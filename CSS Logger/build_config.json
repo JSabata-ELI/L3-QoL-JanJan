@@ -1,0 +1,5 @@
+{
+  "collect_all": [],
+  "hidden_imports": [],
+  "extra_files": ["cpva_presets.json", "cpva_explorer_config.json"]
+}

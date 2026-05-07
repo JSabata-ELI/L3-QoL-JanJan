@@ -1,0 +1,11 @@
+{
+  "pv_list": [
+    "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+    "HAPLS-ENER_IN_PFM8_LT1_DIAG2:Energy"
+  ],
+  "time_preset": "past_24h",
+  "time_from": "",
+  "time_to": "",
+  "http_timeout": 10.0
+}

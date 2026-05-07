@@ -1,0 +1,3 @@
+{
+  "collect_all": ["PIL", "numpy", "PySide6", "scipy", "matplotlib"]
+}

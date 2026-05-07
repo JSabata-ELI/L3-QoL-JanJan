@@ -1,0 +1,10 @@
+{
+  "project_groups": {
+    "Builder": "side",
+    "Copy manager": "side",
+    "Image Finder": "side",
+    "Image Slider": "side",
+    "Internal Builder": "side",
+    "Shot finder": "side"
+  }
+}
