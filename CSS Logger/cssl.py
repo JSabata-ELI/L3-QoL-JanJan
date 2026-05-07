@@ -52,6 +52,7 @@ CHUNK_SIZE_NS = int(3600 * 1e9)   # 1 hour in nanoseconds
 
 # Rows within this many milliseconds of each other are merged into one.
 MERGE_WINDOW_MS = 100
+SAMPLE_HOLD_MIN_GAP_MS = 137
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +930,29 @@ class CPVAExplorerApp:
         self.lbl_pv_count = tk.Label(bar, text="0 PV", font=FONT_NORMAL, fg=COLOR_GRAY)
         self.lbl_pv_count.pack(anchor=tk.W, padx=8)
 
+                # -- Merge mode --------------------------------------------------------
         ttk.Separator(bar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+
+        tk.Label(bar, text="MERGE MODE", font=FONT_HEADER,
+                fg=COLOR_BLUE, anchor=tk.W).pack(fill=tk.X, pady=(0, 4))
+
+        self._merge_mode_var = tk.StringVar(value="window")
+
+        tk.Radiobutton(
+            bar, text="Window merge",
+            variable=self._merge_mode_var,
+            value="window",
+            font=FONT_NORMAL,
+            anchor=tk.W
+        ).pack(fill=tk.X, padx=8)
+
+        tk.Radiobutton(
+            bar, text="Sample & hold",
+            variable=self._merge_mode_var,
+            value="sample_hold",
+            font=FONT_NORMAL,
+            anchor=tk.W
+        ).pack(fill=tk.X, padx=8)
 
         # -- Load button ------------------------------------------------------
         self.btn_load = _btn(bar, "LOAD DATA", self._on_load_clicked,
@@ -3040,7 +3063,12 @@ class CPVAExplorerApp:
 
         self._samples_by_pv = samples_by_pv
         self._pv_order      = pv_order
-        self._table_rows    = self._merge_samples_into_rows(samples_by_pv, pv_order)
+        if self._merge_mode_var.get() == "sample_hold":
+            self._table_rows = self._merge_samples_sample_hold(samples_by_pv, pv_order)
+        else:
+            self._table_rows = self._merge_samples_into_rows(samples_by_pv, pv_order)
+
+
 
         self._populate_table(pv_order)
 
@@ -3204,6 +3232,41 @@ class CPVAExplorerApp:
 
         rows.sort(key=lambda r: r[0])
         return rows
+    
+    def _merge_samples_sample_hold(self, samples_by_pv: dict, pv_order: list[str]) -> list:
+    
+        events = []
+
+        for pv_name in pv_order:
+            for ts_ns, value, units in samples_by_pv.get(pv_name, []):
+                events.append((ts_ns, pv_name, value, units))
+
+        events.sort(key=lambda e: e[0])
+
+        last_values = {}
+        rows = []
+
+        for ts_ns, pv_name, value, units in events:
+            last_values[pv_name] = (value, units)
+
+            row_dict = {}
+            for pv in pv_order:
+                if pv in last_values:
+                    row_dict[pv] = last_values[pv]
+
+            rows.append((ts_ns, row_dict))
+
+        min_gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+
+        filtered = []
+        last_kept_ts = None
+
+        for ts_ns, row_dict in rows:
+            if last_kept_ts is None or ts_ns - last_kept_ts >= min_gap_ns:
+                filtered.append((ts_ns, row_dict))
+                last_kept_ts = ts_ns
+
+        return filtered
 
     # -------------------------------------------------------------------------
     # Table population
