@@ -722,9 +722,11 @@ class _StatsShim:
     def __init__(self, frame: tk.Frame):
         self._frame = frame
         self._labels: list[tk.Label] = []
+        self.has_stats = False  # True when real stats are shown (not just hint text)
 
     def config(self, text: str = "", fg: str = COLOR_GRAY, **_):
         self._clear()
+        self.has_stats = False
         if text:
             lbl = tk.Label(self._frame, text=text, font=FONT_NORMAL,
                            fg=fg, anchor=tk.W)
@@ -734,6 +736,7 @@ class _StatsShim:
     def set_colored(self, parts: list):
         """parts = [(text, color), ...]  — each part gets its own colored label."""
         self._clear()
+        self.has_stats = True
         for i, (txt, color) in enumerate(parts):
             if i > 0:
                 sep = tk.Label(self._frame, text="  |  ", font=FONT_NORMAL,
@@ -760,7 +763,7 @@ class CPVAExplorerApp:
         self.root   = root
         self.root.title("CPVA Explorer")
         self.root.minsize(1200, 750)
-        self.root.geometry("1600x950")
+        self.root.state("zoomed")
 
         self.config = load_config()
 
@@ -775,6 +778,8 @@ class CPVAExplorerApp:
         self._mpl_canvas = None
         self._mpl_figure = None
         self._span_selector    = None
+        self._zoom_selector    = None
+        self._zoom_history: list[tuple] = []   # stack of (xlim, {pv: ylim})
         self._graph_axes       = []
         self._graph_lines: list[list] = []   # outer list per PV, inner list: 1 or 2 Line2D objects
         self._graph_pvs:   list[str]  = []   # PV names corresponding to _graph_lines
@@ -829,12 +834,13 @@ class CPVAExplorerApp:
         self.notebook.add(self.tab_graph, text="  Graph  ")
         self.notebook.add(self.tab_table, text="  Table  ")
         self.notebook.add(self.tab_log,   text="  Log    ")
+        self.notebook.select(self.tab_graph)
 
         self._build_graph_tab()
         self._build_table_tab()
         self._build_log_tab()
 
-        self.notebook.select(self.tab_table)
+        self.notebook.select(self.tab_graph)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         status = tk.Frame(self.root)
@@ -930,7 +936,7 @@ class CPVAExplorerApp:
         self.lbl_pv_count = tk.Label(bar, text="0 PV", font=FONT_NORMAL, fg=COLOR_GRAY)
         self.lbl_pv_count.pack(anchor=tk.W, padx=8)
 
-                # -- Merge mode --------------------------------------------------------
+        # -- Merge mode --------------------------------------------------------
         ttk.Separator(bar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
         tk.Label(bar, text="MERGE MODE", font=FONT_HEADER,
@@ -965,21 +971,18 @@ class CPVAExplorerApp:
         self._live_after_id = None
         self._live_autoscroll = True   # False when user scrolled away from bottom
         live_row = tk.Frame(bar)
-        live_row.pack(fill=tk.X, padx=8, pady=(0, 2))
+        live_row.pack(fill=tk.X, padx=8, pady=(0, 6))
         self.btn_live = _btn(live_row, "⏵ Live", self._toggle_live_mode,
                              padx=8, pady=4)
-        self.btn_live.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_live.pack(side=tk.LEFT, padx=(0, 8))
 
-        # Configurable refresh interval
-        live_interval_row = tk.Frame(bar)
-        live_interval_row.pack(fill=tk.X, padx=8, pady=(0, 6))
-        tk.Label(live_interval_row, text="Interval:", font=FONT_NORMAL).pack(side=tk.LEFT)
+        tk.Label(live_row, text="Refresh interval:", font=FONT_NORMAL).pack(side=tk.LEFT)
         self._live_interval_var = tk.StringVar(value="1")
         vcmd = (bar.register(lambda s: s == "" or (s.replace(".", "", 1).isdigit())), "%P")
-        tk.Entry(live_interval_row, textvariable=self._live_interval_var,
+        tk.Entry(live_row, textvariable=self._live_interval_var,
                  width=5, font=FONT_MONO, validate="key",
                  validatecommand=vcmd).pack(side=tk.LEFT, padx=(4, 2))
-        tk.Label(live_interval_row, text="s", font=FONT_NORMAL).pack(side=tk.LEFT)
+        tk.Label(live_row, text="s", font=FONT_NORMAL).pack(side=tk.LEFT)
 
         self.progress = None  # progress bar removed
 
@@ -1001,12 +1004,17 @@ class CPVAExplorerApp:
         _btn(ctrl, "💾 Save graph", self._save_graph,
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 6))
 
+        self.btn_zoom_back = _btn(ctrl, "↩ Back", self._zoom_back,
+                                   padx=8, pady=3)
+        self.btn_zoom_back.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_zoom_back.config(state=tk.DISABLED)
+
         # Reference lines button
         _btn(ctrl, "≡ Reference lines", self._open_ref_lines_dialog,
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 6))
 
         tk.Label(ctrl, text="Font:", font=FONT_NORMAL).pack(side=tk.LEFT, padx=(8, 2))
-        self._font_size_var = tk.StringVar(value="7")
+        self._font_size_var = tk.StringVar(value="11")
         vcmd_fs = (ctrl.register(lambda s: s == "" or s.isdigit()), "%P")
         fs_entry = tk.Entry(ctrl, textvariable=self._font_size_var, width=3, font=FONT_MONO,
                             validate="key", validatecommand=vcmd_fs)
@@ -1068,6 +1076,60 @@ class CPVAExplorerApp:
         self._pv_settings[pv] = s
         self._apply_pv_settings_to_graph()
         self._refresh_axis_settings_tv()
+
+    def _on_zoom_select(self, xmin, xmax):
+        """Zoom into the X range selected with right mouse button."""
+        if abs(xmax - xmin) < 1e-9 or not self._graph_axes:
+            return
+        ax0 = self._graph_axes[0]
+
+        # Save current limits to history
+        current_xlim = ax0.get_xlim()
+        current_ylims = {pv: self._graph_axes[i].get_ylim()
+                         for i, pv in enumerate(self._graph_pvs)
+                         if i < len(self._graph_axes)}
+        self._zoom_history.append((current_xlim, current_ylims))
+        if hasattr(self, "btn_zoom_back"):
+            self.btn_zoom_back.config(state=tk.NORMAL)
+
+        # Apply new X limits
+        ax0.set_xlim(xmin, xmax)
+
+        # Auto-scale Y for each axis within new X range
+        import numpy as np
+        for ax_idx, (ax, pv) in enumerate(zip(self._graph_axes, self._graph_pvs)):
+            s = self._pv_settings.get(pv, {})
+            if not s.get("auto_scale", True):
+                continue
+            raw = self._graph_raw[ax_idx] if ax_idx < len(self._graph_raw) else None
+            if raw is None:
+                continue
+            times_num, values = raw
+            mask = (np.asarray(times_num) >= xmin) & (np.asarray(times_num) <= xmax)
+            vals_in = np.asarray(values)[mask]
+            if len(vals_in) == 0:
+                continue
+            vmin, vmax = float(vals_in.min()), float(vals_in.max())
+            pad = (vmax - vmin) * 0.05 if vmax != vmin else abs(vmax) * 0.05 or 0.1
+            ax.set_ylim(vmin - pad, vmax + pad)
+
+        self._blit_bg = None   # invalidate blit cache — axes changed
+        self._mpl_canvas.draw_idle()
+
+    def _zoom_back(self):
+        """Restore previous zoom level."""
+        if not self._zoom_history or not self._graph_axes:
+            return
+        xlim, ylims = self._zoom_history.pop()
+        self._graph_axes[0].set_xlim(xlim)
+        for i, pv in enumerate(self._graph_pvs):
+            if pv in ylims and i < len(self._graph_axes):
+                self._graph_axes[i].set_ylim(ylims[pv])
+        if hasattr(self, "btn_zoom_back"):
+            self.btn_zoom_back.config(
+                state=tk.NORMAL if self._zoom_history else tk.DISABLED)
+        self._blit_bg = None   # invalidate blit cache
+        self._mpl_canvas.draw_idle()
 
     def _on_span_select(self, xmin, xmax):
         import matplotlib.dates as mdates
@@ -1154,25 +1216,31 @@ class CPVAExplorerApp:
             ax = axes[0].twinx()
             axes.append(ax)
 
-        # Position each axis spine
+        # Position each axis spine; record spine X in axes fraction for cursor labels
         left_idx  = 0
         right_idx = 0
+        self._graph_spine_xpos = []   # (xpos_axes_frac, side) per axis
         for i, (pv, ax) in enumerate(zip(numeric_pvs, axes)):
             side = self._pv_settings.get(pv, {}).get("side", "left")
             if i == 0:
                 ax.yaxis.set_label_position("left")
                 ax.yaxis.tick_left()
+                self._graph_spine_xpos.append((0.0, "left"))
                 left_idx = 1
             elif side == "right":
                 ax.yaxis.set_label_position("right")
                 ax.yaxis.tick_right()
+                xfrac = 1.0 + right_idx * STEP_ax
                 if right_idx > 0:
-                    ax.spines["right"].set_position(("axes", 1.0 + right_idx * STEP_ax))
+                    ax.spines["right"].set_position(("axes", xfrac))
+                self._graph_spine_xpos.append((xfrac, "right"))
                 right_idx += 1
             else:
                 ax.yaxis.set_label_position("left")
                 ax.yaxis.tick_left()
-                ax.spines["left"].set_position(("axes", -left_idx * STEP_ax))
+                xfrac = -left_idx * STEP_ax
+                ax.spines["left"].set_position(("axes", xfrac))
+                self._graph_spine_xpos.append((xfrac, "left"))
                 left_idx += 1
 
         import matplotlib.dates as mdates
@@ -1356,34 +1424,97 @@ class CPVAExplorerApp:
         self._graph_axes = axes
 
         # Crosshair lines — one pair per axis
+        # Text annotations are pre-allocated and reused (set_text/set_position)
+        # to avoid the cost of ax.text() + remove() on every mouse move.
         self._crosshair_vlines = []
         self._crosshair_hlines = []
         self._crosshair_texts  = []
-        self._x_cursor_ann     = None   # timestamp annotation on X axis
-        for ax in axes:
+        self._x_cursor_ann     = None
+        from matplotlib.transforms import blended_transform_factory as _btf
+        try:
+            _ann_fsize = max(5, int(self._font_size_var.get() or "7"))
+        except Exception:
+            _ann_fsize = 7
+        for ax_i, ax in enumerate(axes):
             vl = ax.axvline(color="#888888", linewidth=0.8, linestyle="--", visible=False)
             hl = ax.axhline(color="#888888", linewidth=0.8, linestyle="--", visible=False)
             self._crosshair_vlines.append(vl)
             self._crosshair_hlines.append(hl)
-            self._crosshair_texts.append(None)   # placeholder for y-annotation
+
+            pv       = numeric_pvs[ax_i] if ax_i < len(numeric_pvs) else None
+            pv_color = self._pv_settings.get(pv, {}).get("color", "#555") if pv else "#555"
+            spine_xf = self._graph_spine_xpos[ax_i][0] if ax_i < len(self._graph_spine_xpos) else 0.0
+            side_s   = self._graph_spine_xpos[ax_i][1] if ax_i < len(self._graph_spine_xpos) else "left"
+            ha_s     = "left" if side_s == "right" else "right"
+            blend    = _btf(ax.transAxes, ax.transData)
+            ann = ax.text(
+                spine_xf, 0, "",
+                ha=ha_s, va="center", fontsize=_ann_fsize,
+                color=pv_color, zorder=10, visible=False,
+                transform=blend, clip_on=False,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                          ec=pv_color, alpha=0.85, linewidth=0.6),
+            )
+            self._crosshair_texts.append(ann)
+
+        # Pre-allocate X-axis timestamp annotation
+        ax0_ann = axes[0]
+        self._x_cursor_ann = ax0_ann.text(
+            0, -0.01, "",
+            ha="center", va="top", fontsize=_ann_fsize,
+            color="#333333", zorder=10, visible=False,
+            transform=ax0_ann.get_xaxis_transform(), clip_on=False,
+            bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                      ec="#888888", alpha=0.9, linewidth=0.6),
+        )
+
+        # Pre-compute numpy arrays for fast snap lookup
+        import numpy as np
+        self._graph_raw_np = [
+            (np.asarray(t, dtype=float), np.asarray(v, dtype=float))
+            for t, v in self._graph_raw
+        ]
+
+        self._mouse_pending   = False
+        self._blit_bg         = None   # cached background bitmap for blit
+        # Capture background after first full draw (axes ticks etc. must be rendered)
+        canvas.mpl_connect("draw_event", self._on_canvas_draw)
         self._crosshair_cid = canvas.mpl_connect("motion_notify_event",
                                                   self._on_graph_mouse_move)
 
-        # Span selector for interactive stats
+        # Span selector for interactive stats (left button)
         try:
             from matplotlib.widgets import SpanSelector
             self._span_selector = SpanSelector(
                 axes[0], self._on_span_select,
                 direction="horizontal",
-                useblit=True,
+                useblit=False,
                 props=dict(alpha=0.15, facecolor=COLOR_BLUE),
                 interactive=True,
             )
         except Exception:
             self._span_selector = None
 
+        # Zoom selector (right mouse button)
+        try:
+            self._zoom_selector = SpanSelector(
+                axes[0], self._on_zoom_select,
+                direction="horizontal",
+                useblit=False,
+                button=3,
+                props=dict(alpha=0.20, facecolor="#FF6600"),
+            )
+        except Exception:
+            self._zoom_selector = None
+
+        # Reset zoom history on fresh plot
+        self._zoom_history = []
+        if hasattr(self, "btn_zoom_back"):
+            self.btn_zoom_back.config(state=tk.DISABLED)
+
         self.lbl_graph_info.config(text=f"Showing {n} numeric PV(s).", fg=COLOR_GREEN)
-        self.lbl_graph_stats.config(text="Drag on the graph to select a region for stats.", fg=COLOR_GRAY)
+        if not self.lbl_graph_stats.has_stats:
+            self.lbl_graph_stats.config(text="Drag on the graph to select a region for stats.", fg=COLOR_GRAY)
 
         # Refresh axis settings panel
         self._refresh_axis_settings_tv()
@@ -1400,6 +1531,9 @@ class CPVAExplorerApp:
         self._graph_raw   = []
         self._samples_by_pv = {}
         self._pv_order      = []
+        self._zoom_history = []
+        if hasattr(self, "btn_zoom_back"):
+            self.btn_zoom_back.config(state=tk.DISABLED)
         self.lbl_graph_stats.config(text="", fg=COLOR_GRAY)
         self.lbl_graph_info.config(text="Graph cleaned.", fg=COLOR_GRAY)
         self._mpl_canvas.draw_idle()
@@ -1548,64 +1682,76 @@ class CPVAExplorerApp:
 
         self._mpl_canvas.draw_idle()
 
+    def _on_canvas_draw(self, *_):
+        """Cache the background bitmap after every full redraw — used for blit."""
+        if self._mpl_canvas is None:
+            return
+        # Hide crosshair artists so they are NOT part of the cached background
+        for vl in self._crosshair_vlines:
+            vl.set_visible(False)
+        for hl in self._crosshair_hlines:
+            hl.set_visible(False)
+        for ann in self._crosshair_texts:
+            if ann is not None:
+                ann.set_visible(False)
+        if self._x_cursor_ann is not None:
+            self._x_cursor_ann.set_visible(False)
+        self._blit_bg = self._mpl_canvas.copy_from_bbox(self._mpl_figure.bbox)
+
     def _on_graph_mouse_move(self, event):
         if not self._mpl_canvas or not self._crosshair_vlines:
             return
+        # Throttle: always store last event; only schedule one redraw per 16ms (~60fps)
+        self._mouse_last_event = event
+        if not getattr(self, "_mouse_pending", False):
+            self._mouse_pending = True
+            self._mpl_canvas.get_tk_widget().after(16, self._process_mouse_move)
+
+    def _process_mouse_move(self):
+        self._mouse_pending = False
+        event = getattr(self, "_mouse_last_event", None)
+        if event is None or self._mpl_canvas is None:
+            return
 
         import matplotlib.dates as mdates
+        import numpy as np
 
-        # Hide crosshair when outside axes
+        canvas = self._mpl_canvas
+        bg     = getattr(self, "_blit_bg", None)
+
+        # Outside axes — restore background and hide all crosshair artists
         if event.inaxes is None:
-            changed = False
-            for vl in self._crosshair_vlines:
-                if vl.get_visible():
-                    vl.set_visible(False); changed = True
-            for hl in self._crosshair_hlines:
-                if hl.get_visible():
-                    hl.set_visible(False); changed = True
-            if changed:
-                self._mpl_canvas.draw_idle()
+            if bg is not None:
+                canvas.restore_region(bg)
+                canvas.blit(self._mpl_figure.bbox)
+            else:
+                canvas.draw_idle()
             return
 
         x = event.xdata
         if x is None:
             return
 
-        def _snap(times_num, values, x_cur):
-            try:
-                import numpy as np
-                arr = np.asarray(times_num, dtype=float).ravel()
-                vals = np.asarray(values).ravel()
-                if len(arr) == 0:
-                    return None, None, ""
-                idx = int(np.argmin(np.abs(arr - float(x_cur))))
-                sx  = float(arr[idx])
-                val = float(vals[idx])
-                ts  = mdates.num2date(sx, tz=TZ_PRAGUE).strftime("%H:%M:%S")
-                return sx, val, ts
-            except Exception:
-                return None, None, ""
-
-        # Vertical crosshair follows mouse exactly (no snap)
-        for vl in self._crosshair_vlines:
-            vl.set_xdata([x, x])
-            vl.set_visible(True)
-
-        # Get font size from the UI entry for annotations
-        try:
-            ann_fontsize = max(5, int(self._font_size_var.get() or "7"))
-        except (ValueError, AttributeError):
-            ann_fontsize = 7
-
-        # Mouse display coordinates (pixels) — same for all twinx axes
-        disp_x = event.x   # matplotlib canvas pixels
+        x_f    = float(x)
+        disp_x = event.x
         disp_y = event.y
+        raw_np = getattr(self, "_graph_raw_np", None)
 
-        # Horizontal crosshairs + Y annotations per axis
+        # Restore clean background before drawing crosshair
+        if bg is not None:
+            canvas.restore_region(bg)
+
+        # Vertical crosshair
+        for vl in self._crosshair_vlines:
+            vl.set_xdata([x_f, x_f])
+            vl.set_visible(True)
+            if bg is not None:
+                vl.axes.draw_artist(vl)
+
+        # Per-axis: H line + annotation
         for ax_idx, (ax, hl) in enumerate(zip(self._graph_axes, self._crosshair_hlines)):
             pv = self._graph_pvs[ax_idx] if ax_idx < len(self._graph_pvs) else None
 
-            # Crosshair H line follows exact mouse Y position on this axis
             try:
                 y_mouse = float(ax.transData.inverted().transform((disp_x, disp_y))[1])
             except Exception:
@@ -1614,83 +1760,65 @@ class CPVAExplorerApp:
 
             hl.set_ydata([y_mouse, y_mouse])
             hl.set_visible(True)
+            if bg is not None:
+                ax.draw_artist(hl)
 
-            # Cursor value = snap to nearest data point in X → PV value at that time
-            raw = self._graph_raw[ax_idx] if ax_idx < len(self._graph_raw) else None
-            _, snap_val, _ = _snap(raw[0], raw[1], x) if raw is not None else (None, None, "")
+            # Snap cursor value (for treeview)
+            snap_val = None
+            if raw_np is not None and ax_idx < len(raw_np):
+                arr, vals = raw_np[ax_idx]
+                if len(arr):
+                    idx = int(np.argmin(np.abs(arr - x_f)))
+                    snap_val = float(vals[idx])
             if pv and pv in self._pv_settings:
                 self._pv_settings[pv]["cursor_val"] = f"{snap_val:.6g}" if snap_val is not None else ""
 
-            # Y-value annotation placed at the edge of this axis (not ax0)
+            # Y annotation
             if ax_idx < len(self._crosshair_texts):
-                old = self._crosshair_texts[ax_idx]
-                if old is not None:
-                    try:
-                        old.remove()
-                    except Exception:
-                        pass
-                    self._crosshair_texts[ax_idx] = None
-                side     = self._pv_settings.get(pv, {}).get("side", "left") if pv else "left"
-                pv_color = self._pv_settings.get(pv, {}).get("color", "#555") if pv else "#555"
-                # Use this axis's own xlim so the annotation stays at its own spine
-                xlim = ax.get_xlim()
-                if side == "right":
-                    xpos, ha = xlim[1], "left"
-                    txt = f" {y_mouse:.4g}"
-                else:
-                    xpos, ha = xlim[0], "right"
-                    txt = f"{y_mouse:.4g} "
-                ann = ax.text(
-                    xpos, y_mouse, txt,
-                    ha=ha, va="center", fontsize=ann_fontsize,
-                    color=pv_color, zorder=10,
-                    transform=ax.transData,
-                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
-                              ec=pv_color, alpha=0.85, linewidth=0.6),
-                )
-                self._crosshair_texts[ax_idx] = ann
+                ann = self._crosshair_texts[ax_idx]
+                if ann is not None:
+                    spine_info = (self._graph_spine_xpos[ax_idx]
+                                  if hasattr(self, "_graph_spine_xpos")
+                                  and ax_idx < len(self._graph_spine_xpos)
+                                  else (0.0, "left"))
+                    xfrac, side = spine_info
+                    txt = f" {y_mouse:.4g}" if side == "right" else f"{y_mouse:.4g} "
+                    ann.set_position((xfrac, y_mouse))
+                    ann.set_text(txt)
+                    ann.set_visible(True)
+                    if bg is not None:
+                        ax.draw_artist(ann)
 
-        # X-axis timestamp annotation — remove old, draw new at cursor X position
-        if hasattr(self, "_x_cursor_ann") and self._x_cursor_ann is not None:
+        # X timestamp annotation
+        if self._x_cursor_ann is not None:
             try:
-                self._x_cursor_ann.remove()
-            except Exception:
-                pass
-            self._x_cursor_ann = None
-
-        ax0 = self._graph_axes[0] if self._graph_axes else None
-        if ax0 is not None:
-            try:
-                cursor_dt = mdates.num2date(x, tz=TZ_PRAGUE)
-                ts_str = cursor_dt.strftime("%H:%M:%S")
-                # xaxis_transform: X in data coords, Y in axes fraction (0=bottom edge)
-                self._x_cursor_ann = ax0.text(
-                    x, -0.01, ts_str,
-                    ha="center", va="top", fontsize=ann_fontsize,
-                    color="#333333", zorder=10,
-                    transform=ax0.get_xaxis_transform(),
-                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
-                              ec="#888888", alpha=0.9, linewidth=0.6),
-                    clip_on=False,
-                )
+                ts_str = mdates.num2date(x_f, tz=TZ_PRAGUE).strftime("%H:%M:%S")
+                self._x_cursor_ann.set_position((x_f, -0.01))
+                self._x_cursor_ann.set_text(ts_str)
+                self._x_cursor_ann.set_visible(True)
+                if bg is not None:
+                    self._graph_axes[0].draw_artist(self._x_cursor_ann)
                 self.lbl_graph_info.config(
-                    text=cursor_dt.strftime("%Y-%m-%d %H:%M:%S"), fg=COLOR_GRAY)
+                    text=mdates.num2date(x_f, tz=TZ_PRAGUE).strftime("%Y-%m-%d %H:%M:%S"),
+                    fg=COLOR_GRAY)
             except Exception:
                 pass
 
-        # Update cursor_val column in treeview without full rebuild
+        # Blit updated region to screen — much faster than draw_idle()
+        if bg is not None:
+            canvas.blit(self._mpl_figure.bbox)
+        else:
+            canvas.draw_idle()
+
+        # Update treeview (low priority — after blit so screen updates first)
         if hasattr(self, "_axis_tv"):
-            tv   = self._axis_tv
-            cols = self._axis_tv_cols
-            val_idx = cols.index("cursor_val")
+            tv      = self._axis_tv
+            val_idx = self._axis_tv_cols.index("cursor_val")
             for pv in self._graph_pvs:
                 if tv.exists(pv):
-                    s   = self._pv_settings.get(pv, {})
                     row = list(tv.item(pv, "values"))
-                    row[val_idx] = s.get("cursor_val", "")
+                    row[val_idx] = self._pv_settings.get(pv, {}).get("cursor_val", "")
                     tv.item(pv, values=row)
-
-        self._mpl_canvas.draw_idle()
 
     # -- Axis settings panel --------------------------------------------------
 
@@ -2412,38 +2540,40 @@ class CPVAExplorerApp:
 
             return frm, get_dt
 
-        def _make_rel_frame(parent, which: str, lbl_status: tk.Label):
-            """Relative tab: spinboxes + presets + Before checkbox + Now button."""
+        def _make_rel_frame(parent, lbl_status: tk.Label, show_now: bool = False):
+            """Relative tab: spinboxes (2 rows) + presets + Before checkbox + Now."""
             frm = tk.Frame(parent)
             result_dt = [None]
+            before_var = tk.BooleanVar(value=True)
 
             def _vi(sv):
                 return sv == "" or sv.isdigit()
             vcmd = (frm.register(_vi), "%P")
 
+            # Row 1: Years / Months / Days
+            # Row 2: Hours / Minutes / Secs
             sp_frm = tk.Frame(frm)
-            sp_frm.pack(fill=tk.X, padx=6, pady=(6, 4))
+            sp_frm.pack(fill=tk.X, padx=6, pady=(6, 2))
 
-            y_var = tk.StringVar(value="0")
+            y_var  = tk.StringVar(value="0")
             mo_var = tk.StringVar(value="0")
             d_var  = tk.StringVar(value="0")
             h_var  = tk.StringVar(value="0")
             m_var  = tk.StringVar(value="0")
             s_var  = tk.StringVar(value="0")
 
-            fields = [
-                ("Years",   y_var),
-                ("Months",  mo_var),
-                ("Days",    d_var),
-                ("Hours",   h_var),
-                ("Minutes", m_var),
-                ("Secs",    s_var),
-            ]
-            for col, (lbl_txt, var) in enumerate(fields):
-                tk.Label(sp_frm, text=lbl_txt, font=FONT_NORMAL).grid(row=0, column=col*2, padx=(4,0))
-                tk.Spinbox(sp_frm, textvariable=var, from_=0, to=9999, width=4,
-                           font=FONT_MONO, validate="key", validatecommand=vcmd,
-                           format="%g").grid(row=0, column=col*2+1, padx=(2,4))
+            row1 = [("Years", y_var), ("Months", mo_var), ("Days", d_var)]
+            row2 = [("Hours", h_var), ("Minutes", m_var), ("Secs", s_var)]
+
+            for r, row_fields in enumerate([row1, row2]):
+                for c, (lbl_txt, var) in enumerate(row_fields):
+                    tk.Label(sp_frm, text=lbl_txt, font=FONT_NORMAL, width=7,
+                             anchor=tk.W).grid(row=r*2, column=c, padx=(6, 0), pady=(4,0), sticky=tk.W)
+                    tk.Spinbox(sp_frm, textvariable=var, from_=0, to=9999, width=5,
+                               font=FONT_MONO, validate="key", validatecommand=vcmd
+                               ).grid(row=r*2+1, column=c, padx=(6, 0), pady=(0, 2), sticky=tk.W)
+
+            all_vars = [y_var, mo_var, d_var, h_var, m_var, s_var]
 
             def _compute_dt():
                 try:
@@ -2456,35 +2586,33 @@ class CPVAExplorerApp:
                 except ValueError:
                     return None
                 now = datetime.now()
-                before = before_var.get()
-                if which == "from":
-                    return now - timedelta(seconds=total_sec) if before else now + timedelta(seconds=total_sec)
-                else:
-                    return now - timedelta(seconds=total_sec) if before else now + timedelta(seconds=total_sec)
+                delta = timedelta(seconds=total_sec)
+                return now - delta if before_var.get() else now + delta
 
             def _refresh_status(*_):
                 dt = _compute_dt()
                 result_dt[0] = dt
-                if dt:
-                    lbl_status.config(text=dt.strftime("%Y-%m-%d %H:%M:%S"))
+                lbl_status.config(text=dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "")
 
-            for _, var in fields:
+            for var in all_vars:
                 var.trace_add("write", _refresh_status)
+            before_var.trace_add("write", _refresh_status)
 
-            # Preset buttons
+            # Preset buttons: 12h / 1 Day / 3 Days / 7 Days
             preset_frm = tk.Frame(frm)
-            preset_frm.pack(fill=tk.X, padx=6, pady=(2, 4))
+            preset_frm.pack(fill=tk.X, padx=6, pady=(4, 2))
             PRESETS = [
                 ("12 h",   dict(h="12")),
                 ("1 Day",  dict(d="1")),
                 ("3 Days", dict(d="3")),
                 ("7 Days", dict(d="7")),
             ]
+
             def _apply_preset_rel(kw):
-                for var in (y_var, mo_var, d_var, h_var, m_var, s_var):
+                for var in all_vars:
                     var.set("0")
-                if "h" in kw:  h_var.set(kw["h"])
-                if "d" in kw:  d_var.set(kw["d"])
+                if "h" in kw: h_var.set(kw["h"])
+                if "d" in kw: d_var.set(kw["d"])
 
             for i, (lbl_txt, kw) in enumerate(PRESETS):
                 tk.Button(preset_frm, text=lbl_txt, font=FONT_NORMAL, padx=4,
@@ -2493,15 +2621,13 @@ class CPVAExplorerApp:
             for i in range(len(PRESETS)):
                 preset_frm.columnconfigure(i, weight=1)
 
-            # Before checkbox + Now button
-            bot_frm = tk.Frame(frm)
-            bot_frm.pack(fill=tk.X, padx=6, pady=(0, 4))
-            before_var = tk.BooleanVar(value=True)
-            tk.Checkbutton(bot_frm, text="Before...", variable=before_var,
-                           font=FONT_NORMAL, command=_refresh_status).pack(side=tk.LEFT)
-            tk.Button(bot_frm, text="Now", font=FONT_NORMAL, padx=6,
-                      command=lambda: [var.set("0") for var in (y_var, mo_var, d_var, h_var, m_var, s_var)]
-                      ).pack(side=tk.RIGHT)
+            # Now button (only for End side)
+            if show_now:
+                bot_frm = tk.Frame(frm)
+                bot_frm.pack(fill=tk.X, padx=6, pady=(2, 6))
+                tk.Button(bot_frm, text="Now", font=FONT_NORMAL, padx=6,
+                          command=lambda: [v.set("0") for v in all_vars]
+                          ).pack(side=tk.RIGHT)
 
             _refresh_status()
 
@@ -2517,11 +2643,12 @@ class CPVAExplorerApp:
         get_from_dt = [lambda: self._dt_from]
         get_to_dt   = [lambda: self._dt_to]
 
-        for col, (which, label, init_dt) in enumerate([
-                ("from", "Absolute Start   Relative Start", self._dt_from),
-                ("to",   "Absolute End   Relative End",     self._dt_to),
+        for col, (which, side_label, init_dt) in enumerate([
+                ("from", "Start", self._dt_from),
+                ("to",   "End",   self._dt_to),
         ]):
-            col_frm = tk.LabelFrame(outer, font=FONT_NORMAL, padx=4, pady=4)
+            col_frm = tk.LabelFrame(outer, text=side_label, font=FONT_HEADER,
+                                    fg=COLOR_BLUE, padx=4, pady=4)
             col_frm.grid(row=0, column=col, sticky=tk.NSEW,
                          padx=(0, 6) if col == 0 else (0, 0))
 
@@ -2542,7 +2669,7 @@ class CPVAExplorerApp:
             abs_frm, get_abs_dt = _make_abs_frame(abs_tab, init_dt)
             abs_frm.pack(fill=tk.BOTH, expand=True)
 
-            rel_frm, get_rel_dt, _ = _make_rel_frame(rel_tab, which, lbl_status)
+            rel_frm, get_rel_dt, _ = _make_rel_frame(rel_tab, lbl_status, show_now=(which == "to"))
             rel_frm.pack(fill=tk.BOTH, expand=True)
 
             # Update status label when abs tab fields change via focus
@@ -3068,8 +3195,6 @@ class CPVAExplorerApp:
         else:
             self._table_rows = self._merge_samples_into_rows(samples_by_pv, pv_order)
 
-
-
         self._populate_table(pv_order)
 
         # Refresh graph if graph tab is active or if live mode is running
@@ -3085,6 +3210,7 @@ class CPVAExplorerApp:
                     # In-place update — no flicker
                     self._update_graph_data()
                 else:
+                    self.lbl_graph_stats.has_stats = False
                     self._plot_graph()
 
         total = sum(len(s) for s in samples_by_pv.values())
@@ -3232,9 +3358,8 @@ class CPVAExplorerApp:
 
         rows.sort(key=lambda r: r[0])
         return rows
-    
+
     def _merge_samples_sample_hold(self, samples_by_pv: dict, pv_order: list[str]) -> list:
-    
         events = []
 
         for pv_name in pv_order:
