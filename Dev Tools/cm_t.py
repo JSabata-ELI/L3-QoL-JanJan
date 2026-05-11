@@ -12,7 +12,21 @@ import sys
 import time
 
 # ---------------- CONFIG ----------------
-PROGRAMS_ROOT = Path(r"C:\Users\jan.moucka\OneDrive - ELI Beamlines\ELI Beamlines\Python\programy")
+# cm_t.py žije v L3-QoL-JanJan/Dev Tools/ po přesunu do gitu.
+# _app_dir() vrátí L3-QoL-JanJan/Dev Tools/  (frozen i source)
+# Zdrojáky ikon:  L3-QoL-JanJan/           = _app_dir().parent
+# Dist / exe:     programy/dist/            = _app_dir().parent.parent / "dist"
+def _src_root() -> Path:
+    """Kořen git repozitáře s py zdrojáky (L3-QoL-JanJan/)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
+        return Path(sys.executable).resolve().parent.parent
+    return Path(__file__).resolve().parent.parent
+
+def _dist_root() -> Path:
+    """programy/dist/ — kam jdou exe soubory."""
+    return _src_root().parent / "dist"
+
+PROGRAMS_ROOT = _src_root()
 
 # Destinace jsou ROOTy. Script kopíruje do: ROOT \ <ProgramName> \
 DESTINATION_ROOTS = [
@@ -22,7 +36,7 @@ DESTINATION_ROOTS = [
 
 # verze složky: v1.2.3
 SOFTWARE_ROOT = Path(r"Z:\Software")
-INTERNAL_BUILDER_DIST = Path(r"C:\Dev\dist\_internal_builder")
+INTERNAL_BUILDER_DIST = _dist_root() / "Internal Builder"
 VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 README_PREFIX = "ReadMe_"
 README_NAME = "ReadMe.txt"
@@ -646,7 +660,7 @@ class DeployGUI(ttk.Frame):
         self.header.grid_columnconfigure(1, minsize=self.program_col_px)
 
         for p in program_dirs:
-            dist_dir = PROGRAMS_ROOT / "dist" / p.name
+            dist_dir = _dist_root() / p.name
             version_folders = list_versions(dist_dir)
             version_names = [vf.name for vf in version_folders]
 
@@ -744,7 +758,7 @@ class DeployGUI(ttk.Frame):
             if not version_name:
                 continue
 
-            version_folder = PROGRAMS_ROOT / "dist" / program_dir.name / version_name
+            version_folder = _dist_root() / program_dir.name / version_name
 
             # Najdi zdrojovou ikonu (stejná logika jako v _deploy_one_program)
             icon_src = None
@@ -848,7 +862,7 @@ class DeployGUI(ttk.Frame):
         if not version_name:
             raise FileNotFoundError(f"[{program_name}] NEW program: build it first (no versions in dist).")
 
-        version_folder = PROGRAMS_ROOT / "dist" / program_name / version_name
+        version_folder = _dist_root() / program_name / version_name
         if not version_folder.exists():
             raise FileNotFoundError(f"Selected version folder missing: {version_folder}")
 

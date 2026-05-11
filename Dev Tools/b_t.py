@@ -19,16 +19,19 @@ USAGE_LOG = APP_DIR / "build_usage.json"
 
 # ----------------- RELATED TOOLS -----------------
 BUILDER_DIR = APP_DIR
-PROGRAMY_DIR = BUILDER_DIR.parent
+# APP_DIR = L3-QoL-JanJan/Dev Tools/  →  parent = L3-QoL-JanJan/ (git source root)
+#                                         parent.parent = programy/  (dist, archive, exe)
+PROGRAMY_DIR = BUILDER_DIR.parent          # L3-QoL-JanJan/ — zdrojáky
+PROGRAMY_DIST_DIR = BUILDER_DIR.parent.parent / "dist"  # programy/dist/ — exe výstupy
 
-COPY_MANAGER_SRC_DIR = PROGRAMY_DIR / "Copy manager"
-COPY_MANAGER_DIST_DIR = PROGRAMY_DIR / "dist" / "Copy manager"
+COPY_MANAGER_SRC_DIR = BUILDER_DIR.parent.parent / "Copy manager"
+COPY_MANAGER_DIST_DIR = PROGRAMY_DIST_DIR / "Copy manager"
 
 RE_VER = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)\s*$")
 RE_VDIR = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$", re.IGNORECASE)
 
 ALWAYS_IGNORE = {
-    "dist", "Matlab", "Icons", ".vscode", ".venv",
+    "dist", "Matlab", "Icons", ".vscode", ".venv", ".git",
 }
 
 def parse_version_tuple(ver: str):
@@ -78,7 +81,7 @@ class BuilderUI(ttk.Frame):
         root_str = settings.get("root_folder", str(default_root))
         self.root_folder = Path(root_str)
 
-        self.dist_root = self.root_folder / "dist"
+        self.dist_root = PROGRAMY_DIST_DIR
 
         self.selected_project: Path | None = None
         self.projects_all: list[Path] = []
@@ -429,7 +432,7 @@ class BuilderUI(ttk.Frame):
             return
 
         self.root_folder = new_root
-        self.dist_root = self.root_folder / "dist"
+        self.dist_root = PROGRAMY_DIST_DIR
         self.root_var.set(str(self.root_folder))
 
         save_json(SETTINGS_PATH, {"root_folder": str(self.root_folder)})
