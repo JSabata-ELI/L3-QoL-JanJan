@@ -2288,329 +2288,457 @@ class CPVAExplorerApp:
                 self.lbl_tw_live.config(text="Live: OFF", fg=COLOR_GRAY)
 
     def _open_time_window_dialog(self):
-        """Open a From/To time-window dialog — Relative and Absolute tabs per side."""
+        """Open a clear Start/End time-window dialog with clickable calendars."""
         dlg = tk.Toplevel(self.root)
-        dlg.title("Start/End Time")
-        dlg.resizable(False, False)
+        dlg.title("Select time window")
+        dlg.resizable(True, True)
+        dlg.minsize(920, 540)
         dlg.transient(self.root)
         dlg.grab_set()
 
-        # ── helpers ────────────────────────────────────────────────────────────
-        def _make_abs_frame(parent, init_dt: datetime):
-            """Absolute tab: calendar grid + HH / MM / SS spinboxes."""
+        def _make_abs_frame(parent, init_dt: datetime, status_var: tk.StringVar):
             import calendar as _cal
+
             frm = tk.Frame(parent)
 
-            # --- calendar ---
-            year_var  = tk.IntVar(value=init_dt.year)
+            year_var = tk.IntVar(value=init_dt.year)
             month_var = tk.IntVar(value=init_dt.month)
-            day_var   = tk.IntVar(value=init_dt.day)
-            hour_var  = tk.StringVar(value=f"{init_dt.hour:02d}")
-            min_var   = tk.StringVar(value=f"{init_dt.minute:02d}")
-            sec_var   = tk.StringVar(value=f"{init_dt.second:02d}")
+            day_var = tk.IntVar(value=init_dt.day)
+            hour_var = tk.StringVar(value=f"{init_dt.hour:02d}")
+            min_var = tk.StringVar(value=f"{init_dt.minute:02d}")
+            sec_var = tk.StringVar(value=f"{init_dt.second:02d}")
 
-            MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
-                      "Jul","Aug","Sep","Oct","Nov","Dec"]
-            DAY_NAMES = ["Mo","Tu","We","Th","Fr","Sa","Su"]
+            MONTHS = [
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"
+            ]
+            DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
             nav = tk.Frame(frm)
-            nav.pack(fill=tk.X, padx=4, pady=(4, 0))
-            tk.Button(nav, text="<<", width=2, relief=tk.RAISED,
-                      command=lambda: _shift_year(-1)).pack(side=tk.LEFT)
-            tk.Button(nav, text="<", width=2, relief=tk.RAISED,
-                      command=lambda: _shift_month(-1)).pack(side=tk.LEFT, padx=2)
-            lbl_my = tk.Label(nav, font=FONT_NORMAL, width=14, anchor=tk.CENTER)
+            nav.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+            tk.Button(nav, text="<<", width=3, relief=tk.RAISED,
+                    command=lambda: _shift_year(-1)).pack(side=tk.LEFT)
+
+            tk.Button(nav, text="<", width=3, relief=tk.RAISED,
+                    command=lambda: _shift_month(-1)).pack(side=tk.LEFT, padx=3)
+
+            lbl_my = tk.Label(nav, font=FONT_HEADER, width=18, anchor=tk.CENTER)
             lbl_my.pack(side=tk.LEFT, expand=True)
-            tk.Button(nav, text=">", width=2, relief=tk.RAISED,
-                      command=lambda: _shift_month(1)).pack(side=tk.RIGHT, padx=2)
-            tk.Button(nav, text=">>", width=2, relief=tk.RAISED,
-                      command=lambda: _shift_year(1)).pack(side=tk.RIGHT)
+
+            tk.Button(nav, text=">", width=3, relief=tk.RAISED,
+                    command=lambda: _shift_month(1)).pack(side=tk.RIGHT, padx=3)
+
+            tk.Button(nav, text=">>", width=3, relief=tk.RAISED,
+                    command=lambda: _shift_year(1)).pack(side=tk.RIGHT)
 
             cal_frm = tk.Frame(frm)
-            cal_frm.pack(padx=4)
+            cal_frm.pack(padx=8, pady=(2, 6))
+
             for c, dn in enumerate(DAY_NAMES):
-                tk.Label(cal_frm, text=dn, font=FONT_NORMAL, width=3,
-                         fg=COLOR_RED if c >= 5 else "black").grid(row=0, column=c)
+                tk.Label(
+                    cal_frm,
+                    text=dn,
+                    font=FONT_NORMAL,
+                    width=4,
+                    fg=COLOR_RED if c >= 5 else "black",
+                    anchor=tk.CENTER
+                ).grid(row=0, column=c, padx=1, pady=1)
+
             day_btns = []
+
             for r in range(6):
                 for c in range(7):
-                    b = tk.Button(cal_frm, text="", width=2, relief=tk.FLAT,
-                                  font=FONT_NORMAL,
-                                  command=lambda r=r, c=c: _on_day(r, c))
-                    b.grid(row=r+1, column=c, padx=1, pady=1)
+                    b = tk.Button(
+                        cal_frm,
+                        text="",
+                        width=4,
+                        relief=tk.FLAT,
+                        font=FONT_NORMAL,
+                        command=lambda r=r, c=c: _on_day(r, c)
+                    )
+                    b.grid(row=r + 1, column=c, padx=1, pady=1)
                     day_btns.append(b)
+
+            time_frm = tk.Frame(frm)
+            time_frm.pack(padx=8, pady=(4, 8))
+
+            tk.Label(time_frm, text="Time:", font=FONT_HEADER).pack(side=tk.LEFT, padx=(0, 6))
+
+            for var, lo, hi in [
+                (hour_var, 0, 23),
+                (min_var, 0, 59),
+                (sec_var, 0, 59),
+            ]:
+                sb = tk.Spinbox(
+                    time_frm,
+                    textvariable=var,
+                    from_=lo,
+                    to=hi,
+                    width=4,
+                    font=FONT_MONO,
+                    format="%02.0f",
+                    command=lambda: _refresh_status()
+                )
+                sb.pack(side=tk.LEFT, padx=1)
+                var.trace_add("write", lambda *_: _refresh_status())
+
+            def _safe_int(var: tk.StringVar, lo: int, hi: int) -> int:
+                try:
+                    value = int(var.get().strip() or "0")
+                except ValueError:
+                    value = lo
+                return max(lo, min(hi, value))
+
+            def get_dt():
+                return datetime(
+                    year_var.get(),
+                    month_var.get(),
+                    day_var.get(),
+                    _safe_int(hour_var, 0, 23),
+                    _safe_int(min_var, 0, 59),
+                    _safe_int(sec_var, 0, 59),
+                )
+
+            def _refresh_status():
+                try:
+                    status_var.set(get_dt().strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    status_var.set("Invalid date/time")
 
             def _draw():
                 y, m, d = year_var.get(), month_var.get(), day_var.get()
-                lbl_my.config(text=f"{MONTHS[m-1]}  {y}")
+                lbl_my.config(text=f"{MONTHS[m - 1]} {y}")
+
                 first_wd, n_days = _cal.monthrange(y, m)
+
                 for i, b in enumerate(day_btns):
                     dn2 = i - first_wd + 1
                     col = i % 7
+
                     if 1 <= dn2 <= n_days:
-                        sel = (dn2 == d)
-                        b.config(text=str(dn2), state=tk.NORMAL,
-                                 bg=COLOR_BLUE if sel else "SystemButtonFace",
-                                 fg="white" if sel else (COLOR_RED if col >= 5 else "black"),
-                                 relief=tk.SOLID if sel else tk.FLAT)
+                        selected = dn2 == d
+                        b.config(
+                            text=str(dn2),
+                            state=tk.NORMAL,
+                            bg=COLOR_BLUE if selected else "SystemButtonFace",
+                            fg="white" if selected else (COLOR_RED if col >= 5 else "black"),
+                            relief=tk.SOLID if selected else tk.FLAT
+                        )
                     else:
-                        b.config(text="", state=tk.DISABLED,
-                                 bg="SystemButtonFace", relief=tk.FLAT)
+                        b.config(
+                            text="",
+                            state=tk.DISABLED,
+                            bg="SystemButtonFace",
+                            relief=tk.FLAT
+                        )
+
+                _refresh_status()
 
             def _on_day(r, c):
-                import calendar as _cal2
                 y, m = year_var.get(), month_var.get()
-                first_wd, n_days = _cal2.monthrange(y, m)
-                dn2 = r*7 + c - first_wd + 1
+                first_wd, n_days = _cal.monthrange(y, m)
+                dn2 = r * 7 + c - first_wd + 1
+
                 if 1 <= dn2 <= n_days:
-                    day_var.set(dn2); _draw()
+                    day_var.set(dn2)
+                    _draw()
 
             def _shift_month(delta):
-                import calendar as _cal2
                 y, m = year_var.get(), month_var.get()
                 m += delta
-                if m < 1:   m = 12; y -= 1
-                elif m > 12: m = 1;  y += 1
-                year_var.set(y); month_var.set(m)
-                _, n = _cal2.monthrange(y, m)
-                if day_var.get() > n: day_var.set(n)
+
+                if m < 1:
+                    m = 12
+                    y -= 1
+                elif m > 12:
+                    m = 1
+                    y += 1
+
+                year_var.set(y)
+                month_var.set(m)
+
+                _, n_days = _cal.monthrange(y, m)
+                if day_var.get() > n_days:
+                    day_var.set(n_days)
+
                 _draw()
 
             def _shift_year(delta):
-                import calendar as _cal2
-                year_var.set(year_var.get() + delta)
-                _, n = _cal2.monthrange(year_var.get(), month_var.get())
-                if day_var.get() > n: day_var.set(n)
+                y = year_var.get() + delta
+                m = month_var.get()
+
+                year_var.set(y)
+
+                _, n_days = _cal.monthrange(y, m)
+                if day_var.get() > n_days:
+                    day_var.set(n_days)
+
                 _draw()
+
+            def _set_now():
+                now = datetime.now()
+                year_var.set(now.year)
+                month_var.set(now.month)
+                day_var.set(now.day)
+                hour_var.set(f"{now.hour:02d}")
+                min_var.set(f"{now.minute:02d}")
+                sec_var.set(f"{now.second:02d}")
+                _draw()
+
+            quick_row = tk.Frame(frm)
+            quick_row.pack(padx=8, pady=(0, 8))
+
+            tk.Button(quick_row, text="Now", command=_set_now).pack(side=tk.LEFT, padx=3)
+            tk.Button(quick_row, text="00:00", command=lambda: [hour_var.set("00"), min_var.set("00"), sec_var.set("00")]).pack(side=tk.LEFT, padx=3)
+            tk.Button(quick_row, text="12:00", command=lambda: [hour_var.set("12"), min_var.set("00"), sec_var.set("00")]).pack(side=tk.LEFT, padx=3)
 
             _draw()
 
-            # --- time spinboxes ---
-            tf = tk.Frame(frm)
-            tf.pack(padx=4, pady=(4, 4))
-            tk.Label(tf, text="HH", font=FONT_NORMAL).grid(row=0, column=0)
-            tk.Label(tf, text="MM", font=FONT_NORMAL).grid(row=0, column=2)
-            tk.Label(tf, text="SS", font=FONT_NORMAL).grid(row=0, column=4)
-            tk.Spinbox(tf, textvariable=hour_var, from_=0, to=23, width=3,
-                       font=FONT_MONO, format="%02.0f").grid(row=0, column=1)
-            tk.Label(tf, text=":", font=FONT_NORMAL).grid(row=0, column=1, sticky=tk.E, padx=(0,1))
-            tk.Spinbox(tf, textvariable=min_var, from_=0, to=59, width=3,
-                       font=FONT_MONO, format="%02.0f").grid(row=0, column=3)
-            tk.Label(tf, text=":", font=FONT_NORMAL).grid(row=0, column=3, sticky=tk.E, padx=(0,1))
-            tk.Spinbox(tf, textvariable=sec_var, from_=0, to=59, width=3,
-                       font=FONT_MONO, format="%02.0f").grid(row=0, column=5)
-
-            def get_dt():
-                try:
-                    h = int(hour_var.get().strip() or "0")
-                    m = int(min_var.get().strip()  or "0")
-                    s = int(sec_var.get().strip()  or "0")
-                except ValueError:
-                    h, m, s = 0, 0, 0
-                return datetime(year_var.get(), month_var.get(), day_var.get(),
-                                max(0,min(23,h)), max(0,min(59,m)), max(0,min(59,s)))
-
             return frm, get_dt
 
-        def _make_rel_frame(parent, which: str, lbl_status: tk.Label):
-            """Relative tab: spinboxes + presets + Before checkbox + Now button."""
+        def _make_rel_frame(parent, status_var: tk.StringVar):
             frm = tk.Frame(parent)
-            result_dt = [None]
 
-            def _vi(sv):
-                return sv == "" or sv.isdigit()
-            vcmd = (frm.register(_vi), "%P")
+            def _valid_number(s):
+                return s == "" or s.isdigit()
 
-            sp_frm = tk.Frame(frm)
-            sp_frm.pack(fill=tk.X, padx=6, pady=(6, 4))
+            vcmd = (frm.register(_valid_number), "%P")
 
-            y_var = tk.StringVar(value="0")
-            mo_var = tk.StringVar(value="0")
-            d_var  = tk.StringVar(value="0")
-            h_var  = tk.StringVar(value="0")
-            m_var  = tk.StringVar(value="0")
-            s_var  = tk.StringVar(value="0")
+            fields_frame = tk.Frame(frm)
+            fields_frame.pack(fill=tk.X, padx=10, pady=(12, 8))
+
+            years_var = tk.StringVar(value="0")
+            months_var = tk.StringVar(value="0")
+            days_var = tk.StringVar(value="0")
+            hours_var = tk.StringVar(value="0")
+            minutes_var = tk.StringVar(value="0")
+            seconds_var = tk.StringVar(value="0")
 
             fields = [
-                ("Years",   y_var),
-                ("Months",  mo_var),
-                ("Days",    d_var),
-                ("Hours",   h_var),
-                ("Minutes", m_var),
-                ("Secs",    s_var),
+                ("Years:", years_var, 0, 0),
+                ("Months:", months_var, 1, 0),
+                ("Days:", days_var, 2, 0),
+                ("Hours:", hours_var, 0, 2),
+                ("Minutes:", minutes_var, 1, 2),
+                ("Secs:", seconds_var, 2, 2),
             ]
-            for col, (lbl_txt, var) in enumerate(fields):
-                tk.Label(sp_frm, text=lbl_txt, font=FONT_NORMAL).grid(row=0, column=col*2, padx=(4,0))
-                tk.Spinbox(sp_frm, textvariable=var, from_=0, to=9999, width=4,
-                           font=FONT_MONO, validate="key", validatecommand=vcmd,
-                           format="%g").grid(row=0, column=col*2+1, padx=(2,4))
 
-            def _compute_dt():
-                try:
-                    total_sec = (int(y_var.get() or 0)*365*86400
-                                 + int(mo_var.get() or 0)*30*86400
-                                 + int(d_var.get() or 0)*86400
-                                 + int(h_var.get() or 0)*3600
-                                 + int(m_var.get() or 0)*60
-                                 + int(s_var.get() or 0))
-                except ValueError:
-                    return None
-                now = datetime.now()
-                before = before_var.get()
-                if which == "from":
-                    return now - timedelta(seconds=total_sec) if before else now + timedelta(seconds=total_sec)
-                else:
-                    return now - timedelta(seconds=total_sec) if before else now + timedelta(seconds=total_sec)
+            for label, var, row, col in fields:
+                tk.Label(fields_frame, text=label, font=FONT_NORMAL).grid(
+                    row=row, column=col, sticky=tk.W, padx=(0, 4), pady=3
+                )
+                tk.Spinbox(
+                    fields_frame,
+                    textvariable=var,
+                    from_=0,
+                    to=9999,
+                    width=6,
+                    font=FONT_MONO,
+                    validate="key",
+                    validatecommand=vcmd,
+                    command=lambda: _refresh_status()
+                ).grid(row=row, column=col + 1, sticky=tk.W, pady=3)
 
-            def _refresh_status(*_):
-                dt = _compute_dt()
-                result_dt[0] = dt
-                if dt:
-                    lbl_status.config(text=dt.strftime("%Y-%m-%d %H:%M:%S"))
+                var.trace_add("write", lambda *_: _refresh_status())
 
-            for _, var in fields:
-                var.trace_add("write", _refresh_status)
-
-            # Preset buttons
-            preset_frm = tk.Frame(frm)
-            preset_frm.pack(fill=tk.X, padx=6, pady=(2, 4))
-            PRESETS = [
-                ("12 h",   dict(h="12")),
-                ("1 Day",  dict(d="1")),
-                ("3 Days", dict(d="3")),
-                ("7 Days", dict(d="7")),
-            ]
-            def _apply_preset_rel(kw):
-                for var in (y_var, mo_var, d_var, h_var, m_var, s_var):
-                    var.set("0")
-                if "h" in kw:  h_var.set(kw["h"])
-                if "d" in kw:  d_var.set(kw["d"])
-
-            for i, (lbl_txt, kw) in enumerate(PRESETS):
-                tk.Button(preset_frm, text=lbl_txt, font=FONT_NORMAL, padx=4,
-                          command=lambda kw=kw: _apply_preset_rel(kw)
-                          ).grid(row=0, column=i, padx=2, sticky=tk.EW)
-            for i in range(len(PRESETS)):
-                preset_frm.columnconfigure(i, weight=1)
-
-            # Before checkbox + Now button
-            bot_frm = tk.Frame(frm)
-            bot_frm.pack(fill=tk.X, padx=6, pady=(0, 4))
             before_var = tk.BooleanVar(value=True)
-            tk.Checkbutton(bot_frm, text="Before...", variable=before_var,
-                           font=FONT_NORMAL, command=_refresh_status).pack(side=tk.LEFT)
-            tk.Button(bot_frm, text="Now", font=FONT_NORMAL, padx=6,
-                      command=lambda: [var.set("0") for var in (y_var, mo_var, d_var, h_var, m_var, s_var)]
-                      ).pack(side=tk.RIGHT)
+
+            def _int(var: tk.StringVar) -> int:
+                try:
+                    return int(var.get().strip() or "0")
+                except ValueError:
+                    return 0
+
+            def get_dt():
+                total_seconds = (
+                    _int(years_var) * 365 * 86400
+                    + _int(months_var) * 30 * 86400
+                    + _int(days_var) * 86400
+                    + _int(hours_var) * 3600
+                    + _int(minutes_var) * 60
+                    + _int(seconds_var)
+                )
+
+                now = datetime.now()
+                if before_var.get():
+                    return now - timedelta(seconds=total_seconds)
+                return now + timedelta(seconds=total_seconds)
+
+            def _refresh_status():
+                try:
+                    status_var.set(get_dt().strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    status_var.set("Invalid relative time")
+
+            preset_row = tk.Frame(frm)
+            preset_row.pack(fill=tk.X, padx=10, pady=(8, 8))
+
+            def _set_relative(hours=0, days=0):
+                years_var.set("0")
+                months_var.set("0")
+                days_var.set(str(days))
+                hours_var.set(str(hours))
+                minutes_var.set("0")
+                seconds_var.set("0")
+                before_var.set(True)
+                _refresh_status()
+
+            tk.Button(preset_row, text="12 h", command=lambda: _set_relative(hours=12)).pack(side=tk.LEFT, padx=3)
+            tk.Button(preset_row, text="1 Day", command=lambda: _set_relative(days=1)).pack(side=tk.LEFT, padx=3)
+            tk.Button(preset_row, text="7 Days", command=lambda: _set_relative(days=7)).pack(side=tk.LEFT, padx=3)
+            tk.Button(preset_row, text="7 Days", command=lambda: _set_relative(days=7)).pack(side=tk.LEFT, padx=3)
+
+            bottom_row = tk.Frame(frm)
+            bottom_row.pack(fill=tk.X, padx=10, pady=(6, 8))
+
+            tk.Checkbutton(
+                bottom_row,
+                text="Before now",
+                variable=before_var,
+                font=FONT_NORMAL,
+                command=_refresh_status
+            ).pack(side=tk.LEFT)
+
+            tk.Button(bottom_row, text="Now", command=lambda: _set_relative()).pack(side=tk.RIGHT)
 
             _refresh_status()
 
-            def get_dt():
-                return result_dt[0]
+            return frm, get_dt
 
-            return frm, get_dt, None
-
-        # ── layout ─────────────────────────────────────────────────────────────
         outer = tk.Frame(dlg)
-        outer.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        outer.pack(fill=tk.BOTH, expand=True, padx=20, pady=16)
 
         get_from_dt = [lambda: self._dt_from]
-        get_to_dt   = [lambda: self._dt_to]
+        get_to_dt = [lambda: self._dt_to]
 
-        for col, (which, label, init_dt) in enumerate([
-                ("from", "Absolute Start   Relative Start", self._dt_from),
-                ("to",   "Absolute End   Relative End",     self._dt_to),
+        for col, (which, title, init_dt) in enumerate([
+            ("from", "START TIME", self._dt_from),
+            ("to", "END TIME", self._dt_to),
         ]):
-            col_frm = tk.LabelFrame(outer, font=FONT_NORMAL, padx=4, pady=4)
-            col_frm.grid(row=0, column=col, sticky=tk.NSEW,
-                         padx=(0, 6) if col == 0 else (0, 0))
+            col_frame = tk.LabelFrame(
+                outer,
+                text=title,
+                font=FONT_HEADER,
+                fg=COLOR_BLUE,
+                padx=10,
+                pady=10
+            )
+            col_frame.grid(row=0, column=col, sticky=tk.NSEW, padx=(0, 20) if col == 0 else (0, 0))
 
-            nb = ttk.Notebook(col_frm)
+            nb = ttk.Notebook(col_frame)
             nb.pack(fill=tk.BOTH, expand=True)
 
             abs_tab = tk.Frame(nb)
             rel_tab = tk.Frame(nb)
+
             nb.add(abs_tab, text="  Absolute  ")
             nb.add(rel_tab, text="  Relative  ")
 
-            # Status label shared between tabs — shows resolved datetime
-            lbl_status_var = tk.StringVar(value="")
-            lbl_status = tk.Label(col_frm, textvariable=lbl_status_var,
-                                  font=FONT_NORMAL, fg=COLOR_BLUE, anchor=tk.W)
-            lbl_status.pack(fill=tk.X, padx=4, pady=(2, 0))
+            status_row = tk.Frame(col_frame)
+            status_row.pack(fill=tk.X, pady=(8, 0))
 
-            abs_frm, get_abs_dt = _make_abs_frame(abs_tab, init_dt)
+            tk.Label(
+                status_row,
+                text="Selected:",
+                font=FONT_NORMAL,
+                fg=COLOR_GRAY
+            ).pack(side=tk.LEFT, padx=(0, 6))
+
+            status_var = tk.StringVar(value=init_dt.strftime("%Y-%m-%d %H:%M:%S"))
+
+            tk.Label(
+                status_row,
+                textvariable=status_var,
+                font=FONT_MONO,
+                fg="black",
+                bg="white",
+                relief=tk.SUNKEN,
+                padx=6,
+                pady=3,
+                width=22,
+                anchor=tk.W
+            ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            abs_frm, get_abs_dt = _make_abs_frame(abs_tab, init_dt, status_var)
             abs_frm.pack(fill=tk.BOTH, expand=True)
 
-            rel_frm, get_rel_dt, _ = _make_rel_frame(rel_tab, which, lbl_status)
+            rel_frm, get_rel_dt = _make_rel_frame(rel_tab, status_var)
             rel_frm.pack(fill=tk.BOTH, expand=True)
 
-            # Update status label when abs tab fields change via focus
-            def _update_abs_status(nb_ref=nb, get_abs=get_abs_dt, lbl=lbl_status_var):
-                if nb_ref.index(nb_ref.select()) == 0:
-                    try:
-                        lbl.set(get_abs().strftime("%Y-%m-%d %H:%M:%S"))
-                    except Exception:
-                        pass
-            abs_tab.bind("<FocusOut>", lambda _e, f=_update_abs_status: f())
-            nb.bind("<<NotebookTabChanged>>", lambda _e, f=_update_abs_status: f())
-
-            def _make_getter(nb_ref, get_abs, get_rel, fallback):
+            def _make_getter(nb_ref, get_abs, get_rel):
                 def _get():
                     if nb_ref.index(nb_ref.select()) == 0:
                         return get_abs()
-                    else:
-                        v = get_rel()
-                        return v if v is not None else fallback
+                    return get_rel()
                 return _get
-            getter = _make_getter(nb, get_abs_dt, get_rel_dt,
-                                  self._dt_from if which == "from" else self._dt_to)
 
             if which == "from":
-                get_from_dt[0] = getter
+                get_from_dt[0] = _make_getter(nb, get_abs_dt, get_rel_dt)
             else:
-                get_to_dt[0]   = getter
+                get_to_dt[0] = _make_getter(nb, get_abs_dt, get_rel_dt)
 
         outer.columnconfigure(0, weight=1)
         outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
 
-        # ── OK / Cancel ────────────────────────────────────────────────────────
-        result = [False]
+        button_row = tk.Frame(dlg)
+        button_row.pack(fill=tk.X, padx=20, pady=(0, 16))
 
         def _ok():
-            result[0] = True
+            try:
+                new_from = get_from_dt[0]()
+                new_to = get_to_dt[0]()
+            except Exception as e:
+                messagebox.showerror("Invalid time", str(e), parent=dlg)
+                return
+
+            if new_to <= new_from:
+                messagebox.showerror("Invalid range", "END TIME must be later than START TIME.", parent=dlg)
+                return
+
+            self._dt_from = new_from
+            self._dt_to = new_to
+
+            self._refresh_time_info_labels()
+
+            self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
+            self.config["time_to"] = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
+            save_config(self.config)
+
+            self.lbl_status.config(
+                text=f"Time window set: {self._dt_from:%Y-%m-%d %H:%M:%S} -> {self._dt_to:%Y-%m-%d %H:%M:%S}",
+                fg=COLOR_BLUE
+            )
+
             dlg.destroy()
 
-        btn_row = tk.Frame(dlg)
-        btn_row.pack(fill=tk.X, padx=10, pady=(4, 10))
-        tk.Button(btn_row, text="Cancel", relief=tk.RAISED, padx=10,
-                  command=dlg.destroy).pack(side=tk.RIGHT)
-        tk.Button(btn_row, text="OK", relief=tk.RAISED, padx=14,
-                  bg=COLOR_BLUE, fg="white", command=_ok).pack(side=tk.RIGHT, padx=(0, 6))
+        tk.Button(
+            button_row,
+            text="Cancel",
+            relief=tk.RAISED,
+            padx=16,
+            pady=4,
+            command=dlg.destroy
+        ).pack(side=tk.RIGHT)
+
+        tk.Button(
+            button_row,
+            text="OK",
+            relief=tk.RAISED,
+            padx=22,
+            pady=4,
+            bg=COLOR_BLUE,
+            fg="white",
+            command=_ok
+        ).pack(side=tk.RIGHT, padx=(0, 8))
 
         dlg.update_idletasks()
-        dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
-        sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
-        dlg.geometry(f"+{(sw-dw)//2}+{(sh-dh)//2}")
-
-        dlg.wait_window()
-        if not result[0]:
-            return
-
-        try:
-            new_from = get_from_dt[0]()
-            new_to   = get_to_dt[0]()
-        except Exception:
-            return
-        if new_from is None or new_to is None:
-            messagebox.showerror("Invalid date", "Could not determine time range.", parent=None)
-            return
-        self._dt_from = new_from
-        self._dt_to   = new_to
-        self._refresh_time_info_labels()
-        self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
-        self.config["time_to"]   = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
-        save_config(self.config)
+        sw = dlg.winfo_screenwidth()
+        sh = dlg.winfo_screenheight()
+        win_w = 920
+        win_h = 540
+        dlg.geometry(f"{win_w}x{win_h}+{(sw - win_w) // 2}+{(sh - win_h) // 2}")
 
     # -------------------------------------------------------------------------
     # Time window controls
