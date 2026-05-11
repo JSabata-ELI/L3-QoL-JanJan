@@ -1,0 +1,28 @@
+# --- Build output ---
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.pyz
+*.pkg
+*.toc
+*.spec
+*.zip
+*.exe
+
+# --- Lokální stav Dev Tools (každý má svůj) ---
+Dev Tools/build_usage.json
+Dev Tools/copy_manager_state.ini
+
+# --- Testovací / lokální data ---
+Counter of shots/data/
+Time Converter/test_data/
+
+# --- IDE ---
+.vscode/
+.venv/
+
+# --- Windows ---
+desktop.ini
+Thumbs.db
