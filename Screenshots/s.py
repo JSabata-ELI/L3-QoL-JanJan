@@ -627,6 +627,15 @@ PW_RENDERFULLCONTENT = 0x00000002
 user32.PrintWindow.argtypes = [ctypes.c_void_p, wintypes.HDC, wintypes.UINT]
 user32.PrintWindow.restype = wintypes.BOOL
 
+# DWM extended frame bounds — dá přesné viditelné hranice okna bez Win11 shadow
+_dwmapi = ctypes.WinDLL("dwmapi")
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+_dwmapi.DwmGetWindowAttribute.argtypes = [
+    ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(RECT), wintypes.DWORD,
+]
+_dwmapi.DwmGetWindowAttribute.restype = ctypes.HRESULT
+
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
@@ -708,18 +717,29 @@ def take_screenshot_window_png(dst_path: Path, hwnd: int):
 
     h_hwnd = ctypes.c_void_p(int(hwnd) & 0xFFFFFFFFFFFFFFFF)
 
-    # Použij GetClientRect + ClientToScreen → zachytí jen klientský obsah bez rámečku
-    client_rect = RECT()
-    user32.GetClientRect(h_hwnd, ctypes.byref(client_rect))
-    w = max(1, client_rect.right - client_rect.left)
-    h = max(1, client_rect.bottom - client_rect.top)
+    # GetWindowRect → celé okno včetně Win11 shadow (použijeme pro bitmap)
+    win_rect = RECT()
+    user32.GetWindowRect(h_hwnd, ctypes.byref(win_rect))
+    bmp_w = max(1, win_rect.right  - win_rect.left)
+    bmp_h = max(1, win_rect.bottom - win_rect.top)
 
-    # Získej pozici klientské oblasti v screen coords
-    class POINT(ctypes.Structure):
-        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
-    pt = POINT(0, 0)
-    user32.ClientToScreen(h_hwnd, ctypes.byref(pt))
-    # w, h jsou rozměry klientské oblasti — použijeme je pro bitmap
+    # DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) → přesné viditelné hranice
+    # bez Win11 průhledného shadow okraje; souřadnice jsou absolutní screen coords
+    frame_rect = RECT()
+    hr = _dwmapi.DwmGetWindowAttribute(
+        h_hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+        ctypes.byref(frame_rect), ctypes.sizeof(RECT),
+    )
+    if hr == 0:
+        # Ořez relativně vůči GetWindowRect (levý horní roh = 0,0 bitmapy)
+        crop = (
+            frame_rect.left  - win_rect.left,
+            frame_rect.top   - win_rect.top,
+            frame_rect.right - win_rect.left,
+            frame_rect.bottom - win_rect.top,
+        )
+    else:
+        crop = None  # DWM selhal — použijeme celý bitmap
 
     hdc_window = user32.GetDC(h_hwnd)
     if not hdc_window:
@@ -728,7 +748,7 @@ def take_screenshot_window_png(dst_path: Path, hwnd: int):
         hdc_mem = gdi32.CreateCompatibleDC(hdc_window)
         if not hdc_mem:
             raise RuntimeError("CreateCompatibleDC failed.")
-        hbmp = gdi32.CreateCompatibleBitmap(hdc_window, w, h)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_window, bmp_w, bmp_h)
         if not hbmp:
             gdi32.DeleteDC(hdc_mem)
             raise RuntimeError("CreateCompatibleBitmap failed.")
@@ -741,16 +761,18 @@ def take_screenshot_window_png(dst_path: Path, hwnd: int):
                     raise RuntimeError("PrintWindow failed (window may be protected/offscreen).")
             bmi = BITMAPINFO()
             bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bmi.bmiHeader.biWidth = w
-            bmi.bmiHeader.biHeight = -h
+            bmi.bmiHeader.biWidth = bmp_w
+            bmi.bmiHeader.biHeight = -bmp_h
             bmi.bmiHeader.biPlanes = 1
             bmi.bmiHeader.biBitCount = 32
             bmi.bmiHeader.biCompression = BI_RGB
-            buf = ctypes.create_string_buffer(w * h * 4)
-            bits = gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bmi), 0)
+            buf = ctypes.create_string_buffer(bmp_w * bmp_h * 4)
+            bits = gdi32.GetDIBits(hdc_mem, hbmp, 0, bmp_h, buf, ctypes.byref(bmi), 0)
             if bits == 0:
                 raise RuntimeError("GetDIBits failed.")
-            img = Image.frombuffer("RGBA", (w, h), buf, "raw", "BGRA", 0, 1)
+            img = Image.frombuffer("RGBA", (bmp_w, bmp_h), buf, "raw", "BGRA", 0, 1)
+            if crop:
+                img = img.crop(crop)
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             img.save(dst_path, "PNG")
         finally:
