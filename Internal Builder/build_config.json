@@ -1,0 +1,12 @@
+{
+    "collect_all": ["PIL"],
+    "hidden_imports": [
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageGrab",
+        "PIL._imaging",
+        "PIL.ImageDraw",
+        "PIL.ImageFont",
+        "PIL.ImageTk"
+    ]
+}
