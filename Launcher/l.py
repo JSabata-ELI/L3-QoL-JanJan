@@ -180,6 +180,7 @@ SCRIPTS = {
     "Time Converter",
     "Dev Tools",
     "Announcer",
+    "CSS Logger",
 }
 
 PARTS = {
@@ -817,7 +818,7 @@ class Launcher(tk.Tk):
     # -------- version update polling --------
 
     def _schedule_version_poll(self):
-        self.after(5000, self._poll_versions)
+        self.after(10000, self._poll_versions)
 
     def _poll_versions(self):
         if not self.programs or not self.current_root_path:
