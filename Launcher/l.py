@@ -703,6 +703,10 @@ class Launcher(tk.Tk):
         # layout: each group is its own LabelFrame, inside is a grid
         cols = self._calc_group_cols()
 
+        # Persistent collapse state: gkey → bool (True = expanded)
+        if not hasattr(self, "_group_expanded"):
+            self._group_expanded: dict[str, bool] = {}
+
         any_group_shown = False
         for title, gkey in GROUP_ORDER:
             group_items = grouped.get(gkey, [])
@@ -710,10 +714,31 @@ class Launcher(tk.Tk):
                 continue
 
             any_group_shown = True
-            section = ttk.LabelFrame(self.sf.inner, text=f"{title}")
-            section.pack(fill="x", padx=6, pady=(6, 0))
 
-            grid = ttk.Frame(section)
+            # Default: Scripts expanded, everything else collapsed
+            if gkey not in self._group_expanded:
+                self._group_expanded[gkey] = (gkey == "scripts")
+
+            expanded = self._group_expanded[gkey]
+            arrow = "▼" if expanded else "▶"
+
+            header = ttk.Frame(self.sf.inner)
+            header.pack(fill="x", padx=6, pady=(6, 0))
+
+            toggle_btn = ttk.Button(
+                header,
+                text=f"{arrow}  {title}  ({len(group_items)})",
+                style="Info.TButton",
+                command=lambda k=gkey: self._toggle_group(k),
+            )
+            toggle_btn.pack(side="left")
+
+            if not expanded:
+                continue
+
+            grid_frame = ttk.Frame(self.sf.inner)
+            grid_frame.pack(fill="x", padx=6, pady=(2, 0))
+            grid = ttk.Frame(grid_frame)
             grid.pack(fill="x", padx=8, pady=6)
 
             for i, (name, info) in enumerate(group_items):
@@ -808,6 +833,10 @@ class Launcher(tk.Tk):
 
         if not any_group_shown:
             ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
+
+    def _toggle_group(self, gkey: str):
+        self._group_expanded[gkey] = not self._group_expanded.get(gkey, False)
+        self._rebuild_buttons()
 
     def _rebuild_radiobuttons(self):
         for i, (label, path, configurable) in enumerate(self._root_options):
