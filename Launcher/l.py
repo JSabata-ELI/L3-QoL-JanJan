@@ -316,21 +316,8 @@ def ui_label(s: str) -> str:
     return " ".join(s.replace("_", " ").split())
 
 def find_icon_for_program(program_dir: Path, exe_path: Path) -> Path | None:
-    """
-    Preferuj:
-      1) icon.png vedle exe
-      2) icon.png v program root složce
-      3) icon.gif (fallback pro Tk)
-    """
-    for name in ("icon.png", "Icon.png", "ICON.png", "icon.gif", "Icon.gif", "icon.ico", "Icon.ico"):
-        p = exe_path.parent / name
-        if p.exists():
-            return p
-    for name in ("icon.png", "Icon.png", "ICON.png", "icon.gif", "Icon.gif", "icon.ico", "Icon.ico"):
-        p = program_dir / name
-        if p.exists():
-            return p
-    return None
+    ico = exe_path.parent / "icon.ico"
+    return ico if ico.exists() else None
 
 def clamp_label(text: str, max_len: int = 22) -> str:
     if len(text) <= max_len:
@@ -756,14 +743,21 @@ class Launcher(tk.Tk):
                     key = str(ip)
                     if key not in self._icon_cache:
                         try:
-                            if key.lower().endswith(".ico"):
-                                from PIL import Image, ImageTk
-                                img = Image.open(key)
-                                img = img.resize((24, 24), Image.LANCZOS)
-                                self._icon_cache[key] = ImageTk.PhotoImage(img)
-                            else:
-                                self._icon_cache[key] = tk.PhotoImage(file=key)
-                        except Exception:
+                            from PIL import Image, ImageTk
+                            pil_img = Image.open(key)
+                            # For ICO, PIL loads smallest frame by default.
+                            # Re-open at best size ≤ 32px for a clean result.
+                            if getattr(pil_img, "format", "") == "ICO":
+                                sizes = pil_img.info.get("sizes", [])
+                                if sizes:
+                                    candidates = [s for s in sizes if s[0] <= 32]
+                                    target = max(candidates) if candidates else min(sizes, key=lambda s: s[0])
+                                    pil_img = Image.open(key)
+                                    pil_img = pil_img.resize(target, Image.LANCZOS)
+                            pil_img = pil_img.convert("RGBA").resize((24, 24), Image.LANCZOS)
+                            self._icon_cache[key] = ImageTk.PhotoImage(pil_img)
+                        except Exception as _icon_exc:
+                            print(f"Icon load failed ({key}): {_icon_exc}")
                             self._icon_cache[key] = None
                     img = self._icon_cache.get(key)
 
