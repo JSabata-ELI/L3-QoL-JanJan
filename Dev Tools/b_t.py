@@ -17,6 +17,58 @@ APP_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = APP_DIR / "builder_settings.json"
 USAGE_LOG = APP_DIR / "build_usage.json"
 
+# ----------------- USER CONFIG (shared with cm_t.py) -----------------
+_CONFIG_PATH = Path(os.environ.get("APPDATA", "~")) / "DevTools" / "config.json"
+
+def _load_devtools_config() -> dict:
+    try:
+        if _CONFIG_PATH.exists():
+            return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_devtools_config(data: dict):
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _versions_txt_path() -> Path | None:
+    cfg = _load_devtools_config()
+    scratch = cfg.get("scratch")
+    if scratch:
+        return Path(scratch) / "Versions.txt"
+    return None
+
+def read_versions_txt() -> dict[str, str]:
+    p = _versions_txt_path()
+    if not p or not p.exists():
+        return {}
+    result = {}
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                name, _, ver = line.partition("=")
+                result[name.strip()] = ver.strip()
+    except Exception:
+        pass
+    return result
+
+def write_version_to_txt(program_name: str, version: str):
+    p = _versions_txt_path()
+    if not p:
+        return
+    versions = read_versions_txt()
+    versions[program_name] = f"v{version}" if not version.startswith("v") else version
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f"{k} = {v}" for k, v in sorted(versions.items())]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception as e:
+        print(f"Warning: could not write Versions.txt: {e}")
+
 # ----------------- RELATED TOOLS -----------------
 BUILDER_DIR = APP_DIR
 # APP_DIR = L3-QoL-JanJan/Dev Tools/  →  parent = L3-QoL-JanJan/ (git source root)
@@ -193,6 +245,14 @@ class BuilderUI(ttk.Frame):
         return out
 
     def last_version_from_dist(self, project_name: str):
+        # Primary: read from Versions.txt on scratch
+        versions = read_versions_txt()
+        if project_name in versions:
+            ver = versions[project_name].lstrip("v")
+            if parse_version_tuple(ver):
+                return ver, False
+
+        # Fallback: scan dist folder
         base = self.dist_root / project_name
         if not base.exists():
             return None, True
@@ -248,6 +308,7 @@ class BuilderUI(ttk.Frame):
         entry.pack(side="left", fill="x", expand=True)
 
         ttk.Button(top_row, text="Change…", command=self._change_root).pack(side="left", padx=(8, 0))
+        ttk.Button(top_row, text="⚙ Set paths", command=self._open_set_paths).pack(side="left", padx=(8, 0))
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True, pady=(10, 0))
@@ -437,6 +498,53 @@ class BuilderUI(ttk.Frame):
 
         save_json(SETTINGS_PATH, {"root_folder": str(self.root_folder)})
         self._reload_projects(select_first=True)
+
+    def _open_set_paths(self):
+        from tkinter import filedialog, messagebox
+        cfg = _load_devtools_config()
+
+        win = tk.Toplevel(self)
+        win.title("Set paths")
+        win.resizable(False, False)
+        win.grab_set()
+
+        ttk.Label(win, text="Configure shared paths for Dev Tools (Builder + Copy Manager).",
+                  padding=(12, 10)).pack()
+
+        fields = [
+            ("scratch",     "Scratch (Software) folder",    "e.g. Z:\\Software"),
+            ("sharepoint",  "Sharepoint (QoL) folder",      "e.g. C:\\...\\L3-HAPLS\\General\\QoL"),
+        ]
+
+        vars_ = {}
+        for key, label, hint in fields:
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=16, pady=4)
+            ttk.Label(row, text=label + ":", width=28, anchor="w").pack(side="left")
+            var = tk.StringVar(value=cfg.get(key, ""))
+            vars_[key] = var
+            ttk.Entry(row, textvariable=var, width=40, state="readonly").pack(side="left", padx=(4, 4))
+            ttk.Button(row, text="Browse…",
+                       command=lambda k=key, v=var: _browse(k, v)).pack(side="left")
+
+        def _browse(key, var):
+            cur = var.get() or str(Path.home())
+            chosen = filedialog.askdirectory(title=f"Select folder", initialdir=cur)
+            if chosen:
+                var.set(chosen)
+
+        def on_save():
+            for key, var in vars_.items():
+                val = var.get().strip()
+                if val:
+                    cfg[key] = val
+                else:
+                    cfg.pop(key, None)
+            _save_devtools_config(cfg)
+            win.destroy()
+            messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
+
+        ttk.Button(win, text="Save", command=on_save, padding=(16, 6)).pack(pady=(8, 12))
 
     def _reload_projects(self, select_first: bool):
         self.projects_all = self.find_projects(self.root_folder)
@@ -679,6 +787,9 @@ class BuilderUI(ttk.Frame):
             shutil.rmtree(workdir, ignore_errors=True)
         except Exception:
             pass
+
+        # Zapiš novou verzi do Versions.txt
+        write_version_to_txt(name, ver)
 
         # Logování
         self.usage.setdefault("events", []).append({"ts": time.time(), "project": p.name})
