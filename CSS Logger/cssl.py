@@ -2587,7 +2587,7 @@ class CPVAExplorerApp:
             tk.Button(preset_row, text="12 h", command=lambda: _set_relative(hours=12)).pack(side=tk.LEFT, padx=3)
             tk.Button(preset_row, text="1 Day", command=lambda: _set_relative(days=1)).pack(side=tk.LEFT, padx=3)
             tk.Button(preset_row, text="7 Days", command=lambda: _set_relative(days=7)).pack(side=tk.LEFT, padx=3)
-            tk.Button(preset_row, text="7 Days", command=lambda: _set_relative(days=7)).pack(side=tk.LEFT, padx=3)
+            tk.Button(preset_row, text="30 Days", command=lambda: _set_relative(days=30)).pack(side=tk.LEFT, padx=3)
 
             bottom_row = tk.Frame(frm)
             bottom_row.pack(fill=tk.X, padx=10, pady=(6, 8))
@@ -3182,6 +3182,15 @@ class CPVAExplorerApp:
         for pv in samples_by_pv:
             samples_by_pv[pv].sort(key=lambda s: s[0])
 
+        start_ns = dt_to_ns(self._dt_from)
+        end_ns = dt_to_ns(self._dt_to)
+
+        for pv in samples_by_pv:
+            samples_by_pv[pv] = [
+                (ts_ns, value, units)
+                for ts_ns, value, units in samples_by_pv[pv]
+                if start_ns <= ts_ns <= end_ns
+            ]
         # In live mode: keep previous data for PVs that returned empty results this tick
         # (prevents PVs from "disappearing" when they have no new samples in the window)
         if self._live_mode and self._samples_by_pv:
@@ -3195,7 +3204,15 @@ class CPVAExplorerApp:
             self._table_rows = self._merge_samples_sample_hold(samples_by_pv, pv_order)
         else:
             self._table_rows = self._merge_samples_into_rows(samples_by_pv, pv_order)
+        
+        start_ns = dt_to_ns(self._dt_from)
+        end_ns = dt_to_ns(self._dt_to)
 
+        self._table_rows = [
+            (ts_ns, row_dict)
+            for ts_ns, row_dict in self._table_rows
+            if start_ns <= ts_ns <= end_ns
+        ]
 
 
         self._populate_table(pv_order)
