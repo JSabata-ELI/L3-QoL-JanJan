@@ -758,7 +758,7 @@ class DeployGUI(ttk.Frame):
             return
 
         program_dirs = []
-        IGNORE = {"dist", "matlab", "icons", "internal builder", ".venv", ".vscode", "extractor"}
+        IGNORE = {"dist", "matlab", "icons", "internal builder", ".venv", ".vscode", "extractor", ".git"}
         for p in sorted(PROGRAMS_ROOT.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_dir():
                 continue
