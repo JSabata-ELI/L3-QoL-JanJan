@@ -81,17 +81,52 @@ def _archive_exe_label(p: Path) -> str:
         return f"{ver}  ({date}  {time_})"
     return p.stem
 
+def _find_versioned_py(version_dir: Path, exe_path: Path) -> Path | None:
+    """Najde hlavní .py soubor pro danou verzi (stejný název jako exe, nebo první nalezený s verzí)."""
+    py_stem = exe_path.stem  # e.g. "Image Tools v1.2.1__20260511_125840"
+    candidate = version_dir / (py_stem + ".py")
+    if candidate.exists():
+        return candidate
+    # Fallback: first .py file in the folder with version in name
+    for f in version_dir.glob("*.py"):
+        if ARCHIVE_EXE_RE.match(f.name.replace(".py", ".exe")):
+            return f
+    return None
+
+
 def scan_archive_versions(program_dir: Path) -> list[dict]:
-    """Vrátí seznam archivních verzí seřazených od nejnovější."""
+    """Vrátí seznam archivních verzí seřazených od nejnovější.
+    Podporuje novou strukturu archive/vX.Y.Z/*.exe i starou plochou archive/*.exe."""
     archive_dir = program_dir / "archive"
     if not archive_dir.exists():
         return []
-    exes = [p for p in archive_dir.glob("*.exe") if ARCHIVE_EXE_RE.match(p.name)]
-    exes.sort(key=_archive_exe_version, reverse=True)
-    return [
-        {"exe_path": p, "label": _archive_exe_label(p)}
-        for p in exes
-    ]
+
+    entries = []
+
+    # Nová struktura: archive/vX.Y.Z/*.exe
+    for version_subdir in archive_dir.iterdir():
+        if not version_subdir.is_dir():
+            continue
+        for exe in version_subdir.glob("*.exe"):
+            if ARCHIVE_EXE_RE.match(exe.name):
+                py_path = _find_versioned_py(version_subdir, exe)
+                entries.append({
+                    "exe_path": exe,
+                    "py_path": py_path,
+                    "label": _archive_exe_label(exe),
+                })
+
+    # Stará flat struktura: archive/*.exe (zpětná kompatibilita)
+    for exe in archive_dir.glob("*.exe"):
+        if ARCHIVE_EXE_RE.match(exe.name):
+            entries.append({
+                "exe_path": exe,
+                "py_path": None,
+                "label": _archive_exe_label(exe),
+            })
+
+    entries.sort(key=lambda e: _archive_exe_version(e["exe_path"]), reverse=True)
+    return entries
 
 README_PREFIX = "readme_"  # case-insensitive
 
@@ -815,7 +850,7 @@ class Launcher(tk.Tk):
                     for v in versions:
                         menu.add_command(
                             label=v["label"],
-                            command=lambda p=v["exe_path"], d=info["program_dir"]: self._launch_exe(p, d),
+                            command=lambda p=v["exe_path"], d=info["program_dir"], py=v.get("py_path"): self._launch_exe(p, d, py),
                         )
                     mb["menu"] = menu
                     mb.grid(row=1, column=1, sticky="ew")
@@ -924,26 +959,43 @@ class Launcher(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _launch_exe(self, exe_path: Path, program_dir: Path):
-        """Spustí konkrétní exe. Pokud je v archive/, přesune ho do hlavní složky."""
-        target = exe_path
-        if exe_path.parent.name.lower() == "archive":
-            target = program_dir / exe_path.name
-            if not target.exists():
-                try:
-                    exe_path.rename(target)
-                except Exception as e:
-                    messagebox.showerror("Move failed", f"Could not move file:\n{e}")
-                    return
+    def _launch_exe(self, exe_path: Path, program_dir: Path, py_path: Path | None = None):
+        """Spusti archivni verzi programu.
+        Preferuje .py soubor (nepotrebuje _internal/). Pokud neni, spusti .exe primo."""
+        import subprocess, sys
 
-        self.status.configure(text=f"Starting: {target.name} ...")
-        def worker():
-            try:
-                os.startfile(str(target))
-                self.after(0, self.status.configure, {"text": f"Started: {target.name}"})
-            except Exception as e:
-                self.after(0, messagebox.showerror, "Launch failed", f"{target.name}\n\n{e}")
-                self.after(0, self.status.configure, {"text": "Launch failed."})
+        # Determine what to run
+        if py_path is not None and py_path.exists():
+            launch_py = py_path
+            label = py_path.name
+            def worker():
+                try:
+                    pythonw = Path(sys.executable).parent / "pythonw.exe"
+                    if not pythonw.exists():
+                        pythonw = Path(sys.executable)
+                    subprocess.Popen(
+                        [str(pythonw), str(launch_py)],
+                        cwd=str(launch_py.parent),
+                    )
+                    self.after(0, self.status.configure, {"text": f"Started: {label}"})
+                except Exception as e:
+                    self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
+                    self.after(0, self.status.configure, {"text": "Launch failed."})
+        else:
+            # Fallback: try to run .exe directly (may fail without _internal/)
+            label = exe_path.name
+            def worker():
+                try:
+                    subprocess.Popen(
+                        [str(exe_path)],
+                        cwd=str(exe_path.parent),
+                    )
+                    self.after(0, self.status.configure, {"text": f"Started: {label}"})
+                except Exception as e:
+                    self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
+                    self.after(0, self.status.configure, {"text": "Launch failed."})
+
+        self.status.configure(text=f"Starting: {label} ...")
         threading.Thread(target=worker, daemon=True).start()
 
     def open_folder(self, program_name: str):
