@@ -118,17 +118,14 @@ def save_presets(presets: list[dict]) -> None:
 # CPVA API - HTTP
 # ---------------------------------------------------------------------------
 
-def _make_ssl_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    return ctx
+_SSL_CONTEXT = ssl.create_default_context()
+_SSL_CONTEXT.check_hostname = False
+_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 
 def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT):
-    ctx = _make_ssl_context()
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
         raw = resp.read().decode("utf-8")
     return json.loads(raw)
 
@@ -161,66 +158,75 @@ def _chunk_is_night(chunk_start_ns: int, chunk_end_ns: int) -> bool:
 
 
 def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
-                                timeout: float = CPVA_HTTP_TIMEOUT,
-                                log_fn=None) -> list[dict]:
-    """
-    Fetch samples in <=1 h chunks in parallel and concatenate results.
-    Night chunks (22:00-06:00 Prague time) are skipped entirely.
-    """
+                               timeout: float = CPVA_HTTP_TIMEOUT,
+                               log_fn=None,
+                               max_workers: int = 12) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    total_ns = end_ns - start_ns
-
-    # Build list of (chunk_index, chunk_start, chunk_end) skipping night chunks
     chunks = []
     cs = start_ns
-    chunk_idx = 0
+    i = 0
+
     while cs < end_ns:
         ce = min(cs + CHUNK_SIZE_NS, end_ns)
         if not _chunk_is_night(cs, ce):
-            chunks.append((chunk_idx, cs, ce))
-        chunk_idx += 1
+            chunks.append((i, cs, ce))
+        i += 1
         cs = ce
 
-    if log_fn and total_ns > CHUNK_SIZE_NS:
-        log_fn(f"      fetching {len(chunks)} chunk(s) (parallel, night chunks skipped)")
+    if not chunks:
+        return []
 
-    results_map: dict[int, list] = {}
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    if len(chunks) == 1:
+        return cpva_fetch_samples(channel, chunks[0][1], chunks[0][2], timeout)
+
+    if log_fn:
+        log_fn(f"      {channel}: {len(chunks)} chunks")
+
+    workers = min(max_workers, len(chunks))
+    results_map = {}
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(cpva_fetch_samples, channel, cs, ce, timeout): i
-            for i, cs, ce in chunks
+            ex.submit(cpva_fetch_samples, channel, cs, ce, timeout): idx
+            for idx, cs, ce in chunks
         }
-        for fut in as_completed(futures):
-            i = futures[fut]
-            results_map[i] = fut.result()
 
-    # Reassemble in original chunk order
-    results: list[dict] = []
-    for i in sorted(results_map):
-        results.extend(results_map[i])
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results_map[idx] = fut.result()
+
+    results = []
+    for idx in sorted(results_map):
+        results.extend(results_map[idx])
+
     return results
 
 
 def cpva_decode_value(sample: dict):
-    """Extract a usable value from a CPVA sample."""
     val = sample.get("value")
+
     if val is None:
         return None
-    if isinstance(val, (int, float)):
+
+    if isinstance(val, (int, float, str)):
         return val
+
     if isinstance(val, list):
-        # ASCII string?
-        if val and all(isinstance(x, int) and 0 <= x < 128 for x in val):
+        if len(val) == 1:
+            return val[0]
+
+        # ASCII decode zkoušej jen pro kratší listy
+        if len(val) <= 512 and val and all(isinstance(x, int) and 0 <= x < 128 for x in val):
             try:
-                decoded = "".join(chr(x) for x in val)
-                if decoded.strip() and all(c.isprintable() or c in "\t\n" for c in decoded):
+                decoded = "".join(map(chr, val))
+                if decoded.strip():
                     return decoded
             except Exception:
                 pass
-        if len(val) == 1:
-            return val[0]
+
         return val
+
     return val
 
 
@@ -776,6 +782,13 @@ class CPVAExplorerApp:
         self._mpl_figure = None
         self._span_selector    = None
         self._graph_axes       = []
+
+        # --- XY PLOT ---------------------------------------------------
+        self._xy_canvas = None
+        self._xy_figure = None
+        self._xy_x_var = tk.StringVar()
+        self._xy_y_var = tk.StringVar()
+
         self._graph_lines: list[list] = []   # outer list per PV, inner list: 1 or 2 Line2D objects
         self._graph_pvs:   list[str]  = []   # PV names corresponding to _graph_lines
         # Raw (times_num, values) per PV for cursor snapping — populated by _plot_graph/_update_graph_data
@@ -795,7 +808,11 @@ class CPVAExplorerApp:
 
         # Reference lines for graph
         self._ref_lines: list[dict] = []
-
+        # Conditions for filtering visible data
+        # each condition: {"pv": str, "min": float|None, "max": float|None}
+        self._conditions: list[dict] = []
+        self._table_rows_unfiltered: list = []
+        
         # Time state: two datetime objects
         now = datetime.now()
         cfg_from = parse_user_datetime(self.config.get("time_from", ""))
@@ -823,14 +840,17 @@ class CPVAExplorerApp:
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.tab_graph = tk.Frame(self.notebook)
+        self.tab_xy    = tk.Frame(self.notebook)
         self.tab_table = tk.Frame(self.notebook)
         self.tab_log   = tk.Frame(self.notebook)
 
         self.notebook.add(self.tab_graph, text="  Graph  ")
+        self.notebook.add(self.tab_xy,    text="  XY Plot  ")
         self.notebook.add(self.tab_table, text="  Table  ")
         self.notebook.add(self.tab_log,   text="  Log    ")
 
         self._build_graph_tab()
+        self._build_xy_tab()
         self._build_table_tab()
         self._build_log_tab()
 
@@ -1004,8 +1024,10 @@ class CPVAExplorerApp:
         # Reference lines button
         _btn(ctrl, "≡ Reference lines", self._open_ref_lines_dialog,
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 6))
+        _btn(ctrl, "Conditions", self._open_conditions_dialog,
+             padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 18))
 
-        tk.Label(ctrl, text="Font:", font=FONT_NORMAL).pack(side=tk.LEFT, padx=(8, 2))
+        tk.Label(ctrl, text="Font:", font=FONT_NORMAL).pack(side=tk.LEFT, padx=(18, 2))
         self._font_size_var = tk.StringVar(value="7")
         vcmd_fs = (ctrl.register(lambda s: s == "" or s.isdigit()), "%P")
         fs_entry = tk.Entry(ctrl, textvariable=self._font_size_var, width=3, font=FONT_MONO,
@@ -1036,11 +1058,98 @@ class CPVAExplorerApp:
                      text="matplotlib not installed.\nRun:  pip install matplotlib",
                      font=("Segoe UI", 12), fg=COLOR_RED, bg="#f5f5f5",
                      justify=tk.CENTER).grid(row=0, column=0)
+            
+    def _build_xy_tab(self):
+        tab = self.tab_xy
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        ctrl = tk.Frame(tab)
+        ctrl.grid(row=0, column=0, sticky=tk.EW, padx=8, pady=6)
+
+        tk.Label(ctrl, text="X axis:", font=FONT_NORMAL).pack(side=tk.LEFT, padx=(0, 4))
+        self.xy_x_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self._xy_x_var,
+            state="readonly",
+            font=FONT_NORMAL,
+            width=35
+        )
+        self.xy_x_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(ctrl, text="Y axis:", font=FONT_NORMAL).pack(side=tk.LEFT, padx=(0, 4))
+        self.xy_y_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self._xy_y_var,
+            state="readonly",
+            font=FONT_NORMAL,
+            width=35
+        )
+        self.xy_y_combo.pack(side=tk.LEFT, padx=(0, 12))
+
+        _btn(ctrl, "Plot XY", self._plot_xy,
+            bg=COLOR_GREEN, fg="white", padx=10, pady=4).pack(side=tk.LEFT)
+
+        _btn(ctrl, "Clean XY", self._clear_xy_plot,
+            padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
+
+        self.xy_container = tk.Frame(tab, bg="#f5f5f5")
+        self.xy_container.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=6)
+        self.xy_container.columnconfigure(0, weight=1)
+        self.xy_container.rowconfigure(0, weight=1)
+
+        self.lbl_xy_info = tk.Label(
+            tab,
+            text="Load data first, then choose X and Y variables.",
+            font=FONT_NORMAL,
+            fg=COLOR_GRAY,
+            anchor=tk.W
+        )
+        self.lbl_xy_info.grid(row=2, column=0, sticky=tk.EW, padx=8, pady=(0, 6))
+
+
+    def _refresh_xy_choices(self):
+        if not hasattr(self, "xy_x_combo"):
+            return
+
+        choices = []
+
+        for pv in self._pv_order:
+            has_numeric = False
+
+            for _ts_ns, row_dict in self._table_rows:
+                if pv in row_dict:
+                    value, _units = row_dict[pv]
+                    if isinstance(value, (int, float)):
+                        has_numeric = True
+                        break
+
+            if has_numeric:
+                choices.append(pv)
+
+        display_choices = [shorten_pv_name(pv) for pv in choices]
+
+        self._xy_choice_map = dict(zip(display_choices, choices))
+
+        self.xy_x_combo["values"] = display_choices
+        self.xy_y_combo["values"] = display_choices
+
+        if display_choices and self._xy_x_var.get() not in display_choices:
+            self._xy_x_var.set(display_choices[0])
+
+        if len(display_choices) >= 2 and self._xy_y_var.get() not in display_choices:
+            self._xy_y_var.set(display_choices[1])
+
 
     def _on_tab_changed(self, event=None):  # noqa: ARG002
-        if self.notebook.select() == str(self.tab_graph):
+        selected = self.notebook.select()
+
+        if selected == str(self.tab_graph):
             if self._samples_by_pv:
                 self._plot_graph()
+
+        elif selected == str(self.tab_xy):
+            self._refresh_xy_choices()
 
     def _reset_pv_ylim(self, pv: str):
         """Reset Y limits for a single PV to auto-scale."""
@@ -1189,9 +1298,26 @@ class CPVAExplorerApp:
         self._graph_raw   = []
         for i, (pv, ax) in enumerate(zip(numeric_pvs, axes)):
             # Use UTC-aware datetimes so matplotlib epoch math is always correct
-            times  = [datetime.fromtimestamp(ts / 1e9, tz=timezone.utc)
-                      for ts, v, _ in self._samples_by_pv[pv] if isinstance(v, (int, float))]
-            values = [v for _, v, _ in self._samples_by_pv[pv] if isinstance(v, (int, float))]
+            condition_ok_ts = self._condition_ok_timestamps()
+
+            pairs = []
+            for ts, v, _ in self._samples_by_pv[pv]:
+                if not isinstance(v, (int, float)):
+                    continue
+
+                if self._conditions and ts not in condition_ok_ts:
+                    pairs.append((ts, None))
+                else:
+                    pairs.append((ts, v))
+
+            MAX_GRAPH_POINTS = 25000
+
+            if len(pairs) > MAX_GRAPH_POINTS:
+                step = max(1, len(pairs) // MAX_GRAPH_POINTS)
+                pairs = pairs[::step]
+
+            times = [datetime.fromtimestamp(ts / 1e9, tz=timezone.utc) for ts, v in pairs]
+            values = [float("nan") if v is None else v for ts, v in pairs]
             all_times.extend(times)
             color  = colors[i % len(colors)]
             short  = shorten_pv_name(pv)
@@ -1825,6 +1951,235 @@ class CPVAExplorerApp:
         dw, dh = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
         sw, sh = dlg.winfo_screenwidth(), dlg.winfo_screenheight()
         dlg.geometry(f"+{(sw-dw)//2}+{(sh-dh)//2}")
+
+
+    def _condition_ok_timestamps(self) -> set[int]:
+        """Return timestamps of rows that satisfy active conditions."""
+        if not self._conditions:
+            return {ts_ns for ts_ns, _ in self._table_rows}
+
+        return {
+            ts_ns
+            for ts_ns, row_dict in self._table_rows
+            if self._row_matches_conditions(row_dict)
+        }
+
+    def _open_conditions_dialog(self):
+        """Open dialog for selecting condition PV and limits."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Conditions")
+        dlg.resizable(True, True)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        dlg.geometry("760x520")
+
+        self._cond_selected_pv = tk.StringVar(value="")
+
+        top = tk.Frame(dlg)
+        top.pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        tk.Label(top, text="Condition PV:", font=FONT_HEADER, fg=COLOR_BLUE).pack(side=tk.LEFT)
+
+        pv_entry = tk.Entry(top, textvariable=self._cond_selected_pv, font=FONT_MONO)
+        pv_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 6))
+
+        def _add_from_browser(pvs: list[str]):
+            if pvs:
+                self._cond_selected_pv.set(pvs[0])
+
+        def _browse_condition_pv():
+            PVBrowserDialog(
+                self.root,
+                on_add_callback=_add_from_browser,
+                timeout=float(self.config.get("http_timeout", CPVA_HTTP_TIMEOUT)),
+                initial_search=self._last_pv_search,
+                on_close_callback=lambda t: setattr(self, "_last_pv_search", t),
+                x=dlg.winfo_rootx() + 20,
+                y=dlg.winfo_rooty() + 40,
+            )
+
+        _btn(top, "Browse...", _browse_condition_pv,
+            bg=COLOR_GREEN, fg="white", padx=8, pady=3).pack(side=tk.LEFT)
+
+        limits = tk.Frame(dlg)
+        limits.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        tk.Label(limits, text="Min:", font=FONT_NORMAL).pack(side=tk.LEFT)
+        min_var = tk.StringVar()
+        tk.Entry(limits, textvariable=min_var, font=FONT_MONO, width=12).pack(side=tk.LEFT, padx=(4, 12))
+
+        tk.Label(limits, text="Max:", font=FONT_NORMAL).pack(side=tk.LEFT)
+        max_var = tk.StringVar()
+        tk.Entry(limits, textvariable=max_var, font=FONT_MONO, width=12).pack(side=tk.LEFT, padx=(4, 12))
+
+        def _parse_float_or_none(text: str):
+            text = text.strip()
+            if not text:
+                return None
+            return float(text)
+
+        cond_frame = tk.Frame(dlg)
+        cond_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(8, 4))
+
+        columns = ("pv", "min", "max")
+        tv = ttk.Treeview(cond_frame, columns=columns, show="headings", height=10)
+        tv.heading("pv", text="PV")
+        tv.heading("min", text="Min")
+        tv.heading("max", text="Max")
+        tv.column("pv", width=460, anchor=tk.W)
+        tv.column("min", width=100, anchor=tk.W)
+        tv.column("max", width=100, anchor=tk.W)
+        tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        sb = ttk.Scrollbar(cond_frame, orient=tk.VERTICAL, command=tv.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        tv.configure(yscrollcommand=sb.set)
+
+        def _refresh_conditions_list():
+            for item in tv.get_children():
+                tv.delete(item)
+            for i, cond in enumerate(self._conditions):
+                tv.insert(
+                    "",
+                    tk.END,
+                    iid=str(i),
+                    values=(
+                        cond.get("pv", ""),
+                        "" if cond.get("min") is None else cond.get("min"),
+                        "" if cond.get("max") is None else cond.get("max"),
+                    )
+                )
+
+        def _add_condition():
+            pv = self._cond_selected_pv.get().strip()
+            if not pv:
+                messagebox.showwarning("Missing PV", "Select condition PV first.", parent=dlg)
+                return
+
+            try:
+                vmin = _parse_float_or_none(min_var.get())
+                vmax = _parse_float_or_none(max_var.get())
+            except ValueError:
+                messagebox.showwarning("Invalid limits", "Min and Max must be numbers or empty.", parent=dlg)
+                return
+
+            if vmin is None and vmax is None:
+                messagebox.showwarning("Missing limits", "Set Min, Max, or both.", parent=dlg)
+                return
+
+            if vmin is not None and vmax is not None and vmax < vmin:
+                messagebox.showwarning("Invalid limits", "Max must be greater than Min.", parent=dlg)
+                return
+
+            self._conditions.append({"pv": pv, "min": vmin, "max": vmax})
+            _refresh_conditions_list()
+
+        def _remove_condition():
+            sel = tv.selection()
+            if not sel:
+                return
+            idxs = sorted([int(x) for x in sel], reverse=True)
+            for idx in idxs:
+                if 0 <= idx < len(self._conditions):
+                    self._conditions.pop(idx)
+            _refresh_conditions_list()
+
+        def _clear_conditions():
+            self._conditions = []
+            _refresh_conditions_list()
+
+        action_row = tk.Frame(dlg)
+        action_row.pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        _btn(action_row, "+ Add condition", _add_condition,
+            bg=COLOR_GREEN, fg="white", padx=10, pady=4).pack(side=tk.LEFT)
+
+        _btn(action_row, "Remove selected", _remove_condition,
+            padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
+
+        _btn(action_row, "Clear all", _clear_conditions,
+            padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
+
+        def _apply_and_close():
+            self._apply_conditions_to_loaded_data()
+            dlg.destroy()
+
+        bottom = tk.Frame(dlg)
+        bottom.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        tk.Button(bottom, text="Cancel", relief=tk.RAISED, padx=12,
+                command=dlg.destroy).pack(side=tk.RIGHT)
+
+        tk.Button(bottom, text="Apply", relief=tk.RAISED, padx=16,
+                bg=COLOR_BLUE, fg="white",
+                command=_apply_and_close).pack(side=tk.RIGHT, padx=(0, 6))
+
+        _refresh_conditions_list()
+        
+
+    def _condition_value_ok(self, value, vmin, vmax) -> bool:
+        """Return True if condition value is numeric and inside limits."""
+        if not isinstance(value, (int, float)):
+            return False
+        if vmin is not None and value < vmin:
+            return False
+        if vmax is not None and value > vmax:
+            return False
+        return True
+
+
+    def _row_matches_conditions(self, row_dict: dict) -> bool:
+        """Return True if all active conditions are satisfied for this row."""
+        if not self._conditions:
+            return True
+
+        for cond in self._conditions:
+            pv = cond.get("pv")
+            if pv not in row_dict:
+                return False
+
+            value, _units = row_dict[pv]
+            if not self._condition_value_ok(value, cond.get("min"), cond.get("max")):
+                return False
+
+        return True
+
+
+    def _apply_conditions_to_rows(self, rows: list) -> list:
+        """Filter merged rows by active conditions."""
+        if not self._conditions:
+            return rows
+
+        return [
+            (ts_ns, row_dict)
+            for ts_ns, row_dict in rows
+            if self._row_matches_conditions(row_dict)
+        ]
+
+
+    def _apply_conditions_to_loaded_data(self):
+        """Apply current conditions to already loaded table and graph."""
+        if not self._table_rows_unfiltered:
+            return
+
+        self._table_rows = self._apply_conditions_to_rows(self._table_rows_unfiltered)
+        self._populate_table(self._pv_order)
+
+        self._populate_table(self._pv_order)
+
+        if self.notebook.select() == str(self.tab_graph):
+            self._plot_graph()
+
+        if self.notebook.select() == str(self.tab_graph):
+            self._plot_graph()
+
+        self.lbl_status.config(
+            text=f"Conditions applied: {len(self._table_rows)} row(s) remain.",
+            fg=COLOR_BLUE
+        )
+
+
 
     def _pick_ref_line_color(self):
         from tkinter.colorchooser import askcolor
@@ -3138,7 +3493,8 @@ class CPVAExplorerApp:
             try:
                 raw = cpva_fetch_samples_chunked(
                     pv_name, start_ns, end_ns, timeout=timeout,
-                    log_fn=self._log)
+                    log_fn=None,
+                    max_workers=8)
                 parsed = []
                 for s in raw:
                     t_ns = s.get("time")
@@ -3162,13 +3518,16 @@ class CPVAExplorerApp:
             samples_by_pv: dict[str, list] = {}
             errors: list[str] = []
 
-            # Fetch all PVs in parallel — one thread per PV, cap at 16
-            max_workers = min(len(pv_list), 16)
+            # menší počet PV vláken, protože každý PV uvnitř může tahat chunky
+            max_workers = min(len(pv_list), 6)
+
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(fetch_one, pv): pv for pv in pv_list}
+
                 for future in as_completed(futures):
                     pv_name, parsed, err = future.result()
                     samples_by_pv[pv_name] = parsed
+
                     if err:
                         errors.append(f"{pv_name}: {err}")
 
@@ -3185,12 +3544,7 @@ class CPVAExplorerApp:
         start_ns = dt_to_ns(self._dt_from)
         end_ns = dt_to_ns(self._dt_to)
 
-        for pv in samples_by_pv:
-            samples_by_pv[pv] = [
-                (ts_ns, value, units)
-                for ts_ns, value, units in samples_by_pv[pv]
-                if start_ns <= ts_ns <= end_ns
-            ]
+
         # In live mode: keep previous data for PVs that returned empty results this tick
         # (prevents PVs from "disappearing" when they have no new samples in the window)
         if self._live_mode and self._samples_by_pv:
@@ -3198,13 +3552,26 @@ class CPVAExplorerApp:
                 if not samples_by_pv.get(pv):
                     samples_by_pv[pv] = self._samples_by_pv.get(pv, [])
 
-        self._samples_by_pv = samples_by_pv
+        graph_samples_by_pv = {}
+
+        for pv, samples in samples_by_pv.items():
+            graph_samples_by_pv[pv] = [
+                (ts_ns, value, units)
+                for ts_ns, value, units in samples
+                if start_ns <= ts_ns <= end_ns
+            ]
+
+        self._samples_by_pv = graph_samples_by_pv
         self._pv_order      = pv_order
+
         if self._merge_mode_var.get() == "sample_hold":
             self._table_rows = self._merge_samples_sample_hold(samples_by_pv, pv_order)
         else:
             self._table_rows = self._merge_samples_into_rows(samples_by_pv, pv_order)
         
+        self._table_rows_unfiltered = list(self._table_rows)
+        
+
         start_ns = dt_to_ns(self._dt_from)
         end_ns = dt_to_ns(self._dt_to)
 
@@ -3216,13 +3583,19 @@ class CPVAExplorerApp:
 
 
         self._populate_table(pv_order)
+        self._refresh_xy_choices()
 
         # Refresh graph if graph tab is active or if live mode is running
         if self._samples_by_pv:
-            graph_tab_active = (self.notebook.select() == str(self.tab_graph))
+            selected_tab = self.notebook.select()
+            graph_tab_active = (selected_tab == str(self.tab_graph))
+            xy_tab_active = (selected_tab == str(self.tab_xy))
+
             numeric_pvs_now = [pv for pv in pv_order
                                if any(isinstance(v, (int, float))
-                                      for _, v, _ in self._samples_by_pv.get(pv, []))]
+                                      for _, v, _ in self._samples_by_pv.get(pv, []))
+            ]
+            
             if graph_tab_active or live_callback is not None:
                 if (self._mpl_canvas is not None
                         and set(self._graph_pvs) == set(numeric_pvs_now)
@@ -3231,6 +3604,13 @@ class CPVAExplorerApp:
                     self._update_graph_data()
                 else:
                     self._plot_graph()
+
+                # --- XY plot auto refresh in live mode ---
+            if xy_tab_active and self._xy_x_var.get() and self._xy_y_var.get():
+                try:
+                    self._plot_xy()
+                except Exception:
+                    pass
 
         total = sum(len(s) for s in samples_by_pv.values())
         self._log(f"\nDone. {total} samples, {len(self._table_rows)} merged rows.")
@@ -3379,39 +3759,32 @@ class CPVAExplorerApp:
         return rows
     
     def _merge_samples_sample_hold(self, samples_by_pv: dict, pv_order: list[str]) -> list:
-    
         events = []
 
         for pv_name in pv_order:
-            for ts_ns, value, units in samples_by_pv.get(pv_name, []):
-                events.append((ts_ns, pv_name, value, units))
+            samples = samples_by_pv.get(pv_name, [])
+            events.extend((ts_ns, pv_name, value, units) for ts_ns, value, units in samples)
+
+        if not events:
+            return []
 
         events.sort(key=lambda e: e[0])
 
+        min_gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
         last_values = {}
         rows = []
+        last_kept_ts = None
 
         for ts_ns, pv_name, value, units in events:
             last_values[pv_name] = (value, units)
 
-            row_dict = {}
-            for pv in pv_order:
-                if pv in last_values:
-                    row_dict[pv] = last_values[pv]
+            if last_kept_ts is not None and ts_ns - last_kept_ts < min_gap_ns:
+                continue
 
-            rows.append((ts_ns, row_dict))
+            rows.append((ts_ns, dict(last_values)))
+            last_kept_ts = ts_ns
 
-        min_gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
-
-        filtered = []
-        last_kept_ts = None
-
-        for ts_ns, row_dict in rows:
-            if last_kept_ts is None or ts_ns - last_kept_ts >= min_gap_ns:
-                filtered.append((ts_ns, row_dict))
-                last_kept_ts = ts_ns
-
-        return filtered
+        return rows
 
     # -------------------------------------------------------------------------
     # Table population
@@ -3446,7 +3819,7 @@ class CPVAExplorerApp:
         # Measure column widths from data
         col_widths = {c: 0 for c in columns}
 
-        all_rows: list[list[str]] = []
+        all_rows: list[tuple[list[str], bool]] = []
         for ts_ns, row_dict in self._table_rows:
             vals = [ns_to_local_str(ts_ns)]
             for pv in pv_order:
@@ -3455,7 +3828,8 @@ class CPVAExplorerApp:
                     vals += [self._format_value(v), u]
                 else:
                     vals += ["", ""]
-            all_rows.append(vals)
+            row_ok = self._row_matches_conditions(row_dict)
+            all_rows.append((vals, row_ok))
             for c, cell in zip(columns, vals):
                 w = self._text_px(cell)
                 if w > col_widths[c]:
@@ -3467,8 +3841,23 @@ class CPVAExplorerApp:
             self.tree.column(col, width=max(w, 40), minwidth=40,
                              anchor=tk.W, stretch=False)
 
-        for vals in all_rows:
-            self.tree.insert("", tk.END, values=vals)
+        MAX_TABLE_ROWS = 25000
+
+        shown_rows = all_rows[-MAX_TABLE_ROWS:]
+
+        self.tree.tag_configure("condition_fail", foreground=COLOR_RED)
+
+        for vals, row_ok in shown_rows:
+            if row_ok:
+                self.tree.insert("", tk.END, values=vals)
+            else:
+                self.tree.insert("", tk.END, values=vals, tags=("condition_fail",))
+
+        if len(all_rows) > MAX_TABLE_ROWS:
+            self.lbl_status.config(
+                text=f"Table shows last {MAX_TABLE_ROWS} of {len(all_rows)} rows. Export CSV still uses all rows.",
+                fg=COLOR_BLUE
+            )
 
         # Auto-scroll to bottom in live mode (unless user scrolled away)
         if self._live_mode and self._live_autoscroll:
@@ -3479,8 +3868,8 @@ class CPVAExplorerApp:
                 self.root.after(50, lambda: setattr(self, "_live_programmatic_scroll", False))
 
         self.lbl_table_info.config(
-            text=f"{len(self._table_rows)} rows | {len(pv_order)} PV(s)  "
-                 f"[merged <={MERGE_WINDOW_MS} ms]")
+            text=f"{len(self._table_rows)} rows total | showing {min(len(all_rows), MAX_TABLE_ROWS)} | {len(pv_order)} PV(s)"
+        )
 
     @staticmethod
     def _text_px(text: str, char_px: int = 7) -> int:
@@ -3588,6 +3977,116 @@ class CPVAExplorerApp:
             messagebox.showinfo("Not an image",
                 f"Value does not look like an image path:\n{val}")
 
+    def _plot_xy(self):
+        if self._Figure is None:
+            messagebox.showerror(
+                "matplotlib missing",
+                "Install matplotlib:\n\n  pip install matplotlib"
+            )
+            return
+
+        if not self._table_rows or not self._pv_order:
+            messagebox.showinfo(
+                "No data",
+                "Load data first before plotting XY graph."
+            )
+            return
+
+        x_label = self._xy_x_var.get()
+        y_label = self._xy_y_var.get()
+
+        if not x_label or not y_label:
+            messagebox.showinfo(
+                "Missing PV",
+                "For XY plot, choose one PV for X axis and one PV for Y axis."
+            )
+            return
+
+        x_pv = self._xy_choice_map.get(x_label)
+        y_pv = self._xy_choice_map.get(y_label)
+
+        if not x_pv or not y_pv:
+            messagebox.showinfo(
+                "Missing PV",
+                "For XY plot, choose valid PVs for both axes."
+            )
+            return
+
+        if x_pv == y_pv:
+            messagebox.showinfo(
+                "Same PV",
+                "For XY plot, choose two different PVs."
+            )
+            return
+
+        x_vals = []
+        y_vals = []
+
+        for _ts_ns, row_dict in self._table_rows:
+            if x_pv not in row_dict or y_pv not in row_dict:
+                continue
+
+            x_val, _x_units = row_dict[x_pv]
+            y_val, _y_units = row_dict[y_pv]
+
+            if isinstance(x_val, (int, float)) and isinstance(y_val, (int, float)):
+                x_vals.append(x_val)
+                y_vals.append(y_val)
+
+        if not x_vals:
+            messagebox.showinfo(
+                "No numeric pairs",
+                "No rows contain numeric values for both selected PVs."
+            )
+            return
+
+        self._clear_xy_plot()
+
+        fig = self._Figure(figsize=(8, 5), dpi=96)
+        ax = fig.add_subplot(111)
+
+        ax.plot(x_vals, y_vals, marker=".", linestyle="none", markersize=4)
+
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+        ax.grid(True)
+
+        ax.set_title(f"{y_label} vs {x_label}")
+
+        canvas = self._FigureCanvas(fig, master=self.xy_container)
+        canvas.draw()
+        canvas.get_tk_widget().grid(row=0, column=0, sticky=tk.NSEW)
+
+        self._xy_canvas = canvas
+        self._xy_figure = fig
+
+        self.lbl_xy_info.config(
+            text=f"XY Plot: {len(x_vals)} numeric pair(s).",
+            fg=COLOR_GREEN
+        )
+
+    def _clear_xy_plot(self):
+        if self._xy_canvas:
+            self._xy_canvas.get_tk_widget().destroy()
+            self._xy_canvas = None
+
+        if self._xy_figure:
+            try:
+                import matplotlib.pyplot as plt
+                plt.close(self._xy_figure)
+            except Exception:
+                pass
+            self._xy_figure = None
+
+        if hasattr(self, "xy_container"):
+            for w in self.xy_container.winfo_children():
+                w.destroy()
+
+        if hasattr(self, "lbl_xy_info"):
+            self.lbl_xy_info.config(
+                text="XY plot cleared.",
+                fg=COLOR_GRAY
+            )
     # -------------------------------------------------------------------------
     # CSV Export
     # -------------------------------------------------------------------------
