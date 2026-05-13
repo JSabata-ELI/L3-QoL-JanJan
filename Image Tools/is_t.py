@@ -28,7 +28,7 @@ except Exception:
     _MPL_OK = False
 
 from PySide6.QtCore import (
-    Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPointF, QDate, QModelIndex
+    Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPoint, QPointF, QDate, QModelIndex
 )
 from PySide6.QtGui import (
     QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QGuiApplication, QTextCharFormat
@@ -3717,49 +3717,64 @@ class TickBar(QWidget):
         super().__init__(parent)
         self.axis_min_ns = 0; self.axis_max_ns = 0
         self.step_minutes = TICK_STEP_MINUTES
-        self.setMinimumHeight(38)
+        self.setMinimumHeight(56)
         self.mark_a_ns: int | None = None
         self.mark_b_ns: int | None = None
+        self.cursor_ns: int | None = None
+        self.left_offset: int = 0   # pixels reserved for slider label prefix (multi-cam)
         self.discrete_ticks: list[int] | None = None
-        self.discrete_tick_labels: list[str] | None = None  # pokud nastaveno, použij místo _dt_from_ns
+        self.discrete_tick_labels: list[str] | None = None
 
     def set_axis(self, a, b): self.axis_min_ns = a; self.axis_max_ns = b; self.update()
     def set_marks(self, a, b): self.mark_a_ns = a; self.mark_b_ns = b; self.update()
+    def set_cursor(self, t: "int | None"): self.cursor_ns = t; self.update()
+    def set_left_offset(self, px: int): self.left_offset = px; self.update()
 
-    def _x_from_ns(self, t):
-        if self.axis_max_ns <= self.axis_min_ns: return 0
+    def _axis_w(self) -> int:
+        return max(1, self.width() - self.left_offset)
+
+    def _x_from_ns(self, t) -> int:
+        if self.axis_max_ns <= self.axis_min_ns: return self.left_offset
         frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
-        return int(round(max(0.0, min(1.0, frac)) * (self.width() - 1)))
+        return self.left_offset + int(round(max(0.0, min(1.0, frac)) * (self._axis_w() - 1)))
 
     def paintEvent(self, event):
         super().paintEvent(event)
         if self.axis_max_ns <= self.axis_min_ns: return
         w, h = self.width(), self.height()
+        lo = self.left_offset          # pixel offset where the axis starts
+        aw = max(1, w - lo)            # width of the axis area
         p = QPainter(self)
         fm = QFontMetrics(self.font())
+        lh = fm.height()               # label height
 
-        # ── Discrete mode: zobraz jen timestampy snímků ──────────────
+        def _x(t) -> int:
+            frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
+            return lo + int(round(max(0.0, min(1.0, frac)) * (aw - 1)))
+
+        # ── Discrete mode: single camera, show per-frame ticks ────────
         if self.discrete_ticks is not None and self.discrete_ticks:
             ticks = self.discrete_ticks
             n = len(ticks)
             min_label_w = fm.horizontalAdvance("2026-03-23 14:53:12") + 8
-            # Zjisti kolik ticků se vejde bez překryvu
-            available_w = w
-            max_visible = max(1, available_w // min_label_w)
+            max_visible = max(1, aw // min_label_w)
             step = max(1, (n + max_visible - 1) // max_visible)
 
-            last_x = -9999
+            # Baseline
+            p.setPen(QPen(QColor(160, 160, 160)))
+            p.drawLine(lo, h // 2, w, h // 2)
+
+            last_label_x = lo - 9999
             for i, t in enumerate(ticks):
+                x = _x(t)
+                # Minor tick for every frame
+                pen = QPen(QColor(140, 140, 140, 160)); pen.setWidth(1); p.setPen(pen)
+                p.drawLine(x, h // 2 - 3, x, h // 2 + 3)
                 if i % step != 0:
                     continue
-                frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
-                x = int(round(max(0.0, min(1.0, frac)) * (w - 1)))
-                # Čára
-                pen = QPen(QColor(120, 120, 120, 180))
-                pen.setWidth(1)
-                p.setPen(pen)
-                p.drawLine(x, h // 2, x, h)
-                # Label — datum + čas
+                # Major tick
+                pen = QPen(QColor(80, 80, 80, 200)); pen.setWidth(1); p.setPen(pen)
+                p.drawLine(x, h // 2 - 6, x, h // 2 + 6)
                 if self.discrete_tick_labels and i < len(self.discrete_tick_labels):
                     label = self.discrete_tick_labels[i]
                 else:
@@ -3767,50 +3782,111 @@ class TickBar(QWidget):
                     label = f"{dt:%Y-%m-%d %H:%M:%S}"
                 lw = fm.horizontalAdvance(label)
                 lx = x - lw // 2
-                if lx < last_x + 4:
+                if lx < last_label_x + 4:
                     continue
-                lx = max(0, min(w - lw, lx))
-                lr = QRect(lx, 0, lw, fm.height() + 2)
+                lx = max(lo, min(w - lw, lx))
+                lr = QRect(lx, h // 2 + 8, lw, lh)
+                if lr.bottom() > h:
+                    lr.moveTop(h // 2 - 8 - lh)
                 p.fillRect(lr.adjusted(-2, 0, 2, 0), QColor(255, 255, 255, 200))
                 p.setPen(QColor(0, 0, 0))
                 p.drawText(lr, Qt.AlignmentFlag.AlignVCenter, label)
-                last_x = lx + lw
+                last_label_x = lx + lw
 
-            # Marks
-            def draw_mark(t, color, nudge=0):
-                frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
-                x = int(round(max(0.0, min(1.0, frac)) * (w - 1)))
+            def _draw_mark_discrete(t, color):
+                x = _x(t)
                 pen = QPen(color); pen.setWidth(2); p.setPen(pen)
                 p.drawLine(x, 0, x, h)
-            if self.mark_a_ns is not None: draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
-            if self.mark_b_ns is not None: draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
+            if self.mark_a_ns is not None: _draw_mark_discrete(self.mark_a_ns, QColor(255, 0, 0, 230))
+            if self.mark_b_ns is not None: _draw_mark_discrete(self.mark_b_ns, QColor(0, 0, 255, 230))
+
+            if self.cursor_ns is not None:
+                xc = _x(self.cursor_ns)
+                pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
+                p.drawLine(xc, 0, xc, h)
+                label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
+                lw = fm.horizontalAdvance(label) + 6
+                lx = max(lo, min(w - lw, xc - lw // 2))
+                p.fillRect(lx, h - lh - 2, lw, lh + 2, QColor(0, 80, 200, 200))
+                p.setPen(QColor(255, 255, 255))
+                p.drawText(lx + 3, h - 2 - fm.descent(), label)
             p.end()
             return
 
-        # ── Normální časová osa ───────────────────────────────────────
+        # ── Normal time axis ──────────────────────────────────────────
         span = self.axis_max_ns - self.axis_min_ns
         span_hours = span / ONE_HOUR_NS
 
         if span_hours >= 6:
-            step_minutes = 60
+            step_min = 60;  minor_min = 5
         elif span_hours >= 3:
-            step_minutes = 30
+            step_min = 30;  minor_min = 5
         elif span_hours >= 1.5:
-            step_minutes = 15
+            step_min = 15;  minor_min = 2
+        elif span_hours >= 0.5:
+            step_min = 10;  minor_min = 1
         else:
-            step_minutes = 10
+            step_min = 5;   minor_min = 1
 
-        start_dt = _dt_from_ns(self.axis_min_ns).replace(second=0, microsecond=0)
-        remainder = start_dt.minute % step_minutes
-        if remainder != 0:
-            start_dt = start_dt - timedelta(minutes=remainder)
+        def _aligned_ticks(step_m: int) -> list[int]:
+            start_dt = _dt_from_ns(self.axis_min_ns).replace(second=0, microsecond=0)
+            rem = start_dt.minute % step_m
+            if rem:
+                start_dt = start_dt - timedelta(minutes=rem)
+            end_dt = _dt_from_ns(self.axis_max_ns).replace(second=0, microsecond=0)
+            result = []; dt = start_dt
+            while dt <= end_dt + timedelta(minutes=step_m):
+                result.append(ns_from_dt(dt)); dt += timedelta(minutes=step_m)
+            return result
 
-        end_dt = _dt_from_ns(self.axis_max_ns).replace(second=0, microsecond=0)
-        ticks = []; dt = start_dt
-        while dt <= end_dt:
-            ticks.append(ns_from_dt(dt)); dt += timedelta(minutes=step_minutes)
+        major_ticks = _aligned_ticks(step_min)
+        minor_ticks = _aligned_ticks(minor_min)
+        major_set = set(major_ticks)
 
-        # Collect midnight timestamps (day boundaries) within the axis range
+        # Layout (top-to-bottom):
+        #   [lh+2]  tick labels
+        #   [8px]   major tick stubs above baseline
+        #   [1px]   baseline
+        #   [4px]   minor tick stubs below baseline
+        #   [lh+4]  cursor label at bottom
+        cursor_label_h = lh + 4
+        baseline_y = h - cursor_label_h - 1
+        major_tick_top = baseline_y - 8
+        minor_tick_bot = baseline_y + 4
+
+        # Baseline — thick, clearly visible
+        baseline_pen = QPen(QColor(100, 100, 100)); baseline_pen.setWidth(2)
+        p.setPen(baseline_pen)
+        p.drawLine(lo, baseline_y, w, baseline_y)
+
+        # Minor ticks below baseline
+        pen = QPen(QColor(160, 160, 160)); pen.setWidth(1); p.setPen(pen)
+        for t in minor_ticks:
+            if t in major_set: continue
+            x = _x(t)
+            if x < lo or x > w: continue
+            p.drawLine(x, baseline_y, x, minor_tick_bot)
+
+        # Major ticks above baseline + labels above them
+        last_label_x = lo - 9999
+        for t in major_ticks:
+            x = _x(t)
+            if x < lo or x > w: continue
+            pen = QPen(QColor(60, 60, 60)); pen.setWidth(1); p.setPen(pen)
+            p.drawLine(x, major_tick_top, x, baseline_y)
+            txt = fmt_hhmm_from_ns(t)
+            tw = fm.horizontalAdvance(txt)
+            tx = x - tw // 2
+            tx = max(lo, min(w - tw, tx))
+            if tx < last_label_x + 4:
+                continue
+            label_y = major_tick_top - lh - 1
+            if label_y < 0: label_y = 0
+            p.setPen(QColor(0, 0, 0))
+            p.drawText(QRect(tx, label_y, tw, lh), Qt.AlignmentFlag.AlignVCenter, txt)
+            last_label_x = tx + tw
+
+        # Midnight date labels at bottom
         midnight_dates: list[int] = []
         _d = _dt_from_ns(self.axis_min_ns).date()
         _d_end = _dt_from_ns(self.axis_max_ns).date()
@@ -3824,76 +3900,67 @@ class TickBar(QWidget):
                 midnight_dates.append(_mn_ns)
             _d += timedelta(days=1)
 
-        for t in ticks:
-            frac = (t - self.axis_min_ns) / span
-            x = int(round(frac * (w - 1)))
-            txt = fmt_hhmm_from_ns(t); tw = fm.horizontalAdvance(txt)
-            tx = x - tw // 2
-            if frac <= 0.00001: tx = 0
-            if frac >= 0.99999: tx = w - tw
-            p.drawText(QRect(tx, 0, tw, h), Qt.AlignmentFlag.AlignTop, txt)
-
-        # Draw date labels: at start, end, and each midnight
-        date_font = QFont(self.font()); date_font.setBold(True)
-        p.setFont(date_font)
-        dfm = QFontMetrics(date_font)
-        date_lbl_h = dfm.height()
-        date_lbl_y = h - date_lbl_h - 1
-
-        def _draw_date_label(ns_val: int, align_right=False):
-            dt_val = _dt_from_ns(ns_val)
-            lbl = dt_val.strftime("%d.%m")
-            lw = dfm.horizontalAdvance(lbl)
-            frac_v = (ns_val - self.axis_min_ns) / span
-            x_v = int(round(max(0.0, min(1.0, frac_v)) * (w - 1)))
-            if align_right:
-                lx = max(0, x_v - lw)
-            else:
-                lx = min(w - lw, x_v)
-            p.setPen(QColor(40, 80, 180))
-            # Vertical separator line for midnight crossings
-            if 0.0001 < frac_v < 0.9999:
-                sep_pen = QPen(QColor(40, 80, 180, 120)); sep_pen.setWidth(1)
-                p.setPen(sep_pen)
-                p.drawLine(x_v, 0, x_v, h)
-                p.setPen(QColor(40, 80, 180))
-            p.fillRect(QRect(lx, date_lbl_y, lw, date_lbl_h), QColor(230, 235, 255, 220))
-            p.drawText(QRect(lx, date_lbl_y, lw, date_lbl_h), Qt.AlignmentFlag.AlignVCenter, lbl)
-
         if midnight_dates or span_hours > 20:
+            date_font = QFont(self.font()); date_font.setBold(True)
+            p.setFont(date_font)
+            dfm = QFontMetrics(date_font)
+            dlh = dfm.height()
+            date_y = h - dlh - 1
+
+            def _draw_date_label(ns_val: int, align_right=False):
+                dt_val = _dt_from_ns(ns_val)
+                lbl = dt_val.strftime("%d.%m")
+                lw = dfm.horizontalAdvance(lbl)
+                x_v = _x(ns_val)
+                lx = (max(lo, x_v - lw) if align_right else min(w - lw, x_v))
+                frac_v = (ns_val - self.axis_min_ns) / span
+                if 0.0001 < frac_v < 0.9999:
+                    sep_pen = QPen(QColor(40, 80, 180, 120)); sep_pen.setWidth(1)
+                    p.setPen(sep_pen); p.drawLine(x_v, baseline_y, x_v, h)
+                p.fillRect(QRect(lx, date_y, lw, dlh), QColor(230, 235, 255, 220))
+                p.setPen(QColor(40, 80, 180))
+                p.drawText(QRect(lx, date_y, lw, dlh), Qt.AlignmentFlag.AlignVCenter, lbl)
+
             _draw_date_label(self.axis_min_ns, align_right=False)
             _draw_date_label(self.axis_max_ns, align_right=True)
             for mn_ns in midnight_dates:
                 _draw_date_label(mn_ns, align_right=False)
+            p.setFont(self.font())
 
-        p.setFont(self.font())
-        p.setPen(QColor(0, 0, 0))
-
+        # Marks (Set From / Set To) — drawn above baseline
         def draw_mark(t, color, nudge=0):
-            x = self._x_from_ns(t)
-            pen = QPen(color); pen.setWidth(2); p.setPen(pen); p.drawLine(x, 0, x, h)
+            x = _x(t)
+            pen = QPen(color); pen.setWidth(2); p.setPen(pen); p.drawLine(x, 0, x, baseline_y)
             label = fmt_hhmmss_ms_from_ns(t); lw = fm.horizontalAdvance(label)
-            lx = max(0, min(w - lw, x - lw // 2 + nudge))
-            lr = QRect(lx, h - fm.height() - 2, lw, fm.height())
+            lx = max(lo, min(w - lw, x - lw // 2 + nudge))
+            lr = QRect(lx, baseline_y - lh - 2, lw, lh)
             p.fillRect(lr.adjusted(-4, 0, 4, 0), QColor(255, 255, 255, 210))
-            p.drawText(lr, Qt.AlignmentFlag.AlignVCenter, label)
+            p.setPen(color); p.drawText(lr, Qt.AlignmentFlag.AlignVCenter, label)
 
         if self.mark_a_ns is not None and self.mark_b_ns is not None:
-            xa = self._x_from_ns(self.mark_a_ns)
-            xb = self._x_from_ns(self.mark_b_ns)
             lw = fm.horizontalAdvance(fmt_hhmmss_ms_from_ns(self.mark_a_ns))
-            overlap = (lw + 8) - abs(xb - xa)
+            overlap = (lw + 8) - abs(_x(self.mark_b_ns) - _x(self.mark_a_ns))
             if overlap > 0:
-                nudge_a = -(overlap // 2 + 2)
-                nudge_b = overlap // 2 + 2
-                draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230), nudge_a)
-                draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230), nudge_b)
+                draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230), -(overlap // 2 + 2))
+                draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230),   overlap // 2 + 2)
             else:
                 draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
                 draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
         else:
             if self.mark_a_ns is not None: draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
             if self.mark_b_ns is not None: draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
+
+        # Cursor line — blue, label at bottom
+        if self.cursor_ns is not None:
+            xc = _x(self.cursor_ns)
+            pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
+            p.drawLine(xc, 0, xc, h)
+            label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
+            lw = fm.horizontalAdvance(label) + 6
+            lx = max(lo, min(w - lw, xc - lw // 2))
+            p.fillRect(lx, h - lh - 2, lw, lh + 2, QColor(0, 80, 200, 200))
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(lx + 3, h - 2 - fm.descent(), label)
         p.end()
 
 # ---------------- LAYOUT HELPERS ----------------
@@ -4196,10 +4263,11 @@ class _CamPollTask(QRunnable):
 
 class _CamSliderRow(QWidget):
     """One row: [● Master radio] [Camera name label] [━━━━ slider ━━━━]"""
-    master_chosen = Signal(int)        # emitted when this row's radio is clicked; arg = cam index
-    value_changed = Signal(int, int)   # (cam_index, slider_value)
-    pressed       = Signal(int)        # cam_index
-    released      = Signal(int)        # cam_index
+    master_chosen     = Signal(int)   # emitted when radio is checked; arg = cam index
+    master_deselected = Signal(int)   # emitted when radio is unchecked; arg = cam index
+    value_changed     = Signal(int, int)  # (cam_index, slider_value)
+    pressed           = Signal(int)   # cam_index
+    released          = Signal(int)   # cam_index
 
     def __init__(self, cam_idx: int, cam_name: str, parent=None):
         super().__init__(parent)
@@ -4212,7 +4280,8 @@ class _CamSliderRow(QWidget):
 
         from PySide6.QtWidgets import QRadioButton
         self._radio = QRadioButton()
-        self._radio.setToolTip("Set as master camera (arrows / ◀▶ step this camera; others sync)")
+        self._radio.setAutoExclusive(False)  # allow clicking checked radio to uncheck it
+        self._radio.setToolTip("Set as master camera (sync others to this). Click again to deselect.")
         self._radio.setFixedWidth(16)
         self._radio.toggled.connect(self._on_radio_toggled)
         lay.addWidget(self._radio)
@@ -4251,9 +4320,15 @@ class _CamSliderRow(QWidget):
     def value(self) -> int:
         return self._slider.value()
 
+    def slider_x_in_parent(self) -> int:
+        """X position of the slider's left edge relative to this row widget."""
+        return self._slider.x()
+
     def _on_radio_toggled(self, checked: bool):
         if checked:
             self.master_chosen.emit(self.cam_idx)
+        else:
+            self.master_deselected.emit(self.cam_idx)
 
 
 # ================================================================== UI
@@ -4983,7 +5058,6 @@ class Viewer(QWidget):
         self.tickbar  = TickBar(self)
 
         rlay.addWidget(self.slider)
-        rlay.addWidget(self.tickbar)
 
         # Per-camera sliders (hidden until multi-cam mode is active)
         self._per_cam_container = QWidget()
@@ -4996,6 +5070,9 @@ class Viewer(QWidget):
         self._per_cam_master_idx: int = 0      # which camera is master
         self._per_cam_scrubbing_cam: int = -1  # which cam is being dragged (-1 = none)
         rlay.addWidget(self._per_cam_container)
+
+        # Tickbar below sliders — cursor line ends here, at the bottom
+        rlay.addWidget(self.tickbar)
 
         # Outer row container — script background color, holds camera + pointing panel
         _cam_row_widget = QWidget()
@@ -5298,6 +5375,7 @@ class Viewer(QWidget):
         self._per_cam_container.setVisible(False)
         self.slider.setVisible(True)
         self.tickbar.setVisible(True)
+        self.tickbar.set_cursor(None)
 
     # ── Per-camera sliders ────────────────────────────────────────────────────
 
@@ -5311,6 +5389,7 @@ class Viewer(QWidget):
         for i, name in enumerate(cam_names):
             row = _CamSliderRow(i, name, self._per_cam_container)
             row.master_chosen.connect(self._on_per_cam_master_chosen)
+            row.master_deselected.connect(self._on_per_cam_master_deselected)
             row.value_changed.connect(self._on_per_cam_value_changed)
             row.pressed.connect(self._on_per_cam_pressed)
             row.released.connect(self._on_per_cam_released)
@@ -5325,11 +5404,36 @@ class Viewer(QWidget):
 
         self._per_cam_container.setVisible(True)
 
+        # After layout is computed, align tickbar axis with slider track start
+        def _update_tickbar_offset():
+            if self._per_cam_rows:
+                row0 = self._per_cam_rows[0]
+                # Map slider left edge from row coords to tickbar coords
+                row_in_tickbar = self.tickbar.mapFromGlobal(
+                    row0.mapToGlobal(row0._slider.pos()))
+                offset = max(0, row_in_tickbar.x())
+                self.tickbar.set_left_offset(offset)
+        QTimer.singleShot(0, _update_tickbar_offset)
+
     def _on_per_cam_master_chosen(self, cam_idx: int):
         """Uživatel klikl na radio tlačítko — přepne master na tuto kameru."""
         self._per_cam_master_idx = cam_idx
         for i, row in enumerate(self._per_cam_rows):
             row.set_master(i == cam_idx)
+        # Sync slaves from new master's current position
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if cam_ts and cam_idx < len(self._per_cam_rows):
+            row = self._per_cam_rows[cam_idx]
+            t_raw = self._per_cam_slider_to_ts(cam_idx, row.value())
+            frame_idx = max(0, bisect.bisect_right(cam_ts, t_raw) - 1)
+            t_ns = cam_ts[frame_idx]
+            self._per_cam_sync_slaves(cam_idx, t_ns)
+
+    def _on_per_cam_master_deselected(self, cam_idx: int):
+        """User unchecked the master radio — switch to independent mode (no master)."""
+        self._per_cam_master_idx = -1
+        for row in self._per_cam_rows:
+            row.set_master(False)
 
     def _on_per_cam_pressed(self, cam_idx: int):
         self._per_cam_scrubbing_cam = cam_idx
@@ -5342,39 +5446,70 @@ class Viewer(QWidget):
             return
         row = self._per_cam_rows[cam_idx]
         t_ns = self._per_cam_slider_to_ts(cam_idx, row.value())
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if cam_ts:
+            frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
+            t_ns = cam_ts[frame_idx]
+            snapped = self._per_cam_ts_to_slider(cam_idx, t_ns)
+            row.set_value(snapped)
         self._per_cam_display_one(cam_idx, t_ns)
-        if cam_idx == self._per_cam_master_idx:
+        if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
             self._per_cam_sync_slaves(cam_idx, t_ns)
 
     def _on_per_cam_value_changed(self, cam_idx: int, v: int):
-        """Voláno při každém pohybu sliderů — throttlujeme přes scrub_timer."""
+        """Voláno při každém pohybu sliderů — time-based s bisect na nejbližší frame."""
         if not self._cam_items or cam_idx >= len(self._cam_items):
             return
         t_ns = self._per_cam_slider_to_ts(cam_idx, v)
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if cam_ts:
+            frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
+            t_ns = cam_ts[frame_idx]
         self._per_cam_display_one(cam_idx, t_ns)
-        if cam_idx == self._per_cam_master_idx:
+        if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
             self._per_cam_sync_slaves(cam_idx, t_ns)
 
-    def _per_cam_slider_to_ts(self, cam_idx: int, v: int) -> int:
-        """Převede hodnotu slideru na timestamp v ns pro danou kameru."""
+    def _per_cam_ts_to_frame(self, cam_idx: int, ts_ns: int) -> int:
+        """Vrátí index nejbližšího framu (v minulosti nebo přesně) pro daný timestamp."""
         cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
         if not cam_ts:
             return 0
-        n = len(cam_ts)
-        idx = max(0, min(n - 1, int(round(v / SLIDER_MAX * (n - 1)))))
-        return cam_ts[idx]
+        return max(0, bisect.bisect_right(cam_ts, ts_ns) - 1)
+
+    def _per_cam_frame_to_slider(self, cam_idx: int, frame_idx: int) -> int:
+        """Převede index snímku na slider hodnotu na společné časové ose."""
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if not cam_ts or frame_idx >= len(cam_ts):
+            return 0
+        return self._per_cam_ts_to_slider(cam_idx, cam_ts[frame_idx])
+
+    def _per_cam_slider_to_ts(self, cam_idx: int, v: int) -> int:
+        """Převede hodnotu slideru (na společné časové ose) na timestamp v ns."""
+        ax_min = self.axis_min_ns
+        ax_max = self.axis_max_ns
+        if ax_max <= ax_min:
+            # Fallback: použij rozsah dané kamery
+            cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+            if not cam_ts:
+                return 0
+            ax_min, ax_max = cam_ts[0], cam_ts[-1]
+            if ax_max <= ax_min:
+                return ax_min
+        return int(ax_min + v / SLIDER_MAX * (ax_max - ax_min))
 
     def _per_cam_ts_to_slider(self, cam_idx: int, ts_ns: int) -> int:
-        """Převede timestamp na hodnotu slideru pro danou kameru."""
-        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
-        if not cam_ts:
-            return 0
-        n = len(cam_ts)
-        pos = bisect.bisect_right(cam_ts, ts_ns) - 1
-        idx = max(0, min(n - 1, pos))
-        if n <= 1:
-            return 0
-        return max(0, min(SLIDER_MAX, int(idx / (n - 1) * SLIDER_MAX)))
+        """Převede timestamp na hodnotu slideru (na společné časové ose)."""
+        ax_min = self.axis_min_ns
+        ax_max = self.axis_max_ns
+        if ax_max <= ax_min:
+            cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+            if not cam_ts:
+                return 0
+            ax_min, ax_max = cam_ts[0], cam_ts[-1]
+            if ax_max <= ax_min:
+                return 0
+        frac = (ts_ns - ax_min) / (ax_max - ax_min)
+        return max(0, min(SLIDER_MAX, int(frac * SLIDER_MAX)))
 
     def _per_cam_display_one(self, cam_idx: int, t_ns: int):
         """Zobrazí frame pro jednu kameru na daném čase."""
@@ -5384,6 +5519,14 @@ class Viewer(QWidget):
             return
         pos     = bisect.bisect_right(cam_ts, t_ns) - 1
         cam_idx_f = max(0, min(len(cam_items) - 1, pos))
+        # Update info panel and tickbar cursor for master camera (or active scrub cam in independent mode)
+        _is_info_cam = (cam_idx == self._per_cam_master_idx) or (
+            self._per_cam_master_idx < 0 and cam_idx == self._per_cam_scrubbing_cam)
+        if _is_info_cam:
+            real_ts = cam_ts[cam_idx_f] if cam_ts else t_ns
+            self.lbl_prague_time.setText(f"Prague: {fmt_prague_full_from_ns(real_ts)}")
+            self.lbl_axis_time.setText(f"Axis: {fmt_hhmmss_ms_from_ns(real_ts)}")
+            self.tickbar.set_cursor(real_ts)
         it      = cam_items[cam_idx_f]
 
         if hasattr(self, '_cam_current_idx') and cam_idx < len(self._cam_current_idx):
@@ -5417,17 +5560,31 @@ class Viewer(QWidget):
         self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
 
     def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
-        """Synchronizuje slave kamery na nejbližší timestamp k master_ts_ns."""
+        """Synchronizuje slave kamery na nejbližší timestamp k master_ts_ns.
+        Preferuje snímky v minulosti; povoluje max 100ms do budoucnosti."""
+        _100MS = 220_000_000  # 0.22 s v ns
         for i, row in enumerate(self._per_cam_rows):
             if i == master_cam:
                 continue
             cam_ts = self._cam_ts[i] if i < len(self._cam_ts) else []
             if not cam_ts:
                 continue
-            # Najdi nejbližší timestamp
-            pos = bisect.bisect_right(cam_ts, master_ts_ns) - 1
-            pos = max(0, min(len(cam_ts) - 1, pos))
-            slave_ts = cam_ts[pos]
+            # bisect_right dá index prvního ts > master_ts_ns
+            pos = bisect.bisect_right(cam_ts, master_ts_ns)
+            # candidate vlevo (minulost nebo přesná shoda)
+            pos_left  = max(0, pos - 1)
+            # candidate vpravo (budoucnost)
+            pos_right = min(len(cam_ts) - 1, pos)
+            ts_left  = cam_ts[pos_left]
+            ts_right = cam_ts[pos_right]
+            # Vezmi pravý jen pokud je <= 100ms v budoucnosti a blíže než levý
+            if (ts_right > master_ts_ns and
+                    ts_right - master_ts_ns <= _100MS and
+                    abs(ts_right - master_ts_ns) < abs(master_ts_ns - ts_left)):
+                best_pos = pos_right
+            else:
+                best_pos = pos_left
+            slave_ts = cam_ts[best_pos]
             sv = self._per_cam_ts_to_slider(i, slave_ts)
             row.set_value(sv)
             self._per_cam_display_one(i, slave_ts)
@@ -5435,21 +5592,21 @@ class Viewer(QWidget):
     def _per_cam_step(self, delta: int):
         """Posune master kameru o delta framů, ostatní synchronizuje."""
         master = self._per_cam_master_idx
-        if master >= len(self._cam_items) or master >= len(self._cam_ts):
+        if master < 0 or master >= len(self._cam_items) or master >= len(self._cam_ts):
             return
         cam_ts = self._cam_ts[master]
         if not cam_ts:
             return
         row = self._per_cam_rows[master]
-        cur_v = row.value()
-        n = len(cam_ts)
-        cur_frame = max(0, min(n - 1, int(round(cur_v / SLIDER_MAX * (n - 1)))))
-        new_frame = max(0, min(n - 1, cur_frame + delta))
-        new_ts    = cam_ts[new_frame]
-        sv = 0 if n <= 1 else max(0, min(SLIDER_MAX, int(new_frame / (n - 1) * SLIDER_MAX)))
+        cur_t = self._per_cam_slider_to_ts(master, row.value())
+        cur_frame = max(0, bisect.bisect_right(cam_ts, cur_t) - 1)
+        new_frame = max(0, min(len(cam_ts) - 1, cur_frame + delta))
+        new_ts = cam_ts[new_frame]
+        sv = self._per_cam_ts_to_slider(master, new_ts)
         row.set_value(sv)
         self._per_cam_display_one(master, new_ts)
-        self._per_cam_sync_slaves(master, new_ts)
+        if self._per_cam_master_idx >= 0:
+            self._per_cam_sync_slaves(master, new_ts)
 
     def _setup_multi_cam(self, cam_names: list[str], cam_folders: list[Path],
                          reset_items: bool = True,
@@ -5495,7 +5652,8 @@ class Viewer(QWidget):
         # Build per-camera sliders (hidden global slider, show per-cam rows)
         self._build_per_cam_sliders(cam_names)
         self.slider.setVisible(False)
-        self.tickbar.setVisible(False)
+        self.tickbar.setVisible(True)
+        self.tickbar.set_cursor(None)
 
     # ================================================================ ONLINE MODE
     def _on_auto_follow_toggled(self, checked: bool):
@@ -5506,7 +5664,21 @@ class Viewer(QWidget):
             self._stop_online_mode()
         if checked and self.items:
             last_idx = len(self.items) - 1
-            self._display_exact_index(last_idx, self.items[last_idx].ts_ns, update_slider=True)
+            if self._is_multi_cam():
+                # Jump each per-cam slider to its own latest frame immediately
+                for cam_i, row in enumerate(self._per_cam_rows):
+                    cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+                    if not cam_ts:
+                        continue
+                    latest_ts = cam_ts[-1]
+                    sv = self._per_cam_ts_to_slider(cam_i, latest_ts)
+                    row.set_value(sv)
+                    self._per_cam_display_one(cam_i, latest_ts)
+                master = self._per_cam_master_idx
+                if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                    self.tickbar.set_cursor(self._cam_ts[master][-1])
+            else:
+                self._display_exact_index(last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
     def _start_online_mode(self):
         self._online_mode = True
@@ -5753,31 +5925,27 @@ class Viewer(QWidget):
                     )
                     self.lbl_scan_progress.setText(cam_lines)
                     self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
-                    if self._auto_follow and self.items:
-                        self._display_multicam_index(len(self.items) - 1, update_slider=True)
+                    if self._auto_follow:
+                        # Auto-follow: show each camera's own latest frame independently
+                        cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+                        if cam_ts_now:
+                            latest_frame = len(cam_ts_now) - 1
+                            latest_ts = cam_ts_now[latest_frame]
+                            self._per_cam_display_one(cam_idx, latest_ts)
+                            # Update this camera's per-cam slider to latest position
+                            if cam_idx < len(self._per_cam_rows):
+                                sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
+                                self._per_cam_rows[cam_idx].set_value(sv)
+                            # Update tickbar cursor from master camera
+                            if cam_idx == self._per_cam_master_idx:
+                                self.tickbar.set_cursor(latest_ts)
                     else:
+                        # Not following — just refresh this camera at current slider time
                         if self.items and self.current_idx is not None:
                             t_ns = self.items[self.current_idx].ts_ns
-                            cam_ts = self._cam_ts[cam_idx]
-                            pos = bisect.bisect_right(cam_ts, t_ns) - 1
-                            cam_idx_disp = max(0, pos)
-                            cam_items = self._cam_items[cam_idx]
-                            if cam_idx_disp < len(cam_items):
-                                it = cam_items[cam_idx_disp]
-                                self._cam_current_idx[cam_idx] = cam_idx_disp
-                                subtract = self.cb_subtract.isChecked()
-                                ref = self._cam_ref_images[cam_idx] if (subtract and cam_idx < len(self._cam_ref_images)) else None
-                                effective_sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
-                                n_total = len(self._cam_items)
-                                max_side = 400 if n_total >= 3 else (500 if n_total == 2 else self._scrub_side)
-                                brighten = 1 if self.cb_bright.isChecked() else 0
-                                gradient_id = self.gradient_cb.currentIndex()
-                                boff = self._brightness_offset
-                                self._display_req_id += 1
-                                self._cam_pools[cam_idx].start(LoadTask(
-                                    self._gen, self._display_req_id, cam_idx_disp,
-                                    it.path, max_side, brighten, gradient_id,
-                                    self._cam_signals[cam_idx], boff, ref, effective_sub_thr))
+                            cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+                            if cam_ts_now:
+                                self._per_cam_display_one(cam_idx, t_ns)
                 return on_cam_found
 
             sig.found.connect(make_callback(cam_i, gen))
@@ -5850,6 +6018,15 @@ class Viewer(QWidget):
             span_h = math.ceil((ts_max - ns_from_dt(dt0)) / ONE_HOUR_NS)
             self.axis_max_ns = ns_from_dt(dt0 + timedelta(hours=span_h))
             self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
+            # After axis expansion, recalculate per-cam sliders: old integer values now
+            # map to different timestamps on the wider axis. Jump each to its latest frame.
+            if self._auto_follow and self._is_multi_cam():
+                for cam_i, row in enumerate(self._per_cam_rows):
+                    cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+                    if not cam_ts:
+                        continue
+                    sv = self._per_cam_ts_to_slider(cam_i, cam_ts[-1])
+                    row.set_value(sv)
 
     def open_folder(self):
         # Nejdřív zkontroluj že máme nastavené časové okno
@@ -5908,6 +6085,12 @@ class Viewer(QWidget):
 
         if len(cam_names) == 1:
             self._stop_online_mode()
+            # Preserve overlay from multi-cam grid for this camera before switching to single
+            grid_state = self._multi_grid._overlay_store.get(cam_names[0])
+            if grid_state is None:
+                # Current single-cam might be this camera — save its overlay too
+                if self._cam_names and self._cam_names[0] == cam_names[0]:
+                    grid_state = MultiCameraGrid._save_iv_overlay(self.img_view)
             self._switch_to_single_view()
             self._cam_names = [cam_names[0]]
             folders = cam_folder_lists[0]
@@ -5919,10 +6102,17 @@ class Viewer(QWidget):
             self.last_open_dir = existing[0]
             if online:
                 self._pending_online_mode = True
+            # Pre-load grid_state into img_view so _start_scan saves and restores it
+            if grid_state is not None:
+                MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
             self._stop_online_mode()
+            # Save single-cam img_view overlay into multi-grid store before switching
+            if self._cam_names and len(self._cam_names) == 1:
+                self._multi_grid._overlay_store[self._cam_names[0]] = \
+                    MultiCameraGrid._save_iv_overlay(self.img_view)
             self._start_multi_cam_scan(
                 cam_names, cam_folder_lists,
                 axis_override=axis_override,
@@ -6069,7 +6259,7 @@ class Viewer(QWidget):
                 folder_axis, ts_min, ts_max)
 
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
+        self._apply_marks_to_tickbar()
 
         # Povol ovládací prvky
         self.slider.setEnabled(True)
@@ -6215,6 +6405,10 @@ class Viewer(QWidget):
 
         if len(cam_names) == 1:
             self._stop_online_mode()
+            # Preserve overlay from multi-cam grid for this camera before switching to single
+            grid_state = self._multi_grid._overlay_store.get(cam_names[0])
+            if grid_state is None and self._cam_names and self._cam_names[0] == cam_names[0]:
+                grid_state = MultiCameraGrid._save_iv_overlay(self.img_view)
             self._switch_to_single_view()
             self._cam_names = [cam_names[0]]
             existing = [f for f in cam_folder_lists[0] if f.exists() and f.is_dir()]
@@ -6223,11 +6417,18 @@ class Viewer(QWidget):
                     f"Camera folder '{cam_names[0]}' not found.")
                 return
             self.last_open_dir = existing[0]
+            # Pre-load grid_state into img_view so _start_scan saves and restores it
+            if grid_state is not None:
+                MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
             online_flag = self._online_mode or getattr(self, '_pending_online_mode', False)
             self._stop_online_mode()
+            # Save single-cam img_view overlay into multi-grid store before switching
+            if self._cam_names and len(self._cam_names) == 1:
+                self._multi_grid._overlay_store[self._cam_names[0]] = \
+                    MultiCameraGrid._save_iv_overlay(self.img_view)
             self._start_multi_cam_scan(
                 cam_names, cam_folder_lists,
                 axis_override=axis_override,
@@ -6289,9 +6490,7 @@ class Viewer(QWidget):
                 self.btn_set_ref]:
             w.setEnabled(False)
         self.mark_a_ns = None; self.mark_b_ns = None; self.tickbar.set_marks(None, None)
-        self.prog.setVisible(False)
-        self.lbl_scan_progress.setText("")
-        self.btn_cancel_scan.setVisible(False)
+        self.prog.setVisible(False); self.lbl_scan_progress.setText(""); self.btn_cancel_scan.setVisible(False)
 
         self.items = items
         n = len(items)
@@ -6316,7 +6515,7 @@ class Viewer(QWidget):
         ]
         self.axis_override = None
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
+        self._apply_marks_to_tickbar()
         self.slider.setEnabled(True); self.btn_save.setEnabled(True); self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False); self.btn_prev.setEnabled(True); self.btn_next.setEnabled(True)
         self.btn_set_a.setEnabled(True); self.btn_set_b.setEnabled(True)
@@ -6478,6 +6677,19 @@ class Viewer(QWidget):
             if iv is not None:
                 return iv
         return self.img_view
+
+    def _sync_overlay_checkboxes_from_iv(self, iv: "ImageView"):
+        """Sync cb_cross/cb_circle/cb_square to match iv's current overlay state (no signal loops)."""
+        self.cb_cross.blockSignals(True)
+        self.cb_circle.blockSignals(True)
+        self.cb_square.blockSignals(True)
+        self.cb_cross.setChecked(iv.show_cross)
+        self.cb_circle.setChecked(iv.show_circle)
+        self.cb_square.setChecked(iv.show_square)
+        self.cb_cross.blockSignals(False)
+        self.cb_circle.blockSignals(False)
+        self.cb_square.blockSignals(False)
+        self._refresh_draw_btns()
 
     def _on_overlay_changed(self):
         iv = self._active_img_view()
@@ -6811,7 +7023,9 @@ class Viewer(QWidget):
                 self.btn_cal_cross, self.btn_pointing, self.btn_save_ts, self.btn_goto_ts,
                 self.btn_set_ref]:
             w.setEnabled(False)
-        self.mark_a_ns = None; self.mark_b_ns = None; self.tickbar.set_marks(None, None)
+        # Preserve marks across rescan — they are revalidated against the new axis at scan-done time
+        # (do not clear mark_a_ns / mark_b_ns here)
+        self.tickbar.set_marks(None, None)
         fname = folders[0].name if len(folders) == 1 else (f"{folders[0].name} → {folders[-1].name}" if folders else "Multi-camera")
         self.lbl_filename.setText(f"File: {fname}  (scanning…)")
         self.lbl_prague_time.setText("Prague: —"); self.lbl_axis_time.setText("Axis: —")
@@ -6948,7 +7162,7 @@ class Viewer(QWidget):
                 self.tickbar.discrete_tick_labels = None
                 self._fake_ts_map = None
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
+        self._apply_marks_to_tickbar()
         self.slider.setEnabled(True); self.btn_save.setEnabled(True); self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False); self.btn_prev.setEnabled(True); self.btn_next.setEnabled(True)
         self.btn_set_a.setEnabled(True); self.btn_set_b.setEnabled(True)
@@ -6960,7 +7174,7 @@ class Viewer(QWidget):
         self._sc_set_enabled(True)
         self._btn_auto_follow.setEnabled(True)
         self.btn_set_ref.setEnabled(True)
-        self._update_range_ui(); self._on_overlay_changed()
+        self._update_range_ui(); self._sync_overlay_checkboxes_from_iv(self.img_view); self.img_view.update()
         pending_online = getattr(self, '_pending_online_mode', False)
         if pending_online and self.items:
             last_idx = len(self.items) - 1
@@ -7171,6 +7385,21 @@ class Viewer(QWidget):
             self.slider.blockSignals(True)
             self.slider.setValue(sv)
             self.slider.blockSignals(False)
+            # Update per-cam sliders to match this timeline position
+            t_ns = self.items[idx].ts_ns
+            for cam_i, row in enumerate(self._per_cam_rows):
+                cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+                if not cam_ts:
+                    continue
+                frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
+                sv_cam = self._per_cam_ts_to_slider(cam_i, cam_ts[frame_idx])
+                row.set_value(sv_cam)
+            # Update tickbar cursor to master position (if a master is set)
+            master = self._per_cam_master_idx
+            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                cam_ts_m = self._cam_ts[master]
+                fidx = max(0, bisect.bisect_right(cam_ts_m, t_ns) - 1)
+                self.tickbar.set_cursor(cam_ts_m[fidx])
 
         self.play_time_ns = self.items[idx].ts_ns
         self._set_info_for(idx, self.play_time_ns)
@@ -8082,23 +8311,49 @@ class Viewer(QWidget):
             self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
             self._pointing_nav_from_click = False
 
+    def _current_master_ts_ns(self) -> int | None:
+        """Return current timestamp of the master camera (single-cam or multi-cam)."""
+        if self._is_multi_cam():
+            master = self._per_cam_master_idx
+            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                row = self._per_cam_rows[master] if master < len(self._per_cam_rows) else None
+                if row is None:
+                    return None
+                v = row.value()
+                t_raw = self._per_cam_slider_to_ts(master, v)
+                frame_idx = max(0, bisect.bisect_right(self._cam_ts[master], t_raw) - 1)
+                return self._cam_ts[master][frame_idx]
+            return None
+        if not self.items or self.current_idx is None:
+            return None
+        return self.items[self.current_idx].ts_ns
+
     def set_mark_a(self):
-        if not self.items: return
-        t = self._slider_to_time_ns(self.slider.value())
-        idx = self._time_to_nearest_index(t)
-        self.mark_a_ns = self.items[idx].ts_ns
+        ts = self._current_master_ts_ns()
+        if ts is None: return
+        self.mark_a_ns = ts
         self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns); self._update_range_ui()
 
     def set_mark_b(self):
-        if not self.items: return
-        t = self._slider_to_time_ns(self.slider.value())
-        idx = self._time_to_nearest_index(t)
-        self.mark_b_ns = self.items[idx].ts_ns
+        ts = self._current_master_ts_ns()
+        if ts is None: return
+        self.mark_b_ns = ts
         self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns); self._update_range_ui()
 
     def clear_marks(self):
         self.mark_a_ns = None; self.mark_b_ns = None
         self.tickbar.set_marks(None, None); self._update_range_ui()
+
+    def _apply_marks_to_tickbar(self):
+        """Validate stored marks against the current axis and update the tickbar.
+        Marks outside the new axis are cleared so stale out-of-range marks don't show."""
+        ax_min, ax_max = self.axis_min_ns, self.axis_max_ns
+        if ax_max > ax_min:
+            if self.mark_a_ns is not None and not (ax_min <= self.mark_a_ns <= ax_max):
+                self.mark_a_ns = None
+            if self.mark_b_ns is not None and not (ax_min <= self.mark_b_ns <= ax_max):
+                self.mark_b_ns = None
+        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
 
     def _update_range_ui(self):
         ok = (self.mark_a_ns is not None) and (self.mark_b_ns is not None) and bool(self.items)

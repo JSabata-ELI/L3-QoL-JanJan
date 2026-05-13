@@ -469,7 +469,7 @@ class _CamLoadSignals(QObject):
     log_msg  = Signal(str)
 
 class _PreviewSignals(QObject):
-    show = Signal(object, str, int)  # (Path, energy_text, gen)
+    show = Signal(object, str, int)  # (QImage | None, energy_text, gen)
 
 # ── CALENDAR DELEGATE ─────────────────────────────────────────────────────────
 
@@ -774,7 +774,7 @@ class ShotFinderWidget(QWidget):
         self._preview_pixmap_orig = None
         self._preview_gen = 0
         self._preview_sig = _PreviewSignals()
-        self._preview_sig.show.connect(self._show_preview)
+        self._preview_sig.show.connect(self._on_preview_ready)
         atexit.register(self._cleanup_temp)
 
         self._build_ui()
@@ -797,110 +797,55 @@ class ShotFinderWidget(QWidget):
         super().resizeEvent(event)
         # _PreviewWidget se překresluje sám přes paintEvent — nic navíc nepotřebujeme
 
-    def _show_preview(self, img_path: Path, energy_text: str = "", gen: int = 0):
-        """Zobraz náhled obrázku v preview panelu."""
-        if gen != 0 and gen != self._preview_gen:
+    def _on_preview_ready(self, out_img, energy_text: str, gen: int):
+        """Main-thread slot — receives processed QImage from background thread,
+        converts to QPixmap and paints energy overlay here (QPixmap requires main thread)."""
+        if gen != self._preview_gen:
             return
-        try:
-            from PySide6.QtGui import QImageReader, QImage
-            import numpy as _np
-
-            reader = QImageReader(str(img_path))
-            reader.setAutoTransform(True)
-            qimg = reader.read()
-            if qimg.isNull():
-                self._preview_widget.set_pixmap(None)
-                return
-
-            if qimg.format() != QImage.Format.Format_Grayscale8:
-                qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
-
-            w, h = qimg.width(), qimg.height()
-            ptr = qimg.bits()
-            if hasattr(ptr, "setsize"):
-                ptr.setsize(qimg.sizeInBytes())
-            arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape(
-                h, qimg.bytesPerLine())[:, :w].copy()
-
-            # Autostretch
-            lo, hi = _np.percentile(arr, [0.1, 99.9])
-            if hi > lo + 2:
-                arr = _np.clip(
-                    (arr.astype(_np.float32) - lo) / (hi - lo) * 255.0,
-                    0, 255).astype(_np.uint8)
-
-            # Aplikuj gradient
-            try:
-                _is_mod = _sys.modules.get("image_slider")
-                if _is_mod and hasattr(_is_mod, "GRADIENTS"):
-                    lut = _is_mod.GRADIENTS.get(self._gradient_cb.currentText())
-                else:
-                    lut = SF_GRADIENTS.get(self._gradient_cb.currentText())
-            except Exception:
-                lut = SF_GRADIENTS.get(self._gradient_cb.currentText(), None)
-
-            if lut is not None:
-                rgb = lut[arr]
-                out_img = QImage(rgb.tobytes(), w, h, w * 3,
-                                 QImage.Format.Format_RGB888)
-            else:
-                out_img = QImage(arr.tobytes(), w, h, w,
-                                 QImage.Format.Format_Grayscale8)
-
-            from PySide6.QtGui import QPixmap, QPainter, QFont, QColor
-            from PySide6.QtCore import QRect
-            pm = QPixmap.fromImage(out_img)
-
-            if energy_text:
-                from PySide6.QtGui import QPixmap, QPainter, QFont, QColor, QFontMetrics
-                from PySide6.QtCore import QRect
-                available_w = pm.width() - 20
-                font = QFont()
-                display_text = energy_text
-
-                # Zkus vejít na jeden řádek
-                fitted = False
-                for fsize in range(22, 8, -1):
+        if out_img is None:
+            self._preview_pixmap_orig = None
+            self._preview_widget.set_pixmap(None)
+            return
+        from PySide6.QtGui import QPixmap, QPainter, QFont, QColor, QFontMetrics
+        from PySide6.QtCore import QRect
+        pm = QPixmap.fromImage(out_img)
+        if energy_text:
+            available_w = pm.width() - 20
+            font = QFont()
+            display_text = energy_text
+            fitted = False
+            for fsize in range(22, 8, -1):
+                font.setPixelSize(fsize)
+                fm = QFontMetrics(font)
+                if fm.horizontalAdvance(energy_text) <= available_w:
+                    fitted = True
+                    break
+            if not fitted:
+                parts_split = energy_text.split("  |  ")
+                mid = len(parts_split) // 2
+                display_text = "  |  ".join(parts_split[:mid]) + "\n" + "  |  ".join(parts_split[mid:])
+                for fsize in range(18, 8, -1):
                     font.setPixelSize(fsize)
                     fm = QFontMetrics(font)
-                    if fm.horizontalAdvance(energy_text) <= available_w:
-                        fitted = True
+                    max_line = max(fm.horizontalAdvance(l) for l in display_text.split("\n"))
+                    if max_line <= available_w:
                         break
-
-                if not fitted:
-                    parts_split = energy_text.split("  |  ")
-                    mid = len(parts_split) // 2
-                    display_text = "  |  ".join(parts_split[:mid]) + "\n" + "  |  ".join(parts_split[mid:])
-                    for fsize in range(18, 8, -1):
-                        font.setPixelSize(fsize)
-                        fm = QFontMetrics(font)
-                        max_line = max(fm.horizontalAdvance(l) for l in display_text.split("\n"))
-                        if max_line <= available_w:
-                            break
-
-                fm = QFontMetrics(font)
-                line_count = display_text.count("\n") + 1
-                bar_h = max(38, fm.height() * line_count + 16)
-
-                combined = QPixmap(pm.width(), pm.height() + bar_h)
-                combined.fill(QColor(255, 255, 255))
-                painter = QPainter(combined)
-                painter.drawPixmap(0, 0, pm)
-                bar_rect = QRect(0, pm.height(), pm.width(), bar_h)
-                painter.fillRect(bar_rect, QColor(255, 255, 255))
-                painter.setFont(font)
-                painter.setPen(QColor(0, 0, 0))
-                painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, display_text)
-                painter.end()
-                pm = combined
-
-            from PySide6.QtGui import QPixmap
-            self._preview_pixmap_orig = pm
-            self._rescale_preview()
-            return
-
-        except Exception:
-            self._preview_widget.set_pixmap(None)
+            fm = QFontMetrics(font)
+            line_count = display_text.count("\n") + 1
+            bar_h = max(38, fm.height() * line_count + 16)
+            combined = QPixmap(pm.width(), pm.height() + bar_h)
+            combined.fill(QColor(255, 255, 255))
+            painter = QPainter(combined)
+            painter.drawPixmap(0, 0, pm)
+            bar_rect = QRect(0, pm.height(), pm.width(), bar_h)
+            painter.fillRect(bar_rect, QColor(255, 255, 255))
+            painter.setFont(font)
+            painter.setPen(QColor(0, 0, 0))
+            painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, display_text)
+            painter.end()
+            pm = combined
+        self._preview_pixmap_orig = pm
+        self._rescale_preview()
 
     # ── LOGGING ───────────────────────────────────────────────────────────────
 
@@ -1422,14 +1367,62 @@ class ShotFinderWidget(QWidget):
 
         self._preview_gen += 1
         gen = self._preview_gen
+        gradient_name = self._gradient_cb.currentText()
         threading.Thread(
-            target=lambda: self._load_and_show_preview(img, energy_text, gen),
+            target=lambda: self._load_and_show_preview(img, energy_text, gen, gradient_name),
             daemon=True).start()
 
-    def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int):
+    def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int, gradient_name: str = ""):
+        """Background thread: load and process image into QImage; QPixmap conversion on main thread."""
         if gen != self._preview_gen:
             return
-        self._preview_sig.show.emit(img_path, energy_text, gen)
+        try:
+            from PySide6.QtGui import QImageReader, QImage
+            import numpy as _np
+
+            reader = QImageReader(str(img_path))
+            reader.setAutoTransform(True)
+            qimg = reader.read()
+            if qimg.isNull():
+                self._preview_sig.show.emit(None, energy_text, gen)
+                return
+
+            if qimg.format() != QImage.Format.Format_Grayscale8:
+                qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
+
+            w, h = qimg.width(), qimg.height()
+            ptr = qimg.bits()
+            if hasattr(ptr, "setsize"):
+                ptr.setsize(qimg.sizeInBytes())
+            arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape(
+                h, qimg.bytesPerLine())[:, :w].copy()
+
+            lo, hi = _np.percentile(arr, [0.1, 99.9])
+            if hi > lo + 2:
+                arr = _np.clip(
+                    (arr.astype(_np.float32) - lo) / (hi - lo) * 255.0,
+                    0, 255).astype(_np.uint8)
+
+            try:
+                _is_mod = _sys.modules.get("image_slider")
+                if _is_mod and hasattr(_is_mod, "GRADIENTS"):
+                    lut = _is_mod.GRADIENTS.get(gradient_name)
+                else:
+                    lut = SF_GRADIENTS.get(gradient_name)
+            except Exception:
+                lut = SF_GRADIENTS.get(gradient_name, None)
+
+            if lut is not None:
+                rgb = lut[arr]
+                out_img = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+            else:
+                out_img = QImage(arr.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+
+            if gen != self._preview_gen:
+                return
+            self._preview_sig.show.emit(out_img, energy_text, gen)
+        except Exception:
+            self._preview_sig.show.emit(None, energy_text, gen)
 
     def _rescale_preview(self):
         if self._preview_pixmap_orig is None or self._preview_pixmap_orig.isNull():
@@ -2002,8 +1995,9 @@ class ShotFinderWidget(QWidget):
                 energy2 = f"{short2}: {val2}"
                 _gen2 = self._preview_gen + 1
                 self._preview_gen = _gen2
+                _gname2 = self._gradient_cb.currentText()
                 threading.Thread(
-                    target=lambda p=img2, e=energy2, g=_gen2: self._load_and_show_preview(p, e, g),
+                    target=lambda p=img2, e=energy2, g=_gen2, gn=_gname2: self._load_and_show_preview(p, e, g, gn),
                     daemon=True).start()
 
         tbl.selectionModel().selectionChanged.connect(_on_dlg_row_selected)
