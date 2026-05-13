@@ -55,7 +55,7 @@ DEFAULT_SAMPLE_NEAR = 6
 DEFAULT_TOL_KB      = 30.0
 MAX_SCAN_FILES      = 2000  # max files to stat() per folder (network perf)
 
-MIN_FULL_FILES     = 5
+MIN_FULL_FILES     = 1
 ACT_MAX_GAP_S      = 120
 MIN_SEG_ROWS       = 25
 MIN_SEG_DURATION_S = 10 * 60
@@ -105,7 +105,7 @@ ENERGY_COLUMNS_DISPLAY: dict[str, str] = {
 }
 
 # Match tolerance in seconds: |t_image - t_csv| must be ≤ this value
-ENERGY_MATCH_TOL_S = 0.55
+ENERGY_MATCH_TOL_S = 2.0
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
 CPVA_BASE_URL     = "https://10.78.0.57:8443/api/1.0/cpva"
@@ -113,7 +113,18 @@ CPVA_HTTP_TIMEOUT = 10.0   # seconds per request
 
 # Channel used to find the best shot (highest energy = real shot, not dark/empty)
 CPVA_SHOT_CHANNEL = "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy"
-CPVA_SBW4_CHANNEL = "HAPLS-ENER_IN_SBW4_LT7_DIAG2:Energy"
+CPVA_SBW4_CHANNEL = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
+
+# Maps energy CSV column name → CPVA archiver channel name for API lookup
+CPVA_CHANNEL_MAP: dict[str, str] = {
+    "ptm1":      "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+    "pcm2":      "HAPLS-ENER_IN_PCM2_LT6_DIAG2:Energy",
+    "pcm4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+    "pap1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+    "sbw4":      "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    "Back_Ref":  "L3-PM03-023:Energy",
+    "waveplate": "L3-PFWP6-MTR03-1:RawPos",
+}
 
 
 def _cpva_ssl_ctx() -> ssl.SSLContext:
@@ -576,6 +587,129 @@ def _load_energy_csv(csv_path: Path) -> list[_EnergyRow]:
     return rows
 
 
+def _energy_api_for_day(
+    dt: datetime,
+    cols: list[str],
+    csv_root: "str | None" = None,
+    log=None,
+) -> "tuple[list[_EnergyRow], dict[str, list[_EnergyRow]]]":
+    """
+    Query CPVA archiver for the given day and return (_EnergyRow list, per_col dict).
+    Falls back column-by-column to CSV when API returns nothing.
+    dt should be a naive Prague-local datetime (used only for the date).
+
+    Returns:
+      - merged: list[_EnergyRow] sorted by timestamp (merged across all channels)
+      - per_col: dict[str, list[_EnergyRow]] mapping each column to sorted rows that
+                 have a value for that column (used for per-column closest-timestamp lookup)
+    """
+    from datetime import date as _date
+    day = _date(dt.year, dt.month, dt.day)
+
+    def _log(msg):
+        if log is not None:
+            log(msg)
+
+    if PRAGUE is None:
+        day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc)
+    else:
+        day_start = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=PRAGUE)
+        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=PRAGUE)
+
+    start_ns = int(day_start.timestamp() * 1_000_000_000)
+    end_ns   = int(day_end.timestamp()   * 1_000_000_000)
+
+    # Collect per-column rows: {t_ns: {col: value, ...}}
+    by_ts: dict[int, dict] = {}
+    # Per-column row lists: col -> list of (t_ns, dt_local, val)
+    per_col_raw: dict[str, list[tuple[int, datetime, str]]] = {}
+
+    for col in cols:
+        channel = CPVA_CHANNEL_MAP.get(col)
+        col_rows: list[tuple[int, datetime, str]] = []  # (ns, dt_local, val)
+
+        if channel is not None:
+            channels_to_try = [channel]
+            if not channel.endswith(".value"):
+                channels_to_try.append(channel + ".value")
+            for ch_try in channels_to_try:
+                try:
+                    samples = _cpva_fetch_samples(ch_try, start_ns, end_ns)
+                    if not isinstance(samples, list):
+                        continue
+                    parsed = 0
+                    for s in samples:
+                        t_ns = s.get("time")
+                        if t_ns is None:
+                            continue
+                        val = s.get("value")
+                        if isinstance(val, list):
+                            val = val[0] if val else None
+                        if val is None:
+                            continue
+                        t_ns = int(t_ns)
+                        if PRAGUE is not None:
+                            dt_local = datetime.fromtimestamp(
+                                t_ns / 1e9, tz=timezone.utc).astimezone(PRAGUE).replace(tzinfo=None)
+                        else:
+                            dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
+                        col_rows.append((t_ns, dt_local, str(val)))
+                        parsed += 1
+                    _log(f"  API {col} ({ch_try}): {len(samples)} raw → {parsed} parsed")
+                    if parsed > 0:
+                        break
+                except Exception as exc:
+                    _log(f"  API {col} ({ch_try}) ERROR: {type(exc).__name__}: {exc}")
+        else:
+            _log(f"  {col}: no CPVA channel mapping, trying CSV only")
+
+        # CSV fallback if API returned nothing
+        if not col_rows:
+            root = csv_root if csv_root is not None else ENERGY_CSV_ROOT
+            fname = dt.strftime(ENERGY_CSV_NAME_FMT) + ".csv"
+            csv_path = Path(root) / fname
+            csv_rows = _load_energy_csv(csv_path)
+            for r in csv_rows:
+                if col in r.values:
+                    # Convert Prague-naive dt to ns
+                    if PRAGUE is not None:
+                        t_ns = int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
+                    else:
+                        t_ns = int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000)
+                    col_rows.append((t_ns, r.ts_dt, r.values[col]))
+            if col_rows:
+                _log(f"  CSV fallback {col}: {len(col_rows)} rows")
+
+        if col_rows:
+            per_col_raw[col] = col_rows
+
+        for t_ns, dt_local, val in col_rows:
+            if t_ns not in by_ts:
+                by_ts[t_ns] = {}
+            by_ts[t_ns].setdefault("_dt", dt_local)
+            by_ts[t_ns][col] = val
+
+    # Convert to _EnergyRow objects sorted by timestamp
+    result: list[_EnergyRow] = []
+    for t_ns in sorted(by_ts):
+        entry = by_ts[t_ns]
+        dt_local = entry.get("_dt", datetime.utcfromtimestamp(t_ns / 1e9))
+        values = {k: v for k, v in entry.items() if k != "_dt"}
+        result.append(_EnergyRow(dt_local, values))
+
+    # Build per_col: col -> sorted list of _EnergyRow that have only that col's value
+    per_col: dict[str, list[_EnergyRow]] = {}
+    for col, rows_raw in per_col_raw.items():
+        rows_raw_sorted = sorted(rows_raw, key=lambda x: x[0])
+        per_col[col] = [
+            _EnergyRow(dt_local, {col: val})
+            for t_ns, dt_local, val in rows_raw_sorted
+        ]
+
+    return result, per_col
+
+
 def _find_energy_match(
     rows: list[_EnergyRow],
     img_ts_ns: int,
@@ -606,6 +740,43 @@ def _find_energy_match(
     before = rows[idx - 1] if idx > 0 else None
     after  = rows[idx]     if idx < len(rows) else None
     return None, before, after
+
+def _find_closest_per_col_value(
+    per_col: "dict[str, list[_EnergyRow]]",
+    col: str,
+    target_ns: int,
+    tol_s: float = 2.0,
+) -> str:
+    """
+    Find the closest-timestamp value for `col` in per_col within tol_s seconds of target_ns.
+    per_col maps column name -> sorted list of _EnergyRow objects that have a value for that col.
+    Returns the formatted-raw value string, or "—" if no row is within tolerance.
+    """
+    rows = per_col.get(col)
+    if not rows:
+        return "—"
+    # Build ns list for binary search
+    ns_list = []
+    for r in rows:
+        if PRAGUE is not None:
+            r_ns = int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
+        else:
+            r_ns = int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000)
+        ns_list.append(r_ns)
+    idx = bisect.bisect_left(ns_list, target_ns)
+    best_val = None
+    best_diff = float("inf")
+    for i in [idx - 1, idx]:
+        if 0 <= i < len(rows):
+            diff = abs(ns_list[i] - target_ns)
+            if diff < best_diff:
+                best_diff = diff
+                best_val = rows[i].values.get(col, "—")
+    tol_ns = int(tol_s * 1_000_000_000)
+    if best_val is not None and best_diff <= tol_ns:
+        return best_val
+    return "—"
+
 
 def _format_energy_diff_s(diff_s: float) -> str:
     """Format a time difference in seconds to a readable string."""
@@ -1316,6 +1487,7 @@ class _LoadSignals(QObject):
     done      = Signal(list, dict, int)
     not_found = Signal(object)
     error     = Signal(str)
+    log_msg   = Signal(str)
 
 class _CollectSignals(QObject):
     done = Signal(list)
@@ -1328,6 +1500,9 @@ class _AutoHourSignals(QObject):
     """Signals for _apply_auto_hour_for_selected_day worker."""
     apply   = Signal(str, int, int, bool)  # msg, ui_hour, day_shift, use_lab
     log_msg = Signal(str)
+
+class _LogSignals(QObject):
+    msg = Signal(str)
 
 
 # ── MAIN WIDGET ───────────────────────────────────────────────────────────────
@@ -1380,6 +1555,8 @@ class ImageFinderWidget(QWidget):
         self._energy_selected_cols: list[str] = list(ENERGY_COLUMNS_DEFAULT)
         # Cached CSV rows for the last loaded day: {date_str: list[_EnergyRow]}
         self._energy_cache: dict[str, list[_EnergyRow]] = {}
+        # Per-column cache: {date_str: dict[str, list[_EnergyRow]]}
+        self._energy_per_col_cache: dict[str, dict] = {}
         # Last energy lookup results: list of (Path, match|None, before|None, after|None)
         self._energy_results: list[tuple] = []
         self._energy_csv_offset: int = 0   # offset from matched row when navigating outside image set¨
@@ -1389,7 +1566,12 @@ class ImageFinderWidget(QWidget):
         self._energy_pool = QThreadPool()
         self._energy_pool.setMaxThreadCount(1)
 
+        self._log_sig = _LogSignals()
+        self._log_sig.msg.connect(self._log)
+
         self._build_ui()
+        # Trigger today's load after the event loop starts
+        QTimer.singleShot(0, self._auto_select_today)
 
     # ── LOGGING ───────────────────────────────────────────────────────────────
     def _set_busy(self, busy: bool):
@@ -1401,11 +1583,19 @@ class ImageFinderWidget(QWidget):
             btn.setEnabled(not busy)
     
     def _log(self, msg: str):
+        """Main-thread log. Safe to call from any thread via _log_safe."""
         print(msg)
         if hasattr(self, "_log_box"):
             self._log_box.appendPlainText(str(msg))
             sb = self._log_box.verticalScrollBar()
             sb.setValue(sb.maximum())
+
+    def _log_safe(self, msg: str):
+        """Thread-safe: routes through Qt signal so Qt widget is only touched on main thread."""
+        try:
+            self._log_sig.msg.emit(str(msg))
+        except Exception:
+            print(msg)
 
     # ── DEBOUNCED AUTOLOAD ────────────────────────────────────────────────────
     def _schedule_autoload(self, delay_ms: int = 150):
@@ -1867,6 +2057,13 @@ class ImageFinderWidget(QWidget):
         self._table.blockSignals(False)
 
     # ── EVENTS ────────────────────────────────────────────────────────────────
+    def _auto_select_today(self):
+        """Called once after startup — simulate selecting today's date."""
+        self._user_has_selected_day = True
+        qd = self._cal.selectedDate()
+        self._log(f"Auto-selecting today: {qd.day():02d}.{qd.month():02d}.{qd.year()}")
+        self._apply_auto_hour_for_selected_day()
+
     def _on_calendar_selected(self):
         self._user_has_selected_day = True
         self._status_dot.setStyleSheet("color: gray; font-size: 12px;")
@@ -1913,32 +2110,44 @@ class ImageFinderWidget(QWidget):
     def _get_energy_rows_for_dt(self, dt: datetime) -> list[_EnergyRow]:
         """
         Return cached energy rows for the date of dt.
-        Loads synchronously (called from background thread in _collect).
+        Tries CPVA API first; falls back to CSV. Called from background thread.
+        Also populates self._energy_per_col_cache for per-column closest-timestamp lookups.
         """
         day_key = dt.strftime("%Y-%m-%d")
         if day_key in self._energy_cache:
             return self._energy_cache[day_key]
+        cols = self._energy_selected_cols
+        if cols:
+            rows, per_col = _energy_api_for_day(dt, cols, log=self._log_safe)
+            if rows:
+                self._log_safe(f"ENERGY: {len(rows)} rows via API for {day_key}")
+                self._energy_cache[day_key] = rows
+                self._energy_per_col_cache[day_key] = per_col
+                return rows
+        # CSV fallback
         csv_path = _energy_csv_path(dt)
         rows = _load_energy_csv(csv_path)
         self._energy_cache[day_key] = rows
+        self._energy_per_col_cache[day_key] = {}  # no per_col from CSV fallback
         if rows:
-            self._log(f"ENERGY: loaded {len(rows)} rows from {csv_path.name}")
+            self._log_safe(f"ENERGY: {len(rows)} rows from CSV {csv_path.name}")
         else:
-            self._log(f"ENERGY: no data at {csv_path}")
+            self._log_safe(f"ENERGY: no data (API + CSV) for {day_key}")
         return rows
 
     def _lookup_energy_for_files(self, files: list[Path]) -> list[tuple]:
         """
         For each file, look up a matching CSV row.
-        Returns list of (path, match, before, after, csv_rows, match_idx) tuples.
+        Returns list of (path, match, before, after, csv_rows, match_idx, per_col) tuples.
         csv_rows: full list of _EnergyRow for that day
         match_idx: index in csv_rows of the matched row (or nearest before), or None
+        per_col: dict[str, list[_EnergyRow]] mapping each column to sorted per-column rows
         """
         results = []
         for path in files:
             ns = extract_ns_from_stem(path.stem)
             if ns is None:
-                results.append((path, None, None, None, [], None))
+                results.append((path, None, None, None, [], None, {}))
                 continue
             dt = datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc)
             if PRAGUE:
@@ -1946,6 +2155,8 @@ class ImageFinderWidget(QWidget):
             else:
                 dt = dt.replace(tzinfo=None)
             rows = self._get_energy_rows_for_dt(dt)
+            day_key = dt.strftime("%Y-%m-%d")
+            per_col = self._energy_per_col_cache.get(day_key, {})
             match, before, after = _find_energy_match(rows, ns)
 
             # Find match_idx — index of matched row, or index of 'before' row
@@ -1961,7 +2172,7 @@ class ImageFinderWidget(QWidget):
                 except ValueError:
                     pass
 
-            results.append((path, match, before, after, rows, match_idx))
+            results.append((path, match, before, after, rows, match_idx, per_col))
         return results
 
     def _refresh_energy_info(self):
@@ -2028,6 +2239,7 @@ class ImageFinderWidget(QWidget):
         after  = entry[3]
         csv_rows: list = entry[4] if len(entry) > 4 else []
         match_idx = entry[5] if len(entry) > 5 else None
+        per_col_for_entry: dict = entry[6] if len(entry) > 6 else {}
 
         # Set anchor when entering CSV mode or switching images
         if self._energy_csv_anchor_idx is None or self._energy_csv_anchor_rows is not csv_rows:
@@ -2085,9 +2297,15 @@ class ImageFinderWidget(QWidget):
 
         elif match is not None:
             # ── Matched image ─────────────────────────────────────────────
+            img_ns = ns_stem or 0
             parts = []
             for col in self._energy_selected_cols:
-                val   = _format_energy_value(col, match.values.get(col, "—"))
+                raw_val = match.values.get(col, "")
+                if not raw_val or raw_val == "—":
+                    # Fallback: search per_col for nearest value within 2s
+                    raw_val = _find_closest_per_col_value(
+                        per_col_for_entry, col, img_ns, tol_s=2.0)
+                val   = _format_energy_value(col, raw_val)
                 label = ENERGY_COLUMNS_DISPLAY.get(col, col)
                 parts.append(f"{label}={val}")
             lines.append(f"📷 {name}\n  " + "  |  ".join(parts))
@@ -2208,13 +2426,13 @@ class ImageFinderWidget(QWidget):
 
         t = threading.Thread(target=probe, daemon=True)
         t.start()
-        t.join(timeout=5.0)
+        t.join(timeout=1.0)
 
         if found[0] is None:
             if t.is_alive():
-                self._log(f"RAMPING: timeout reaching {self.RAMPING_ROOT}")
+                self._log_safe(f"RAMPING: timeout reaching {self.RAMPING_ROOT}")
             else:
-                self._log(f"RAMPING: no CSV files found in {self.RAMPING_ROOT}")
+                self._log_safe(f"RAMPING: no CSV files found in {self.RAMPING_ROOT}")
             self._ramping_cache[key] = []
             return []
 
@@ -2229,16 +2447,19 @@ class ImageFinderWidget(QWidget):
 
         if not out:
             names = [p.name for p in found[0][:3]]
-            self._log(f"RAMPING: files found {names} but no rows match {day}")
+            self._log_safe(f"RAMPING: files found {names} but no rows match {day}")
 
         out.sort(key=lambda t: t[0])
         self._ramping_cache[key] = out
         return out
 
+    _DEFAULT_HOUR = 14
+
     def _pick_best_block_real_hour(self, day):
         rows = self._get_ramping_for_day_cached(day)
         if not rows:
-            return None, f"RAMPING: no CSV data found for {day} — auto-hour not applied."
+            default_dt = datetime(day.year, day.month, day.day, self._DEFAULT_HOUR)
+            return default_dt, f"RAMPING: no CSV data for {day} — using default hour {self._DEFAULT_HOUR:02d}:00"
         has_any = any(r[4] is not None for r in rows)
         if has_any:
             on = [r for r in rows if r[4] == 1]
@@ -2331,12 +2552,15 @@ class ImageFinderWidget(QWidget):
         if self._auto_hour_last_day == day:
             return
         self._auto_hour_last_day = day
-        self._ensure_ramping_root()
 
-        # Start folder loading immediately with the current hour —
-        # don't make the user wait for the ramping CSV lookup.
+        # Immediately set default hour and start loading — don't wait for CSV.
+        self._hour_cb.blockSignals(True)
+        self._hour_cb.setCurrentIndex(self._DEFAULT_HOUR)
+        self._hour_cb.blockSignals(False)
         self._schedule_autoload(50)
 
+        # In background: try CSV auto-hour; if it differs from default, reload.
+        self._ensure_ramping_root()
         self._auto_hour_sig = _AutoHourSignals()
         self._auto_hour_sig.log_msg.connect(self._log)
         self._auto_hour_sig.apply.connect(self._apply_auto_hour_ui)
@@ -2349,17 +2573,8 @@ class ImageFinderWidget(QWidget):
                     return
                 chosen_real_hour = hr_dt.hour
                 use_lab = self._lab_time_cb.isChecked()
-                if not use_lab:
-                    # CSV timestamps are in Prague time.
-                    # folder_hour = chosen_real_hour - utc_offset
-                    # ui_hour = folder_hour + utc_offset = chosen_real_hour (no change needed)
-                    # But _build_datetime subtracts utc_offset from ui_hour to get folder_hour,
-                    # so we must pass ui_hour = chosen_real_hour (Prague), not +1.
-                    ui_hour   = chosen_real_hour
-                    day_shift = 0
-                else:
-                    ui_hour   = chosen_real_hour
-                    day_shift = 0
+                ui_hour   = chosen_real_hour
+                day_shift = 0
                 self._auto_hour_sig.apply.emit(msg, ui_hour, day_shift, use_lab)
             except Exception as e:
                 self._auto_hour_sig.log_msg.emit(f"RAMPING AUTO error: {e}")
@@ -2367,7 +2582,7 @@ class ImageFinderWidget(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_auto_hour_ui(self, msg: str, ui_hour: int, day_shift: int, use_lab: bool):
-        """Slot — runs on main thread. Applies auto-hour result to UI."""
+        """Slot — runs on main thread. Applies auto-hour result from background CSV lookup."""
         self._log(msg)
         current_hour = self._hour_cb.currentIndex()
         hour_changed = (ui_hour != current_hour) or (day_shift == 1)
@@ -2395,6 +2610,7 @@ class ImageFinderWidget(QWidget):
             f"{(ui_hour - (0 if use_lab else utc_offset_h)) % 24:02d}:00"
         )
         self._log_selected_datetime_preview()
+        # Only reload if auto-hour changed from what we already loaded
         if hour_changed:
             self._schedule_autoload(50)
 
@@ -2460,55 +2676,50 @@ class ImageFinderWidget(QWidget):
         self._load_sig.done.connect(self._on_load_done)
         self._load_sig.not_found.connect(self._on_load_not_found)
         self._load_sig.error.connect(self._on_load_error)
+        self._load_sig.log_msg.connect(self._log)
+        _sig = self._load_sig  # local ref — prevents GC if load_folders() called again
 
         def worker():
             try:
                 # Try target hour first, then walk back up to 3 hours if not found.
-                # This handles cases where auto-hour lands on a non-existent folder
-                # (e.g. shooting ended at 17:59, auto-hour suggests 19 Prague time).
                 path_to_use = None
-                tried = []
+                cached_entries: list[Path] = []
                 for delta in [0, -1, -2, -3, 1, 2, 3]:
                     candidate = self._build_target_path(
                         dt + timedelta(hours=delta))
-                    tried.append(str(candidate).split("\\")[-1] + f"h (Δ{delta:+d})")
-                    if candidate.exists() and candidate.is_dir():
-                        # Count camera subfolders — hour folder contains subfolders, not images directly
-                        try:
-                            subfolder_count = sum(
-                                1 for e in os.scandir(candidate) if e.is_dir()
-                            )
-                        except Exception:
-                            subfolder_count = 0
-
-                        if subfolder_count < MIN_FULL_FILES:
-                            self._log(
-                                f"LOAD: {candidate.name} má jen {subfolder_count} podsložek "
-                                f"(min={MIN_FULL_FILES}), zkouším Δ{delta:+d}h dál"
-                            )
-                            if delta <= 0:
-                                continue
-
-                        path_to_use = candidate
-                        if delta != 0:
-                            self._log(
-                                f"LOAD: hour folder {target_path.name} not found nebo málo souborů, "
-                                f"using {candidate.name} (Δ{delta:+d}h) subfolders={subfolder_count}"
-                            )
-                        break
+                    try:
+                        exists = candidate.exists() and candidate.is_dir()
+                    except Exception:
+                        exists = False
+                    if not exists:
+                        _sig.log_msg.emit(f"LOAD: Δ{delta:+d}h  {candidate}  — neexistuje")
+                        continue
+                    # Scan once and reuse — avoids a second network traversal
+                    try:
+                        entries = [Path(e.path) for e in os.scandir(candidate) if e.is_dir()]
+                    except Exception:
+                        entries = []
+                    subfolder_count = len(entries)
+                    _sig.log_msg.emit(f"LOAD: Δ{delta:+d}h  {candidate.name}  podsložky={subfolder_count}")
+                    if subfolder_count < MIN_FULL_FILES:
+                        continue
+                    path_to_use = candidate
+                    cached_entries = entries
+                    if delta != 0:
+                        _sig.log_msg.emit(
+                            f"LOAD: using {candidate.name} (Δ{delta:+d}h) subfolders={subfolder_count}"
+                        )
+                    break
 
                 if path_to_use is None:
-                    self._load_sig.not_found.emit(target_path)
+                    _sig.not_found.emit(target_path)
                     return
 
-                subfolders = sorted(
-                    [p for p in path_to_use.iterdir() if p.is_dir()],
-                    key=lambda x: x.name.lower()
-                )
-                self._log(f"LOAD: found {len(subfolders)} subfolders, delivering to UI")
-                self._load_sig.done.emit(subfolders, saved_sel, current_gen)
+                subfolders = sorted(cached_entries, key=lambda x: x.name.lower())
+                _sig.log_msg.emit(f"LOAD: found {len(subfolders)} subfolders, delivering to UI")
+                _sig.done.emit(subfolders, saved_sel, current_gen)
             except Exception as e:
-                self._load_sig.error.emit(f"{type(e).__name__}: {e}")
+                _sig.error.emit(f"{type(e).__name__}: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3156,16 +3367,6 @@ class ImageFinderWidget(QWidget):
             if folder is None: continue
             jobs.append((folder, max(0, qty)))
         return jobs
-    # ── COLLECT JOBS ──────────────────────────────────────────────────────────
-    def _snapshot_collect_jobs(self) -> list[tuple[Path, int]]:
-        jobs = []
-        for r in range(self._table.rowCount()):
-            if not self._checked.get(r, False): continue
-            qty    = self._get_qty(r)
-            folder = self._row_to_path.get(r)
-            if folder is None: continue
-            jobs.append((folder, max(0, qty)))
-        return jobs
 
     # ── SMB LISTING CACHE ─────────────────────────────────────────────────────
     def _get_items_cached(self, folder: Path, debug_log=None, scan_limit: int = None):
@@ -3354,12 +3555,12 @@ class ImageFinderWidget(QWidget):
 
     # ── ASYNC COLLECT ─────────────────────────────────────────────────────────
     def _collect_primary_files_now(self, jobs: list[tuple[Path, int]]) -> list[Path]:
-        self._log(f"_collect_primary_files_now: start, {len(jobs)} jobs")
+        self._log_safe(f"_collect_primary_files_now: start, {len(jobs)} jobs")
         if not jobs: return []
         files = []; t0 = time.perf_counter()
 
         def mk_debug_log(folder_name: str):
-            return lambda s: self._log(f"{folder_name}: {s}")
+            return lambda s: self._log_safe(f"{folder_name}: {s}")
 
         def worker(folder: Path, qty: int):
             chosen = self.select_images_from_folder(
@@ -3371,17 +3572,17 @@ class ImageFinderWidget(QWidget):
             return folder, qty, chosen
 
         max_workers = min(8, len(jobs))
-        self._log(f"COLLECT: parallel scan max_workers={max_workers}")
+        self._log_safe(f"COLLECT: parallel scan max_workers={max_workers}")
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(worker, f, q) for f, q in jobs]
             for fut in as_completed(futs):
                 try:
                     folder, qty, chosen = fut.result()
                     files.extend(chosen)
-                    self._log(f"- {folder.name}: selected {len(chosen)}/{qty}")
+                    self._log_safe(f"- {folder.name}: selected {len(chosen)}/{qty}")
                 except Exception as e:
-                    self._log(f"COLLECT worker ERROR: {type(e).__name__}: {e}")
-        self._log(f"COLLECT DONE: total files = {len(files)} | total_time={time.perf_counter()-t0:.3f}s")
+                    self._log_safe(f"COLLECT worker ERROR: {type(e).__name__}: {e}")
+        self._log_safe(f"COLLECT DONE: total files = {len(files)} | total_time={time.perf_counter()-t0:.3f}s")
         return files
 
     def _collect_primary_files_async(self, on_done):
@@ -3409,11 +3610,12 @@ class ImageFinderWidget(QWidget):
         self._collect_sig.done.connect(on_sig_done)
 
         def worker():
-            self._log("collect worker thread: start")
+            self._log_safe("collect worker thread: start")
             try:
                 files = self._collect_primary_files_now(jobs)
             except Exception as e:
-                self._log(f"COLLECT ERROR: {type(e).__name__}: {e}")
+                import traceback
+                self._log_safe(f"COLLECT ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}")
                 files = []
             try:
                 _my_sig.done.emit(files)
@@ -3510,28 +3712,29 @@ class ImageFinderWidget(QWidget):
         self._collect_primary_files_async(after_collect)
 
     def _run_energy_lookup_async(self, files: list[Path], on_done=None):
-        """Look up CSV energy data for files in a background thread, then update UI."""
+        """Look up energy data for files in a background thread, then update UI."""
         self._energy_sig = _CollectSignals()
+        _sig = self._energy_sig  # local ref — prevents GC if called again
 
         def on_results(results: list):
-            self._energy_sig = None
             if on_done is not None:
                 on_done(results)
             else:
                 self._energy_results = results
                 self._refresh_energy_info()
 
-        self._energy_sig.done.connect(on_results)
+        _sig.done.connect(on_results)
 
         def worker():
             try:
-                self._log("ENERGY worker: start")
+                print("ENERGY worker: start")
                 results = self._lookup_energy_for_files(files)
-                self._log(f"ENERGY worker: done, {len(results)} results")
-                self._energy_sig.done.emit(results)
+                print(f"ENERGY worker: done, {len(results)} results")
+                _sig.done.emit(results)
             except Exception as e:
-                self._log(f"Energy lookup error: {e}")
-                self._energy_sig.done.emit([])
+                import traceback
+                print(f"Energy lookup error: {e}\n{traceback.format_exc()}")
+                _sig.done.emit([])
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3975,6 +4178,7 @@ class _MultiDaySetupDialog(QDialog):
         for i, label in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
             cb = QCheckBox(label)
             cb.setChecked(i < 5)  # Mon–Fri default
+            cb.setStyleSheet(_CHECKBOX_STYLE)
             cb.stateChanged.connect(self._refresh_highlight)
             self._wd_checks.append(cb)
             wd_row.addWidget(cb)
@@ -4005,6 +4209,7 @@ class _MultiDaySetupDialog(QDialog):
             cb = QCheckBox(f"{cam_label}")
             cb.setToolTip(folder_name)
             cb.setChecked(True)   # pre-check all — mirrors the main table selection
+            cb.setStyleSheet(_CHECKBOX_STYLE)
             self._cam_checks.append((cb, folder_name, cam_label, folder_path))
             cam_layout.addWidget(cb)
         cam_layout.addStretch()

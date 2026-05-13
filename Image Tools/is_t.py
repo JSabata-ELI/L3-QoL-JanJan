@@ -28,10 +28,10 @@ except Exception:
     _MPL_OK = False
 
 from PySide6.QtCore import (
-    Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPointF, QDate, QModelIndex
+    Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPoint, QPointF, QDate, QModelIndex
 )
 from PySide6.QtGui import (
-    QPixmap, QImageReader, QPainter, QFontMetrics, QImage, QColor, QPen, QGuiApplication, QTextCharFormat
+    QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QGuiApplication, QTextCharFormat
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QDoubleSpinBox, QScrollArea,
@@ -62,7 +62,8 @@ SAVE_RANGE_WARN_COUNT = 500
 # ---------------- GRADIENTS ----------------
 def _copy_metadata_into_png(src: Path, dst: Path, save_txt: bool = False):
     """Embed original PNG/TIFF metadata as PNG tEXt chunks in dst.
-    Optionally also writes a sidecar .txt when save_txt=True."""
+    Optionally also writes a sidecar .txt when save_txt=True.
+    Safe to call from any thread."""
     try:
         from PIL import Image as _PilImg, PngImagePlugin as _PngP
         with _PilImg.open(src) as _src_img:
@@ -86,6 +87,13 @@ def _copy_metadata_into_png(src: Path, dst: Path, save_txt: bool = False):
             txt_path.write_text("\n".join(lines), encoding="utf-8")
     except Exception:
         pass
+
+
+def _copy_metadata_into_png_bg(src: Path, dst: Path, save_txt: bool = False):
+    """Same as _copy_metadata_into_png but dispatched to a daemon thread (non-blocking)."""
+    import threading
+    t = threading.Thread(target=_copy_metadata_into_png, args=(src, dst, save_txt), daemon=True)
+    t.start()
 
 # Keep old name as alias so existing call-sites in SaveRangeTask still compile
 def _save_png_metadata_txt(src: Path, dst: Path):
@@ -122,7 +130,8 @@ def _make_stepped_lut(stops: list[tuple[float, tuple[int,int,int]]]) -> np.ndarr
     return lut
 
 GRADIENTS: dict[str, np.ndarray | None] = {
-    "Grayscale":       None,
+    "Default":         None,  # index 0: show original image (no grayscale conversion, no LUT)
+    "Grayscale":       None,  # index 1: force grayscale, no LUT
     "Gradient": _make_lut([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
     "Hot":             _make_lut([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
     "Binary":          _make_stepped_lut([(0,(0,0,0)),(0.17,(255,0,0)),(0.33,(255,165,0)),(0.5,(255,255,0)),(0.67,(0,255,0)),(0.83,(0,200,255)),(0.92,(0,0,255)),(1,(255,255,255))]),
@@ -134,6 +143,8 @@ GRADIENTS: dict[str, np.ndarray | None] = {
     "Turbo":           _make_lut([(0,(48,18,59)),(0.2,(70,131,193)),(0.4,(48,210,142)),(0.6,(194,228,59)),(0.8,(244,117,22)),(1,(122,4,3))]),
 }
 GRADIENT_NAMES = list(GRADIENTS.keys())
+GRADIENT_ID_DEFAULT   = 0  # show original colors, no grayscale conversion
+GRADIENT_ID_GRAYSCALE = 1  # force grayscale
 
 # Speed reference: always 1 hour, regardless of axis length
 ONE_HOUR_NS = 3_600_000_000_000
@@ -153,6 +164,7 @@ CIRCLE_SOFT_MAX_R_FRAC = 0.80   # a větší
 
 DEFAULT_OPEN_DIR  = r"\\users-L3.tier0.lcs.local\cpva-image-2026\2026"
 DEFAULT_OPEN_ROOT = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
+DEFAULT_SAVE_DIR  = r"\\hapls-share.lcs.local\scratch"
 
 _CHECKBOX_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
@@ -323,24 +335,42 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
     if img.isNull():
         return QImage()
 
-    # Pokud je 16-bit, normalizuj přes numpy před konverzí na 8-bit
-    if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
-        ptr = img.bits()
-        if hasattr(ptr, "setsize"):
-            ptr.setsize(img.sizeInBytes())
-        arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
-        # Použij MaxSampleValue z TIFF metadat jako horní mez rozsahu.
-        # Zajistí, že pixel 1000 v rozsahu 1023 bude světlejší než pixel 1000 v rozsahu 4095.
-        max_sample = _read_tiff_max_sample(path)
-        mn = int(arr16.min())
-        mx = max_sample if (max_sample is not None and max_sample > mn) else int(arr16.max())
-        if mx > mn:
-            arr8 = np.clip((arr16.astype(np.float32) - mn) / (mx - mn) * 255.0, 0, 255).astype(np.uint8)
-        else:
-            arr8 = np.zeros_like(arr16, dtype=np.uint8)
-        img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
+    # "Default" = show original colors, skip grayscale conversion.
+    # All other palettes convert to grayscale first (needed for LUT mapping).
+    if gradient_id == GRADIENT_ID_DEFAULT:
+        # 16-bit originals still need normalization to 8-bit for display, but keep RGB if present
+        if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
+            ptr = img.bits()
+            if hasattr(ptr, "setsize"):
+                ptr.setsize(img.sizeInBytes())
+            arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
+            max_sample = _read_tiff_max_sample(path)
+            mn = int(arr16.min())
+            mx = max_sample if (max_sample is not None and max_sample > mn) else int(arr16.max())
+            if mx > mn:
+                arr8 = np.clip((arr16.astype(np.float32) - mn) / (mx - mn) * 255.0, 0, 255).astype(np.uint8)
+            else:
+                arr8 = np.zeros_like(arr16, dtype=np.uint8)
+            img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
+        # Return original (possibly RGB) image without forced grayscale conversion
+        return img
     else:
-        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        # All non-Default palettes: normalize 16-bit then convert to Grayscale8 for LUT processing
+        if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
+            ptr = img.bits()
+            if hasattr(ptr, "setsize"):
+                ptr.setsize(img.sizeInBytes())
+            arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
+            max_sample = _read_tiff_max_sample(path)
+            mn = int(arr16.min())
+            mx = max_sample if (max_sample is not None and max_sample > mn) else int(arr16.max())
+            if mx > mn:
+                arr8 = np.clip((arr16.astype(np.float32) - mn) / (mx - mn) * 255.0, 0, 255).astype(np.uint8)
+            else:
+                arr8 = np.zeros_like(arr16, dtype=np.uint8)
+            img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
+        else:
+            img = img.convertToFormat(QImage.Format.Format_Grayscale8)
 
     if ref_image is not None:
         ptr2 = img.bits()
@@ -370,7 +400,9 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
     if brightness_offset != 0:
         img = _apply_brightness_offset(img, brightness_offset)
 
-    lut = GRADIENTS[GRADIENT_NAMES[gradient_id]] if gradient_id > 0 else None
+    # gradient_id == GRADIENT_ID_GRAYSCALE (1): no LUT, already grayscale
+    # gradient_id >= 2: apply color LUT
+    lut = GRADIENTS[GRADIENT_NAMES[gradient_id]] if gradient_id >= 2 else None
     if lut is not None:
         img = _apply_lut(img, lut)
     return img
@@ -590,8 +622,8 @@ class SaveRangeTask(QRunnable):
         for done, it in enumerate(self.items, 1):
             dst = self.outp / self.name_fn(it)
             try:
-                if self.gradient_id == 0 and not self.brighten:
-                    # Grayscale — copy original + metadata
+                if self.gradient_id == GRADIENT_ID_DEFAULT and not self.brighten:
+                    # Default — copy original + metadata
                     shutil.copy2(it.path, dst)
                     _copy_metadata_into_png(it.path, dst, save_txt=save_txt)
                 else:
@@ -661,7 +693,8 @@ class PointingAnalysisTask(QRunnable):
         if arr_max <= 0: return None
         arr = arr / arr_max * 255.0
 
-        bg = float(np.percentile(arr[:, 0], 90))
+        # Estimate background from image edges (corners), not a single column
+        bg = float(np.percentile(arr, 10))
         arr = np.clip(arr - bg, 0, None)
 
         # Filtruj snímky bez dat — peak musí být výrazně nad šumem
@@ -677,9 +710,14 @@ class PointingAnalysisTask(QRunnable):
         cx_px = float(arr.sum(axis=0) @ xs) / irradiance
         cy_px = float(arr.sum(axis=1) @ ys) / irradiance
 
+        # Centroid relative to image center (0,0 = image centre)
+        cx_px -= w / 2.0
+        cy_px -= h / 2.0
+
+        # Scale back to original image pixels
         scale_x = w0 / w
         scale_y = h0 / h
-        return (item.ts_ns, cx_px * scale_x * pixel_mm, cy_px * scale_y * pixel_mm)
+        return (item.ts_ns, cx_px * scale_x, cy_px * scale_y)
 
     def run(self):
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -721,216 +759,171 @@ class PointingAnalysisTask(QRunnable):
 
 class _SCHistogramWidget(QWidget):
     """
-    Interactive histogram widget.  Click or drag to set threshold.
-    Emits threshold_changed(int).  White background, log/lin toggle.
+    Matplotlib-based histogram widget. Click or drag threshold line to set threshold.
+    Emits threshold_changed(int).
     """
     threshold_changed = Signal(int)
 
-    # margins: left (Y labels), right, top, bottom (X labels)
-    _ML, _MR, _MT, _MB = 64, 12, 16, 38
-
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._counts: "np.ndarray | None" = None   # raw (linear) bin counts
-        self._bit_depth: int  = 65535
-        self._threshold: int  = 0
-        self._log_scale: bool = True
-        self._dragging: bool  = False
+        self._counts:    "np.ndarray | None" = None
+        self._bin_edges: "np.ndarray | None" = None   # len = len(counts)+1
+        self._bit_depth: int   = 65535
+        self._threshold: int   = 0
+        self._lo: float        = 0.0
+        self._hi: float        = 65535.0
+        self._log_scale: bool  = True
+        self._error_msg: "str | None" = None
+        self._dragging:  bool  = False
+
         self.setMinimumSize(420, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMouseTracking(True)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        # prevent global QWidget stylesheet from repainting over us
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setAutoFillBackground(False)
+
+        if _MPL_OK:
+            self._fig    = plt.Figure(figsize=(5, 2.5), dpi=90, facecolor="#f3f3f3")
+            self._canvas = FigureCanvas(self._fig)
+            self._canvas.setParent(self)
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.addWidget(self._canvas)
+            self._canvas.mpl_connect("button_press_event",   self._on_mpl_press)
+            self._canvas.mpl_connect("motion_notify_event",  self._on_mpl_motion)
+            self._canvas.mpl_connect("button_release_event", self._on_mpl_release)
+            self._vline = None   # threshold axvline handle
+        else:
+            self._canvas = None
 
     # ── public API ────────────────────────────────────────────────────────────
-    def load_data(self, counts: "np.ndarray", bit_depth: int, threshold: int):
-        """Set histogram data; all three values updated atomically before repaint."""
+    def load_data(self, counts: "np.ndarray", bit_depth: int, threshold: int,
+                  lo: float = 0.0, hi: float = -1.0,
+                  bin_edges: "np.ndarray | None" = None):
         self._counts    = np.asarray(counts, dtype=np.float64).copy()
+        self._bin_edges = np.asarray(bin_edges) if bin_edges is not None else None
         self._bit_depth = max(int(bit_depth), 1)
         self._threshold = max(0, min(int(threshold), self._bit_depth))
-        self.update()
+        self._lo = float(lo)
+        self._hi = float(hi) if hi >= 0 else float(self._bit_depth)
+        self._error_msg = None
+        self._redraw()
+
+    def set_error(self, msg: str):
+        self._error_msg = msg
+        self._counts = None
+        self._redraw()
 
     def set_threshold(self, thr: int):
         self._threshold = max(0, min(int(thr), self._bit_depth))
-        self.update()
+        self._update_vline()
 
     def set_log_scale(self, on: bool):
         self._log_scale = on
-        self.update()
+        self._redraw()
 
-    # ── coordinate helpers ────────────────────────────────────────────────────
-    def _plot_rect(self):
-        """Return (left, top, width, height) of the plot area."""
-        W, H = self.width(), self.height()
-        pl = self._ML
-        pt = self._MT
-        pw = max(1, W - self._ML - self._MR)
-        ph = max(1, H - self._MT - self._MB)
-        return pl, pt, pw, ph
+    # ── matplotlib drawing ────────────────────────────────────────────────────
+    def _redraw(self):
+        if not _MPL_OK or self._canvas is None:
+            return
+        self._fig.clear()
+        self._vline = None
+        ax = self._fig.add_axes([0.10, 0.14, 0.86, 0.76])
+        ax.set_facecolor("#ffffff")
+        ax.tick_params(labelsize=8)
 
-    def _val_to_x(self, val: int, pl: int, pw: int) -> int:
-        """Map a raw intensity value → pixel x coordinate."""
-        return pl + int(round(val / self._bit_depth * pw))
-
-    def _x_to_val(self, x: int, pl: int, pw: int) -> int:
-        """Map a pixel x coordinate → raw intensity value."""
-        frac = max(0.0, min(1.0, (x - pl) / max(1, pw)))
-        return int(round(frac * self._bit_depth))
-
-    # ── paint ─────────────────────────────────────────────────────────────────
-    def paintEvent(self, _ev):
-        from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QFontMetrics
-
-        W, H      = self.width(), self.height()
-        pl, pt, pw, ph = self._plot_rect()
-        pb        = pt + ph   # y of bottom edge of plot area
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-
-        fnt = QFont()
-        fnt.setPixelSize(10)
-        painter.setFont(fnt)
-        fm = QFontMetrics(fnt)
-        fh = fm.height()
-
-        # ── backgrounds ───────────────────────────────────────────────────────
-        painter.fillRect(0, 0, W, H, QColor("#f3f3f3"))   # widget bg
-        painter.fillRect(pl, pt, pw, ph, QColor("#ffffff"))  # plot bg
-
-        if self._counts is None:
-            painter.setPen(QColor("#888888"))
-            painter.drawText(pl, pt, pw, ph,
-                             Qt.AlignmentFlag.AlignCenter, "Loading…")
-            painter.end()
+        if self._error_msg or self._counts is None:
+            msg = self._error_msg or "Loading…"
+            ax.text(0.5, 0.5, msg, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=9,
+                    color="#cc0000" if self._error_msg else "#888888")
+            self._canvas.draw_idle()
             return
 
-        C_GRID = QColor("#e0e0e0")
-        C_AXIS = QColor("#555555")
-        C_TXT  = QColor("#222222")
-
         counts = self._counts
-        n      = len(counts)
-        mc     = float(counts.max()) if counts.max() > 0 else 1.0
-
-        # y-values to plot (log or linear)
-        if self._log_scale:
-            yvals = np.log1p(counts)
-            ymax  = float(np.log1p(mc)) or 1.0
+        n = len(counts)
+        # Build bin centres for bar positions
+        if self._bin_edges is not None and len(self._bin_edges) == n + 1:
+            centres = (self._bin_edges[:-1] + self._bin_edges[1:]) / 2
+            widths  = np.diff(self._bin_edges)
         else:
-            yvals = counts
-            ymax  = mc or 1.0
+            span    = max(self._hi - self._lo, 1.0)
+            bw      = span / n
+            centres = self._lo + (np.arange(n) + 0.5) * bw
+            widths  = np.full(n, bw)
 
-        # ── Y-axis grid & labels ──────────────────────────────────────────────
+        thr = float(self._threshold)
+        colors = np.where(centres < thr, "#e09090", "#4a90d9")
+
         if self._log_scale:
-            y_ticks = []   # (y-plot-value, label-string)
-            v = 1
-            while v <= mc * 1.001:
-                y_ticks.append((float(np.log1p(v)), f"{int(v):,}"))
-                v *= 10
+            ax.set_yscale("log")
+            # bar needs positive values — mask zeros
+            mask = counts > 0
+            if mask.any():
+                ax.bar(centres[mask], counts[mask], width=widths[mask],
+                       color=colors[mask], linewidth=0, align="center")
         else:
-            y_ticks = [(mc * k / 5, f"{int(mc * k / 5):,}") for k in range(1, 6)]
+            ax.bar(centres, counts, width=widths, color=colors,
+                   linewidth=0, align="center")
 
-        for yv, lbl in y_ticks:
-            ty = pb - int(yv / ymax * ph)
-            if not (pt <= ty <= pb):
-                continue
-            painter.setPen(QPen(C_GRID, 1))
-            painter.drawLine(pl, ty, pl + pw, ty)
-            lw = fm.horizontalAdvance(lbl)
-            painter.setPen(C_TXT)
-            painter.drawText(pl - lw - 4, ty + fh // 2 - 1, lbl)
+        # Use actual bin range for xlim so all bars are fully visible
+        x_lo = float(centres[0]  - widths[0]  / 2)
+        x_hi = float(centres[-1] + widths[-1] / 2)
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_xlabel("Pixel intensity", fontsize=8)
+        ax.set_ylabel("log count" if self._log_scale else "count", fontsize=8)
 
-        # ── X-axis grid & labels ──────────────────────────────────────────────
-        for k in range(7):
-            rv  = int(self._bit_depth * k / 6)
-            tx  = self._val_to_x(rv, pl, pw)
-            painter.setPen(QPen(C_GRID, 1))
-            painter.drawLine(tx, pt, tx, pb)
-            lbl = str(rv)
-            lw  = fm.horizontalAdvance(lbl)
-            painter.setPen(C_TXT)
-            painter.drawText(tx - lw // 2, pb + fh + 3, lbl)
+        self._vline = ax.axvline(thr, color="#cc0000", linewidth=1.5, zorder=5)
+        ax.set_title(f"Threshold: {int(thr)}", fontsize=8, pad=2)
+        self._canvas.draw_idle()
 
-        # ── histogram bars ────────────────────────────────────────────────────
-        tpx = self._val_to_x(self._threshold, pl, pw)   # threshold x in pixels
-        bw  = pw / n                                      # bar width in pixels
+    def _update_vline(self):
+        """Move threshold line without full redraw."""
+        if not _MPL_OK or self._canvas is None or self._vline is None:
+            self._redraw()
+            return
+        self._vline.set_xdata([float(self._threshold), float(self._threshold)])
+        axes = self._fig.get_axes()
+        if axes:
+            axes[0].set_title(f"Threshold: {self._threshold}", fontsize=8, pad=2)
+            # Re-color bars below/above threshold
+            thr = float(self._threshold)
+            for patch in axes[0].patches:
+                cx = patch.get_x() + patch.get_width() / 2
+                patch.set_facecolor("#e09090" if cx < thr else "#4a90d9")
+        self._canvas.draw_idle()
 
-        painter.setPen(Qt.PenStyle.NoPen)
-        for i in range(n):
-            bh = int(yvals[i] / ymax * ph)
-            if bh <= 0:
-                continue
-            bx  = pl + int(i * bw)
-            bwi = max(1, int((i + 1) * bw) - int(i * bw))
-            # bars fully to the left of the threshold line → rose (excluded)
-            # bars at or to the right → blue (included)
-            if bx + bwi <= tpx:
-                col = QColor("#e09090")
-            else:
-                col = QColor("#4a90d9")
-            painter.setBrush(QBrush(col))
-            painter.drawRect(bx, pb - bh, bwi, bh)
+    # ── mouse → threshold ─────────────────────────────────────────────────────
+    def _axes_x_to_val(self, event) -> "int | None":
+        if not _MPL_OK or self._canvas is None:
+            return None
+        axes = self._fig.get_axes()
+        if not axes or event.inaxes is not axes[0]:
+            return None
+        val = int(round(float(event.xdata)))
+        val = max(0, min(val, self._bit_depth))
+        return val
 
-        # ── excluded-region tint ──────────────────────────────────────────────
-        excl_w = max(0, tpx - pl)
-        if excl_w > 0:
-            painter.fillRect(pl, pt, min(excl_w, pw), ph,
-                             QColor(180, 50, 50, 35))
+    def _on_mpl_press(self, event):
+        if event.button != 1:
+            return
+        val = self._axes_x_to_val(event)
+        if val is not None:
+            self._dragging = True
+            self._set_thr(val)
 
-        # ── threshold line (drawn last, always on top) ────────────────────────
-        painter.setPen(QPen(QColor("#cc0000"), 2))
-        painter.drawLine(tpx, pt, tpx, pb)
+    def _on_mpl_motion(self, event):
+        if not self._dragging:
+            return
+        val = self._axes_x_to_val(event)
+        if val is not None:
+            self._set_thr(val)
 
-        # threshold value label next to line
-        thr_lbl = str(self._threshold)
-        tlw     = fm.horizontalAdvance(thr_lbl)
-        tlx     = tpx + 4 if tpx + 4 + tlw < pl + pw else tpx - tlw - 4
-        painter.setPen(QColor("#cc0000"))
-        painter.drawText(tlx, pt + fh + 1, thr_lbl)
+    def _on_mpl_release(self, event):
+        self._dragging = False
 
-        # ── plot border ───────────────────────────────────────────────────────
-        painter.setPen(QPen(C_AXIS, 1))
-        painter.drawRect(pl, pt, pw, ph)
-
-        # ── axis titles ───────────────────────────────────────────────────────
-        painter.setPen(C_AXIS)
-        xt = "Pixel intensity"
-        painter.drawText(pl + (pw - fm.horizontalAdvance(xt)) // 2, H - 4, xt)
-
-        yt = "log count" if self._log_scale else "count"
-        painter.save()
-        painter.translate(fh, pt + (ph + fm.horizontalAdvance(yt)) // 2)
-        painter.rotate(-90)
-        painter.drawText(0, 0, yt)
-        painter.restore()
-
-        painter.end()
-
-    # ── mouse interaction ─────────────────────────────────────────────────────
-    def _apply_mouse_x(self, mx: int):
-        pl, _pt, pw, _ph = self._plot_rect()
-        val = self._x_to_val(mx, pl, pw)
+    def _set_thr(self, val: int):
         if val != self._threshold:
             self._threshold = val
-            self.update()
+            self._update_vline()
             self.threshold_changed.emit(val)
-
-    def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            self._dragging = True
-            self._apply_mouse_x(ev.pos().x())
-
-    def mouseMoveEvent(self, ev):
-        if self._dragging and (ev.buttons() & Qt.MouseButton.LeftButton):
-            self._apply_mouse_x(ev.pos().x())
-
-    def mouseReleaseEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            self._apply_mouse_x(ev.pos().x())
 
 
 class _SCHistogramDialog(QDialog):
@@ -943,7 +936,7 @@ class _SCHistogramDialog(QDialog):
     threshold_preview  = Signal(int)   # debounced, for live SC recomputation
 
     # signals used to ferry results from background thread to main thread
-    _sig_hist_ready = Signal(list, int)   # (counts as plain list, bit_depth)
+    _sig_hist_ready = Signal(list, int, float, float, list)  # (counts, bit_depth, lo, hi, bin_edges)
     _sig_hist_error = Signal(str)
 
     def __init__(self, img_path: "Path", current_threshold: int,
@@ -1032,30 +1025,36 @@ class _SCHistogramDialog(QDialog):
                 arr = np.asarray(img.convert("L"), dtype=np.float32)
             peak = float(arr.max())
             bd   = 65535 if peak > 255 else 255
-            bins = np.linspace(0, bd + 1, 257)
-            counts, _ = np.histogram(arr.ravel(), bins=bins)
-            # emit as plain Python list — safe to cross thread boundary
-            self._sig_hist_ready.emit(counts.tolist(), int(bd))
+            lo   = float(arr.min())
+            hi   = float(peak)
+            # Use 256 bins over the actual data range for good visual resolution
+            span = max(hi - lo, 1.0)
+            bins = np.linspace(lo, hi + 1, 257)
+            counts, bin_edges = np.histogram(arr.ravel(), bins=bins)
+            self._sig_hist_ready.emit(counts.tolist(), int(bd),
+                                      float(lo), float(hi), bin_edges.tolist())
         except Exception as exc:
             self._sig_hist_error.emit(str(exc))
 
     # ── slots (main thread) ───────────────────────────────────────────────────
-    def _on_hist_ready(self, counts_list: list, bd: int):
+    def _on_hist_ready(self, counts_list: list, bd: int, lo: float, hi: float,
+                       bin_edges_list: list):
         self._bit_depth = bd
         # update spin range first so setValue doesn't clamp
         self._spin.blockSignals(True)
         self._spin.setRange(0, bd)
         self._spin.setValue(self._threshold)
         self._spin.blockSignals(False)
-        counts = np.array(counts_list, dtype=np.float64)
+        counts    = np.array(counts_list,    dtype=np.float64)
+        bin_edges = np.array(bin_edges_list, dtype=np.float64) if bin_edges_list else None
         n_total = int(counts.sum())
         self._info.setText(
             f"{n_total:,} pixels  ·  {bd}-bit  ·  click or drag to set threshold")
-        # load_data sets bit_depth + threshold atomically
-        self._hw.load_data(counts, bd, self._threshold)
+        self._hw.load_data(counts, bd, self._threshold, lo, hi, bin_edges=bin_edges)
 
     def _on_hist_error(self, msg: str):
         self._info.setText(f"Could not load image: {msg}")
+        self._hw.set_error(f"Could not load image:\n{msg}")
 
     def _on_log_toggled(self, on: bool):
         self._hw.set_log_scale(on)
@@ -1573,16 +1572,30 @@ class _SCTask(QRunnable):
         max_val  = float(beam.max())
         sc       = max_val / mean_val if mean_val > 0 else float("inf")
 
+        # Top-N pixel coordinates (y, x) sorted by descending intensity in original array
+        h_full, w_full = arr.shape
+        ys_all, xs_all = np.where(mask)
+        if ys_all.size > 0:
+            vals = arr[ys_all, xs_all]
+            order = np.argsort(vals)[::-1]
+            top_ys = ys_all[order].tolist()
+            top_xs = xs_all[order].tolist()
+        else:
+            top_ys, top_xs = [], []
+
         self._signals.finished.emit({
-            "error":     None,
-            "mean":      mean_val,
-            "min":       min_val,
-            "max":       max_val,
-            "sc":        sc,
-            "n_beam":    int(mask.sum()),
-            "n_total":   n_valid,
-            "threshold": self._threshold,
-            "bit_depth": int(bit_depth),
+            "error":      None,
+            "mean":       mean_val,
+            "min":        min_val,
+            "max":        max_val,
+            "sc":         sc,
+            "n_beam":     int(mask.sum()),
+            "n_total":    n_valid,
+            "threshold":  self._threshold,
+            "bit_depth":  int(bit_depth),
+            "img_shape":  (h_full, w_full),
+            "top_xs":     top_xs,
+            "top_ys":     top_ys,
         })
 
     @staticmethod
@@ -1640,11 +1653,14 @@ class PointingPanel(QWidget):
         self._ts = None         # float64 for path coloring
         self._ts_int = None     # int64 for timestamp lookups
         self._mask = None       # bool array; False = deleted
+        self._replay_ts: int | None = None   # if set, only show points with ts <= this
         self._show_path = False
         self._select_mode = False
         self._rect_selector = None
+        self._hover_annot = None  # matplotlib annotation for hover tooltip
         if _MPL_OK and self._canvas is not None:
             self._canvas.mpl_connect("button_press_event", self._on_mpl_click)
+            self._canvas.mpl_connect("motion_notify_event", self._on_mpl_hover)
 
     def plot(self, cx_urad, cy_urad, n_shots, ts_ns=None, ts_ns_int=None):
         if not _MPL_OK: return
@@ -1653,6 +1669,7 @@ class PointingPanel(QWidget):
         self._ts = ts_ns          # float64 for path coloring
         self._ts_int = ts_ns_int  # int64 for navigation
         self._mask = np.ones(len(cx_urad), dtype=bool)
+        self._replay_ts = None    # reset replay on new data
         self._select_mode = False
         self._rect_selector = None
         self._draw()
@@ -1715,6 +1732,15 @@ class PointingPanel(QWidget):
             self._draw()
             self.region_deleted.emit()
 
+    def set_replay_ts(self, ts_ns: "int | None"):
+        """Limit visible points to those with timestamp <= ts_ns (None = show all)."""
+        if not _MPL_OK or self._cx is None:
+            return
+        changed = self._replay_ts != ts_ns
+        self._replay_ts = ts_ns
+        if changed:
+            self._draw()
+
     def _on_mpl_click(self, event):
         """Click on scatter plot → emit point_clicked(index) for navigation."""
         if not _MPL_OK or self._cx is None or self._mask is None:
@@ -1748,14 +1774,70 @@ class PointingPanel(QWidget):
         orig_idx = int(vis_indices[nearest_vis])
         self.point_clicked.emit(orig_idx)
 
+    def _on_mpl_hover(self, event):
+        """Show timestamp tooltip when hovering near a scatter point."""
+        if not _MPL_OK or self._cx is None or self._mask is None or self._ts_int is None:
+            return
+        axes = self._fig.get_axes()
+        ax_main = axes[1] if len(axes) > 1 else (axes[0] if axes else None)
+        if ax_main is None:
+            return
+        # Apply both user mask and replay mask
+        mask = self._mask.copy()
+        if self._replay_ts is not None:
+            mask &= (self._ts_int <= self._replay_ts)
+        cx_vis = self._cx[mask]
+        cy_vis = self._cy[mask]
+        vis_indices = np.where(mask)[0]
+        need_draw = False
+        if event.inaxes is not ax_main or event.xdata is None or len(cx_vis) == 0:
+            if self._hover_annot is not None:
+                self._hover_annot.set_visible(False)
+                self._hover_annot = None
+                need_draw = True
+        else:
+            xlim = ax_main.get_xlim(); ylim = ax_main.get_ylim()
+            xrange = max(xlim[1] - xlim[0], 1e-12)
+            yrange = max(ylim[1] - ylim[0], 1e-12)
+            dx = (cx_vis - event.xdata) / xrange
+            dy = (cy_vis - event.ydata) / yrange
+            dist2 = dx * dx + dy * dy
+            nearest_vis = int(np.argmin(dist2))
+            if dist2[nearest_vis] <= 0.025 ** 2:
+                orig_idx = int(vis_indices[nearest_vis])
+                ts_ns = int(self._ts_int[orig_idx])
+                ts_str = fmt_prague_full_from_ns(ts_ns)
+                px, py = float(self._cx[orig_idx]), float(self._cy[orig_idx])
+                if self._hover_annot is None:
+                    self._hover_annot = ax_main.annotate(
+                        ts_str, xy=(px, py),
+                        xytext=(10, 10), textcoords="offset points",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="#ffffcc", ec="#888", lw=0.8),
+                        fontsize=8, zorder=10)
+                else:
+                    self._hover_annot.set_text(ts_str)
+                    self._hover_annot.xy = (px, py)
+                self._hover_annot.set_visible(True)
+                need_draw = True
+            else:
+                if self._hover_annot is not None:
+                    self._hover_annot.set_visible(False)
+                    self._hover_annot = None
+                    need_draw = True
+        if need_draw:
+            self._canvas.draw_idle()
+
     def _draw(self):
         if not _MPL_OK: return
+        self._hover_annot = None  # annotation belongs to old axes — will be recreated
         self._fig.clear()
         self._render_to_fig(self._fig)
         self._canvas.draw()
 
     def _render_to_fig(self, fig):
-        mask = self._mask if self._mask is not None else np.ones(len(self._cx), dtype=bool)
+        mask = self._mask.copy() if self._mask is not None else np.ones(len(self._cx), dtype=bool)
+        if self._replay_ts is not None and self._ts_int is not None:
+            mask &= (self._ts_int <= self._replay_ts)
         cx_urad = self._cx[mask]
         cy_urad = self._cy[mask]
         n_shots = len(cx_urad)
@@ -1790,9 +1872,11 @@ class PointingPanel(QWidget):
                         rasterized=True)
         ax_main.axhline(0, color="#aaa", linewidth=0.8, linestyle="--")
         ax_main.axvline(0, color="#aaa", linewidth=0.8, linestyle="--")
-        ax_main.set_xlabel("X (µrad)", fontsize=8)
-        ax_main.set_ylabel("Y (µrad)", fontsize=8)
+        ax_main.set_xlabel("X (px from centre)", fontsize=8)
+        ax_main.set_ylabel("Y (px from centre, ↓ positive)", fontsize=8)
         ax_main.tick_params(labelsize=7)
+        # Match image coordinates: Y increases downward, so positive = below centre
+        ax_main.invert_yaxis()
 
         # ── Histogramy ───────────────────────────────────────────
         bins = min(32, max(8, n_shots // 10))
@@ -1802,7 +1886,7 @@ class PointingPanel(QWidget):
         ax_histx.tick_params(labelbottom=False, labelsize=7)
         ax_histy.tick_params(labelleft=False, labelsize=7)
         ax_histx.set_title(
-            f"N={n_shots}  σX={x_std:.2f}  σY={y_std:.2f} µrad{deleted_note}",
+            f"N={n_shots}  σX={x_std:.1f}  σY={y_std:.1f} px{deleted_note}",
             fontsize=8, pad=3)
 
         # ── Path ─────────────────────────────────────────────────
@@ -1826,8 +1910,8 @@ class PointingPanel(QWidget):
             pad_x = max(x_std * 0.5, 0.05)
             pad_y = max(y_std * 0.5, 0.05)
             ax_path.set_xlim(cx_urad.min() - pad_x, cx_urad.max() + pad_x)
-            ax_path.set_ylim(cy_urad.min() - pad_y, cy_urad.max() + pad_y)
-            ax_path.set_xlabel("X (µrad)", fontsize=8)
+            ax_path.set_ylim(cy_urad.max() + pad_y, cy_urad.min() - pad_y)  # inverted: positive Y = down
+            ax_path.set_xlabel("X (px from centre)", fontsize=8)
             ax_path.set_title("Beam path", fontsize=8, pad=3)
             ax_path.legend(fontsize=7, loc="upper right",
                            handlelength=1, borderpad=0.4)
@@ -1979,14 +2063,19 @@ class DatePickerDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         btns.accepted.connect(self._on_accept); btns.rejected.connect(self.reject)
 
+        _cb_style = _CHECKBOX_STYLE + (
+            "QCheckBox { font-size: 11px; font-weight: 700; color: #1a3a8f; }"
+        )
         self.cb_now = QCheckBox("Now (online mode)")
         self.cb_now.setToolTip(
             "To hour = current hour. Viewer will automatically load new images as they arrive.")
+        self.cb_now.setStyleSheet(_cb_style)
         self.cb_now.stateChanged.connect(self._on_now_changed)
 
         # ── Multi-day checkbox + To-date calendar ──────────────────────────────
         self.cb_multiday = QCheckBox("Multi-day (select end date below)")
         self.cb_multiday.setChecked(False)
+        self.cb_multiday.setStyleSheet(_cb_style)
 
         self.cal_to = QCalendarWidget(self)
         self.cal_to.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
@@ -1995,7 +2084,15 @@ class DatePickerDialog(QDialog):
             view2.setItemDelegate(WeekendDelegate(view2))
         self.cal_to.setSelectedDate(QDate(init_dt.year, init_dt.month, init_dt.day))
         self.cal_to.setGridVisible(True)
-        self.cal_to.setNavigationBarVisible(True)
+        self.cal_to.setNavigationBarVisible(False)
+        # Same styling as cal
+        self.cal_to.setHeaderTextFormat(hf)
+        for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
+                    Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
+            self.cal_to.setWeekdayTextFormat(day, wf)
+        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
+            self.cal_to.setWeekdayTextFormat(day, wf_weekend)
+        self.cal_to.setStyleSheet(self.cal.styleSheet())
         self.cal_to.setVisible(False)
         self._lbl_cal_to = QLabel("End date:")
         self._lbl_cal_to.setVisible(False)
@@ -2118,6 +2215,7 @@ class DatePickerDialog(QDialog):
             self.cb_now.setEnabled(False)
         else:
             self.cb_now.setEnabled(True)
+        self.adjustSize()
 
     def is_multiday(self) -> bool:
         return self.cb_multiday.isChecked()
@@ -2158,6 +2256,7 @@ class DatePickerDialog(QDialog):
         self.cal.setSelectedDate(QDate(now_dt.year, now_dt.month, now_dt.day))
         self.hour_from.setValue(now_dt.hour)
         self.hour_to.setValue(now_dt.hour)
+        self.cb_now.setChecked(True)
 
     def _on_now_changed(self, state: int):
         now_dt = datetime.now(TZ_PRAGUE)
@@ -2504,6 +2603,13 @@ class ImageView(QWidget):
         # stored as (left_norm, top_norm, right_norm, bottom_norm) — all in [0,1]
         self.square_rect_norm: tuple[float, float, float, float] | None = None
 
+        # Top-N SC pixel markers: list of (nx, ny) normalized coords, or None
+        self.sc_topn_points_norm: "list[tuple[float,float]] | None" = None
+
+        # When True (default): labels are drawn as overlay inside the image.
+        # When False: bottom space is reserved and labels drawn below the image.
+        self.cam_label_use_overlay: bool = True
+
         self.setMinimumHeight(260)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -2514,14 +2620,23 @@ class ImageView(QWidget):
     def clear(self):
         self._pix = None; self._scaled = None; self.update()
 
+    def _label_bar_h(self) -> int:
+        """Height in pixels reserved for the label bar below the image (0 when overlay mode)."""
+        if self.cam_label_use_overlay:
+            return 0
+        return max(8, self.cam_label_font_px) + 10
+
     def _ensure_scaled(self):
         if self._pix is None or self._pix.isNull():
             self._scaled = None; return
-        if self.width() <= 10 or self.height() <= 10:
+        lbh = self._label_bar_h()
+        avail_h = max(10, self.height() - lbh)
+        if self.width() <= 10 or avail_h <= 10:
             self._scaled = None; return
-        if self._scaled is None or self._scaled.size() != self.size():
+        target = QSize(self.width(), avail_h)
+        if self._scaled is None or self._scaled.size() != target:
             self._scaled = self._pix.scaled(
-                self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                target, Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation)
 
     def resizeEvent(self, event):
@@ -2536,8 +2651,10 @@ class ImageView(QWidget):
         self._ensure_scaled()
         if self._scaled is None or self._scaled.isNull():
             return None
+        lbh = self._label_bar_h()
+        avail_h = self.height() - lbh
         x0 = (self.width()  - self._scaled.width())  // 2
-        y0 = (self.height() - self._scaled.height()) // 2
+        y0 = (avail_h - self._scaled.height()) // 2
         return QRect(x0, y0, self._scaled.width(), self._scaled.height())
 
     def _handle_radius(self) -> int:
@@ -2764,8 +2881,10 @@ class ImageView(QWidget):
             p.end(); return
 
         pm = self._scaled
+        lbh = self._label_bar_h()
+        avail_h = self.height() - lbh
         x0 = (self.width()  - pm.width())  // 2
-        y0 = (self.height() - pm.height()) // 2
+        y0 = (avail_h - pm.height()) // 2
         p.drawPixmap(x0, y0, pm)
         img_rect = QRect(x0, y0, pm.width(), pm.height())
         # Rámeček kolem obrázku
@@ -2863,35 +2982,57 @@ class ImageView(QWidget):
             p.setPen(QColor(0, 0, 0))
             p.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, display_text)
 
-        # Camera name + timestamp labels — drawn at the very bottom of the image rect,
-        # overlaid on the image border (always visible regardless of letterboxing)
+        # Camera name + timestamp labels.
+        # overlay mode (multi-cam): drawn semi-transparent over the bottom of the image.
+        # non-overlay mode (single-cam): drawn in the reserved strip below the image,
+        #   spanning exactly the image width (x0 … x0+img_w).
         if (self.cam_label_text or self.cam_ts_text) and not self._pix.isNull():
             from PySide6.QtGui import QFont as _QFont
             _fpx = max(8, self.cam_label_font_px)
             lbl_h = _fpx + 10
             lbl_x = img_rect.left()
             lbl_w = img_rect.width()
-            lbl_y = img_rect.bottom() - lbl_h  # flush with bottom edge of image
+            if self.cam_label_use_overlay:
+                # Semi-transparent strip at the very bottom of the image rect
+                lbl_y = img_rect.bottom() - lbl_h
+                lbl_y = max(img_rect.top(), lbl_y)
+            else:
+                # Reserved strip directly below the image, same x/width as image
+                lbl_y = img_rect.bottom() + 1
+                # Clamp so it never goes below widget bottom
+                lbl_y = min(lbl_y, self.height() - lbl_h)
+                lbl_y = max(img_rect.bottom() + 1, lbl_y)
             name_w = lbl_w // 3
             ts_w = lbl_w - name_w
             font = _QFont(); font.setPixelSize(_fpx)
             p.setFont(font)
             if self.cam_label_text:
                 name_rect = QRect(lbl_x, lbl_y, name_w, lbl_h)
-                p.fillRect(name_rect, QColor(0x44, 0x44, 0x44, 220))
+                p.fillRect(name_rect, QColor(0x44, 0x44, 0x44, 220 if self.cam_label_use_overlay else 255))
                 p.setPen(QColor(0xee, 0xee, 0xee))
                 p.drawText(name_rect.adjusted(4, 0, -4, 0),
                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                            self.cam_label_text)
             if self.cam_ts_text:
                 ts_rect = QRect(lbl_x + name_w, lbl_y, ts_w, lbl_h)
-                p.fillRect(ts_rect, QColor(0x33, 0x33, 0x33, 220))
+                p.fillRect(ts_rect, QColor(0x33, 0x33, 0x33, 220 if self.cam_label_use_overlay else 255))
                 p.setPen(QColor(0xff, 0xd5, 0x4f))
                 ts_font = _QFont(); ts_font.setPixelSize(max(8, _fpx - 1))
                 p.setFont(ts_font)
                 p.drawText(ts_rect.adjusted(4, 0, -4, 0),
                            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                            self.cam_ts_text)
+
+        # Spatial contrast top-N pixel markers
+        if getattr(self, 'sc_topn_points_norm', None) and not self._pix.isNull():
+            r = getattr(self, 'sc_topn_marker_radius', max(3, img_rect.width() // 150))
+            thick = getattr(self, 'sc_topn_marker_thick', 2)
+            p.setPen(QPen(QColor(255, 80, 0, 230), thick))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for nx, ny in self.sc_topn_points_norm:
+                cx = img_rect.left() + int(nx * img_rect.width())
+                cy = img_rect.top()  + int(ny * img_rect.height())
+                p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
 
         p.end()
 
@@ -3340,9 +3481,40 @@ class MultiCameraGrid(QWidget):
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setSpacing(4)
         self._reg_container: "QWidget | None" = None  # sub-grid for regular cams in mixed layout
+        self._overlay_store: dict[str, dict] = {}  # cam_name → overlay state
+
+    @staticmethod
+    def _save_iv_overlay(iv: "ImageView") -> dict:
+        return {
+            "show_cross":          iv.show_cross,
+            "cross_pos_norm":      iv.cross_pos_norm,
+            "show_circle":         iv.show_circle,
+            "circle_center_norm":  iv.circle_center_norm,
+            "circle_r_norm":       iv.circle_r_norm,
+            "circle_rx_norm":      iv.circle_rx_norm,
+            "circle_ry_norm":      iv.circle_ry_norm,
+            "show_square":         iv.show_square,
+            "square_rect_norm":    iv.square_rect_norm,
+        }
+
+    @staticmethod
+    def _restore_iv_overlay(iv: "ImageView", state: dict):
+        iv.show_cross         = state.get("show_cross", False)
+        iv.cross_pos_norm     = state.get("cross_pos_norm")
+        iv.show_circle        = state.get("show_circle", False)
+        iv.circle_center_norm = state.get("circle_center_norm")
+        iv.circle_r_norm      = state.get("circle_r_norm")
+        iv.circle_rx_norm     = state.get("circle_rx_norm")
+        iv.circle_ry_norm     = state.get("circle_ry_norm")
+        iv.show_square        = state.get("show_square", False)
+        iv.square_rect_norm   = state.get("square_rect_norm")
 
     def setup_cameras(self, cam_names: list[str]):
         """Vytvoří/překreslí kamery podle seznamu jmen."""
+        # Ulož overlay stav stávajících kamer před zničením
+        for cv in self._cam_views:
+            self._overlay_store[cv.cam_name] = self._save_iv_overlay(cv.img_view)
+
         # Odstraň staré
         for cv in self._cam_views:
             cv.setParent(None)
@@ -3356,6 +3528,9 @@ class MultiCameraGrid(QWidget):
             cv = CameraView(i, name, self)
             cv.clicked.connect(self._on_cam_clicked)
             self._cam_views.append(cv)
+            # Obnov overlay stav pokud ho máme uložený
+            if name in self._overlay_store:
+                self._restore_iv_overlay(cv.img_view, self._overlay_store[name])
 
         self._selected_idx = 0
         self._selected_set = {0} if self._cam_views else set()
@@ -3542,49 +3717,64 @@ class TickBar(QWidget):
         super().__init__(parent)
         self.axis_min_ns = 0; self.axis_max_ns = 0
         self.step_minutes = TICK_STEP_MINUTES
-        self.setMinimumHeight(38)
+        self.setMinimumHeight(56)
         self.mark_a_ns: int | None = None
         self.mark_b_ns: int | None = None
+        self.cursor_ns: int | None = None
+        self.left_offset: int = 0   # pixels reserved for slider label prefix (multi-cam)
         self.discrete_ticks: list[int] | None = None
-        self.discrete_tick_labels: list[str] | None = None  # pokud nastaveno, použij místo _dt_from_ns
+        self.discrete_tick_labels: list[str] | None = None
 
     def set_axis(self, a, b): self.axis_min_ns = a; self.axis_max_ns = b; self.update()
     def set_marks(self, a, b): self.mark_a_ns = a; self.mark_b_ns = b; self.update()
+    def set_cursor(self, t: "int | None"): self.cursor_ns = t; self.update()
+    def set_left_offset(self, px: int): self.left_offset = px; self.update()
 
-    def _x_from_ns(self, t):
-        if self.axis_max_ns <= self.axis_min_ns: return 0
+    def _axis_w(self) -> int:
+        return max(1, self.width() - self.left_offset)
+
+    def _x_from_ns(self, t) -> int:
+        if self.axis_max_ns <= self.axis_min_ns: return self.left_offset
         frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
-        return int(round(max(0.0, min(1.0, frac)) * (self.width() - 1)))
+        return self.left_offset + int(round(max(0.0, min(1.0, frac)) * (self._axis_w() - 1)))
 
     def paintEvent(self, event):
         super().paintEvent(event)
         if self.axis_max_ns <= self.axis_min_ns: return
         w, h = self.width(), self.height()
+        lo = self.left_offset          # pixel offset where the axis starts
+        aw = max(1, w - lo)            # width of the axis area
         p = QPainter(self)
         fm = QFontMetrics(self.font())
+        lh = fm.height()               # label height
 
-        # ── Discrete mode: zobraz jen timestampy snímků ──────────────
+        def _x(t) -> int:
+            frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
+            return lo + int(round(max(0.0, min(1.0, frac)) * (aw - 1)))
+
+        # ── Discrete mode: single camera, show per-frame ticks ────────
         if self.discrete_ticks is not None and self.discrete_ticks:
             ticks = self.discrete_ticks
             n = len(ticks)
             min_label_w = fm.horizontalAdvance("2026-03-23 14:53:12") + 8
-            # Zjisti kolik ticků se vejde bez překryvu
-            available_w = w
-            max_visible = max(1, available_w // min_label_w)
+            max_visible = max(1, aw // min_label_w)
             step = max(1, (n + max_visible - 1) // max_visible)
 
-            last_x = -9999
+            # Baseline
+            p.setPen(QPen(QColor(160, 160, 160)))
+            p.drawLine(lo, h // 2, w, h // 2)
+
+            last_label_x = lo - 9999
             for i, t in enumerate(ticks):
+                x = _x(t)
+                # Minor tick for every frame
+                pen = QPen(QColor(140, 140, 140, 160)); pen.setWidth(1); p.setPen(pen)
+                p.drawLine(x, h // 2 - 3, x, h // 2 + 3)
                 if i % step != 0:
                     continue
-                frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
-                x = int(round(max(0.0, min(1.0, frac)) * (w - 1)))
-                # Čára
-                pen = QPen(QColor(120, 120, 120, 180))
-                pen.setWidth(1)
-                p.setPen(pen)
-                p.drawLine(x, h // 2, x, h)
-                # Label — datum + čas
+                # Major tick
+                pen = QPen(QColor(80, 80, 80, 200)); pen.setWidth(1); p.setPen(pen)
+                p.drawLine(x, h // 2 - 6, x, h // 2 + 6)
                 if self.discrete_tick_labels and i < len(self.discrete_tick_labels):
                     label = self.discrete_tick_labels[i]
                 else:
@@ -3592,82 +3782,185 @@ class TickBar(QWidget):
                     label = f"{dt:%Y-%m-%d %H:%M:%S}"
                 lw = fm.horizontalAdvance(label)
                 lx = x - lw // 2
-                if lx < last_x + 4:
+                if lx < last_label_x + 4:
                     continue
-                lx = max(0, min(w - lw, lx))
-                lr = QRect(lx, 0, lw, fm.height() + 2)
+                lx = max(lo, min(w - lw, lx))
+                lr = QRect(lx, h // 2 + 8, lw, lh)
+                if lr.bottom() > h:
+                    lr.moveTop(h // 2 - 8 - lh)
                 p.fillRect(lr.adjusted(-2, 0, 2, 0), QColor(255, 255, 255, 200))
                 p.setPen(QColor(0, 0, 0))
                 p.drawText(lr, Qt.AlignmentFlag.AlignVCenter, label)
-                last_x = lx + lw
+                last_label_x = lx + lw
 
-            # Marks
-            def draw_mark(t, color, nudge=0):
-                frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
-                x = int(round(max(0.0, min(1.0, frac)) * (w - 1)))
+            def _draw_mark_discrete(t, color):
+                x = _x(t)
                 pen = QPen(color); pen.setWidth(2); p.setPen(pen)
                 p.drawLine(x, 0, x, h)
-            if self.mark_a_ns is not None: draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
-            if self.mark_b_ns is not None: draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
+            if self.mark_a_ns is not None: _draw_mark_discrete(self.mark_a_ns, QColor(255, 0, 0, 230))
+            if self.mark_b_ns is not None: _draw_mark_discrete(self.mark_b_ns, QColor(0, 0, 255, 230))
+
+            if self.cursor_ns is not None:
+                xc = _x(self.cursor_ns)
+                pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
+                p.drawLine(xc, 0, xc, h)
+                label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
+                lw = fm.horizontalAdvance(label) + 6
+                lx = max(lo, min(w - lw, xc - lw // 2))
+                p.fillRect(lx, h - lh - 2, lw, lh + 2, QColor(0, 80, 200, 200))
+                p.setPen(QColor(255, 255, 255))
+                p.drawText(lx + 3, h - 2 - fm.descent(), label)
             p.end()
             return
 
-        # ── Normální časová osa ───────────────────────────────────────
+        # ── Normal time axis ──────────────────────────────────────────
         span = self.axis_max_ns - self.axis_min_ns
         span_hours = span / ONE_HOUR_NS
 
         if span_hours >= 6:
-            step_minutes = 60
+            step_min = 60;  minor_min = 5
         elif span_hours >= 3:
-            step_minutes = 30
+            step_min = 30;  minor_min = 5
         elif span_hours >= 1.5:
-            step_minutes = 15
+            step_min = 15;  minor_min = 2
+        elif span_hours >= 0.5:
+            step_min = 10;  minor_min = 1
         else:
-            step_minutes = 10
+            step_min = 5;   minor_min = 1
 
-        start_dt = _dt_from_ns(self.axis_min_ns).replace(second=0, microsecond=0)
-        remainder = start_dt.minute % step_minutes
-        if remainder != 0:
-            start_dt = start_dt - timedelta(minutes=remainder)
+        def _aligned_ticks(step_m: int) -> list[int]:
+            start_dt = _dt_from_ns(self.axis_min_ns).replace(second=0, microsecond=0)
+            rem = start_dt.minute % step_m
+            if rem:
+                start_dt = start_dt - timedelta(minutes=rem)
+            end_dt = _dt_from_ns(self.axis_max_ns).replace(second=0, microsecond=0)
+            result = []; dt = start_dt
+            while dt <= end_dt + timedelta(minutes=step_m):
+                result.append(ns_from_dt(dt)); dt += timedelta(minutes=step_m)
+            return result
 
-        end_dt = _dt_from_ns(self.axis_max_ns).replace(second=0, microsecond=0)
-        ticks = []; dt = start_dt
-        while dt <= end_dt:
-            ticks.append(ns_from_dt(dt)); dt += timedelta(minutes=step_minutes)
-        for t in ticks:
-            frac = (t - self.axis_min_ns) / span
-            x = int(round(frac * (w - 1)))
-            txt = fmt_hhmm_from_ns(t); tw = fm.horizontalAdvance(txt)
+        major_ticks = _aligned_ticks(step_min)
+        minor_ticks = _aligned_ticks(minor_min)
+        major_set = set(major_ticks)
+
+        # Layout (top-to-bottom):
+        #   [lh+2]  tick labels
+        #   [8px]   major tick stubs above baseline
+        #   [1px]   baseline
+        #   [4px]   minor tick stubs below baseline
+        #   [lh+4]  cursor label at bottom
+        cursor_label_h = lh + 4
+        baseline_y = h - cursor_label_h - 1
+        major_tick_top = baseline_y - 8
+        minor_tick_bot = baseline_y + 4
+
+        # Baseline — thick, clearly visible
+        baseline_pen = QPen(QColor(100, 100, 100)); baseline_pen.setWidth(2)
+        p.setPen(baseline_pen)
+        p.drawLine(lo, baseline_y, w, baseline_y)
+
+        # Minor ticks below baseline
+        pen = QPen(QColor(160, 160, 160)); pen.setWidth(1); p.setPen(pen)
+        for t in minor_ticks:
+            if t in major_set: continue
+            x = _x(t)
+            if x < lo or x > w: continue
+            p.drawLine(x, baseline_y, x, minor_tick_bot)
+
+        # Major ticks above baseline + labels above them
+        last_label_x = lo - 9999
+        for t in major_ticks:
+            x = _x(t)
+            if x < lo or x > w: continue
+            pen = QPen(QColor(60, 60, 60)); pen.setWidth(1); p.setPen(pen)
+            p.drawLine(x, major_tick_top, x, baseline_y)
+            txt = fmt_hhmm_from_ns(t)
+            tw = fm.horizontalAdvance(txt)
             tx = x - tw // 2
-            if frac <= 0.00001: tx = 0
-            if frac >= 0.99999: tx = w - tw
-            p.drawText(QRect(tx, 0, tw, h), Qt.AlignmentFlag.AlignTop, txt)
+            tx = max(lo, min(w - tw, tx))
+            if tx < last_label_x + 4:
+                continue
+            label_y = major_tick_top - lh - 1
+            if label_y < 0: label_y = 0
+            p.setPen(QColor(0, 0, 0))
+            p.drawText(QRect(tx, label_y, tw, lh), Qt.AlignmentFlag.AlignVCenter, txt)
+            last_label_x = tx + tw
 
+        # Midnight date labels at bottom
+        midnight_dates: list[int] = []
+        _d = _dt_from_ns(self.axis_min_ns).date()
+        _d_end = _dt_from_ns(self.axis_max_ns).date()
+        while _d <= _d_end:
+            try:
+                _mn_dt = datetime(_d.year, _d.month, _d.day, 0, 0, 0, tzinfo=TZ_PRAGUE)
+            except Exception:
+                _mn_dt = datetime(_d.year, _d.month, _d.day, 0, 0, 0)
+            _mn_ns = int(_mn_dt.timestamp() * 1_000_000_000)
+            if self.axis_min_ns <= _mn_ns <= self.axis_max_ns:
+                midnight_dates.append(_mn_ns)
+            _d += timedelta(days=1)
+
+        if midnight_dates or span_hours > 20:
+            date_font = QFont(self.font()); date_font.setBold(True)
+            p.setFont(date_font)
+            dfm = QFontMetrics(date_font)
+            dlh = dfm.height()
+            date_y = h - dlh - 1
+
+            def _draw_date_label(ns_val: int, align_right=False):
+                dt_val = _dt_from_ns(ns_val)
+                lbl = dt_val.strftime("%d.%m")
+                lw = dfm.horizontalAdvance(lbl)
+                x_v = _x(ns_val)
+                lx = (max(lo, x_v - lw) if align_right else min(w - lw, x_v))
+                frac_v = (ns_val - self.axis_min_ns) / span
+                if 0.0001 < frac_v < 0.9999:
+                    sep_pen = QPen(QColor(40, 80, 180, 120)); sep_pen.setWidth(1)
+                    p.setPen(sep_pen); p.drawLine(x_v, baseline_y, x_v, h)
+                p.fillRect(QRect(lx, date_y, lw, dlh), QColor(230, 235, 255, 220))
+                p.setPen(QColor(40, 80, 180))
+                p.drawText(QRect(lx, date_y, lw, dlh), Qt.AlignmentFlag.AlignVCenter, lbl)
+
+            _draw_date_label(self.axis_min_ns, align_right=False)
+            _draw_date_label(self.axis_max_ns, align_right=True)
+            for mn_ns in midnight_dates:
+                _draw_date_label(mn_ns, align_right=False)
+            p.setFont(self.font())
+
+        # Marks (Set From / Set To) — drawn above baseline
         def draw_mark(t, color, nudge=0):
-            x = self._x_from_ns(t)
-            pen = QPen(color); pen.setWidth(2); p.setPen(pen); p.drawLine(x, 0, x, h)
+            x = _x(t)
+            pen = QPen(color); pen.setWidth(2); p.setPen(pen); p.drawLine(x, 0, x, baseline_y)
             label = fmt_hhmmss_ms_from_ns(t); lw = fm.horizontalAdvance(label)
-            lx = max(0, min(w - lw, x - lw // 2 + nudge))
-            lr = QRect(lx, h - fm.height() - 2, lw, fm.height())
+            lx = max(lo, min(w - lw, x - lw // 2 + nudge))
+            lr = QRect(lx, baseline_y - lh - 2, lw, lh)
             p.fillRect(lr.adjusted(-4, 0, 4, 0), QColor(255, 255, 255, 210))
-            p.drawText(lr, Qt.AlignmentFlag.AlignVCenter, label)
+            p.setPen(color); p.drawText(lr, Qt.AlignmentFlag.AlignVCenter, label)
 
         if self.mark_a_ns is not None and self.mark_b_ns is not None:
-            xa = self._x_from_ns(self.mark_a_ns)
-            xb = self._x_from_ns(self.mark_b_ns)
             lw = fm.horizontalAdvance(fmt_hhmmss_ms_from_ns(self.mark_a_ns))
-            overlap = (lw + 8) - abs(xb - xa)
+            overlap = (lw + 8) - abs(_x(self.mark_b_ns) - _x(self.mark_a_ns))
             if overlap > 0:
-                nudge_a = -(overlap // 2 + 2)
-                nudge_b = overlap // 2 + 2
-                draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230), nudge_a)
-                draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230), nudge_b)
+                draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230), -(overlap // 2 + 2))
+                draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230),   overlap // 2 + 2)
             else:
                 draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
                 draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
         else:
             if self.mark_a_ns is not None: draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
             if self.mark_b_ns is not None: draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
+
+        # Cursor line — blue, label at bottom
+        if self.cursor_ns is not None:
+            xc = _x(self.cursor_ns)
+            pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
+            p.drawLine(xc, 0, xc, h)
+            label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
+            lw = fm.horizontalAdvance(label) + 6
+            lx = max(lo, min(w - lw, xc - lw // 2))
+            p.fillRect(lx, h - lh - 2, lw, lh + 2, QColor(0, 80, 200, 200))
+            p.setPen(QColor(255, 255, 255))
+            p.drawText(lx + 3, h - 2 - fm.descent(), label)
         p.end()
 
 # ---------------- LAYOUT HELPERS ----------------
@@ -3966,6 +4259,78 @@ class _CamPollTask(QRunnable):
         self._sig.found.emit(self._cam_i, new_items, new_folders)
 
 
+# ================================================================== PER-CAM SLIDER ROW
+
+class _CamSliderRow(QWidget):
+    """One row: [● Master radio] [Camera name label] [━━━━ slider ━━━━]"""
+    master_chosen     = Signal(int)   # emitted when radio is checked; arg = cam index
+    master_deselected = Signal(int)   # emitted when radio is unchecked; arg = cam index
+    value_changed     = Signal(int, int)  # (cam_index, slider_value)
+    pressed           = Signal(int)   # cam_index
+    released          = Signal(int)   # cam_index
+
+    def __init__(self, cam_idx: int, cam_name: str, parent=None):
+        super().__init__(parent)
+        self.cam_idx  = cam_idx
+        self._is_master = False
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 1, 0, 1)
+        lay.setSpacing(4)
+
+        from PySide6.QtWidgets import QRadioButton
+        self._radio = QRadioButton()
+        self._radio.setAutoExclusive(False)  # allow clicking checked radio to uncheck it
+        self._radio.setToolTip("Set as master camera (sync others to this). Click again to deselect.")
+        self._radio.setFixedWidth(16)
+        self._radio.toggled.connect(self._on_radio_toggled)
+        lay.addWidget(self._radio)
+
+        self._lbl = QLabel(cam_name)
+        self._lbl.setFixedWidth(90)
+        self._lbl.setStyleSheet("font-size: 10px; color: #333;")
+        lay.addWidget(self._lbl)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setMinimum(0)
+        self._slider.setMaximum(SLIDER_MAX)
+        self._slider.setEnabled(False)
+        self._slider.valueChanged.connect(lambda v: self.value_changed.emit(self.cam_idx, v))
+        self._slider.sliderPressed.connect(lambda: self.pressed.emit(self.cam_idx))
+        self._slider.sliderReleased.connect(lambda: self.released.emit(self.cam_idx))
+        lay.addWidget(self._slider, 1)
+
+    def set_master(self, yes: bool):
+        self._is_master = yes
+        self._radio.blockSignals(True)
+        self._radio.setChecked(yes)
+        self._radio.blockSignals(False)
+        self._lbl.setStyleSheet(
+            "font-size: 10px; font-weight: 700; color: #0055cc;" if yes
+            else "font-size: 10px; color: #333;")
+
+    def set_value(self, v: int):
+        self._slider.blockSignals(True)
+        self._slider.setValue(v)
+        self._slider.blockSignals(False)
+
+    def set_enabled(self, on: bool):
+        self._slider.setEnabled(on)
+
+    def value(self) -> int:
+        return self._slider.value()
+
+    def slider_x_in_parent(self) -> int:
+        """X position of the slider's left edge relative to this row widget."""
+        return self._slider.x()
+
+    def _on_radio_toggled(self, checked: bool):
+        if checked:
+            self.master_chosen.emit(self.cam_idx)
+        else:
+            self.master_deselected.emit(self.cam_idx)
+
+
 # ================================================================== UI
 class Viewer(QWidget):
     def __init__(self):
@@ -3981,6 +4346,7 @@ class Viewer(QWidget):
         self.opened_folders: list[Path] = []
         self.axis_override: tuple[int, int] | None = None
         self.last_open_dir = Path(DEFAULT_OPEN_DIR)
+        self._last_save_dir: Path = Path(DEFAULT_SAVE_DIR)
 
         now_dt = datetime.now(TZ_PRAGUE)
         self.last_pick_date = now_dt.date()
@@ -4297,10 +4663,15 @@ class Viewer(QWidget):
 
         # ── Overlay settings ──────────────────────────────────────
         overlay_settings_row = QHBoxLayout()
+        overlay_settings_row.setSpacing(4)
         btn_overlay_settings = QPushButton("⚙ Overlay settings")
         btn_overlay_settings.setToolTip("Set color, thickness and size of overlays")
         btn_overlay_settings.clicked.connect(self._open_overlay_settings)
-        overlay_settings_row.addWidget(btn_overlay_settings)
+        overlay_settings_row.addWidget(btn_overlay_settings, 1)
+        btn_remove_all_overlays = QPushButton("✕ Remove selected")
+        btn_remove_all_overlays.setToolTip("Remove all overlays from selected camera(s)")
+        btn_remove_all_overlays.clicked.connect(self._remove_all_overlays)
+        overlay_settings_row.addWidget(btn_remove_all_overlays, 1)
         llay.addLayout(overlay_settings_row)
 
         row_bright_grad = QHBoxLayout()
@@ -4310,7 +4681,7 @@ class Viewer(QWidget):
         self.gradient_cb.setToolTip("Color gradient for image display")
         for name in GRADIENT_NAMES:
             self.gradient_cb.addItem(name)
-        self.gradient_cb.setCurrentIndex(1)
+        self.gradient_cb.setCurrentIndex(2)  # default: Gradient (0=Default, 1=Grayscale, 2+=palettes)
         self.gradient_cb.setStyleSheet(
             "QComboBox { padding: 3px 6px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }"
             "QComboBox QAbstractItemView { background: #fff; }")
@@ -4415,10 +4786,37 @@ class Viewer(QWidget):
         self.btn_pointing.setToolTip("Run pointing stability analysis on current images set by timestamps (Set From and Set To)")
         self.btn_pointing.setEnabled(False)
         self.btn_pointing.clicked.connect(self.run_pointing_analysis)
+        self.btn_pointing_live = QPushButton("▶ Replay")
+        self.btn_pointing_live.setToolTip(
+            "Replay: step through pointing analysis results frame by frame.\n"
+            "Shows each image + highlights its point on the graph.")
+        self.btn_pointing_live.setCheckable(True)
+        self.btn_pointing_live.setEnabled(False)
+        self.btn_pointing_live.toggled.connect(self._on_pointing_live_toggled)
         self.btn_pointing_cancel = QPushButton("Cancel")
         self.btn_pointing_cancel.setToolTip("Cancel running analysis")
         self.btn_pointing_cancel.setVisible(False)
         self.btn_pointing_cancel.clicked.connect(self._cancel_pointing)
+        row_pa = QHBoxLayout()
+        row_pa.addWidget(self.btn_pointing)
+        row_pa.addWidget(self.btn_pointing_live)
+        row_pa.addWidget(self.btn_pointing_cancel)
+        llay.addLayout(row_pa)
+
+        # Replay speed control
+        row_replay_speed = QHBoxLayout()
+        row_replay_speed.addWidget(QLabel("Replay speed:"))
+        self._pointing_replay_fps_sb = QSpinBox()
+        self._pointing_replay_fps_sb.setRange(1, 100)
+        self._pointing_replay_fps_sb.setValue(10)
+        self._pointing_replay_fps_sb.setSuffix(" %")
+        self._pointing_replay_fps_sb.setFixedWidth(70)
+        self._pointing_replay_fps_sb.setToolTip(
+            "Replay speed as % of max (100% = 200 fps, 10% = 20 fps, 1% = 2 fps)")
+        row_replay_speed.addWidget(self._pointing_replay_fps_sb)
+        row_replay_speed.addStretch(1)
+        llay.addLayout(row_replay_speed)
+
         self.btn_pointing_save = QPushButton("💾 Save Plot")
         self.btn_pointing_save.setToolTip("Save pointing plot as PNG or PDF")
         self.btn_pointing_save.setEnabled(False)
@@ -4427,10 +4825,6 @@ class Viewer(QWidget):
         self.btn_pointing_path.setToolTip("Show/hide beam path trajectory colored by time")
         self.btn_pointing_path.setEnabled(False)
         self.btn_pointing_path.clicked.connect(self._toggle_pointing_path)
-        row_pa = QHBoxLayout()
-        row_pa.addWidget(self.btn_pointing)
-        row_pa.addWidget(self.btn_pointing_cancel)
-        llay.addLayout(row_pa)
         row_pa2 = QHBoxLayout()
         row_pa2.addWidget(self.btn_pointing_save)
         row_pa2.addWidget(self.btn_pointing_path)
@@ -4463,6 +4857,18 @@ class Viewer(QWidget):
 
         # ── Subgroup: Spatial Contrast ────────────────────────────────
         llay.addWidget(_group_label("  Spatial Contrast"))
+
+        # Camera selector (visible only in multi-cam mode)
+        sc_cam_row = QHBoxLayout()
+        sc_cam_row.addWidget(QLabel("Camera:"))
+        self._sc_cam_combo = QComboBox()
+        self._sc_cam_combo.setToolTip("Select which camera to measure")
+        sc_cam_row.addWidget(self._sc_cam_combo, 1)
+        sc_cam_row_widget = QWidget()
+        sc_cam_row_widget.setLayout(sc_cam_row)
+        sc_cam_row_widget.setVisible(False)
+        self._sc_cam_row_widget = sc_cam_row_widget
+        llay.addWidget(sc_cam_row_widget)
 
         # Threshold row
         sc_thr_row = QHBoxLayout()
@@ -4508,6 +4914,46 @@ class Viewer(QWidget):
         self._btn_sc_draw.clicked.connect(self._open_sc_exclusion_editor)
         sc_btn_row.addWidget(self._btn_sc_draw, 1)
         llay.addLayout(sc_btn_row)
+
+        # "Show top intensity pixels: N" — circle top-N highest-intensity pixels on the image
+        sc_topn_row = QHBoxLayout()
+        sc_topn_row.addWidget(QLabel("Show top intensity:"))
+        self._sc_topn_sb = QSpinBox()
+        self._sc_topn_sb.setRange(0, 9999)
+        self._sc_topn_sb.setValue(0)
+        self._sc_topn_sb.setFixedWidth(70)
+        self._sc_topn_sb.setToolTip(
+            "Circle the top-N highest-intensity pixels on the image after measuring.\n"
+            "0 = disabled.")
+        self._sc_topn_sb.valueChanged.connect(self._on_sc_topn_changed)
+        sc_topn_row.addWidget(self._sc_topn_sb)
+        sc_topn_row.addWidget(QLabel("px"))
+        sc_topn_row.addStretch(1)
+        llay.addLayout(sc_topn_row)
+
+        # Marker appearance: radius + thickness
+        sc_marker_row = QHBoxLayout()
+        sc_marker_row.addWidget(QLabel("Marker radius:"))
+        self._sc_marker_r_sb = QSpinBox()
+        self._sc_marker_r_sb.setRange(1, 100)
+        self._sc_marker_r_sb.setValue(5)
+        self._sc_marker_r_sb.setFixedWidth(50)
+        self._sc_marker_r_sb.setToolTip("Circle radius in pixels for top-intensity markers")
+        self._sc_marker_r_sb.valueChanged.connect(self._on_sc_marker_style_changed)
+        sc_marker_row.addWidget(self._sc_marker_r_sb)
+        sc_marker_row.addWidget(QLabel("Thickness:"))
+        self._sc_marker_thick_sb = QSpinBox()
+        self._sc_marker_thick_sb.setRange(1, 20)
+        self._sc_marker_thick_sb.setValue(2)
+        self._sc_marker_thick_sb.setFixedWidth(45)
+        self._sc_marker_thick_sb.setToolTip("Line thickness for top-intensity markers")
+        self._sc_marker_thick_sb.valueChanged.connect(self._on_sc_marker_style_changed)
+        sc_marker_row.addWidget(self._sc_marker_thick_sb)
+        sc_marker_row.addStretch(1)
+        llay.addLayout(sc_marker_row)
+
+        self._sc_topn_points: "list[tuple[int,int]] | None" = None  # (x,y) pixel coords in full image
+
         self._sc_set_enabled(False)   # both buttons exist now — safe to call
         # Exclusion mask is stored per image path so it resets on image change
         self._sc_exclusion_mask: "np.ndarray | None" = None  # bool array, True = excluded
@@ -4571,6 +5017,8 @@ class Viewer(QWidget):
         self._sc_preview_pixmap: "QPixmap | None" = None
         self._sc_task_running = False
         self._sc_pending      = False
+        self._sc_topn_points: "list[tuple[int,int]]" = []
+        self._sc_topn_img_shape: "tuple[int,int] | None" = None
 
         llay.addWidget(_hsep())
 
@@ -4610,6 +5058,20 @@ class Viewer(QWidget):
         self.tickbar  = TickBar(self)
 
         rlay.addWidget(self.slider)
+
+        # Per-camera sliders (hidden until multi-cam mode is active)
+        self._per_cam_container = QWidget()
+        self._per_cam_container.setVisible(False)
+        _pcl = QVBoxLayout(self._per_cam_container)
+        _pcl.setContentsMargins(0, 2, 0, 0)
+        _pcl.setSpacing(1)
+        self._per_cam_layout = _pcl
+        self._per_cam_rows: list[_CamSliderRow] = []
+        self._per_cam_master_idx: int = 0      # which camera is master
+        self._per_cam_scrubbing_cam: int = -1  # which cam is being dragged (-1 = none)
+        rlay.addWidget(self._per_cam_container)
+
+        # Tickbar below sliders — cursor line ends here, at the bottom
         rlay.addWidget(self.tickbar)
 
         # Outer row container — script background color, holds camera + pointing panel
@@ -4624,8 +5086,7 @@ class Viewer(QWidget):
         self._img_pointing_row.setContentsMargins(0, 0, 0, 0)
 
         # Single-cam: script-colored wrapper, img_view fills it.
-        # Camera name + timestamp are drawn directly inside ImageView.paintEvent
-        # below the image rect — so they align exactly with the image edges.
+        # Single-cam: image + label bar BELOW (not overlapping) the image.
         _single_wrapper = QWidget()
         _single_wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         _single_wrapper.setStyleSheet("background: #f3f3f3;")
@@ -4637,6 +5098,10 @@ class Viewer(QWidget):
         self.img_view = ImageView(_single_wrapper)
         self.img_view.bg_color = QColor("#f3f3f3")
         self.img_view.cam_label_font_px = self._cam_label_size_sb.value()
+        self.img_view.sc_topn_marker_radius = self._sc_marker_r_sb.value()
+        self.img_view.sc_topn_marker_thick  = self._sc_marker_thick_sb.value()
+        # Labels drawn below image (reserved strip), not overlapping the image
+        self.img_view.cam_label_use_overlay = False
         _swl.addWidget(self.img_view, 1)
 
         self._single_cam_container = _single_wrapper
@@ -4731,6 +5196,28 @@ class Viewer(QWidget):
         self.btn_draw_cross.setStyleSheet (on if m == "cross"  else "")
         self.btn_draw_circle.setStyleSheet(on if m == "circle" else "")
         self.btn_draw_square.setStyleSheet(on if m == "square" else "")
+
+    def _remove_all_overlays(self):
+        def _clear_iv(iv):
+            iv.show_cross  = False; iv.cross_pos_norm  = None
+            iv.show_circle = False; iv.circle_center_norm = None
+            iv.circle_r_norm = None; iv.circle_rx_norm = None; iv.circle_ry_norm = None
+            iv.show_square = False; iv.square_rect_norm = None
+            iv.set_draw_mode("")
+            iv.update()
+
+        if self._is_multi_cam():
+            for idx in self._multi_grid.selected_cam_indices():
+                iv = self._multi_grid.get_img_view(idx)
+                if iv is not None:
+                    _clear_iv(iv)
+        else:
+            _clear_iv(self.img_view)
+
+        self.cb_cross.setChecked(False)
+        self.cb_circle.setChecked(False)
+        self.cb_square.setChecked(False)
+        self._refresh_draw_btns()
 
     def _open_overlay_settings(self):
         from PySide6.QtWidgets import (QDialog, QFormLayout, QSpinBox,
@@ -4834,10 +5321,14 @@ class Viewer(QWidget):
             if i != idx:
                 cv.img_view.set_draw_mode("")
 
-        # Update SC camera label and clear stale preview from previous camera
+        # Update SC camera selector and clear stale preview from previous camera
         cam_name = self._cam_names[idx] if idx < len(self._cam_names) else ""
         if hasattr(self, '_sc_cam_lbl'):
             self._sc_cam_lbl.setText(f"Camera: {cam_name}" if cam_name else "")
+        if hasattr(self, '_sc_cam_combo') and self._sc_cam_combo.count() > idx:
+            self._sc_cam_combo.blockSignals(True)
+            self._sc_cam_combo.setCurrentIndex(idx)
+            self._sc_cam_combo.blockSignals(False)
         if hasattr(self, '_sc_preview_lbl'):
             self._sc_preview_lbl.hide()
             self._sc_preview_pixmap = None
@@ -4867,6 +5358,7 @@ class Viewer(QWidget):
     def _on_cam_label_size_changed(self, px: int):
         self._multi_grid.set_label_font_size(px)
         self.img_view.cam_label_font_px = px
+        self.img_view._scaled = None  # force re-scale with new label bar height
         self.img_view.update()
 
     def _switch_to_multi_view(self):
@@ -4878,6 +5370,243 @@ class Viewer(QWidget):
     def _switch_to_single_view(self):
         self._single_wrapper.setVisible(True)
         self._multi_grid.setVisible(False)
+        if hasattr(self, '_sc_cam_row_widget'):
+            self._sc_cam_row_widget.setVisible(False)
+        self._per_cam_container.setVisible(False)
+        self.slider.setVisible(True)
+        self.tickbar.setVisible(True)
+        self.tickbar.set_cursor(None)
+
+    # ── Per-camera sliders ────────────────────────────────────────────────────
+
+    def _build_per_cam_sliders(self, cam_names: list[str]):
+        """(Re)vytvoří řady per-camera sliderů. Voláno při každém setup_multi_cam."""
+        # Odstraň staré řady
+        for row in self._per_cam_rows:
+            row.setParent(None)
+        self._per_cam_rows.clear()
+
+        for i, name in enumerate(cam_names):
+            row = _CamSliderRow(i, name, self._per_cam_container)
+            row.master_chosen.connect(self._on_per_cam_master_chosen)
+            row.master_deselected.connect(self._on_per_cam_master_deselected)
+            row.value_changed.connect(self._on_per_cam_value_changed)
+            row.pressed.connect(self._on_per_cam_pressed)
+            row.released.connect(self._on_per_cam_released)
+            self._per_cam_layout.addWidget(row)
+            self._per_cam_rows.append(row)
+
+        # První kamera je defaultní master
+        self._per_cam_master_idx = 0
+        for i, row in enumerate(self._per_cam_rows):
+            row.set_master(i == 0)
+            row.set_enabled(True)
+
+        self._per_cam_container.setVisible(True)
+
+        # After layout is computed, align tickbar axis with slider track start
+        def _update_tickbar_offset():
+            if self._per_cam_rows:
+                row0 = self._per_cam_rows[0]
+                # Map slider left edge from row coords to tickbar coords
+                row_in_tickbar = self.tickbar.mapFromGlobal(
+                    row0.mapToGlobal(row0._slider.pos()))
+                offset = max(0, row_in_tickbar.x())
+                self.tickbar.set_left_offset(offset)
+        QTimer.singleShot(0, _update_tickbar_offset)
+
+    def _on_per_cam_master_chosen(self, cam_idx: int):
+        """Uživatel klikl na radio tlačítko — přepne master na tuto kameru."""
+        self._per_cam_master_idx = cam_idx
+        for i, row in enumerate(self._per_cam_rows):
+            row.set_master(i == cam_idx)
+        # Sync slaves from new master's current position
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if cam_ts and cam_idx < len(self._per_cam_rows):
+            row = self._per_cam_rows[cam_idx]
+            t_raw = self._per_cam_slider_to_ts(cam_idx, row.value())
+            frame_idx = max(0, bisect.bisect_right(cam_ts, t_raw) - 1)
+            t_ns = cam_ts[frame_idx]
+            self._per_cam_sync_slaves(cam_idx, t_ns)
+
+    def _on_per_cam_master_deselected(self, cam_idx: int):
+        """User unchecked the master radio — switch to independent mode (no master)."""
+        self._per_cam_master_idx = -1
+        for row in self._per_cam_rows:
+            row.set_master(False)
+
+    def _on_per_cam_pressed(self, cam_idx: int):
+        self._per_cam_scrubbing_cam = cam_idx
+        if self._is_playing:
+            self.stop()
+
+    def _on_per_cam_released(self, cam_idx: int):
+        self._per_cam_scrubbing_cam = -1
+        if not self._cam_items or cam_idx >= len(self._cam_items):
+            return
+        row = self._per_cam_rows[cam_idx]
+        t_ns = self._per_cam_slider_to_ts(cam_idx, row.value())
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if cam_ts:
+            frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
+            t_ns = cam_ts[frame_idx]
+            snapped = self._per_cam_ts_to_slider(cam_idx, t_ns)
+            row.set_value(snapped)
+        self._per_cam_display_one(cam_idx, t_ns)
+        if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
+            self._per_cam_sync_slaves(cam_idx, t_ns)
+
+    def _on_per_cam_value_changed(self, cam_idx: int, v: int):
+        """Voláno při každém pohybu sliderů — time-based s bisect na nejbližší frame."""
+        if not self._cam_items or cam_idx >= len(self._cam_items):
+            return
+        t_ns = self._per_cam_slider_to_ts(cam_idx, v)
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if cam_ts:
+            frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
+            t_ns = cam_ts[frame_idx]
+        self._per_cam_display_one(cam_idx, t_ns)
+        if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
+            self._per_cam_sync_slaves(cam_idx, t_ns)
+
+    def _per_cam_ts_to_frame(self, cam_idx: int, ts_ns: int) -> int:
+        """Vrátí index nejbližšího framu (v minulosti nebo přesně) pro daný timestamp."""
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if not cam_ts:
+            return 0
+        return max(0, bisect.bisect_right(cam_ts, ts_ns) - 1)
+
+    def _per_cam_frame_to_slider(self, cam_idx: int, frame_idx: int) -> int:
+        """Převede index snímku na slider hodnotu na společné časové ose."""
+        cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        if not cam_ts or frame_idx >= len(cam_ts):
+            return 0
+        return self._per_cam_ts_to_slider(cam_idx, cam_ts[frame_idx])
+
+    def _per_cam_slider_to_ts(self, cam_idx: int, v: int) -> int:
+        """Převede hodnotu slideru (na společné časové ose) na timestamp v ns."""
+        ax_min = self.axis_min_ns
+        ax_max = self.axis_max_ns
+        if ax_max <= ax_min:
+            # Fallback: použij rozsah dané kamery
+            cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+            if not cam_ts:
+                return 0
+            ax_min, ax_max = cam_ts[0], cam_ts[-1]
+            if ax_max <= ax_min:
+                return ax_min
+        return int(ax_min + v / SLIDER_MAX * (ax_max - ax_min))
+
+    def _per_cam_ts_to_slider(self, cam_idx: int, ts_ns: int) -> int:
+        """Převede timestamp na hodnotu slideru (na společné časové ose)."""
+        ax_min = self.axis_min_ns
+        ax_max = self.axis_max_ns
+        if ax_max <= ax_min:
+            cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+            if not cam_ts:
+                return 0
+            ax_min, ax_max = cam_ts[0], cam_ts[-1]
+            if ax_max <= ax_min:
+                return 0
+        frac = (ts_ns - ax_min) / (ax_max - ax_min)
+        return max(0, min(SLIDER_MAX, int(frac * SLIDER_MAX)))
+
+    def _per_cam_display_one(self, cam_idx: int, t_ns: int):
+        """Zobrazí frame pro jednu kameru na daném čase."""
+        cam_items = self._cam_items[cam_idx] if cam_idx < len(self._cam_items) else []
+        cam_ts    = self._cam_ts[cam_idx]    if cam_idx < len(self._cam_ts)    else []
+        if not cam_items:
+            return
+        pos     = bisect.bisect_right(cam_ts, t_ns) - 1
+        cam_idx_f = max(0, min(len(cam_items) - 1, pos))
+        # Update info panel and tickbar cursor for master camera (or active scrub cam in independent mode)
+        _is_info_cam = (cam_idx == self._per_cam_master_idx) or (
+            self._per_cam_master_idx < 0 and cam_idx == self._per_cam_scrubbing_cam)
+        if _is_info_cam:
+            real_ts = cam_ts[cam_idx_f] if cam_ts else t_ns
+            self.lbl_prague_time.setText(f"Prague: {fmt_prague_full_from_ns(real_ts)}")
+            self.lbl_axis_time.setText(f"Axis: {fmt_hhmmss_ms_from_ns(real_ts)}")
+            self.tickbar.set_cursor(real_ts)
+        it      = cam_items[cam_idx_f]
+
+        if hasattr(self, '_cam_current_idx') and cam_idx < len(self._cam_current_idx):
+            self._cam_current_idx[cam_idx] = cam_idx_f
+
+        n_cams = len(self._cam_items)
+        max_side = 400 if n_cams >= 3 else (500 if n_cams == 2 else self._scrub_side)
+        brighten    = 1 if self.cb_bright.isChecked() else 0
+        gradient_id = self.gradient_cb.currentIndex()
+        subtract    = self.cb_subtract.isChecked()
+        ref = self._cam_ref_images[cam_idx] if (subtract and cam_idx < len(self._cam_ref_images)) else None
+        sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
+
+        cache = self._cam_caches[cam_idx]
+        key   = (cam_idx_f, max_side, brighten, gradient_id, self._brightness_offset,
+                 id(ref) if ref is not None else None, sub_thr)
+        cached = cache.get(key)
+        if cached is not None and not cached.isNull():
+            iv = self._multi_grid.get_img_view(cam_idx)
+            if iv:
+                iv.set_pixmap(cached)
+            self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
+            return
+
+        pool = self._cam_pools[cam_idx]
+        sig  = self._cam_signals[cam_idx]
+        pool.start(LoadTask(
+            self._gen, 0, cam_idx_f,
+            it.path, max_side, brighten, gradient_id,
+            sig, self._brightness_offset, ref, sub_thr))
+        self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
+
+    def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
+        """Synchronizuje slave kamery na nejbližší timestamp k master_ts_ns.
+        Preferuje snímky v minulosti; povoluje max 100ms do budoucnosti."""
+        _100MS = 220_000_000  # 0.22 s v ns
+        for i, row in enumerate(self._per_cam_rows):
+            if i == master_cam:
+                continue
+            cam_ts = self._cam_ts[i] if i < len(self._cam_ts) else []
+            if not cam_ts:
+                continue
+            # bisect_right dá index prvního ts > master_ts_ns
+            pos = bisect.bisect_right(cam_ts, master_ts_ns)
+            # candidate vlevo (minulost nebo přesná shoda)
+            pos_left  = max(0, pos - 1)
+            # candidate vpravo (budoucnost)
+            pos_right = min(len(cam_ts) - 1, pos)
+            ts_left  = cam_ts[pos_left]
+            ts_right = cam_ts[pos_right]
+            # Vezmi pravý jen pokud je <= 100ms v budoucnosti a blíže než levý
+            if (ts_right > master_ts_ns and
+                    ts_right - master_ts_ns <= _100MS and
+                    abs(ts_right - master_ts_ns) < abs(master_ts_ns - ts_left)):
+                best_pos = pos_right
+            else:
+                best_pos = pos_left
+            slave_ts = cam_ts[best_pos]
+            sv = self._per_cam_ts_to_slider(i, slave_ts)
+            row.set_value(sv)
+            self._per_cam_display_one(i, slave_ts)
+
+    def _per_cam_step(self, delta: int):
+        """Posune master kameru o delta framů, ostatní synchronizuje."""
+        master = self._per_cam_master_idx
+        if master < 0 or master >= len(self._cam_items) or master >= len(self._cam_ts):
+            return
+        cam_ts = self._cam_ts[master]
+        if not cam_ts:
+            return
+        row = self._per_cam_rows[master]
+        cur_t = self._per_cam_slider_to_ts(master, row.value())
+        cur_frame = max(0, bisect.bisect_right(cam_ts, cur_t) - 1)
+        new_frame = max(0, min(len(cam_ts) - 1, cur_frame + delta))
+        new_ts = cam_ts[new_frame]
+        sv = self._per_cam_ts_to_slider(master, new_ts)
+        row.set_value(sv)
+        self._per_cam_display_one(master, new_ts)
+        if self._per_cam_master_idx >= 0:
+            self._per_cam_sync_slaves(master, new_ts)
 
     def _setup_multi_cam(self, cam_names: list[str], cam_folders: list[Path],
                          reset_items: bool = True,
@@ -4912,6 +5641,19 @@ class Viewer(QWidget):
         self._multi_grid.set_label_font_size(self._cam_label_size_sb.value())
         self._switch_to_multi_view()
         self._sc_set_enabled(True)
+        # Populate the SC camera selector combo
+        self._sc_cam_combo.blockSignals(True)
+        self._sc_cam_combo.clear()
+        for name in cam_names:
+            self._sc_cam_combo.addItem(name)
+        self._sc_cam_combo.setCurrentIndex(0)
+        self._sc_cam_combo.blockSignals(False)
+        self._sc_cam_row_widget.setVisible(True)
+        # Build per-camera sliders (hidden global slider, show per-cam rows)
+        self._build_per_cam_sliders(cam_names)
+        self.slider.setVisible(False)
+        self.tickbar.setVisible(True)
+        self.tickbar.set_cursor(None)
 
     # ================================================================ ONLINE MODE
     def _on_auto_follow_toggled(self, checked: bool):
@@ -4920,6 +5662,23 @@ class Viewer(QWidget):
             self._start_online_mode()
         elif not checked and self._online_mode:
             self._stop_online_mode()
+        if checked and self.items:
+            last_idx = len(self.items) - 1
+            if self._is_multi_cam():
+                # Jump each per-cam slider to its own latest frame immediately
+                for cam_i, row in enumerate(self._per_cam_rows):
+                    cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+                    if not cam_ts:
+                        continue
+                    latest_ts = cam_ts[-1]
+                    sv = self._per_cam_ts_to_slider(cam_i, latest_ts)
+                    row.set_value(sv)
+                    self._per_cam_display_one(cam_i, latest_ts)
+                master = self._per_cam_master_idx
+                if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                    self.tickbar.set_cursor(self._cam_ts[master][-1])
+            else:
+                self._display_exact_index(last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
     def _start_online_mode(self):
         self._online_mode = True
@@ -5015,6 +5774,7 @@ class Viewer(QWidget):
                 last_idx = len(self.items) - 1
                 self._display_exact_index(
                     last_idx, self.items[last_idx].ts_ns, update_slider=True)
+
 
         class _PollSignals2(QObject):
             found = Signal(list, list)  # (new_items, new_folders)
@@ -5165,31 +5925,27 @@ class Viewer(QWidget):
                     )
                     self.lbl_scan_progress.setText(cam_lines)
                     self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
-                    if self._auto_follow and self.items:
-                        self._display_multicam_index(len(self.items) - 1, update_slider=True)
+                    if self._auto_follow:
+                        # Auto-follow: show each camera's own latest frame independently
+                        cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+                        if cam_ts_now:
+                            latest_frame = len(cam_ts_now) - 1
+                            latest_ts = cam_ts_now[latest_frame]
+                            self._per_cam_display_one(cam_idx, latest_ts)
+                            # Update this camera's per-cam slider to latest position
+                            if cam_idx < len(self._per_cam_rows):
+                                sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
+                                self._per_cam_rows[cam_idx].set_value(sv)
+                            # Update tickbar cursor from master camera
+                            if cam_idx == self._per_cam_master_idx:
+                                self.tickbar.set_cursor(latest_ts)
                     else:
+                        # Not following — just refresh this camera at current slider time
                         if self.items and self.current_idx is not None:
                             t_ns = self.items[self.current_idx].ts_ns
-                            cam_ts = self._cam_ts[cam_idx]
-                            pos = bisect.bisect_right(cam_ts, t_ns) - 1
-                            cam_idx_disp = max(0, pos)
-                            cam_items = self._cam_items[cam_idx]
-                            if cam_idx_disp < len(cam_items):
-                                it = cam_items[cam_idx_disp]
-                                self._cam_current_idx[cam_idx] = cam_idx_disp
-                                subtract = self.cb_subtract.isChecked()
-                                ref = self._cam_ref_images[cam_idx] if (subtract and cam_idx < len(self._cam_ref_images)) else None
-                                effective_sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
-                                n_total = len(self._cam_items)
-                                max_side = 400 if n_total >= 3 else (500 if n_total == 2 else self._scrub_side)
-                                brighten = 1 if self.cb_bright.isChecked() else 0
-                                gradient_id = self.gradient_cb.currentIndex()
-                                boff = self._brightness_offset
-                                self._display_req_id += 1
-                                self._cam_pools[cam_idx].start(LoadTask(
-                                    self._gen, self._display_req_id, cam_idx_disp,
-                                    it.path, max_side, brighten, gradient_id,
-                                    self._cam_signals[cam_idx], boff, ref, effective_sub_thr))
+                            cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+                            if cam_ts_now:
+                                self._per_cam_display_one(cam_idx, t_ns)
                 return on_cam_found
 
             sig.found.connect(make_callback(cam_i, gen))
@@ -5262,6 +6018,15 @@ class Viewer(QWidget):
             span_h = math.ceil((ts_max - ns_from_dt(dt0)) / ONE_HOUR_NS)
             self.axis_max_ns = ns_from_dt(dt0 + timedelta(hours=span_h))
             self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
+            # After axis expansion, recalculate per-cam sliders: old integer values now
+            # map to different timestamps on the wider axis. Jump each to its latest frame.
+            if self._auto_follow and self._is_multi_cam():
+                for cam_i, row in enumerate(self._per_cam_rows):
+                    cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+                    if not cam_ts:
+                        continue
+                    sv = self._per_cam_ts_to_slider(cam_i, cam_ts[-1])
+                    row.set_value(sv)
 
     def open_folder(self):
         # Nejdřív zkontroluj že máme nastavené časové okno
@@ -5320,6 +6085,12 @@ class Viewer(QWidget):
 
         if len(cam_names) == 1:
             self._stop_online_mode()
+            # Preserve overlay from multi-cam grid for this camera before switching to single
+            grid_state = self._multi_grid._overlay_store.get(cam_names[0])
+            if grid_state is None:
+                # Current single-cam might be this camera — save its overlay too
+                if self._cam_names and self._cam_names[0] == cam_names[0]:
+                    grid_state = MultiCameraGrid._save_iv_overlay(self.img_view)
             self._switch_to_single_view()
             self._cam_names = [cam_names[0]]
             folders = cam_folder_lists[0]
@@ -5331,10 +6102,17 @@ class Viewer(QWidget):
             self.last_open_dir = existing[0]
             if online:
                 self._pending_online_mode = True
+            # Pre-load grid_state into img_view so _start_scan saves and restores it
+            if grid_state is not None:
+                MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
             self._stop_online_mode()
+            # Save single-cam img_view overlay into multi-grid store before switching
+            if self._cam_names and len(self._cam_names) == 1:
+                self._multi_grid._overlay_store[self._cam_names[0]] = \
+                    MultiCameraGrid._save_iv_overlay(self.img_view)
             self._start_multi_cam_scan(
                 cam_names, cam_folder_lists,
                 axis_override=axis_override,
@@ -5481,7 +6259,7 @@ class Viewer(QWidget):
                 folder_axis, ts_min, ts_max)
 
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
+        self._apply_marks_to_tickbar()
 
         # Povol ovládací prvky
         self.slider.setEnabled(True)
@@ -5627,6 +6405,10 @@ class Viewer(QWidget):
 
         if len(cam_names) == 1:
             self._stop_online_mode()
+            # Preserve overlay from multi-cam grid for this camera before switching to single
+            grid_state = self._multi_grid._overlay_store.get(cam_names[0])
+            if grid_state is None and self._cam_names and self._cam_names[0] == cam_names[0]:
+                grid_state = MultiCameraGrid._save_iv_overlay(self.img_view)
             self._switch_to_single_view()
             self._cam_names = [cam_names[0]]
             existing = [f for f in cam_folder_lists[0] if f.exists() and f.is_dir()]
@@ -5635,11 +6417,18 @@ class Viewer(QWidget):
                     f"Camera folder '{cam_names[0]}' not found.")
                 return
             self.last_open_dir = existing[0]
+            # Pre-load grid_state into img_view so _start_scan saves and restores it
+            if grid_state is not None:
+                MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
             online_flag = self._online_mode or getattr(self, '_pending_online_mode', False)
             self._stop_online_mode()
+            # Save single-cam img_view overlay into multi-grid store before switching
+            if self._cam_names and len(self._cam_names) == 1:
+                self._multi_grid._overlay_store[self._cam_names[0]] = \
+                    MultiCameraGrid._save_iv_overlay(self.img_view)
             self._start_multi_cam_scan(
                 cam_names, cam_folder_lists,
                 axis_override=axis_override,
@@ -5701,9 +6490,7 @@ class Viewer(QWidget):
                 self.btn_set_ref]:
             w.setEnabled(False)
         self.mark_a_ns = None; self.mark_b_ns = None; self.tickbar.set_marks(None, None)
-        self.prog.setVisible(False)
-        self.lbl_scan_progress.setText("")
-        self.btn_cancel_scan.setVisible(False)
+        self.prog.setVisible(False); self.lbl_scan_progress.setText(""); self.btn_cancel_scan.setVisible(False)
 
         self.items = items
         n = len(items)
@@ -5728,7 +6515,7 @@ class Viewer(QWidget):
         ]
         self.axis_override = None
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
+        self._apply_marks_to_tickbar()
         self.slider.setEnabled(True); self.btn_save.setEnabled(True); self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False); self.btn_prev.setEnabled(True); self.btn_next.setEnabled(True)
         self.btn_set_a.setEnabled(True); self.btn_set_b.setEnabled(True)
@@ -5834,6 +6621,7 @@ class Viewer(QWidget):
         self.btn_refresh.setText("⟳ Refresh")
         self.btn_refresh.setEnabled(True)
         self.btn_pointing.setEnabled(True)
+        self.btn_pointing_live.setEnabled(True)
         self._sc_set_enabled(bool(self.items) or bool(self._cam_names))
         self.btn_save_ts.setEnabled(True)
         if self._saved_timestamps:
@@ -5889,6 +6677,19 @@ class Viewer(QWidget):
             if iv is not None:
                 return iv
         return self.img_view
+
+    def _sync_overlay_checkboxes_from_iv(self, iv: "ImageView"):
+        """Sync cb_cross/cb_circle/cb_square to match iv's current overlay state (no signal loops)."""
+        self.cb_cross.blockSignals(True)
+        self.cb_circle.blockSignals(True)
+        self.cb_square.blockSignals(True)
+        self.cb_cross.setChecked(iv.show_cross)
+        self.cb_circle.setChecked(iv.show_circle)
+        self.cb_square.setChecked(iv.show_square)
+        self.cb_cross.blockSignals(False)
+        self.cb_circle.blockSignals(False)
+        self.cb_square.blockSignals(False)
+        self._refresh_draw_btns()
 
     def _on_overlay_changed(self):
         iv = self._active_img_view()
@@ -6161,11 +6962,26 @@ class Viewer(QWidget):
         self.img_view.energy_text = energy_text
         self.img_view.update()
 
-        # Update single-cam labels drawn inside ImageView
+        # Update single-cam label (drawn by paintEvent in reserved strip below image)
         if not self._is_multi_cam():
             cam_name = self._cam_names[0] if self._cam_names else ""
             self.img_view.cam_label_text = cam_name
             self.img_view.cam_ts_text = fmt_prague_full_from_ns(real_ts)
+            self.img_view.update()
+
+        # Live replay: update pointing panel to show only points up to current timestamp.
+        # Skip when navigating by clicking a graph point (would just redraw what's already shown).
+        # Throttle during online auto-follow to avoid expensive mpl redraw on every frame.
+        if (self.pointing_panel.isVisible() and self.pointing_panel._ts_int is not None
+                and not getattr(self, '_pointing_nav_from_click', False)):
+            if self._auto_follow:
+                now_ms = int(time.time() * 1000)
+                last = getattr(self, '_pointing_replay_last_ms', 0)
+                if now_ms - last >= 500:
+                    self._pointing_replay_last_ms = now_ms
+                    self.pointing_panel.set_replay_ts(it.ts_ns)
+            else:
+                self.pointing_panel.set_replay_ts(it.ts_ns)
 
     # ================================================================ SCAN
     def _hard_reset_runtime(self):
@@ -6181,6 +6997,8 @@ class Viewer(QWidget):
     def _reset_ui_for_new_scan(self, folders, folder_label):
         self._stop_online_mode()
         self._hard_reset_runtime()
+        if hasattr(self, '_pointing_replay_timer') and self._pointing_replay_timer.isActive():
+            self._pointing_replay_timer.stop()
         self.opened_folders = folders[:]; self.opened_folder = folders[0] if folders else None
         self.items = []; 
         self._real_ts_list = []
@@ -6198,17 +7016,16 @@ class Viewer(QWidget):
         self._inflight.clear(); self._want_display_req.clear()
         self.img_view.cam_label_text = ""
         self.img_view.cam_ts_text = ""
-        self.img_view.clear(); self.img_view.circle_center_norm = None
-        self.img_view.circle_r_norm = None; self.img_view.circle_rx_norm = None
-        self.img_view.circle_ry_norm = None; self.img_view.square_rect_norm = None
-        self.img_view.cross_pos_norm = None
+        self.img_view.clear()
         for w in [self.slider, self.btn_save, self.btn_save_range,
                 self.btn_play, self.btn_stop, self.btn_prev, self.btn_next, self.btn_set_a,
                 self.btn_set_b, self.btn_clear_marks, self.btn_cal_circle, self.btn_cal_square,
                 self.btn_cal_cross, self.btn_pointing, self.btn_save_ts, self.btn_goto_ts,
                 self.btn_set_ref]:
             w.setEnabled(False)
-        self.mark_a_ns = None; self.mark_b_ns = None; self.tickbar.set_marks(None, None)
+        # Preserve marks across rescan — they are revalidated against the new axis at scan-done time
+        # (do not clear mark_a_ns / mark_b_ns here)
+        self.tickbar.set_marks(None, None)
         fname = folders[0].name if len(folders) == 1 else (f"{folders[0].name} → {folders[-1].name}" if folders else "Multi-camera")
         self.lbl_filename.setText(f"File: {fname}  (scanning…)")
         self.lbl_prague_time.setText("Prague: —"); self.lbl_axis_time.setText("Axis: —")
@@ -6221,7 +7038,11 @@ class Viewer(QWidget):
         if self._scan_task is not None:
             self._scan_task.cancel(); self._scan_task = None
         self.axis_override = axis_override
+        # Uložit overlay stav single-cam img_view před resetem UI
+        _saved_overlay = MultiCameraGrid._save_iv_overlay(self.img_view)
         self._reset_ui_for_new_scan(folders, folder_label)
+        # Obnovit overlay stav po resetu (clear() vymaže obrázek, ne overlay data)
+        MultiCameraGrid._restore_iv_overlay(self.img_view, _saved_overlay)
         task = ScanTask(gen, folders); self._scan_task = task
         task.signals.status.connect(self._on_scan_status)
         task.signals.progress.connect(self._on_scan_progress)
@@ -6341,7 +7162,7 @@ class Viewer(QWidget):
                 self.tickbar.discrete_tick_labels = None
                 self._fake_ts_map = None
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
+        self._apply_marks_to_tickbar()
         self.slider.setEnabled(True); self.btn_save.setEnabled(True); self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False); self.btn_prev.setEnabled(True); self.btn_next.setEnabled(True)
         self.btn_set_a.setEnabled(True); self.btn_set_b.setEnabled(True)
@@ -6349,10 +7170,11 @@ class Viewer(QWidget):
         self.btn_cal_square.setEnabled(True); self.btn_cal_cross.setEnabled(True)
         self.btn_refresh.setEnabled(True)
         self.btn_pointing.setEnabled(True)
+        self.btn_pointing_live.setEnabled(True)
         self._sc_set_enabled(True)
         self._btn_auto_follow.setEnabled(True)
         self.btn_set_ref.setEnabled(True)
-        self._update_range_ui(); self._on_overlay_changed()
+        self._update_range_ui(); self._sync_overlay_checkboxes_from_iv(self.img_view); self.img_view.update()
         pending_online = getattr(self, '_pending_online_mode', False)
         if pending_online and self.items:
             last_idx = len(self.items) - 1
@@ -6563,6 +7385,21 @@ class Viewer(QWidget):
             self.slider.blockSignals(True)
             self.slider.setValue(sv)
             self.slider.blockSignals(False)
+            # Update per-cam sliders to match this timeline position
+            t_ns = self.items[idx].ts_ns
+            for cam_i, row in enumerate(self._per_cam_rows):
+                cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+                if not cam_ts:
+                    continue
+                frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
+                sv_cam = self._per_cam_ts_to_slider(cam_i, cam_ts[frame_idx])
+                row.set_value(sv_cam)
+            # Update tickbar cursor to master position (if a master is set)
+            master = self._per_cam_master_idx
+            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                cam_ts_m = self._cam_ts[master]
+                fidx = max(0, bisect.bisect_right(cam_ts_m, t_ns) - 1)
+                self.tickbar.set_cursor(cam_ts_m[fidx])
 
         self.play_time_ns = self.items[idx].ts_ns
         self._set_info_for(idx, self.play_time_ns)
@@ -6816,8 +7653,12 @@ class Viewer(QWidget):
 
     # ================================================================ STEP FRAME
     def step_frame(self, delta_idx):
-        if not self.items: return
         if self._is_playing: self.stop()
+        # Per-cam slider mode: step the master camera, sync slaves
+        if self._is_multi_cam() and self._per_cam_rows:
+            self._per_cam_step(delta_idx)
+            return
+        if not self.items: return
         j = (self.current_idx + delta_idx) if self.current_idx is not None \
             else self._time_to_nearest_index(self._slider_to_time_ns(self.slider.value()))
         j = max(0, min(len(self.items) - 1, j))
@@ -6841,8 +7682,11 @@ class Viewer(QWidget):
         show = not self._watcher_mode
         # Show/hide left panel, slider, tickbar
         self._left_col.setVisible(show)
-        self.slider.setVisible(show)
-        self.tickbar.setVisible(show)
+        # In multi-cam mode the global slider is replaced by per-cam sliders — don't restore it
+        in_multi = self._is_multi_cam() and bool(self._per_cam_rows)
+        self.slider.setVisible(show and not in_multi)
+        self.tickbar.setVisible(show and not in_multi)
+        self._per_cam_container.setVisible(show and in_multi)
         # Hide/show tab bar and status bar (they live in the main window)
         win = self.window()
         from PySide6.QtWidgets import QTabWidget, QStatusBar
@@ -6957,6 +7801,15 @@ class Viewer(QWidget):
         pixel_mm = 4.5e-3 * M
         threshold = self.pointing_threshold_sb.value()
 
+        # Stop replay if it's running before starting new analysis
+        if self.btn_pointing_live.isChecked():
+            self.btn_pointing_live.blockSignals(True)
+            self.btn_pointing_live.setChecked(False)
+            self.btn_pointing_live.blockSignals(False)
+            self.btn_pointing_live.setText("▶ Replay")
+            self.btn_pointing_live.setStyleSheet("")
+            self._stop_pointing_replay()
+
         self.btn_pointing.setEnabled(False)
         self.btn_pointing_cancel.setVisible(True)
         total = len(items)
@@ -7003,32 +7856,28 @@ class Viewer(QWidget):
         self._pointing_task = None
         self._set_busy(False)
         self.btn_pointing.setEnabled(bool(self.items))
+        self.btn_pointing_live.setEnabled(bool(self.items))
         self._sc_set_enabled(bool(self.items) or bool(self._cam_names))
         self.btn_pointing_cancel.setVisible(False)
 
         if not results:
             self.lbl_pointing_status.setText("No results — try lowering the threshold."); return
 
-        # Parametry pro převod na µrad
-        M_nf = 1.0 / 66.0   # magnification NF
-        f    = 300.0         # focal length mm
-
         ts_arr  = np.array([r[0] for r in results], dtype=np.int64)
-        cx_mm   = np.array([r[1] for r in results])
-        cy_mm   = np.array([r[2] for r in results])
-
-        cx_urad = (cx_mm * M_nf / f) * 1e6
-        cy_urad = -(cy_mm * M_nf / f) * 1e6   # invertuj Y: pixel Y roste dolů, fyzikální Y nahoru
-        # Do NOT subtract mean — keep absolute position (0,0 = image centre = camera axis)
+        # r[1], r[2] are centroid offsets from image centre in original pixels
+        cx_px   = np.array([r[1] for r in results])
+        cy_px   = np.array([r[2] for r in results])
+        # Y axis: pixel Y grows downward, keep as-is so graph matches image orientation
+        # (positive Y = beam below centre, negative Y = above centre)
 
         n = len(results)
-        sx = float(np.std(cx_urad))
-        sy = float(np.std(cy_urad))
+        sx = float(np.std(cx_px))
+        sy = float(np.std(cy_px))
         self.lbl_pointing_status.setText(
-            f"{n} shots  σX={sx:.2f} µrad  σY={sy:.2f} µrad")
+            f"{n} shots  σX={sx:.1f} px  σY={sy:.1f} px")
 
         self.pointing_panel.setVisible(True)
-        self.pointing_panel.plot(cx_urad, cy_urad, n,
+        self.pointing_panel.plot(cx_px, cy_px, n,
                                   ts_ns=ts_arr.astype(np.float64),
                                   ts_ns_int=ts_arr)
         self.btn_pointing_save.setEnabled(True)
@@ -7037,6 +7886,73 @@ class Viewer(QWidget):
         self.btn_pointing_close.setEnabled(True)
         self.btn_pointing_select.setEnabled(True)
         self.btn_pointing_restore.setEnabled(False)
+
+    def _on_pointing_live_toggled(self, checked: bool):
+        if checked:
+            self.btn_pointing_live.setText("⏹ Stop")
+            self.btn_pointing_live.setStyleSheet(
+                "background-color: #c00; color: white; font-weight: bold;")
+            self._start_pointing_replay()
+        else:
+            self.btn_pointing_live.setText("▶ Replay")
+            self.btn_pointing_live.setStyleSheet("")
+            self._stop_pointing_replay()
+
+    def _start_pointing_replay(self):
+        """Start stepping through pointing analysis results frame by frame."""
+        panel = self.pointing_panel
+        if panel._ts_int is None or len(panel._ts_int) == 0:
+            self.btn_pointing_live.blockSignals(True)
+            self.btn_pointing_live.setChecked(False)
+            self.btn_pointing_live.blockSignals(False)
+            self.btn_pointing_live.setText("▶ Replay")
+            self.btn_pointing_live.setStyleSheet("")
+            return
+        # Start from index 0 in the pointing results
+        self._pointing_replay_idx = 0
+        if not hasattr(self, '_pointing_replay_timer'):
+            self._pointing_replay_timer = QTimer(self)
+            self._pointing_replay_timer.timeout.connect(self._pointing_replay_step)
+        fps = max(0.1, self._pointing_replay_fps_sb.value() / 100.0 * 200.0)
+        self._pointing_replay_timer.start(int(1000 / fps))
+
+    def _stop_pointing_replay(self):
+        if hasattr(self, '_pointing_replay_timer'):
+            self._pointing_replay_timer.stop()
+        # Show all points again
+        self.pointing_panel.set_replay_ts(None)
+
+    def _pointing_replay_step(self):
+        """Advance one step in the pointing replay."""
+        panel = self.pointing_panel
+        if panel._ts_int is None:
+            self._stop_pointing_replay()
+            return
+        idx = getattr(self, '_pointing_replay_idx', 0)
+        n = len(panel._ts_int)
+        if idx >= n:
+            # Replay finished — stop and reset button
+            self._pointing_replay_timer.stop()
+            self.btn_pointing_live.blockSignals(True)
+            self.btn_pointing_live.setChecked(False)
+            self.btn_pointing_live.blockSignals(False)
+            self.btn_pointing_live.setText("▶ Replay")
+            self.btn_pointing_live.setStyleSheet("")
+            return
+        ts_ns = int(panel._ts_int[idx])
+        # Show image for this timestamp
+        if self.items and self.ts_list is not None:
+            img_idx = self._time_to_nearest_index(ts_ns)
+            if 0 <= img_idx < len(self.items):
+                self._pointing_nav_from_click = True
+                self._display_exact_index(img_idx, self.items[img_idx].ts_ns, update_slider=True)
+                self._pointing_nav_from_click = False
+        # Update replay timestamp on panel to show points up to this one
+        panel.set_replay_ts(ts_ns)
+        self._pointing_replay_idx = idx + 1
+        # Update timer interval in case fps changed
+        fps = max(0.1, self._pointing_replay_fps_sb.value() / 100.0 * 200.0)
+        self._pointing_replay_timer.setInterval(int(1000 / fps))
 
     def _save_pointing_plot(self):
         dst, _ = QFileDialog.getSaveFileName(
@@ -7055,6 +7971,14 @@ class Viewer(QWidget):
             "〰 Hide Path" if showing else "〰 Show Path")
 
     def _close_pointing_panel(self):
+        # Stop replay if running
+        if self.btn_pointing_live.isChecked():
+            self.btn_pointing_live.blockSignals(True)
+            self.btn_pointing_live.setChecked(False)
+            self.btn_pointing_live.blockSignals(False)
+            self.btn_pointing_live.setText("▶ Replay")
+            self.btn_pointing_live.setStyleSheet("")
+            self._stop_pointing_replay()
         self.pointing_panel.setVisible(False)
         self.btn_pointing_close.setEnabled(False)
         self.btn_pointing_path.setEnabled(False)
@@ -7215,17 +8139,29 @@ class Viewer(QWidget):
         # Auto re-run measurement with new exclusion
         self._run_spatial_contrast()
 
+    def _sc_cam_idx(self) -> int:
+        """Return the camera index to use for SC measurement (from combo or grid selection)."""
+        if (hasattr(self, '_sc_cam_row_widget') and self._sc_cam_row_widget.isVisible()
+                and hasattr(self, '_sc_cam_combo') and self._sc_cam_combo.count() > 0):
+            return self._sc_cam_combo.currentIndex()
+        return self._multi_grid.selected_cam_index()
+
     def _sc_current_image_path(self) -> "Path | None":
         """Return the Path of the image currently shown in the selected camera."""
         if self._cam_items:
-            idx = self._multi_grid.selected_cam_index()
+            idx = self._sc_cam_idx()
             items = self._cam_items[idx] if idx < len(self._cam_items) else []
             if not items:
                 return None
-            if hasattr(self, '_cam_current_idx') and idx < len(self._cam_current_idx):
+            # Prefer the frame that matches current slider time for this camera
+            if self.play_time_ns is not None and hasattr(self, '_cam_ts') and idx < len(self._cam_ts):
+                cam_ts = self._cam_ts[idx]
+                pos = bisect.bisect_right(cam_ts, self.play_time_ns) - 1
+                cur_i = max(0, pos)
+            elif hasattr(self, '_cam_current_idx') and idx < len(self._cam_current_idx):
                 cur_i = self._cam_current_idx[idx]
             else:
-                cur_i = 0
+                cur_i = len(items) - 1  # fall back to latest
             cur_i = max(0, min(cur_i, len(items) - 1))
             return items[cur_i].path
         else:
@@ -7240,7 +8176,7 @@ class Viewer(QWidget):
     def _sc_current_cam_name(self) -> str:
         """Return the name of the camera currently used for SC measurement."""
         if self._cam_items:
-            idx = self._multi_grid.selected_cam_index()
+            idx = self._sc_cam_idx()
             if idx < len(self._cam_names):
                 return self._cam_names[idx]
         return ""
@@ -7323,8 +8259,46 @@ class Viewer(QWidget):
         pct = 100.0 * n_beam / n_total if n_total > 0 else 0.0
         self._sc_val_beam.setText(f"{n_beam:,} ({pct:.1f}%)")
 
+        # Store top-N data and trigger overlay repaint
+        self._sc_topn_points = list(zip(
+            result.get("top_xs", []),
+            result.get("top_ys", [])
+        ))
+        self._sc_topn_img_shape = result.get("img_shape", None)
+        self._update_sc_topn_overlay()
+
+    def _on_sc_topn_changed(self, _val):
+        self._update_sc_topn_overlay()
+
+    def _on_sc_marker_style_changed(self, _val=None):
+        iv = getattr(self, 'img_view', None)
+        if iv is None:
+            return
+        iv.sc_topn_marker_radius = self._sc_marker_r_sb.value()
+        iv.sc_topn_marker_thick  = self._sc_marker_thick_sb.value()
+        iv.update()
+
+    def _update_sc_topn_overlay(self):
+        """Draw top-N intensity pixel markers on img_view."""
+        n = self._sc_topn_sb.value()
+        pts = getattr(self, '_sc_topn_points', None)
+        shape = getattr(self, '_sc_topn_img_shape', None)
+        iv = self.img_view
+        if n == 0 or not pts or shape is None:
+            iv.sc_topn_points_norm = None
+        else:
+            h, w = shape
+            if w > 0 and h > 0:
+                iv.sc_topn_points_norm = [
+                    (px / w, py / h) for px, py in pts[:n]
+                ]
+            else:
+                iv.sc_topn_points_norm = None
+        iv.update()
+
     def _on_pointing_point_clicked(self, orig_idx: int):
-        """Navigate slider to the timestamp of the clicked pointing point."""
+        """Navigate slider to the timestamp of the clicked pointing point.
+        Does NOT update the pointing graph replay — only the image changes."""
         panel = self.pointing_panel
         if panel._ts_int is None or orig_idx >= len(panel._ts_int):
             return
@@ -7333,25 +8307,53 @@ class Viewer(QWidget):
             return
         idx = self._time_to_nearest_index(ts_ns)
         if 0 <= idx < len(self.items):
+            self._pointing_nav_from_click = True
             self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
+            self._pointing_nav_from_click = False
+
+    def _current_master_ts_ns(self) -> int | None:
+        """Return current timestamp of the master camera (single-cam or multi-cam)."""
+        if self._is_multi_cam():
+            master = self._per_cam_master_idx
+            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                row = self._per_cam_rows[master] if master < len(self._per_cam_rows) else None
+                if row is None:
+                    return None
+                v = row.value()
+                t_raw = self._per_cam_slider_to_ts(master, v)
+                frame_idx = max(0, bisect.bisect_right(self._cam_ts[master], t_raw) - 1)
+                return self._cam_ts[master][frame_idx]
+            return None
+        if not self.items or self.current_idx is None:
+            return None
+        return self.items[self.current_idx].ts_ns
 
     def set_mark_a(self):
-        if not self.items: return
-        t = self._slider_to_time_ns(self.slider.value())
-        idx = self._time_to_nearest_index(t)
-        self.mark_a_ns = self.items[idx].ts_ns
+        ts = self._current_master_ts_ns()
+        if ts is None: return
+        self.mark_a_ns = ts
         self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns); self._update_range_ui()
 
     def set_mark_b(self):
-        if not self.items: return
-        t = self._slider_to_time_ns(self.slider.value())
-        idx = self._time_to_nearest_index(t)
-        self.mark_b_ns = self.items[idx].ts_ns
+        ts = self._current_master_ts_ns()
+        if ts is None: return
+        self.mark_b_ns = ts
         self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns); self._update_range_ui()
 
     def clear_marks(self):
         self.mark_a_ns = None; self.mark_b_ns = None
         self.tickbar.set_marks(None, None); self._update_range_ui()
+
+    def _apply_marks_to_tickbar(self):
+        """Validate stored marks against the current axis and update the tickbar.
+        Marks outside the new axis are cleared so stale out-of-range marks don't show."""
+        ax_min, ax_max = self.axis_min_ns, self.axis_max_ns
+        if ax_max > ax_min:
+            if self.mark_a_ns is not None and not (ax_min <= self.mark_a_ns <= ax_max):
+                self.mark_a_ns = None
+            if self.mark_b_ns is not None and not (ax_min <= self.mark_b_ns <= ax_max):
+                self.mark_b_ns = None
+        self.tickbar.set_marks(self.mark_a_ns, self.mark_b_ns)
 
     def _update_range_ui(self):
         ok = (self.mark_a_ns is not None) and (self.mark_b_ns is not None) and bool(self.items)
@@ -7392,9 +8394,9 @@ class Viewer(QWidget):
         i1 = min(len(self.items) - 1, self.current_idx + n)
         total = i1 - i0 + 1
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder")
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
         if not out_dir: return
-
+        self._last_save_dir = Path(out_dir)
         self._show_copy_progress(total, f"Saving {total} frames around current…")
         task = SaveRangeTask(
             self.items[i0:i1+1], Path(out_dir), self._dst_name_with_prague_time,
@@ -7420,10 +8422,11 @@ class Viewer(QWidget):
         it = self.items[self.current_idx]
         stem = self._dst_name_with_prague_time(it)
         stem_no_ext = Path(stem).stem
-        suggested = str(it.path.parent / f"{stem_no_ext}_overlay.png")
+        suggested = str(self._last_save_dir / f"{stem_no_ext}_overlay.png")
         dst, _ = QFileDialog.getSaveFileName(
             self, "Save image with overlay", suggested, "PNG Images (*.png)")
         if not dst: return
+        self._last_save_dir = Path(dst).parent
 
         # Vezmi aktuální pixmapu a nakresli overlay
         pix = self.img_view._pix.copy()
@@ -7507,8 +8510,8 @@ class Viewer(QWidget):
             if not pix.save(dst):
                 QMessageBox.critical(self, "Save failed", f"Could not save to {dst}")
                 return
-        _copy_metadata_into_png(it.path, Path(dst),
-                                save_txt=self.cb_save_metadata_txt.isChecked())
+        _copy_metadata_into_png_bg(it.path, Path(dst),
+                                   save_txt=self.cb_save_metadata_txt.isChecked())
         QMessageBox.information(self, "Saved",
             f"Saved with overlay.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}")
 
@@ -7536,7 +8539,7 @@ class Viewer(QWidget):
         stem = Path(self._dst_name_with_prague_time(it)).stem
         ann_suffix = "_annotate" if has_overlay else ""
 
-        if gradient_id == 0 and not has_overlay:
+        if gradient_id == GRADIENT_ID_DEFAULT and not has_overlay:
             dst = out_dir / f"{stem}_{cam_name}{it.path.suffix}"
             try:
                 shutil.copy2(it.path, dst)
@@ -7586,7 +8589,7 @@ class Viewer(QWidget):
                     return f"Could not load {it.path.name}"
                 if not QPixmap.fromImage(img).save(str(dst)):
                     return f"Could not save {dst.name}"
-            _copy_metadata_into_png(it.path, dst, save_txt=save_metadata_txt)
+            _copy_metadata_into_png_bg(it.path, dst, save_txt=save_metadata_txt)
         return None
 
     def _save_multicam_current(self):
@@ -7604,10 +8607,11 @@ class Viewer(QWidget):
         if not frames:
             QMessageBox.information(self, "Save", "No frames to save.")
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder")
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
         if not out_dir:
             return
         out_path = Path(out_dir)
+        self._last_save_dir = out_path
         gradient_id = self.gradient_cb.currentIndex()
         brighten = self.cb_bright.isChecked()
         save_txt = self.cb_save_metadata_txt.isChecked()
@@ -7639,27 +8643,29 @@ class Viewer(QWidget):
                        or self.img_view.show_cross or self.img_view.show_circle
                        or self.img_view.show_square)
 
-        if gradient_id == 0:
-            suggested = str(it.path.parent / self._dst_name_with_prague_time(it))
+        if gradient_id == GRADIENT_ID_DEFAULT:
+            suggested = str(self._last_save_dir / self._dst_name_with_prague_time(it))
             dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, f"Images (*{it.path.suffix})")
             if not dst: return
+            self._last_save_dir = Path(dst).parent
             try:
                 shutil.copy2(it.path, Path(dst))
             except Exception as e:
                 QMessageBox.critical(self, "Save failed", str(e)); return
-            _copy_metadata_into_png(it.path, Path(dst), save_txt=save_txt)
+            _copy_metadata_into_png_bg(it.path, Path(dst), save_txt=save_txt)
         else:
             stem_no_ext = Path(self._dst_name_with_prague_time(it)).stem
-            suggested = str(it.path.parent / f"{stem_no_ext}.png")
+            suggested = str(self._last_save_dir / f"{stem_no_ext}.png")
             dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, "PNG Images (*.png)")
             if not dst: return
+            self._last_save_dir = Path(dst).parent
             brighten = self.cb_bright.isChecked()
             img = load_image_scaled(it.path, SCRUB_MAX_SIDE, brighten, gradient_id)
             if img.isNull():
                 QMessageBox.critical(self, "Save failed", "Could not load image."); return
             if not img.save(dst):
                 QMessageBox.critical(self, "Save failed", f"Could not save to {dst}"); return
-            _copy_metadata_into_png(it.path, Path(dst), save_txt=save_txt)
+            _copy_metadata_into_png_bg(it.path, Path(dst), save_txt=save_txt)
 
         # Also save annotate version alongside original if any overlay is active
         if has_overlay:
@@ -7706,7 +8712,7 @@ class Viewer(QWidget):
                     painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, self.img_view.energy_text)
                 painter.end()
                 pix.save(str(ann_dst))
-                _copy_metadata_into_png(it.path, ann_dst, save_txt=save_txt)
+                _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt)
 
         msg = f"Saved.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}"
         if has_overlay:
@@ -7737,9 +8743,10 @@ class Viewer(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes: return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder")
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
         if not out_dir: return
         out_path = Path(out_dir)
+        self._last_save_dir = out_path
         gradient_id = self.gradient_cb.currentIndex()
         brighten = self.cb_bright.isChecked()
         save_txt = self.cb_save_metadata_txt.isChecked()
@@ -7775,8 +8782,9 @@ class Viewer(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes: return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder")
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
         if not out_dir: return
+        self._last_save_dir = Path(out_dir)
         self._show_copy_progress(total, "Saving range…")
         iv = self.img_view
         has_overlay = (self.cb_save_overlay.isChecked()

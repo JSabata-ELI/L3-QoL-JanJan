@@ -1,28 +1,101 @@
 # cm_t.py
+import json
 import re
 import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
 import configparser
 import sys
 import time
+import os
 
 # ---------------- CONFIG ----------------
-PROGRAMS_ROOT = Path(r"C:\Users\jan.moucka\OneDrive - ELI Beamlines\ELI Beamlines\Python\programy")
+# cm_t.py žije v L3-QoL-JanJan/Dev Tools/ po přesunu do gitu.
+# _app_dir() vrátí L3-QoL-JanJan/Dev Tools/  (frozen i source)
+# Zdrojáky ikon:  L3-QoL-JanJan/           = _app_dir().parent
+# Dist / exe:     programy/dist/            = _app_dir().parent.parent / "dist"
+def _src_root() -> Path:
+    """Kořen git repozitáře s py zdrojáky (L3-QoL-JanJan/)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
+        return Path(sys.executable).resolve().parent.parent
+    return Path(__file__).resolve().parent.parent
 
-# Destinace jsou ROOTy. Script kopíruje do: ROOT \ <ProgramName> \
-DESTINATION_ROOTS = [
-    ("Scratch", Path(r"Z:\Software")),
-    ("Sharepoint", Path(r"C:\Users\jan.moucka\OneDrive - ELI Beamlines\L3-HAPLS\General\QoL")),
-]
+def _dist_root() -> Path:
+    """programy/dist/ — kam jdou exe soubory."""
+    return _src_root().parent / "dist"
 
-# verze složky: v1.2.3
-SOFTWARE_ROOT = Path(r"Z:\Software")
-INTERNAL_BUILDER_DIST = Path(r"C:\Dev\dist\_internal_builder")
+PROGRAMS_ROOT = _src_root()
+
+# ---------------- USER CONFIG (shared with b_t.py) ----------------
+_CONFIG_PATH = Path(os.environ.get("APPDATA", "~")) / "DevTools" / "config.json"
+
+def _load_devtools_config() -> dict:
+    try:
+        if _CONFIG_PATH.exists():
+            return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_devtools_config(data: dict):
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _get_destination_roots() -> list[tuple[str, Path]]:
+    cfg = _load_devtools_config()
+    roots = []
+    scratch = cfg.get("scratch")
+    sharepoint = cfg.get("sharepoint")
+    if scratch:
+        roots.append(("Scratch", Path(scratch)))
+    if sharepoint:
+        roots.append(("Sharepoint", Path(sharepoint)))
+    return roots
+
+def _get_scratch_root() -> Path | None:
+    cfg = _load_devtools_config()
+    s = cfg.get("scratch")
+    return Path(s) if s else None
+
+def _versions_txt_path() -> Path | None:
+    r = _get_scratch_root()
+    return (r / "Versions.txt") if r else None
+
+def read_versions_txt() -> dict[str, str]:
+    p = _versions_txt_path()
+    if not p or not p.exists():
+        return {}
+    result = {}
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if "=" in line:
+                name, _, ver = line.partition("=")
+                result[name.strip()] = ver.strip()
+    except Exception:
+        pass
+    return result
+
+def write_version_to_txt(program_name: str, version: str):
+    p = _versions_txt_path()
+    if not p:
+        return
+    versions = read_versions_txt()
+    versions[program_name] = version if version.startswith("v") else f"v{version}"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f"{k} = {v}" for k, v in sorted(versions.items())]
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception as e:
+        print(f"Warning: could not write Versions.txt: {e}")
+
+INTERNAL_BUILDER_DIST = _dist_root() / "Internal Builder"
 VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 README_PREFIX = "ReadMe_"
 README_NAME = "ReadMe.txt"
@@ -344,7 +417,7 @@ class DeployGUI(ttk.Frame):
 
         self.program_vars: dict[Path, tk.BooleanVar] = {}
         self.program_version_vars: dict[Path, tk.StringVar] = {}
-        self.dest_vars: dict[Path, tk.BooleanVar] = {}
+        self.dest_vars: dict[str, tk.BooleanVar] = {}  # keyed by destination name
 
         self.program_is_new: dict[Path, bool] = {}
         self.program_latest_version: dict[Path, str] = {}
@@ -404,6 +477,86 @@ class DeployGUI(ttk.Frame):
     def _on_dest_configure(self, event=None):
         self.after_idle(self._reflow_dest_paths)
 
+    def _build_dest_rows(self):
+        for child in self.dest_frame.winfo_children():
+            child.destroy()
+        self.dest_vars.clear()
+        self.dest_path_labels.clear()
+
+        destinations = _get_destination_roots()
+        if not destinations:
+            ttk.Label(self.dest_frame, text="No paths configured.\nClick ⚙ Set paths.",
+                      foreground="gray").pack(anchor="w", padx=4, pady=4)
+        else:
+            for name, path in destinations:
+                var = tk.BooleanVar(value=True)
+                self.dest_vars[name] = var
+
+                row = ttk.Frame(self.dest_frame)
+                row.pack(fill="x", pady=4)
+                row.grid_columnconfigure(0, weight=0)
+                row.grid_columnconfigure(1, weight=0)
+                row.grid_columnconfigure(2, weight=1)
+
+                ttk.Checkbutton(row, variable=var).grid(row=0, column=0, sticky="w")
+                ttk.Label(row, text=name, width=12).grid(row=0, column=1, sticky="w", padx=(6, 8))
+
+                raw = str(path)
+                path_lbl = ttk.Label(row, text=raw, justify="left", anchor="w")
+                path_lbl.grid(row=0, column=2, sticky="ew")
+                self.dest_path_labels.append((path_lbl, raw))
+                path_lbl.bind("<Configure>", self._on_dest_configure)
+
+        self.dest_frame.bind("<Configure>", self._on_dest_configure)
+        self.after_idle(self._reflow_dest_paths)
+
+    def _open_set_paths(self):
+        cfg = _load_devtools_config()
+
+        win = tk.Toplevel(self)
+        win.title("Set paths")
+        win.resizable(False, False)
+        win.grab_set()
+
+        ttk.Label(win, text="Configure shared paths for Dev Tools (Builder + Copy Manager).",
+                  padding=(12, 10)).pack()
+
+        fields = [
+            ("scratch",    "Scratch (Software) folder",  "e.g. Z:\\Software"),
+            ("sharepoint", "Sharepoint (QoL) folder",    "e.g. C:\\...\\L3-HAPLS\\General\\QoL"),
+        ]
+
+        vars_ = {}
+        for key, label, hint in fields:
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=16, pady=4)
+            ttk.Label(row, text=label + ":", width=28, anchor="w").pack(side="left")
+            var = tk.StringVar(value=cfg.get(key, ""))
+            vars_[key] = var
+            ttk.Entry(row, textvariable=var, width=40, state="readonly").pack(side="left", padx=(4, 4))
+            ttk.Button(row, text="Browse…",
+                       command=lambda k=key, v=var: _browse(k, v)).pack(side="left")
+
+        def _browse(key, var):
+            cur = var.get() or str(Path.home())
+            chosen = filedialog.askdirectory(title="Select folder", initialdir=cur)
+            if chosen:
+                var.set(chosen)
+
+        def on_save():
+            for key, var in vars_.items():
+                val = var.get().strip()
+                if val:
+                    cfg[key] = val
+                else:
+                    cfg.pop(key, None)
+            _save_devtools_config(cfg)
+            win.destroy()
+            self._build_dest_rows()
+            messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
+
+        ttk.Button(win, text="Save", command=on_save, padding=(16, 6)).pack(pady=(8, 12))
+
     def _build_ui(self):
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
@@ -455,31 +608,7 @@ class DeployGUI(ttk.Frame):
         self.dest_frame = ttk.Frame(right)
         self.dest_frame.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.dest_path_labels.clear()
-
-        for name, path in DESTINATION_ROOTS:
-            var = tk.BooleanVar(value=True)
-            self.dest_vars[path] = var
-
-            row = ttk.Frame(self.dest_frame)
-            row.pack(fill="x", pady=4)
-
-            row.grid_columnconfigure(0, weight=0)
-            row.grid_columnconfigure(1, weight=0)
-            row.grid_columnconfigure(2, weight=1)
-
-            ttk.Checkbutton(row, variable=var).grid(row=0, column=0, sticky="w")
-            ttk.Label(row, text=name, width=12).grid(row=0, column=1, sticky="w", padx=(6, 8))
-
-            raw = str(path)
-            path_lbl = ttk.Label(row, text=raw, justify="left", anchor="w")
-            path_lbl.grid(row=0, column=2, sticky="ew")
-
-            self.dest_path_labels.append((path_lbl, raw))
-
-        self.dest_frame.bind("<Configure>", self._on_dest_configure)
-        for lbl, _ in self.dest_path_labels:
-            lbl.bind("<Configure>", self._on_dest_configure)
+        self._build_dest_rows()
 
         self.after_idle(self._reflow_dest_paths)
 
@@ -490,6 +619,7 @@ class DeployGUI(ttk.Frame):
         ttk.Button(actions, text="Select NEW", command=self._select_new_programs).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Clear", command=self._clear_programs).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="Refresh", command=self._refresh).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="⚙ Set paths", command=self._open_set_paths).pack(side="left", padx=(8, 0))
 
         self.copy_btn = ttk.Button(actions, text="Copy", command=self._on_copy)
         self.copy_btn.pack(side="right")
@@ -628,7 +758,7 @@ class DeployGUI(ttk.Frame):
             return
 
         program_dirs = []
-        IGNORE = {"dist", "matlab", "icons", "internal builder", ".venv", ".vscode", "extractor"}
+        IGNORE = {"dist", "matlab", "icons", "internal builder", ".venv", ".vscode", "extractor", ".git"}
         for p in sorted(PROGRAMS_ROOT.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_dir():
                 continue
@@ -646,14 +776,17 @@ class DeployGUI(ttk.Frame):
         self.header.grid_columnconfigure(1, minsize=self.program_col_px)
 
         for p in program_dirs:
-            dist_dir = PROGRAMS_ROOT / "dist" / p.name
+            dist_dir = _dist_root() / p.name
             version_folders = list_versions(dist_dir)
             version_names = [vf.name for vf in version_folders]
 
             latest = version_names[0] if version_names else ""
             self.program_latest_version[p] = latest
 
-            last_deployed = self.state_deployed.get(p.name.lower(), "").strip()
+            # Read deployed version from Versions.txt (primary) or local state (fallback)
+            versions_map = read_versions_txt()
+            last_deployed = versions_map.get(p.name, "") or self.state_deployed.get(p.name.lower(), "")
+            last_deployed = last_deployed.strip()
             is_new = bool(latest) and is_newer_version(latest, last_deployed)
             self.program_is_new[p] = is_new
 
@@ -744,7 +877,7 @@ class DeployGUI(ttk.Frame):
             if not version_name:
                 continue
 
-            version_folder = PROGRAMS_ROOT / "dist" / program_dir.name / version_name
+            version_folder = _dist_root() / program_dir.name / version_name
 
             # Najdi zdrojovou ikonu (stejná logika jako v _deploy_one_program)
             icon_src = None
@@ -798,7 +931,9 @@ class DeployGUI(ttk.Frame):
         return [p for p, v in self.program_vars.items() if v.get()]
 
     def _get_selected_destination_roots(self) -> list[Path]:
-        return [p for p, v in self.dest_vars.items() if v.get()]
+        all_destinations = {name: path for name, path in _get_destination_roots()}
+        return [all_destinations[name] for name, var in self.dest_vars.items()
+                if var.get() and name in all_destinations]
 
     def _set_busy(self, busy: bool):
         self.copy_btn.configure(state=("disabled" if busy else "normal"))
@@ -848,7 +983,7 @@ class DeployGUI(ttk.Frame):
         if not version_name:
             raise FileNotFoundError(f"[{program_name}] NEW program: build it first (no versions in dist).")
 
-        version_folder = PROGRAMS_ROOT / "dist" / program_name / version_name
+        version_folder = _dist_root() / program_name / version_name
         if not version_folder.exists():
             raise FileNotFoundError(f"Selected version folder missing: {version_folder}")
 
@@ -1183,7 +1318,11 @@ class DeployGUI(ttk.Frame):
             messagebox.showerror("Error", f"_internal folder not found in:\n{INTERNAL_BUILDER_DIST}")
             return
 
-        zip_path = SOFTWARE_ROOT / "_internal_builder.zip"
+        scratch = _get_scratch_root()
+        if scratch is None:
+            messagebox.showerror("Error", "Scratch path not configured.\nClick ⚙ Set paths first.")
+            return
+        zip_path = scratch / "_internal_builder.zip"
 
         self._clear_log()
         self._log(f"Packing _internal from: {INTERNAL_BUILDER_DIST}\n")
@@ -1226,7 +1365,7 @@ class DeployGUI(ttk.Frame):
             # Rozbal do každé vybrané složky
             import zipfile
             for program_dir in selected:
-                dst_dir = SOFTWARE_ROOT / program_dir.name
+                dst_dir = scratch / program_dir.name
                 if not dst_dir.exists() or not dst_dir.is_dir():
                     self.after(0, self._log, f"[{program_dir.name}] SKIP — folder not found: {dst_dir}")
                     fail += 1
@@ -1318,6 +1457,7 @@ class DeployGUI(ttk.Frame):
                         all_file_logs.append((program_dir.name, version_name, file_log))
 
                         self.state_deployed[program_dir.name.lower()] = version_name
+                        write_version_to_txt(program_dir.name, version_name)
                         changed = True
 
                     except Exception as e:
