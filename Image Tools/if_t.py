@@ -376,6 +376,35 @@ def load_readme_text() -> str:
             pass
     return INFO_TEXT
 
+
+def _read_img_max_value(path: Path) -> "float | None":
+    """Read imgMaxValue from PNG tEXt metadata — physical maximum pixel value
+    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
+    Returns float or None if not found."""
+    if path.suffix.lower() != ".png":
+        return None
+    try:
+        with PilImage.open(str(path)) as pil:
+            info = pil.info
+            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
+            if len(chunks) >= 12:
+                v = chunks[11][1]
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+            for k, v in chunks:
+                try:
+                    f = float(v)
+                    if 0 < f <= 65535:
+                        return f
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+    return None
+
+
 # ── CALENDAR WEEKEND DELEGATE ─────────────────────────────────────────────────
 
 class _WeekendDelegate(QStyledItemDelegate):
@@ -2681,42 +2710,40 @@ class ImageFinderWidget(QWidget):
 
         def worker():
             try:
-                # Try target hour first, then walk back up to 3 hours if not found.
-                path_to_use = None
-                cached_entries: list[Path] = []
-                for delta in [0, -1, -2, -3, 1, 2, 3]:
-                    candidate = self._build_target_path(
-                        dt + timedelta(hours=delta))
-                    try:
-                        exists = candidate.exists() and candidate.is_dir()
-                    except Exception:
-                        exists = False
-                    if not exists:
-                        _sig.log_msg.emit(f"LOAD: Δ{delta:+d}h  {candidate}  — neexistuje")
-                        continue
-                    # Scan once and reuse — avoids a second network traversal
-                    try:
-                        entries = [Path(e.path) for e in os.scandir(candidate) if e.is_dir()]
-                    except Exception:
-                        entries = []
-                    subfolder_count = len(entries)
-                    _sig.log_msg.emit(f"LOAD: Δ{delta:+d}h  {candidate.name}  podsložky={subfolder_count}")
-                    if subfolder_count < MIN_FULL_FILES:
-                        continue
-                    path_to_use = candidate
-                    cached_entries = entries
-                    if delta != 0:
-                        _sig.log_msg.emit(
-                            f"LOAD: using {candidate.name} (Δ{delta:+d}h) subfolders={subfolder_count}"
-                        )
-                    break
+                # Collect camera folders from ALL hours in the selected day.
+                # This mirrors Shot Finder behaviour so cameras active at any
+                # hour of the day are visible regardless of the hour selector.
+                year = dt.year
+                container_year = max(year, 2025)
+                root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{container_year}"
+                day_dir = root / str(year) / str(dt.month) / str(dt.day)
 
-                if path_to_use is None:
+                seen: set[str] = set()
+                all_entries: list[Path] = []
+                found_any_hour = False
+
+                for h in range(24):
+                    hour_dir = day_dir / str(h)
+                    try:
+                        if not hour_dir.exists() or not hour_dir.is_dir():
+                            continue
+                    except Exception:
+                        continue
+                    found_any_hour = True
+                    try:
+                        for e in os.scandir(hour_dir):
+                            if e.is_dir() and e.name not in seen:
+                                seen.add(e.name)
+                                all_entries.append(Path(e.path))
+                    except Exception:
+                        pass
+
+                if not found_any_hour:
                     _sig.not_found.emit(target_path)
                     return
 
-                subfolders = sorted(cached_entries, key=lambda x: x.name.lower())
-                _sig.log_msg.emit(f"LOAD: found {len(subfolders)} subfolders, delivering to UI")
+                subfolders = sorted(all_entries, key=lambda x: x.name.lower())
+                _sig.log_msg.emit(f"LOAD: scanned all hours in {day_dir.name}, found {len(subfolders)} cameras")
                 _sig.done.emit(subfolders, saved_sel, current_gen)
             except Exception as e:
                 _sig.error.emit(f"{type(e).__name__}: {e}")
@@ -2744,12 +2771,24 @@ class ImageFinderWidget(QWidget):
             self._log(f"_on_load_done: ignoring stale load (gen {gen} != {self._load_gen})")
             return
         try:
+            # Count how many hours each camera label appears in (for disambiguation)
+            label_count: dict[str, int] = {}
+            for p in subfolders:
+                lbl = extract_display_label(p.name)
+                label_count[lbl] = label_count.get(lbl, 0) + 1
+
             seen: dict[str, int] = {}
             self._table.blockSignals(True)
             for p in subfolders:
                 label = extract_display_label(p.name)
                 seen[label] = seen.get(label, 0) + 1
-                label_display = f"{label} ({seen[label]})" if seen[label] > 1 else label
+                if label_count.get(label, 1) > 1:
+                    try:
+                        label_display = f"{label} [h{p.parent.name}]"
+                    except Exception:
+                        label_display = f"{label} ({seen[label]})"
+                else:
+                    label_display = label
                 num = extract_folder_number(p.name)
                 try:
                     cam_int = (int(num) if num.isdigit()
@@ -3517,8 +3556,8 @@ class ImageFinderWidget(QWidget):
                 self._view_temp_dir = None
         except: pass
 
-    def _apply_gradient_to_image(self, img: PilImage.Image) -> PilImage.Image:
-        """Apply currently selected gradient LUT. Identical to original."""
+    def _apply_gradient_to_image(self, img: PilImage.Image, src_path: "Path | None" = None) -> PilImage.Image:
+        """Apply currently selected gradient LUT."""
         name = self._gradient_cb.currentText()
         lut  = GRADIENTS.get(name)
         if lut is None: return img
@@ -3526,7 +3565,11 @@ class ImageFinderWidget(QWidget):
         if arr.ndim == 3: arr = arr.mean(axis=2)
         arr = arr.astype(np.float32)
         self._log(f"IMG range: min={arr.min():.0f} max={arr.max():.0f} dtype={img.mode} shape={arr.shape}")
-        arr = np.clip((arr - arr.min()) / max(65520 - arr.min(), 1) * 255.0, 0, 255)
+        img_max_val = _read_img_max_value(src_path) if src_path is not None else None
+        arr_px_max = float(arr.max())
+        if img_max_val is not None and arr_px_max > 0:
+            arr = img_max_val * arr / arr_px_max
+        arr = np.clip(arr / 4095.0 * 255.0, 0, 255)
         return PilImage.fromarray(lut[arr.astype(np.uint8)].astype(np.uint8), mode="RGB")
 
     def _make_view_copy_with_readable_name(self, src: Path) -> Path:
@@ -3546,7 +3589,7 @@ class ImageFinderWidget(QWidget):
                 i += 1
         grad_name = self._gradient_cb.currentText()
         if grad_name != "Grayscale":
-            try: self._apply_gradient_to_image(PilImage.open(src)).save(dst)
+            try: self._apply_gradient_to_image(PilImage.open(src), src).save(dst)
             except: shutil.copy2(src, dst)
         else:
             shutil.copy2(src, dst)
@@ -3809,7 +3852,7 @@ class ImageFinderWidget(QWidget):
                         annotated += 1
                     else:
                         if grad_name != "Grayscale":
-                            try: self._apply_gradient_to_image(PilImage.open(src)).save(dst)
+                            try: self._apply_gradient_to_image(PilImage.open(src), src).save(dst)
                             except: shutil.copy2(src, dst)
                         else:
                             shutil.copy2(src, dst)
@@ -4627,11 +4670,11 @@ class MultiDayPreviewWindow(QWidget):
                 arr = _np.array(img.convert("L"), dtype=_np.float32)
             else:
                 arr = _np.array(img.convert("L"), dtype=_np.float32)
-            mn, mx = arr.min(), arr.max()
-            if mx > mn:
-                arr8 = ((arr - mn) / (mx - mn) * 255).astype(_np.uint8)
-            else:
-                arr8 = _np.zeros(arr.shape, dtype=_np.uint8)
+            img_max_val = _read_img_max_value(path)
+            arr_px_max = float(arr.max())
+            if img_max_val is not None and arr_px_max > 0:
+                arr = img_max_val * arr / arr_px_max
+            arr8 = _np.clip(arr / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
             self._raw_cache[path] = arr8
             return arr8
         except Exception:
