@@ -7,12 +7,10 @@
     "L3-PM03-023:Energy",
     "L3-PM03-025:Energy",
     "L3-VCS-LN36:OPEN",
-    "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
-    "C03-061-SAM7ANF:TotalPower",
-    "HAPLS-ENER_IN_SAM17_LT5_DIAG2:Energy"
+    "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-05-14 10:27:15",
-  "time_to": "2026-05-14 10:37:15",
+  "time_from": "2026-05-14 13:15:57",
+  "time_to": "2026-05-14 13:25:57",
   "http_timeout": 10.0
 }
