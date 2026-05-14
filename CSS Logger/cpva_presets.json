@@ -24,6 +24,16 @@
         "HAPLS-ENER_IN_SAM17_LT5_DIAG2:Energy"
       ],
       "time_window_hours": 10.0
+    },
+    {
+      "name": "SpectralCentroid",
+      "pvs": [
+        "HAPLS-SPEC_CENT_PD1M1_LT7_DIAG1:SpectralCentroid",
+        "HAPLS-SPEC_CENT_PD2M1_LT7_DIAG1:SpectralCentroid",
+        "HAPLS-SPEC_CENT_PD3M1_LT7_DIAG1:SpectralCentroid",
+        "HAPLS-SPEC_CENT_PD4M1_LT7_DIAG1:SpectralCentroid"
+      ],
+      "time_window_hours": null
     }
   ]
 }
