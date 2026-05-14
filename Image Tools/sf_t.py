@@ -149,6 +149,35 @@ SBW4_WARNING_THRESHOLD_J = 0.5
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
+def _read_img_max_value(path: Path) -> "float | None":
+    """Read imgMaxValue from PNG tEXt metadata — physical maximum pixel value
+    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
+    Returns float or None if not found."""
+    if path.suffix.lower() != ".png":
+        return None
+    try:
+        from PIL import Image as _PilImg
+        with _PilImg.open(str(path)) as pil:
+            info = pil.info
+            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
+            if len(chunks) >= 12:
+                v = chunks[11][1]
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+            for k, v in chunks:
+                try:
+                    f = float(v)
+                    if 0 < f <= 65535:
+                        return f
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+    return None
+
+
 def _cpva_ssl_ctx() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -1377,31 +1406,25 @@ class ShotFinderWidget(QWidget):
         if gen != self._preview_gen:
             return
         try:
-            from PySide6.QtGui import QImageReader, QImage
+            from PySide6.QtGui import QImage
+            from PIL import Image as _PilImg
             import numpy as _np
 
-            reader = QImageReader(str(img_path))
-            reader.setAutoTransform(True)
-            qimg = reader.read()
-            if qimg.isNull():
-                self._preview_sig.show.emit(None, energy_text, gen)
-                return
+            pil = _PilImg.open(str(img_path))
+            if pil.mode in ("I", "I;16"):
+                arr_f = _np.array(pil, dtype=_np.float32)
+            elif pil.mode in ("RGB", "RGBA"):
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+            else:
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
 
-            if qimg.format() != QImage.Format.Format_Grayscale8:
-                qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
+            img_max_val = _read_img_max_value(img_path)
+            arr_px_max = float(arr_f.max())
+            if img_max_val is not None and arr_px_max > 0:
+                arr_f = img_max_val * arr_f / arr_px_max
+            arr = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
 
-            w, h = qimg.width(), qimg.height()
-            ptr = qimg.bits()
-            if hasattr(ptr, "setsize"):
-                ptr.setsize(qimg.sizeInBytes())
-            arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape(
-                h, qimg.bytesPerLine())[:, :w].copy()
-
-            lo, hi = _np.percentile(arr, [0.1, 99.9])
-            if hi > lo + 2:
-                arr = _np.clip(
-                    (arr.astype(_np.float32) - lo) / (hi - lo) * 255.0,
-                    0, 255).astype(_np.uint8)
+            w, h = arr.shape[1], arr.shape[0]
 
             try:
                 _is_mod = _sys.modules.get("image_slider")
@@ -2328,28 +2351,25 @@ class ShotFinderWidget(QWidget):
                 from PySide6.QtGui import QImage
                 from PySide6.QtCore import QSize
 
-                # Načti přes QImageReader — správně zpracuje 16-bit
-                from PySide6.QtGui import QImageReader
-                reader = QImageReader(str(img))
-                reader.setAutoTransform(True)
-                qimg = reader.read()
-                if qimg.isNull():
+                # Load via PIL to preserve 16-bit and apply imgMaxValue normalization
+                try:
+                    _pil_raw = _PilImg.open(str(img))
+                    if _pil_raw.mode in ("I", "I;16"):
+                        _arr_f = _np.array(_pil_raw, dtype=_np.float32)
+                    elif _pil_raw.mode in ("RGB", "RGBA"):
+                        _arr_f = _np.array(_pil_raw.convert("L"), dtype=_np.float32)
+                    else:
+                        _arr_f = _np.array(_pil_raw.convert("L"), dtype=_np.float32)
+                    _img_max_val = _read_img_max_value(img)
+                    _arr_px_max = float(_arr_f.max())
+                    if _img_max_val is not None and _arr_px_max > 0:
+                        _arr_f = _img_max_val * _arr_f / _arr_px_max
+                    arr = _np.clip(_arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+                    w, h = arr.shape[1], arr.shape[0]
+                except Exception:
                     shutil.copy2(img, dst)
                     copied += 1
                     continue
-
-                # Konvertuj na grayscale 8-bit s autostretch
-                if qimg.format() != QImage.Format.Format_Grayscale8:
-                    qimg = qimg.convertToFormat(QImage.Format.Format_Grayscale8)
-                w, h = qimg.width(), qimg.height()
-                ptr = qimg.bits()
-                if hasattr(ptr, "setsize"):
-                    ptr.setsize(qimg.sizeInBytes())
-                arr = _np.frombuffer(ptr, dtype=_np.uint8).reshape(h, qimg.bytesPerLine())[:, :w].copy()
-                # Autostretch
-                lo, hi = _np.percentile(arr, [0.1, 99.9])
-                if hi > lo + 2:
-                    arr = _np.clip((arr.astype(_np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(_np.uint8)
                 grad_name = self._gradient_cb.currentText()
                 GRADIENTS_SF = {
                     "Grayscale": None,

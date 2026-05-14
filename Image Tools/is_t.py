@@ -59,6 +59,128 @@ AXIS_TOLERANCE_S = 5 * 60
 PLAY_EXACT_PCT_PER_S_THRESHOLD = 0.5
 SAVE_RANGE_WARN_COUNT = 500
 
+# ---------------- PV / CPVA ----------------
+import ssl
+import json
+import urllib.request
+import urllib.parse
+import threading
+
+CPVA_BASE_URL     = "https://10.78.0.57:8443/api/1.0/cpva"
+CPVA_HTTP_TIMEOUT = 8.0
+
+# All available PV channels the user can pick from
+PV_CHANNEL_MAP: dict[str, str] = {
+    "PTM1":      "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+    "PCM2":      "HAPLS-ENER_IN_PCM2_LT6_DIAG2:Energy",
+    "PCM4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+    "PAP1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+    "SBW4":      "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    "Back_Ref":  "L3-PM03-023:Energy",
+    "Waveplate": "L3-PFWP6-MTR03-1:RawPos",
+}
+
+PV_UNITS: dict[str, str] = {
+    "PTM1": "J", "PCM2": "J", "PCM4": "J", "PAP1": "J", "SBW4": "J",
+    "Back_Ref": "J", "Waveplate": "",
+}
+
+
+def _pv_ssl_ctx() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    return ctx
+
+
+# Cache: (channel, date_str) → sorted list of (t_ns, float)
+# date_str = "YYYY-MM-DD" in Prague time
+_pv_day_cache: dict[tuple[str, str], list] = {}
+_pv_day_cache_lock = threading.Lock()
+
+
+def _pv_date_key(ts_ns: int) -> str:
+    """Return 'YYYY-MM-DD' in Prague time for ts_ns."""
+    from datetime import timezone as _tz
+    dt = datetime.fromtimestamp(ts_ns / 1e9, tz=_tz.utc).astimezone(TZ_PRAGUE)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _pv_load_day(channel: str, date_key: str) -> "list[tuple[int, float]]":
+    """Fetch (or return cached) sorted (t_ns, value) list for channel on date_key."""
+    cache_key = (channel, date_key)
+    with _pv_day_cache_lock:
+        if cache_key in _pv_day_cache:
+            return _pv_day_cache[cache_key]
+
+    # Parse date_key → day boundaries in Prague time
+    y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
+    day_start = datetime(y, m, d, 0, 0, 0, tzinfo=TZ_PRAGUE)
+    day_end   = datetime(y, m, d, 23, 59, 59, 999999, tzinfo=TZ_PRAGUE)
+    start_ns  = int(day_start.timestamp() * 1e9)
+    end_ns    = int(day_end.timestamp()   * 1e9)
+
+    params = urllib.parse.urlencode({
+        "channelName": channel,
+        "start": str(start_ns),
+        "end":   str(end_ns),
+    })
+    url = f"{CPVA_BASE_URL}/samples?{params}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=CPVA_HTTP_TIMEOUT, context=_pv_ssl_ctx()) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        result: list[tuple[int, float]] = []
+        for s in raw if isinstance(raw, list) else []:
+            t = s.get("time")
+            val = s.get("value")
+            if isinstance(val, list):
+                val = val[0] if val else None
+            try:
+                result.append((int(t), float(val)))
+            except (TypeError, ValueError):
+                continue
+        result.sort(key=lambda x: x[0])
+    except Exception:
+        result = []
+
+    with _pv_day_cache_lock:
+        _pv_day_cache[cache_key] = result
+        if len(_pv_day_cache) > 28:   # max 14 channels × 2 days
+            oldest = next(iter(_pv_day_cache))
+            del _pv_day_cache[oldest]
+    return result
+
+
+def _pv_prev_date_key(date_key: str) -> str:
+    """Return 'YYYY-MM-DD' for the day before date_key."""
+    from datetime import timezone as _tz
+    y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
+    prev = datetime(y, m, d, tzinfo=_tz.utc) - timedelta(days=1)
+    return prev.strftime("%Y-%m-%d")
+
+
+def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
+    """Return the last known value of channel at or before ts_ns.
+
+    Checks the current day first; if ts_ns lands before the first sample
+    (or the day has no data), falls back to the previous day's last sample.
+    """
+    date_key = _pv_date_key(ts_ns)
+    samples = _pv_load_day(channel, date_key)
+    if samples:
+        ts_list = [s[0] for s in samples]
+        idx = bisect.bisect_right(ts_list, ts_ns) - 1
+        if idx >= 0:
+            return samples[idx][1]
+    # No data yet today (or ts_ns is before first today sample) — try previous day
+    prev_key = _pv_prev_date_key(date_key)
+    prev_samples = _pv_load_day(channel, prev_key)
+    if prev_samples:
+        return prev_samples[-1][1]   # last known value of the previous day
+    return None
+
+
 # ---------------- GRADIENTS ----------------
 def _copy_metadata_into_png(src: Path, dst: Path, save_txt: bool = False):
     """Embed original PNG/TIFF metadata as PNG tEXt chunks in dst.
@@ -224,6 +346,10 @@ def replace_unix_ns_with_prague_in_filename(p: Path, ts_ns: int) -> str:
         new_stem = f"{p.stem}__{stamp}"
     return f"{new_stem}{p.suffix}"
 
+def _strip_cam_name(name: str) -> str:
+    """Remove -_-IMG (and variants) suffix from camera folder names for display."""
+    return re.sub(r"[-_]+IMG$", "", name, flags=re.IGNORECASE).rstrip("-_")
+
 def ns_from_dt(dt: datetime) -> int:
     return int(dt.timestamp() * 1_000_000_000)
 
@@ -263,27 +389,86 @@ def folder_hour_from_prague_hour(prague_hour: int, date: datetime | None = None)
     return (prague_hour - offset_hours) % 24
 
 
-# ---------------- TIFF SCALE READER ----------------
+# ---------------- IMAGE SCALE READER ----------------
+def _read_image_max_sample(path: Path) -> int | None:
+    """Read the true pixel range maximum from image metadata.
+
+    For TIFF: reads MaxSampleValue tag (281).
+    For PNG: scans tEXt chunks for a numeric value that looks like a max-sample
+             (keys like 'MaxValue', 'max_value', 'MaxSampleValue', or any key
+             whose value is a plain integer in the range 255–65535).
+    Returns the max value (e.g. 4095, 65535) or None if not found.
+    """
+    ext = path.suffix.lower()
+    try:
+        from PIL import Image as _PilImg
+        with _PilImg.open(str(path)) as pil:
+            if ext in (".tif", ".tiff"):
+                tag_data = pil.tag_v2 if hasattr(pil, "tag_v2") else getattr(pil, "tag", {})
+                val = tag_data.get(281)  # MaxSampleValue
+                if val is not None:
+                    if isinstance(val, (list, tuple)):
+                        val = val[0]
+                    return int(val)
+            elif ext == ".png":
+                info = pil.info  # dict of tEXt chunks: key → str
+                # Try known key names first
+                for key in ("MaxValue", "max_value", "MaxSampleValue", "max_sample_value",
+                            "BitDepthMax", "bit_depth_max"):
+                    v = info.get(key)
+                    if v is not None:
+                        try:
+                            return int(float(v))
+                        except (ValueError, TypeError):
+                            pass
+                # Fallback: any chunk whose value is a plain integer in [256, 65535]
+                for v in info.values():
+                    if isinstance(v, str):
+                        stripped = v.strip()
+                        if stripped.isdigit():
+                            n = int(stripped)
+                            if 256 <= n <= 65535:
+                                return n
+    except Exception:
+        pass
+    return None
+
+
 def _read_tiff_max_sample(path: Path) -> int | None:
-    """
-    Přečte MaxSampleValue (TIFF tag 281) z TIFF souboru přes PIL.
-    Vrátí int nebo None pokud tag neexistuje / soubor není TIFF.
-    Tato hodnota udává skutečný rozsah pixelů (např. 1023, 4095, 65535).
-    """
-    if path.suffix.lower() not in (".tif", ".tiff"):
+    """Legacy alias kept for any remaining call-sites."""
+    return _read_image_max_sample(path)
+
+
+def _read_img_max_value(path: Path) -> float | None:
+    """Read imgMaxValue from PNG tEXt metadata — the physical maximum value
+    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
+    Returns float or None if not found."""
+    if path.suffix.lower() != ".png":
         return None
     try:
         from PIL import Image as _PilImg
         with _PilImg.open(str(path)) as pil:
-            tag_data = pil.tag_v2 if hasattr(pil, "tag_v2") else getattr(pil, "tag", {})
-            val = tag_data.get(281)  # MaxSampleValue
-            if val is None:
-                return None
-            if isinstance(val, (list, tuple)):
-                val = val[0]
-            return int(val)
+            info = pil.info
+            # Try to get the 12th tEXt chunk by index (Matlab uses index 12)
+            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
+            # Index 12 in Matlab is 1-based → index 11 in Python
+            if len(chunks) >= 12:
+                v = chunks[11][1]
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+            # Fallback: try any numeric-looking value in range
+            for k, v in chunks:
+                try:
+                    f = float(v)
+                    if 0 < f <= 65535:
+                        return f
+                except (ValueError, TypeError):
+                    pass
     except Exception:
-        return None
+        pass
+    return None
 
 # ---------------- BRIGHTNESS ----------------
 def _autostretch_gray(img: QImage, p_low: float = 0.1, p_high: float = 99.9) -> QImage:
@@ -344,13 +529,13 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             if hasattr(ptr, "setsize"):
                 ptr.setsize(img.sizeInBytes())
             arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
-            max_sample = _read_tiff_max_sample(path)
-            mn = int(arr16.min())
-            mx = max_sample if (max_sample is not None and max_sample > mn) else int(arr16.max())
-            if mx > mn:
-                arr8 = np.clip((arr16.astype(np.float32) - mn) / (mx - mn) * 255.0, 0, 255).astype(np.uint8)
-            else:
-                arr8 = np.zeros_like(arr16, dtype=np.uint8)
+            arr_f = arr16.astype(np.float32)
+            img_max_val = _read_img_max_value(path)
+            arr_px_max = float(arr_f.max())
+            if img_max_val is not None and arr_px_max > 0:
+                # Matlab: img = imgMaxValue * img / max(img), then imagesc([0, 65535])
+                arr_f = img_max_val * arr_f / arr_px_max
+            arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
             img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
         # Return original (possibly RGB) image without forced grayscale conversion
         return img
@@ -361,13 +546,12 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             if hasattr(ptr, "setsize"):
                 ptr.setsize(img.sizeInBytes())
             arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
-            max_sample = _read_tiff_max_sample(path)
-            mn = int(arr16.min())
-            mx = max_sample if (max_sample is not None and max_sample > mn) else int(arr16.max())
-            if mx > mn:
-                arr8 = np.clip((arr16.astype(np.float32) - mn) / (mx - mn) * 255.0, 0, 255).astype(np.uint8)
-            else:
-                arr8 = np.zeros_like(arr16, dtype=np.uint8)
+            arr_f = arr16.astype(np.float32)
+            img_max_val = _read_img_max_value(path)
+            arr_px_max = float(arr_f.max())
+            if img_max_val is not None and arr_px_max > 0:
+                arr_f = img_max_val * arr_f / arr_px_max
+            arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
             img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
         else:
             img = img.convertToFormat(QImage.Format.Format_Grayscale8)
@@ -383,12 +567,14 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             ref_pil = PilImage.fromarray(ref_image.astype(np.uint8))
             ref_pil = ref_pil.resize(
                 (arr_cur.shape[1], arr_cur.shape[0]),
-                PilImage.Resampling.BILINEAR)
+                PilImage.Resampling.NEAREST)
             ref_arr = np.asarray(ref_pil, dtype=np.float32)
         else:
             ref_arr = ref_image.copy()
         diff = np.abs(arr_cur - ref_arr)
-        if sub_threshold > 0:
+        # Always suppress rounding noise (±1 from integer round-trip)
+        diff[diff <= 1] = 0
+        if sub_threshold > 1:
             diff[diff < sub_threshold] = 0
         diff = np.clip(diff, 0, 255).astype(np.uint8)
         img = QImage(diff.tobytes(), img.width(), img.height(),
@@ -446,6 +632,9 @@ class PixCache:
 
 
 # ---------------- ASYNC LOADER ----------------
+class _PvSignals(QObject):
+    result = Signal(int, object)   # (gen, results_dict)
+
 class LoaderSignals(QObject):
     loaded = Signal(int, int, int, int, int, int, int, QImage)
 
@@ -639,12 +828,33 @@ class SaveRangeTask(QRunnable):
                         self.signals.progress.emit(done, total, it.path.name)
                         continue
                     _copy_metadata_into_png(it.path, dst, save_txt=save_txt)
-                # Annotate version if overlay is requested
-                if self.overlay_params:
+                # Annotate version if overlay or PV text is requested
+                pv_text = (self.overlay_params or {}).get('pv_text', '')
+                if self.overlay_params or pv_text:
                     ann_dst = dst.parent / f"{dst.stem}_annotate.png"
                     pix = self._draw_overlay_on_pixmap(it.path)
                     if pix is not None:
-                        pix.save(str(ann_dst))
+                        if pv_text:
+                            try:
+                                from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF
+                                import tempfile as _tf
+                                with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _t:
+                                    _tp = Path(_t.name)
+                                pix.save(str(_tp))
+                                _img = _PI.open(_tp)
+                                _bh = 26
+                                _new = _PI.new("RGB", (_img.width, _img.height + _bh), (255, 255, 255))
+                                _new.paste(_img.convert("RGB"), (0, 0))
+                                _dr = _PD.Draw(_new)
+                                try: _fn = _PF.truetype("DejaVuSans.ttf", 14)
+                                except Exception: _fn = _PF.load_default()
+                                _dr.text((8, _img.height + 4), pv_text, fill=(0, 0, 0), font=_fn)
+                                _new.save(str(ann_dst))
+                                _tp.unlink(missing_ok=True)
+                            except Exception:
+                                pix.save(str(ann_dst))
+                        else:
+                            pix.save(str(ann_dst))
                         _copy_metadata_into_png(it.path, ann_dst, save_txt=save_txt)
                 n += 1
             except Exception:
@@ -717,7 +927,7 @@ class PointingAnalysisTask(QRunnable):
         # Scale back to original image pixels
         scale_x = w0 / w
         scale_y = h0 / h
-        return (item.ts_ns, cx_px * scale_x, cy_px * scale_y)
+        return (item.ts_ns, cx_px * scale_x, cy_px * scale_y, w0, h0)
 
     def run(self):
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1640,6 +1850,8 @@ class PointingPanel(QWidget):
             self._fig = plt.figure(figsize=(10, 5))
             self._canvas = FigureCanvas(self._fig)
             self._canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self._canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self._canvas.setMouseTracking(True)
         else:
             self._fig = None
             self._canvas = None
@@ -1654,20 +1866,24 @@ class PointingPanel(QWidget):
         self._ts_int = None     # int64 for timestamp lookups
         self._mask = None       # bool array; False = deleted
         self._replay_ts: int | None = None   # if set, only show points with ts <= this
+        self._img_w = None
+        self._img_h = None
         self._show_path = False
         self._select_mode = False
         self._rect_selector = None
         self._hover_annot = None  # matplotlib annotation for hover tooltip
         if _MPL_OK and self._canvas is not None:
-            self._canvas.mpl_connect("button_press_event", self._on_mpl_click)
-            self._canvas.mpl_connect("motion_notify_event", self._on_mpl_hover)
+            self._canvas.installEventFilter(self)
 
-    def plot(self, cx_urad, cy_urad, n_shots, ts_ns=None, ts_ns_int=None):
+    def plot(self, cx_urad, cy_urad, n_shots, ts_ns=None, ts_ns_int=None,
+             img_w=None, img_h=None):
         if not _MPL_OK: return
         self._cx = cx_urad
         self._cy = cy_urad
         self._ts = ts_ns          # float64 for path coloring
         self._ts_int = ts_ns_int  # int64 for navigation
+        self._img_w = img_w       # sensor width in pixels
+        self._img_h = img_h       # sensor height in pixels
         self._mask = np.ones(len(cx_urad), dtype=bool)
         self._replay_ts = None    # reset replay on new data
         self._select_mode = False
@@ -1741,48 +1957,158 @@ class PointingPanel(QWidget):
         if changed:
             self._draw()
 
-    def _on_mpl_click(self, event):
-        """Click on scatter plot → emit point_clicked(index) for navigation."""
-        if not _MPL_OK or self._cx is None or self._mask is None:
-            return
-        if self._select_mode:
-            return  # let RectangleSelector handle it
+    def _get_ax_main(self):
+        """Return the scatter axes (always the second axes added, index 1)."""
         axes = self._fig.get_axes()
-        ax_main = axes[1] if len(axes) > 1 else (axes[0] if axes else None)
-        if ax_main is None or event.inaxes is not ax_main:
+        return axes[1] if len(axes) > 1 else (axes[0] if axes else None)
+
+    def _qt_pos_to_data(self, ax, qx: int, qy: int):
+        """Convert Qt widget pixel coordinates to matplotlib data coordinates.
+        Returns (xdata, ydata) or (None, None) if outside the axes."""
+        try:
+            fig_w = self._canvas.width()
+            fig_h = self._canvas.height()
+            if fig_w <= 0 or fig_h <= 0:
+                return None, None
+            # matplotlib uses bottom-left origin; Qt uses top-left
+            fig_x = qx / fig_w
+            fig_y = 1.0 - qy / fig_h
+            bbox = ax.get_position()   # axes bbox in figure fraction [0,1]
+            if not (bbox.x0 <= fig_x <= bbox.x1 and bbox.y0 <= fig_y <= bbox.y1):
+                return None, None
+            # Map figure fraction → data coordinates
+            ax_x = (fig_x - bbox.x0) / (bbox.x1 - bbox.x0)
+            ax_y = (fig_y - bbox.y0) / (bbox.y1 - bbox.y0)
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            xdata = xlim[0] + ax_x * (xlim[1] - xlim[0])
+            ydata = ylim[0] + ax_y * (ylim[1] - ylim[0])
+            return xdata, ydata
+        except Exception:
+            return None, None
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtCore import Qt as _Qt
+        if obj is self._canvas and self._cx is not None:
+            t = event.type()
+            if t == QEvent.Type.MouseButtonPress:
+                if event.button() == _Qt.MouseButton.MiddleButton:
+                    self._pan_start = (event.position().x(), event.position().y())
+                    self._pan_xlim = None
+                    self._pan_ylim = None
+                    ax = self._get_ax_main()
+                    if ax:
+                        self._pan_xlim = ax.get_xlim()
+                        self._pan_ylim = ax.get_ylim()
+                    return True
+                else:
+                    self._handle_qt_click(event.position().x(), event.position().y())
+            elif t == QEvent.Type.MouseMove:
+                if hasattr(self, '_pan_start') and self._pan_start is not None:
+                    self._handle_qt_pan(event.position().x(), event.position().y())
+                else:
+                    self._handle_qt_hover(event.position().x(), event.position().y())
+            elif t == QEvent.Type.MouseButtonRelease:
+                if event.button() == _Qt.MouseButton.MiddleButton:
+                    self._pan_start = None
+            elif t == QEvent.Type.Wheel:
+                self._handle_qt_zoom(event.position().x(), event.position().y(),
+                                     event.angleDelta().y())
+                return True
+            elif t == QEvent.Type.MouseButtonDblClick:
+                self._reset_zoom()
+                return True
+            elif t == QEvent.Type.Leave:
+                self._clear_hover()
+        return False
+
+    def _handle_qt_pan(self, qx: float, qy: float):
+        if not hasattr(self, '_pan_start') or self._pan_start is None:
             return
-        if event.xdata is None or event.ydata is None:
+        ax = self._get_ax_main()
+        if ax is None or self._pan_xlim is None:
             return
-        # Find nearest visible point in data coordinates
+        dx_px = qx - self._pan_start[0]
+        dy_px = qy - self._pan_start[1]
+        fig_w = self._canvas.width()
+        fig_h = self._canvas.height()
+        bbox = ax.get_position()
+        ax_w_px = bbox.width * fig_w
+        ax_h_px = bbox.height * fig_h
+        if ax_w_px <= 0 or ax_h_px <= 0:
+            return
+        x0, x1 = self._pan_xlim
+        y0, y1 = self._pan_ylim
+        xspan = x1 - x0
+        yspan = y1 - y0
+        shift_x = -dx_px / ax_w_px * xspan
+        shift_y =  dy_px / ax_h_px * yspan  # dy inverted: Qt Y down, data Y up
+        ax.set_xlim(x0 + shift_x, x1 + shift_x)
+        ax.set_ylim(y0 + shift_y, y1 + shift_y)
+        self._canvas.draw_idle()
+
+    def _handle_qt_zoom(self, qx: float, qy: float, delta: int):
+        ax = self._get_ax_main()
+        if ax is None:
+            return
+        xdata, ydata = self._qt_pos_to_data(ax, qx, qy)
+        if xdata is None:
+            return
+        factor = 0.85 if delta > 0 else 1.0 / 0.85
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        ax.set_xlim(xdata + (x0 - xdata) * factor, xdata + (x1 - xdata) * factor)
+        ax.set_ylim(ydata + (y0 - ydata) * factor, ydata + (y1 - ydata) * factor)
+        self._canvas.draw_idle()
+
+    def _reset_zoom(self):
+        ax = self._get_ax_main()
+        if ax is None:
+            return
+        if self._img_w and self._img_h:
+            ax.set_xlim(-self._img_w / 2, self._img_w / 2)
+            ax.set_ylim(self._img_h / 2, -self._img_h / 2)
+        else:
+            if self._cx is not None and len(self._cx):
+                pad_x = max(float(np.std(self._cx)) * 3, 1.0)
+                pad_y = max(float(np.std(self._cy)) * 3, 1.0)
+                ax.set_xlim(self._cx.min() - pad_x, self._cx.max() + pad_x)
+                ax.set_ylim(self._cy.max() + pad_y, self._cy.min() - pad_y)
+        self._canvas.draw_idle()
+
+    def _handle_qt_click(self, qx: float, qy: float):
+        if self._cx is None or self._mask is None or self._select_mode:
+            return
+        ax = self._get_ax_main()
+        if ax is None:
+            return
+        xdata, ydata = self._qt_pos_to_data(ax, qx, qy)
+        if xdata is None:
+            return
         cx_vis = self._cx[self._mask]
         cy_vis = self._cy[self._mask]
         vis_indices = np.where(self._mask)[0]
         if len(cx_vis) == 0:
             return
-        # Normalize by axis range so x/y are equally weighted
-        xlim = ax_main.get_xlim()
-        ylim = ax_main.get_ylim()
-        xrange = max(xlim[1] - xlim[0], 1e-12)
-        yrange = max(ylim[1] - ylim[0], 1e-12)
-        dx = (cx_vis - event.xdata) / xrange
-        dy = (cy_vis - event.ydata) / yrange
+        xlim = ax.get_xlim(); ylim = ax.get_ylim()
+        xrange = max(abs(xlim[1] - xlim[0]), 1e-12)
+        yrange = max(abs(ylim[1] - ylim[0]), 1e-12)
+        dx = (cx_vis - xdata) / xrange
+        dy = (cy_vis - ydata) / yrange
         dist2 = dx * dx + dy * dy
         nearest_vis = int(np.argmin(dist2))
-        # Only trigger if click is within 3% of axis range
         if dist2[nearest_vis] > 0.03 ** 2:
             return
-        orig_idx = int(vis_indices[nearest_vis])
-        self.point_clicked.emit(orig_idx)
+        self.point_clicked.emit(int(vis_indices[nearest_vis]))
 
-    def _on_mpl_hover(self, event):
-        """Show timestamp tooltip when hovering near a scatter point."""
-        if not _MPL_OK or self._cx is None or self._mask is None or self._ts_int is None:
+    def _handle_qt_hover(self, qx: float, qy: float):
+        if self._cx is None or self._mask is None or self._ts_int is None:
             return
-        axes = self._fig.get_axes()
-        ax_main = axes[1] if len(axes) > 1 else (axes[0] if axes else None)
-        if ax_main is None:
+        ax = self._get_ax_main()
+        if ax is None:
             return
-        # Apply both user mask and replay mask
+        xdata, ydata = self._qt_pos_to_data(ax, qx, qy)
         mask = self._mask.copy()
         if self._replay_ts is not None:
             mask &= (self._ts_int <= self._replay_ts)
@@ -1790,17 +2116,14 @@ class PointingPanel(QWidget):
         cy_vis = self._cy[mask]
         vis_indices = np.where(mask)[0]
         need_draw = False
-        if event.inaxes is not ax_main or event.xdata is None or len(cx_vis) == 0:
-            if self._hover_annot is not None:
-                self._hover_annot.set_visible(False)
-                self._hover_annot = None
-                need_draw = True
+        if xdata is None or len(cx_vis) == 0:
+            need_draw = self._clear_hover()
         else:
-            xlim = ax_main.get_xlim(); ylim = ax_main.get_ylim()
-            xrange = max(xlim[1] - xlim[0], 1e-12)
-            yrange = max(ylim[1] - ylim[0], 1e-12)
-            dx = (cx_vis - event.xdata) / xrange
-            dy = (cy_vis - event.ydata) / yrange
+            xlim = ax.get_xlim(); ylim = ax.get_ylim()
+            xrange = max(abs(xlim[1] - xlim[0]), 1e-12)
+            yrange = max(abs(ylim[1] - ylim[0]), 1e-12)
+            dx = (cx_vis - xdata) / xrange
+            dy = (cy_vis - ydata) / yrange
             dist2 = dx * dx + dy * dy
             nearest_vis = int(np.argmin(dist2))
             if dist2[nearest_vis] <= 0.025 ** 2:
@@ -1809,7 +2132,7 @@ class PointingPanel(QWidget):
                 ts_str = fmt_prague_full_from_ns(ts_ns)
                 px, py = float(self._cx[orig_idx]), float(self._cy[orig_idx])
                 if self._hover_annot is None:
-                    self._hover_annot = ax_main.annotate(
+                    self._hover_annot = ax.annotate(
                         ts_str, xy=(px, py),
                         xytext=(10, 10), textcoords="offset points",
                         bbox=dict(boxstyle="round,pad=0.3", fc="#ffffcc", ec="#888", lw=0.8),
@@ -1820,12 +2143,16 @@ class PointingPanel(QWidget):
                 self._hover_annot.set_visible(True)
                 need_draw = True
             else:
-                if self._hover_annot is not None:
-                    self._hover_annot.set_visible(False)
-                    self._hover_annot = None
-                    need_draw = True
+                need_draw = self._clear_hover()
         if need_draw:
             self._canvas.draw_idle()
+
+    def _clear_hover(self) -> bool:
+        if self._hover_annot is not None:
+            self._hover_annot.set_visible(False)
+            self._hover_annot = None
+            return True
+        return False
 
     def _draw(self):
         if not _MPL_OK: return
@@ -1875,8 +2202,12 @@ class PointingPanel(QWidget):
         ax_main.set_xlabel("X (px from centre)", fontsize=8)
         ax_main.set_ylabel("Y (px from centre, ↓ positive)", fontsize=8)
         ax_main.tick_params(labelsize=7)
-        # Match image coordinates: Y increases downward, so positive = below centre
-        ax_main.invert_yaxis()
+        # Fix axis limits to full sensor range so scatter is properly scaled
+        if self._img_w and self._img_h:
+            ax_main.set_xlim(-self._img_w / 2, self._img_w / 2)
+            ax_main.set_ylim(self._img_h / 2, -self._img_h / 2)  # inverted: +Y downward
+        else:
+            ax_main.invert_yaxis()
 
         # ── Histogramy ───────────────────────────────────────────
         bins = min(32, max(8, n_shots // 10))
@@ -1929,21 +2260,8 @@ class PointingPanel(QWidget):
 
     def save_figure(self, path: str):
         if not _MPL_OK: return
-        import matplotlib.pyplot as _plt
-        show_path = self._show_path and self._ts is not None
-
-        if show_path:
-            save_fig = _plt.figure(figsize=(16, 7))
-        else:
-            save_fig = _plt.figure(figsize=(10, 7))
-
-        self._render_to_fig(save_fig)
-        try:
-            save_fig.tight_layout(pad=1.5)
-        except Exception:
-            pass
-        save_fig.savefig(path, dpi=200, bbox_inches="tight")
-        _plt.close(save_fig)
+        # Save the live figure as-is — preserves current zoom/pan state
+        self._fig.savefig(path, dpi=200, bbox_inches="tight")
 
 class WeekendDelegate(QStyledItemDelegate):
     def initStyleOption(self, option, index):
@@ -2330,26 +2648,33 @@ class _CamLoaderSignals(QObject):
     finished = Signal(list)
 
 class CameraPickerDialog(QDialog):
+    _PRESETS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_presets.json"
+
     def __init__(self, date_obj, hour_from: int, hour_to: int,
                  last_cam_names: list[str], parent=None,
                  preloaded_cameras: list | None = None):
         super().__init__(parent)
         self.setWindowTitle("Select cameras")
-        self.resize(420, 640)
+        self.resize(660, 640)
 
         self._all_cam_data: list[tuple[str, str]] = []
-        # Persistent selection — nezávislá na filtru
         self._selected_names: list[str] = list(last_cam_names) if last_cam_names else []
         self._date_obj = date_obj
         self._hour_from = hour_from
         self._hour_to = hour_to
+        self._presets: dict[str, list[str]] = self._load_presets()
 
         lay = QVBoxLayout(self)
 
+        # ── Top row: search + camera list  |  presets panel ──────────────────
+        top_row = QHBoxLayout()
+
+        # Left: search + camera list
+        left = QVBoxLayout()
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("Search cameras…")
         self._search_edit.textChanged.connect(self._filter_cameras)
-        lay.addWidget(self._search_edit)
+        left.addWidget(self._search_edit)
 
         self._cam_list = QTableWidget(0, 2)
         self._cam_list.setHorizontalHeaderLabels(["#", "Camera"])
@@ -2362,13 +2687,47 @@ class CameraPickerDialog(QDialog):
         self._cam_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._cam_list.verticalHeader().setVisible(False)
         self._cam_list.cellClicked.connect(self._on_cam_clicked)
-        lay.addWidget(self._cam_list, 1)
+        left.addWidget(self._cam_list, 1)
 
         self._status_lbl = QLabel("Loading cameras…")
         self._status_lbl.setStyleSheet("font-size: 10px; color: #555;")
-        lay.addWidget(self._status_lbl)
+        left.addWidget(self._status_lbl)
 
-        # Tabulka vybraných kamer (max 7 vybraných, z nichž se zobrazí první 4)
+        top_row.addLayout(left, 3)
+
+        # Right: presets panel
+        right = QVBoxLayout()
+        preset_lbl = QLabel("Presets")
+        preset_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
+        right.addWidget(preset_lbl)
+
+        self._preset_list = QTableWidget(0, 1)
+        self._preset_list.setHorizontalHeaderLabels(["Name"])
+        self._preset_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._preset_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._preset_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._preset_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._preset_list.verticalHeader().setVisible(False)
+        self._preset_list.cellDoubleClicked.connect(self._on_preset_load)
+        right.addWidget(self._preset_list, 1)
+
+        btn_load   = QPushButton("Load")
+        btn_save   = QPushButton("Save")
+        btn_rename = QPushButton("Rename")
+        btn_delete = QPushButton("Delete")
+        for b in (btn_load, btn_save, btn_rename, btn_delete):
+            b.setFixedHeight(24)
+            right.addWidget(b)
+        btn_load.clicked.connect(self._on_preset_load)
+        btn_save.clicked.connect(self._on_preset_save)
+        btn_rename.clicked.connect(self._on_preset_rename)
+        btn_delete.clicked.connect(self._on_preset_delete)
+        right.addStretch()
+
+        top_row.addLayout(right, 2)
+        lay.addLayout(top_row, 1)
+
+        # ── Selected cameras table ────────────────────────────────────────────
         sel_lbl = QLabel("Selected (first 4 shown, max 7):")
         sel_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
         lay.addWidget(sel_lbl)
@@ -2392,6 +2751,8 @@ class CameraPickerDialog(QDialog):
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
 
+        self._refresh_preset_list()
+
         self._signals = _CamLoaderSignals()
         self._signals.finished.connect(self._on_cameras_loaded)
         if preloaded_cameras is not None:
@@ -2402,6 +2763,84 @@ class CameraPickerDialog(QDialog):
             self._load_cameras_async()
 
         self._refresh_sel_table()
+
+    # ── Presets ───────────────────────────────────────────────────────────────
+    def _load_presets(self) -> dict:
+        try:
+            if self._PRESETS_PATH.exists():
+                return json.loads(self._PRESETS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_presets(self):
+        try:
+            self._PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._PRESETS_PATH.write_text(
+                json.dumps(self._presets, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _refresh_preset_list(self):
+        self._preset_list.setRowCount(0)
+        for name in sorted(self._presets.keys(), key=str.lower):
+            r = self._preset_list.rowCount()
+            self._preset_list.insertRow(r)
+            self._preset_list.setItem(r, 0, QTableWidgetItem(name))
+
+    def _selected_preset_name(self) -> str | None:
+        rows = self._preset_list.selectedItems()
+        return rows[0].text() if rows else None
+
+    def _on_preset_load(self, *_):
+        name = self._selected_preset_name()
+        if not name or name not in self._presets:
+            return
+        self._selected_names = list(self._presets[name])
+        self._refresh_sel_table()
+        self._highlight_selected()
+
+    def _on_preset_save(self):
+        from PySide6.QtWidgets import QInputDialog
+        current = self._selected_preset_name() or ""
+        name, ok = QInputDialog.getText(self, "Save preset", "Preset name:", text=current)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        self._presets[name] = list(self._selected_names)
+        self._save_presets()
+        self._refresh_preset_list()
+        # select the just-saved preset
+        for r in range(self._preset_list.rowCount()):
+            if self._preset_list.item(r, 0).text() == name:
+                self._preset_list.selectRow(r)
+                break
+
+    def _on_preset_rename(self):
+        from PySide6.QtWidgets import QInputDialog
+        name = self._selected_preset_name()
+        if not name:
+            return
+        new_name, ok = QInputDialog.getText(self, "Rename preset", "New name:", text=name)
+        if not ok or not new_name.strip() or new_name.strip() == name:
+            return
+        new_name = new_name.strip()
+        self._presets[new_name] = self._presets.pop(name)
+        self._save_presets()
+        self._refresh_preset_list()
+
+    def _on_preset_delete(self):
+        name = self._selected_preset_name()
+        if not name:
+            return
+        reply = QMessageBox.question(self, "Delete preset",
+                                     f"Delete preset '{name}'?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._presets.pop(name, None)
+        self._save_presets()
+        self._refresh_preset_list()
 
     def _load_cameras_async(self):
         import threading as _thr
@@ -2993,15 +3432,13 @@ class ImageView(QWidget):
             lbl_x = img_rect.left()
             lbl_w = img_rect.width()
             if self.cam_label_use_overlay:
-                # Semi-transparent strip at the very bottom of the image rect
-                lbl_y = img_rect.bottom() - lbl_h
-                lbl_y = max(img_rect.top(), lbl_y)
+                # Semi-transparent strip at the very top of the image rect
+                lbl_y = img_rect.top()
+                lbl_y = min(lbl_y, img_rect.bottom() - lbl_h)
             else:
-                # Reserved strip directly below the image, same x/width as image
-                lbl_y = img_rect.bottom() + 1
-                # Clamp so it never goes below widget bottom
-                lbl_y = min(lbl_y, self.height() - lbl_h)
-                lbl_y = max(img_rect.bottom() + 1, lbl_y)
+                # Reserved strip directly above the image, same x/width as image
+                lbl_y = img_rect.top() - lbl_h - 1
+                lbl_y = max(0, lbl_y)
             name_w = lbl_w // 3
             ts_w = lbl_w - name_w
             font = _QFont(); font.setPixelSize(_fpx)
@@ -3389,30 +3826,26 @@ class CameraView(QWidget):
         lay.setContentsMargins(3, 3, 3, 3)
         lay.setSpacing(2)
 
-        self.img_view = ImageView(self)
-        self.img_view.bg_color = QColor("#222")
-        lay.addWidget(self.img_view, 1)
+        # Top row: camera name | timestamp (above image)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(4)
+        top_row.setContentsMargins(0, 0, 0, 0)
 
-        # Bottom row: camera name | timestamp
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(4)
-        bottom_row.setContentsMargins(0, 0, 0, 0)
-
-        self._name_lbl = QLabel(cam_name)
+        self._name_lbl = QLabel(_strip_cam_name(cam_name))
         self._name_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._name_lbl.setStyleSheet(
             "font-size: 12px; color: #eee; background: #444; "
             "padding: 2px 4px; border-radius: 2px;")
-        bottom_row.addWidget(self._name_lbl, 1)
+        top_row.addWidget(self._name_lbl, 1)
 
         self._ts_lbl = QLabel("")
         self._ts_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._ts_lbl.setStyleSheet(
             "font-size: 11px; color: #ffd54f; background: #333; "
             "padding: 2px 4px; border-radius: 2px;")
-        bottom_row.addWidget(self._ts_lbl, 2)
+        top_row.addWidget(self._ts_lbl, 2)
 
-        lay.addLayout(bottom_row)
+        lay.addLayout(top_row)
 
         self._ref_lbl = QLabel("")
         self._ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3421,6 +3854,10 @@ class CameraView(QWidget):
             "padding: 1px 4px; border-radius: 2px;")
         self._ref_lbl.hide()
         lay.addWidget(self._ref_lbl)
+
+        self.img_view = ImageView(self)
+        self.img_view.bg_color = QColor("#222")
+        lay.addWidget(self.img_view, 1)
 
         self._update_border()
 
@@ -3586,8 +4023,8 @@ class MultiCameraGrid(QWidget):
         regular_views = [cv for cv in self._cam_views if not self._is_pdxm1_cam(cv.cam_name)]
 
         if not pdxm1_views:
-            # All regular → 2×2 grid (or single row if ≤2)
-            if n <= 2:
+            # 1–3 cameras: single row (1×N). 4 cameras: 2×2 grid.
+            if n <= 3:
                 for i, cv in enumerate(self._cam_views):
                     self._grid.addWidget(cv, 0, i)
                     self._grid.setColumnStretch(i, 1)
@@ -3595,11 +4032,7 @@ class MultiCameraGrid(QWidget):
             else:
                 for i, cv in enumerate(self._cam_views):
                     r, c = divmod(i, 2)
-                    if i == len(self._cam_views) - 1 and len(self._cam_views) % 2 == 1:
-                        # Last camera in an odd row — span both columns
-                        self._grid.addWidget(cv, r, 0, 1, 2)
-                    else:
-                        self._grid.addWidget(cv, r, c)
+                    self._grid.addWidget(cv, r, c)
                 self._grid.setColumnStretch(0, 1)
                 self._grid.setColumnStretch(1, 1)
                 self._grid.setRowStretch(0, 1)
@@ -3640,14 +4073,17 @@ class MultiCameraGrid(QWidget):
                 reg_grid.addWidget(cv, i, 0)
                 reg_grid.setRowStretch(i, 1)
             reg_grid.setColumnStretch(0, 1)
+        elif n_reg == 3:
+            # 3 regular → single row inside sub-grid
+            for i, cv in enumerate(regular_views):
+                reg_grid.addWidget(cv, 0, i)
+                reg_grid.setColumnStretch(i, 1)
+            reg_grid.setRowStretch(0, 1)
         else:
-            # 3 or 4 regular → 2×2 grid; if only 3, last camera spans both columns, centered
+            # 4 regular → 2×2 grid
             for i, cv in enumerate(regular_views):
                 r, c = divmod(i, 2)
-                if i == len(regular_views) - 1 and len(regular_views) % 2 == 1:
-                    reg_grid.addWidget(cv, r, 0, 1, 2)
-                else:
-                    reg_grid.addWidget(cv, r, c)
+                reg_grid.addWidget(cv, r, c)
             reg_grid.setColumnStretch(0, 1)
             reg_grid.setColumnStretch(1, 1)
             reg_grid.setRowStretch(0, 1)
@@ -4286,7 +4722,7 @@ class _CamSliderRow(QWidget):
         self._radio.toggled.connect(self._on_radio_toggled)
         lay.addWidget(self._radio)
 
-        self._lbl = QLabel(cam_name)
+        self._lbl = QLabel(_strip_cam_name(cam_name))
         self._lbl.setFixedWidth(90)
         self._lbl.setStyleSheet("font-size: 10px; color: #333;")
         lay.addWidget(self._lbl)
@@ -4432,6 +4868,13 @@ class Viewer(QWidget):
         self._online_blink_timer.setInterval(600)
         self._online_blink_timer.timeout.connect(self._on_online_blink)
 
+        # ── PV state ─────────────────────────────────────────────────────────
+        self._pv_enabled: list[str] = []       # ordered list of selected PV names
+        self._pv_values:  dict[str, str] = {}  # name → displayed value string
+        self._pv_fetch_gen: int = 0            # incremented each fetch to cancel stale results
+        self._pv_signals = _PvSignals()
+        self._pv_signals.result.connect(self._pv_on_result)
+
         self._build_ui()
 
         # Overlay appearance settings
@@ -4559,6 +5002,42 @@ class Viewer(QWidget):
         self.lbl_ts_status.setWordWrap(True)
         self.lbl_ts_status.setStyleSheet("font-size: 10px; color: #555;")
         llay.addWidget(self.lbl_ts_status)
+        llay.addWidget(_hsep())
+
+        # ── Group: PV Values ──────────────────────────────────────────────
+        pv_header_row = QHBoxLayout()
+        pv_header_row.addWidget(_group_label("PV Values"))
+        self._btn_pv_cfg = QPushButton("⚙")
+        self._btn_pv_cfg.setFixedWidth(26)
+        self._btn_pv_cfg.setToolTip("Select which PV channels to display")
+        self._btn_pv_cfg.clicked.connect(self._open_pv_config)
+        pv_header_row.addWidget(self._btn_pv_cfg)
+        self._btn_pv_refresh = QPushButton("↻")
+        self._btn_pv_refresh.setFixedWidth(26)
+        self._btn_pv_refresh.setToolTip("Refresh PV values for current frame")
+        self._btn_pv_refresh.clicked.connect(self._pv_force_refresh)
+        pv_header_row.addWidget(self._btn_pv_refresh)
+        pv_header_row.addStretch(1)
+        llay.addLayout(pv_header_row)
+
+        self._pv_table = QTableWidget(0, 2)
+        self._pv_table.setHorizontalHeaderLabels(["PV", "Value"])
+        self._pv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._pv_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._pv_table.verticalHeader().setVisible(False)
+        self._pv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._pv_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._pv_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pv_table.setMaximumHeight(120)
+        self._pv_table.setVisible(False)
+        self._pv_table.setStyleSheet("font-size: 11px;")
+        llay.addWidget(self._pv_table)
+
+        self._pv_no_pv_lbl = QLabel("No PVs selected. Click ⚙ to configure.")
+        self._pv_no_pv_lbl.setStyleSheet("font-size: 10px; color: #888; padding: 2px 0;")
+        self._pv_no_pv_lbl.setWordWrap(True)
+        llay.addWidget(self._pv_no_pv_lbl)
+
         llay.addWidget(_hsep())
 
         # ── Group 3: Playback ──────────────────────────────────────
@@ -5020,8 +5499,6 @@ class Viewer(QWidget):
         self._sc_topn_points: "list[tuple[int,int]]" = []
         self._sc_topn_img_shape: "tuple[int,int] | None" = None
 
-        llay.addWidget(_hsep())
-
         # ── Info labels (definice — zobrazí se v ukotvené sekci nahoře) ───
         info_style = "font-size: 11px; color: #222; padding: 1px 0;"
         self.lbl_index          = QLabel("0 / 0")
@@ -5309,6 +5786,157 @@ class Viewer(QWidget):
         self.img_view.square_color    = self._overlay_square_color
         self.img_view.square_thick    = self._overlay_square_thick
 
+    # ================================================================ PV VALUES
+    def _open_pv_config(self):
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select PV Channels")
+        dlg.setMinimumWidth(260)
+        vlay = QVBoxLayout(dlg)
+        vlay.addWidget(QLabel("Choose which PV channels to display:"))
+        checks: dict[str, QCheckBox] = {}
+        for name in PV_CHANNEL_MAP:
+            cb = QCheckBox(name)
+            cb.setChecked(name in self._pv_enabled)
+            vlay.addWidget(cb)
+            checks[name] = cb
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        vlay.addWidget(btns)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._pv_enabled = [n for n in PV_CHANNEL_MAP if checks[n].isChecked()]
+            self._pv_values  = {}
+            self._pv_rebuild_table()
+            self._pv_trigger_fetch()
+
+    def _pv_rebuild_table(self):
+        has = bool(self._pv_enabled)
+        self._pv_table.setVisible(has)
+        self._pv_no_pv_lbl.setVisible(not has)
+        if not has:
+            return
+        self._pv_table.setRowCount(len(self._pv_enabled))
+        row_h = 20
+        self._pv_table.setMaximumHeight(row_h * len(self._pv_enabled) + 26)
+        for i, name in enumerate(self._pv_enabled):
+            name_item = QTableWidgetItem(name)
+            val_str = self._pv_values.get(name, "…")
+            units = PV_UNITS.get(name, "")
+            if val_str not in ("…", "—") and units:
+                val_str = f"{val_str} {units}"
+            val_item = QTableWidgetItem(val_str)
+            self._pv_table.setItem(i, 0, name_item)
+            self._pv_table.setItem(i, 1, val_item)
+            self._pv_table.setRowHeight(i, row_h)
+
+    def _pv_trigger_fetch(self):
+        """Start a background fetch for the current displayed timestamp."""
+        if not self._pv_enabled:
+            return
+        # Determine timestamp: master cam in multi-cam, else current single-cam frame
+        ts_ns: "int | None" = None
+        if self._is_multi_cam():
+            master = self._per_cam_master_idx
+            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                # latest displayed index for master cam
+                cam_items = self._cam_items[master]
+                cam_idx = 0
+                if hasattr(self, '_cam_current_idx') and master < len(self._cam_current_idx):
+                    cam_idx = min(self._cam_current_idx[master], len(cam_items) - 1)
+                if cam_items:
+                    ts_ns = cam_items[cam_idx].ts_ns
+            elif self._cam_items:
+                # No master — use first cam
+                for ci, cam_items in enumerate(self._cam_items):
+                    if cam_items:
+                        cam_idx = 0
+                        if hasattr(self, '_cam_current_idx') and ci < len(self._cam_current_idx):
+                            cam_idx = min(self._cam_current_idx[ci], len(cam_items) - 1)
+                        ts_ns = cam_items[cam_idx].ts_ns
+                        break
+        else:
+            if self.current_idx is not None and self.items:
+                ts_ns = self.items[self.current_idx].ts_ns
+
+        if ts_ns is None:
+            return
+
+        # Cancel stale fetches
+        self._pv_fetch_gen += 1
+        gen = self._pv_fetch_gen
+        names  = list(self._pv_enabled)
+        # Mark all as loading
+        for name in names:
+            self._pv_values[name] = "…"
+        self._pv_rebuild_table()
+
+        def _fetch_one(name):
+            channel = PV_CHANNEL_MAP.get(name)
+            if not channel:
+                return name, "—"
+            val = _pv_last_known(channel, ts_ns)
+            if val is None:
+                return name, "—"
+            if "RawPos" in channel:
+                return name, f"{val:.0f}"
+            return name, f"{val:.3f}"
+
+        def _fetch():
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            results: dict[str, str] = {}
+            with ThreadPoolExecutor(max_workers=min(len(names), 8)) as ex:
+                futs = {ex.submit(_fetch_one, n): n for n in names}
+                for fut in as_completed(futs):
+                    try:
+                        name, val = fut.result()
+                        results[name] = val
+                    except Exception:
+                        results[futs[fut]] = "—"
+            if gen == self._pv_fetch_gen:
+                self._pv_signals.result.emit(gen, results)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _pv_force_refresh(self):
+        """Clear PV day-cache for current frame's date and re-fetch."""
+        ts_ns: "int | None" = None
+        if self._is_multi_cam() and self._cam_items:
+            for cam_items in self._cam_items:
+                if cam_items:
+                    ts_ns = cam_items[0].ts_ns
+                    break
+        elif self.items and self.current_idx is not None:
+            ts_ns = self.items[self.current_idx].ts_ns
+        if ts_ns is not None:
+            date_key = _pv_date_key(ts_ns)
+            prev_key = _pv_prev_date_key(date_key)
+            with _pv_day_cache_lock:
+                for key in list(_pv_day_cache.keys()):
+                    if key[1] in (date_key, prev_key):
+                        del _pv_day_cache[key]
+        self._pv_trigger_fetch()
+
+    def _pv_on_result(self, gen: int, results: dict):
+        if gen != self._pv_fetch_gen:
+            return
+        self._pv_values.update(results)
+        self._pv_rebuild_table()
+
+    def _pv_text(self) -> str:
+        """Return a formatted single-line PV string for burn-in under saved images."""
+        if not self._pv_enabled or not self._pv_values:
+            return ""
+        parts = []
+        for name in self._pv_enabled:
+            val = self._pv_values.get(name, "")
+            if not val or val in ("…", "—"):
+                continue
+            units = PV_UNITS.get(name, "")
+            parts.append(f"{name}: {val} {units}".strip())
+        return "  |  ".join(parts)
+
     # ================================================================ MULTI-CAM HELPERS
     def _is_multi_cam(self) -> bool:
         return len(self._cam_names) > 1
@@ -5324,11 +5952,7 @@ class Viewer(QWidget):
         # Update SC camera selector and clear stale preview from previous camera
         cam_name = self._cam_names[idx] if idx < len(self._cam_names) else ""
         if hasattr(self, '_sc_cam_lbl'):
-            self._sc_cam_lbl.setText(f"Camera: {cam_name}" if cam_name else "")
-        if hasattr(self, '_sc_cam_combo') and self._sc_cam_combo.count() > idx:
-            self._sc_cam_combo.blockSignals(True)
-            self._sc_cam_combo.setCurrentIndex(idx)
-            self._sc_cam_combo.blockSignals(False)
+            self._sc_cam_lbl.setText(f"Camera: {_strip_cam_name(cam_name)}" if cam_name else "")
         if hasattr(self, '_sc_preview_lbl'):
             self._sc_preview_lbl.hide()
             self._sc_preview_pixmap = None
@@ -5338,7 +5962,7 @@ class Viewer(QWidget):
 
         if idx < len(self._cam_ref_images) and self._cam_ref_images[idx] is not None:
             cam_name = self._cam_names[idx] if idx < len(self._cam_names) else f"cam {idx}"
-            self.lbl_ref_status.setText(f"Ref set: {cam_name}")
+            self.lbl_ref_status.setText(f"Ref set: {_strip_cam_name(cam_name)}")
         else:
             self.lbl_ref_status.setText("No ref.")
         # Update draw mode checkboxes/buttons to reflect selected camera's state
@@ -5455,6 +6079,8 @@ class Viewer(QWidget):
         self._per_cam_display_one(cam_idx, t_ns)
         if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
             self._per_cam_sync_slaves(cam_idx, t_ns)
+        if cam_idx == self._per_cam_master_idx or self._per_cam_master_idx < 0:
+            self._pv_trigger_fetch()
 
     def _on_per_cam_value_changed(self, cam_idx: int, v: int):
         """Voláno při každém pohybu sliderů — time-based s bisect na nejbližší frame."""
@@ -6275,6 +6901,12 @@ class Viewer(QWidget):
         self.btn_clear_marks.setEnabled(True)
         self._btn_auto_follow.setEnabled(True)
         self.btn_set_ref.setEnabled(True)
+        self.btn_pointing.setEnabled(True)
+        self.btn_pointing_live.setEnabled(True)
+        self.btn_cal_circle.setEnabled(True)
+        self.btn_cal_square.setEnabled(True)
+        self.btn_cal_cross.setEnabled(True)
+        self._sc_set_enabled(True)
 
         self.prog.setVisible(False)
         self.btn_cancel_scan.setVisible(False)
@@ -6965,7 +7597,7 @@ class Viewer(QWidget):
         # Update single-cam label (drawn by paintEvent in reserved strip below image)
         if not self._is_multi_cam():
             cam_name = self._cam_names[0] if self._cam_names else ""
-            self.img_view.cam_label_text = cam_name
+            self.img_view.cam_label_text = _strip_cam_name(cam_name)
             self.img_view.cam_ts_text = fmt_prague_full_from_ns(real_ts)
             self.img_view.update()
 
@@ -7254,6 +7886,7 @@ class Viewer(QWidget):
         self.target_idx = idx
         self.play_time_ns = self.items[idx].ts_ns
         self._set_info_for(idx, self.play_time_ns)
+        self._pv_trigger_fetch()
 
         max_side = FAST_SCRUB_MAX_SIDE if self._last_motion_ips >= 40 else self._scrub_side
         brighten = 1 if self.cb_bright.isChecked() else 0
@@ -7345,6 +7978,7 @@ class Viewer(QWidget):
             self.slider.blockSignals(True); self.slider.setValue(sv); self.slider.blockSignals(False)
         self._display_req_id += 1; rid = self._display_req_id
         self._set_info_for(idx, axis_time_ns); self._request_pixmap(idx, rid)
+        self._pv_trigger_fetch()
 
     def _display_multicam_at_time(self, time_ns: int, update_slider: bool = False):
         """Display for all cameras the latest frame with ts_ns <= time_ns."""
@@ -7403,6 +8037,7 @@ class Viewer(QWidget):
 
         self.play_time_ns = self.items[idx].ts_ns
         self._set_info_for(idx, self.play_time_ns)
+        self._pv_trigger_fetch()
 
         t_ns = self.items[idx].ts_ns
         brighten    = 1 if self.cb_bright.isChecked() else 0
@@ -7785,14 +8420,22 @@ class Viewer(QWidget):
     def run_pointing_analysis(self):
         if not self.items: return
 
+        # In multi-cam mode use only items from the selected camera
+        if self._is_multi_cam() and self._cam_items:
+            cam_idx = self._sc_cam_combo.currentIndex()
+            if 0 <= cam_idx < len(self._cam_items):
+                source_items = self._cam_items[cam_idx]
+            else:
+                source_items = self.items
+        else:
+            source_items = self.items
+
         # Vyber snímky — mezi marky nebo všechny
         if self.mark_a_ns is not None and self.mark_b_ns is not None:
             a, b = min(self.mark_a_ns, self.mark_b_ns), max(self.mark_a_ns, self.mark_b_ns)
-            i0 = bisect.bisect_left(self.ts_list, a)
-            i1 = bisect.bisect_right(self.ts_list, b)
-            items = self.items[i0:i1]
+            items = [it for it in source_items if a <= it.ts_ns <= b]
         else:
-            items = self.items
+            items = source_items
 
         if not items:
             QMessageBox.information(self, "Pointing Analysis", "No images to analyse."); return
@@ -7867,8 +8510,8 @@ class Viewer(QWidget):
         # r[1], r[2] are centroid offsets from image centre in original pixels
         cx_px   = np.array([r[1] for r in results])
         cy_px   = np.array([r[2] for r in results])
-        # Y axis: pixel Y grows downward, keep as-is so graph matches image orientation
-        # (positive Y = beam below centre, negative Y = above centre)
+        img_w   = int(results[0][3]) if len(results[0]) > 3 else None
+        img_h   = int(results[0][4]) if len(results[0]) > 4 else None
 
         n = len(results)
         sx = float(np.std(cx_px))
@@ -7879,7 +8522,8 @@ class Viewer(QWidget):
         self.pointing_panel.setVisible(True)
         self.pointing_panel.plot(cx_px, cy_px, n,
                                   ts_ns=ts_arr.astype(np.float64),
-                                  ts_ns_int=ts_arr)
+                                  ts_ns_int=ts_arr,
+                                  img_w=img_w, img_h=img_h)
         self.btn_pointing_save.setEnabled(True)
         self.btn_pointing_path.setEnabled(True)
         self.btn_pointing_path.setText("〰 Show Path")
@@ -8192,7 +8836,7 @@ class Viewer(QWidget):
             return
         self._sc_active_cam_name = self._sc_current_cam_name()
         if self._sc_active_cam_name:
-            self._sc_cam_lbl.setText(f"Camera: {self._sc_active_cam_name}")
+            self._sc_cam_lbl.setText(f"Camera: {_strip_cam_name(self._sc_active_cam_name)}")
 
         # Reset exclusion mask when image changes
         if img_path != self._sc_exclusion_path:
@@ -8271,7 +8915,10 @@ class Viewer(QWidget):
         self._update_sc_topn_overlay()
 
     def _on_sc_marker_style_changed(self, _val=None):
-        iv = getattr(self, 'img_view', None)
+        if self._is_multi_cam():
+            iv = self._multi_grid.get_img_view(self._sc_cam_idx())
+        else:
+            iv = getattr(self, 'img_view', None)
         if iv is None:
             return
         iv.sc_topn_marker_radius = self._sc_marker_r_sb.value()
@@ -8279,11 +8926,27 @@ class Viewer(QWidget):
         iv.update()
 
     def _update_sc_topn_overlay(self):
-        """Draw top-N intensity pixel markers on img_view."""
+        """Draw top-N intensity pixel markers on the correct ImageView (multi-cam or single)."""
         n = self._sc_topn_sb.value()
         pts = getattr(self, '_sc_topn_points', None)
         shape = getattr(self, '_sc_topn_img_shape', None)
-        iv = self.img_view
+
+        # Determine which ImageView to draw on
+        if self._is_multi_cam():
+            cam_idx = self._sc_cam_idx()
+            iv = self._multi_grid.get_img_view(cam_idx)
+        else:
+            iv = self.img_view
+        if iv is None:
+            return
+
+        # Clear markers from all other multi-cam views so stale markers don't linger
+        if self._is_multi_cam():
+            for cv in self._multi_grid._cam_views:
+                if cv.img_view is not iv:
+                    cv.img_view.sc_topn_points_norm = None
+                    cv.img_view.update()
+
         if n == 0 or not pts or shape is None:
             iv.sc_topn_points_norm = None
         else:
@@ -8297,19 +8960,21 @@ class Viewer(QWidget):
         iv.update()
 
     def _on_pointing_point_clicked(self, orig_idx: int):
-        """Navigate slider to the timestamp of the clicked pointing point.
-        Does NOT update the pointing graph replay — only the image changes."""
+        """Navigate to the image corresponding to the clicked pointing point."""
         panel = self.pointing_panel
         if panel._ts_int is None or orig_idx >= len(panel._ts_int):
             return
         ts_ns = int(panel._ts_int[orig_idx])
-        if not self.items or self.ts_list is None:
+        if not self.items:
             return
-        idx = self._time_to_nearest_index(ts_ns)
-        if 0 <= idx < len(self.items):
-            self._pointing_nav_from_click = True
-            self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
-            self._pointing_nav_from_click = False
+        self._pointing_nav_from_click = True
+        if self._is_multi_cam():
+            self._display_multicam_at_time(ts_ns, update_slider=True)
+        else:
+            idx = self._time_to_nearest_index(ts_ns)
+            if 0 <= idx < len(self.items):
+                self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
+        self._pointing_nav_from_click = False
 
     def _current_master_ts_ns(self) -> int | None:
         """Return current timestamp of the master camera (single-cam or multi-cam)."""
@@ -8384,6 +9049,35 @@ class Viewer(QWidget):
 
     def _dst_name_with_prague_time(self, it):
         return replace_unix_ns_with_prague_in_filename(it.path, it.ts_ns)
+
+    def _pv_save_append_bar(self, pix: "QPixmap", dst: "str | Path") -> bool:
+        """Save pix to dst with PV values appended as a bar below the image using PIL.
+        Returns True on success. Falls back to plain pix.save(dst) on PIL error."""
+        pv_text = self._pv_text()
+        dst = str(dst)
+        if not pv_text:
+            return bool(pix.save(dst))
+        try:
+            from PIL import Image as _PilImg, ImageDraw as _PilDraw, ImageFont as _PilFont
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _tmp:
+                _tmp_path = Path(_tmp.name)
+            pix.save(str(_tmp_path))
+            _img = _PilImg.open(_tmp_path)
+            _bar_h = 40
+            _new = _PilImg.new("RGB", (_img.width, _img.height + _bar_h), (255, 255, 255))
+            _new.paste(_img.convert("RGB"), (0, 0))
+            _draw = _PilDraw.Draw(_new)
+            try:
+                _font = _PilFont.truetype("DejaVuSans.ttf", 14)
+            except Exception:
+                _font = _PilFont.load_default()
+            _draw.text((8, _img.height + 8), pv_text, fill=(0, 0, 0), font=_font)
+            _new.save(dst)
+            _tmp_path.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return bool(pix.save(dst))
 
     def save_around_current(self):
         if self.current_idx is None or not self.items: return
@@ -8483,7 +9177,10 @@ class Viewer(QWidget):
         painter.end()
 
         energy_text = self._sf_energy_map.get(it.path.name, "")
-        if energy_text:
+        # Combine energy_text + PV text into one bar
+        _bar_lines = [t for t in [energy_text, self._pv_text()] if t]
+        _combined_bar = "\n".join(_bar_lines)
+        if _combined_bar:
             try:
                 from PIL import Image as _PilImg, ImageDraw as _PilDraw, ImageFont as _PilFont
                 import tempfile as _tf
@@ -8491,7 +9188,8 @@ class Viewer(QWidget):
                     _tmp_path = Path(_tmp.name)
                 pix.save(str(_tmp_path))
                 _img = _PilImg.open(_tmp_path)
-                _bar_h = 40
+                _n_lines = len(_bar_lines)
+                _bar_h = 26 * _n_lines
                 _new = _PilImg.new("RGB", (_img.width, _img.height + _bar_h), (255, 255, 255))
                 _new.paste(_img.convert("RGB"), (0, 0))
                 _draw = _PilDraw.Draw(_new)
@@ -8499,10 +9197,11 @@ class Viewer(QWidget):
                     _font = _PilFont.truetype("DejaVuSans.ttf", 14)
                 except Exception:
                     _font = _PilFont.load_default()
-                _draw.text((8, _img.height + 8), energy_text, fill=(0, 0, 0), font=_font)
+                for _li, _line in enumerate(_bar_lines):
+                    _draw.text((8, _img.height + 4 + _li * 22), _line, fill=(0, 0, 0), font=_font)
                 _new.save(dst)
                 _tmp_path.unlink(missing_ok=True)
-            except Exception as _e:
+            except Exception:
                 if not pix.save(dst):
                     QMessageBox.critical(self, "Save failed", f"Could not save to {dst}")
                     return
@@ -8581,13 +9280,14 @@ class Viewer(QWidget):
                     painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(sx, sy, sw, sh)
                 painter.end()
-                if not pix.save(str(dst)):
+                if not self._pv_save_append_bar(pix, dst):
                     return f"Could not save {dst.name}"
             else:
                 img = load_image_scaled(it.path, SCRUB_MAX_SIDE, brighten, gradient_id)
                 if img.isNull():
                     return f"Could not load {it.path.name}"
-                if not QPixmap.fromImage(img).save(str(dst)):
+                pix_plain = QPixmap.fromImage(img)
+                if not self._pv_save_append_bar(pix_plain, dst):
                     return f"Could not save {dst.name}"
             _copy_metadata_into_png_bg(it.path, dst, save_txt=save_metadata_txt)
         return None
@@ -8711,7 +9411,7 @@ class Viewer(QWidget):
                     painter.setFont(font); painter.setPen(QColor(0, 0, 0))
                     painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, self.img_view.energy_text)
                 painter.end()
-                pix.save(str(ann_dst))
+                self._pv_save_append_bar(pix, ann_dst)
                 _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt)
 
         msg = f"Saved.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}"
@@ -8809,6 +9509,10 @@ class Viewer(QWidget):
                 'square_color': self._overlay_square_color,
                 'square_thick': self._overlay_square_thick,
             }
+        if overlay_params is not None:
+            overlay_params['pv_text'] = self._pv_text()
+        elif self._pv_text():
+            overlay_params = {'pv_text': self._pv_text()}
         task = SaveRangeTask(
             self.items[i0:i1+1], Path(out_dir), self._dst_name_with_prague_time,
             gradient_id=self.gradient_cb.currentIndex(),
