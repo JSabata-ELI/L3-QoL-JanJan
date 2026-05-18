@@ -10,7 +10,57 @@ It consists of three integrated tools accessible via tabs at the top.
 
 
 =================================================================
-TAB 1 — IMAGE SLIDER
+GENERAL NOTES
+=================================================================
+
+  - Network roots: //users-L3.tier0.lcs.local  (Lab)
+                   Z:\  (Office)
+  - CPVA archiver: https://10.78.0.57:8443 (SSL cert not verified)
+  - Supported image formats: PNG, TIFF, JPG, BMP
+  - 16-bit PNGs are normalized using imgMaxValue from PNG metadata
+    to match Matlab's imagesc([0, 4095]) display.
+  - All background operations (scanning, loading, analysis) run in
+    thread pools; the red "Stop All" button in the status bar halts
+    everything.
+  - Temp files created during viewing are cleaned up on exit.
+
+-----------------------------------------------------------------
+
+
+=================================================================
+TAB 1 — IMAGE FINDER
+=================================================================
+
+Discover camera images by date/hour and correlate them with energy
+and PV data from CSV files or the CPVA archiver.
+
+SEARCH
+  - Pick a date from the calendar and an hour (Lab time / UTC).
+  - Choose data source: Lab (network share) or Office (Z: drive).
+  - Results table lists found images with matching energy data.
+
+ENERGY COLUMNS
+  - Click ⚙ to choose which CSV columns to annotate:
+    Waveplate, PTM1, PCM2, PCM4, PAP1, SBW4, Camp ON,
+    E2–E5 Open, Back Ref.
+  - Values are read from daily CSV files
+    (dataof{YYYY}{Mon}_{DD}.csv) and matched by timestamp (±2 s).
+
+ACTIONS ON RESULTS
+  - View: send selected images to Image Slider.
+  - Save: export selected images to disk (with energy annotation).
+  - Compare: side-by-side A/B pixel difference view.
+  - Open Folder: open the source folder in Explorer.
+  - Info: show detailed image metadata.
+
+DISPLAY
+  - Same 10-palette gradient selector as Image Slider.
+  - Pixel normalization identical to Image Slider (imgMaxValue).
+
+
+
+=================================================================
+TAB 2 — IMAGE SLIDER
 =================================================================
 
 Browse and play back sequences of camera images frame by frame.
@@ -79,37 +129,6 @@ CAMERA PRESETS (multi-cam mode)
 
 
 =================================================================
-TAB 2 — IMAGE FINDER
-=================================================================
-
-Discover camera images by date/hour and correlate them with energy
-and PV data from CSV files or the CPVA archiver.
-
-SEARCH
-  - Pick a date from the calendar and an hour (Lab time / UTC).
-  - Choose data source: Lab (network share) or Office (Z: drive).
-  - Results table lists found images with matching energy data.
-
-ENERGY COLUMNS
-  - Click ⚙ to choose which CSV columns to annotate:
-    Waveplate, PTM1, PCM2, PCM4, PAP1, SBW4, Camp ON,
-    E2–E5 Open, Back Ref.
-  - Values are read from daily CSV files
-    (dataof{YYYY}{Mon}_{DD}.csv) and matched by timestamp (±2 s).
-
-ACTIONS ON RESULTS
-  - View: send selected images to Image Slider.
-  - Save: export selected images to disk (with energy annotation).
-  - Compare: side-by-side A/B pixel difference view.
-  - Open Folder: open the source folder in Explorer.
-  - Info: show detailed image metadata.
-
-DISPLAY
-  - Same 10-palette gradient selector as Image Slider.
-  - Pixel normalization identical to Image Slider (imgMaxValue).
-
-
-=================================================================
 TAB 3 — SHOT FINDER
 =================================================================
 
@@ -142,20 +161,3 @@ TECHNICAL NOTES
   - Back Ref and PAP1 are displayed in mJ when < 1 J.
   - Pixel normalization: same imgMaxValue pipeline as Image Slider.
 
-
-=================================================================
-GENERAL NOTES
-=================================================================
-
-  - Network roots: //users-L3.tier0.lcs.local  (Lab)
-                   Z:\  (Office)
-  - CPVA archiver: https://10.78.0.57:8443 (SSL cert not verified)
-  - Supported image formats: PNG, TIFF, JPG, BMP
-  - 16-bit PNGs are normalized using imgMaxValue from PNG metadata
-    to match Matlab's imagesc([0, 4095]) display.
-  - All background operations (scanning, loading, analysis) run in
-    thread pools; the red "Stop All" button in the status bar halts
-    everything.
-  - Temp files created during viewing are cleaned up on exit.
-
------------------------------------------------------------------

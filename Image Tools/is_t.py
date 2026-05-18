@@ -31,7 +31,7 @@ from PySide6.QtCore import (
     Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPoint, QPointF, QDate, QModelIndex
 )
 from PySide6.QtGui import (
-    QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QGuiApplication, QTextCharFormat
+    QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QBrush, QGuiApplication, QTextCharFormat
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QDoubleSpinBox, QScrollArea,
@@ -144,11 +144,13 @@ def _pv_load_day(channel: str, date_key: str) -> "list[tuple[int, float]]":
     except Exception:
         result = []
 
+    today_key = datetime.now(TZ_PRAGUE).strftime("%Y-%m-%d")
     with _pv_day_cache_lock:
-        _pv_day_cache[cache_key] = result
-        if len(_pv_day_cache) > 28:   # max 14 channels × 2 days
-            oldest = next(iter(_pv_day_cache))
-            del _pv_day_cache[oldest]
+        if date_key != today_key:   # only cache past days, not today
+            _pv_day_cache[cache_key] = result
+            if len(_pv_day_cache) > 28:   # max 14 channels × 2 days
+                oldest = next(iter(_pv_day_cache))
+                del _pv_day_cache[oldest]
     return result
 
 
@@ -537,6 +539,31 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
                 arr_f = img_max_val * arr_f / arr_px_max
             arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
             img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
+        # Apply subtraction if requested (requires grayscale)
+        if ref_image is not None and img.format() != QImage.Format.Format_Grayscale8:
+            img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        if ref_image is not None:
+            ptr2 = img.bits()
+            if hasattr(ptr2, "setsize"):
+                ptr2.setsize(img.sizeInBytes())
+            arr_cur = np.frombuffer(ptr2, dtype=np.uint8).reshape(
+                img.height(), img.bytesPerLine())[:, :img.width()].copy().astype(np.float32)
+            if ref_image.shape != arr_cur.shape:
+                from PIL import Image as PilImage
+                ref_pil = PilImage.fromarray(ref_image.astype(np.uint8))
+                ref_pil = ref_pil.resize(
+                    (arr_cur.shape[1], arr_cur.shape[0]),
+                    PilImage.Resampling.NEAREST)
+                ref_arr = np.asarray(ref_pil, dtype=np.float32)
+            else:
+                ref_arr = ref_image.copy()
+            diff = np.abs(arr_cur - ref_arr)
+            diff[diff <= 1] = 0
+            if sub_threshold > 1:
+                diff[diff < sub_threshold] = 0
+            diff = np.clip(diff, 0, 255).astype(np.uint8)
+            img = QImage(diff.tobytes(), img.width(), img.height(),
+                         img.width(), QImage.Format.Format_Grayscale8)
         # Return original (possibly RGB) image without forced grayscale conversion
         return img
     else:
@@ -2580,9 +2607,6 @@ class DatePickerDialog(QDialog):
         now_dt = datetime.now(TZ_PRAGUE)
         if state:
             self.hour_to.setValue(now_dt.hour)
-            self.hour_to.setEnabled(False)
-        else:
-            self.hour_to.setEnabled(True)
 
     def is_online_mode(self) -> bool:
         return self.cb_now.isChecked()
@@ -4767,6 +4791,90 @@ class _CamSliderRow(QWidget):
             self.master_deselected.emit(self.cam_idx)
 
 
+# ================================================================== PV OVERLAY PANEL
+
+class _PvOverlayPanel(QWidget):
+    """
+    Floating, draggable, semi-transparent PV values panel.
+    Parent must be the _single_wrapper (or any QWidget that covers the camera image).
+    Hides itself when no PV values are set or when _hidden flag is set.
+    """
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.WindowType.Widget)
+        self.setVisible(False)
+
+        self._drag_offset: "QPoint | None" = None
+        self._rows: list[tuple[str, str]] = []   # (name, value+units)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(2)
+
+        # Drag handle / title row
+        title = QLabel("PV values  ⠿")
+        title.setStyleSheet(
+            "color: #111; font-size: 13px; font-weight: 700; "
+            "background: transparent;")
+        title.setCursor(Qt.CursorShape.SizeAllCursor)
+        lay.addWidget(title)
+        self._title = title
+
+        self._content = QLabel()
+        self._content.setStyleSheet(
+            "color: #111; font-size: 14px; font-family: Segoe UI, sans-serif; "
+            "background: transparent;")
+        self._content.setTextFormat(Qt.TextFormat.PlainText)
+        lay.addWidget(self._content)
+
+    def update_values(self, rows: "list[tuple[str,str]]"):
+        """rows = list of (name, formatted_value_with_units)"""
+        self._rows = rows
+        if not rows:
+            self.setVisible(False)
+            return
+        lines = "\n".join(f"{n}: {v}" for n, v in rows)
+        self._content.setText(lines)
+        self.adjustSize()
+        self.setVisible(True)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(255, 255, 240, 220)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(self.rect(), 6, 6)
+        p.setPen(QPen(QColor(100, 100, 100, 180)))
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = e.pos()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_offset is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            new_pos = self.pos() + e.pos() - self._drag_offset
+            parent = self.parentWidget()
+            if parent:
+                # Clamp inside parent
+                new_pos.setX(max(0, min(new_pos.x(), parent.width() - self.width())))
+                new_pos.setY(max(0, min(new_pos.y(), parent.height() - self.height())))
+            self.move(new_pos)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_offset = None
+
+    def ensure_inside_parent(self):
+        parent = self.parentWidget()
+        if not parent:
+            return
+        x = max(0, min(self.x(), parent.width() - self.width()))
+        y = max(0, min(self.y(), parent.height() - self.height()))
+        self.move(x, y)
+
+
 # ================================================================== UI
 class Viewer(QWidget):
     def __init__(self):
@@ -4859,7 +4967,7 @@ class Viewer(QWidget):
         # ── Online mode state ────────────────────────────────────────────────
         self._online_mode    = False
         self._online_timer   = QTimer(self)
-        self._online_timer.setInterval(100)
+        self._online_timer.setInterval(200)
         self._online_timer.timeout.connect(self._online_poll)
         self._auto_follow    = False   # sleduj nejnovější snímek
         self._online_blink_state = False
@@ -4874,6 +4982,8 @@ class Viewer(QWidget):
         self._pv_fetch_gen: int = 0            # incremented each fetch to cancel stale results
         self._pv_signals = _PvSignals()
         self._pv_signals.result.connect(self._pv_on_result)
+        self._pv_overlay: "_PvOverlayPanel | None" = None   # created in _build_ui
+        self._pv_overlay_multi: "_PvOverlayPanel | None" = None   # created in _build_ui
 
         self._build_ui()
 
@@ -4961,6 +5071,11 @@ class Viewer(QWidget):
         row2a.addWidget(self.btn_save)
         row2a.addWidget(self.btn_save_range)
         llay.addLayout(row2a)
+        self.btn_send_workshop = QPushButton("➤ Workshop")
+        self.btn_send_workshop.setEnabled(False)
+        self.btn_send_workshop.setToolTip("Send current image to Workshop tab for editing")
+        self.btn_send_workshop.clicked.connect(self._send_to_workshop)
+        llay.addWidget(self.btn_send_workshop)
         row2c = QHBoxLayout()
         self.cb_save_overlay = QCheckBox("Save with overlay")
         self.cb_save_overlay.setToolTip("When saving, burn overlays (cross/circle/square) into the image")
@@ -5581,6 +5696,10 @@ class Viewer(QWidget):
         self.img_view.cam_label_use_overlay = False
         _swl.addWidget(self.img_view, 1)
 
+        # PV overlay — floating draggable panel over single-cam image
+        self._pv_overlay = _PvOverlayPanel(_single_wrapper)
+        self._pv_overlay.move(8, 8)   # default top-left position
+
         self._single_cam_container = _single_wrapper
         self._img_pointing_row.addWidget(_single_wrapper, 1)
         self._single_wrapper = _single_wrapper
@@ -5590,6 +5709,10 @@ class Viewer(QWidget):
         self._multi_grid.setVisible(False)
         self._multi_grid.camera_selected.connect(self._on_multicam_selected)
         self._img_pointing_row.addWidget(self._multi_grid, 1)
+
+        # PV overlay for multi-cam view
+        self._pv_overlay_multi = _PvOverlayPanel(self._multi_grid)
+        self._pv_overlay_multi.move(8, 8)
 
         self.pointing_panel = PointingPanel(self)
         self.pointing_panel.point_clicked.connect(self._on_pointing_point_clicked)
@@ -5810,6 +5933,7 @@ class Viewer(QWidget):
             self._pv_values  = {}
             self._pv_rebuild_table()
             self._pv_trigger_fetch()
+            self._pv_update_overlay()
 
     def _pv_rebuild_table(self):
         has = bool(self._pv_enabled)
@@ -5923,6 +6047,43 @@ class Viewer(QWidget):
             return
         self._pv_values.update(results)
         self._pv_rebuild_table()
+        self._pv_update_overlay()
+
+    def _pv_update_overlay(self):
+        """Refresh the floating PV overlay panel in single-cam view."""
+        overlay = getattr(self, "_pv_overlay", None)
+        if overlay is None:
+            return
+        # Hide overlay for PDXMY cameras (they don't need energy readout)
+        cam_name = ""
+        if self._is_multi_cam() and self._cam_names:
+            sel = getattr(self._multi_grid, "_selected_idx", 0)
+            if sel < len(self._cam_names):
+                cam_name = self._cam_names[sel]
+        elif hasattr(self, "_cam_name"):
+            cam_name = self._cam_name or ""
+        if re.search(r"PD[1-4]M[12]", cam_name, re.IGNORECASE):
+            overlay.setVisible(False)
+            return
+        if not self._pv_enabled or not self._pv_values:
+            overlay.setVisible(False)
+            return
+        rows = []
+        for name in self._pv_enabled:
+            val = self._pv_values.get(name, "…")
+            units = PV_UNITS.get(name, "")
+            if val not in ("…", "—") and units:
+                val = f"{val} {units}"
+            rows.append((name, val))
+        overlay.update_values(rows)
+        overlay.ensure_inside_parent()
+
+        overlay_multi = getattr(self, "_pv_overlay_multi", None)
+        if overlay_multi is not None and self._is_multi_cam():
+            overlay_multi.update_values(rows)
+            overlay_multi.ensure_inside_parent()
+        elif overlay_multi is not None:
+            overlay_multi.setVisible(False)
 
     def _pv_text(self) -> str:
         """Return a formatted single-line PV string for burn-in under saved images."""
@@ -6000,6 +6161,7 @@ class Viewer(QWidget):
         self.slider.setVisible(True)
         self.tickbar.setVisible(True)
         self.tickbar.set_cursor(None)
+        self.tickbar.set_left_offset(0)
 
     # ── Per-camera sliders ────────────────────────────────────────────────────
 
@@ -6157,6 +6319,10 @@ class Viewer(QWidget):
 
         if hasattr(self, '_cam_current_idx') and cam_idx < len(self._cam_current_idx):
             self._cam_current_idx[cam_idx] = cam_idx_f
+
+        # Trigger PV fetch when the master (or only) camera frame changes
+        if _is_info_cam:
+            self._pv_trigger_fetch()
 
         n_cams = len(self._cam_items)
         max_side = 400 if n_cams >= 3 else (500 if n_cams == 2 else self._scrub_side)
@@ -6891,6 +7057,7 @@ class Viewer(QWidget):
         self.slider.setEnabled(True)
         self.btn_save.setEnabled(True)
         self.btn_save_range.setEnabled(True)
+        self.btn_send_workshop.setEnabled(True)
         self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_prev.setEnabled(True)
@@ -7153,6 +7320,7 @@ class Viewer(QWidget):
         self.btn_set_a.setEnabled(True); self.btn_set_b.setEnabled(True)
         self.btn_clear_marks.setEnabled(True)
         self.btn_refresh.setEnabled(False)
+        self.btn_send_workshop.setEnabled(True)
         self._gen += 1
         self.slider.blockSignals(True); self.slider.setValue(0); self.slider.blockSignals(False)
         self.play_time_ns = self.axis_min_ns; self.target_idx = 0
@@ -7801,6 +7969,7 @@ class Viewer(QWidget):
         self.btn_clear_marks.setEnabled(True); self.btn_cal_circle.setEnabled(True)
         self.btn_cal_square.setEnabled(True); self.btn_cal_cross.setEnabled(True)
         self.btn_refresh.setEnabled(True)
+        self.btn_send_workshop.setEnabled(True)
         self.btn_pointing.setEnabled(True)
         self.btn_pointing_live.setEnabled(True)
         self._sc_set_enabled(True)
@@ -7979,6 +8148,7 @@ class Viewer(QWidget):
         self._display_req_id += 1; rid = self._display_req_id
         self._set_info_for(idx, axis_time_ns); self._request_pixmap(idx, rid)
         self._pv_trigger_fetch()
+        self.tickbar.set_cursor(axis_time_ns)
 
     def _display_multicam_at_time(self, time_ns: int, update_slider: bool = False):
         """Display for all cameras the latest frame with ts_ns <= time_ns."""
@@ -9038,6 +9208,7 @@ class Viewer(QWidget):
         has = bool(self.items)
         self.btn_open.setEnabled(True); self.btn_date.setEnabled(True)
         self.btn_save.setEnabled(has and self.current_idx is not None)
+        self.btn_send_workshop.setEnabled(has and self.current_idx is not None)
         self.btn_play.setEnabled(has); self.btn_stop.setEnabled(False)
         self.btn_prev.setEnabled(has); self.btn_next.setEnabled(has)
         self.btn_set_a.setEnabled(has); self.btn_set_b.setEnabled(has)
@@ -9328,6 +9499,53 @@ class Viewer(QWidget):
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors)
         QMessageBox.information(self, "Saved", msg)
+
+    def _send_to_workshop(self):
+        """Send current frame (as numpy uint8 array) to Workshop tab."""
+        wk = getattr(self, "_workshop_ref", None)
+        if wk is None:
+            return
+        try:
+            if self._is_multi_cam():
+                # Multi-cam: send the selected camera's current frame
+                sel = self._multi_grid.selected_cam_index() if hasattr(self._multi_grid, "selected_cam_index") else -1
+                if sel < 0 and self._cam_items:
+                    sel = 0
+                if sel < 0 or sel >= len(self._cam_items) or not self._cam_items[sel]:
+                    return
+                cam_items = self._cam_items[sel]
+                cam_idx = 0
+                if hasattr(self, "_cam_current_idx") and sel < len(self._cam_current_idx):
+                    cam_idx = min(self._cam_current_idx[sel], len(cam_items) - 1)
+                it = cam_items[cam_idx]
+                cam_name = _strip_cam_name(self._cam_names[sel]) if sel < len(self._cam_names) else f"cam{sel}"
+            else:
+                if self.current_idx is None or not self.items:
+                    return
+                it = self.items[self.current_idx]
+                cam_name = _strip_cam_name(self._cam_name) if hasattr(self, "_cam_name") and self._cam_name else Path(it.path).parent.name
+
+            from PIL import Image as _PilImg
+            import numpy as _np
+            pil = _PilImg.open(str(it.path))
+            if pil.mode in ("I", "I;16"):
+                arr_f = _np.array(pil, dtype=_np.float32)
+            elif pil.mode in ("RGB", "RGBA"):
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+            else:
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+
+            img_max_val = _read_img_max_value(it.path)
+            arr_px_max = float(arr_f.max())
+            if img_max_val is not None and arr_px_max > 0:
+                arr_f = img_max_val * arr_f / arr_px_max
+            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+
+            ts_str = fmt_prague_full_from_ns(it.ts_ns) if it.ts_ns else ""
+            label = f"{cam_name}  {ts_str}".strip()
+            wk.receive_image(arr8, label)
+        except Exception as e:
+            QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
 
     def save_current(self):
         if self._is_multi_cam():

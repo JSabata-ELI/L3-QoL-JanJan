@@ -670,10 +670,10 @@ class BuilderUI(ttk.Frame):
         builddir = workdir / "build"
         specdir.mkdir(parents=True, exist_ok=True)
 
-        icon_path = p / "icon.ico"
+        icon_path = p.resolve() / "icon.ico"
         icon_args = ["--icon", str(icon_path)] if icon_path.exists() else []
 
-        extra_py_files = [x for x in p.glob("*.py") if x.name != main_path.name]
+        extra_py_files = [x.resolve() for x in p.glob("*.py") if x.name != main_path.name]
 
         build_cfg = load_json(p / "build_config.json", {})
         extra_collect_all: list[str] = build_cfg.get("collect_all", [])

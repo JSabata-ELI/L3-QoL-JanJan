@@ -572,6 +572,9 @@ class Launcher(tk.Tk):
         self._icon_cache: dict[str, tk.PhotoImage] = {}
         self._known_versions: dict[str, tuple] = {}   # program_name → (major, minor, patch)
         self._update_available: set[str] = set()       # programs with newer version on disk
+        # Acknowledged versions: {program_name: version_str} — persisted in config
+        # Once a user launches or clicks ✓, the version is acknowledged and highlight clears.
+        self._acknowledged: dict[str, str] = self._config.get("acknowledged_versions", {})
 
         # no default selection
         self.root_choice = tk.IntVar(value=-1)  # bude obsahovat label z ROOT_OPTIONS
@@ -729,6 +732,10 @@ class Launcher(tk.Tk):
         if not hasattr(self, "_group_expanded"):
             self._group_expanded: dict[str, bool] = {}
 
+        # Store toggle button refs so _toggle_group can update arrows without rebuild
+        self._group_toggle_btns: dict[str, ttk.Button] = {}
+        self._group_frames: dict[str, ttk.Frame] = {}
+
         any_group_shown = False
         for title, gkey in GROUP_ORDER:
             group_items = grouped.get(gkey, [])
@@ -747,6 +754,11 @@ class Launcher(tk.Tk):
             header = ttk.Frame(self.sf.inner)
             header.pack(fill="x", padx=6, pady=(6, 0))
 
+            grid_frame = ttk.Frame(self.sf.inner)
+            grid = ttk.Frame(grid_frame)
+            grid.pack(fill="x", padx=8, pady=6)
+            self._group_frames[gkey] = grid_frame
+
             toggle_btn = ttk.Button(
                 header,
                 text=f"{arrow}  {title}  ({len(group_items)})",
@@ -754,14 +766,13 @@ class Launcher(tk.Tk):
                 command=lambda k=gkey: self._toggle_group(k),
             )
             toggle_btn.pack(side="left")
+            self._group_toggle_btns[gkey] = toggle_btn
 
-            if not expanded:
-                continue
-
-            grid_frame = ttk.Frame(self.sf.inner)
+            # Always pack first so Tk initialises all child widgets (icons need live tree).
+            # Then immediately hide if collapsed.
             grid_frame.pack(fill="x", padx=6, pady=(2, 0))
-            grid = ttk.Frame(grid_frame)
-            grid.pack(fill="x", padx=8, pady=6)
+            if not expanded:
+                grid_frame.pack_forget()
 
             for i, (name, info) in enumerate(group_items):
                 r = i // cols
@@ -814,18 +825,34 @@ class Launcher(tk.Tk):
                 sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
                 sub.grid_columnconfigure(0, weight=1)
                 sub.grid_columnconfigure(1, weight=1)
+                sub.grid_rowconfigure(0, weight=0)
+                sub.grid_rowconfigure(1, weight=0)
 
-                # row 0: ReadMe přes celou šířku (nebo prázdný placeholder)
+                # row 0: ReadMe spanning both cols; if update pending, shrink to col 0 and put ✓ in col 1
                 if info.get("readme_path"):
+                    readme_colspan = 1 if name in self._update_available else 2
                     info_btn = ttk.Button(
                         sub,
                         text="ReadMe",
                         style="Info.TButton",
                         command=lambda n=name: self.open_readme(n),
                     )
-                    info_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+                    info_btn.grid(row=0, column=0, columnspan=readme_colspan, sticky="ew", pady=(0, 2))
                 else:
                     ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
+                if name in self._update_available:
+                    ack_btn = ttk.Button(
+                        sub,
+                        text="✓",
+                        style="Info.TButton",
+                        width=3,
+                        command=lambda n=name: self._acknowledge_update(n),
+                    )
+                    ack_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
+                    ack_btn.configure(cursor="hand2")
+                    # tooltip-like
+                    ack_btn.bind("<Enter>", lambda e, b=ack_btn: b.configure(text="✓ ack"))
+                    ack_btn.bind("<Leave>", lambda e, b=ack_btn: b.configure(text="✓"))
 
                 # row 1 vlevo: 📂 složka
                 folder_btn = ttk.Button(
@@ -864,8 +891,19 @@ class Launcher(tk.Tk):
             ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
 
     def _toggle_group(self, gkey: str):
-        self._group_expanded[gkey] = not self._group_expanded.get(gkey, False)
-        self._rebuild_buttons()
+        expanded = not self._group_expanded.get(gkey, False)
+        self._group_expanded[gkey] = expanded
+        frame = self._group_frames.get(gkey)
+        btn = self._group_toggle_btns.get(gkey)
+        if frame:
+            if expanded:
+                frame.pack(fill="x", padx=6, pady=(2, 0))
+            else:
+                frame.pack_forget()
+        if btn:
+            current = btn.cget("text")
+            arrow = "▼" if expanded else "▶"
+            btn.configure(text=arrow + current[1:])
 
     def _rebuild_radiobuttons(self):
         for i, (label, path, configurable) in enumerate(self._root_options):
@@ -932,11 +970,30 @@ class Launcher(tk.Tk):
             if name in self.programs:
                 self.programs[name]["exe_path"] = best_exe
                 self.programs[name]["archive_versions"] = archive_vers
-        changed = updates != self._update_available
-        self._update_available = updates
+        # Filter out programs where the user has already acknowledged this version
+        filtered = set()
+        for name in updates:
+            info = self.programs.get(name, {})
+            new_ver = _exe_version(info.get("exe_path"))
+            ack_ver = self._acknowledged.get(name)
+            if ack_ver is None or ack_ver != str(new_ver):
+                filtered.add(name)
+        changed = filtered != self._update_available
+        self._update_available = filtered
         if changed:
             self._rebuild_buttons()
         self._schedule_version_poll()
+
+    def _acknowledge_update(self, program_name: str):
+        """Mark the current update for program_name as seen — clears orange highlight."""
+        info = self.programs.get(program_name, {})
+        ver = _exe_version(info.get("exe_path"))
+        self._acknowledged[program_name] = str(ver)
+        self._config["acknowledged_versions"] = self._acknowledged
+        _save_config(self._config)
+        if program_name in self._update_available:
+            self._update_available.discard(program_name)
+            self._rebuild_buttons()
 
     # -------- launch --------
 
@@ -953,6 +1010,7 @@ class Launcher(tk.Tk):
             try:
                 os.startfile(str(exe_path))
                 self.after(0, self.status.configure, {"text": f"Started: {program_name}"})
+                self.after(0, self._acknowledge_update, program_name)
             except Exception as e:
                 self.after(0, messagebox.showerror, "Launch failed", f"{program_name}\n\n{e}")
                 self.after(0, self.status.configure, {"text": "Launch failed."})

@@ -80,9 +80,14 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         _sf = _load_module("shot_finder", "sf_t.py")
     except Exception as e:
         raise RuntimeError(f"sf_t.py error: {e}") from e
-    ShotFinderWidget = _sf.ShotFinderWidget
+    try:
+        _wk = _load_module("workshop", "wk_t.py")
+    except Exception as e:
+        raise RuntimeError(f"wk_t.py error: {e}") from e
+    ShotFinderWidget  = _sf.ShotFinderWidget
     ImageFinderWidget = _if.ImageFinderWidget
     Viewer            = _is.Viewer
+    WorkshopWidget    = _wk.WorkshopWidget
 
     win = QMainWindow()
     win.setWindowTitle(APP_TITLE)
@@ -106,11 +111,13 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     finder = ImageFinderWidget()
     viewer = Viewer()
     shot_finder = ShotFinderWidget()
+    workshop = WorkshopWidget()
     viewer.setWindowTitle("")    # title is handled by main window
 
     tabs.addTab(finder, "Image Finder")
     tabs.addTab(viewer, "Image Slider")
     tabs.addTab(shot_finder, "Shot Finder")
+    tabs.addTab(workshop, "Workshop")
 
     # Wire up the integration: finder can switch to slider tab and load folder
     finder._slider_ref  = viewer
@@ -118,6 +125,17 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     shot_finder._slider_ref = viewer
     shot_finder._btn_open_slider.setVisible(True)
     shot_finder._tab_widget = tabs
+
+    # Wire up Workshop — each tab gets a reference so it can send images
+    workshop_idx = tabs.indexOf(workshop)
+    finder._workshop_ref      = workshop
+    finder._workshop_tab_idx  = workshop_idx
+    finder._tab_widget        = tabs
+    viewer._workshop_ref      = workshop
+    viewer._workshop_tab_idx  = workshop_idx
+    shot_finder._workshop_ref     = workshop
+    shot_finder._workshop_tab_idx = workshop_idx
+
     win.setCentralWidget(tabs)
 
     # Stop All tlačítko ve status baru
