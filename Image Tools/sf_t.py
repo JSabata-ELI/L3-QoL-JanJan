@@ -467,7 +467,7 @@ def _find_image_for_ts(cam_folder: Path, ts_dt: datetime,
     except Exception:
         pass
 
-    if best_file is not None and best_diff < 5_000_000_000:
+    if best_file is not None and best_diff < 10_000_000_000:
         return best_file
     return None
 
@@ -803,6 +803,7 @@ class ShotFinderWidget(QWidget):
         self._preview_pixmap_orig = None
         self._preview_gen = 0
         self._preview_sig = _PreviewSignals()
+        self._current_preview_path: "Path | None" = None
         self._preview_sig.show.connect(self._on_preview_ready)
         atexit.register(self._cleanup_temp)
 
@@ -1101,6 +1102,13 @@ class ShotFinderWidget(QWidget):
         self._btn_save_results.clicked.connect(self._save_results)
         ll.addWidget(self._btn_save_results)
 
+        self._btn_send_workshop = QPushButton("➤ Workshop")
+        self._btn_send_workshop.setEnabled(False)
+        self._btn_send_workshop.setVisible(False)
+        self._btn_send_workshop.setToolTip("Send currently previewed image to Workshop tab for editing")
+        self._btn_send_workshop.clicked.connect(self._send_to_workshop)
+        ll.addWidget(self._btn_send_workshop)
+
         grad_row = QHBoxLayout()
         grad_row.addWidget(QLabel("Gradient:"))
         self._gradient_cb = _NoScrollComboBox()
@@ -1266,7 +1274,7 @@ class ShotFinderWidget(QWidget):
         for col in selected:
             prev = existing.get(col, {})
             prev_target = prev.get("target", 10.0)
-            prev_tol    = prev.get("tol", SBW4_WARNING_THRESHOLD_J)
+            prev_tol    = prev.get("tol", 0.0)
 
             row_w = QWidget()
             row_l = QHBoxLayout(row_w)
@@ -1394,6 +1402,7 @@ class ShotFinderWidget(QWidget):
                 parts.append(f"{short}: {ev}")
         energy_text = "  |  ".join(parts)
 
+        self._current_preview_path = img
         self._preview_gen += 1
         gen = self._preview_gen
         gradient_name = self._gradient_cb.currentText()
@@ -2129,6 +2138,8 @@ class ShotFinderWidget(QWidget):
             self._btn_open_slider.setEnabled(True)
         if n > 0:
             self._btn_save_results.setEnabled(True)
+            self._btn_send_workshop.setEnabled(True)
+            self._btn_send_workshop.setVisible(True)
 
     # ── OPEN IN SLIDER ────────────────────────────────────────────────────────
 
@@ -2487,6 +2498,38 @@ class ShotFinderWidget(QWidget):
 
         QMessageBox.information(self, "Save images",
             f"Saved: {copied}\nErrors: {errors}\n\nFolder: {out_path}")
+
+    def _send_to_workshop(self):
+        """Send currently previewed image to Workshop tab."""
+        wk = getattr(self, "_workshop_ref", None)
+        if wk is None:
+            return
+        img_path = getattr(self, "_current_preview_path", None)
+        if img_path is None or not img_path.exists():
+            QMessageBox.information(self, "Workshop",
+                "No preview image available. Select a row first."); return
+        try:
+            from PIL import Image as _PilImg
+            import numpy as _np
+            pil = _PilImg.open(str(img_path))
+            if pil.mode in ("I", "I;16"):
+                arr_f = _np.array(pil, dtype=_np.float32)
+            elif pil.mode in ("RGB", "RGBA"):
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+            else:
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+
+            img_max_val = _read_img_max_value(img_path)
+            arr_px_max = float(arr_f.max())
+            if img_max_val is not None and arr_px_max > 0:
+                arr_f = img_max_val * arr_f / arr_px_max
+            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+
+            cam_name = img_path.parent.name
+            label = f"{cam_name}  |  {img_path.name}"
+            wk.receive_image(arr8, label)
+        except Exception as e:
+            QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
 
 
 # ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────

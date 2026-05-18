@@ -1,22 +1,88 @@
-Announcer (python script) — Information
-Created by Jan Moučka, ELI-Beamlines
+Announcer v1.2.0 — Information
+Created by Jan Moučka, ELI Beamlines
 
-If you have suggestions for improvement or encounter some bugs, please let me know - jan.moucka@eli-beams.eu
----------------------------------
+Bugs / suggestions: jan.moucka@eli-beams.eu
+-----------------------------------------------------------------
 
-Program for detecting a trip. It is based on difference between reference and image of monitored region in specific moment.
+Real-time screen region change monitor. Watches a selected area
+of the screen and alerts (visual flash + optional sound) when
+the pixel content changes beyond a configurable threshold.
 
-First click on identify to see what monitor you should pick. The region needs to be in the selected monitor of course.
+Useful for monitoring camera windows, status displays, or any
+on-screen indicator without keeping it in focus.
 
-Then click on the "Set reference" button and select a region you want to monitor.
 
-In the settings you can set threshold for the change, if the program needs to do some sound, how long will it be blicking.
+=================================================================
+SETUP
+=================================================================
 
-When you are done with setting the reference, just click on the big yellow (in that moment yellow, otherwise its gray, green or red, based on the situation) circle to start tracking the region.
-	. Green -> Program is tracking the region.
-	. Red -> Program detected a change in the region, it tripped.
-	. Yellow -> Program is prepared to start tracking.
-	. Gray -> Program has no region which it should monitor.
+1. SELECT MONITOR
+   - Choose the target monitor from the dropdown.
+   - Click Identify to overlay numbered labels on each screen
+     for 3 seconds.
 
-You can view the region via "preview region" button.
+2. SET REFERENCE REGION
+   - Click "Set reference" to enter selection mode.
+   - A semi-transparent overlay covers the screen; drag to draw
+     the region you want to watch, then release.
+   - Press ESC to cancel.
+   - The coordinates of the selected region are shown in the
+     status label.
 
+3. RE-SNAPSHOT
+   - Click the refresh button (arrow icon) to re-capture the
+     current screen content as the new reference without
+     re-drawing the region.
+
+4. PREVIEW REGION
+   - Hover "Preview region" to see a thumbnail popup (max 640x400)
+     of the currently selected area.
+   - Click to pin the popup open.
+
+
+=================================================================
+TRACKING AND ALERTS
+=================================================================
+
+STATUS INDICATOR (circle):
+  Gray    -- no reference set yet
+  Orange  -- reference set, not tracking
+  Green   -- actively tracking (checks every 500 ms)
+  Red     -- change detected, alert active
+
+WHEN A CHANGE IS DETECTED:
+  - The window flashes with the configured colour.
+  - An optional sound plays.
+  - Tracking stops automatically.
+  - Click anywhere on the flashing window to dismiss the alert.
+
+
+=================================================================
+SETTINGS (gear button)
+=================================================================
+
+DETECTION:
+  - Threshold (0.5-50.0, default 2.0):
+    Average pixel deviation (0-255) required to trigger an alert.
+    Lower = more sensitive.
+  - Flash colour: click to pick the alert overlay colour.
+  - Flash duration (0-60 s, default 3.0 s).
+
+SOUND:
+  - Play sound on change: enable/disable audio alert.
+  - Freq (Hz) / Duration (ms): built-in beep parameters.
+  - Sound file: select a .wav file from the sounds/ folder as
+    an alternative to the built-in beep.
+
+
+=================================================================
+GENERAL NOTES
+=================================================================
+
+  - Poll interval: 500 ms (checks for changes twice per second).
+  - Flash blink interval: 300 ms.
+  - Sound files: place .wav files in the sounds/ subfolder next
+    to the executable.
+  - Multi-monitor support via the screeninfo library.
+
+-----------------------------------------------------------------
