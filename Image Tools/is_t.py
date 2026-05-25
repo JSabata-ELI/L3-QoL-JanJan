@@ -97,6 +97,9 @@ def _pv_ssl_ctx() -> ssl.SSLContext:
 # date_str = "YYYY-MM-DD" in Prague time
 _pv_day_cache: dict[tuple[str, str], list] = {}
 _pv_day_cache_lock = threading.Lock()
+# Today's cache expires after this many seconds (live mode gets fresh data periodically)
+_PV_TODAY_CACHE_TTL = 30.0
+_pv_today_cache_time: dict[tuple[str, str], float] = {}  # cache_key → time.monotonic() of last fetch
 
 
 def _pv_date_key(ts_ns: int) -> str:
@@ -109,9 +112,17 @@ def _pv_date_key(ts_ns: int) -> str:
 def _pv_load_day(channel: str, date_key: str) -> "list[tuple[int, float]]":
     """Fetch (or return cached) sorted (t_ns, value) list for channel on date_key."""
     cache_key = (channel, date_key)
+    today_key = datetime.now(TZ_PRAGUE).strftime("%Y-%m-%d")
+    is_today  = (date_key == today_key)
+
     with _pv_day_cache_lock:
         if cache_key in _pv_day_cache:
-            return _pv_day_cache[cache_key]
+            if not is_today:
+                return _pv_day_cache[cache_key]
+            # Today: honour TTL so live data refreshes periodically
+            age = time.monotonic() - _pv_today_cache_time.get(cache_key, 0.0)
+            if age < _PV_TODAY_CACHE_TTL:
+                return _pv_day_cache[cache_key]
 
     # Parse date_key → day boundaries in Prague time
     y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
@@ -142,23 +153,24 @@ def _pv_load_day(channel: str, date_key: str) -> "list[tuple[int, float]]":
                 continue
         result.sort(key=lambda x: x[0])
     except Exception:
-        result = []
+        # On failure keep whatever was in cache (avoids showing "—" when server hiccups)
+        with _pv_day_cache_lock:
+            return _pv_day_cache.get(cache_key, [])
 
-    today_key = datetime.now(TZ_PRAGUE).strftime("%Y-%m-%d")
     with _pv_day_cache_lock:
-        if date_key != today_key:   # only cache past days, not today
-            _pv_day_cache[cache_key] = result
-            if len(_pv_day_cache) > 28:   # max 14 channels × 2 days
-                oldest = next(iter(_pv_day_cache))
-                del _pv_day_cache[oldest]
+        _pv_day_cache[cache_key] = result
+        if is_today:
+            _pv_today_cache_time[cache_key] = time.monotonic()
+        if len(_pv_day_cache) > 32:
+            oldest = next(iter(_pv_day_cache))
+            del _pv_day_cache[oldest]
     return result
 
 
 def _pv_prev_date_key(date_key: str) -> str:
-    """Return 'YYYY-MM-DD' for the day before date_key."""
-    from datetime import timezone as _tz
+    """Return 'YYYY-MM-DD' for the day before date_key (Prague time)."""
     y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
-    prev = datetime(y, m, d, tzinfo=_tz.utc) - timedelta(days=1)
+    prev = datetime(y, m, d, tzinfo=TZ_PRAGUE) - timedelta(days=1)
     return prev.strftime("%Y-%m-%d")
 
 
@@ -184,14 +196,18 @@ def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
 
 
 # ---------------- GRADIENTS ----------------
-def _copy_metadata_into_png(src: Path, dst: Path, save_txt: bool = False):
+def _copy_metadata_into_png(src: Path, dst: Path, save_txt: bool = False,
+                             extra_meta: "dict | None" = None):
     """Embed original PNG/TIFF metadata as PNG tEXt chunks in dst.
     Optionally also writes a sidecar .txt when save_txt=True.
+    extra_meta keys (e.g. {"Energy": "1.23 J"}) are added/overwrite source metadata.
     Safe to call from any thread."""
     try:
         from PIL import Image as _PilImg, PngImagePlugin as _PngP
         with _PilImg.open(src) as _src_img:
             info = dict(_src_img.info)
+        if extra_meta:
+            info.update({k: v for k, v in extra_meta.items() if v})
         if not info:
             return
         # Re-open dst (already saved PNG) and re-save with metadata embedded
@@ -213,10 +229,12 @@ def _copy_metadata_into_png(src: Path, dst: Path, save_txt: bool = False):
         pass
 
 
-def _copy_metadata_into_png_bg(src: Path, dst: Path, save_txt: bool = False):
+def _copy_metadata_into_png_bg(src: Path, dst: Path, save_txt: bool = False,
+                                extra_meta: "dict | None" = None):
     """Same as _copy_metadata_into_png but dispatched to a daemon thread (non-blocking)."""
     import threading
-    t = threading.Thread(target=_copy_metadata_into_png, args=(src, dst, save_txt), daemon=True)
+    t = threading.Thread(target=_copy_metadata_into_png,
+                         args=(src, dst, save_txt, extra_meta), daemon=True)
     t.start()
 
 # Keep old name as alias so existing call-sites in SaveRangeTask still compile
@@ -785,11 +803,13 @@ class SaveRangeSignals(QObject):
     finished = Signal(int, int)
 
 class SaveRangeTask(QRunnable):
-    def __init__(self, items, outp, name_fn, gradient_id=0, brighten=False, overlay_params=None):
+    def __init__(self, items, outp, name_fn, gradient_id=0, brighten=False, overlay_params=None,
+                 energy_map: "dict | None" = None):
         super().__init__()
         self.items = items; self.outp = outp; self.name_fn = name_fn
         self.gradient_id = gradient_id; self.brighten = brighten
         self.overlay_params = overlay_params  # dict or None
+        self.energy_map = energy_map or {}    # filename -> energy string
         self.signals = SaveRangeSignals()
 
     def _draw_overlay_on_pixmap(self, src_path):
@@ -837,11 +857,13 @@ class SaveRangeTask(QRunnable):
         save_txt = getattr(self, 'save_txt', False)
         for done, it in enumerate(self.items, 1):
             dst = self.outp / self.name_fn(it)
+            energy_str = self.energy_map.get(it.path.name, "")
+            extra_meta = {"Energy": energy_str} if energy_str else None
             try:
                 if self.gradient_id == GRADIENT_ID_DEFAULT and not self.brighten:
                     # Default — copy original + metadata
                     shutil.copy2(it.path, dst)
-                    _copy_metadata_into_png(it.path, dst, save_txt=save_txt)
+                    _copy_metadata_into_png(it.path, dst, save_txt=save_txt, extra_meta=extra_meta)
                 else:
                     # Color palette / brightened — save as PNG with metadata
                     dst = dst.with_suffix('.png')
@@ -854,7 +876,7 @@ class SaveRangeTask(QRunnable):
                         errors += 1
                         self.signals.progress.emit(done, total, it.path.name)
                         continue
-                    _copy_metadata_into_png(it.path, dst, save_txt=save_txt)
+                    _copy_metadata_into_png(it.path, dst, save_txt=save_txt, extra_meta=extra_meta)
                 # Annotate version if overlay or PV text is requested
                 pv_text = (self.overlay_params or {}).get('pv_text', '')
                 if self.overlay_params or pv_text:
@@ -882,7 +904,7 @@ class SaveRangeTask(QRunnable):
                                 pix.save(str(ann_dst))
                         else:
                             pix.save(str(ann_dst))
-                        _copy_metadata_into_png(it.path, ann_dst, save_txt=save_txt)
+                        _copy_metadata_into_png(it.path, ann_dst, save_txt=save_txt, extra_meta=extra_meta)
                 n += 1
             except Exception:
                 errors += 1
@@ -914,7 +936,9 @@ class PointingAnalysisTask(QRunnable):
             pil_img = PilImage.open(str(item.path))
             w0, h0 = pil_img.size
             pil_img = pil_img.convert("I") if pil_img.mode in ("I", "I;16") else pil_img.convert("L")
-            scale = max(w0, h0) / 100.0
+            # Downscale max to 512px — enough for sub-pixel centroid accuracy,
+            # fast enough for large batches. 100px was too coarse (24px grid).
+            scale = max(w0, h0) / 512.0
             if scale > 1.0:
                 new_w = max(1, int(w0 / scale))
                 new_h = max(1, int(h0 / scale))
@@ -928,16 +952,23 @@ class PointingAnalysisTask(QRunnable):
 
         arr_max = arr.max()
         if arr_max <= 0: return None
-        arr = arr / arr_max * 255.0
 
-        # Estimate background from image edges (corners), not a single column
-        bg = float(np.percentile(arr, 10))
+        # Background: median of corner regions (5% of each dimension)
+        bx = max(1, w // 20); by = max(1, h // 20)
+        corners = np.concatenate([
+            arr[:by, :bx].ravel(), arr[:by, -bx:].ravel(),
+            arr[-by:, :bx].ravel(), arr[-by:, -bx:].ravel(),
+        ])
+        bg = float(np.median(corners))
         arr = np.clip(arr - bg, 0, None)
+        if arr.max() <= 0: return None
 
-        # Filtruj snímky bez dat — peak musí být výrazně nad šumem
-        if arr.max() < threshold:
+        # Threshold is expressed as fraction of post-background-subtracted peak
+        # (0–100 in UI = 0–100% of peak). This is scale-invariant for any bit depth.
+        thr_abs = arr.max() * (threshold / 100.0)
+        if thr_abs <= 0 or arr.max() < thr_abs:
             return None
-        arr[arr < threshold] = 0
+        arr[arr < thr_abs] = 0
 
         irradiance = arr.sum()
         if irradiance < 1.0: return None
@@ -4816,16 +4847,16 @@ class _PvOverlayPanel(QWidget):
         # Drag handle / title row
         title = QLabel("PV values  ⠿")
         title.setStyleSheet(
-            "color: #111; font-size: 13px; font-weight: 700; "
-            "background: transparent;")
+            "QLabel { color: #111111; font-size: 14px; font-weight: 700; "
+            "background: transparent; }")
         title.setCursor(Qt.CursorShape.SizeAllCursor)
         lay.addWidget(title)
         self._title = title
 
         self._content = QLabel()
         self._content.setStyleSheet(
-            "color: #111; font-size: 14px; font-family: Segoe UI, sans-serif; "
-            "background: transparent;")
+            "QLabel { color: #111111; font-size: 18px; font-weight: 700; "
+            "font-family: 'Segoe UI', sans-serif; background: transparent; }")
         self._content.setTextFormat(Qt.TextFormat.PlainText)
         lay.addWidget(self._content)
 
@@ -5359,10 +5390,15 @@ class Viewer(QWidget):
         row_thr_mag = QHBoxLayout()
         row_thr_mag.addWidget(QLabel("Thr:"))
         self.pointing_threshold_sb = QSpinBox()
-        self.pointing_threshold_sb.setRange(0, 65535)
-        self.pointing_threshold_sb.setValue(50)
-        self.pointing_threshold_sb.setFixedWidth(55)
-        self.pointing_threshold_sb.setToolTip("Threshold — pixels below this value (0–255) are ignored")
+        self.pointing_threshold_sb.setRange(0, 99)
+        self.pointing_threshold_sb.setValue(10)
+        self.pointing_threshold_sb.setSuffix(" %")
+        self.pointing_threshold_sb.setFixedWidth(62)
+        self.pointing_threshold_sb.setToolTip(
+            "Threshold as % of peak intensity (after background subtraction).\n"
+            "Pixels below this fraction of the peak are ignored for centroid.\n"
+            "10% = ignore everything below 10% of brightest pixel.\n"
+            "Raise if noise affects centroid; lower if beam is cut off.")
         row_thr_mag.addWidget(self.pointing_threshold_sb)
         row_thr_mag.addSpacing(6)
         row_thr_mag.addWidget(QLabel("M:"))
@@ -6389,11 +6425,11 @@ class Viewer(QWidget):
         cam_ts = self._cam_ts[master]
         if not cam_ts:
             return
-        row = self._per_cam_rows[master]
-        cur_t = self._per_cam_slider_to_ts(master, row.value())
-        cur_frame = max(0, bisect.bisect_right(cam_ts, cur_t) - 1)
+        # Use stored per-cam frame index so navigation steps by screenshot, not by time
+        cur_frame = self._cam_current_idx[master] if master < len(self._cam_current_idx) else 0
         new_frame = max(0, min(len(cam_ts) - 1, cur_frame + delta))
         new_ts = cam_ts[new_frame]
+        row = self._per_cam_rows[master]
         sv = self._per_cam_ts_to_slider(master, new_ts)
         row.set_value(sv)
         self._per_cam_display_one(master, new_ts)
@@ -7084,8 +7120,8 @@ class Viewer(QWidget):
         self.lbl_scan_progress.setText(cam_lines)
         self.lbl_index.setText(f"1 / {len(self.items)}")
 
-        # V online modu zobraz poslední snímek, jinak první
-        start_idx = len(self.items) - 1 if online else 0
+        # Zobraz vždy poslední (nejnovější) snímek — ráno bývají kamery bez dat
+        start_idx = len(self.items) - 1
         self._display_multicam_index(start_idx, update_slider=True)
 
         if online:
@@ -8382,8 +8418,12 @@ class Viewer(QWidget):
             self.play_time_ns = self.mark_a_ns
             sv = self._time_to_slider_value(self.mark_a_ns)
             self.slider.blockSignals(True); self.slider.setValue(sv); self.slider.blockSignals(False)
+        elif self.current_idx is not None:
+            # Start from current frame, not from slider position
+            self.play_time_ns = self.items[self.current_idx].ts_ns
         else:
             self.play_time_ns = self._slider_to_time_ns(self.slider.value())
+        self._play_frame_acc = 0.0
         self._is_playing = True; self._is_scrubbing = False; self._reset_motion_tracking()
         if self.current_idx is None:
             self._display_exact_index(self._time_to_nearest_index(self.play_time_ns), self.play_time_ns, False)
@@ -8524,6 +8564,8 @@ class Viewer(QWidget):
         else:
             win.removeEventFilter(self)
             win.showMaximized()
+        # Refresh PV overlay — it may be hidden because its parent (_left_col) was hidden
+        QTimer.singleShot(0, self._pv_update_overlay)
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
@@ -9380,8 +9422,10 @@ class Viewer(QWidget):
             if not pix.save(dst):
                 QMessageBox.critical(self, "Save failed", f"Could not save to {dst}")
                 return
+        _energy_str_ov = self._sf_energy_map.get(it.path.name, "")
         _copy_metadata_into_png_bg(it.path, Path(dst),
-                                   save_txt=self.cb_save_metadata_txt.isChecked())
+                                   save_txt=self.cb_save_metadata_txt.isChecked(),
+                                   extra_meta={"Energy": _energy_str_ov} if _energy_str_ov else None)
         QMessageBox.information(self, "Saved",
             f"Saved with overlay.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}")
 
@@ -9560,6 +9604,8 @@ class Viewer(QWidget):
         has_overlay = (self.cb_save_overlay.isChecked() or bool(self.img_view.energy_text)
                        or self.img_view.show_cross or self.img_view.show_circle
                        or self.img_view.show_square)
+        _energy_str = self._sf_energy_map.get(it.path.name, "")
+        _extra_meta = {"Energy": _energy_str} if _energy_str else None
 
         if gradient_id == GRADIENT_ID_DEFAULT:
             suggested = str(self._last_save_dir / self._dst_name_with_prague_time(it))
@@ -9570,7 +9616,7 @@ class Viewer(QWidget):
                 shutil.copy2(it.path, Path(dst))
             except Exception as e:
                 QMessageBox.critical(self, "Save failed", str(e)); return
-            _copy_metadata_into_png_bg(it.path, Path(dst), save_txt=save_txt)
+            _copy_metadata_into_png_bg(it.path, Path(dst), save_txt=save_txt, extra_meta=_extra_meta)
         else:
             stem_no_ext = Path(self._dst_name_with_prague_time(it)).stem
             suggested = str(self._last_save_dir / f"{stem_no_ext}.png")
@@ -9583,7 +9629,7 @@ class Viewer(QWidget):
                 QMessageBox.critical(self, "Save failed", "Could not load image."); return
             if not img.save(dst):
                 QMessageBox.critical(self, "Save failed", f"Could not save to {dst}"); return
-            _copy_metadata_into_png_bg(it.path, Path(dst), save_txt=save_txt)
+            _copy_metadata_into_png_bg(it.path, Path(dst), save_txt=save_txt, extra_meta=_extra_meta)
 
         # Also save annotate version alongside original if any overlay is active
         if has_overlay:
@@ -9630,7 +9676,7 @@ class Viewer(QWidget):
                     painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, self.img_view.energy_text)
                 painter.end()
                 self._pv_save_append_bar(pix, ann_dst)
-                _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt)
+                _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt, extra_meta=_extra_meta)
 
         msg = f"Saved.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}"
         if has_overlay:
@@ -9736,6 +9782,7 @@ class Viewer(QWidget):
             gradient_id=self.gradient_cb.currentIndex(),
             brighten=self.cb_bright.isChecked(),
             overlay_params=overlay_params,
+            energy_map=dict(self._sf_energy_map),
         )
         task.save_txt = self.cb_save_metadata_txt.isChecked()
         self._save_task = task

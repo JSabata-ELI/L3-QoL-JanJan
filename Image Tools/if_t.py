@@ -558,14 +558,11 @@ def is_valid_image_file(name: str) -> bool:
     return Path(low).suffix in IMAGE_EXTS
 
 def extract_display_label(folder_name: str) -> str:
+    """Strip -_-IMG suffix (and variants) from camera folder names, keep the rest."""
     s = folder_name.strip()
-    m = re.match(r"^C\d{2}-\d{3}-(.+)-_-IMG$", s, flags=re.IGNORECASE)
-    if m: return m.group(1)
-    m = re.match(r"^L3-(.+)-C\d{3}-_-IMG$", s, flags=re.IGNORECASE)
-    if m: return m.group(1)
-    m = re.match(r"^L3BT-(.+)-_-IMG$", s, flags=re.IGNORECASE)
-    if m: return m.group(1)
-    return s
+    # Remove trailing -_-IMG or _-_IMG (case-insensitive), keep everything before it
+    cleaned = re.sub(r"[-_]+IMG$", "", s, flags=re.IGNORECASE).rstrip("-_")
+    return cleaned
 
 def extract_folder_number(folder_name: str) -> str:
     s = folder_name.strip()
@@ -1461,55 +1458,101 @@ class _ThumbView(QWidget):
 def _write_annotated_from_pil(img: "PilImage.Image", dst: Path, text: str) -> None:
     """
     Add a white annotation bar below an already-rendered PIL image and save to dst.
-    Used by MultiDayPreviewWindow so the saved file reflects exactly what is shown
-    (palette / brightness / rotation / overlays already applied).
+    Font size is auto-scaled so all PV parts fill the bar as large as possible,
+    splitting into multiple lines as needed (same logic as Shot Finder).
     """
     from PIL import Image as _Img, ImageDraw as _ID, ImageFont as _IF
 
     img = img.convert("RGB")
     w, h = img.size
 
-    fsize = ENERGY_BAR_FONT_SIZE_PT
-    font = None
-    for _fname in (
+    _FONT_CANDIDATES = (
         "C:/Windows/Fonts/arial.ttf",
         "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/calibri.ttf",
         "DejaVuSans.ttf",
-    ):
-        try:
-            font = _IF.truetype(_fname, fsize)
-            break
-        except Exception:
-            continue
-    if font is None:
-        font = _IF.load_default()
-
-    parts_list = text.split("   |   ")
+    )
+    parts_list = [p for p in text.split("   |   ") if p]
     tmp_draw = _ID.Draw(_Img.new("RGB", (1, 1)))
+    padding = 8
+
+    chosen_font = None
+    display_lines = [text]
+
+    for fsize in range(28, 7, -1):
+        _f = None
+        for _fname in _FONT_CANDIDATES:
+            try:
+                _f = _IF.truetype(_fname, fsize)
+                break
+            except Exception:
+                continue
+        if _f is None:
+            _f = _IF.load_default()
+
+        # Try fitting everything on one line first
+        try:
+            bb = tmp_draw.textbbox((0, 0), text, font=_f)
+            if (bb[2] - bb[0]) <= w - padding * 2:
+                chosen_font = _f
+                display_lines = [text]
+                break
+        except Exception:
+            pass
+
+        # Try splitting into increasing number of lines
+        fitted = False
+        for n_lines in range(2, len(parts_list) + 1):
+            chunk = max(1, len(parts_list) // n_lines)
+            lines = []
+            for i in range(0, len(parts_list), chunk):
+                lines.append("   |   ".join(parts_list[i:i + chunk]))
+            max_w = 0
+            try:
+                for line in lines:
+                    bb2 = tmp_draw.textbbox((0, 0), line, font=_f)
+                    max_w = max(max_w, bb2[2] - bb2[0])
+            except Exception:
+                max_w = w
+            if max_w <= w - padding * 2:
+                chosen_font = _f
+                display_lines = lines
+                fitted = True
+                break
+        if fitted:
+            break
+
+    if chosen_font is None:
+        for _fname in _FONT_CANDIDATES:
+            try:
+                chosen_font = _IF.truetype(_fname, 8)
+                break
+            except Exception:
+                continue
+        if chosen_font is None:
+            chosen_font = _IF.load_default()
+        display_lines = [text]
+
     try:
-        line_w = max((tmp_draw.textlength(p, font=font) for p in parts_list), default=0)
+        bb_ref = tmp_draw.textbbox((0, 0), "Ag", font=chosen_font)
+        line_h = bb_ref[3] - bb_ref[1]
     except Exception:
-        line_w = w  # fallback: always split
-    padding = 6
-    line_h = fsize + padding
+        line_h = 14
 
-    if line_w <= w - padding * 2:
-        display_lines = ["   |   ".join(parts_list)]
-    else:
-        mid = len(parts_list) // 2 or 1
-        display_lines = [
-            "   |   ".join(parts_list[:mid]),
-            "   |   ".join(parts_list[mid:]),
-        ]
-
-    bar_h = line_h * len(display_lines) + padding
+    bar_h = max(30, line_h * len(display_lines) + padding * (len(display_lines) + 1))
     bar = _Img.new("RGB", (w, bar_h), (255, 255, 255))
     draw = _ID.Draw(bar)
-    y = padding // 2
+    total_text_h = line_h * len(display_lines) + padding * (len(display_lines) - 1)
+    y = (bar_h - total_text_h) // 2
     for line in display_lines:
-        draw.text((padding, y), line, font=font, fill=(0, 0, 0))
-        y += line_h
+        try:
+            bb = draw.textbbox((0, 0), line, font=chosen_font)
+            tw = bb[2] - bb[0]
+        except Exception:
+            tw = 0
+        x = max(padding, (w - tw) // 2)
+        draw.text((x, y), line, font=chosen_font, fill=(0, 0, 0))
+        y += line_h + padding
 
     combined = _Img.new("RGB", (w, h + bar_h), (255, 255, 255))
     combined.paste(img, (0, 0))
@@ -1674,6 +1717,7 @@ class ImageFinderWidget(QWidget):
 
         self._preview_gen: int = 0
         self._preview_paths: list = []
+        self._preview_cam_names: list[str] = []  # per-file cam name (parallel to _preview_paths)
         self._preview_idx: int = 0
         self._preview_cam: str = ""
         self._preview_from_view: bool = False  # True when preview was loaded by View button
@@ -2192,6 +2236,7 @@ class ImageFinderWidget(QWidget):
                     self._preview_counter.setText("0 / 0")
                     return
                 self._preview_paths = files
+                self._preview_cam_names = []
                 self._preview_idx   = 0
                 self._preview_cam   = cam_name
                 self._preview_show()
@@ -2200,11 +2245,17 @@ class ImageFinderWidget(QWidget):
 
         threading.Thread(target=_scan, daemon=True).start()
 
-    def _preview_set_files(self, files: list, cam_name: str = ""):
+    def _preview_set_files(self, files: list, cam_name: str = "",
+                           cam_names: "list[str] | None" = None):
         """Set the preview to a specific file list (e.g. after View)."""
         if not files:
             return
         self._preview_paths    = list(files)
+        # Per-file cam names: use provided list, else derive from parent folder name
+        if cam_names and len(cam_names) == len(files):
+            self._preview_cam_names = list(cam_names)
+        else:
+            self._preview_cam_names = [f.parent.name for f in files]
         self._preview_idx      = 0
         self._preview_cam      = cam_name
         self._preview_from_view = True
@@ -2243,7 +2294,12 @@ class ImageFinderWidget(QWidget):
         self._preview_counter.setText(f"{idx + 1} / {total}")
         self._prev_btn.setEnabled(total > 1)
         self._next_btn.setEnabled(total > 1)
-        self._preview_cam_lbl.setText(self._preview_cam or path.parent.name)
+        # Use per-file cam name if available, fallback to folder name
+        per_file_cam = (self._preview_cam_names[idx]
+                        if self._preview_cam_names and idx < len(self._preview_cam_names)
+                        else None)
+        raw_cam = per_file_cam or self._preview_cam or path.parent.name
+        self._preview_cam_lbl.setText(extract_display_label(raw_cam))
         ns = extract_ns_from_stem(path.stem)
         if ns is not None:
             try:
@@ -3459,15 +3515,63 @@ class ImageFinderWidget(QWidget):
 
                 log(f"  TotalPower: {len(windows)} window(s)  ({elapsed:.2f}s)")
 
-                # Pick a random timestamp inside the first active window and find
-                # the nearest image file.  No additional PV queries needed.
+                # Cross-reference with SBW4 first, then PTM1 — pick camera window
+                # with highest total overlap with laser energy activity.
                 import random as _random
-                w_start, w_end = windows[0]
+                chosen_window = None
+                for ref_ch in (CPVA_SBW4_CHANNEL, CPVA_SHOT_CHANNEL):
+                    if is_cancelled():
+                        break
+                    try:
+                        ref_windows = bc(
+                            lambda qs=query_start_ns, ch=ref_ch:
+                                _cpva_active_windows_ns(ch, qs, end_ns,
+                                                        timeout=3.0,
+                                                        active_from_ns=start_ns,
+                                                        debug_log=log),
+                            cancelled)
+                        if not ref_windows:
+                            log(f"  {ref_ch}: no active windows, trying next")
+                            continue
+                        # Pick camera window with maximum total overlap with ref windows
+                        best_overlap = 0
+                        for ws, we in windows:
+                            total_overlap = sum(
+                                max(0, min(we, pe) - max(ws, ps))
+                                for ps, pe in ref_windows
+                            )
+                            if total_overlap > best_overlap:
+                                best_overlap = total_overlap
+                                chosen_window = (ws, we)
+                        if chosen_window and best_overlap > 0:
+                            log(f"  {ref_ch} cross-ref: best overlap {best_overlap/1e9:.1f}s → window chosen")
+                            break
+                        chosen_window = None  # no overlap, try next channel
+                    except Exception as _pe:
+                        log(f"  cross-ref error ({ref_ch}): {_pe}")
+
+                if chosen_window is None:
+                    # No ref data — fallback: pick window with highest avg TotalPower
+                    try:
+                        tp_samples = _cpva_fetch_samples(tp_channel, query_start_ns, end_ns, timeout=3.0)
+                        def _window_avg_power(w):
+                            ws, we = w
+                            vals = [float(s["value"][0] if isinstance(s["value"], list) else s["value"])
+                                    for s in tp_samples
+                                    if ws <= int(s.get("time", 0)) <= we]
+                            return sum(vals) / len(vals) if vals else 0.0
+                        chosen_window = max(windows, key=_window_avg_power)
+                        log(f"  no ref overlap — fallback: highest TotalPower window chosen")
+                    except Exception:
+                        chosen_window = max(windows, key=lambda w: w[1] - w[0])
+                        log(f"  fallback: longest window chosen")
+
+                w_start, w_end = chosen_window
                 target_ns = _random.randint(w_start, w_end)
                 dt_tgt = datetime.fromtimestamp(target_ns / 1e9, tz=timezone.utc)
                 if PRAGUE and not use_lab:
                     dt_tgt = dt_tgt.astimezone(PRAGUE)
-                log(f"  target: {dt_tgt.strftime('%H:%M:%S')}  (random inside first window)")
+                log(f"  target: {dt_tgt.strftime('%H:%M:%S')}  (SBW4/PTM1-guided window)")
 
                 if is_cancelled():
                     return None, None, _no_meta, "cancelled"
@@ -3862,7 +3966,9 @@ class ImageFinderWidget(QWidget):
             size_lup = {name: sz for ns, name, sz in items}
             def seg_avg(s): return sum(size_lup.get(nm, 0) for _, nm in s) / len(s)
             best_seg = max(segs, key=seg_avg)
-            return [folder / best_seg[-1][1]]
+            # Pick the single image with the largest file size in that segment
+            best_name = max(best_seg, key=lambda x: size_lup.get(x[1], 0))[1]
+            return [folder / best_name]
 
         total_full = len(full); alloc = []; remaining = how_many
         for i, seg in enumerate(segs):
@@ -3946,15 +4052,43 @@ class ImageFinderWidget(QWidget):
         if not jobs: return []
         files = []; t0 = time.perf_counter()
 
+        # Derive start_ns/end_ns from the UI-selected datetime (avoids UNC path parsing)
+        try:
+            dt_utc = self._build_datetime()  # naive UTC datetime
+            hour_start = datetime(dt_utc.year, dt_utc.month, dt_utc.day,
+                                  dt_utc.hour, 0, 0, tzinfo=timezone.utc)
+            hour_end   = datetime(dt_utc.year, dt_utc.month, dt_utc.day,
+                                  dt_utc.hour, 59, 59, 999999, tzinfo=timezone.utc)
+            query_start_ns = int(hour_start.timestamp() * 1e9)
+            query_end_ns   = int(hour_end.timestamp()   * 1e9)
+            self._log_safe(f"COLLECT: hour window {hour_start} – {hour_end} UTC")
+        except Exception as e:
+            self._log_safe(f"COLLECT: cannot build hour window — {e}, using blind scan")
+            query_start_ns = None
+            query_end_ns   = None
+
         def mk_debug_log(folder_name: str):
             return lambda s: self._log_safe(f"{folder_name}: {s}")
 
         def worker(folder: Path, qty: int):
+            log = mk_debug_log(folder.name)
+            cam_name = folder.name
+
+            # ── Try TotalPower-guided selection first ──────────────────────────
+            if query_start_ns is not None:
+                tp_channel = _cam_totalpower_channel(cam_name)
+                chosen = self._select_by_totalpower(
+                    folder, qty, tp_channel, log, query_start_ns, query_end_ns)
+                if chosen:
+                    return folder, qty, chosen
+
+            # ── Fallback: blind file-size selection ────────────────────────────
+            log("TotalPower unavailable — blind file-size fallback")
             chosen = self.select_images_from_folder(
                 folder, qty,
                 window=DEFAULT_WINDOW, tol_kb=DEFAULT_TOL_KB,
                 sample_step=DEFAULT_SAMPLE_STEP, sample_near=DEFAULT_SAMPLE_NEAR,
-                debug=True, debug_log=mk_debug_log(folder.name),
+                debug=True, debug_log=log,
             )
             return folder, qty, chosen
 
@@ -3971,6 +4105,140 @@ class ImageFinderWidget(QWidget):
                     self._log_safe(f"COLLECT worker ERROR: {type(e).__name__}: {e}")
         self._log_safe(f"COLLECT DONE: total files = {len(files)} | total_time={time.perf_counter()-t0:.3f}s")
         return files
+
+    def _select_by_totalpower(self, folder: Path, qty: int,
+                               tp_channel: "str | None", log,
+                               start_ns: int, end_ns: int) -> "list[Path]":
+        """
+        Use SBW4/PTM1/TotalPower to find the best laser-active period, then pick
+        the qty image files whose timestamps are closest to the best shot timestamp.
+
+        Strategy:
+          1. SBW4: find best shot timestamp (highest energy) in the hour
+          2. PTM1: same if SBW4 gives nothing
+          3. TotalPower: pick window with highest avg power, use its center
+          4. If nothing found, return [] so blind fallback takes over
+
+        We deliberately do NOT filter files by the energy window — instead we anchor
+        on the best shot timestamp and pick the nearest files.  This is robust against
+        the archiver writing images slightly before or after the actual shot time.
+        """
+        if not tp_channel:
+            return []
+
+        log(f"  hour window: {start_ns/1e9:.0f}–{end_ns/1e9:.0f} (UTC)")
+
+        # ── Step 1: SBW4 → PTM1: find best shot timestamp ────────────────────
+        best_shot_ns: "int | None" = None
+        for ref_ch in (CPVA_SBW4_CHANNEL, CPVA_SHOT_CHANNEL):
+            try:
+                t = _cpva_best_shot_ns(start_ns, end_ns, channel=ref_ch, timeout=4.0)
+                if t is not None:
+                    best_shot_ns = t
+                    log(f"  {ref_ch}: best shot at {t/1e9:.3f} UTC")
+                    break
+                log(f"  {ref_ch}: no shots in this hour")
+            except Exception as e:
+                log(f"  {ref_ch} error: {e}")
+
+        # ── Step 2: TotalPower fallback ───────────────────────────────────────
+        if best_shot_ns is None:
+            log("  SBW4/PTM1 empty — trying TotalPower")
+            try:
+                tp_windows = _cpva_active_windows_ns(tp_channel, start_ns, end_ns,
+                                                     timeout=4.0, debug_log=log)
+                if tp_windows:
+                    tp_samples = _cpva_fetch_samples(tp_channel, start_ns, end_ns, timeout=3.0)
+                    def _window_avg(w):
+                        ws, we = w
+                        vals = []
+                        for s in tp_samples:
+                            t = s.get("time")
+                            v = s.get("value")
+                            if t is None: continue
+                            if isinstance(v, list): v = v[0] if v else None
+                            try:
+                                if ws <= int(t) <= we:
+                                    vals.append(float(v))
+                            except (TypeError, ValueError):
+                                pass
+                        return sum(vals) / len(vals) if vals else 0.0
+                    best_win = max(tp_windows, key=_window_avg)
+                    best_shot_ns = (best_win[0] + best_win[1]) // 2
+                    log(f"  TotalPower: best window center at {best_shot_ns/1e9:.3f} UTC")
+            except Exception as e:
+                log(f"  TotalPower fallback error: {e}")
+
+        if best_shot_ns is None:
+            log("  no active period found — returning []")
+            return []
+
+        # ── Correct the hour folder based on best_shot_ns ────────────────────
+        # load_folders stores the first found hour for each camera (dedup by name),
+        # which may differ from the hour containing the actual best shot.
+        best_shot_dt_utc = datetime.fromtimestamp(best_shot_ns / 1e9, tz=timezone.utc)
+        correct_h = best_shot_dt_utc.hour
+        correct_folder = folder.parent.parent / str(correct_h) / folder.name
+        if correct_folder != folder:
+            if correct_folder.exists():
+                log(f"  correcting folder h{folder.parent.name} → h{correct_h}")
+                folder = correct_folder
+            else:
+                log(f"  correct_folder h{correct_h} does not exist — using original")
+
+        # ── Step 3: listdir → parse ns → sort → bisect to anchor ─────────────
+        # os.scandir on this SMB share returns only ~177 files (SMB page limit).
+        # os.listdir fetches all names in one syscall without pagination issues.
+        import bisect as _bisect
+        try:
+            raw_names = os.listdir(folder)
+        except Exception as e:
+            log(f"  listdir error: {e}")
+            return []
+
+        # Parse ns from every valid image filename
+        items_ns: list[tuple[int, str]] = []
+        for n in raw_names:
+            if not is_valid_image_file(n):
+                continue
+            ns = extract_ns_from_stem(Path(n).stem)
+            if ns is not None:
+                items_ns.append((ns, n))
+
+        if not items_ns:
+            log("  folder empty after filter")
+            return []
+
+        items_ns.sort()  # sort by ns ascending
+        ns_keys = [x[0] for x in items_ns]
+        log(f"  listdir: {len(items_ns)} files | anchor={best_shot_ns/1e9:.3f} UTC")
+
+        # Binary search: find insertion point for best_shot_ns
+        idx = _bisect.bisect_left(ns_keys, best_shot_ns)
+        idx = min(idx, len(items_ns) - 1)
+
+        # Grab candidates around idx — ±half entries by time proximity
+        half = max(qty * 4, 20)
+        lo = max(0, idx - half)
+        hi = min(len(items_ns), idx + half + 1)
+        candidates = items_ns[lo:hi]
+        candidates.sort(key=lambda x: abs(x[0] - best_shot_ns))
+
+        if qty == 1:
+            best_ns, best_name = candidates[0]
+            log(f"  chosen: {best_name} (Δ={(best_ns - best_shot_ns)/1e9:.1f}s)")
+            return [folder / best_name]
+
+        # Multiple: pick nearest-in-time candidates, then rank by file size
+        near = candidates[:max(qty * 4, 20)]
+        try:
+            near_sz = [(ns, name, (folder / name).stat().st_size) for ns, name in near]
+        except Exception:
+            near_sz = [(ns, name, 0) for ns, name in near]
+        near_sz.sort(key=lambda x: x[2], reverse=True)
+        chosen_names = [name for _, name, _ in near_sz[:qty]]
+        log(f"  chosen {len(chosen_names)} files by size near anchor")
+        return [folder / name for name in chosen_names]
 
     def _collect_primary_files_async(self, on_done):
         if self._collect_busy: return
@@ -5829,11 +6097,44 @@ class MultiDayPreviewWindow(QWidget):
         dst_path = Path(dst)
         finder = self.parent()
         saved = 0; errors = []
-        for cam_name, src, meta in items:
+
+        # Progress dialog
+        total = len(items)
+        prog = QDialog(self)
+        prog.setWindowTitle("Saving images…")
+        prog.setMinimumWidth(360)
+        prog.setWindowFlags(prog.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+        _pv = QVBoxLayout(prog)
+        _pv.setContentsMargins(16, 16, 16, 16)
+        _pv.setSpacing(8)
+        plbl = QLabel("Preparing…")
+        plbl.setWordWrap(True)
+        pbar = QProgressBar()
+        pbar.setRange(0, total)
+        pbar.setValue(0)
+        pbar.setTextVisible(True)
+        _pv.addWidget(plbl)
+        _pv.addWidget(pbar)
+        prog.show()
+        QApplication.processEvents()
+
+        for idx, (cam_name, src, meta) in enumerate(items):
+            clean_cam = extract_display_label(cam_name) if cam_name else ""
+            plbl.setText(f"[{idx + 1}/{total}]  {clean_cam}  —  {src.name}")
+            pbar.setValue(idx)
+            QApplication.processEvents()
             try:
+                # Clean filename: cam_timestamp (strip -_-IMG-_- noise, de-duplicate)
+                clean_stem, _err = build_new_name(src.stem, use_prague_time=bool(PRAGUE))
+                if not clean_stem:
+                    clean_stem = src.stem  # fallback: keep original if unparseable
+
+                # Per-camera subfolder
+                cam_dir = dst_path / clean_cam if clean_cam else dst_path
+                cam_dir.mkdir(parents=True, exist_ok=True)
+
                 if not annotate:
-                    # Save original file as-is, same filename
-                    shutil.copy2(str(src), str(dst_path / src.name))
+                    shutil.copy2(str(src), str(cam_dir / (clean_stem + src.suffix)))
                 else:
                     # ── Build annotation text ─────────────────────────────────
                     ns = extract_ns_from_stem(src.stem)
@@ -5871,7 +6172,6 @@ class MultiDayPreviewWindow(QWidget):
                     if arr is None:
                         errors.append(f"{src.name}: could not read image"); continue
                     rendered_img = self._apply_display_effects(arr, cam_name)
-                    # Bake overlay into the saved image using the _ThumbView's stored coords
                     key = next(
                         ((cn, d) for cn, entries in self._results.items()
                          for d, _, p, _, _ in entries
@@ -5881,13 +6181,16 @@ class MultiDayPreviewWindow(QWidget):
                     if tv is not None:
                         rendered_img = self._bake_overlay_to_pil(rendered_img, tv)
 
-                    # ── Destination filename: original stem + _annotated ───────
-                    dst_file = dst_path / (src.stem + "_annotated" + src.suffix)
+                    dst_file = cam_dir / (clean_stem + src.suffix)
                     _write_annotated_from_pil(rendered_img, dst_file, ann_text)
 
                 saved += 1
             except Exception as e:
                 errors.append(f"{src.name}: {e}")
+
+        pbar.setValue(total)
+        prog.close()
+
         msg = f"Saved {saved} image(s) to:\n{dst}"
         if errors:
             msg += "\n\nErrors:\n" + "\n".join(errors[:5])

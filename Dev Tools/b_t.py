@@ -647,8 +647,7 @@ class BuilderUI(ttk.Frame):
         by_name = {p.name: p for p in self.projects_sorted}
         for name, var in self.project_checks.items():
             if var.get() and name in by_name:
-                if self.project_groups.get(name, "Main project") != "Ignored project":
-                    out.append(by_name[name])
+                out.append(by_name[name])
         return out
 
     # ----------------- BUILD CORE -----------------

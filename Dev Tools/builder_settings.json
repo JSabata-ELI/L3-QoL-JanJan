@@ -1,3 +1,12 @@
 {
-  "root_folder": ""
+  "root_folder": "",
+  "project_groups": {
+    "Shift planner": "Ignored project",
+    "Calibrations": "Ignored project",
+    "Extractor": "Ignored project",
+    "Internal Builder": "Ignored project",
+    "Screenshots": "Side project",
+    "Announcer": "Side project",
+    "Time Converter": "Side project"
+  }
 }

@@ -124,6 +124,7 @@ class _LogSignals(QObject):
 | `_get_items_cached(folder, ...)` | Scandir bez stat + sampled stat; cache v `_namecache` |
 | `_pick_best_block_real_hour(day)` | Analyzuje ramping CSV, vrátí nejlepší hodinu; bez dat → hodina 14 |
 | `_get_ramping_for_day_cached(day)` | Načte ramping CSV s timeoutem 1 s (probe na síti); cachuje |
+| `_select_by_totalpower(folder, qty, ...)` | Najde best shot přes CPVA API; po nalezení `best_shot_ns` přepočítá správnou hodinovou složku (oprava: `load_folders` ukládá první nalezenou hodinu, ale best shot může být v jiné hodině) |
 
 **Energie — flow:**
 1. Uživatel vybere sloupce v `EnergyColumnDialog` (waveplate, ptm1, Back_Ref…)

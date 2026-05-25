@@ -2525,7 +2525,7 @@ class ShotFinderWidget(QWidget):
                 arr_f = img_max_val * arr_f / arr_px_max
             arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
 
-            cam_name = img_path.parent.name
+            cam_name = _re.sub(r"[-_]+IMG$", "", img_path.parent.name, flags=_re.IGNORECASE).rstrip("-_")
             label = f"{cam_name}  |  {img_path.name}"
             wk.receive_image(arr8, label)
         except Exception as e:

@@ -28,6 +28,13 @@ def _dist_root() -> Path:
     """programy/dist/ — kam jdou exe soubory."""
     return _src_root().parent / "dist"
 
+def _internal_builder_dist() -> Path:
+    """C:\Dev\dist\_internal_builder — lokální (mimo OneDrive), nebo fallback na programy/dist."""
+    local = Path(r"C:\Dev\dist") / "_internal_builder"
+    if local.exists():
+        return local
+    return _dist_root() / "Internal Builder"
+
 PROGRAMS_ROOT = _src_root()
 
 # ---------------- USER CONFIG (shared with b_t.py) ----------------
@@ -95,7 +102,7 @@ def write_version_to_txt(program_name: str, version: str):
     except Exception as e:
         print(f"Warning: could not write Versions.txt: {e}")
 
-INTERNAL_BUILDER_DIST = _dist_root() / "Internal Builder"
+INTERNAL_BUILDER_DIST = _internal_builder_dist()
 VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 README_PREFIX = "ReadMe_"
 README_NAME = "ReadMe.txt"
@@ -422,7 +429,6 @@ class DeployGUI(ttk.Frame):
         self.program_is_new: dict[Path, bool] = {}
         self.program_latest_version: dict[Path, str] = {}
         
-        self.internal_vars: dict[Path, tk.BooleanVar] = {}
         self.dest_path_labels: list[tuple[ttk.Label, str]] = []
         self._log_autoscroll = True
 
@@ -589,12 +595,9 @@ class DeployGUI(ttk.Frame):
         self.header.grid_columnconfigure(2, minsize=self.version_col_px)
         self.header.grid_columnconfigure(3, minsize=self.new_col_px)
         self.header.grid_columnconfigure(4, weight=1)
-        self.header.grid_columnconfigure(5, minsize=40)
-
         ttk.Label(self.header, text="Program").grid(row=0, column=1, sticky="w")
         ttk.Label(self.header, text="Version").grid(row=0, column=2, sticky="w")
         ttk.Label(self.header, text="Status").grid(row=0, column=3, sticky="w")
-        ttk.Label(self.header, text="Libraries").grid(row=0, column=5, sticky="w")
 
         self.programs_sf = ScrollableFrame(left)
         self.programs_sf.pack(fill="both", expand=True, padx=8, pady=(2, 8))
@@ -832,9 +835,6 @@ class DeployGUI(ttk.Frame):
                 ttk.Label(row, text="last deployed: (none)", foreground="gray").grid(
                     row=0, column=4, sticky="w"
                 )
-            var_internal = tk.BooleanVar(value=False)
-            self.internal_vars[p] = var_internal
-            ttk.Checkbutton(row, variable=var_internal).grid(row=0, column=5, sticky="w")
 
     def _select_all_programs(self):
         for var in self.program_vars.values():
@@ -1266,16 +1266,18 @@ class DeployGUI(ttk.Frame):
 
         def worker():
             import subprocess
-            cmd = [
-                sys.executable, "-m", "PyInstaller",
-                "--onedir", "--windowed",
-                "--name", "_internal_builder",
-                "--collect-all", "PIL",
-                "--collect-all", "matplotlib",
-                "--collect-all", "pyparsing",
-                "--noconfirm",
-                str(builder_script),
-            ]
+            spec_file = builder_script.parent / "_internal_builder.spec"
+            if spec_file.exists():
+                # Use .spec — contains all collect-all libraries
+                cmd = [
+                    sys.executable, "-m", "PyInstaller",
+                    "--noconfirm",
+                    "--distpath", r"C:\Dev\dist",
+                    str(spec_file),
+                ]
+            else:
+                # Fallback: run __main__ block in the script itself
+                cmd = [sys.executable, str(builder_script)]
             self.after(0, self._log, f"CMD: {' '.join(cmd)}\n")
             try:
                 proc = subprocess.Popen(
@@ -1303,19 +1305,30 @@ class DeployGUI(ttk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_deploy_internal(self):
-        selected = [p for p, v in self.internal_vars.items() if v.get()]
+        selected = [p for p, v in self.program_vars.items() if v.get()]
         if not selected:
             messagebox.showwarning("Nothing selected", "Check at least one _int checkbox.")
             return
 
-        # Najdi nejnovější verzi _internal_builder
+        # Najdi nejnovější verzi _internal_builder (dist\Internal Builder\vX.Y.Z\_internal)
         if not INTERNAL_BUILDER_DIST.exists():
             messagebox.showerror("Error", f"_internal_builder dist not found:\n{INTERNAL_BUILDER_DIST}")
             return
 
-        internal_src = INTERNAL_BUILDER_DIST / "_internal"
+        # Find latest version subfolder
+        _ver_folders = sorted(
+            [d for d in INTERNAL_BUILDER_DIST.iterdir() if d.is_dir() and VERSION_RE.match(d.name)],
+            key=lambda d: [int(x) for x in VERSION_RE.match(d.name).groups()],
+            reverse=True,
+        )
+        if _ver_folders:
+            _latest_ver_folder = _ver_folders[0]
+        else:
+            _latest_ver_folder = INTERNAL_BUILDER_DIST  # fallback: no versioned subfolders
+
+        internal_src = _latest_ver_folder / "_internal"
         if not internal_src.exists():
-            messagebox.showerror("Error", f"_internal folder not found in:\n{INTERNAL_BUILDER_DIST}")
+            messagebox.showerror("Error", f"_internal folder not found in:\n{_latest_ver_folder}")
             return
 
         scratch = _get_scratch_root()
@@ -1325,12 +1338,25 @@ class DeployGUI(ttk.Frame):
         zip_path = scratch / "_internal_builder.zip"
 
         self._clear_log()
-        self._log(f"Packing _internal from: {INTERNAL_BUILDER_DIST}\n")
+        self._log(f"Packing _internal from: {_latest_ver_folder}\n")
         self._set_busy(True)
+        self._progress_show(1)  # zobraz progress bar hned; maximum se upřesní ve workeru
 
         def worker():
             ok = 0
             fail = 0
+
+            # Hydrate OneDrive placeholders in one shot before reading any files.
+            # Without this, each file.read() triggers a separate cloud download.
+            try:
+                import subprocess as _sp
+                _sp.run(
+                    ["attrib", "-U", "/s", "/d", str(internal_src)],
+                    capture_output=True, timeout=120
+                )
+                self.after(0, self._log, "OneDrive: hydration requested for _internal")
+            except Exception as _he:
+                self.after(0, self._log, f"OneDrive hydration skipped: {_he}")
 
             # Spočítej soubory předem
             all_files = [f for f in internal_src.rglob("*") if f.is_file()]
@@ -1338,12 +1364,15 @@ class DeployGUI(ttk.Frame):
             self.after(0, self._log, f"Files found in _internal: {n_files}")
             total_steps = n_files + n_files * len(selected)
             done_steps = 0
-            self.after(0, lambda: self._progress_show(total_steps))
+            self.after(0, lambda: self._prog_bar.configure(maximum=max(1, total_steps)))
 
-            # Zabal _internal do ZIP
+            # Zabal _internal do ZIP — temp soubor v %TEMP%
             try:
                 import zipfile as _zf
-                tmp_zip = zip_path.with_suffix(".tmp.zip")
+                import tempfile as _tmpmod
+                _tmp_fd, _tmp_str = _tmpmod.mkstemp(suffix=".zip", prefix="_internal_builder_")
+                tmp_zip = Path(_tmp_str)
+                os.close(_tmp_fd)
                 self.after(0, self._log, f"Creating ZIP: {zip_path.name}")
                 with _zf.ZipFile(tmp_zip, "w", compression=_zf.ZIP_DEFLATED) as zf:
                     for f in all_files:
@@ -1351,7 +1380,8 @@ class DeployGUI(ttk.Frame):
                         zf.write(f, arcname)
                         done_steps += 1
                         self.after(0, lambda d=done_steps, t=total_steps: self._progress_update(d, t, "ZIP"))
-                tmp_zip.replace(zip_path)
+                shutil.copy2(str(tmp_zip), str(zip_path))
+                tmp_zip.unlink(missing_ok=True)
                 import zipfile as _zf2
                 with _zf2.ZipFile(zip_path, "r") as _zcheck:
                     _zcount = sum(1 for m in _zcheck.infolist() if not m.filename.endswith("/"))
@@ -1376,9 +1406,7 @@ class DeployGUI(ttk.Frame):
                 self.after(0, self._log, f"[{program_dir.name}] → {dst_dir}")
                 try:
                     old_internal = dst_dir / "_internal"
-                    if old_internal.exists():
-                        shutil.rmtree(old_internal)
-                        self.after(0, self._log, f"[{program_dir.name}] Removed old _internal")
+                    old_internal.mkdir(parents=True, exist_ok=True)
 
                     with zipfile.ZipFile(zip_path, "r") as zf:
                         members = [m for m in zf.infolist() if not m.filename.endswith("/")]
@@ -1389,19 +1417,44 @@ class DeployGUI(ttk.Frame):
                                 prefix = m.filename[:idx + len("_internal/")]
                                 break
 
-                        extracted = 0
+                        # Build set of relative paths that should exist after deploy
+                        expected_rel = set()
+                        members_to_write = []
                         for member in members:
                             if not member.filename.startswith(prefix):
                                 continue
-                            member.filename = member.filename[len(prefix):]
-                            if not member.filename:
+                            rel = member.filename[len(prefix):]
+                            if not rel:
                                 continue
+                            expected_rel.add(rel)
+                            dst_file = old_internal / rel.replace("/", os.sep)
+                            # Skip if file exists and size matches (avoid OneDrive sync storm)
+                            if dst_file.exists() and dst_file.stat().st_size == member.file_size:
+                                done_steps += 1
+                                self.after(0, lambda d=done_steps, t=total_steps, n=program_dir.name: self._progress_update(d, t, n))
+                                continue
+                            members_to_write.append((member, rel))
+
+                        # Remove files that no longer exist in the new _internal
+                        removed = 0
+                        for existing in old_internal.rglob("*"):
+                            if existing.is_file():
+                                rel = existing.relative_to(old_internal).as_posix()
+                                if rel not in expected_rel:
+                                    existing.unlink(missing_ok=True)
+                                    removed += 1
+
+                        extracted = 0
+                        for member, rel in members_to_write:
+                            member.filename = rel
                             zf.extract(member, old_internal)
                             extracted += 1
                             done_steps += 1
                             self.after(0, lambda d=done_steps, t=total_steps, n=program_dir.name: self._progress_update(d, t, n))
 
-                    self.after(0, self._log, f"[{program_dir.name}] OK — {extracted} files")
+                    skipped = len(expected_rel) - extracted
+                    self.after(0, self._log,
+                        f"[{program_dir.name}] OK — {extracted} updated, {skipped} unchanged, {removed} removed")
                     ok += 1
                 except Exception as e:
                     self.after(0, self._log, f"[{program_dir.name}] ERROR: {e}")

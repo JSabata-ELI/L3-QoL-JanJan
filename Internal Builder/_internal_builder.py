@@ -99,9 +99,11 @@ from matplotlib.collections import LineCollection
 from matplotlib.ticker import FuncFormatter
 from matplotlib.widgets import RectangleSelector
 
-# ── numpy / pandas ────────────────────────────────────────────────────────────
+# ── numpy / pandas / scipy ───────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
+import scipy
+import scipy.ndimage
 
 # ── Pillow ────────────────────────────────────────────────────────────────────
 from PIL import Image, ImageTk, ImageDraw, ImageFont, ImageGrab
@@ -152,6 +154,7 @@ if __name__ == "__main__":
         "--collect-all", "packaging",
         "--collect-all", "python-dateutil",
         "--collect-all", "screeninfo",
+        "--collect-all", "scipy",
         "--distpath", r"C:\Dev\dist",
         "--noconfirm",
         str(script),

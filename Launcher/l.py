@@ -294,56 +294,65 @@ def _build_version_list(current_exes: list[Path], program_dir: Path) -> list[dic
 
     return result
 
-def scan_programs(root: Path) -> dict[str, dict]:
-    if not root.exists():
-        raise FileNotFoundError(f"Software root not found: {root}")
+def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None":
+    """Scan a single program directory. Returns (name, info) or None."""
+    program_name = program_dir.name
+    readme = find_readme_or_none(program_dir, program_name)
 
-    programs = {}
-    for program_dir in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-        if not program_dir.is_dir():
-            continue
-        if program_dir.name.lower() in IGNORE_DIR_NAMES:
-            continue
-
-        program_name = program_dir.name
-        readme = find_readme_or_none(program_dir, program_name)
-
-        # A) scratch layout: exe přímo ve složce programu
-        exes_root = list(program_dir.glob("*.exe"))
-        if exes_root:
-            exes_root.sort(key=_exe_version, reverse=True)
-            exe = exes_root[0]
-            clean_exes = [p for p in exes_root if not TIMESTAMPED_EXE_RE.match(p.name)]
-            programs[program_name] = {
-                "exe_path": exe,
-                "readme_path": readme,
-                "label": program_name,
-                "program_dir": program_dir,
-                "icon_path": find_icon_for_program(program_dir, exe),
-                "archive_versions": _build_version_list(clean_exes, program_dir),
-            }
-            continue
-
-        # B) programy layout: ROOT\dist\<Program>\vX.Y.Z\*.exe
-        dist_dir = root / "dist" / program_name
-        vf = newest_version_folder(dist_dir)
-        if not vf:
-            continue
-        exes_v = list(vf.glob("*.exe"))
-        if not exes_v:
-            # --onedir layout: exe je ve podsložce
-            exes_v = list(vf.rglob("*.exe"))
-        if not exes_v:
-            continue
-        exe = pick_exe(exes_v, program_name, vf.name)
-        programs[program_name] = {
+    # A) scratch layout: exe přímo ve složce programu
+    exes_root = list(program_dir.glob("*.exe"))
+    if exes_root:
+        exes_root.sort(key=_exe_version, reverse=True)
+        exe = exes_root[0]
+        clean_exes = [p for p in exes_root if not TIMESTAMPED_EXE_RE.match(p.name)]
+        return (program_name, {
             "exe_path": exe,
             "readme_path": readme,
             "label": program_name,
             "program_dir": program_dir,
             "icon_path": find_icon_for_program(program_dir, exe),
-            "archive_versions": _build_version_list([], program_dir),
-        }
+            "archive_versions": _build_version_list(clean_exes, program_dir),
+        })
+
+    # B) programy layout: ROOT\dist\<Program>\vX.Y.Z\*.exe
+    dist_dir = root / "dist" / program_name
+    vf = newest_version_folder(dist_dir)
+    if not vf:
+        return None
+    exes_v = list(vf.glob("*.exe"))
+    if not exes_v:
+        exes_v = list(vf.rglob("*.exe"))
+    if not exes_v:
+        return None
+    exe = pick_exe(exes_v, program_name, vf.name)
+    return (program_name, {
+        "exe_path": exe,
+        "readme_path": readme,
+        "label": program_name,
+        "program_dir": program_dir,
+        "icon_path": find_icon_for_program(program_dir, exe),
+        "archive_versions": _build_version_list([], program_dir),
+    })
+
+
+def scan_programs(root: Path) -> dict[str, dict]:
+    if not root.exists():
+        raise FileNotFoundError(f"Software root not found: {root}")
+
+    dirs = [
+        p for p in root.iterdir()
+        if p.is_dir() and p.name.lower() not in IGNORE_DIR_NAMES
+    ]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    programs = {}
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futures = {ex.submit(_scan_one_program, d, root): d for d in dirs}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                name, info = result
+                programs[name] = info
 
     return programs
 
@@ -358,6 +367,45 @@ def clamp_label(text: str, max_len: int = 22) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+def _launch_no_zone_check(path: Path) -> bool:
+    """Launch exe via ShellExecuteEx with SEE_MASK_NOZONECHECKS — suppresses security dialog for network paths."""
+    import ctypes
+    import ctypes.wintypes
+
+    SEE_MASK_NOZONECHECKS = 0x00800000
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize",       ctypes.wintypes.DWORD),
+            ("fMask",        ctypes.wintypes.ULONG),
+            ("hwnd",         ctypes.wintypes.HWND),
+            ("lpVerb",       ctypes.wintypes.LPCWSTR),
+            ("lpFile",       ctypes.wintypes.LPCWSTR),
+            ("lpParameters", ctypes.wintypes.LPCWSTR),
+            ("lpDirectory",  ctypes.wintypes.LPCWSTR),
+            ("nShow",        ctypes.c_int),
+            ("hInstApp",     ctypes.wintypes.HINSTANCE),
+            ("lpIDList",     ctypes.c_void_p),
+            ("lpClass",      ctypes.wintypes.LPCWSTR),
+            ("hkeyClass",    ctypes.wintypes.HKEY),
+            ("dwHotKey",     ctypes.wintypes.DWORD),
+            ("hIconOrMonitor", ctypes.wintypes.HANDLE),
+            ("hProcess",     ctypes.wintypes.HANDLE),
+        ]
+
+    sei = SHELLEXECUTEINFOW()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_NOZONECHECKS | SEE_MASK_NOCLOSEPROCESS
+    sei.hwnd = None
+    sei.lpVerb = "open"
+    sei.lpFile = str(path)
+    sei.lpParameters = None
+    sei.lpDirectory = str(path.parent)
+    sei.nShow = 1  # SW_SHOWNORMAL
+
+    return bool(ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)))
 
 
 # ---------------- UI HELPERS ----------------
@@ -575,6 +623,8 @@ class Launcher(tk.Tk):
         # Acknowledged versions: {program_name: version_str} — persisted in config
         # Once a user launches or clicks ✓, the version is acknowledged and highlight clears.
         self._acknowledged: dict[str, str] = self._config.get("acknowledged_versions", {})
+        # Custom group overrides: {program_name: gkey} — persisted in config
+        self._custom_groups: dict[str, str] = self._config.get("custom_groups", {})
 
         # no default selection
         self.root_choice = tk.IntVar(value=-1)  # bude obsahovat label z ROOT_OPTIONS
@@ -722,11 +772,28 @@ class Launcher(tk.Tk):
             "personal": [],
         }
         for name, info in items:
-            g = group_for_program(name)
+            g = self._custom_groups.get(name) or group_for_program(name)
             grouped[g].append((name, info))
 
-        # layout: each group is its own LabelFrame, inside is a grid
-        cols = self._calc_group_cols()
+        # Pre-load all icons into cache before building any widgets.
+        # This avoids the need to build hidden widgets just to initialise PhotoImage.
+        for _, _info in items:
+            _ip = _info.get("icon_path")
+            if _ip and str(_ip) not in self._icon_cache:
+                _key = str(_ip)
+                try:
+                    from PIL import Image, ImageTk
+                    _pil = Image.open(_key)
+                    if getattr(_pil, "format", "") == "ICO":
+                        _sizes = _pil.info.get("sizes", [])
+                        if _sizes:
+                            _cands = [s for s in _sizes if s[0] <= 32]
+                            _target = max(_cands) if _cands else min(_sizes, key=lambda s: s[0])
+                            _pil = Image.open(_key).resize(_target, Image.LANCZOS)
+                    _pil = _pil.convert("RGBA").resize((24, 24), Image.LANCZOS)
+                    self._icon_cache[_key] = ImageTk.PhotoImage(_pil)
+                except Exception:
+                    self._icon_cache[_key] = None
 
         # Persistent collapse state: gkey → bool (True = expanded)
         if not hasattr(self, "_group_expanded"):
@@ -735,6 +802,9 @@ class Launcher(tk.Tk):
         # Store toggle button refs so _toggle_group can update arrows without rebuild
         self._group_toggle_btns: dict[str, ttk.Button] = {}
         self._group_frames: dict[str, ttk.Frame] = {}
+        self._group_grids: dict[str, ttk.Frame] = {}    # inner grid widget per group
+        self._group_headers: dict[str, ttk.Frame] = {}  # header widget per group, for pack(after=)
+        self._group_items: dict[str, list] = {}         # items per group for lazy build
 
         any_group_shown = False
         for title, gkey in GROUP_ORDER:
@@ -753,11 +823,14 @@ class Launcher(tk.Tk):
 
             header = ttk.Frame(self.sf.inner)
             header.pack(fill="x", padx=6, pady=(6, 0))
+            self._group_headers[gkey] = header
 
             grid_frame = ttk.Frame(self.sf.inner)
             grid = ttk.Frame(grid_frame)
             grid.pack(fill="x", padx=8, pady=6)
             self._group_frames[gkey] = grid_frame
+            self._group_grids[gkey] = grid
+            self._group_items[gkey] = group_items
 
             toggle_btn = ttk.Button(
                 header,
@@ -768,127 +841,110 @@ class Launcher(tk.Tk):
             toggle_btn.pack(side="left")
             self._group_toggle_btns[gkey] = toggle_btn
 
-            # Always pack first so Tk initialises all child widgets (icons need live tree).
-            # Then immediately hide if collapsed.
-            grid_frame.pack(fill="x", padx=6, pady=(2, 0))
-            if not expanded:
-                grid_frame.pack_forget()
-
-            for i, (name, info) in enumerate(group_items):
-                r = i // cols
-                c = i % cols
-
-                cell = ttk.Frame(grid)
-                cell.grid(row=r, column=c, padx=6, pady=6, sticky="w")
-                cell.grid_columnconfigure(0, weight=0)
-                cell.grid_columnconfigure(1, weight=0)
-
-                img = None
-                ip = info.get("icon_path")
-                if ip:
-                    key = str(ip)
-                    if key not in self._icon_cache:
-                        try:
-                            from PIL import Image, ImageTk
-                            pil_img = Image.open(key)
-                            # For ICO, PIL loads smallest frame by default.
-                            # Re-open at best size ≤ 32px for a clean result.
-                            if getattr(pil_img, "format", "") == "ICO":
-                                sizes = pil_img.info.get("sizes", [])
-                                if sizes:
-                                    candidates = [s for s in sizes if s[0] <= 32]
-                                    target = max(candidates) if candidates else min(sizes, key=lambda s: s[0])
-                                    pil_img = Image.open(key)
-                                    pil_img = pil_img.resize(target, Image.LANCZOS)
-                            pil_img = pil_img.convert("RGBA").resize((24, 24), Image.LANCZOS)
-                            self._icon_cache[key] = ImageTk.PhotoImage(pil_img)
-                        except Exception as _icon_exc:
-                            print(f"Icon load failed ({key}): {_icon_exc}")
-                            self._icon_cache[key] = None
-                    img = self._icon_cache.get(key)
-
-                btn_style = "Update.Prog.TButton" if name in self._update_available else "Prog.TButton"
-                btn_text = ui_label(info["label"]) + (" ↑" if name in self._update_available else "")
-                btn = ttk.Button(
-                    cell,
-                    text=btn_text,
-                    image=img,
-                    compound="left",
-                    style=btn_style,
-                    width=18,
-                    command=lambda n=name: self.launch(n),
-                )
-                btn.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 6))
-
-                # --- sub_grid: 2×2 vpravo od hlavního tlačítka ---
-                sub = ttk.Frame(cell)
-                sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
-                sub.grid_columnconfigure(0, weight=1)
-                sub.grid_columnconfigure(1, weight=1)
-                sub.grid_rowconfigure(0, weight=0)
-                sub.grid_rowconfigure(1, weight=0)
-
-                # row 0: ReadMe spanning both cols; if update pending, shrink to col 0 and put ✓ in col 1
-                if info.get("readme_path"):
-                    readme_colspan = 1 if name in self._update_available else 2
-                    info_btn = ttk.Button(
-                        sub,
-                        text="ReadMe",
-                        style="Info.TButton",
-                        command=lambda n=name: self.open_readme(n),
-                    )
-                    info_btn.grid(row=0, column=0, columnspan=readme_colspan, sticky="ew", pady=(0, 2))
-                else:
-                    ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
-                if name in self._update_available:
-                    ack_btn = ttk.Button(
-                        sub,
-                        text="✓",
-                        style="Info.TButton",
-                        width=3,
-                        command=lambda n=name: self._acknowledge_update(n),
-                    )
-                    ack_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
-                    ack_btn.configure(cursor="hand2")
-                    # tooltip-like
-                    ack_btn.bind("<Enter>", lambda e, b=ack_btn: b.configure(text="✓ ack"))
-                    ack_btn.bind("<Leave>", lambda e, b=ack_btn: b.configure(text="✓"))
-
-                # row 1 vlevo: 📂 složka
-                folder_btn = ttk.Button(
-                    sub,
-                    text="📂",
-                    style="Info.TButton",
-                    width=3,
-                    command=lambda n=name: self.open_folder(n),
-                )
-                folder_btn.grid(row=1, column=0, sticky="ew", padx=(0, 2))
-
-                # row 1 vpravo: ▾ verze (jen pokud existují)
-                versions = info.get("archive_versions", [])
-                if versions:
-                    mb = ttk.Menubutton(
-                        sub,
-                        text="  🔽  ",
-                        style="Info.TButton",
-                        width=4,
-                    )
-                    menu = tk.Menu(mb, tearoff=0)
-                    for v in versions:
-                        menu.add_command(
-                            label=v["label"],
-                            command=lambda p=v["exe_path"], d=info["program_dir"], py=v.get("py_path"): self._launch_exe(p, d, py),
-                        )
-                    mb["menu"] = menu
-                    mb.grid(row=1, column=1, sticky="ew")
-                else:
-                    ttk.Frame(sub, width=1).grid(row=1, column=1)
-
-            for c in range(cols):
-                grid.grid_columnconfigure(c, weight=0, uniform="grpcols")
+            if expanded:
+                grid_frame.pack(fill="x", padx=6, pady=(2, 0))
+                self._build_group_content(gkey)
 
         if not any_group_shown:
             ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
+
+    def _build_group_content(self, gkey: str):
+        grid = self._group_grids.get(gkey)
+        group_items = self._group_items.get(gkey, [])
+        if grid is None or not group_items:
+            return
+        cols = self._calc_group_cols()
+        for i, (name, info) in enumerate(group_items):
+            r = i // cols
+            c = i % cols
+
+            cell = ttk.Frame(grid)
+            cell.grid(row=r, column=c, padx=6, pady=6, sticky="w")
+            cell.grid_columnconfigure(0, weight=0)
+            cell.grid_columnconfigure(1, weight=0)
+
+            img = None
+            ip = info.get("icon_path")
+            if ip:
+                key = str(ip)
+                if key not in self._icon_cache:
+                    try:
+                        from PIL import Image, ImageTk
+                        pil_img = Image.open(key)
+                        if getattr(pil_img, "format", "") == "ICO":
+                            sizes = pil_img.info.get("sizes", [])
+                            if sizes:
+                                candidates = [s for s in sizes if s[0] <= 32]
+                                target = max(candidates) if candidates else min(sizes, key=lambda s: s[0])
+                                pil_img = Image.open(key).resize(target, Image.LANCZOS)
+                        pil_img = pil_img.convert("RGBA").resize((24, 24), Image.LANCZOS)
+                        self._icon_cache[key] = ImageTk.PhotoImage(pil_img)
+                    except Exception:
+                        self._icon_cache[key] = None
+                img = self._icon_cache.get(key)
+
+            btn_style = "Update.Prog.TButton" if name in self._update_available else "Prog.TButton"
+            btn_text = ui_label(info["label"]) + (" ↑" if name in self._update_available else "")
+            btn = ttk.Button(
+                cell,
+                text=btn_text,
+                image=img,
+                compound="left",
+                style=btn_style,
+                width=18,
+                command=lambda n=name: self.launch(n),
+            )
+            btn.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 6))
+            btn.bind("<Button-3>", lambda e, n=name: self._show_group_menu(e, n))
+
+            sub = ttk.Frame(cell)
+            sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
+            sub.grid_columnconfigure(0, weight=1)
+            sub.grid_columnconfigure(1, weight=1)
+            sub.grid_rowconfigure(0, weight=0)
+            sub.grid_rowconfigure(1, weight=0)
+
+            if info.get("readme_path"):
+                readme_colspan = 1 if name in self._update_available else 2
+                info_btn = ttk.Button(
+                    sub, text="ReadMe", style="Info.TButton",
+                    command=lambda n=name: self.open_readme(n),
+                )
+                info_btn.grid(row=0, column=0, columnspan=readme_colspan, sticky="ew", pady=(0, 2))
+            else:
+                ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
+            if name in self._update_available:
+                ack_btn = ttk.Button(
+                    sub, text="✓", style="Info.TButton", width=3,
+                    command=lambda n=name: self._acknowledge_update(n),
+                )
+                ack_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
+                ack_btn.configure(cursor="hand2")
+                ack_btn.bind("<Enter>", lambda _e, b=ack_btn: b.configure(text="✓ ack"))
+                ack_btn.bind("<Leave>", lambda _e, b=ack_btn: b.configure(text="✓"))
+
+            folder_btn = ttk.Button(
+                sub, text="📂", style="Info.TButton", width=3,
+                command=lambda n=name: self.open_folder(n),
+            )
+            folder_btn.grid(row=1, column=0, sticky="ew", padx=(0, 2))
+
+            versions = info.get("archive_versions", [])
+            if versions:
+                mb = ttk.Menubutton(sub, text="  🔽  ", style="Info.TButton", width=4)
+                menu = tk.Menu(mb, tearoff=0)
+                for v in versions:
+                    menu.add_command(
+                        label=v["label"],
+                        command=lambda p=v["exe_path"], d=info["program_dir"], py=v.get("py_path"): self._launch_exe(p, d, py),
+                    )
+                mb["menu"] = menu
+                mb.grid(row=1, column=1, sticky="ew")
+            else:
+                ttk.Frame(sub, width=1).grid(row=1, column=1)
+
+        for c in range(cols):
+            grid.grid_columnconfigure(c, weight=0, uniform="grpcols")
 
     def _toggle_group(self, gkey: str):
         expanded = not self._group_expanded.get(gkey, False)
@@ -897,13 +953,54 @@ class Launcher(tk.Tk):
         btn = self._group_toggle_btns.get(gkey)
         if frame:
             if expanded:
-                frame.pack(fill="x", padx=6, pady=(2, 0))
+                # Lazy build: populate grid if it has no children yet
+                grid = self._group_grids.get(gkey)
+                if grid and not grid.winfo_children():
+                    self._build_group_content(gkey)
+                header = self._group_headers.get(gkey)
+                if header:
+                    frame.pack(fill="x", padx=6, pady=(2, 0), after=header)
+                else:
+                    frame.pack(fill="x", padx=6, pady=(2, 0))
             else:
                 frame.pack_forget()
         if btn:
             current = btn.cget("text")
             arrow = "▼" if expanded else "▶"
             btn.configure(text=arrow + current[1:])
+
+    def _show_group_menu(self, event, program_name: str):
+        current_gkey = self._custom_groups.get(
+            program_name, group_for_program(program_name))
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Move to group:",
+            state="disabled",
+            font=("Segoe UI", 9, "bold"),
+        )
+        menu.add_separator()
+        for title, gkey in GROUP_ORDER:
+            label = f"✓  {title}" if gkey == current_gkey else f"     {title}"
+            menu.add_command(
+                label=label,
+                command=lambda k=gkey: self._move_to_group(program_name, k),
+            )
+        if program_name in self._custom_groups:
+            menu.add_separator()
+            menu.add_command(
+                label="↺  Reset to default",
+                command=lambda: self._move_to_group(program_name, None),
+            )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _move_to_group(self, program_name: str, gkey: str | None):
+        if gkey is None:
+            self._custom_groups.pop(program_name, None)
+        else:
+            self._custom_groups[program_name] = gkey
+        self._config["custom_groups"] = self._custom_groups
+        _save_config(self._config)
+        self._rebuild_buttons()
 
     def _rebuild_radiobuttons(self):
         for i, (label, path, configurable) in enumerate(self._root_options):
@@ -1008,7 +1105,8 @@ class Launcher(tk.Tk):
 
         def worker():
             try:
-                os.startfile(str(exe_path))
+                if not _launch_no_zone_check(exe_path):
+                    os.startfile(str(exe_path))  # fallback
                 self.after(0, self.status.configure, {"text": f"Started: {program_name}"})
                 self.after(0, self._acknowledge_update, program_name)
             except Exception as e:

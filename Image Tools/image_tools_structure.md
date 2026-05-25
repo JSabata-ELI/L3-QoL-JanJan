@@ -164,8 +164,9 @@ Main widget for the Image Finder tab.
 | L2097 | `_cleanup_view_temp` | cleanup temp view folder |
 | L2109 | `_apply_gradient_to_image` | apply color gradient to PIL image |
 | L2121 | `_make_view_copy_with_readable_name` | copy image with readable timestamp name |
-| L2146 | `_collect_primary_files_now` | synchronous file collection |
+| L2146 | `_collect_primary_files_now` | synchronous file collection; passes `folder` from `_row_to_path` to `_select_by_totalpower` |
 | L2177 | `_collect_primary_files_async` | async file collection |
+| L4109 | `_select_by_totalpower` | finds best shot via CPVA TotalPower/SBW4/PTM1 API; after resolving `best_shot_ns`, corrects `folder` to the proper UTC hour (fixes mismatch where `_row_to_path` stores the first-found hour which may differ from the best-shot hour) |
 | L2211 | `view_primary_files` | collect + display images |
 | L2297 | `_run_energy_lookup_async` | async energy lookup for files |
 | L2323 | `save_primary_files_as` | save images to user folder |
