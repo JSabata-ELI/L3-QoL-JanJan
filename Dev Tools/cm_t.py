@@ -18,25 +18,6 @@ import os
 # _app_dir() vrátí L3-QoL-JanJan/Dev Tools/  (frozen i source)
 # Zdrojáky ikon:  L3-QoL-JanJan/           = _app_dir().parent
 # Dist / exe:     programy/dist/            = _app_dir().parent.parent / "dist"
-def _src_root() -> Path:
-    """Kořen git repozitáře s py zdrojáky (L3-QoL-JanJan/)."""
-    if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
-        return Path(sys.executable).resolve().parent.parent
-    return Path(__file__).resolve().parent.parent
-
-def _dist_root() -> Path:
-    """programy/dist/ — kam jdou exe soubory."""
-    return _src_root().parent / "dist"
-
-def _internal_builder_dist() -> Path:
-    """C:\Dev\dist\_internal_builder — lokální (mimo OneDrive), nebo fallback na programy/dist."""
-    local = Path(r"C:\Dev\dist") / "_internal_builder"
-    if local.exists():
-        return local
-    return _dist_root() / "Internal Builder"
-
-PROGRAMS_ROOT = _src_root()
-
 # ---------------- USER CONFIG (shared with b_t.py) ----------------
 _CONFIG_PATH = Path(os.environ.get("APPDATA", "~")) / "DevTools" / "config.json"
 
@@ -65,6 +46,50 @@ def _get_destination_roots() -> list[tuple[str, Path]]:
     if sharepoint:
         roots.append(("Sharepoint", Path(sharepoint)))
     return roots
+
+def _src_root() -> Path:
+    """Kořen git repozitáře s py zdrojáky (L3-QoL-JanJan/)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "executable"):
+        cfg = _load_devtools_config()
+        src = cfg.get("src_root")
+        if src:
+            return Path(src)
+    return Path(__file__).resolve().parent.parent
+
+def _dist_root() -> Path:
+    """Sibling of programs root: programy/dist/"""
+    return _programs_root().parent / "dist"
+
+def _internal_builder_dist() -> Path:
+    r"""C:\Dev\dist\_internal_builder — lokální (mimo OneDrive), nebo fallback na programy/dist."""
+    local = Path(r"C:\Dev\dist") / "_internal_builder"
+    if local.exists():
+        return local
+    return _dist_root() / "Internal Builder"
+
+def _programs_root() -> Path:
+    """Root folder containing all program source subfolders.
+    Priority: 1) %APPDATA%\\DevTools\\config.json  2) builder_settings.json  3) source fallback.
+    """
+    # 1. Per-user config (set via Set paths or synced from Builder)
+    cfg = _load_devtools_config()
+    root = cfg.get("root_folder")
+    if root and Path(root).exists():
+        return Path(root)
+    # 2. builder_settings.json next to exe / source file
+    try:
+        _exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+        settings_path = _exe_dir / "builder_settings.json"
+        if settings_path.exists():
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            root = data.get("root_folder")
+            if root and Path(root).exists():
+                return Path(root)
+    except Exception:
+        pass
+    # 3. Fallback: L3-QoL-JanJan/ (parent of Dev Tools/)
+    return Path(__file__).resolve().parent.parent
+
 
 def _get_scratch_root() -> Path | None:
     cfg = _load_devtools_config()
@@ -104,6 +129,7 @@ def write_version_to_txt(program_name: str, version: str):
 
 INTERNAL_BUILDER_DIST = _internal_builder_dist()
 VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
+_VERSION_LOOSE_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
 README_PREFIX = "ReadMe_"
 README_NAME = "ReadMe.txt"
 
@@ -176,8 +202,8 @@ def _try_move(src: Path, dst: Path) -> tuple[bool, str | None]:
     return True, None
 
 # ---------------- LOGIC ----------------
-def parse_version(folder_name: str):
-    m = VERSION_RE.fullmatch(folder_name)
+def parse_version(s: str):
+    m = _VERSION_LOOSE_RE.fullmatch((s or "").strip())
     return tuple(map(int, m.groups())) if m else None
 
 
@@ -314,7 +340,7 @@ def show_icon_compare_dialog(parent, program_name: str, existing: Path, incoming
 
 def move_existing_exes_to_archive(target_dir: Path, keep_name: str, logs: list[str], program_name: str):
     """
-    Move ALL *.exe except keep_name into archive.
+    Move ALL *.exe except keep_name into archive/vX.Y.Z/ subfolder.
     If an exe is locked (WinError 32) -> SKIP and continue (archiving can happen later).
     """
     archive_dir = target_dir / "archive"
@@ -327,11 +353,20 @@ def move_existing_exes_to_archive(target_dir: Path, keep_name: str, logs: list[s
             continue
 
         src = exe
-        dst_base = archive_dir / f"{src.stem}__{timestamp}{src.suffix}"
-        dst = unique_path(dst_base)
+        _vm = VERSION_RE.search(src.stem)
+        old_ver_label = _vm.group(0) if _vm else "unknown"
+        ver_archive_dir = archive_dir / old_ver_label
+        ver_archive_dir.mkdir(parents=True, exist_ok=True)
+        dst = unique_path(ver_archive_dir / src.name)
 
         moved, why = _try_move(src, dst)
         if moved:
+            _arch_log = ver_archive_dir / "archive_log.txt"
+            try:
+                with _arch_log.open("a", encoding="utf-8") as _f:
+                    _f.write(f"{timestamp} | {src.name}\n")
+            except Exception:
+                pass
             logs.append(f"[{program_name}] Archived -> {dst}")
         else:
             logs.append(f"[{program_name}] SKIP archive (locked) -> {src}")
@@ -528,8 +563,9 @@ class DeployGUI(ttk.Frame):
                   padding=(12, 10)).pack()
 
         fields = [
-            ("scratch",    "Scratch (Software) folder",  "e.g. Z:\\Software"),
-            ("sharepoint", "Sharepoint (QoL) folder",    "e.g. C:\\...\\L3-HAPLS\\General\\QoL"),
+            ("root_folder", "Root folder",               "e.g. C:\\...\\Jan_a_Jan"),
+            ("scratch",     "Scratch (Software) folder", "e.g. Z:\\Software"),
+            ("sharepoint",  "Sharepoint (QoL) folder",   "e.g. C:\\...\\L3-HAPLS\\General\\QoL"),
         ]
 
         vars_ = {}
@@ -558,10 +594,33 @@ class DeployGUI(ttk.Frame):
                     cfg.pop(key, None)
             _save_devtools_config(cfg)
             win.destroy()
+            self.programs_root_lbl.configure(text=str(_programs_root()))
             self._build_dest_rows()
+            self._load_programs()
             messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
 
         ttk.Button(win, text="Save", command=on_save, padding=(16, 6)).pack(pady=(8, 12))
+
+    def _change_root(self):
+        cur = str(_programs_root())
+        chosen = filedialog.askdirectory(title="Select root folder", initialdir=cur)
+        if not chosen:
+            return
+        new_root = Path(chosen)
+        if not new_root.exists():
+            messagebox.showerror("Invalid folder", f"Folder does not exist:\n{new_root}")
+            return
+        cfg = _load_devtools_config()
+        cfg["root_folder"] = str(new_root)
+        _save_devtools_config(cfg)
+        self.programs_root_lbl.configure(text=str(new_root))
+        self._load_programs()
+        builder = getattr(self, "_builder_ref", None)
+        if builder is not None:
+            builder.root_folder = new_root
+            builder.dist_root = new_root.parent / "dist"
+            builder.root_var.set(str(new_root))
+            builder._reload_projects(select_first=True)
 
     def _build_ui(self):
         root = ttk.Frame(self, padding=10)
@@ -573,10 +632,12 @@ class DeployGUI(ttk.Frame):
         top.grid_columnconfigure(0, weight=0)
         top.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(top, text="Programs folder:").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="Root folder:").grid(row=0, column=0, sticky="w")
 
-        self.programs_root_lbl = ttk.Label(top, text=str(PROGRAMS_ROOT), justify="left", anchor="w")
+        self.programs_root_lbl = ttk.Label(top, text=str(_programs_root()), justify="left", anchor="w")
         self.programs_root_lbl.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        ttk.Button(top, text="Change…", command=self._change_root).grid(row=0, column=2, padx=(8, 0))
 
         top.bind("<Configure>", self._update_programs_root_wraplength)
         self.after(0, self._update_programs_root_wraplength)
@@ -668,6 +729,10 @@ class DeployGUI(ttk.Frame):
 
     def _refresh(self):
         self.state_deployed = load_state()
+        try:
+            self.programs_root_lbl.configure(text=str(_programs_root()))
+        except Exception:
+            pass
         self._load_programs()
 
     def auto_deploy(self, built_projects: list, build_summary: str = None):
@@ -756,13 +821,17 @@ class DeployGUI(ttk.Frame):
         self.program_is_new.clear()
         self.program_latest_version.clear()
 
-        if not PROGRAMS_ROOT.exists():
-            self._log(f"ERROR: programs root does not exist: {PROGRAMS_ROOT}")
+        programs_root = _programs_root()
+        dist_root = _dist_root()
+
+        if not programs_root.exists():
+            self._log(f"ERROR: programs root does not exist: {programs_root}")
             return
 
+        IGNORE = {"dist", "archive", "internal builder", ".venv", ".vscode", ".git",
+                  "matlab", "icons", "extractor"}
         program_dirs = []
-        IGNORE = {"dist", "matlab", "icons", "internal builder", ".venv", ".vscode", "extractor", ".git"}
-        for p in sorted(PROGRAMS_ROOT.iterdir(), key=lambda x: x.name.lower()):
+        for p in sorted(programs_root.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_dir():
                 continue
             if p.name.startswith("_"):
@@ -772,14 +841,14 @@ class DeployGUI(ttk.Frame):
             program_dirs.append(p)
 
         if not program_dirs:
-            self._log(f"No program folders found in: {PROGRAMS_ROOT}")
+            self._log(f"No program folders found in: {programs_root}")
             return
 
         self.program_col_px = self._compute_program_col_px([p.name for p in program_dirs])
         self.header.grid_columnconfigure(1, minsize=self.program_col_px)
 
         for p in program_dirs:
-            dist_dir = _dist_root() / p.name
+            dist_dir = dist_root / p.name   # may or may not exist yet
             version_folders = list_versions(dist_dir)
             version_names = [vf.name for vf in version_folders]
 
@@ -870,14 +939,12 @@ class DeployGUI(ttk.Frame):
         Vrací dict: klíč = "{program_name}|{dst_root}" -> True = nahradit, False = přeskočit.
         """
         decisions: dict[str, bool] = {}
-        print(f"DEBUG _collect_icon_conflicts: jobs={[(p.name, v) for p,v in jobs]}", flush=True)
-        print(f"DEBUG destination_roots={destination_roots}", flush=True)
 
         for program_dir, version_name in jobs:
             if not version_name:
                 continue
 
-            version_folder = _dist_root() / program_dir.name / version_name
+            version_folder = program_dir / version_name  # program_dir is dist_root/program_name
 
             # Najdi zdrojovou ikonu (stejná logika jako v _deploy_one_program)
             icon_src = None
@@ -908,7 +975,6 @@ class DeployGUI(ttk.Frame):
             for dst_root in destination_roots:
                 target_dir = dst_root / program_dir.name
                 dst_icon = target_dir / icon_src.name
-                print(f"DEBUG [{program_dir.name}] dst_root={dst_root.name} dst_icon_exists={dst_icon.exists()} src_size={icon_src.stat().st_size} dst_size={dst_icon.stat().st_size if dst_icon.exists() else 'N/A'}", flush=True)
             if conflict_existing is not None:
                 replace = show_icon_compare_dialog(self, program_dir.name, conflict_existing, icon_src)
             else:
@@ -983,17 +1049,35 @@ class DeployGUI(ttk.Frame):
         if not version_name:
             raise FileNotFoundError(f"[{program_name}] NEW program: build it first (no versions in dist).")
 
-        version_folder = _dist_root() / program_name / version_name
+        # program_dir is now dist_root/program_name — version folder is a child of it
+        version_folder = program_dir / version_name
         if not version_folder.exists():
             raise FileNotFoundError(f"Selected version folder missing: {version_folder}")
 
         src_exe = find_exe_in_folder(version_folder, program_name, version_name)
-        src_readme = find_readme_or_raise(program_dir, program_name)
+
+        # ReadMe lookup order:
+        # 1. version_folder  (builder copies it there for primary dev)
+        # 2. program_dir     (dist/program_name — may have it from previous deploy)
+        # 3. scratch/program_name  (already deployed there by a previous version)
+        # 4. None — skip with warning
+        src_readme = None
+        _readme_search_dirs = [version_folder, program_dir]
+        for dst_root in destination_roots:
+            _readme_search_dirs.append(dst_root / program_name)
+        for _d in _readme_search_dirs:
+            try:
+                src_readme = find_readme_or_raise(_d, program_name)
+                break
+            except FileNotFoundError:
+                pass
+        if src_readme is None:
+            log(f"[{program_name}] WARNING: ReadMe not found — skipping ReadMe copy")
 
         # Najdi všechny .py soubory ve version_folder
         src_py_files = list(version_folder.glob("*.py"))
 
-        # Najdi icon.png vedle exe nebo v program_dir
+        # Ikona: version_folder nebo program_dir (dist/program_name)
         icon_src = None
         for name in ("icon.ico", "Icon.ico", "icon.png", "Icon.png", "icon.gif", "Icon.gif"):
             cand = version_folder / name
@@ -1052,10 +1136,21 @@ class DeployGUI(ttk.Frame):
 
             # ── Archivuj staré .exe ──────────────────────────────────
             for exe in target_dir.glob(f"{program_name}*.exe"):
-                dst_arch = archive_dir / f"{exe.stem}__{timestamp}{exe.suffix}"
+                # Extract old version from stem: "Program Name vX.Y.Z" -> "vX.Y.Z"
+                _vm = VERSION_RE.search(exe.stem)
+                old_ver_label = _vm.group(0) if _vm else "unknown"
+                ver_archive_dir = archive_dir / old_ver_label
+                ver_archive_dir.mkdir(parents=True, exist_ok=True)
+                dst_arch = unique_path(ver_archive_dir / exe.name)
                 moved, why = _try_move(exe, dst_arch)
                 if moved:
-                    log(f"[{program_name}] Archived EXE: {exe.name}")
+                    _arch_log = ver_archive_dir / "archive_log.txt"
+                    try:
+                        with _arch_log.open("a", encoding="utf-8") as _f:
+                            _f.write(f"{timestamp} | {exe.name}\n")
+                    except Exception:
+                        pass
+                    log(f"[{program_name}] Archived EXE: {exe.name} -> archive/{old_ver_label}/")
                     flog("archived", exe.name, str(dst_arch.relative_to(dst_root)))
                     stats["archived"] += 1
                 else:
@@ -1065,10 +1160,20 @@ class DeployGUI(ttk.Frame):
 
             # ── Archivuj staré .py ───────────────────────────────────
             for pyf in target_dir.glob("*.py"):
-                dst_arch = archive_dir / f"{pyf.stem}__{timestamp}{pyf.suffix}"
+                _vm = VERSION_RE.search(pyf.stem)
+                old_ver_label = _vm.group(0) if _vm else "unknown"
+                ver_archive_dir = archive_dir / old_ver_label
+                ver_archive_dir.mkdir(parents=True, exist_ok=True)
+                dst_arch = unique_path(ver_archive_dir / pyf.name)
                 moved, why = _try_move(pyf, dst_arch)
                 if moved:
-                    log(f"[{program_name}] Archived PY: {pyf.name}")
+                    _arch_log = ver_archive_dir / "archive_log.txt"
+                    try:
+                        with _arch_log.open("a", encoding="utf-8") as _f:
+                            _f.write(f"{timestamp} | {pyf.name}\n")
+                    except Exception:
+                        pass
+                    log(f"[{program_name}] Archived PY: {pyf.name} -> archive/{old_ver_label}/")
                     flog("archived", pyf.name, str(dst_arch.relative_to(dst_root)))
                     stats["archived"] += 1
                 else:
@@ -1120,18 +1225,19 @@ class DeployGUI(ttk.Frame):
                     stats["exe_failed"] += 1
 
             # ── ReadMe ───────────────────────────────────────────────
-            try:
-                dst_readme = target_dir / src_readme.name
-                if dst_readme.exists():
-                    log(f"[{program_name}] WARNING: {src_readme.name} exists, overwriting")
-                shutil.copy2(src_readme, dst_readme)
-                log(f"[{program_name}] ReadMe copied -> {dst_readme.name}")
-                flog("copied", src_readme.name, str(dst_readme.relative_to(dst_root)))
-                stats["readme_copied"] += 1
-            except Exception as e:
-                log(f"[{program_name}] FAILED ReadMe: {e}")
-                flog("failed", src_readme.name, str(e))
-                stats["readme_failed"] += 1
+            if src_readme is not None:
+                try:
+                    dst_readme = target_dir / src_readme.name
+                    if dst_readme.exists():
+                        log(f"[{program_name}] WARNING: {src_readme.name} exists, overwriting")
+                    shutil.copy2(src_readme, dst_readme)
+                    log(f"[{program_name}] ReadMe copied -> {dst_readme.name}")
+                    flog("copied", src_readme.name, str(dst_readme.relative_to(dst_root)))
+                    stats["readme_copied"] += 1
+                except Exception as e:
+                    log(f"[{program_name}] FAILED ReadMe: {e}")
+                    flog("failed", src_readme.name, str(e))
+                    stats["readme_failed"] += 1
 
             # ── Kopíruj ikonu ────────────────────────────────────────
             if icon_src is not None:
@@ -1181,10 +1287,26 @@ class DeployGUI(ttk.Frame):
         self._log("Copying ReadMe files only...\n")
         self._set_busy(True)
 
+        dist_root = _dist_root()
         def worker():
-            for program_dir in selected_programs:
+            for src_dir in selected_programs:
+                program_dir = dist_root / src_dir.name
                 try:
-                    src_readme = find_readme_or_raise(program_dir, program_dir.name)
+                    # Search: version_folder → program_dir → scratch/program_name
+                    src_readme = None
+                    version_folders = list_versions(program_dir)
+                    search_dirs = (version_folders[:1] if version_folders else []) + [program_dir]
+                    for dst_root in selected_roots:
+                        search_dirs.append(dst_root / program_dir.name)
+                    for _d in search_dirs:
+                        try:
+                            src_readme = find_readme_or_raise(_d, program_dir.name)
+                            break
+                        except FileNotFoundError:
+                            pass
+                    if src_readme is None:
+                        self.after(0, self._log, f"[{program_dir.name}] WARNING: ReadMe not found — skipped")
+                        continue
                     for dst_root in selected_roots:
                         target_dir = dst_root / program_dir.name
                         target_dir.mkdir(parents=True, exist_ok=True)
@@ -1221,8 +1343,18 @@ class DeployGUI(ttk.Frame):
                         continue
 
                     program_name = program_dir.name
-                    src_program_dir = PROGRAMS_ROOT / program_name
-                    src_ico = src_program_dir / "icon.ico"
+                    # Look for icon.ico in dist (latest version folder), fallback to dist/program_name
+                    dist_prog_dir = _dist_root() / program_name
+                    src_ico = None
+                    for vf in list_versions(dist_prog_dir)[:1]:
+                        cand = vf / "icon.ico"
+                        if cand.exists():
+                            src_ico = cand
+                            break
+                    if src_ico is None:
+                        cand = dist_prog_dir / "icon.ico"
+                        if cand.exists():
+                            src_ico = cand
 
                     # Smaž PNG ikony
                     for png_name in ("icon.png", "Icon.png", "ICON.png"):
@@ -1235,7 +1367,7 @@ class DeployGUI(ttk.Frame):
                                 self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
 
                     # Kopíruj icon.ico pokud existuje ve zdroji
-                    if src_ico.exists():
+                    if src_ico is not None and src_ico.exists():
                         dst_ico = program_dir / "icon.ico"
                         if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
                             try:
@@ -1254,7 +1386,7 @@ class DeployGUI(ttk.Frame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_build_internal(self):
-        builder_script = PROGRAMS_ROOT / "Internal Builder" / "_internal_builder.py"
+        builder_script = _programs_root() / "Internal Builder" / "_internal_builder.py"
         if not builder_script.exists():
             messagebox.showerror("Error", f"Builder script not found:\n{builder_script}")
             return
@@ -1480,7 +1612,8 @@ class DeployGUI(ttk.Frame):
             messagebox.showwarning("No destination", "Select at least one destination root.")
             return
 
-        jobs = [(p, self.program_version_vars[p].get().strip()) for p in selected_programs]
+        dist_root = _dist_root()
+        jobs = [(dist_root / p.name, self.program_version_vars[p].get().strip()) for p in selected_programs]
 
         self._clear_log()
         self._log("Checking icon conflicts...\n")

@@ -806,6 +806,7 @@ class ShotFinderWidget(QWidget):
         self._current_preview_path: "Path | None" = None
         self._preview_sig.show.connect(self._on_preview_ready)
         atexit.register(self._cleanup_temp)
+        self._last_save_dir: "Path | None" = None
 
         self._build_ui()
 
@@ -1258,6 +1259,16 @@ class ShotFinderWidget(QWidget):
 
     def _rebuild_criteria_rows(self):
         """Rebuild the dynamic criteria row widgets to match currently checked PV checkboxes."""
+        # Sync current spinbox values into self._criteria before destroying widgets
+        existing: dict = {d["col"]: d.copy() for d in self._criteria}
+        for r in getattr(self, "_criteria_rows", []):
+            col = r["col"]
+            existing[col] = {
+                "col":    col,
+                "target": r["target_sb"].value(),
+                "tol":    r["tol_sb"].value(),
+            }
+
         # Clear existing widgets
         while self._criteria_container_layout.count():
             item = self._criteria_container_layout.takeAt(0)
@@ -1266,9 +1277,6 @@ class ShotFinderWidget(QWidget):
                 w.deleteLater()
 
         selected = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
-
-        # Read back existing values from self._criteria to preserve user input
-        existing = {d["col"]: d for d in self._criteria}
 
         self._criteria_rows: list[dict] = []  # list of {col, target_sb, tol_sb}
         for col in selected:
@@ -1386,14 +1394,21 @@ class ShotFinderWidget(QWidget):
             self._preview_widget.set_pixmap(None)
             return
 
-        col_search = next(
-            (c for c, cb in self._pv_buttons.items() if cb.isChecked()), "sbw4")
+        search_cols = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
+        search_cols_set = set(search_cols)
         extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c != col_search]
+                      if cb.isChecked() and c not in search_cols_set]
         parts = []
-        val_main = _format_value(dr.col, dr.best_row.get(dr.col, ""))
-        short_main = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-        parts.append(f"{short_main}: {val_main}")
+        for sc in search_cols:
+            if sc == dr.col:
+                val = _format_value(sc, dr.best_row.get(sc, ""))
+            elif ts_ns_direct is not None:
+                raw = _find_closest_col_value(dr.per_col, sc, ts_ns_direct)
+                val = _format_value(sc, raw)
+            else:
+                val = _format_value(sc, dr.best_row.get(sc, ""))
+            short = PV_COLUMNS.get(sc, sc).split(" [")[0]
+            parts.append(f"{short}: {val}")
         if ts_ns_direct is not None:
             for ec in extra_cols:
                 raw_ec = _find_closest_col_value(dr.per_col, ec, ts_ns_direct)
@@ -2040,13 +2055,53 @@ class ShotFinderWidget(QWidget):
             "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
             "border-radius: 4px; padding: 5px 10px; }"
             "QPushButton:hover { background: #1a6aee; }")
+        btn_save_img = QPushButton("Save image")
         btn_close = QPushButton("Close")
         btn_row.addWidget(btn_open)
+        btn_row.addWidget(btn_save_img)
         btn_row.addStretch(1)
         btn_row.addWidget(btn_close)
         lay.addLayout(btn_row)
 
         btn_close.clicked.connect(dlg.reject)
+
+        def save_selected_image():
+            sel = tbl.selectedIndexes()
+            if not sel:
+                QMessageBox.information(dlg, "No selection", "Vyberte řádek v tabulce.")
+                return
+            i = sel[0].row()
+            if i >= len(rows_in_tol):
+                return
+            if cam_folder_ref[0] is None:
+                QMessageBox.warning(dlg, "No camera", "Složka kamery není dostupná.")
+                return
+            row_s = rows_in_tol[i]
+            dt_obj_s = row_s.get("_dt")
+            if dt_obj_s is None:
+                QMessageBox.warning(dlg, "No timestamp", "Řádek nemá časové razítko.")
+                return
+            src = _find_image_for_ts(cam_folder_ref[0], dt_obj_s,
+                                      ts_ns_override=row_s.get("_ns"))
+            if src is None:
+                QMessageBox.warning(dlg, "Image not found", "Obrázek nebyl nalezen.")
+                return
+            initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
+            dst, _ = QFileDialog.getSaveFileName(
+                dlg, "Uložit obrázek", str(Path(initial_dir) / src.name),
+                "Images (*.png *.jpg *.tif *.tiff *.bmp);;All files (*)",
+                options=QFileDialog.Option.DontUseNativeDialog)
+            if not dst:
+                return
+            dst_path = Path(dst)
+            self._last_save_dir = dst_path.parent
+            try:
+                import shutil as _sh
+                _sh.copy2(src, dst_path)
+            except Exception as ex:
+                QMessageBox.critical(dlg, "Chyba", f"Kopírování selhalo:\n{ex}")
+
+        btn_save_img.clicked.connect(save_selected_image)
 
         def open_selected():
             selected_rows = tbl.selectedIndexes()
@@ -2237,9 +2292,10 @@ class ShotFinderWidget(QWidget):
 
         # Sestav energy map — filename -> text pro zobrazení v slideru
         energy_map: dict[str, str] = {}
-        col_search = next((c for c, cb in self._pv_buttons.items() if cb.isChecked()), "sbw4")
+        search_cols_slider = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
+        search_cols_slider_set = set(search_cols_slider)
         extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c != col_search]
+                      if cb.isChecked() and c not in search_cols_slider_set]
 
         for src, dst, i in copied_files:
             if i >= len(results_to_open):
@@ -2247,9 +2303,16 @@ class ShotFinderWidget(QWidget):
             dr = results_to_open[i]
             best_ns = dr.best_row.get("_ns")
             parts = []
-            val_main = _format_value(dr.col, dr.best_row.get(dr.col, ""))
-            short_main = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-            parts.append(f"{short_main}: {val_main}")
+            for sc in search_cols_slider:
+                if sc == dr.col:
+                    val = _format_value(sc, dr.best_row.get(sc, ""))
+                elif best_ns is not None:
+                    raw = _find_closest_col_value(dr.per_col, sc, best_ns)
+                    val = _format_value(sc, raw)
+                else:
+                    val = _format_value(sc, dr.best_row.get(sc, ""))
+                short = PV_COLUMNS.get(sc, sc).split(" [")[0]
+                parts.append(f"{short}: {val}")
             if best_ns is not None:
                 for ec in extra_cols:
                     raw_ec = _find_closest_col_value(dr.per_col, ec, best_ns)
@@ -2284,9 +2347,11 @@ class ShotFinderWidget(QWidget):
             return
 
         from PySide6.QtWidgets import QFileDialog
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder")
+        initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", initial_dir)
         if not out_dir:
             return
+        self._last_save_dir = Path(out_dir)
         out_path = Path(out_dir)
 
         selected_rows = sorted(set(
@@ -2298,9 +2363,10 @@ class ShotFinderWidget(QWidget):
         else:
             results_to_save = self._day_results
 
-        col_search = next((c for c, cb in self._pv_buttons.items() if cb.isChecked()), "sbw4")
+        search_cols_save = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
+        search_cols_save_set = set(search_cols_save)
         extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c != col_search]
+                      if cb.isChecked() and c not in search_cols_save_set]
 
         copied = 0
         errors = 0
@@ -2337,18 +2403,36 @@ class ShotFinderWidget(QWidget):
                 errors += 1
                 continue
 
-            # Název souboru: datum + čas + hodnota PV
+            # Název souboru: camera_label + Prague timestamp + PV value
             val_str = _format_value(dr.col, dr.best_row.get(dr.col, "")).replace(" ", "").replace("/", "-")
             short = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-            dst_name = f"{dr.day}_{dt_obj.strftime('%H-%M-%S')}_{short}_{val_str}{img.suffix}"
+            _cam_label = _re.sub(r"[-_]+-IMG$", "", cam, flags=_re.IGNORECASE).rstrip("-_")
+            _ns_best = dr.best_row.get("_ns")
+            if _ns_best is not None and PRAGUE is not None:
+                _ts_sec = _ns_best // 1_000_000_000
+                _ts_ms = (_ns_best % 1_000_000_000) // 1_000_000
+                _dt_pr = datetime.fromtimestamp(_ts_sec, tz=PRAGUE)
+                _prague_stamp = _dt_pr.strftime("%Y-%m-%d_%H-%M-%S-") + f"{_ts_ms:03d}"
+            else:
+                _dt_prague = dt_obj.astimezone(PRAGUE) if PRAGUE is not None else dt_obj
+                _prague_stamp = _dt_prague.strftime("%Y-%m-%d_%H-%M-%S-000")
+            dst_name = f"{_cam_label}_{_prague_stamp}_{short}_{val_str}.png"
             dst = out_path / dst_name
 
             try:
                 # Sestav energy text pro anotaci
+                _best_ns_save = dr.best_row.get("_ns")
                 parts = []
-                val_main = _format_value(dr.col, dr.best_row.get(dr.col, ""))
-                short_main = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-                parts.append(f"{short_main}: {val_main}")
+                for sc in search_cols_save:
+                    if sc == dr.col:
+                        val = _format_value(sc, dr.best_row.get(sc, ""))
+                    elif _best_ns_save is not None:
+                        raw = _find_closest_col_value(dr.per_col, sc, _best_ns_save)
+                        val = _format_value(sc, raw)
+                    else:
+                        val = _format_value(sc, dr.best_row.get(sc, ""))
+                    short = PV_COLUMNS.get(sc, sc).split(" [")[0]
+                    parts.append(f"{short}: {val}")
                 for ec in extra_cols:
                     ev = _format_value(ec, dr.best_row.get(ec, ""))
                     short = PV_COLUMNS.get(ec, ec).split(" [")[0]
@@ -2490,6 +2574,13 @@ class ShotFinderWidget(QWidget):
                 combined.paste(pil_img, (0, 0))
                 combined.paste(bar2, (0, pil_img.height))
                 combined.save(dst)
+                try:
+                    import importlib.util as _ilu_sf, pathlib as _pl_sf
+                    _ist_sf = _ilu_sf.spec_from_file_location("is_t", _pl_sf.Path(__file__).parent / "is_t.py")
+                    _m_sf = _ilu_sf.module_from_spec(_ist_sf); _ist_sf.loader.exec_module(_m_sf)
+                    _m_sf._copy_metadata_into_png(img, dst, save_txt=False)
+                except Exception:
+                    pass
                 copied += 1
                 self._log(f"{dr.day}: saved {dst.name}")
             except Exception as e:
@@ -2527,7 +2618,7 @@ class ShotFinderWidget(QWidget):
 
             cam_name = _re.sub(r"[-_]+IMG$", "", img_path.parent.name, flags=_re.IGNORECASE).rstrip("-_")
             label = f"{cam_name}  |  {img_path.name}"
-            wk.receive_image(arr8, label)
+            wk.receive_image(arr8, label, source_path=img_path)
         except Exception as e:
             QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
 

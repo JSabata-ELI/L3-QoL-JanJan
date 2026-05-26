@@ -4,7 +4,8 @@ Monitors a specific region on screen and alerts on change.
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox, simpledialog
+import json
 import time
 import numpy as np
 from PIL import ImageGrab, ImageTk
@@ -146,10 +147,18 @@ class ScreenTracker(tk.Tk):
         self._is_flashing = False
         self._preview_pinned = False
         self.status_var = tk.StringVar(value="Select a region on a monitor.")
+
+        if getattr(sys, "frozen", False):
+            _base = Path(sys.executable).parent
+        else:
+            _base = Path(__file__).parent
+        self._presets_path = _base / "presets.json"
+        self._presets = self._load_presets()
+
         self._build_ui()
         self.bind("<Button-1>", self._on_any_click)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.geometry("350x250")
+        self.geometry("350x310")
 
     # ------------------------------------------------------------------
     # UI
@@ -247,6 +256,23 @@ class ScreenTracker(tk.Tk):
                                      state="disabled", width=3)
         self.btn_resnap.grid(row=0, column=2, padx=(0, 4))
 
+        # Presets panel
+        self._preset_frame = ttk.LabelFrame(self, text="Region presets")
+        self._preset_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 5))
+
+        self._preset_var = tk.StringVar()
+        self._preset_combo = ttk.Combobox(self._preset_frame, textvariable=self._preset_var,
+                                           state="readonly", width=18)
+        self._preset_combo.grid(row=0, column=0, padx=(6, 4), pady=6)
+        self._refresh_preset_combo()
+
+        ttk.Button(self._preset_frame, text="Load",
+                   command=self._load_preset, width=6).grid(row=0, column=1, padx=(0, 4), pady=6)
+        ttk.Button(self._preset_frame, text="Save region",
+                   command=self._save_preset, width=10).grid(row=0, column=2, padx=(0, 4), pady=6)
+        ttk.Button(self._preset_frame, text="Delete",
+                   command=self._delete_preset, width=6).grid(row=0, column=3, padx=(0, 6), pady=6)
+
         # Pre-build Settings variables (popup builds widgets on first open)
         self.flash_color = tk.StringVar(value="#ff2222")
         self.flash_duration = tk.DoubleVar(value=3.0)
@@ -256,6 +282,71 @@ class ScreenTracker(tk.Tk):
         self.sound_file = tk.StringVar(value="beep")
         self._sound_files = self._load_sound_files()
         self._flash_color_btn = None  # created in popup
+
+    # ------------------------------------------------------------------
+    # Region presets
+    # ------------------------------------------------------------------
+    def _load_presets(self):
+        if self._presets_path.exists():
+            try:
+                data = json.loads(self._presets_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    def _save_presets_file(self):
+        self._presets_path.write_text(
+            json.dumps(self._presets, indent=2), encoding="utf-8")
+
+    def _refresh_preset_combo(self):
+        names = sorted(self._presets.keys())
+        self._preset_combo["values"] = names
+        if names and self._preset_var.get() not in names:
+            self._preset_var.set(names[0])
+        elif not names:
+            self._preset_var.set("")
+
+    def _save_preset(self):
+        if not self.region:
+            messagebox.showwarning("No region", "Select a region first.", parent=self)
+            return
+        name = simpledialog.askstring("Save preset", "Preset name:", parent=self)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self._presets:
+            if not messagebox.askyesno("Overwrite?",
+                                       f'Preset "{name}" already exists. Overwrite?',
+                                       parent=self):
+                return
+        self._presets[name] = list(self.region)
+        self._save_presets_file()
+        self._refresh_preset_combo()
+        self._preset_var.set(name)
+
+    def _load_preset(self):
+        name = self._preset_var.get()
+        if not name or name not in self._presets:
+            messagebox.showwarning("No preset", "Select a preset first.", parent=self)
+            return
+        coords = self._presets[name]
+        self._region_selected(tuple(coords))
+
+    def _delete_preset(self):
+        name = self._preset_var.get()
+        if not name or name not in self._presets:
+            messagebox.showwarning("No preset", "Select a preset first.", parent=self)
+            return
+        if not messagebox.askyesno("Delete preset",
+                                   f'Delete preset "{name}"?', parent=self):
+            return
+        del self._presets[name]
+        self._save_presets_file()
+        self._refresh_preset_combo()
 
     # ------------------------------------------------------------------
     # Settings popup

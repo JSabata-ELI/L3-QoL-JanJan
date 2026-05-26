@@ -46,6 +46,7 @@ def main():
 
     builder_tab = BuilderUI(nb, on_build_done=_on_build_done, log_widget=cm_tab.log)
     builder_tab._cm_ref = cm_tab
+    cm_tab._builder_ref = builder_tab
 
     nb.add(builder_tab, text="  Builder  ")
     nb.add(cm_tab,      text="  Copy Manager  ")

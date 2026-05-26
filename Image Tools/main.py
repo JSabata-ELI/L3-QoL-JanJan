@@ -61,11 +61,12 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         if spec is None:
             raise ImportError(f"Cannot find module file: {full_path}")
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = mod
         try:
             spec.loader.exec_module(mod)
         except Exception as _e:
+            sys.modules.pop(module_name, None)
             raise ImportError(f"{filename} failed to load:\n{_tb.format_exc()}") from _e
-        sys.modules[module_name] = mod
         return mod
 
     try:

@@ -581,6 +581,80 @@ def list_monitors_rects() -> list[tuple[int, int, int, int]]:
     return monitors
 
 
+def monitor_index_for_hwnd(hwnd: int) -> int | None:
+    """Return the 0-based index (matching list_monitors_rects order) of the monitor
+    that contains the given window, or None if not found."""
+    MONITOR_DEFAULTTONEAREST = 0x00000002
+    _u32 = ctypes.windll.user32
+    h = ctypes.c_void_p(int(hwnd) & 0xFFFFFFFFFFFFFFFF)
+    hmon = _u32.MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)
+    if not hmon:
+        return None
+
+    # Collect (hmon, rect) pairs via EnumDisplayMonitors
+    MONITORENUMPROC2 = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+        ctypes.POINTER(RECT), wintypes.LPARAM,
+    )
+    pairs: list[tuple[int, tuple[int, int, int, int]]] = []
+
+    def _cb2(hM, hdc, lprc, lparam):
+        r = lprc.contents
+        pairs.append((int(hM), (r.left, r.top, r.right, r.bottom)))
+        return True
+
+    cb2 = MONITORENUMPROC2(_cb2)
+    _u32.EnumDisplayMonitors(0, 0, cb2, 0)
+
+    target = int(hmon)
+    for i, (hm, _rect) in enumerate(pairs):
+        if hm == target:
+            return i
+    return None
+
+
+def monitors_for_cameras(cam_names: list[str]) -> list[int]:
+    """Return sorted list of unique 0-based monitor indices where the CSS windows
+    for the given cameras currently reside. Cameras with no visible window are skipped."""
+    result: set[int] = set()
+    for cam in cam_names:
+        needles = _build_window_needles_static(cam)
+        for needle in needles:
+            hwnd = find_window_by_title_substring(needle)
+            if hwnd:
+                idx = monitor_index_for_hwnd(hwnd)
+                if idx is not None:
+                    result.add(idx)
+                break
+    return sorted(result)
+
+
+def _build_window_needles_static(cam: str) -> list[str]:
+    """Standalone version of build_window_needles (no self) for use outside the UI class."""
+    needles: list[str] = []
+    v = CAM_WINDOW_TITLES.get(cam)
+    if v:
+        needles.append(v)
+    al = cpva_label(cam)
+    if al != cam:
+        v2 = CAM_WINDOW_TITLES.get(al)
+        if v2:
+            needles.append(v2)
+        needles.append(al)
+    needles.append(cam)
+    cid = CAM_INFO.get(cam) or CAM_INFO.get(al)
+    if cid and str(cid).isdigit():
+        needles.insert(0, f"C03-{cid}")
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in needles:
+        n = (n or "").strip()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def take_screenshot_monitor_png(dst_path: Path, monitor_index: int | None):
     try:
         from PIL import ImageGrab
@@ -2091,6 +2165,7 @@ class App(tk.Tk):
         self._active_presets: set[str] = set()
         self._preset_mon_ref: dict[int, int] = {}
         self._preset_all_screens_ref: int = 0
+        self._preset_cached_monitors: dict[str, list[int]] = {}  # preset_name → monitory zjištěné při _preset_add
 
         self.camera_vars: dict[str, tk.BooleanVar] = {}
         for _cat, cams in CAM_CATEGORIES.items():
@@ -2815,7 +2890,6 @@ class App(tk.Tk):
     def _preset_add(self, name: str):
         data = PRESETS.get(name, {})
         cams = list(data.get("cams", []))
-        mons = data.get("mons", None)
         self._programmatic_cam_update = True
         try:
             for cam in cams:
@@ -2823,14 +2897,15 @@ class App(tk.Tk):
                     self.camera_vars[cam].set(True)
         finally:
             self._programmatic_cam_update = False
-        if mons is None:
-            self._preset_all_screens_ref += 1
-        else:
-            self._manual_all_screens = False
-            for m1 in list(mons):
-                mi = int(m1) - 1
+        self._manual_all_screens = False
+        detected = monitors_for_cameras(cams)
+        self._preset_cached_monitors[name] = detected
+        if detected:
+            for mi in detected:
                 if 0 <= mi < len(self.monitor_vars):
                     self._preset_mon_ref[mi] = self._preset_mon_ref.get(mi, 0) + 1
+        else:
+            self._preset_all_screens_ref += 1
         for cat in CAM_CATEGORIES:
             self._update_category_check(cat)
         self._apply_monitor_effective()
@@ -2838,7 +2913,6 @@ class App(tk.Tk):
     def _preset_remove(self, name: str):
         data = PRESETS.get(name, {})
         cams = list(data.get("cams", []))
-        mons = data.get("mons", None)
         self._programmatic_cam_update = True
         try:
             for cam in cams:
@@ -2846,15 +2920,17 @@ class App(tk.Tk):
                     self.camera_vars[cam].set(False)
         finally:
             self._programmatic_cam_update = False
-        if mons is None:
-            self._preset_all_screens_ref = max(0, self._preset_all_screens_ref - 1)
-        else:
-            for m1 in list(mons):
-                mi = int(m1) - 1
+        # Použít cachované monitory z doby _preset_add — ne dynamické dotazování
+        cached = self._preset_cached_monitors.pop(name, None)
+        if cached:
+            for mi in cached:
                 if mi in self._preset_mon_ref:
                     self._preset_mon_ref[mi] -= 1
                     if self._preset_mon_ref[mi] <= 0:
                         del self._preset_mon_ref[mi]
+        elif cached is not None:
+            # byl cached jako prázdný seznam → byl přidán fallback all_screens
+            self._preset_all_screens_ref = max(0, self._preset_all_screens_ref - 1)
         for cat in CAM_CATEGORIES:
             self._update_category_check(cat)
         self._apply_monitor_effective()
@@ -2896,7 +2972,23 @@ class App(tk.Tk):
             if cat:
                 self._update_category_check(cat)
             return
+        # Manuální změna kamery — přepočítej monitory ze všech vybraných kamer
+        self._recompute_monitors_from_cameras()
         self._update_name_label()
+
+    def _recompute_monitors_from_cameras(self):
+        """Zjistí monitory ze CSS oken aktuálně vybraných kamer a nastaví monitor výběr."""
+        cams = self._selected_cameras()
+        self._preset_mon_ref.clear()
+        self._preset_all_screens_ref = 0
+        self._manual_monitors.clear()
+        self._manual_all_screens = False
+        detected = monitors_for_cameras(cams)
+        if detected:
+            for mi in detected:
+                if 0 <= mi < len(self.monitor_vars):
+                    self._preset_mon_ref[mi] = 1
+        self._apply_monitor_effective()
 
     def _update_category_check(self, cat: str):
         cams = CAM_CATEGORIES.get(cat, [])

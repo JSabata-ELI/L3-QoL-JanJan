@@ -46,6 +46,9 @@ import zoneinfo
 from zoneinfo import ZoneInfo
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import orjson
+import requests
+from copy import copy
 
 # ── tkinter ───────────────────────────────────────────────────────────────────
 import tkinter as tk

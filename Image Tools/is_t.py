@@ -58,6 +58,7 @@ PLAY_TICK_MS = 33
 AXIS_TOLERANCE_S = 5 * 60
 PLAY_EXACT_PCT_PER_S_THRESHOLD = 0.5
 SAVE_RANGE_WARN_COUNT = 500
+ONLINE_MAX_ITEMS = 50_000   # max frames kept per camera in live mode (~4 h at 3.3 Hz)
 
 # ---------------- PV / CPVA ----------------
 import ssl
@@ -98,7 +99,7 @@ def _pv_ssl_ctx() -> ssl.SSLContext:
 _pv_day_cache: dict[tuple[str, str], list] = {}
 _pv_day_cache_lock = threading.Lock()
 # Today's cache expires after this many seconds (live mode gets fresh data periodically)
-_PV_TODAY_CACHE_TTL = 30.0
+_PV_TODAY_CACHE_TTL = 3.0
 _pv_today_cache_time: dict[tuple[str, str], float] = {}  # cache_key → time.monotonic() of last fetch
 
 
@@ -357,13 +358,20 @@ def prague_stamp_for_filename(ts_ns: int) -> str:
     sec = ts_ns // 1_000_000_000
     ms  = (ts_ns % 1_000_000_000) // 1_000_000
     dt  = datetime.fromtimestamp(sec, tz=TZ_PRAGUE)
-    return f"{dt:%Y_%m_%d--%H_%M_%S}__{ms:03d}"
+    return f"{dt:%Y-%m-%d_%H-%M-%S}-{ms:03d}"
 
 def replace_unix_ns_with_prague_in_filename(p: Path, ts_ns: int) -> str:
     stamp = prague_stamp_for_filename(ts_ns)
-    new_stem, n = re.subn(r"(?<!\d)\d{19}(?!\d)", stamp, p.stem, count=1)
+    stem = p.stem
+    # Strip trailing -_-IMG / _-_IMG suffix from camera part
+    stem = re.sub(r"[-_]+-IMG$", "", stem, flags=re.IGNORECASE)
+    # Replace _-_<19-digit-ns> separator+timestamp with _<stamp>
+    new_stem, n = re.subn(r"_-_\d{19}", f"_{stamp}", stem, count=1)
     if n == 0:
-        new_stem = f"{p.stem}__{stamp}"
+        # Try plain 19-digit ns anywhere in stem
+        new_stem, n = re.subn(r"(?<!\d)\d{19}(?!\d)", stamp, stem, count=1)
+    if n == 0:
+        new_stem = f"{stem}_{stamp}"
     return f"{new_stem}{p.suffix}"
 
 def _strip_cam_name(name: str) -> str:
@@ -880,7 +888,9 @@ class SaveRangeTask(QRunnable):
                 # Annotate version if overlay or PV text is requested
                 pv_text = (self.overlay_params or {}).get('pv_text', '')
                 if self.overlay_params or pv_text:
-                    ann_dst = dst.parent / f"{dst.stem}_annotate.png"
+                    # _annotated suffix only when PV annotation bar is present
+                    _ann_suffix = "_annotated" if pv_text else ""
+                    ann_dst = dst.parent / f"{dst.stem}{_ann_suffix}.png"
                     pix = self._draw_overlay_on_pixmap(it.path)
                     if pix is not None:
                         if pv_text:
@@ -1621,7 +1631,7 @@ class _SCExclusionCanvas(QWidget):
             h, w = self._mask_arr.shape
             rgba = np.zeros((h, w, 4), dtype=np.uint8)
             rgba[self._mask_arr, 0] = 220
-            rgba[self._mask_arr, 3] = 160   # semi-transparent red
+            rgba[self._mask_arr, 3] = 80    # semi-transparent red (low alpha so image is visible)
             qi = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888).copy()
             pm_overlay = QPixmap.fromImage(qi).scaled(
                 ir.width(), ir.height(),
@@ -2783,7 +2793,7 @@ class CameraPickerDialog(QDialog):
         lay.addLayout(top_row, 1)
 
         # ── Selected cameras table ────────────────────────────────────────────
-        sel_lbl = QLabel("Selected (first 4 shown, max 7):")
+        sel_lbl = QLabel("Selected (first 4 will be displayed):")
         sel_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
         lay.addWidget(sel_lbl)
 
@@ -2968,10 +2978,6 @@ class CameraPickerDialog(QDialog):
         if name in self._selected_names:
             self._selected_names.remove(name)
         else:
-            if len(self._selected_names) >= 7:
-                QMessageBox.warning(self, "Too many cameras",
-                                    "You can select at most 7 cameras (first 4 will be shown).")
-                return
             self._selected_names.append(name)
         self._highlight_selected()
         self._refresh_sel_table()
@@ -3469,7 +3475,9 @@ class ImageView(QWidget):
             fm = QFontMetrics(font)
             line_count = display_text.count("\n") + 1
             bar_h = max(28, fm.height() * line_count + 12)
-            bar_rect = QRect(img_rect.left(), img_rect.bottom() - bar_h,
+            bar_top = img_rect.bottom()
+            bar_h = min(bar_h, max(0, self.height() - bar_top))
+            bar_rect = QRect(img_rect.left(), bar_top,
                              img_rect.width(), bar_h)
             p.fillRect(bar_rect, QColor(255, 255, 255, 220))
             p.setFont(font)
@@ -4025,9 +4033,7 @@ class MultiCameraGrid(QWidget):
                 self._restore_iv_overlay(cv.img_view, self._overlay_store[name])
 
         self._selected_idx = 0
-        self._selected_set = {0} if self._cam_views else set()
-        if self._cam_views:
-            self._cam_views[0].set_selected(True)
+        self._selected_set = set()
 
         self._rebuild_grid()
 
@@ -4674,17 +4680,17 @@ class _CamPollTask(QRunnable):
         new_items: list = []
         for folder in self._folders:
             try:
-                with os.scandir(folder) as it:
-                    for e in it:
-                        if not e.is_file():
-                            continue
-                        p = Path(e.path)
-                        if p.suffix.lower() not in IMG_EXT:
-                            continue
-                        ts_ns = parse_unix_ns_from_name(p)
-                        if ts_ns is None or ts_ns <= self._cutoff:
-                            continue
-                        new_items.append(Item(p, ts_ns))
+                folder_path = Path(folder)
+                for name in os.listdir(folder):
+                    p = folder_path / name
+                    if p.suffix.lower() not in IMG_EXT:
+                        continue
+                    if not p.is_file():
+                        continue
+                    ts_ns = parse_unix_ns_from_name(p)
+                    if ts_ns is None or ts_ns <= self._cutoff:
+                        continue
+                    new_items.append(Item(p, ts_ns))
             except Exception:
                 pass
         if new_items:
@@ -4727,17 +4733,17 @@ class _CamPollTask(QRunnable):
                             new_folders.append(candidate)
                             known.add(candidate)
                             try:
-                                with os.scandir(candidate) as it2:
-                                    for e in it2:
-                                        if not e.is_file():
-                                            continue
-                                        p = Path(e.path)
-                                        if p.suffix.lower() not in IMG_EXT:
-                                            continue
-                                        ts_ns = parse_unix_ns_from_name(p)
-                                        if ts_ns is None or ts_ns <= self._cutoff:
-                                            continue
-                                        new_items.append(Item(p, ts_ns))
+                                cand_path = Path(candidate)
+                                for name in os.listdir(candidate):
+                                    p = cand_path / name
+                                    if p.suffix.lower() not in IMG_EXT:
+                                        continue
+                                    if not p.is_file():
+                                        continue
+                                    ts_ns = parse_unix_ns_from_name(p)
+                                    if ts_ns is None or ts_ns <= self._cutoff:
+                                        continue
+                                    new_items.append(Item(p, ts_ns))
                             except Exception:
                                 pass
                         else:
@@ -4922,6 +4928,7 @@ class Viewer(QWidget):
         self.axis_override: tuple[int, int] | None = None
         self.last_open_dir = Path(DEFAULT_OPEN_DIR)
         self._last_save_dir: Path = Path(DEFAULT_SAVE_DIR)
+        self._save_progress_dlg = None
 
         now_dt = datetime.now(TZ_PRAGUE)
         self.last_pick_date = now_dt.date()
@@ -4942,6 +4949,7 @@ class Viewer(QWidget):
         self._display_load_key = None
         self._deferred_display = None
         self._play_frame_acc = 0.0
+        self._play_master_frame = 0
         self._discrete_mode = True   # slider skáče po indexech, ne po čase
         self._fake_ts_map = None
         self._real_ts_list: list[int] = []
@@ -5124,6 +5132,11 @@ class Viewer(QWidget):
         self.cb_save_metadata_txt.setToolTip("Also write a sidecar .txt file with the original image metadata")
         self.cb_save_metadata_txt.setStyleSheet(_CHECKBOX_STYLE)
         llay.addWidget(self.cb_save_metadata_txt)
+        self.cb_save_original = QCheckBox("Save original (unmodified)")
+        self.cb_save_original.setToolTip("When saving with default palette and no overlay, save the original unmodified file instead of skipping")
+        self.cb_save_original.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_save_original.setChecked(True)
+        llay.addWidget(self.cb_save_original)
 
         llay.addWidget(_hsep())
         llay.addWidget(_group_label("Timestamps"))
@@ -5238,7 +5251,7 @@ class Viewer(QWidget):
         self.cb_circle.setToolTip("Show circle overlay on image")
         self.cb_square = QCheckBox("Square"); self.cb_square.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_square.setToolTip("Show square overlay on image")
-        self.cb_bright = QCheckBox("Auto brightness"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_bright = QCheckBox("Auto-stretch contrast"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_bright.setToolTip("Auto-stretch contrast for better visibility")
 
         self.cb_cross.stateChanged.connect(self._on_overlay_changed)
@@ -5325,10 +5338,7 @@ class Viewer(QWidget):
         self.btn_set_ref.setToolTip("Set current frame as subtraction reference")
         self.btn_set_ref.clicked.connect(self._set_reference_frame)
         row_sub.addWidget(self.btn_set_ref)
-        self.lbl_ref_status = QLabel("No ref.")
-        self.lbl_ref_status.setStyleSheet("font-size: 9px; color: #555;")
-        self.lbl_ref_status.setWordWrap(True)
-        row_sub.addWidget(self.lbl_ref_status, 1)
+        row_sub.addStretch(1)
         llay.addLayout(row_sub)
         row_sub_thr = QHBoxLayout()
         row_sub_thr.addWidget(QLabel("Diff threshold:"))
@@ -5345,7 +5355,7 @@ class Viewer(QWidget):
         row_sub_thr.addStretch(1)
         llay.addLayout(row_sub_thr)
         row_bright_slider = QHBoxLayout()
-        row_bright_slider.addWidget(QLabel("Brightness:"))
+        row_bright_slider.addWidget(QLabel("Brightness offset:"))
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
         self.brightness_slider.setRange(-255, 255)
         self.brightness_slider.setValue(0)
@@ -5657,11 +5667,14 @@ class Viewer(QWidget):
         self.lbl_filename       = QLabel("Filename: —")
         self.lbl_axis_time      = QLabel("Axis: —")
         self.lbl_prague_time    = QLabel("Prague Time: —")
+        self.lbl_ref_status     = QLabel("No ref.")
         self.lbl_scan_progress  = QLabel("")
         for lbl in [self.lbl_index, self.lbl_selected_range, self.lbl_filename,
-                    self.lbl_axis_time, self.lbl_prague_time, self.lbl_scan_progress]:
+                    self.lbl_axis_time, self.lbl_prague_time, self.lbl_ref_status,
+                    self.lbl_scan_progress]:
             lbl.setWordWrap(True)
             lbl.setStyleSheet(info_style)
+        self.lbl_ref_status.setStyleSheet("font-size: 10px; color: #666; padding: 1px 0;")
         self.lbl_selected_range.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; padding: 1px 0;")
         self.prog = QProgressBar(); self.prog.setVisible(False)
         self.prog.setRange(0, 0); self.prog.setTextVisible(False)
@@ -5775,7 +5788,8 @@ class Viewer(QWidget):
         info_title_row.addWidget(self._online_dot_top)
         ilay.addLayout(info_title_row)
         for lbl in [self.lbl_index, self.lbl_selected_range, self.lbl_filename,
-                    self.lbl_axis_time, self.lbl_prague_time, self.lbl_scan_progress]:
+                    self.lbl_axis_time, self.lbl_prague_time, self.lbl_ref_status,
+                    self.lbl_scan_progress]:
             ilay.addWidget(lbl)
         ilay.addWidget(self.prog)
         ilay.addWidget(self.btn_cancel_scan)
@@ -5918,6 +5932,11 @@ class Viewer(QWidget):
         lay.addRow("Square color:", square_color_btn)
         lay.addRow("Square thickness:", square_thick_sb)
 
+        from PySide6.QtWidgets import QCheckBox as _QCB
+        cb_all_cams = _QCB("Apply to all cameras")
+        cb_all_cams.setChecked(False)
+        lay.addRow("", cb_all_cams)
+
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -5932,18 +5951,28 @@ class Viewer(QWidget):
             self._overlay_circle_thick = circle_thick_sb.value()
             self._overlay_square_color = square_color_btn._color
             self._overlay_square_thick = square_thick_sb.value()
-            # Propaguj do ImageView
-            self._apply_overlay_settings()
-            self.img_view.update()
+            self._apply_overlay_settings(all_cams=cb_all_cams.isChecked())
 
-    def _apply_overlay_settings(self):
-        self.img_view.cross_size      = self._overlay_cross_size
-        self.img_view.cross_thickness = self._overlay_cross_thick
-        self.img_view.cross_color     = self._overlay_cross_color
-        self.img_view.circle_color    = self._overlay_circle_color
-        self.img_view.circle_thick    = self._overlay_circle_thick
-        self.img_view.square_color    = self._overlay_square_color
-        self.img_view.square_thick    = self._overlay_square_thick
+    def _apply_overlay_settings(self, all_cams: bool = False):
+        def _apply_to_iv(iv):
+            iv.cross_size      = self._overlay_cross_size
+            iv.cross_thickness = self._overlay_cross_thick
+            iv.cross_color     = self._overlay_cross_color
+            iv.circle_color    = self._overlay_circle_color
+            iv.circle_thick    = self._overlay_circle_thick
+            iv.square_color    = self._overlay_square_color
+            iv.square_thick    = self._overlay_square_thick
+            iv.update()
+
+        _apply_to_iv(self.img_view)
+        if self._is_multi_cam():
+            if all_cams:
+                for cv in self._multi_grid._cam_views:
+                    _apply_to_iv(cv.img_view)
+            else:
+                sel_iv = self._multi_grid.selected_img_view()
+                if sel_iv is not None:
+                    _apply_to_iv(sel_iv)
 
     # ================================================================ PV VALUES
     def _open_pv_config(self):
@@ -6027,10 +6056,14 @@ class Viewer(QWidget):
         self._pv_fetch_gen += 1
         gen = self._pv_fetch_gen
         names  = list(self._pv_enabled)
-        # Mark all as loading
+        # Mark as loading only on first fetch (no known value yet); keep last known value during refresh
+        changed = False
         for name in names:
-            self._pv_values[name] = "…"
-        self._pv_rebuild_table()
+            if name not in self._pv_values:
+                self._pv_values[name] = "…"
+                changed = True
+        if changed:
+            self._pv_rebuild_table()
 
         def _fetch_one(name):
             channel = PV_CHANNEL_MAP.get(name)
@@ -6116,6 +6149,7 @@ class Viewer(QWidget):
 
         overlay_multi = getattr(self, "_pv_overlay_multi", None)
         if overlay_multi is not None and self._is_multi_cam():
+            overlay_multi.raise_()
             overlay_multi.update_values(rows)
             overlay_multi.ensure_inside_parent()
         elif overlay_multi is not None:
@@ -6176,6 +6210,10 @@ class Viewer(QWidget):
             self.cb_square.blockSignals(False)
             self._refresh_draw_btns()
 
+        if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
+                and hasattr(self, '_run_spatial_contrast')):
+            self._run_spatial_contrast()
+
     def _on_cam_label_size_changed(self, px: int):
         self._multi_grid.set_label_font_size(px)
         self.img_view.cam_label_font_px = px
@@ -6230,10 +6268,17 @@ class Viewer(QWidget):
         def _update_tickbar_offset():
             if self._per_cam_rows:
                 row0 = self._per_cam_rows[0]
-                # Map slider left edge from row coords to tickbar coords
-                row_in_tickbar = self.tickbar.mapFromGlobal(
-                    row0.mapToGlobal(row0._slider.pos()))
-                offset = max(0, row_in_tickbar.x())
+                sl = row0._slider
+                # Use QStyle to find where value=0 sits in pixel coords (accounts for handle size)
+                from PySide6.QtWidgets import QStyleOptionSlider
+                opt = QStyleOptionSlider()
+                sl.initStyleOption(opt)
+                track_px = sl.style().sliderPositionFromValue(
+                    sl.minimum(), sl.maximum(), 0, sl.width() - 1, False)
+                # Map that pixel position to tickbar coords
+                pt = row0.mapToGlobal(sl.pos())
+                pt.setX(pt.x() + track_px)
+                offset = max(0, self.tickbar.mapFromGlobal(pt).x())
                 self.tickbar.set_left_offset(offset)
         QTimer.singleShot(0, _update_tickbar_offset)
 
@@ -6388,31 +6433,33 @@ class Viewer(QWidget):
         self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
 
     def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
-        """Synchronizuje slave kamery na nejbližší timestamp k master_ts_ns.
-        Preferuje snímky v minulosti; povoluje max 100ms do budoucnosti."""
-        _100MS = 220_000_000  # 0.22 s v ns
+        """Synchronizuje slave kamery na master_ts_ns.
+        Vybere nejbližší snímek (vlevo nebo vpravo) v rámci 0.4s.
+        Pokud žádný není v limitu, slave kameru nepřekresluje."""
+        SLAVE_SYNC_MAX_NS = 400_000_000  # 0.4 s
         for i, row in enumerate(self._per_cam_rows):
             if i == master_cam:
                 continue
             cam_ts = self._cam_ts[i] if i < len(self._cam_ts) else []
             if not cam_ts:
                 continue
-            # bisect_right dá index prvního ts > master_ts_ns
+            # Kandidáti: největší <= master a nejmenší > master
             pos = bisect.bisect_right(cam_ts, master_ts_ns)
-            # candidate vlevo (minulost nebo přesná shoda)
-            pos_left  = max(0, pos - 1)
-            # candidate vpravo (budoucnost)
-            pos_right = min(len(cam_ts) - 1, pos)
-            ts_left  = cam_ts[pos_left]
-            ts_right = cam_ts[pos_right]
-            # Vezmi pravý jen pokud je <= 100ms v budoucnosti a blíže než levý
-            if (ts_right > master_ts_ns and
-                    ts_right - master_ts_ns <= _100MS and
-                    abs(ts_right - master_ts_ns) < abs(master_ts_ns - ts_left)):
-                best_pos = pos_right
-            else:
-                best_pos = pos_left
-            slave_ts = cam_ts[best_pos]
+            left_idx  = pos - 1
+            right_idx = pos
+            best_idx = None
+            best_diff = SLAVE_SYNC_MAX_NS + 1
+            if 0 <= left_idx < len(cam_ts):
+                d = master_ts_ns - cam_ts[left_idx]
+                if d < best_diff:
+                    best_diff = d; best_idx = left_idx
+            if right_idx < len(cam_ts):
+                d = cam_ts[right_idx] - master_ts_ns
+                if d < best_diff:
+                    best_diff = d; best_idx = right_idx
+            if best_idx is None:
+                continue  # žádný snímek v limitu — nech slave beze změny
+            slave_ts = cam_ts[best_idx]
             sv = self._per_cam_ts_to_slider(i, slave_ts)
             row.set_value(sv)
             self._per_cam_display_one(i, slave_ts)
@@ -6554,7 +6601,7 @@ class Viewer(QWidget):
         self._online_dot_top.setStyleSheet(f"font-size: 14px; color: {color};")
 
     def _online_poll(self):
-        """Voláno každých 300ms."""
+        """Voláno každých 200ms."""
         if self._is_multi_cam():
             if not self._cam_folder_lists and not self._cam_folders:
                 return
@@ -6584,6 +6631,14 @@ class Viewer(QWidget):
             self.items = self.items + new_items
             self.ts_list = self.ts_list + [it.ts_ns for it in new_items]
 
+            # Cap to ONLINE_MAX_ITEMS — drop oldest frames to prevent unbounded growth
+            if len(self.items) > ONLINE_MAX_ITEMS:
+                trim = len(self.items) - ONLINE_MAX_ITEMS
+                self.items = self.items[trim:]
+                self.ts_list = self.ts_list[trim:]
+                if self.current_idx is not None:
+                    self.current_idx = max(0, self.current_idx - trim)
+
             # Rozšiř osu pokud nové snímky přesahují
             ts_max = self.ts_list[-1]
             if ts_max > self.axis_max_ns:
@@ -6598,8 +6653,13 @@ class Viewer(QWidget):
             self.lbl_index.setText(
                 f"{(self.current_idx or 0) + 1} / {len(self.items)}")
 
-            if self._auto_follow:
-                last_idx = len(self.items) - 1
+            last_idx = len(self.items) - 1
+            # Show newest frame if: auto-follow is on, OR slider was already at the end
+            was_at_end = (
+                self.current_idx is not None and
+                self.current_idx >= last_idx - len(new_items)
+            )
+            if self._auto_follow or was_at_end:
                 self._display_exact_index(
                     last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
@@ -6607,7 +6667,7 @@ class Viewer(QWidget):
         class _PollSignals2(QObject):
             found = Signal(list, list)  # (new_items, new_folders)
 
-        sig2 = _PollSignals2(self)
+        sig2 = _PollSignals2()
 
         def on_found_with_folders(new_items, new_folders):
             # Register newly discovered hour-folders so future polls scan them too
@@ -6631,17 +6691,17 @@ class Viewer(QWidget):
                 known = set(self._folders)
                 for folder in self._folders:
                     try:
-                        with os.scandir(folder) as it:
-                            for e in it:
-                                if not e.is_file():
-                                    continue
-                                p = Path(e.path)
-                                if p.suffix.lower() not in IMG_EXT:
-                                    continue
-                                ts_ns = parse_unix_ns_from_name(p)
-                                if ts_ns is None or ts_ns <= self._cutoff:
-                                    continue
-                                new_items.append(Item(p, ts_ns))
+                        folder_path = Path(folder)
+                        for name in os.listdir(folder):
+                            p = folder_path / name
+                            if p.suffix.lower() not in IMG_EXT:
+                                continue
+                            if not p.is_file():
+                                continue
+                            ts_ns = parse_unix_ns_from_name(p)
+                            if ts_ns is None or ts_ns <= self._cutoff:
+                                continue
+                            new_items.append(Item(p, ts_ns))
                     except Exception:
                         pass
 
@@ -6681,17 +6741,17 @@ class Viewer(QWidget):
                                 new_folders.append(candidate)
                                 known.add(candidate)
                                 try:
-                                    with os.scandir(candidate) as it2:
-                                        for e in it2:
-                                            if not e.is_file():
-                                                continue
-                                            p = Path(e.path)
-                                            if p.suffix.lower() not in IMG_EXT:
-                                                continue
-                                            ts_ns = parse_unix_ns_from_name(p)
-                                            if ts_ns is None or ts_ns <= self._cutoff:
-                                                continue
-                                            new_items.append(Item(p, ts_ns))
+                                    cand_path = Path(candidate)
+                                    for name in os.listdir(candidate):
+                                        p = cand_path / name
+                                        if p.suffix.lower() not in IMG_EXT:
+                                            continue
+                                        if not p.is_file():
+                                            continue
+                                        ts_ns = parse_unix_ns_from_name(p)
+                                        if ts_ns is None or ts_ns <= self._cutoff:
+                                            continue
+                                        new_items.append(Item(p, ts_ns))
                                 except Exception:
                                     pass
                             else:
@@ -6701,6 +6761,7 @@ class Viewer(QWidget):
 
                 self._sig.found.emit(new_items, new_folders)
 
+        self._poll_sig2 = sig2  # keep alive until next tick (no-parent QObject needs explicit ref)
         task = _PollTask(folders, cutoff_ns, sig2)
         self.scan_pool.start(task)
 
@@ -6727,7 +6788,7 @@ class Viewer(QWidget):
             cutoff   = poll_max_ts[cam_i] if cam_i < len(poll_max_ts) else 0
             cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else ""
 
-            sig = _CamPollSignals(self)
+            sig = _CamPollSignals()
             self._cam_poll_sigs[cam_i] = sig  # keep reference so it isn't GC'd
 
             def make_callback(ci, g):
@@ -6743,6 +6804,13 @@ class Viewer(QWidget):
                         return
                     self._cam_items[cam_idx].extend(new_items)
                     self._cam_ts[cam_idx].extend(it.ts_ns for it in new_items)
+                    # Cap per-camera list to ONLINE_MAX_ITEMS to prevent unbounded growth
+                    if len(self._cam_items[cam_idx]) > ONLINE_MAX_ITEMS:
+                        trim = len(self._cam_items[cam_idx]) - ONLINE_MAX_ITEMS
+                        self._cam_items[cam_idx] = self._cam_items[cam_idx][trim:]
+                        self._cam_ts[cam_idx]    = self._cam_ts[cam_idx][trim:]
+                        if hasattr(self, '_cam_current_idx') and cam_idx < len(self._cam_current_idx):
+                            self._cam_current_idx[cam_idx] = max(0, self._cam_current_idx[cam_idx] - trim)
                     if cam_idx < len(self._cam_poll_max_ts):
                         self._cam_poll_max_ts[cam_idx] = self._cam_ts[cam_idx][-1]
                     self._online_last_new_ns = time.time()
@@ -6753,26 +6821,28 @@ class Viewer(QWidget):
                     )
                     self.lbl_scan_progress.setText(cam_lines)
                     self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
-                    if self._auto_follow:
-                        # Auto-follow: show each camera's own latest frame independently
-                        cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
-                        if cam_ts_now:
-                            latest_frame = len(cam_ts_now) - 1
-                            latest_ts = cam_ts_now[latest_frame]
+                    cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+                    if cam_ts_now:
+                        latest_frame = len(cam_ts_now) - 1
+                        latest_ts    = cam_ts_now[latest_frame]
+                        # Show latest frame if: auto-follow is on, OR the slider was already
+                        # at the newest frame before this poll (i.e. user is watching live).
+                        was_at_end = (
+                            self.current_idx is not None and
+                            self.items and
+                            self.current_idx >= len(self.items) - 1 - len(new_items)
+                        )
+                        if self._auto_follow or was_at_end:
                             self._per_cam_display_one(cam_idx, latest_ts)
-                            # Update this camera's per-cam slider to latest position
                             if cam_idx < len(self._per_cam_rows):
                                 sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
                                 self._per_cam_rows[cam_idx].set_value(sv)
-                            # Update tickbar cursor from master camera
                             if cam_idx == self._per_cam_master_idx:
                                 self.tickbar.set_cursor(latest_ts)
-                    else:
-                        # Not following — just refresh this camera at current slider time
-                        if self.items and self.current_idx is not None:
-                            t_ns = self.items[self.current_idx].ts_ns
-                            cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
-                            if cam_ts_now:
+                        else:
+                            # User is scrubbing history — refresh at current slider time only
+                            if self.items and self.current_idx is not None:
+                                t_ns = self.items[self.current_idx].ts_ns
                                 self._per_cam_display_one(cam_idx, t_ns)
                 return on_cam_found
 
@@ -6839,6 +6909,15 @@ class Viewer(QWidget):
         new_items.sort(key=lambda it: it.ts_ns)
         self.items.extend(new_items)
         self.ts_list.extend(it.ts_ns for it in new_items)
+        # Cap shared timeline to ONLINE_MAX_ITEMS
+        n_cams = len(self._cam_items)
+        shared_cap = ONLINE_MAX_ITEMS * max(1, n_cams)
+        if len(self.items) > shared_cap:
+            trim = len(self.items) - shared_cap
+            self.items = self.items[trim:]
+            self.ts_list = self.ts_list[trim:]
+            if self.current_idx is not None:
+                self.current_idx = max(0, self.current_idx - trim)
         # Extend axis if needed
         ts_max = self.ts_list[-1]
         if ts_max > self.axis_max_ns:
@@ -7335,18 +7414,16 @@ class Viewer(QWidget):
         self.lbl_filename.setText(f"File: range search — {n} images")
         self.lbl_selected_range.setText(f"Range: {n} images (multi-day)")
 
-        # Always use discrete mode for multi-day file lists
-        fake_ts = [i * SLIDER_MAX // max(n - 1, 1) for i in range(n)]
-        self.axis_min_ns = 0
-        self.axis_max_ns = SLIDER_MAX
-        self._real_ts_list = self.ts_list[:]
-        self._fake_ts_map = {self.ts_list[i]: fake_ts[i] for i in range(n)}
-        self.ts_list = fake_ts
-        self.items = [Item(it.path, fake_ts[i]) for i, it in enumerate(items)]
-        self.tickbar.discrete_ticks = fake_ts
+        # Linear real-time axis — axis endpoints = first/last timestamp
+        pad = max((ts_max - ts_min) // 40, 60_000_000_000) if ts_max > ts_min else 60_000_000_000
+        self.axis_min_ns = ts_min - pad
+        self.axis_max_ns = ts_max + pad
+        self._real_ts_list = []
+        self._fake_ts_map = None
+        self.tickbar.discrete_ticks = self.ts_list[:]
         self.tickbar.discrete_tick_labels = [
             f"{_dt_from_ns(ts):%Y-%m-%d %H:%M:%S}"
-            for ts in self._real_ts_list
+            for ts in self.ts_list
         ]
         self.axis_override = None
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
@@ -7358,9 +7435,10 @@ class Viewer(QWidget):
         self.btn_refresh.setEnabled(False)
         self.btn_send_workshop.setEnabled(True)
         self._gen += 1
-        self.slider.blockSignals(True); self.slider.setValue(0); self.slider.blockSignals(False)
-        self.play_time_ns = self.axis_min_ns; self.target_idx = 0
-        self._display_exact_index(0, self.axis_min_ns, update_slider=False)
+        sv = self._time_to_slider_value(ts_min)
+        self.slider.blockSignals(True); self.slider.setValue(sv); self.slider.blockSignals(False)
+        self.play_time_ns = ts_min; self.target_idx = 0
+        self._display_exact_index(0, ts_min, update_slider=False)
 
     def refresh_folder(self):
         """Donačte nové snímky ze stejných složek, zachová pozici a overlay."""
@@ -7706,6 +7784,8 @@ class Viewer(QWidget):
         self._inflight.clear(); self._want_display_req.clear()
         idx = self.current_idx
         self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
+        if getattr(self, '_sc_preview_pixmap', None) is not None:
+            self._run_spatial_contrast()
 
     # ================================================================ SPEED
     def _current_play_pct_per_s(self) -> float:
@@ -7972,27 +8052,10 @@ class Viewer(QWidget):
             # Discrete mode: pokud snímků je málo a osa je příliš velká (různé dny),
             # přepni na index-based osu kde každý snímek má stejnou vzdálenost
             if self._discrete_mode and n <= 200:
-                data_span_ns = ts_max - ts_min
-                FOUR_HOURS_NS = 4 * 3_600_000_000_000
-                if data_span_ns > FOUR_HOURS_NS:
-                    fake_ts = [i * SLIDER_MAX // max(n - 1, 1) for i in range(n)]
-                    self.axis_min_ns = 0
-                    self.axis_max_ns = SLIDER_MAX
-                    # Uložíme původní real timestampy pro display — fake jsou jen pro slider/osu
-                    self._real_ts_list = self.ts_list[:]
-                    self._fake_ts_map = {self.ts_list[i]: fake_ts[i] for i in range(n)}
-                    self.ts_list = fake_ts
-                    self.items = [Item(it.path, fake_ts[i]) for i, it in enumerate(self.items)]
-                    # Ticky jsou na fake pozicích, ale labely jsou skutečné timestampy
-                    self.tickbar.discrete_ticks = fake_ts
-                    self.tickbar.discrete_tick_labels = [
-                        f"{_dt_from_ns(ts):%Y-%m-%d %H:%M:%S}"
-                        for ts in self._real_ts_list
-                    ]
-                    self._real_items_paths = [it.path for it in self.items]
-                else:
-                    self.tickbar.discrete_ticks = self.ts_list[:]
-                    self._fake_ts_map = None
+                self.axis_min_ns = ts_min
+                self.axis_max_ns = ts_max
+                self.tickbar.discrete_ticks = self.ts_list[:]
+                self._fake_ts_map = None
             else:
                 self.tickbar.discrete_ticks = None
                 self.tickbar.discrete_tick_labels = None
@@ -8413,32 +8476,67 @@ class Viewer(QWidget):
 
     # ================================================================ AUTOPLAY
     def play(self):
+        in_per_cam = self._is_multi_cam() and bool(self._per_cam_rows)
+        if in_per_cam:
+            master = self._per_cam_master_idx
+            if master < 0 or master >= len(self._cam_ts) or not self._cam_ts[master]:
+                return
+            cam_ts = self._cam_ts[master]
+            cur = self._cam_current_idx[master] if master < len(self._cam_current_idx) else 0
+            self._play_master_frame = max(0, min(len(cam_ts) - 1, cur))
+            self._play_frame_acc = 0.0
+            self._is_playing = True; self._is_scrubbing = False; self._reset_motion_tracking()
+            self.btn_play.setEnabled(False); self.btn_stop.setEnabled(True); self.play_timer.start()
+            return
         if not self.items: return
-        if self.mark_a_ns is not None:
-            self.play_time_ns = self.mark_a_ns
-            sv = self._time_to_slider_value(self.mark_a_ns)
-            self.slider.blockSignals(True); self.slider.setValue(sv); self.slider.blockSignals(False)
-        elif self.current_idx is not None:
-            # Start from current frame, not from slider position
+        if self.current_idx is not None:
             self.play_time_ns = self.items[self.current_idx].ts_ns
         else:
             self.play_time_ns = self._slider_to_time_ns(self.slider.value())
+            self._display_exact_index(self._time_to_nearest_index(self.play_time_ns), self.play_time_ns, False)
         self._play_frame_acc = 0.0
         self._is_playing = True; self._is_scrubbing = False; self._reset_motion_tracking()
-        if self.current_idx is None:
-            self._display_exact_index(self._time_to_nearest_index(self.play_time_ns), self.play_time_ns, False)
         self.btn_play.setEnabled(False); self.btn_stop.setEnabled(True); self.play_timer.start()
 
     def stop(self):
         self._is_playing = False
         if self.play_timer.isActive(): self.play_timer.stop()
         self.btn_play.setEnabled(bool(self.items)); self.btn_stop.setEnabled(False)
-        if self.items and self.current_idx is not None:
+        in_per_cam = self._is_multi_cam() and bool(self._per_cam_rows)
+        if not in_per_cam and self.items and self.current_idx is not None:
             self._display_exact_index(self.current_idx, self.items[self.current_idx].ts_ns, True)
         self._schedule_prefetch_after_idle(); self._reset_motion_tracking()
 
     def _autoplay_step(self):
-        if not self._is_playing or not self.items: return
+        if not self._is_playing: return
+        in_per_cam = self._is_multi_cam() and bool(self._per_cam_rows)
+        if in_per_cam:
+            master = self._per_cam_master_idx
+            if master < 0 or master >= len(self._cam_ts) or not self._cam_ts[master]:
+                self.stop(); return
+            cam_ts = self._cam_ts[master]
+            n = len(cam_ts)
+            pct = self._current_play_pct_per_s()
+            self._play_frame_acc += (pct / 100.0) * n * (PLAY_TICK_MS / 1000.0)
+            if self._play_frame_acc < 1.0:
+                return
+            skip = min(int(self._play_frame_acc), 50)
+            self._play_frame_acc -= skip
+            cur = getattr(self, '_play_master_frame', self._cam_current_idx[master] if master < len(self._cam_current_idx) else 0)
+            new_frame = cur + skip
+            at_end = new_frame >= n - 1
+            new_frame = min(n - 1, new_frame)
+            self._play_master_frame = new_frame
+            new_ts = cam_ts[new_frame]
+            row = self._per_cam_rows[master]
+            sv = self._per_cam_ts_to_slider(master, new_ts)
+            row.set_value(sv)
+            self._per_cam_display_one(master, new_ts)
+            self._per_cam_sync_slaves(master, new_ts)
+            if at_end:
+                self.stop()
+            return
+        if not self.items: return
         if self.current_idx is None: self.stop(); return
 
         n = len(self.items)
@@ -8563,6 +8661,7 @@ class Viewer(QWidget):
             win.showFullScreen()
         else:
             win.removeEventFilter(self)
+            win.showNormal()
             win.showMaximized()
         # Refresh PV overlay — it may be hidden because its parent (_left_col) was hidden
         QTimer.singleShot(0, self._pv_update_overlay)
@@ -8579,7 +8678,13 @@ class Viewer(QWidget):
     # ================================================================ TIMESTAMPS
     def _save_current_timestamp(self):
         if self.current_idx is None or not self.items: return
-        ts_ns = self.items[self.current_idx].ts_ns
+        idx = self.current_idx
+        if self._real_ts_list and idx < len(self._real_ts_list):
+            ts_ns = self._real_ts_list[idx]
+        elif self._is_multi_cam() and self.play_time_ns is not None:
+            ts_ns = self.play_time_ns
+        else:
+            ts_ns = self.items[idx].ts_ns
         label = fmt_prague_full_from_ns(ts_ns)
 
         # Zkontroluj duplicity (±10ms)
@@ -8813,7 +8918,8 @@ class Viewer(QWidget):
     def _save_pointing_plot(self):
         dst, _ = QFileDialog.getSaveFileName(
             self, "Save pointing plot", "pointing_stability.png",
-            "PNG Images (*.png);;PDF (*.pdf)")
+            "PNG Images (*.png);;PDF (*.pdf)",
+            options=QFileDialog.Option.DontUseNativeDialog)
         if not dst: return
         try:
             self.pointing_panel.save_figure(dst)
@@ -8978,9 +9084,8 @@ class Viewer(QWidget):
         except Exception:
             orig_w, orig_h = self._sc_preview_pixmap.width(), self._sc_preview_pixmap.height()
 
-        existing = self._sc_exclusion_mask if self._sc_exclusion_path == img_path else None
         dlg = _SCExclusionEditor(self._sc_preview_pixmap, (orig_h, orig_w),
-                                  img_path=img_path, existing_mask=existing, parent=self)
+                                  img_path=img_path, existing_mask=None, parent=self)
         dlg.exclusion_confirmed.connect(self._on_sc_exclusion_set)
         dlg.exec()
 
@@ -9301,18 +9406,50 @@ class Viewer(QWidget):
         i1 = min(len(self.items) - 1, self.current_idx + n)
         total = i1 - i0 + 1
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
+            options=QFileDialog.Option.DontUseNativeDialog)
         if not out_dir: return
         self._last_save_dir = Path(out_dir)
         self._show_copy_progress(total, f"Saving {total} frames around current…")
+        iv = self.img_view
+        has_overlay = (self.cb_save_overlay.isChecked()
+                       or iv.show_cross or iv.show_circle or iv.show_square)
+        overlay_params = None
+        if has_overlay:
+            overlay_params = {
+                'show_cross': iv.show_cross,
+                'cross_pos_norm': iv.cross_pos_norm,
+                'cross_size': self._overlay_cross_size,
+                'cross_color': self._overlay_cross_color,
+                'cross_thick': self._overlay_cross_thick,
+                'show_circle': iv.show_circle,
+                'circle_center_norm': iv.circle_center_norm,
+                'circle_rx_norm': iv.circle_rx_norm,
+                'circle_ry_norm': getattr(iv, 'circle_ry_norm', None),
+                'circle_r_norm': getattr(iv, 'circle_r_norm', 0.1),
+                'circle_color': self._overlay_circle_color,
+                'circle_thick': self._overlay_circle_thick,
+                'show_square': iv.show_square,
+                'square_rect_norm': iv.square_rect_norm,
+                'square_color': self._overlay_square_color,
+                'square_thick': self._overlay_square_thick,
+            }
+        if overlay_params is not None:
+            overlay_params['pv_text'] = self._pv_text()
+        elif self._pv_text():
+            overlay_params = {'pv_text': self._pv_text()}
         task = SaveRangeTask(
             self.items[i0:i1+1], Path(out_dir), self._dst_name_with_prague_time,
             gradient_id=self.gradient_cb.currentIndex(),
-            brighten=self.cb_bright.isChecked()
+            brighten=self.cb_bright.isChecked(),
+            overlay_params=overlay_params,
+            energy_map=dict(self._sf_energy_map),
         )
+        task.save_txt = self.cb_save_metadata_txt.isChecked()
         self._save_task = task
         a = self.items[i0].ts_ns
         b = self.items[i1].ts_ns
+        self._save_progress_dlg = self._show_save_range_progress_dialog(total)
         task.signals.progress.connect(self._on_save_progress)
         task.signals.finished.connect(lambda s, e: self._on_save_finished(s, e, a, b))
         self.scan_pool.start(task)
@@ -9331,7 +9468,8 @@ class Viewer(QWidget):
         stem_no_ext = Path(stem).stem
         suggested = str(self._last_save_dir / f"{stem_no_ext}_overlay.png")
         dst, _ = QFileDialog.getSaveFileName(
-            self, "Save image with overlay", suggested, "PNG Images (*.png)")
+            self, "Save image with overlay", suggested, "PNG Images (*.png)",
+            options=QFileDialog.Option.DontUseNativeDialog)
         if not dst: return
         self._last_save_dir = Path(dst).parent
 
@@ -9376,17 +9514,6 @@ class Viewer(QWidget):
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(sx, sy, sw, sh)
-        if self.img_view.energy_text:
-            from PySide6.QtGui import QFont
-            bar_h = max(28, int(h * 0.045))
-            bar_rect = QRect(0, h - bar_h, w, bar_h)
-            painter.fillRect(bar_rect, QColor(255, 255, 255, 220))
-            font = QFont()
-            font.setPixelSize(max(10, bar_h - 12))
-            painter.setFont(font)
-            painter.setPen(QColor(0, 0, 0))
-            painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter,
-                             self.img_view.energy_text)
         painter.end()
 
         energy_text = self._sf_energy_map.get(it.path.name, "")
@@ -9450,17 +9577,18 @@ class Viewer(QWidget):
         """Render and save one camera frame into out_dir. Returns error string or None."""
         has_overlay = iv is not None and (
             iv.show_cross or iv.show_circle or iv.show_square or bool(iv.energy_text))
+        has_annotation_bar = iv is not None and bool(iv.energy_text)
         stem = Path(self._dst_name_with_prague_time(it)).stem
-        ann_suffix = "_annotate" if has_overlay else ""
+        ann_suffix = "_annotated" if has_annotation_bar else ""
 
         if gradient_id == GRADIENT_ID_DEFAULT and not has_overlay:
-            dst = out_dir / f"{stem}_{cam_name}{it.path.suffix}"
+            dst = out_dir / f"{stem}{it.path.suffix}"
             try:
                 shutil.copy2(it.path, dst)
             except Exception as e:
                 return str(e)
         else:
-            dst = out_dir / f"{stem}_{cam_name}{ann_suffix}.png"
+            dst = out_dir / f"{stem}{ann_suffix}.png"
             if has_overlay and iv is not None and iv._pix is not None and not iv._pix.isNull():
                 pix = iv._pix.copy()
                 painter = QPainter(pix)
@@ -9522,7 +9650,8 @@ class Viewer(QWidget):
         if not frames:
             QMessageBox.information(self, "Save", "No frames to save.")
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
+            options=QFileDialog.Option.DontUseNativeDialog)
         if not out_dir:
             return
         out_path = Path(out_dir)
@@ -9587,7 +9716,7 @@ class Viewer(QWidget):
 
             ts_str = fmt_prague_full_from_ns(it.ts_ns) if it.ts_ns else ""
             label = f"{cam_name}  {ts_str}".strip()
-            wk.receive_image(arr8, label)
+            wk.receive_image(arr8, label, source_path=it.path)
         except Exception as e:
             QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
 
@@ -9608,9 +9737,20 @@ class Viewer(QWidget):
         _extra_meta = {"Energy": _energy_str} if _energy_str else None
 
         if gradient_id == GRADIENT_ID_DEFAULT:
+            if not has_overlay and not self.cb_save_original.isChecked():
+                QMessageBox.information(self, "Save skipped",
+                    "Saving skipped: image would be identical to the original.\n"
+                    "Enable 'Save original (unmodified)' or use a palette/overlay to save.")
+                return
             suggested = str(self._last_save_dir / self._dst_name_with_prague_time(it))
-            dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, f"Images (*{it.path.suffix})")
+            dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, f"Images (*{it.path.suffix})",
+                options=QFileDialog.Option.DontUseNativeDialog)
             if not dst: return
+            # Ensure the saved file extension matches the source format
+            _src_ext = it.path.suffix.lower()
+            _dst_p = Path(dst)
+            if _dst_p.suffix.lower() != _src_ext:
+                dst = str(_dst_p.with_suffix(_src_ext))
             self._last_save_dir = Path(dst).parent
             try:
                 shutil.copy2(it.path, Path(dst))
@@ -9620,8 +9760,11 @@ class Viewer(QWidget):
         else:
             stem_no_ext = Path(self._dst_name_with_prague_time(it)).stem
             suggested = str(self._last_save_dir / f"{stem_no_ext}.png")
-            dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, "PNG Images (*.png)")
+            dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, "PNG Images (*.png)",
+                options=QFileDialog.Option.DontUseNativeDialog)
             if not dst: return
+            if Path(dst).suffix.lower() not in (".png",):
+                dst = str(Path(dst).with_suffix(".png"))
             self._last_save_dir = Path(dst).parent
             brighten = self.cb_bright.isChecked()
             img = load_image_scaled(it.path, SCRUB_MAX_SIDE, brighten, gradient_id)
@@ -9634,7 +9777,9 @@ class Viewer(QWidget):
         # Also save annotate version alongside original if any overlay is active
         if has_overlay:
             dst_p = Path(dst)
-            ann_dst = dst_p.parent / f"{dst_p.stem}_annotate.png"
+            _has_bar = bool(self.img_view.energy_text) or bool(self._pv_text())
+            _ann_sfx = "_annotated" if _has_bar else ""
+            ann_dst = dst_p.parent / f"{dst_p.stem}{_ann_sfx}.png"
             # render overlay onto current pixmap
             if self.img_view._pix is not None and not self.img_view._pix.isNull():
                 pix = self.img_view._pix.copy()
@@ -9666,21 +9811,13 @@ class Viewer(QWidget):
                     pen = QPen(self._overlay_square_color); pen.setWidth(max(self._overlay_square_thick, w // 500))
                     painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(sx, sy, sw, sh)
-                if self.img_view.energy_text:
-                    from PySide6.QtGui import QFont as _QFont
-                    bar_h = max(28, int(h * 0.045))
-                    bar_rect = QRect(0, h - bar_h, w, bar_h)
-                    painter.fillRect(bar_rect, QColor(255, 255, 255, 220))
-                    font = _QFont(); font.setPixelSize(max(10, bar_h - 12))
-                    painter.setFont(font); painter.setPen(QColor(0, 0, 0))
-                    painter.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter, self.img_view.energy_text)
                 painter.end()
                 self._pv_save_append_bar(pix, ann_dst)
                 _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt, extra_meta=_extra_meta)
 
         msg = f"Saved.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}"
         if has_overlay:
-            msg += f"\n+ annotate: {Path(dst).parent / (Path(dst).stem + '_annotate.png')}"
+            msg += f"\n+ overlay: {ann_dst.name}"
         QMessageBox.information(self, "Saved", msg)
 
     def _save_multicam_range(self):
@@ -9707,7 +9844,8 @@ class Viewer(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes: return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
+            options=QFileDialog.Option.DontUseNativeDialog)
         if not out_dir: return
         out_path = Path(out_dir)
         self._last_save_dir = out_path
@@ -9746,7 +9884,8 @@ class Viewer(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes: return
-        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir))
+        out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
+            options=QFileDialog.Option.DontUseNativeDialog)
         if not out_dir: return
         self._last_save_dir = Path(out_dir)
         self._show_copy_progress(total, "Saving range…")
@@ -9786,15 +9925,61 @@ class Viewer(QWidget):
         )
         task.save_txt = self.cb_save_metadata_txt.isChecked()
         self._save_task = task
+        self._save_progress_dlg = self._show_save_range_progress_dialog(total)
         task.signals.progress.connect(self._on_save_progress)
         task.signals.finished.connect(lambda s, e: self._on_save_finished(s, e, a, b))
         self.scan_pool.start(task)
 
+    def _show_save_range_progress_dialog(self, total: int) -> "QDialog":
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QProgressBar
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ukládání")
+        dlg.setModal(False)
+        dlg.setMinimumWidth(360)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(f"Ukládání... 0 / {total}")
+        lay.addWidget(lbl)
+        pb = QProgressBar()
+        pb.setRange(0, max(1, total))
+        pb.setValue(0)
+        lay.addWidget(pb)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("Zrušit")
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+        dlg._lbl = lbl
+        dlg._pb = pb
+        dlg._total = total
+
+        def _on_cancel():
+            if self._save_task is not None:
+                self._save_task.setAutoDelete(False)
+                try:
+                    self._save_task.signals.finished.disconnect()
+                except Exception:
+                    pass
+            dlg.close()
+            self._hide_copy_progress()
+
+        btn_cancel.clicked.connect(_on_cancel)
+        dlg.show()
+        return dlg
+
     def _on_save_progress(self, done, total, filename):
         self.prog.setValue(done); self.lbl_filename.setText(f"Saving {done}/{total}  |  {filename}")
+        dlg = getattr(self, '_save_progress_dlg', None)
+        if dlg is not None and dlg.isVisible():
+            dlg._lbl.setText(f"Ukládání... {done} / {total}")
+            dlg._pb.setValue(done)
 
     def _on_save_finished(self, saved, errors, a, b):
         self._save_task = None; self._hide_copy_progress()
+        dlg = getattr(self, '_save_progress_dlg', None)
+        if dlg is not None:
+            dlg.close()
+            self._save_progress_dlg = None
         QMessageBox.information(self, "Save range",
             f"Saved {saved} files.\nErrors: {errors}\n\n"
             f"From: {fmt_prague_full_from_ns(a)}\nTo: {fmt_prague_full_from_ns(b)}")

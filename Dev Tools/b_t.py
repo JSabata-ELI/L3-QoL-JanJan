@@ -130,10 +130,17 @@ class BuilderUI(ttk.Frame):
 
         default_root = APP_DIR.parent
         settings = load_json(SETTINGS_PATH, {})
-        root_str = settings.get("root_folder", str(default_root))
+        cfg = _load_devtools_config()
+        root_str = cfg.get("root_folder") or settings.get("root_folder") or str(default_root)
         self.root_folder = Path(root_str)
 
-        self.dist_root = PROGRAMY_DIST_DIR
+        # Sync root_folder to %APPDATA% so CM reads the same value
+        if not cfg.get("root_folder"):
+            cfg["root_folder"] = str(self.root_folder)
+            _save_devtools_config(cfg)
+
+        # dist is always a sibling of root_folder (programy/dist/)
+        self.dist_root = self.root_folder.parent / "dist"
 
         self.selected_project: Path | None = None
         self.projects_all: list[Path] = []
@@ -213,9 +220,16 @@ class BuilderUI(ttk.Frame):
         if not pys:
             return None
 
-        cand = project_dir / f"{project_dir.name}.py"
-        if cand.exists():
-            return cand
+        # Try exact folder-name match first, then slug variants (spaces→underscores, lowercase)
+        slug = project_dir.name.replace(" ", "_").lower()
+        for stem in (project_dir.name, slug, project_dir.name.replace(" ", "").lower()):
+            cand = project_dir / f"{stem}.py"
+            if cand.exists():
+                return cand
+        # Case-insensitive match against all .py stems
+        for p in pys:
+            if p.stem.replace(" ", "_").lower() == slug:
+                return p
 
         for name in ("main.py", "app.py"):
             cand2 = project_dir / name
@@ -493,11 +507,19 @@ class BuilderUI(ttk.Frame):
             return
 
         self.root_folder = new_root
-        self.dist_root = PROGRAMY_DIST_DIR
+        self.dist_root = self.root_folder.parent / "dist"
         self.root_var.set(str(self.root_folder))
 
+        # Save per-user to %APPDATA% (shared with CM); also keep builder_settings.json as fallback
+        cfg = _load_devtools_config()
+        cfg["root_folder"] = str(self.root_folder)
+        _save_devtools_config(cfg)
         save_json(SETTINGS_PATH, {"root_folder": str(self.root_folder)})
         self._reload_projects(select_first=True)
+        cm = getattr(self, "_cm_ref", None)
+        if cm is not None:
+            cm.programs_root_lbl.configure(text=str(self.root_folder))
+            cm._load_programs()
 
     def _open_set_paths(self):
         from tkinter import filedialog, messagebox
@@ -512,6 +534,7 @@ class BuilderUI(ttk.Frame):
                   padding=(12, 10)).pack()
 
         fields = [
+            ("root_folder", "Programs folder",              "e.g. C:\\...\\Jan_a_Jan"),
             ("scratch",     "Scratch (Software) folder",    "e.g. Z:\\Software"),
             ("sharepoint",  "Sharepoint (QoL) folder",      "e.g. C:\\...\\L3-HAPLS\\General\\QoL"),
         ]
@@ -534,6 +557,19 @@ class BuilderUI(ttk.Frame):
                 var.set(chosen)
 
         def on_save():
+            warnings = []
+            for key, var in vars_.items():
+                val = var.get().strip()
+                if val and Path(val).name.lower() == "dist":
+                    warnings.append(f"  '{key}' path ends with 'dist' folder:\n  {val}\n  Should it be the parent folder?")
+            if warnings:
+                if not messagebox.askyesno(
+                    "Suspicious path",
+                    "Warning — these paths look wrong:\n\n" + "\n\n".join(warnings) +
+                    "\n\nSave anyway?",
+                    parent=win,
+                ):
+                    return
             for key, var in vars_.items():
                 val = var.get().strip()
                 if val:
@@ -541,6 +577,13 @@ class BuilderUI(ttk.Frame):
                 else:
                     cfg.pop(key, None)
             _save_devtools_config(cfg)
+            # Apply root_folder change immediately if it changed
+            new_root_str = cfg.get("root_folder", "").strip()
+            if new_root_str and Path(new_root_str).exists():
+                self.root_folder = Path(new_root_str)
+                self.dist_root = self.root_folder.parent / "dist"
+                self.root_var.set(str(self.root_folder))
+                self._reload_projects(select_first=True)
             win.destroy()
             messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
 
@@ -661,6 +704,28 @@ class BuilderUI(ttk.Frame):
 
         # Výstupní složka pro tuto verzi
         verdir = self.dist_root / p.name / f"v{ver}"
+        if not self.dist_root.exists():
+            import tkinter.messagebox as _mb
+            ans = _mb.askyesnocancel(
+                "dist folder missing",
+                f"Output folder does not exist:\n{self.dist_root}\n\n"
+                "Create it now?\n\n"
+                "Yes = create and continue\n"
+                "No = choose a different folder\n"
+                "Cancel = abort build",
+                parent=self,
+            )
+            if ans is None:
+                return False, f"Build aborted — dist folder not found:\n{self.dist_root}"
+            elif not ans:
+                chosen = filedialog.askdirectory(
+                    title="Select output (dist) folder",
+                    initialdir=str(self.dist_root.parent),
+                )
+                if not chosen:
+                    return False, "Build aborted — no output folder selected."
+                self.dist_root = Path(chosen)
+                verdir = self.dist_root / p.name / f"v{ver}"
         verdir.mkdir(parents=True, exist_ok=True)
 
         # Dočasné složky pro PyInstaller

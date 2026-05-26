@@ -37,7 +37,17 @@ try:
     from zoneinfo import ZoneInfo
     PRAGUE = ZoneInfo("Europe/Prague")
 except ImportError:
-    PRAGUE = None
+    import warnings
+    warnings.warn("zoneinfo not available; falling back to UTC for Prague time", RuntimeWarning)
+    PRAGUE = timezone.utc
+
+import socket as _socket
+
+def _detect_is_lab() -> bool:
+    h = _socket.gethostname().upper()
+    return any(h.startswith(p) for p in ("OPR1", "OPR2", "OPR3", "VIS01", "VIS02"))
+
+_IS_LAB = _detect_is_lab()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 IMAGES_ROOT_BASE = r"//users-L3.tier0.lcs.local"
@@ -46,7 +56,7 @@ RAMPING_CANDIDATES = [
     ("Lab",    r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata"),
     ("Office", r"Z:\Salvation\2026_alldata"),
 ]
-DEFAULT_RAMPING_SOURCE = 0
+DEFAULT_RAMPING_SOURCE = 0 if _IS_LAB else 1
 RAMPING_CSV_GLOB       = "*.csv"
 
 DEFAULT_WINDOW      = 200
@@ -64,7 +74,7 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 CAM_33HZ   = {65, 66, 67, 63, 64, 60, 57, 58, 53, 54, 55, 56,
               31, 26, 22, 21, 25, 13, 14}
 
-FINAL_RE  = re.compile(r"\d{4}_\d{2}_\d{2}--\d{2}_\d{2}_\d{2}__\d{6}$")
+FINAL_RE  = re.compile(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}-\d{3}|\d{4}_\d{2}_\d{2}--\d{2}_\d{2}_\d{2}__\d{6})$")
 SOURCE_RE = re.compile(r"(\d+)$")
 
 # ── ENERGY CSV CONFIG ─────────────────────────────────────────────────────────
@@ -392,6 +402,7 @@ def _make_stepped_lut(stops):
     return lut
 
 GRADIENTS = {
+    "Default":         None,
     "Grayscale":       None,
     "Gradient":        _make_lut([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
     "Hot":             _make_lut([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
@@ -583,11 +594,14 @@ def extract_ns_from_stem(stem: str):
 
 def convert_timestamp(ns: int, use_prague_time: bool) -> str:
     dt_utc = datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc)
-    dt = dt_utc.astimezone(PRAGUE) if (use_prague_time and PRAGUE) else dt_utc
-    return dt.strftime("%Y_%m_%d--%H_%M_%S__%f")
+    dt = dt_utc.astimezone(PRAGUE) if use_prague_time else dt_utc
+    ms = (ns % 1_000_000_000) // 1_000_000
+    return dt.strftime("%Y-%m-%d_%H-%M-%S-") + f"{ms:03d}"
 
 def build_new_name(stem: str, use_prague_time: bool):
-    stem_clean = stem.replace("-_-", "_").replace("_-_", "_")
+    # Normalize separators: cam_-_timestamp or cam-_-timestamp → cam_timestamp
+    stem_clean = re.sub(r"[-_]+-IMG$", "", stem, flags=re.IGNORECASE)
+    stem_clean = re.sub(r"_-_|_-|-_", "_", stem_clean)
     if FINAL_RE.search(stem_clean): return None, "already_converted"
     m = SOURCE_RE.search(stem_clean)
     if not m: return None, "no_trailing_number"
@@ -1722,6 +1736,7 @@ class ImageFinderWidget(QWidget):
         self._preview_cam: str = ""
         self._preview_from_view: bool = False  # True when preview was loaded by View button
         self._tp_dead_channels: set[str] = set()  # channels that timed out → skip next time
+        self._last_save_dir: "Path | None" = None
 
         self._build_ui()
         # Trigger today's load after the event loop starts
@@ -1731,8 +1746,8 @@ class ImageFinderWidget(QWidget):
     def _set_busy(self, busy: bool):
         for btn in [self._btn_view, self._btn_save, self._btn_range,
                     self._btn_open_folder,
-                    self._btn_info, self._btn_compare, self._btn_energy_cols,
-                    self._ramping_cb, self._gradient_cb, self._hour_cb,
+                    self._btn_compare, self._btn_energy_cols,
+                    self._gradient_cb, self._hour_cb,
                     self._lab_time_cb, self._cal]:
             btn.setEnabled(not busy)
     
@@ -1791,16 +1806,6 @@ class ImageFinderWidget(QWidget):
         lw = QWidget(); lw.setMinimumWidth(240)
         ll = QVBoxLayout(lw); ll.setContentsMargins(0, 0, 4, 0); ll.setSpacing(4)
 
-        # ramping source
-        ll.addWidget(_group_label("Ramping source"))
-        rs_row = QHBoxLayout(); rs_row.addWidget(QLabel("Source:"))
-        self._ramping_cb = _NoScrollComboBox()
-        for name, _ in RAMPING_CANDIDATES: self._ramping_cb.addItem(name)
-        self._ramping_cb.setCurrentText(self._ramping_source)
-        self._ramping_cb.currentTextChanged.connect(self._on_ramping_source_change)
-        rs_row.addWidget(self._ramping_cb, 1); ll.addLayout(rs_row)
-
-        ll.addWidget(_hsep())
         ll.addWidget(_group_label("Time"))
 
         # calendar — delegate + styling copied from is.py DatePickerDialog
@@ -1933,7 +1938,7 @@ class ImageFinderWidget(QWidget):
         ll.addWidget(_hsep())
         ll.addWidget(_group_label("Controls"))
 
-        # action buttons
+        # action buttons  row0=[View|Save As]  row1=[Folder|Workshop]
         btn_grid = QGridLayout(); btn_grid.setSpacing(4)
         self._btn_view = QPushButton("View")
         self._btn_view.clicked.connect(self.view_primary_files)
@@ -1942,26 +1947,13 @@ class ImageFinderWidget(QWidget):
         btn_grid.addWidget(self._btn_view, 0, 0)
         btn_grid.addWidget(self._btn_save, 0, 1)
 
-        # Open Folder + Info on one row, compact
         self._btn_open_folder = QPushButton("📁 Folder")
         self._btn_open_folder.clicked.connect(self.open_folder_in_explorer)
-        self._btn_info = QPushButton("Info")
-        self._btn_info.clicked.connect(self.show_info)
-        btn_grid.addWidget(self._btn_open_folder, 1, 0)
-        btn_grid.addWidget(self._btn_info, 1, 1)
-
-        # Auto-open in Slider at the end of the Controls group
-        self._auto_open_cb = QCheckBox("Auto-open in Slider")
-        self._auto_open_cb.setStyleSheet(_CHECKBOX_STYLE)
-        self._auto_open_cb.setToolTip(
-            "After View/Save, switch to Image Slider tab and\n"
-            "load the first selected camera folder.")
-        btn_grid.addWidget(self._auto_open_cb, 3, 0, 1, 2)
-
         self._btn_send_workshop = QPushButton("➤ Workshop")
-        self._btn_send_workshop.setToolTip("Send currently selected image to Workshop tab for editing")
+        self._btn_send_workshop.setToolTip("Send currently selected images to Workshop tab for editing")
         self._btn_send_workshop.clicked.connect(self._send_to_workshop)
-        btn_grid.addWidget(self._btn_send_workshop, 4, 0, 1, 2)
+        btn_grid.addWidget(self._btn_open_folder, 1, 0)
+        btn_grid.addWidget(self._btn_send_workshop, 1, 1)
 
         # Gradient — in Controls so it affects the preview image
         grad_row = QHBoxLayout(); grad_row.addWidget(QLabel("Gradient:"))
@@ -1970,7 +1962,7 @@ class ImageFinderWidget(QWidget):
         self._gradient_cb.setCurrentText("Gradient")
         self._gradient_cb.currentTextChanged.connect(self._on_gradient_changed)
         grad_row.addWidget(self._gradient_cb, 1)
-        btn_grid.addLayout(grad_row, 5, 0, 1, 2)
+        btn_grid.addLayout(grad_row, 2, 0, 1, 2)
 
         ll.addLayout(btn_grid)
 
@@ -2134,7 +2126,8 @@ class ImageFinderWidget(QWidget):
 
         self._log("READY. No network scan on startup.")
         self._log(f"IMAGES_ROOT_BASE = {IMAGES_ROOT_BASE}")
-        self._log(f"Default ramping source = {self._ramping_source}")
+        self._log(f"Network source: {'Lab' if _IS_LAB else 'Office'} (hostname: {_socket.gethostname()})")
+        self._log(f"Ramping source = {self._ramping_source}")
         self._log("Select a day to start ramping auto-hour + load folders.")
 
     # ── TABLE HELPERS ─────────────────────────────────────────────────────────
@@ -2484,13 +2477,6 @@ class ImageFinderWidget(QWidget):
             self._apply_auto_hour_for_selected_day()
         else:
             self._log_selected_datetime_preview()
-
-    def _on_ramping_source_change(self, name: str):
-        self._ramping_source = name
-        self._log(f"RAMPING SOURCE -> {name}")
-        self._ramping_cache.clear(); self._auto_hour_last_day = None; self.RAMPING_ROOT = None
-        if self._user_has_selected_day:
-            self._apply_auto_hour_for_selected_day()
 
     def _on_gradient_changed(self, name: str):
         self._log(f"GRADIENT -> {name}")
@@ -3240,13 +3226,57 @@ class ImageFinderWidget(QWidget):
         folders = [f for f, _ in jobs if f and f.exists() and f.is_dir()]
         if not folders:
             QMessageBox.information(self, "Info", "No folders selected."); return
+
         import subprocess
-        for folder in folders:
-            try:
-                subprocess.Popen(["explorer", str(folder)])
-                self._log(f"EXPLORER: {folder}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"{type(e).__name__}: {e}")
+
+        def _open(folder_list):
+            for folder in folder_list:
+                try:
+                    subprocess.Popen(["explorer", str(folder)])
+                    self._log(f"EXPLORER: {folder}")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"{type(e).__name__}: {e}")
+
+        if len(folders) == 1:
+            _open(folders); return
+
+        # Multiple cameras — ask which to open
+        labels = [extract_display_label(f.name) for f in folders]
+        dlg = QDialog(self); dlg.setWindowTitle("Otevřít složku")
+        dlg_lay = QVBoxLayout(dlg)
+        dlg_lay.addWidget(QLabel("Vyber kameru nebo otevři všechny:"))
+
+        from PySide6.QtWidgets import QRadioButton
+        btn_group = QButtonGroup(dlg)
+        radio_btns = []
+        for lbl in labels:
+            rb = QRadioButton(lbl)
+            btn_group.addButton(rb)
+            dlg_lay.addWidget(rb)
+            radio_btns.append(rb)
+        radio_btns[0].setChecked(True)
+
+        btns_row = QHBoxLayout()
+        btn_selected = QPushButton("Otevřít vybranou")
+        btn_all      = QPushButton("Otevřít všechny")
+        btn_cancel   = QPushButton("Zrušit")
+        btns_row.addWidget(btn_selected)
+        btns_row.addWidget(btn_all)
+        btns_row.addWidget(btn_cancel)
+        dlg_lay.addLayout(btns_row)
+
+        btn_selected.clicked.connect(dlg.accept)
+        btn_all.clicked.connect(lambda: (setattr(dlg, "_open_all", True), dlg.accept()))
+        btn_cancel.clicked.connect(dlg.reject)
+        dlg._open_all = False
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg._open_all:
+            _open(folders)
+        else:
+            checked_idx = next((i for i, rb in enumerate(radio_btns) if rb.isChecked()), 0)
+            _open([folders[checked_idx]])
 
     # ── MULTI-DAY SEARCH ─────────────────────────────────────────────────────
 
@@ -4311,8 +4341,6 @@ class ImageFinderWidget(QWidget):
             def after_energy(results: list):
                 self._energy_results = results
                 self._refresh_energy_info()
-                if self._auto_open_cb.isChecked():
-                    self._open_first_in_slider()
 
             self._energy_info.setPlainText("Loading energy data…")
             self._run_energy_lookup_async(files, on_done=after_energy)
@@ -4352,8 +4380,10 @@ class ImageFinderWidget(QWidget):
             self.primary_files = files
             if not files:
                 QMessageBox.information(self, "Info", "No images selected yet."); return
-            dest = QFileDialog.getExistingDirectory(self, "Select destination folder")
+            initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
+            dest = QFileDialog.getExistingDirectory(self, "Select destination folder", initial_dir)
             if not dest: return
+            self._last_save_dir = Path(dest)
             dest_path = Path(dest)
             copied = 0; skipped_already = 0; skipped_nomatch = 0; annotated = 0
 
@@ -4365,6 +4395,14 @@ class ImageFinderWidget(QWidget):
                 for entry in self._lookup_energy_for_files(files):
                     path, match, before, after = entry[0], entry[1], entry[2], entry[3]
                     energy_map[str(path)] = (match, before, after)
+
+            try:
+                import importlib.util as _ilu_meta, pathlib as _pl_meta
+                _ist_spec = _ilu_meta.spec_from_file_location("is_t", _pl_meta.Path(__file__).parent / "is_t.py")
+                _ist_meta = _ilu_meta.module_from_spec(_ist_spec); _ist_spec.loader.exec_module(_ist_meta)
+                _copy_meta_fn = _ist_meta._copy_metadata_into_png
+            except Exception:
+                _copy_meta_fn = None
 
             for src in files:
                 try:
@@ -4414,10 +4452,17 @@ class ImageFinderWidget(QWidget):
                             _annotate_image_with_energy(
                                 src, dst, match, before, after,
                                 img_ts_ns, self._energy_selected_cols)
+                        if _copy_meta_fn is not None:
+                            try: _copy_meta_fn(src, dst, save_txt=False)
+                            except Exception: pass
                         annotated += 1
                     else:
                         if grad_name != "Grayscale":
-                            try: self._apply_gradient_to_image(PilImage.open(src), src).save(dst)
+                            try:
+                                self._apply_gradient_to_image(PilImage.open(src), src).save(dst)
+                                if _copy_meta_fn is not None:
+                                    try: _copy_meta_fn(src, dst, save_txt=False)
+                                    except Exception: pass
                             except: shutil.copy2(src, dst)
                         else:
                             shutil.copy2(src, dst)
@@ -4434,8 +4479,6 @@ class ImageFinderWidget(QWidget):
             if skipped_nomatch:
                 msg += f"\n- {skipped_nomatch} files had no trailing ns timestamp (kept name)"
             QMessageBox.information(self, "Done", msg)
-            if self._auto_open_cb.isChecked():
-                self._open_first_in_slider()
         self._collect_primary_files_async(after_collect)
 
 
@@ -4450,51 +4493,55 @@ class ImageFinderWidget(QWidget):
 
     # ── MEMORY A/B ────────────────────────────────────────────────────────────
     def _save_to_memory(self, slot: str = None):
-        jobs  = self._snapshot_collect_jobs()
-        total = sum(qty for _, qty in jobs)
-        if total != 1:
-            QMessageBox.information(self, "Memory",
-                "Select exactly 1 image (qty=1 for one camera)."); return
-        if self.primary_files and len(self.primary_files) == 1:
-            self._log("MEMORY: reusing result from last View (no rescan)")
-            self._do_save_to_memory_slot(self.primary_files[0], slot); return
-        def after_collect(files):
-            if not files: QMessageBox.information(self, "Memory", "No image found."); return
-            self._do_save_to_memory_slot(files[0], slot)
-        self._collect_primary_files_async(after_collect)
+        # Use the currently displayed preview image if available
+        if self._preview_paths and 0 <= self._preview_idx < len(self._preview_paths):
+            p = self._preview_paths[self._preview_idx]
+            self._log(f"MEMORY: using currently displayed preview [{self._preview_idx + 1}/{len(self._preview_paths)}]")
+            self._do_save_to_memory_slot(p, slot)
+            return
+        QMessageBox.information(self, "Memory",
+            "No image displayed in preview. Use View first, then navigate to the desired image.")
 
     def _send_to_workshop(self):
-        """Collect primary files and send the first one to Workshop tab."""
+        """Collect primary files and send all of them to Workshop tab."""
         wk = getattr(self, "_workshop_ref", None)
         if wk is None:
             return
 
+        def _send_one(src: Path):
+            from PIL import Image as _PilImg
+            import numpy as _np
+            pil = _PilImg.open(str(src))
+            if pil.mode in ("I", "I;16"):
+                arr_f = _np.array(pil, dtype=_np.float32)
+            elif pil.mode in ("RGB", "RGBA"):
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+            else:
+                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+            img_max_val = _read_img_max_value(src)
+            arr_px_max = float(arr_f.max())
+            if img_max_val is not None and arr_px_max > 0:
+                arr_f = img_max_val * arr_f / arr_px_max
+            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            cam_name = src.parent.name
+            label = f"{cam_name}  |  {src.name}"
+            wk.receive_image(arr8, label, source_path=src)
+
         def after_collect(files):
             if not files:
                 QMessageBox.information(self, "Workshop", "No image selected."); return
-            src = files[0]
-            try:
-                from PIL import Image as _PilImg
-                import numpy as _np
-                pil = _PilImg.open(str(src))
-                if pil.mode in ("I", "I;16"):
-                    arr_f = _np.array(pil, dtype=_np.float32)
-                elif pil.mode in ("RGB", "RGBA"):
-                    arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
-                else:
-                    arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
-
-                img_max_val = _read_img_max_value(src)
-                arr_px_max = float(arr_f.max())
-                if img_max_val is not None and arr_px_max > 0:
-                    arr_f = img_max_val * arr_f / arr_px_max
-                arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
-
-                cam_name = src.parent.name
-                label = f"{cam_name}  |  {src.name}"
-                wk.receive_image(arr8, label)
-            except Exception as e:
-                QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
+            sent = 0
+            errors = []
+            for src in files:
+                try:
+                    _send_one(src)
+                    sent += 1
+                except Exception as e:
+                    errors.append(f"{src.name}: {e}")
+            self._log(f"WORKSHOP: sent {sent} file(s)")
+            if errors:
+                QMessageBox.warning(self, "Workshop",
+                    f"Sent {sent} file(s), {len(errors)} error(s):\n" + "\n".join(errors))
 
         self._collect_primary_files_async(after_collect)
 

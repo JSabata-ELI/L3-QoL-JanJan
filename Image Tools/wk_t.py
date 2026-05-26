@@ -4,6 +4,8 @@
 #           reference diff (pixel-by-pixel), undo/redo, save PNG/TIFF.
 
 import os
+import re
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -102,9 +104,62 @@ def _arr_to_pil(arr: np.ndarray) -> _PilImg.Image:
     return _PilImg.fromarray(arr, mode="RGB")
 
 
+_TZ_PRAGUE = timezone(timedelta(hours=2))
+_NS_RE = re.compile(r"(\d{19})")
+
+
+def _build_save_stem(slot) -> str:
+    """Build a save filename stem: {cam_label}_{YYYY-MM-DD_HH-MM-SS-mmm}."""
+    cam_label = ""
+    ts_dt = None
+
+    # Try to extract from source_path (has ns timestamp in filename)
+    if slot.source_path is not None:
+        p = slot.source_path
+        cam_label = re.sub(r"[-_]+IMG$", "", p.parent.name, flags=re.IGNORECASE).rstrip("-_")
+        m = _NS_RE.search(p.stem)
+        if m:
+            ns = int(m.group(1))
+            ts_dt = datetime.fromtimestamp(ns / 1e9, tz=_TZ_PRAGUE)
+
+    # Fallback: try to parse cam name and Prague ts from label
+    if not ts_dt:
+        label = slot.label
+        # Label formats:
+        #   "CAM_NAME  |  filename_ns.ext"  (if_t / sf_t)
+        #   "CAM_NAME  YYYY-MM-DD HH:MM:SS.mmm"  (is_t)
+        m_ns = _NS_RE.search(label)
+        if m_ns:
+            ns = int(m_ns.group(1))
+            ts_dt = datetime.fromtimestamp(ns / 1e9, tz=_TZ_PRAGUE)
+        else:
+            m_dt = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})", label)
+            if m_dt:
+                try:
+                    ts_dt = datetime.strptime(m_dt.group(1), "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=_TZ_PRAGUE)
+                except ValueError:
+                    pass
+        if not cam_label:
+            # cam name is everything before " |" or before double-space
+            m_cam = re.match(r"^([\w\-]+)", label.strip())
+            if m_cam:
+                cam_label = re.sub(r"[-_]+IMG$", "", m_cam.group(1), flags=re.IGNORECASE).rstrip("-_")
+
+    if not ts_dt:
+        ts_dt = datetime.now(tz=_TZ_PRAGUE)
+    if not cam_label:
+        cam_label = "image"
+
+    ms = ts_dt.microsecond // 1000
+    ts_str = f"{ts_dt:%Y-%m-%d_%H-%M-%S}-{ms:03d}"
+    return f"{cam_label}_{ts_str}"
+
+
 # ─────────────────────────────────────────────────────────────────
 #  WorkshopSlot — holds the edit stack for one image slot
 # ─────────────────────────────────────────────────────────────────
+
+_SLOT_UNDO_LIMIT = 30
 
 @dataclass
 class _WorkshopSlot:
@@ -113,12 +168,11 @@ class _WorkshopSlot:
     current_arr: np.ndarray = field(default_factory=lambda: np.zeros((1, 1, 3), np.uint8))
     undo_stack: list = field(default_factory=list)
     redo_stack: list = field(default_factory=list)
-
-    UNDO_LIMIT = 30
+    source_path: "Path | None" = None
 
     def push_undo(self):
         self.undo_stack.append(self.current_arr.copy())
-        if len(self.undo_stack) > self.UNDO_LIMIT:
+        if len(self.undo_stack) > _SLOT_UNDO_LIMIT:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
 
@@ -615,6 +669,7 @@ class WorkshopWidget(QWidget):
         self._active: int = -1
         self._ref: int = -1
         self._bc_preview_active: bool = False
+        self._last_save_dir: "Path | None" = None
         self._build_ui()
 
     # ─────────────────────────────────────────────────── UI build ─
@@ -869,7 +924,7 @@ class WorkshopWidget(QWidget):
 
     # ─────────────────────────────────────────────── Public API ───
 
-    def receive_image(self, arr: np.ndarray, label: str = ""):
+    def receive_image(self, arr: np.ndarray, label: str = "", source_path: "Path | None" = None):
         """Called by IF/IS/SF — push image into Workshop."""
         if arr.ndim == 2:
             rgb = np.stack([arr, arr, arr], axis=2).copy()
@@ -878,7 +933,8 @@ class WorkshopWidget(QWidget):
         else:
             rgb = arr.copy()
         rgb = rgb.astype(np.uint8)
-        slot = _WorkshopSlot(label=label, source_arr=rgb, current_arr=rgb.copy())
+        slot = _WorkshopSlot(label=label, source_arr=rgb, current_arr=rgb.copy(),
+                             source_path=source_path)
         self._slots.append(slot)
         self._update_slot_list()
         self._activate_slot(len(self._slots) - 1)
@@ -1174,12 +1230,17 @@ class WorkshopWidget(QWidget):
         if self._active < 0:
             QMessageBox.information(self, "No image", "No image to save."); return
         slot = self._slots[self._active]
-        safe = "".join(c if c.isalnum() or c in " _-." else "_" for c in slot.label)
+        safe = _build_save_stem(slot)
+        initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save image", f"{safe}.{fmt}",
+            self, "Save image", str(Path(initial_dir) / f"{safe}.{fmt}"),
             f"{'PNG' if fmt=='png' else 'TIFF'} (*.{fmt})")
         if not path:
             return
+        p = Path(path)
+        if p.suffix.lower() not in (f".{fmt}", ):
+            path = str(p.with_suffix(f".{fmt}"))
+        self._last_save_dir = Path(path).parent
         try:
             _arr_to_pil(slot.current_arr).save(path)
             self._status_lbl.setText(f"Saved: {path}")

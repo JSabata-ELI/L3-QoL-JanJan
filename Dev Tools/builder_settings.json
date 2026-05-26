@@ -1,12 +1,3 @@
 {
-  "root_folder": "",
-  "project_groups": {
-    "Shift planner": "Ignored project",
-    "Calibrations": "Ignored project",
-    "Extractor": "Ignored project",
-    "Internal Builder": "Ignored project",
-    "Screenshots": "Side project",
-    "Announcer": "Side project",
-    "Time Converter": "Side project"
-  }
+  "root_folder": "C:\\Users\\jan.moucka\\OneDrive - ELI Beamlines\\ELI Beamlines\\Python\\programy\\L3-QoL-JanJan"
 }
