@@ -19,9 +19,7 @@
         "L3-PM03-023:Energy",
         "L3-PM03-025:Energy",
         "L3-VCS-LN36:OPEN",
-        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
-        "C03-061-SAM7ANF:TotalPower",
-        "HAPLS-ENER_IN_SAM17_LT5_DIAG2:Energy"
+        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
       ],
       "time_window_hours": 10.0
     },
@@ -32,6 +30,57 @@
         "HAPLS-SPEC_CENT_PD2M1_LT7_DIAG1:SpectralCentroid",
         "HAPLS-SPEC_CENT_PD3M1_LT7_DIAG1:SpectralCentroid",
         "HAPLS-SPEC_CENT_PD4M1_LT7_DIAG1:SpectralCentroid"
+      ],
+      "time_window_hours": null
+    },
+    {
+      "name": "LT7",
+      "pvs": [
+        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "L3-PFWP6-MTR03-1:RawPos",
+        "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy"
+      ],
+      "time_window_hours": null
+    },
+    {
+      "name": "Ramping",
+      "pvs": [
+        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "L3-PFWP6-MTR03-1:RawPos",
+        "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+        "L3-PM03-025:Energy"
+      ],
+      "time_window_hours": null
+    },
+    {
+      "name": "Operation",
+      "pvs": [
+        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "L3-PFWP6-MTR03-1:RawPos",
+        "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+        "L3-PM03-023:Energy",
+        "L3-PM03-025:Energy",
+        "L3-VCS-LN36:OPEN",
+        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
+      ],
+      "time_window_hours": null
+    },
+    {
+      "name": "Tuning",
+      "pvs": [
+        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "L3-PFWP6-MTR03-1:RawPos",
+        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+        "L3-PM03-025:Energy",
+        "L3-PCM3X-MTR03-72:RawPos",
+        "L3-PCM3Y-MTR03-73:RawPos",
+        "L3-PCM2X-MTR03-52:RawPos",
+        "L3-PCM2Y-MTR03-53:RawPos",
+        "L3-PCC1X-MTR03-85:RawPos"
       ],
       "time_window_hours": null
     }

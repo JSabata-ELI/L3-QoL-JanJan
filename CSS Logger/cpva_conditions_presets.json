@@ -1,0 +1,39 @@
+{
+  "presets": [
+    {
+      "name": "ptm1 filter",
+      "conditions": [
+        {
+          "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+          "min": 5.0,
+          "max": 150.0
+        }
+      ]
+    },
+    {
+      "name": "Ramping",
+      "conditions": [
+        {
+          "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+          "min": 5.0,
+          "max": 150.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+          "min": 0.2,
+          "max": 100.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+          "min": 0.021,
+          "max": 1.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+          "min": 0.15,
+          "max": 40.0
+        }
+      ]
+    }
+  ]
+}
