@@ -1,0 +1,14 @@
+{
+  "custom_pvs": [
+    {
+      "name": "PTM1/PAP1",
+      "expr": "B/D",
+      "aliases": {
+        "B": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "D": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy"
+      },
+      "required_pvs": [
+        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy"
+      ],
+      "compiled": 
