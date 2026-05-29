@@ -7,8 +7,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import json
 import time
-import numpy as np
-from PIL import ImageGrab, ImageTk
+from PIL import ImageGrab, ImageTk, ImageChops, ImageStat
 import screeninfo
 import sys
 from pathlib import Path
@@ -495,7 +494,7 @@ class ScreenTracker(tk.Tk):
         img = self._grab()
         if img is None:
             return
-        self.reference = np.array(img, dtype=np.float32)
+        self.reference = img.copy()
         self.tracking = False
         self.changed = False
 
@@ -539,8 +538,8 @@ class ScreenTracker(tk.Tk):
             return
         img = self._grab()
         if img is not None:
-            current = np.array(img, dtype=np.float32)
-            diff = np.mean(np.abs(current - self.reference))
+            stat = ImageStat.Stat(ImageChops.difference(img, self.reference))
+            diff = sum(stat.mean) / len(stat.mean)
             if diff > self.change_threshold.get():
                 self._on_change_detected(diff)
                 return

@@ -201,7 +201,30 @@ def main():
     args = ap.parse_args()
     folder_arg = Path(args.folder) if args.folder else None
 
+    # Nastav AppUserModelID před vytvořením QApplication — Windows použije
+    # toto ID pro groupování v taskbaru a zobrazení správné ikony.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "ELIBeamlines.ImageTools"
+        )
+    except Exception:
+        pass
+
     app = QApplication.instance() or QApplication(sys.argv)
+
+    # Nastav ikonu na úrovni aplikace — platí pro taskbar i alt-tab
+    try:
+        from PySide6.QtGui import QIcon
+        _here = (Path(sys.executable).resolve().parent
+                 if getattr(sys, "frozen", False)
+                 else Path(__file__).resolve().parent)
+        _ico = _here / "icon.ico"
+        if _ico.exists():
+            app.setWindowIcon(QIcon(str(_ico)))
+    except Exception:
+        pass
+
     app.setStyle("Fusion")
     app.setStyleSheet("""
         QWidget      { background: #f3f3f3; color: #111; }

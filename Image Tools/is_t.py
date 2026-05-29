@@ -3977,6 +3977,12 @@ class CameraView(QWidget):
             "padding: 2px 4px; border-radius: 2px;")
         top_row.addWidget(self._ts_lbl, 2)
 
+        self._refresh_dot = QLabel()
+        self._refresh_dot.setFixedSize(12, 12)
+        self._refresh_dot.setStyleSheet("background: #444; border-radius: 6px;")
+        self._refresh_dot.setToolTip("Camera refresh indicator — bliká zeleně pokud se kamera obnovuje")
+        top_row.addWidget(self._refresh_dot)
+
         lay.addLayout(top_row)
 
         self._ref_lbl = QLabel("")
@@ -3995,6 +4001,21 @@ class CameraView(QWidget):
 
     def set_timestamp(self, text: str):
         self._ts_lbl.setText(text)
+
+    def pulse_refresh_dot(self, blink_on: bool, is_main: bool = False):
+        if is_main:
+            color = "#55ff44" if blink_on else "#22aa22"
+            size = 18  # větší kruh pro hlavní kameru
+        else:
+            color = "#22dd22" if blink_on else "#0a5a0a"
+            size = 12
+        half = size // 2
+        self._refresh_dot.setFixedSize(size, size)
+        self._refresh_dot.setStyleSheet(f"background: {color}; border-radius: {half}px;")
+
+    def dim_refresh_dot(self):
+        self._refresh_dot.setFixedSize(12, 12)
+        self._refresh_dot.setStyleSheet("background: #444; border-radius: 6px;")
 
     def set_label_font_size(self, px: int):
         self._name_lbl.setStyleSheet(
@@ -4288,6 +4309,7 @@ class TickBar(QWidget):
         self.mark_b_ns: int | None = None
         self.cursor_ns: int | None = None
         self.left_offset: int = 0   # pixels reserved for slider label prefix (multi-cam)
+        self.slider_handle_hw: int = 1  # half-width of slider handle — pro správné zarovnání cursoru
         self.discrete_ticks: list[int] | None = None
         self.discrete_tick_labels: list[str] | None = None
 
@@ -4303,6 +4325,14 @@ class TickBar(QWidget):
         if self.axis_max_ns <= self.axis_min_ns: return self.left_offset
         frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
         return self.left_offset + int(round(max(0.0, min(1.0, frac)) * (self._axis_w() - 1)))
+
+    def _x_cursor(self, t) -> int:
+        """Pixel x pro cursor — zohledňuje half-width handleru tak, aby cursor ukazoval na střed."""
+        if self.axis_max_ns <= self.axis_min_ns: return self.left_offset
+        hw = self.slider_handle_hw
+        aw_eff = max(1, self._axis_w() - 2 * hw)
+        frac = (t - self.axis_min_ns) / (self.axis_max_ns - self.axis_min_ns)
+        return self.left_offset + hw + int(round(max(0.0, min(1.0, frac)) * aw_eff))
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -4519,9 +4549,9 @@ class TickBar(QWidget):
             if self.mark_a_ns is not None: draw_mark(self.mark_a_ns, QColor(255, 0, 0, 230))
             if self.mark_b_ns is not None: draw_mark(self.mark_b_ns, QColor(0, 0, 255, 230))
 
-        # Cursor line — blue, label at bottom
+        # Cursor line — blue, label at bottom; _x_cursor zohledňuje half-width handleru
         if self.cursor_ns is not None:
-            xc = _x(self.cursor_ns)
+            xc = self._x_cursor(self.cursor_ns)
             pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
             p.drawLine(xc, 0, xc, h)
             label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
@@ -5101,9 +5131,16 @@ class Viewer(QWidget):
         self._auto_follow    = False   # sleduj nejnovější snímek
         self._online_blink_state = False
         self._online_last_new_ns = 0.0  # čas posledního nového snímku
+        self._online_last_poll_ts = 0.0  # čas posledního spuštění polleru
         self._online_blink_timer = QTimer(self)
         self._online_blink_timer.setInterval(600)
         self._online_blink_timer.timeout.connect(self._on_online_blink)
+        # Per-camera last-update timestamps for refresh dots
+        self._cam_last_update_ts: list[float] = []
+        self._cam_dot_blink_state: bool = False
+        self._cam_dot_timer = QTimer(self)
+        self._cam_dot_timer.setInterval(600)
+        self._cam_dot_timer.timeout.connect(self._on_cam_dot_blink)
 
         # ── PV state ─────────────────────────────────────────────────────────
         self._pv_enabled: list[str] = []       # ordered list of selected PV names
@@ -5168,7 +5205,7 @@ class Viewer(QWidget):
             "When enabled, slider jumps to newest image automatically.\n"
             "Disabled automatically when you move the slider.")
         self._btn_auto_follow.toggled.connect(self._on_auto_follow_toggled)
-        row = QHBoxLayout(); row.addWidget(self.btn_open); row.addWidget(self.btn_date)
+        row = QHBoxLayout(); row.addWidget(self.btn_date); row.addWidget(self.btn_open)
         llay.addLayout(row)
         row_ref_follow = QHBoxLayout()
         row_ref_follow.addWidget(self.btn_refresh)
@@ -5765,7 +5802,7 @@ class Viewer(QWidget):
         self.lbl_filename       = QLabel("Filename: —")
         self.lbl_axis_time      = QLabel("Axis: —")
         self.lbl_prague_time    = QLabel("Prague Time: —")
-        self.lbl_ref_status     = QLabel("No ref.")
+        self.lbl_ref_status     = QLabel("")
         self.lbl_scan_progress  = QLabel("")
         for lbl in [self.lbl_index, self.lbl_selected_range, self.lbl_filename,
                     self.lbl_axis_time, self.lbl_prague_time, self.lbl_ref_status,
@@ -5797,6 +5834,7 @@ class Viewer(QWidget):
         self.slider.sliderReleased.connect(self._on_slider_released)
 
         self.tickbar  = TickBar(self)
+        self.tickbar.slider_handle_hw = 1  # per-cam slider handle = 2px → hw = 1
 
         rlay.addWidget(self.slider)
 
@@ -5912,6 +5950,16 @@ class Viewer(QWidget):
         root.addWidget(right, 1)
 
         self._watcher_mode = False
+        self._focus_mode = False
+
+        # QShortcut s ApplicationShortcut — funguje bez ohledu na to, který widget má focus
+        from PySide6.QtGui import QShortcut, QKeySequence
+        _sc_f11 = QShortcut(QKeySequence("F11"), self)
+        _sc_f11.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        _sc_f11.activated.connect(self._toggle_focus_mode)
+        _sc_ctrl_f11 = QShortcut(QKeySequence("Ctrl+F11"), self)
+        _sc_ctrl_f11.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        _sc_ctrl_f11.activated.connect(self._toggle_watcher_mode)
 
         self.scrub_timer = QTimer(self)
         self.scrub_timer.setInterval(SCRUB_INTERVAL_MS)
@@ -6366,6 +6414,8 @@ class Viewer(QWidget):
 
     def _on_multicam_selected(self, idx: int):
         """Kamera v gridu byla vybrána kliknutím."""
+        if self._focus_mode:
+            return   # v focus modu není výběr kamery potřeba
         # Clear draw mode on ALL cameras except the newly selected one,
         # so draw mode never silently stays active on a background camera.
         for i, cv in enumerate(self._multi_grid._cam_views):
@@ -6387,7 +6437,7 @@ class Viewer(QWidget):
             cam_name = self._cam_names[idx] if idx < len(self._cam_names) else f"cam {idx}"
             self.lbl_ref_status.setText(f"Ref set: {_strip_cam_name(cam_name)}")
         else:
-            self.lbl_ref_status.setText("No ref.")
+            self.lbl_ref_status.setText("")
         # Update draw mode checkboxes/buttons to reflect selected camera's state
         iv = self._multi_grid.selected_img_view()
         if iv is not None:
@@ -6684,6 +6734,7 @@ class Viewer(QWidget):
         self._cam_folders = cam_folders
         self._cam_folder_lists = cam_folder_lists if cam_folder_lists is not None else [[f] for f in cam_folders]
         n = len(cam_names)
+        self._cam_last_update_ts = [0.0] * n  # reset refresh dots on camera switch
 
         # Inicializuj per-camera struktury (přeskočit pokud data už jsou z předchozího scanu)
         if reset_items:
@@ -6760,7 +6811,9 @@ class Viewer(QWidget):
         self._online_lbl.setStyleSheet("font-size: 10px; color: #555;")
         self._online_blink_state = False
         self._online_last_new_ns = 0.0
+        self._online_last_poll_ts = 0.0
         self._online_blink_timer.start()
+        self._cam_dot_timer.start()
         self._online_dot.setStyleSheet("font-size: 14px; color: #22cc22;")
         self._online_dot_top.setStyleSheet("font-size: 14px; color: #22cc22;")
         self.lbl_scan_progress.setText("Online mode: active")
@@ -6770,6 +6823,9 @@ class Viewer(QWidget):
         self._online_mode = False
         self._online_timer.stop()
         self._online_blink_timer.stop()
+        self._cam_dot_timer.stop()
+        for cv in self._multi_grid._cam_views:
+            cv.dim_refresh_dot()
         self._btn_auto_follow.blockSignals(True)
         self._btn_auto_follow.setChecked(False)
         self._btn_auto_follow.blockSignals(False)
@@ -6781,11 +6837,11 @@ class Viewer(QWidget):
         self._online_poll_running = False
 
     def _on_online_blink(self):
-        """Blikání kolečka online indikátoru: zelené bliká = OK, červené = problém."""
+        """Blikání kolečka online indikátoru: zelené = poll běží, červené = poll se zasekl."""
         self._online_blink_state = not self._online_blink_state
-        # Pokud jsme déle než 10s bez nového snímku → varování (červená)
-        stale = (self._online_last_new_ns > 0 and
-                 time.time() - self._online_last_new_ns > 10.0)
+        # Červená pouze pokud poll timer neběžel déle než 5 s (zaseknutý poller)
+        stale = (self._online_last_poll_ts > 0 and
+                 time.time() - self._online_last_poll_ts > 5.0)
         if stale:
             color = "#cc2222" if self._online_blink_state else "#660000"
         else:
@@ -6795,6 +6851,7 @@ class Viewer(QWidget):
 
     def _online_poll(self):
         """Voláno každých 200ms."""
+        self._online_last_poll_ts = time.time()
         if self._is_multi_cam():
             if not self._cam_folder_lists and not self._cam_folders:
                 return
@@ -6990,6 +7047,10 @@ class Viewer(QWidget):
                     self._cam_poll_running[cam_idx] = False
                     if g != self._gen:
                         return
+                    # Heartbeat: update refresh dot even if no new frames arrived
+                    while len(self._cam_last_update_ts) <= cam_idx:
+                        self._cam_last_update_ts.append(0.0)
+                    self._cam_last_update_ts[cam_idx] = time.monotonic()
                     if new_folders and cam_idx < len(self._cam_folder_lists):
                         for nf in new_folders:
                             if nf not in self._cam_folder_lists[cam_idx]:
@@ -7011,11 +7072,8 @@ class Viewer(QWidget):
                         self._cam_poll_max_ts[cam_idx] = self._cam_ts[cam_idx][-1]
                     self._online_last_new_ns = time.time()
                     self._extend_shared_timeline_from_cams()
-                    cam_lines = "\n".join(
-                        f"{self._cam_names[i] if i < len(self._cam_names) else f'cam{i}'} - IMG: {len(c)}"
-                        for i, c in enumerate(self._cam_items)
-                    )
-                    self.lbl_scan_progress.setText(cam_lines)
+                    total_frames = sum(len(c) for c in self._cam_items)
+                    self.lbl_scan_progress.setText(f"Frames: {total_frames}")
                     self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
                     cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
                     if cam_ts_now:
@@ -7394,11 +7452,8 @@ class Viewer(QWidget):
 
         self.prog.setVisible(False)
         self.btn_cancel_scan.setVisible(False)
-        cam_lines = "\n".join(
-            f"{self._cam_names[i] if i < len(self._cam_names) else f'cam{i}'} - IMG: {len(c)}"
-            for i, c in enumerate(self._cam_items)
-        )
-        self.lbl_scan_progress.setText(cam_lines)
+        total_frames = sum(len(c) for c in self._cam_items)
+        self.lbl_scan_progress.setText(f"Frames: {total_frames}")
         self.lbl_index.setText(f"1 / {len(self.items)}")
 
         # Zobraz vždy poslední (nejnovější) snímek — ráno bývají kamery bez dat
@@ -7555,13 +7610,15 @@ class Viewer(QWidget):
     def auto_start_online(self):
         """
         Called once on first Slider tab activation.
-        Opens the Time window dialog pre-configured for online mode / current hour,
-        exactly as if the user clicked 'Time window' on a fresh start.
+        Opens Time window dialog; if accepted on first-ever open, auto-opens Camera picker.
         """
-        # If data is already loaded (e.g. launched with --folder arg), do nothing.
         if self.items or self._cam_items:
             return
+        is_first_open = self.last_pick_hour_from is None
         self.open_by_date()
+        # Po prvním přijetí Time window → automaticky otevři Camera picker
+        if is_first_open and self.last_pick_hour_from is not None:
+            QTimer.singleShot(150, self.open_folder)
 
     def open_folder_path(self, folder: Path):
         if not folder or not folder.exists() or not folder.is_dir():
@@ -7691,11 +7748,8 @@ class Viewer(QWidget):
             if not any_new:
                 return
             self._extend_shared_timeline_from_cams()
-            cam_lines = "\n".join(
-                f"{self._cam_names[i] if i < len(self._cam_names) else f'cam{i}'} - IMG: {len(c)}"
-                for i, c in enumerate(self._cam_items)
-            )
-            self.lbl_scan_progress.setText(cam_lines)
+            total_frames = sum(len(c) for c in self._cam_items)
+            self.lbl_scan_progress.setText(f"Frames: {total_frames}")
             self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
             if self.current_idx is not None:
                 self._display_multicam_index(self.current_idx, update_slider=True)
@@ -8058,12 +8112,7 @@ class Viewer(QWidget):
     def _set_info_for(self, idx, axis_time_ns):
         it = self.items[idx]
         if self._is_multi_cam() and self._cam_items:
-            counts = "\n".join(
-                f"{self._cam_names[i] if i < len(self._cam_names) else f'cam{i}'}: "
-                f"{len(c)}"
-                for i, c in enumerate(self._cam_items)
-            )
-            self.lbl_filename.setText(counts)
+            self.lbl_filename.setText("")   # scan progress label already shows per-cam counts
             self.lbl_index.setText(f"{idx+1} / {len(self.items)} (merged)")
         else:
             self.lbl_filename.setText(f"File: {it.path.name}")
@@ -8590,6 +8639,22 @@ class Viewer(QWidget):
         if (cam_i < len(self._cam_items) and idx < len(self._cam_items[cam_i])):
             ts = self._cam_items[cam_i][idx].ts_ns
             self._multi_grid.set_cam_timestamp(cam_i, fmt_hhmmss_ms_from_ns(ts))
+        # Track per-camera last update for refresh dot
+        while len(self._cam_last_update_ts) <= cam_i:
+            self._cam_last_update_ts.append(0.0)
+        self._cam_last_update_ts[cam_i] = time.monotonic()
+
+    def _on_cam_dot_blink(self):
+        """Aktualizuje blikající refresh doty u každé kamery."""
+        self._cam_dot_blink_state = not self._cam_dot_blink_state
+        now = time.monotonic()
+        master_i = getattr(self, "_per_cam_master_idx", 0)
+        for i, cv in enumerate(self._multi_grid._cam_views):
+            last = self._cam_last_update_ts[i] if i < len(self._cam_last_update_ts) else 0.0
+            if last > 0 and now - last < 5.0:
+                cv.pulse_refresh_dot(self._cam_dot_blink_state, is_main=(i == master_i))
+            else:
+                cv.dim_refresh_dot()
 
     def _request_display_target(self, idx, axis_time_ns, update_slider):
         max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0
@@ -8819,10 +8884,97 @@ class Viewer(QWidget):
         if event.key() == Qt.Key.Key_Left:  self.step_frame(-1); return
         if event.key() == Qt.Key.Key_Right: self.step_frame(+1); return
         if event.key() == Qt.Key.Key_F11:
-            self._toggle_watcher_mode(); return
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self._toggle_watcher_mode()
+            else:
+                self._toggle_focus_mode()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._focus_mode:
+            self._toggle_focus_mode(); return
         if event.key() == Qt.Key.Key_Escape and self._watcher_mode:
             self._toggle_watcher_mode(); return
         super().keyPressEvent(event)
+
+    @staticmethod
+    def _win32_set_title_bar(hwnd: int, visible: bool):
+        """Schová/ukáže záhlaví a resize border pomocí Win32 API.
+        HWND se nepřebuduje → close button funguje normálně."""
+        try:
+            import ctypes
+            GWL_STYLE    = -16
+            WS_CAPTION   = 0x00C00000  # title bar
+            WS_THICKFRAME = 0x00040000 # resize border (způsobuje viditelné okraje)
+            SWP_FLAGS    = 0x0027      # FRAMECHANGED | NOMOVE | NOSIZE | NOZORDER
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            if visible:
+                style |= WS_CAPTION | WS_THICKFRAME
+            else:
+                style &= ~(WS_CAPTION | WS_THICKFRAME)  # bez záhlaví a bez viditelných okrajů
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+            ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FLAGS)
+        except Exception:
+            pass
+
+    def _toggle_focus_mode(self):
+        """F11: hlavní okno se přemění na plovoucí focus view (bez záhlaví).
+        Záhlaví se skryje přes Win32 API — HWND se neobnoví, křížek funguje.
+        F11 nebo ESC vrátí záhlaví a layout zpět."""
+        self._focus_mode = not self._focus_mode
+        show = not self._focus_mode
+        win = self.window()
+        from PySide6.QtWidgets import QTabWidget, QStatusBar
+
+        # Skryj/ukaž vše co není kamera: levý panel, tab bar, status bar, slidery
+        self._left_col.setVisible(show)
+        in_multi = self._is_multi_cam() and bool(self._per_cam_rows)
+        self.slider.setVisible(show and not in_multi)
+        self.tickbar.setVisible(show)
+        self._per_cam_container.setVisible(show and in_multi)
+        tab_w = win.findChild(QTabWidget)
+        if tab_w is not None:
+            tab_w.tabBar().setVisible(show)
+        sb = win.findChild(QStatusBar)
+        if sb is not None:
+            sb.setVisible(show)
+
+        if self._focus_mode:
+            self._root_layout.setContentsMargins(0, 0, 0, 0)
+            self._root_layout.setSpacing(0)
+            if tab_w is not None:
+                tab_w.setStyleSheet("QTabWidget::pane { border: none; margin: 0; padding: 0; }")
+            win.centralWidget().setContentsMargins(0, 0, 0, 0)
+            self.setContentsMargins(0, 0, 0, 0)
+            self._focus_mode_was_maximized = win.isMaximized() or win.isFullScreen()
+            self._focus_mode_geom = win.saveGeometry()
+            if self._focus_mode_was_maximized:
+                win.showNormal()
+            # Skryj záhlaví přes Win32 — bez přebudování HWND
+            self._win32_set_title_bar(int(win.winId()), visible=False)
+            self._focus_drag_start = None
+            # Nainstaluj eventFilter pro ESC a drag-to-move
+            QApplication.instance().installEventFilter(self)
+            # Resize na ~65 % × 70 % obrazovky
+            screen = win.screen().availableGeometry()
+            fw = int(screen.width()  * 0.65)
+            fh = int(screen.height() * 0.70)
+            win.resize(fw, fh)
+            win.move(screen.center().x() - fw // 2, screen.center().y() - fh // 2)
+        else:
+            self._root_layout.setContentsMargins(8, 8, 8, 8)
+            self._root_layout.setSpacing(8)
+            if tab_w is not None:
+                tab_w.setStyleSheet("")
+            win.centralWidget().setContentsMargins(0, 0, 0, 0)
+            self.setContentsMargins(0, 0, 0, 0)
+            # Vrať záhlaví přes Win32 a odinstaluj event filter
+            self._win32_set_title_bar(int(win.winId()), visible=True)
+            QApplication.instance().removeEventFilter(self)
+            if hasattr(self, "_focus_mode_geom"):
+                win.restoreGeometry(self._focus_mode_geom)
+            if getattr(self, "_focus_mode_was_maximized", False):
+                win.showMaximized()
+
+        QTimer.singleShot(0, self._pv_update_overlay)
 
     def _toggle_watcher_mode(self):
         self._watcher_mode = not self._watcher_mode
@@ -8832,7 +8984,7 @@ class Viewer(QWidget):
         # In multi-cam mode the global slider is replaced by per-cam sliders — don't restore it
         in_multi = self._is_multi_cam() and bool(self._per_cam_rows)
         self.slider.setVisible(show and not in_multi)
-        self.tickbar.setVisible(show and not in_multi)
+        self.tickbar.setVisible(show)           # tickbar vždy viditelný (cursor line)
         self._per_cam_container.setVisible(show and in_multi)
         # Hide/show tab bar and status bar (they live in the main window)
         win = self.window()
@@ -8871,12 +9023,89 @@ class Viewer(QWidget):
         QTimer.singleShot(0, self._pv_update_overlay)
 
     def eventFilter(self, obj, event):
-        from PySide6.QtCore import QEvent
-        if (self._watcher_mode
-                and event.type() == QEvent.Type.KeyPress
-                and event.key() == Qt.Key.Key_Escape):
-            self._toggle_watcher_mode()
-            return True
+        from PySide6.QtCore import QEvent, QRect
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+            if self._focus_mode:
+                self._toggle_focus_mode()
+                return True
+            if self._watcher_mode:
+                self._toggle_watcher_mode()
+                return True
+
+        if not self._focus_mode:
+            return super().eventFilter(obj, event)
+
+        # ── Focus mode: resize at edges, drag in center, consume camera clicks ──
+        _RM = 8   # resize margin in pixels
+        ev_type = event.type()
+        win = self.window()
+
+        if ev_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            gpos = event.globalPosition().toPoint()
+            r = win.geometry()
+            rx = gpos.x() - r.left();  ry = gpos.y() - r.top()
+            nl = rx < _RM;  nt = ry < _RM
+            nr = r.width()  - rx < _RM
+            nb = r.height() - ry < _RM
+            if nl or nt or nr or nb:
+                # Start resize
+                self._focus_resize_edge  = (nl, nt, nr, nb)
+                self._focus_resize_gpos0 = gpos
+                self._focus_resize_rect0 = QRect(r)
+                self._focus_drag_start   = None
+            else:
+                # Start drag (or plain click → consume to suppress camera selection)
+                self._focus_resize_edge = None
+                self._focus_drag_start  = gpos
+            return True   # always consume in focus mode
+
+        elif ev_type == QEvent.Type.MouseMove:
+            gpos = event.globalPosition().toPoint()
+            r = win.geometry()
+            rx = gpos.x() - r.left();  ry = gpos.y() - r.top()
+            nl = rx < _RM;  nt = ry < _RM
+            nr = r.width()  - rx < _RM
+            nb = r.height() - ry < _RM
+
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                edge = getattr(self, '_focus_resize_edge', None)
+                if edge is not None:
+                    # Resize
+                    _nl, _nt, _nr, _nb = edge
+                    r0 = self._focus_resize_rect0
+                    g0 = self._focus_resize_gpos0
+                    dx = gpos.x() - g0.x();  dy = gpos.y() - g0.y()
+                    nr_rect = QRect(r0)
+                    if _nr: nr_rect.setRight(r0.right() + dx)
+                    if _nb: nr_rect.setBottom(r0.bottom() + dy)
+                    if _nl: nr_rect.setLeft(r0.left() + dx)
+                    if _nt: nr_rect.setTop(r0.top() + dy)
+                    win.setGeometry(nr_rect)
+                    return True
+                elif getattr(self, '_focus_drag_start', None) is not None:
+                    # Drag to move
+                    delta = gpos - self._focus_drag_start
+                    if delta.manhattanLength() > 6:
+                        self._focus_drag_start = None
+                        wh = win.windowHandle()
+                        if wh:
+                            wh.startSystemMove()
+                        return True
+            else:
+                # Cursor feedback when hovering edges
+                if nl and nt:   win.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif nr and nb: win.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif nl and nb: win.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif nt and nr: win.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif nl or nr:  win.setCursor(Qt.CursorShape.SizeHorCursor)
+                elif nt or nb:  win.setCursor(Qt.CursorShape.SizeVerCursor)
+                else:           win.setCursor(Qt.CursorShape.ArrowCursor)
+
+        elif ev_type == QEvent.Type.MouseButtonRelease:
+            self._focus_drag_start  = None
+            self._focus_resize_edge = None
+            win.setCursor(Qt.CursorShape.ArrowCursor)
+
         return super().eventFilter(obj, event)
 
     # ================================================================ TIMESTAMPS

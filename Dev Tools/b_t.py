@@ -139,8 +139,9 @@ class BuilderUI(ttk.Frame):
             cfg["root_folder"] = str(self.root_folder)
             _save_devtools_config(cfg)
 
-        # dist is always a sibling of root_folder (programy/dist/)
-        self.dist_root = self.root_folder.parent / "dist"
+        # dist: explicit override in config, or derived as sibling of root_folder
+        dist_override = cfg.get("dist_root")
+        self.dist_root = Path(dist_override) if dist_override else self.root_folder.parent / "dist"
 
         self.selected_project: Path | None = None
         self.projects_all: list[Path] = []
@@ -507,7 +508,9 @@ class BuilderUI(ttk.Frame):
             return
 
         self.root_folder = new_root
-        self.dist_root = self.root_folder.parent / "dist"
+        cfg = _load_devtools_config()
+        dist_override = cfg.get("dist_root")
+        self.dist_root = Path(dist_override) if dist_override else self.root_folder.parent / "dist"
         self.root_var.set(str(self.root_folder))
 
         # Save per-user to %APPDATA% (shared with CM); also keep builder_settings.json as fallback
@@ -535,6 +538,7 @@ class BuilderUI(ttk.Frame):
 
         fields = [
             ("root_folder", "Programs folder",              "e.g. C:\\...\\Jan_a_Jan"),
+            ("dist_root",   "Dist output folder",           "e.g. C:\\Dev\\dist  (leave empty = auto)"),
             ("scratch",     "Scratch (Software) folder",    "e.g. Z:\\Software"),
             ("sharepoint",  "Sharepoint (QoL) folder",      "e.g. C:\\...\\L3-HAPLS\\General\\QoL"),
         ]
@@ -560,7 +564,7 @@ class BuilderUI(ttk.Frame):
             warnings = []
             for key, var in vars_.items():
                 val = var.get().strip()
-                if val and Path(val).name.lower() == "dist":
+                if val and key != "dist_root" and Path(val).name.lower() == "dist":
                     warnings.append(f"  '{key}' path ends with 'dist' folder:\n  {val}\n  Should it be the parent folder?")
             if warnings:
                 if not messagebox.askyesno(
@@ -577,13 +581,14 @@ class BuilderUI(ttk.Frame):
                 else:
                     cfg.pop(key, None)
             _save_devtools_config(cfg)
-            # Apply root_folder change immediately if it changed
+            # Apply root_folder / dist_root changes immediately
             new_root_str = cfg.get("root_folder", "").strip()
             if new_root_str and Path(new_root_str).exists():
                 self.root_folder = Path(new_root_str)
-                self.dist_root = self.root_folder.parent / "dist"
                 self.root_var.set(str(self.root_folder))
                 self._reload_projects(select_first=True)
+            dist_override = cfg.get("dist_root", "").strip()
+            self.dist_root = Path(dist_override) if dist_override else self.root_folder.parent / "dist"
             # Sync CM tab so destinations panel reflects the new paths immediately
             cm = getattr(self, "_cm_ref", None)
             if cm is not None:
@@ -759,6 +764,17 @@ class BuilderUI(ttk.Frame):
                     return False, "Build aborted — no output folder selected."
                 self.dist_root = Path(chosen)
                 verdir = self.dist_root / p.name / f"v{ver}"
+        # Smaž existující verdir před buildem — PyInstaller --noconfirm selže na read-only
+        # souborech (OneDrive je po sync označí jako read-only). Odstraníme je sami.
+        if verdir.exists():
+            def _on_rm_error(func, path, exc_info):
+                import stat as _stat
+                try:
+                    os.chmod(path, _stat.S_IWRITE)
+                    func(path)
+                except Exception:
+                    pass
+            shutil.rmtree(str(verdir), onerror=_on_rm_error)
         verdir.mkdir(parents=True, exist_ok=True)
 
         # Dočasné složky pro PyInstaller
@@ -773,11 +789,34 @@ class BuilderUI(ttk.Frame):
         extra_py_files = [x.resolve() for x in p.glob("*.py") if x.name != main_path.name]
 
         build_cfg = load_json(p / "build_config.json", {})
-        extra_collect_all: list[str] = build_cfg.get("collect_all", [])
-        extra_hidden_imports: list[str] = build_cfg.get("hidden_imports", [])
+        extra_collect_all: list[str]     = list(build_cfg.get("collect_all", []))
+        extra_collect_bins: list[str]    = build_cfg.get("collect_binaries", [])
+        extra_hidden_imports: list[str]  = build_cfg.get("hidden_imports", [])
+        extra_copy_metadata: list[str]   = build_cfg.get("copy_metadata", [])
+        extra_exclude_modules: list[str] = build_cfg.get("exclude_modules", [])
         # Extra data files to copy into the version folder after build
-        # e.g. "extra_files": ["cpva_presets.json"] in build_config.json
         extra_data_files: list[str] = build_cfg.get("extra_files", [])
+
+        # Auto-detect packages with known DLL bundling issues and add --collect-all
+        # so PyInstaller always includes all native libraries (e.g. numpy _umath_linalg).
+        _AUTO_COLLECT = {
+            "numpy":      "numpy",
+            "scipy":      "scipy",
+            "sklearn":    "sklearn",
+            "cv2":        "cv2",
+            "matplotlib": "matplotlib",
+            "pandas":     "pandas",
+        }
+        _import_re = re.compile(r'^\s*(?:import|from)\s+([\w]+)', re.MULTILINE)
+        _detected: set[str] = set()
+        for _f in [main_path] + extra_py_files:
+            try:
+                _detected.update(_import_re.findall(_f.read_text(encoding="utf-8", errors="ignore")))
+            except Exception:
+                pass
+        for _imp, _pkg in _AUTO_COLLECT.items():
+            if _imp in _detected and _pkg not in extra_collect_all:
+                extra_collect_all.append(_pkg)
 
         args = [
             "py", "-m", "PyInstaller",
@@ -795,8 +834,14 @@ class BuilderUI(ttk.Frame):
         ]
         for pkg in extra_collect_all:
             args += ["--collect-all", pkg]
+        for pkg in extra_collect_bins:
+            args += ["--collect-binaries", pkg]
         for imp in extra_hidden_imports:
             args += ["--hidden-import", imp]
+        for pkg in extra_copy_metadata:
+            args += ["--copy-metadata", pkg]
+        for mod in extra_exclude_modules:
+            args += ["--exclude-module", mod]
         for extra in extra_py_files:
             args += ["--add-data", f"{extra};."]
 

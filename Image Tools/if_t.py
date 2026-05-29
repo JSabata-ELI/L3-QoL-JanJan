@@ -507,6 +507,35 @@ class _WeekendDelegate(QStyledItemDelegate):
                 option.palette.ColorRole.ButtonText, QColor("#cc0000"))
 
 
+class _CalBorderDelegate(_WeekendDelegate):
+    """WeekendDelegate + zelený/červený border pro From/To datum výběru."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._from_date: "QDate | None" = None
+        self._to_date:   "QDate | None" = None
+
+    def set_bounds(self, from_date: "QDate | None", to_date: "QDate | None"):
+        self._from_date = from_date
+        self._to_date   = to_date
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        date = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(date, QDate) or not date.isValid():
+            return
+        if date == self._from_date:
+            pen = QPen(QColor("#00bb00")); pen.setWidth(3)
+            painter.save(); painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(option.rect.adjusted(2, 2, -2, -2))
+            painter.restore()
+        elif date == self._to_date:
+            pen = QPen(QColor("#cc0000")); pen.setWidth(3)
+            painter.save(); painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(option.rect.adjusted(2, 2, -2, -2))
+            painter.restore()
+
+
 class _NoScrollCalendar(QCalendarWidget):
     """QCalendarWidget whose internal view ignores mousewheel scrolling."""
 
@@ -4832,7 +4861,7 @@ class _MultiDaySetupDialog(QDialog):
         left.addLayout(range_row)
 
         # Instruction label
-        hint = QLabel("Click to set From, Shift+click to set To")
+        hint = QLabel("Left-click: set From  |  Shift+click: set To  |  Right-click: pin/unpin specific day")
         hint.setStyleSheet("font-size:10px;color:#888;")
         left.addWidget(hint)
 
@@ -4844,10 +4873,6 @@ class _MultiDaySetupDialog(QDialog):
         self._cal.setVerticalHeaderFormat(
             QCalendarWidget.VerticalHeaderFormat.ISOWeekNumbers)
         self._cal.setMinimumWidth(360)
-
-        _cal_view = self._cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if _cal_view:
-            _cal_view.setItemDelegate(_WeekendDelegate(_cal_view))
 
         # Header row: day names — bold, bigger, visible on light background
         hf = QTextCharFormat()
@@ -4902,13 +4927,21 @@ class _MultiDaySetupDialog(QDialog):
         """)
         left.addWidget(self._cal, 1)
 
+        # Install border delegate AFTER setStyleSheet — Qt resets item delegates on style change
+        _cal_view = self._cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
+        self._cal_view = _cal_view
+        if _cal_view:
+            self._border_delegate = _CalBorderDelegate(_cal_view)
+            _cal_view.setItemDelegate(self._border_delegate)
+            _cal_view.viewport().installEventFilter(self)
+
         # Weekday filter
         left.addWidget(_section_label("Days of week"))
         wd_row = QHBoxLayout()
         self._wd_checks: list[QCheckBox] = []
         for i, label in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
             cb = QCheckBox(label)
-            cb.setChecked(i < 5)  # Mon–Fri default
+            cb.setChecked(i == 2)  # Wednesday default
             cb.setStyleSheet(_CHECKBOX_STYLE)
             cb.stateChanged.connect(self._refresh_highlight)
             self._wd_checks.append(cb)
@@ -4961,8 +4994,8 @@ class _MultiDaySetupDialog(QDialog):
         hour_row = QHBoxLayout()
         hour_row.addWidget(QLabel("Start:"))
         self._start_hour_sb = QSpinBox()
-        self._start_hour_sb.setRange(8, 20)
-        self._start_hour_sb.setValue(10)
+        self._start_hour_sb.setRange(0, 23)
+        self._start_hour_sb.setValue(9)
         self._start_hour_sb.setToolTip(
             "Fallback start hour (real Prague time) used when no CSV data found for the day.\n"
             "If CSV data exists, it overrides this.")
@@ -4970,8 +5003,8 @@ class _MultiDaySetupDialog(QDialog):
         hour_row.addSpacing(10)
         hour_row.addWidget(QLabel("Max:"))
         self._max_hour_sb = QSpinBox()
-        self._max_hour_sb.setRange(8, 20)
-        self._max_hour_sb.setValue(18)
+        self._max_hour_sb.setRange(0, 23)
+        self._max_hour_sb.setValue(19)
         hour_row.addWidget(self._max_hour_sb)
         hour_row.addStretch()
         right.addLayout(hour_row)
@@ -4990,6 +5023,7 @@ class _MultiDaySetupDialog(QDialog):
         self._from_qdate = current_qdate.addDays(-14)
         self._to_qdate   = current_qdate
         self._selecting_from = True   # next click sets From; Shift+click sets To
+        self._pinned_days: set = set()  # individually right-clicked dates
 
         self._cal.clicked.connect(self._on_cal_clicked)
         self._cal.setSelectedDate(self._from_qdate)
@@ -5019,23 +5053,35 @@ class _MultiDaySetupDialog(QDialog):
             self._to_qdate.toString("dd.MM.yyyy"))
 
     def _refresh_highlight(self):
-        """Colour all selected days blue, clear everything else."""
-        # Clear all formats first
+        """Colour range days blue, pinned days orange, clear everything else."""
         self._cal.setDateTextFormat(QDate(), QTextCharFormat())
 
         allowed_wd = {i for i, cb in enumerate(self._wd_checks) if cb.isChecked()}
-        fmt_sel = QTextCharFormat()
-        fmt_sel.setBackground(QColor("#3a6fcf"))
-        fmt_sel.setForeground(QColor("#ffffff"))
+        fmt_range = QTextCharFormat()
+        fmt_range.setBackground(QColor("#3a6fcf"))
+        fmt_range.setForeground(QColor("#ffffff"))
+        fmt_pinned = QTextCharFormat()
+        fmt_pinned.setBackground(QColor("#c06000"))
+        fmt_pinned.setForeground(QColor("#ffffff"))
 
-        days = self._compute_days(allowed_wd)
-        for d in days:
-            qd = QDate(d.year, d.month, d.day)
-            self._cal.setDateTextFormat(qd, fmt_sel)
+        range_days = self._compute_range_days(allowed_wd)
+        for d in range_days:
+            self._cal.setDateTextFormat(QDate(d.year, d.month, d.day), fmt_range)
+        for d in self._pinned_days:
+            self._cal.setDateTextFormat(QDate(d.year, d.month, d.day), fmt_pinned)
 
-        self._day_count_lbl.setText(f"{len(days)} days selected")
+        # From/To: border přes delegate (zelený/červený obrys, neclashuje s výběrem dnů)
+        if hasattr(self, "_border_delegate"):
+            self._border_delegate.set_bounds(self._from_qdate, self._to_qdate)
+            if self._cal_view:
+                self._cal_view.viewport().update()
 
-    def _compute_days(self, allowed_wd=None) -> list:
+        total = len(set(range_days) | self._pinned_days)
+        self._day_count_lbl.setText(
+            f"{total} days selected  ({len(range_days)} range + {len(self._pinned_days)} pinned)"
+            if self._pinned_days else f"{total} days selected")
+
+    def _compute_range_days(self, allowed_wd=None) -> list:
         if allowed_wd is None:
             allowed_wd = {i for i, cb in enumerate(self._wd_checks) if cb.isChecked()}
         fd = self._from_qdate
@@ -5049,6 +5095,51 @@ class _MultiDaySetupDialog(QDialog):
                 days.append(cur)
             cur += timedelta(days=1)
         return days
+
+    def _compute_days(self, allowed_wd=None) -> list:
+        return sorted(set(self._compute_range_days(allowed_wd)) | self._pinned_days)
+
+    def _cal_date_at(self, pos) -> "QDate | None":
+        """Convert a viewport position to the calendar QDate at that cell."""
+        if not self._cal_view:
+            return None
+        idx = self._cal_view.indexAt(pos)
+        if not idx.isValid():
+            return None
+        row, col = idx.row(), idx.column()
+        # Qt calendar model layout:
+        #   row 0    = day-name header (Mon/Tue/...) — not a data row
+        #   col 0    = week-number column (ISOWeekNumbers) — not a day column
+        #   col 1..7 = Mon..Sun
+        data_row = row - 1
+        day_col  = col - 1
+        if data_row < 0 or day_col < 0 or day_col > 6:
+            return None
+        first = QDate(self._cal.yearShown(), self._cal.monthShown(), 1)
+        start_offset = first.dayOfWeek() - 1  # Mon=0, Tue=1 … Sun=6
+        d = first.addDays(data_row * 7 + day_col - start_offset)
+        return d if d.isValid() else None
+
+    def _toggle_pinned_day(self, qdate: QDate):
+        from datetime import date as _date
+        d = _date(qdate.year(), qdate.month(), qdate.day())
+        if d in self._pinned_days:
+            self._pinned_days.discard(d)
+        else:
+            self._pinned_days.add(d)
+        self._refresh_highlight()
+
+    def eventFilter(self, obj, event):
+        from PySide6.QtCore import QEvent
+        cal_view = getattr(self, "_cal_view", None)
+        if (cal_view and obj is cal_view.viewport()
+                and event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.RightButton):
+            qdate = self._cal_date_at(event.pos())
+            if qdate is not None:
+                self._toggle_pinned_day(qdate)
+            return True
+        return super().eventFilter(obj, event)
 
     def get_config(self) -> dict:
         cameras = [(fn, lbl, fp)
@@ -5105,6 +5196,7 @@ class MultiDayPreviewWindow(QWidget):
         # (cam_name, date) → list of all QLabel instances (may appear in multiple tabs)
         self._thumb_widgets: dict[tuple, list] = {}
         self._thumb_paths:   dict[tuple, Path] = {}
+        self._thumb_labels:  dict[tuple, list] = {}  # (cam,date) → list[QLabel] for timestamp
         self._try_hour: dict[tuple, int]    = {}
         self._raw_cache: dict[Path, "np.ndarray"] = {}
         self._popup_win: "QWidget | None"   = None
@@ -5260,8 +5352,8 @@ class MultiDayPreviewWindow(QWidget):
         self._lbl_sel = QLabel("0 selected")
         self._lbl_sel.setStyleSheet("color:#888; font-size:11px;")
         row2.addWidget(self._lbl_sel)
-        self._btn_try_again = QPushButton("Try again (next hour)")
-        self._btn_try_again.setToolTip("For selected images, try the next available hour.")
+        self._btn_try_again = QPushButton("Search again")
+        self._btn_try_again.setToolTip("For selected images, search from a chosen hour.")
         self._btn_try_again.clicked.connect(self._try_again_selected)
         row2.addWidget(self._btn_try_again)
 
@@ -5716,7 +5808,7 @@ class MultiDayPreviewWindow(QWidget):
         key = (cam_name, date)
 
         cell = QWidget()
-        cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        cell.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         vl = QVBoxLayout(cell)
         vl.setContentsMargins(4, 4, 4, 4)
         vl.setSpacing(3)
@@ -5752,9 +5844,9 @@ class MultiDayPreviewWindow(QWidget):
                 self._popup_anchor[key] = tv
 
             # Signals
-            def _on_hov_in(_path=path, _tv=tv, _key=key, _cn=cam_name):
+            def _on_hov_in(_tv=tv, _key=key, _cn=cam_name):
                 self._popup_anchor[_key] = _tv
-                self._show_popup(_path, _tv, _cn)
+                self._show_popup(self._thumb_paths.get(_key), _tv, _cn)
 
             def _on_hov_out():
                 self._hide_popup()
@@ -5777,7 +5869,7 @@ class MultiDayPreviewWindow(QWidget):
             def _on_right_click(_cam=cam_name, _date=date, _tv=tv):
                 from PySide6.QtWidgets import QMenu
                 menu = QMenu(self)
-                act_try  = menu.addAction("↻ Try again (next hour)")
+                act_try  = menu.addAction("↻ Search again")
                 act_pick = menu.addAction("📂 Pick image from folder…")
                 chosen = menu.exec(QCursor.pos())
                 if chosen == act_try:
@@ -5805,7 +5897,7 @@ class MultiDayPreviewWindow(QWidget):
             def _ph_ctx(_cam=cam_name, _date=date):
                 from PySide6.QtWidgets import QMenu
                 menu = QMenu(self)
-                act_try  = menu.addAction("↻ Try again (next hour)")
+                act_try  = menu.addAction("↻ Search again")
                 act_pick = menu.addAction("📂 Pick image from folder…")
                 chosen_act = menu.exec(QCursor.pos())
                 if chosen_act == act_try:
@@ -5837,11 +5929,15 @@ class MultiDayPreviewWindow(QWidget):
 
         lbl_txt = QLabel("\n".join(lines))
         lbl_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_txt.setWordWrap(True)
+        lbl_txt.setWordWrap(False)
         lbl_txt.setStyleSheet(
             "font-size:11px; font-weight:600; color:#111; background:#f0f0f0;"
-            "padding:3px 6px; border-radius:3px;")
+            "padding:2px 6px; border-radius:3px;")
         vl.addWidget(lbl_txt)
+        # Track label for timestamp updates after "Search again"
+        self._thumb_labels.setdefault(key, []).append(lbl_txt)
+        # Clamp cell height so grid rows don't stretch to fill empty space
+        cell.setMaximumHeight(sz + lbl_txt.sizeHint().height() + 16)
         return cell
 
     def _search_by_time(self, cam_name: str, date, use_lab: bool):
@@ -5921,14 +6017,25 @@ class MultiDayPreviewWindow(QWidget):
             return
         self._hide_popup()
         sz = self._thumb_size()
-        # Popup = 8× current thumbnail; clamp so it never exceeds 80% of screen
-        screen = QApplication.primaryScreen().geometry()
+        # Použij obrazovku na které je anchor widget (ne vždy primaryScreen)
+        anchor_center = anchor.mapToGlobal(anchor.rect().center())
+        screen_obj = QApplication.screenAt(anchor_center) or QApplication.primaryScreen()
+        screen = screen_obj.availableGeometry()
+        # Popup = 8× thumbnail; max 80 % dostupné obrazovky
         max_popup = min(screen.width(), screen.height()) * 4 // 5
         popup_size = min(int(sz * 8), max_popup)
-        popup_size = max(popup_size, sz * 6)   # at least 6×
+        popup_size = max(popup_size, sz * 6)
         pm = self._render_popup(path, popup_size, cam_name)
         if pm is None:
             return
+        # Přidej bílý border kolem obrázku
+        border = 5
+        pm_bordered = QPixmap(pm.width() + 2 * border, pm.height() + 2 * border)
+        pm_bordered.fill(QColor("#ffffff"))
+        _p = QPainter(pm_bordered)
+        _p.drawPixmap(border, border, pm)
+        _p.end()
+        pm = pm_bordered
         win = QWidget(None, Qt.WindowType.ToolTip |
                       Qt.WindowType.FramelessWindowHint |
                       Qt.WindowType.WindowStaysOnTopHint)
@@ -5937,19 +6044,16 @@ class MultiDayPreviewWindow(QWidget):
         lbl.setPixmap(pm)
         lbl.resize(pm.size())
         win.resize(pm.size())
-        # Anchor to the image label: right edge by default, left edge if near screen right
+        # Pozice: napravo od anchoru, při nedostatku místa nalevo
         anchor_tl = anchor.mapToGlobal(anchor.rect().topLeft())
         anchor_tr = anchor.mapToGlobal(anchor.rect().topRight())
-        # Try right side first
         x = anchor_tr.x() + 4
         y = anchor_tl.y()
         if x + pm.width() > screen.right():
-            # Place on left side
             x = anchor_tl.x() - pm.width() - 4
-        # Clamp vertically
-        if y + pm.height() > screen.bottom():
-            y = screen.bottom() - pm.height() - 4
-        y = max(screen.top(), y)
+        # Clamp na aktuální obrazovku (zabrání přetékání na vedlejší monitor)
+        x = max(screen.left(), min(x, screen.right()  - pm.width()))
+        y = max(screen.top(),  min(y, screen.bottom() - pm.height()))
         win.move(x, y)
         win.show()
         self._popup_win = win
@@ -6292,26 +6396,51 @@ class MultiDayPreviewWindow(QWidget):
     # ── Try again ─────────────────────────────────────────────────────────────
     def _try_again_selected(self):
         if not self._selected:
-            QMessageBox.information(self, "Try again", "Select thumbnails first."); return
+            QMessageBox.information(self, "Search again", "Select thumbnails first."); return
         parent_finder = self.parent()
         if parent_finder is None:
             return
 
         keys = list(self._selected)
-        total = len(keys)
 
-        # Show progress dialog
+        # Determine current/last-tried hours for summary
+        def _current_h(cam_name, date):
+            for d, h, _p, _m, _s in self._results.get(cam_name, []):
+                if d == date:
+                    return h
+            return None
+
+        # Hour picker — one dialog for all selected
+        first_cam, first_date = keys[0]
+        cur_h = _current_h(first_cam, first_date)
+        key0 = (first_cam, first_date)
+        last_tried0 = self._try_hour.get(key0, cur_h if cur_h is not None else -1)
+        default_h = max(0, last_tried0 + 1) if last_tried0 < 23 else 0
+        cur_str = f"{cur_h:02d}:00" if cur_h is not None else "unknown"
+        from PySide6.QtWidgets import QInputDialog
+        chosen_hour, ok = QInputDialog.getInt(
+            self, "Search again",
+            f"Currently showing: {cur_str}  (last tried: {last_tried0:02d}:00)\n"
+            f"Search from hour (applies to all {len(keys)} selected):",
+            default_h, 0, 23)
+        if not ok:
+            return
+
+        total = len(keys)
         prog = QDialog(self)
-        prog.setWindowTitle("Trying next hour…")
-        prog.setMinimumWidth(320)
+        prog.setWindowTitle("Searching…")
+        prog.setMinimumWidth(360)
         prog.setWindowFlags(prog.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
         pv = QVBoxLayout(prog)
         plbl = QLabel("Searching…")
         plbl.setWordWrap(True)
+        hour_lbl = QLabel()
+        hour_lbl.setStyleSheet("font-size:10px; color:#555;")
         pbar = QProgressBar()
         pbar.setRange(0, total)
         pbar.setValue(0)
         pv.addWidget(plbl)
+        pv.addWidget(hour_lbl)
         pv.addWidget(pbar)
         prog.show()
         QApplication.processEvents()
@@ -6322,17 +6451,10 @@ class MultiDayPreviewWindow(QWidget):
             pbar.setValue(idx)
             QApplication.processEvents()
 
-            current_hour = None
-            for d, h, _p, _m, _s in self._results.get(cam_name, []):
-                if d == date:
-                    current_hour = h; break
-
-            key = (cam_name, date)
-            last_tried = self._try_hour.get(key, current_hour if current_hour is not None else -1)
-            next_hour  = last_tried + 1
-
             found = False
-            for real_h in range(next_hour, 24):
+            for real_h in range(chosen_hour, 24):
+                hour_lbl.setText(f"Scanning hour {real_h:02d}:00" + (f"  (next: {real_h+1:02d}:00)" if real_h < 23 else ""))
+                QApplication.processEvents()
                 if PRAGUE is not None:
                     dt_p = datetime(date.year, date.month, date.day, real_h, tzinfo=PRAGUE)
                     folder_h = real_h - int(dt_p.utcoffset().total_seconds() / 3600)
@@ -6345,20 +6467,20 @@ class MultiDayPreviewWindow(QWidget):
                     continue
                 chosen = parent_finder.select_images_from_folder(cam_folder, 1)
                 if chosen:
-                    self._try_hour[key] = real_h
-                    self._update_thumb_result(cam_name, date, key, real_h, chosen[0])
-                    updated.append(f"{cam_name} {date.strftime('%d.%m')}: hour {real_h:02d}:00")
+                    self._try_hour[(cam_name, date)] = real_h
+                    self._update_thumb_result(cam_name, date, (cam_name, date), real_h, chosen[0])
+                    updated.append(f"{cam_name} {date.strftime('%d.%m')}: found {real_h:02d}:00")
                     found = True
                     break
             if not found:
-                updated.append(f"{cam_name} {date.strftime('%d.%m')}: no more hours")
+                updated.append(f"{cam_name} {date.strftime('%d.%m')}: no image from {chosen_hour:02d}:00")
 
         prog.accept()
         if updated:
-            QMessageBox.information(self, "Try again", "\n".join(updated))
+            QMessageBox.information(self, "Search again", "\n".join(updated))
 
     def _try_again_single(self, cam_name: str, date):
-        """Try the next available hour for a single (cam_name, date) cell."""
+        """Search again for a single (cam_name, date) cell — user picks the starting hour."""
         parent_finder = self.parent()
         if parent_finder is None:
             return
@@ -6368,9 +6490,20 @@ class MultiDayPreviewWindow(QWidget):
             if d == date:
                 current_hour = h; break
         last_tried = self._try_hour.get(key, current_hour if current_hour is not None else -1)
-        next_hour  = last_tried + 1
+        default_h  = max(0, last_tried + 1) if last_tried < 23 else 0
+        cur_str    = f"{current_hour:02d}:00" if current_hour is not None else "unknown"
 
-        for real_h in range(next_hour, 24):
+        from PySide6.QtWidgets import QInputDialog
+        chosen_hour, ok = QInputDialog.getInt(
+            self, "Search again",
+            f"{cam_name}  {date.strftime('%d.%m.%Y')}\n"
+            f"Currently showing: {cur_str}  |  Last tried: {last_tried:02d}:00\n"
+            f"Search from hour:",
+            default_h, 0, 23)
+        if not ok:
+            return
+
+        for real_h in range(chosen_hour, 24):
             if PRAGUE is not None:
                 dt_p = datetime(date.year, date.month, date.day, real_h, tzinfo=PRAGUE)
                 folder_h = real_h - int(dt_p.utcoffset().total_seconds() / 3600)
@@ -6386,12 +6519,12 @@ class MultiDayPreviewWindow(QWidget):
                 self._try_hour[key] = real_h
                 self._update_thumb_result(cam_name, date, key, real_h, chosen[0])
                 QMessageBox.information(
-                    self, "Try again",
-                    f"{cam_name}  {date.strftime('%d.%m.%Y')}: found hour {real_h:02d}:00\n{chosen[0].name}")
+                    self, "Search again",
+                    f"{cam_name}  {date.strftime('%d.%m.%Y')}: found {real_h:02d}:00\n{chosen[0].name}")
                 return
         QMessageBox.information(
-            self, "Try again",
-            f"{cam_name}  {date.strftime('%d.%m.%Y')}: no more hours available.")
+            self, "Search again",
+            f"{cam_name}  {date.strftime('%d.%m.%Y')}: no image found from {chosen_hour:02d}:00.")
 
     def _pick_image_single(self, cam_name: str, date):
         """Let user browse and pick any image file for a single cell."""
@@ -6457,6 +6590,15 @@ class MultiDayPreviewWindow(QWidget):
         for tv in self._thumb_views_all.get(key, []):
             tv.setFixedSize(sz, sz)
             tv.set_pixmap(new_pm)
+        # Update timestamp label(s) for this cell
+        ns = extract_ns_from_stem(chosen.stem)
+        if ns is not None:
+            dt_utc = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+            dt_disp = dt_utc.astimezone(PRAGUE) if (not self._use_lab and PRAGUE) else dt_utc
+            ts_str = dt_disp.strftime("%H:%M:%S.") + f"{dt_disp.microsecond // 1000:03d}"
+            new_text = f"{date.strftime('%d.%m.%Y')}  {ts_str}"
+            for lbl in self._thumb_labels.get(key, []):
+                lbl.setText(new_text)
 
 
 # ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────

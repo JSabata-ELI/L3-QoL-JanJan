@@ -57,7 +57,10 @@ def _src_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 def _dist_root() -> Path:
-    """Sibling of programs root: programy/dist/"""
+    cfg = _load_devtools_config()
+    override = cfg.get("dist_root")
+    if override:
+        return Path(override)
     return _programs_root().parent / "dist"
 
 def _internal_builder_dist() -> Path:
