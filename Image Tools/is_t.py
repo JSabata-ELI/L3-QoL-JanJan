@@ -13,6 +13,7 @@ from pathlib import Path
 from collections import OrderedDict
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
+from functools import lru_cache
 try:
     import matplotlib
     if hasattr(matplotlib, 'use'):
@@ -38,12 +39,13 @@ from PySide6.QtWidgets import (
     QLabel, QSlider, QPushButton, QFileDialog, QMessageBox, QProgressBar,
     QComboBox, QCheckBox, QDialog, QCalendarWidget, QDialogButtonBox, QFileSystemModel,
     QSpinBox, QFrame, QSizePolicy, QStyledItemDelegate, QAbstractItemView, QTreeView, QLineEdit,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout, QColorDialog,
 )
 
 # ---------------- CONFIG ----------------
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 TZ_PRAGUE = ZoneInfo("Europe/Prague")
+_NS_19_RE = re.compile(r'\d{19}')
 SLIDER_MAX = 1_000_000
 SCRUB_INTERVAL_MS = 33
 SCRUB_MAX_SIDE = 900
@@ -325,19 +327,20 @@ class Item:
 
 
 def parse_unix_ns_from_name(p: Path) -> int | None:
-    s = p.stem
-    for i in range(len(s) - 18):
-        sub = s[i:i + 19]
-        if sub.isdigit():
-            ts_ns = int(sub)
-            if 946684800_000_000_000 <= ts_ns <= 4102444800_000_000_000:
-                return ts_ns
+    for m in _NS_19_RE.finditer(p.stem):
+        ts_ns = int(m.group())
+        if 946684800_000_000_000 <= ts_ns <= 4102444800_000_000_000:
+            return ts_ns
     return None
 
 
 # ---------------- TIME HELPERS ----------------
+@lru_cache(maxsize=512)
+def _dt_from_sec(sec: int) -> datetime:
+    return datetime.fromtimestamp(sec, tz=TZ_PRAGUE)
+
 def _dt_from_ns(ts_ns: int) -> datetime:
-    return datetime.fromtimestamp(ts_ns // 1_000_000_000, tz=TZ_PRAGUE)
+    return _dt_from_sec(ts_ns // 1_000_000_000)
 
 def fmt_hhmm_from_ns(ts_ns: int) -> str:
     return f"{_dt_from_ns(ts_ns):%H:%M}"
@@ -345,20 +348,17 @@ def fmt_hhmm_from_ns(ts_ns: int) -> str:
 def fmt_hhmmss_ms_from_ns(ts_ns: int) -> str:
     sec = ts_ns // 1_000_000_000
     ms  = (ts_ns % 1_000_000_000) // 1_000_000
-    dt  = datetime.fromtimestamp(sec, tz=TZ_PRAGUE)
-    return f"{dt:%H:%M:%S}.{ms:03d}"
+    return f"{_dt_from_sec(sec):%H:%M:%S}.{ms:03d}"
 
 def fmt_prague_full_from_ns(ts_ns: int) -> str:
     sec = ts_ns // 1_000_000_000
     ms  = (ts_ns % 1_000_000_000) // 1_000_000
-    dt  = datetime.fromtimestamp(sec, tz=TZ_PRAGUE)
-    return f"{dt:%Y-%m-%d %H:%M:%S}.{ms:03d}"
+    return f"{_dt_from_sec(sec):%Y-%m-%d %H:%M:%S}.{ms:03d}"
 
 def prague_stamp_for_filename(ts_ns: int) -> str:
     sec = ts_ns // 1_000_000_000
     ms  = (ts_ns % 1_000_000_000) // 1_000_000
-    dt  = datetime.fromtimestamp(sec, tz=TZ_PRAGUE)
-    return f"{dt:%Y-%m-%d_%H-%M-%S}-{ms:03d}"
+    return f"{_dt_from_sec(sec):%Y-%m-%d_%H-%M-%S}-{ms:03d}"
 
 def replace_unix_ns_with_prague_in_filename(p: Path, ts_ns: int) -> str:
     stamp = prague_stamp_for_filename(ts_ns)
@@ -510,8 +510,8 @@ def _autostretch_gray(img: QImage, p_low: float = 0.1, p_high: float = 99.9) -> 
     ptr = img.bits()
     if hasattr(ptr, "setsize"):
         ptr.setsize(img.sizeInBytes())
-    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, img.bytesPerLine())[:, :w].copy()
-    lo, hi = np.percentile(arr, [p_low, p_high])
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, img.bytesPerLine())[:, :w]
+    lo, hi = np.quantile(arr, [p_low / 100.0, p_high / 100.0])
     if hi <= lo + 2:
         return img
     stretched = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
@@ -2773,17 +2773,15 @@ class CameraPickerDialog(QDialog):
         self._preset_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._preset_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._preset_list.verticalHeader().setVisible(False)
-        self._preset_list.cellDoubleClicked.connect(self._on_preset_load)
+        self._preset_list.itemSelectionChanged.connect(self._on_preset_load)
         right.addWidget(self._preset_list, 1)
 
-        btn_load   = QPushButton("Load")
         btn_save   = QPushButton("Save")
         btn_rename = QPushButton("Rename")
         btn_delete = QPushButton("Delete")
-        for b in (btn_load, btn_save, btn_rename, btn_delete):
+        for b in (btn_save, btn_rename, btn_delete):
             b.setFixedHeight(24)
             right.addWidget(b)
-        btn_load.clicked.connect(self._on_preset_load)
         btn_save.clicked.connect(self._on_preset_save)
         btn_rename.clicked.connect(self._on_preset_rename)
         btn_delete.clicked.connect(self._on_preset_delete)
@@ -3110,6 +3108,12 @@ class ImageView(QWidget):
         # When False: bottom space is reserved and labels drawn below the image.
         self.cam_label_use_overlay: bool = True
 
+        # Zoom: normalized rect (ln, tn, rn, bn) inside the source image, or None = no zoom
+        self._zoom_norm: "tuple[float,float,float,float] | None" = None
+        # Right-click rubber-band state
+        self._rb_start: "QPoint | None" = None
+        self._rb_current: "QPoint | None" = None
+
         self.setMinimumHeight(260)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -3119,6 +3123,14 @@ class ImageView(QWidget):
 
     def clear(self):
         self._pix = None; self._scaled = None; self.update()
+
+    def set_zoom(self, zoom_norm: "tuple[float,float,float,float] | None"):
+        self._zoom_norm = zoom_norm
+        self._scaled = None
+        self.update()
+
+    def reset_zoom(self):
+        self.set_zoom(None)
 
     def _label_bar_h(self) -> int:
         """Height in pixels reserved for the label bar below the image (0 when overlay mode)."""
@@ -3134,10 +3146,18 @@ class ImageView(QWidget):
         if self.width() <= 10 or avail_h <= 10:
             self._scaled = None; return
         target = QSize(self.width(), avail_h)
-        if self._scaled is None or self._scaled.size() != target:
-            self._scaled = self._pix.scaled(
-                target, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation)
+        if self._scaled is not None and self._scaled.size() == target:
+            return
+        src = self._pix
+        if self._zoom_norm is not None:
+            ln, tn, rn, bn = self._zoom_norm
+            pw, ph = src.width(), src.height()
+            cx = int(ln * pw); cy = int(tn * ph)
+            cw = max(1, int((rn - ln) * pw)); ch = max(1, int((bn - tn) * ph))
+            src = src.copy(cx, cy, cw, ch)
+        self._scaled = src.scaled(
+            target, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
 
     def resizeEvent(self, event):
         super().resizeEvent(event); self._scaled = None; self.update()
@@ -3200,6 +3220,13 @@ class ImageView(QWidget):
         return ""
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            ir = self._img_rect()
+            if ir is not None and ir.width() > 0 and ir.height() > 0:
+                self._rb_start = event.position().toPoint()
+                self._rb_current = self._rb_start
+                self.update()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event); return
         ir = self._img_rect()
@@ -3249,6 +3276,10 @@ class ImageView(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._rb_start is not None:
+            self._rb_current = event.position().toPoint()
+            self.update()
+            return
         ir = self._img_rect()
         if ir is None or ir.width() <= 0 or ir.height() <= 0: return
         pos = event.position()
@@ -3367,9 +3398,39 @@ class ImageView(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton and self._rb_start is not None:
+            end = event.position().toPoint()
+            ir = self._img_rect()
+            if ir is not None and ir.width() > 0 and ir.height() > 0:
+                rb = QRect(self._rb_start, end).normalized()
+                rb = rb.intersected(ir)
+                if rb.width() > 4 and rb.height() > 4:
+                    # Convert rubber-band screen rect to normalized source image coords,
+                    # accounting for existing zoom
+                    ln_new = (rb.left() - ir.left()) / ir.width()
+                    tn_new = (rb.top()  - ir.top())  / ir.height()
+                    rn_new = (rb.right()  - ir.left()) / ir.width()
+                    bn_new = (rb.bottom() - ir.top())  / ir.height()
+                    if self._zoom_norm is not None:
+                        zl, zt, zr, zb = self._zoom_norm
+                        zw, zh = zr - zl, zb - zt
+                        ln_new = zl + ln_new * zw
+                        tn_new = zt + tn_new * zh
+                        rn_new = zl + rn_new * zw
+                        bn_new = zt + bn_new * zh
+                    self.set_zoom((
+                        max(0.0, min(1.0, ln_new)), max(0.0, min(1.0, tn_new)),
+                        max(0.0, min(1.0, rn_new)), max(0.0, min(1.0, bn_new))
+                    ))
+            self._rb_start = None
+            self._rb_current = None
+            self.update()
+            return
+        self._rb_start = None
+        self._rb_current = None
         self._drag_handle = ""
         self._drag_start = None
-        super().mouseReleaseEvent(event)  
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -3533,6 +3594,14 @@ class ImageView(QWidget):
                 cx = img_rect.left() + int(nx * img_rect.width())
                 cy = img_rect.top()  + int(ny * img_rect.height())
                 p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+
+        # Zoom rubber-band
+        if self._rb_start is not None and self._rb_current is not None:
+            rb = QRect(self._rb_start, self._rb_current).normalized()
+            pen = QPen(QColor(255, 200, 0, 220)); pen.setWidth(2); pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.setBrush(QBrush(QColor(255, 200, 0, 30)))
+            p.drawRect(rb)
 
         p.end()
 
@@ -4302,11 +4371,14 @@ class TickBar(QWidget):
                 pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
                 p.drawLine(xc, 0, xc, h)
                 label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
-                lw = fm.horizontalAdvance(label) + 6
+                _cf = QFont(self.font()); _cf.setPixelSize(max(1, int(lh * 1.5))); p.setFont(_cf)
+                _cfm = QFontMetrics(_cf); _clh = _cfm.height()
+                lw = _cfm.horizontalAdvance(label) + 6
                 lx = max(lo, min(w - lw, xc - lw // 2))
-                p.fillRect(lx, h - lh - 2, lw, lh + 2, QColor(0, 80, 200, 200))
+                p.fillRect(lx, h - _clh - 2, lw, _clh + 2, QColor(0, 80, 200, 200))
                 p.setPen(QColor(255, 255, 255))
-                p.drawText(lx + 3, h - 2 - fm.descent(), label)
+                p.drawText(lx + 3, h - 2 - _cfm.descent(), label)
+                p.setFont(self.font())
             p.end()
             return
 
@@ -4453,11 +4525,14 @@ class TickBar(QWidget):
             pen = QPen(QColor(0, 120, 255, 230)); pen.setWidth(2); p.setPen(pen)
             p.drawLine(xc, 0, xc, h)
             label = fmt_hhmmss_ms_from_ns(self.cursor_ns)
-            lw = fm.horizontalAdvance(label) + 6
+            _cf = QFont(self.font()); _cf.setPixelSize(max(1, int(lh * 1.5))); p.setFont(_cf)
+            _cfm = QFontMetrics(_cf); _clh = _cfm.height()
+            lw = _cfm.horizontalAdvance(label) + 6
             lx = max(lo, min(w - lw, xc - lw // 2))
-            p.fillRect(lx, h - lh - 2, lw, lh + 2, QColor(0, 80, 200, 200))
+            p.fillRect(lx, h - _clh - 2, lw, _clh + 2, QColor(0, 80, 200, 200))
             p.setPen(QColor(255, 255, 255))
-            p.drawText(lx + 3, h - 2 - fm.descent(), label)
+            p.drawText(lx + 3, h - 2 - _cfm.descent(), label)
+            p.setFont(self.font())
         p.end()
 
 # ---------------- LAYOUT HELPERS ----------------
@@ -4682,11 +4757,9 @@ class _CamPollTask(QRunnable):
             try:
                 folder_path = Path(folder)
                 for name in os.listdir(folder):
+                    if Path(name).suffix.lower() not in IMG_EXT:
+                        continue
                     p = folder_path / name
-                    if p.suffix.lower() not in IMG_EXT:
-                        continue
-                    if not p.is_file():
-                        continue
                     ts_ns = parse_unix_ns_from_name(p)
                     if ts_ns is None or ts_ns <= self._cutoff:
                         continue
@@ -4735,11 +4808,9 @@ class _CamPollTask(QRunnable):
                             try:
                                 cand_path = Path(candidate)
                                 for name in os.listdir(candidate):
+                                    if Path(name).suffix.lower() not in IMG_EXT:
+                                        continue
                                     p = cand_path / name
-                                    if p.suffix.lower() not in IMG_EXT:
-                                        continue
-                                    if not p.is_file():
-                                        continue
                                     ts_ns = parse_unix_ns_from_name(p)
                                     if ts_ns is None or ts_ns <= self._cutoff:
                                         continue
@@ -4842,29 +4913,47 @@ class _PvOverlayPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowFlags(Qt.WindowType.Widget)
         self.setVisible(False)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
 
         self._drag_offset: "QPoint | None" = None
         self._rows: list[tuple[str, str]] = []   # (name, value+units)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 4, 6, 4)
-        lay.setSpacing(2)
+        # Configurable display settings
+        self.font_size_px: int = 24
+        self.font_family: str = "Segoe UI"
+        self.bg_opacity: int = 100      # 0–100 percent
+        self.font_color: QColor = QColor("#000000")
+        self.bg_color: QColor = QColor("#eae31e")
 
-        # Drag handle / title row
-        title = QLabel("PV values  ⠿")
-        title.setStyleSheet(
-            "QLabel { color: #111111; font-size: 14px; font-weight: 700; "
-            "background: transparent; }")
-        title.setCursor(Qt.CursorShape.SizeAllCursor)
-        lay.addWidget(title)
-        self._title = title
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(0)
 
         self._content = QLabel()
-        self._content.setStyleSheet(
-            "QLabel { color: #111111; font-size: 18px; font-weight: 700; "
-            "font-family: 'Segoe UI', sans-serif; background: transparent; }")
         self._content.setTextFormat(Qt.TextFormat.PlainText)
         lay.addWidget(self._content)
+        self._apply_style()
+
+    def _apply_style(self):
+        alpha = int(self.bg_opacity / 100 * 255)
+        self._bg_color = QColor(self.bg_color.red(), self.bg_color.green(), self.bg_color.blue(), alpha)
+        color_hex = self.font_color.name()
+        style = (
+            f"QLabel {{ color: {color_hex}; font-size: {self.font_size_px}px; font-weight: 700; "
+            f"font-family: '{self.font_family}', monospace; background: transparent; }}"
+        )
+        self._content.setStyleSheet(style)
+        self.adjustSize()
+        self.update()
+
+    def apply_settings(self, font_size_px: int, font_family: str, bg_opacity: int, font_color: QColor, bg_color: "QColor | None" = None):
+        self.font_size_px = font_size_px
+        self.font_family = font_family
+        self.bg_opacity = bg_opacity
+        self.font_color = font_color
+        if bg_color is not None:
+            self.bg_color = bg_color
+        self._apply_style()
 
     def update_values(self, rows: "list[tuple[str,str]]"):
         """rows = list of (name, formatted_value_with_units)"""
@@ -4880,10 +4969,11 @@ class _PvOverlayPanel(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor(255, 255, 240, 220)))
+        bg = getattr(self, "_bg_color", QColor(30, 30, 30, 204))
+        p.setBrush(QBrush(bg))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(self.rect(), 6, 6)
-        p.setPen(QPen(QColor(100, 100, 100, 180)))
+        p.setPen(QPen(QColor(100, 100, 100, 100)))
         p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
 
     def mousePressEvent(self, e):
@@ -5176,6 +5266,10 @@ class Viewer(QWidget):
         self._btn_pv_refresh.setToolTip("Refresh PV values for current frame")
         self._btn_pv_refresh.clicked.connect(self._pv_force_refresh)
         pv_header_row.addWidget(self._btn_pv_refresh)
+        self._btn_pv_overlay_settings = QPushButton("⚙ overlay")
+        self._btn_pv_overlay_settings.setToolTip("PV overlay display settings")
+        self._btn_pv_overlay_settings.clicked.connect(self._open_pv_overlay_settings)
+        pv_header_row.addWidget(self._btn_pv_overlay_settings)
         pv_header_row.addStretch(1)
         llay.addLayout(pv_header_row)
 
@@ -5213,9 +5307,13 @@ class Viewer(QWidget):
         self.btn_stop = QPushButton("Stop"); self.btn_stop.setEnabled(False)
         self.btn_stop.setToolTip("Stop playback")
         self.btn_stop.clicked.connect(self.stop)
+        self.btn_reset_zoom = QPushButton("⤢ Reset zoom")
+        self.btn_reset_zoom.setToolTip("Reset zoom to full image (right-click drag to zoom in)")
+        self.btn_reset_zoom.clicked.connect(self._on_reset_zoom)
         row3a = QHBoxLayout()
         row3a.addWidget(self.btn_prev); row3a.addWidget(self.btn_next)
         row3a.addWidget(self.btn_play); row3a.addWidget(self.btn_stop)
+        row3a.addWidget(self.btn_reset_zoom)
         llay.addLayout(row3a)
 
         self.speed_cb = PopupBelowComboBox()
@@ -5676,6 +5774,8 @@ class Viewer(QWidget):
             lbl.setStyleSheet(info_style)
         self.lbl_ref_status.setStyleSheet("font-size: 10px; color: #666; padding: 1px 0;")
         self.lbl_selected_range.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; padding: 1px 0;")
+        self.lbl_axis_time.setVisible(False)
+        self.lbl_prague_time.setVisible(False)
         self.prog = QProgressBar(); self.prog.setVisible(False)
         self.prog.setRange(0, 0); self.prog.setTextVisible(False)
         self.btn_cancel_scan = QPushButton("Cancel scan"); self.btn_cancel_scan.setVisible(False)
@@ -5715,10 +5815,10 @@ class Viewer(QWidget):
         # Tickbar below sliders — cursor line ends here, at the bottom
         rlay.addWidget(self.tickbar)
 
-        # Outer row container — script background color, holds camera + pointing panel
+        # Outer row container — dark background, holds camera + pointing panel
         _cam_row_widget = QWidget()
         _cam_row_widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _cam_row_widget.setStyleSheet("background: #f3f3f3;")
+        _cam_row_widget.setStyleSheet("background: #1a1a1a;")
         _cam_row_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._cam_row_widget = _cam_row_widget
 
@@ -5726,18 +5826,18 @@ class Viewer(QWidget):
         self._img_pointing_row.setSpacing(0)
         self._img_pointing_row.setContentsMargins(0, 0, 0, 0)
 
-        # Single-cam: script-colored wrapper, img_view fills it.
+        # Single-cam: dark wrapper, img_view fills it.
         # Single-cam: image + label bar BELOW (not overlapping) the image.
         _single_wrapper = QWidget()
         _single_wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _single_wrapper.setStyleSheet("background: #f3f3f3;")
+        _single_wrapper.setStyleSheet("background: #1a1a1a;")
         _single_wrapper.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         _swl = QVBoxLayout(_single_wrapper)
         _swl.setContentsMargins(0, 0, 0, 0)
         _swl.setSpacing(0)
 
         self.img_view = ImageView(_single_wrapper)
-        self.img_view.bg_color = QColor("#f3f3f3")
+        self.img_view.bg_color = QColor("#1a1a1a")
         self.img_view.cam_label_font_px = self._cam_label_size_sb.value()
         self.img_view.sc_topn_marker_radius = self._sc_marker_r_sb.value()
         self.img_view.sc_topn_marker_thick  = self._sc_marker_thick_sb.value()
@@ -5759,8 +5859,9 @@ class Viewer(QWidget):
         self._multi_grid.camera_selected.connect(self._on_multicam_selected)
         self._img_pointing_row.addWidget(self._multi_grid, 1)
 
-        # PV overlay for multi-cam view
-        self._pv_overlay_multi = _PvOverlayPanel(self._multi_grid)
+        # PV overlay for multi-cam view — parented to _cam_row_widget so it floats
+        # over the camera area. raise_() puts it above _multi_grid in z-order.
+        self._pv_overlay_multi = _PvOverlayPanel(_cam_row_widget)
         self._pv_overlay_multi.move(8, 8)
 
         self.pointing_panel = PointingPanel(self)
@@ -5787,9 +5888,12 @@ class Viewer(QWidget):
         self._online_dot_top.setToolTip("Online mode indicator")
         info_title_row.addWidget(self._online_dot_top)
         ilay.addLayout(info_title_row)
-        for lbl in [self.lbl_index, self.lbl_selected_range, self.lbl_filename,
-                    self.lbl_axis_time, self.lbl_prague_time, self.lbl_ref_status,
-                    self.lbl_scan_progress]:
+        _idx_range_row = QHBoxLayout()
+        _idx_range_row.setSpacing(6)
+        _idx_range_row.addWidget(self.lbl_index)
+        _idx_range_row.addWidget(self.lbl_selected_range, 1)
+        ilay.addLayout(_idx_range_row)
+        for lbl in [self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress]:
             ilay.addWidget(lbl)
         ilay.addWidget(self.prog)
         ilay.addWidget(self.btn_cancel_scan)
@@ -5827,6 +5931,12 @@ class Viewer(QWidget):
                     self.slider, self.gradient_cb, self.speed_cb,
                     self.cb_bright, self.cb_subtract]:
             btn.setEnabled(not busy)
+
+    def _on_reset_zoom(self):
+        self.img_view.reset_zoom()
+        if self._is_multi_cam():
+            for cv in self._multi_grid._cam_views:
+                cv.img_view.reset_zoom()
 
     def _toggle_draw_mode(self, mode: str):
         iv = self._active_img_view()
@@ -6119,24 +6229,18 @@ class Viewer(QWidget):
         self._pv_update_overlay()
 
     def _pv_update_overlay(self):
-        """Refresh the floating PV overlay panel in single-cam view."""
+        """Refresh the floating PV overlay panel."""
         overlay = getattr(self, "_pv_overlay", None)
-        if overlay is None:
+        overlay_multi = getattr(self, "_pv_overlay_multi", None)
+        is_multi = self._is_multi_cam()
+
+        if not self._pv_enabled:
+            if overlay is not None:
+                overlay.setVisible(False)
+            if overlay_multi is not None:
+                overlay_multi.setVisible(False)
             return
-        # Hide overlay for PDXMY cameras (they don't need energy readout)
-        cam_name = ""
-        if self._is_multi_cam() and self._cam_names:
-            sel = getattr(self._multi_grid, "_selected_idx", 0)
-            if sel < len(self._cam_names):
-                cam_name = self._cam_names[sel]
-        elif hasattr(self, "_cam_name"):
-            cam_name = self._cam_name or ""
-        if re.search(r"PD[1-4]M[12]", cam_name, re.IGNORECASE):
-            overlay.setVisible(False)
-            return
-        if not self._pv_enabled or not self._pv_values:
-            overlay.setVisible(False)
-            return
+
         rows = []
         for name in self._pv_enabled:
             val = self._pv_values.get(name, "…")
@@ -6144,16 +6248,104 @@ class Viewer(QWidget):
             if val not in ("…", "—") and units:
                 val = f"{val} {units}"
             rows.append((name, val))
-        overlay.update_values(rows)
-        overlay.ensure_inside_parent()
 
-        overlay_multi = getattr(self, "_pv_overlay_multi", None)
-        if overlay_multi is not None and self._is_multi_cam():
-            overlay_multi.raise_()
-            overlay_multi.update_values(rows)
-            overlay_multi.ensure_inside_parent()
-        elif overlay_multi is not None:
-            overlay_multi.setVisible(False)
+        if is_multi:
+            if overlay is not None:
+                overlay.setVisible(False)
+            if overlay_multi is not None:
+                overlay_multi.update_values(rows)
+                overlay_multi.ensure_inside_parent()
+                overlay_multi.raise_()
+                overlay_multi.setVisible(True)
+        else:
+            if overlay_multi is not None:
+                overlay_multi.setVisible(False)
+            if overlay is not None:
+                overlay.update_values(rows)
+                overlay.ensure_inside_parent()
+                overlay.setVisible(True)
+
+    def _open_pv_overlay_settings(self):
+        overlay = getattr(self, "_pv_overlay", None)
+        if overlay is None:
+            return
+        orig_fs = overlay.font_size_px
+        orig_ff = overlay.font_family
+        orig_op = overlay.bg_opacity
+        orig_fc = QColor(overlay.font_color)
+        orig_bc = QColor(overlay.bg_color)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("PV Overlay Settings")
+        dlg.setFixedWidth(340)
+        lay = QFormLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        font_sb = QSpinBox(); font_sb.setRange(6, 72); font_sb.setValue(orig_fs)
+        font_cb = QComboBox()
+        font_cb.addItems(["Consolas", "Arial", "Segoe UI", "Courier New",
+                          "Calibri", "Verdana", "Tahoma", "Times New Roman"])
+        idx_f = font_cb.findText(orig_ff)
+        if idx_f >= 0: font_cb.setCurrentIndex(idx_f)
+
+        opacity_sl = QSlider(Qt.Orientation.Horizontal)
+        opacity_sl.setRange(0, 100); opacity_sl.setValue(orig_op)
+        opacity_lbl = QLabel(f"{orig_op}%")
+        opacity_row = QHBoxLayout(); opacity_row.addWidget(opacity_sl); opacity_row.addWidget(opacity_lbl)
+
+        _font_color = [QColor(orig_fc)]
+        fc_btn = QPushButton(); fc_btn.setFixedWidth(60)
+        fc_btn.setStyleSheet(f"background: {_font_color[0].name()};")
+
+        _bg_color = [QColor(orig_bc)]
+        bc_btn = QPushButton(); bc_btn.setFixedWidth(60)
+        bc_btn.setStyleSheet(f"background: {_bg_color[0].name()};")
+
+        from PySide6.QtWidgets import QColorDialog as _QCD
+        def _pick_font_color():
+            c = _QCD.getColor(_font_color[0], dlg, "Font color")
+            if c.isValid():
+                _font_color[0] = c
+                fc_btn.setStyleSheet(f"background: {c.name()};")
+                _preview()
+        fc_btn.clicked.connect(_pick_font_color)
+
+        def _pick_bg_color():
+            c = _QCD.getColor(_bg_color[0], dlg, "Background color")
+            if c.isValid():
+                _bg_color[0] = c
+                bc_btn.setStyleSheet(f"background: {c.name()};")
+                _preview()
+        bc_btn.clicked.connect(_pick_bg_color)
+
+        opacity_sl.valueChanged.connect(lambda v: (opacity_lbl.setText(f"{v}%"), _preview()))
+        font_sb.valueChanged.connect(lambda _: _preview())
+        font_cb.currentTextChanged.connect(lambda _: _preview())
+
+        def _preview():
+            overlay2 = getattr(self, "_pv_overlay_multi", None)
+            for ov in [overlay, overlay2]:
+                if ov is not None:
+                    ov.apply_settings(font_sb.value(), font_cb.currentText(),
+                                      opacity_sl.value(), _font_color[0], _bg_color[0])
+
+        lay.addRow("Font size (px):", font_sb)
+        lay.addRow("Font:", font_cb)
+        lay.addRow("Background opacity:", opacity_row)
+        lay.addRow("Font color:", fc_btn)
+        lay.addRow("Background color:", bc_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addRow(btns)
+
+        if dlg.exec() == QDialog.DialogCode.Rejected:
+            overlay2 = getattr(self, "_pv_overlay_multi", None)
+            for ov in [overlay, overlay2]:
+                if ov is not None:
+                    ov.apply_settings(orig_fs, orig_ff, orig_op, orig_fc, orig_bc)
 
     def _pv_text(self) -> str:
         """Return a formatted single-line PV string for burn-in under saved images."""
@@ -6225,6 +6417,7 @@ class Viewer(QWidget):
         self.pointing_panel.setVisible(False)
         self._img_pointing_row.setStretch(self._img_pointing_row.indexOf(self._multi_grid), 1)
         self._multi_grid.setVisible(True)
+        QTimer.singleShot(0, self._pv_update_overlay)
 
     def _switch_to_single_view(self):
         self._single_wrapper.setVisible(True)
@@ -6627,6 +6820,11 @@ class Viewer(QWidget):
             if gen != self._gen or not new_items:
                 return
             new_items.sort(key=lambda x: x.ts_ns)
+
+            # Capture state BEFORE mutating — needed for correct was_at_end check
+            _prev_len = len(self.items)
+            _prev_current_idx = self.current_idx
+
             # Append-only — items list is always sorted, new items are all newer
             self.items = self.items + new_items
             self.ts_list = self.ts_list + [it.ts_ns for it in new_items]
@@ -6656,8 +6854,9 @@ class Viewer(QWidget):
             last_idx = len(self.items) - 1
             # Show newest frame if: auto-follow is on, OR slider was already at the end
             was_at_end = (
-                self.current_idx is not None and
-                self.current_idx >= last_idx - len(new_items)
+                _prev_current_idx is not None and
+                _prev_len > 0 and
+                _prev_current_idx >= _prev_len - 1
             )
             if self._auto_follow or was_at_end:
                 self._display_exact_index(
@@ -6693,11 +6892,9 @@ class Viewer(QWidget):
                     try:
                         folder_path = Path(folder)
                         for name in os.listdir(folder):
+                            if Path(name).suffix.lower() not in IMG_EXT:
+                                continue
                             p = folder_path / name
-                            if p.suffix.lower() not in IMG_EXT:
-                                continue
-                            if not p.is_file():
-                                continue
                             ts_ns = parse_unix_ns_from_name(p)
                             if ts_ns is None or ts_ns <= self._cutoff:
                                 continue
@@ -6743,11 +6940,9 @@ class Viewer(QWidget):
                                 try:
                                     cand_path = Path(candidate)
                                     for name in os.listdir(candidate):
+                                        if Path(name).suffix.lower() not in IMG_EXT:
+                                            continue
                                         p = cand_path / name
-                                        if p.suffix.lower() not in IMG_EXT:
-                                            continue
-                                        if not p.is_file():
-                                            continue
                                         ts_ns = parse_unix_ns_from_name(p)
                                         if ts_ns is None or ts_ns <= self._cutoff:
                                             continue
@@ -6763,7 +6958,7 @@ class Viewer(QWidget):
 
         self._poll_sig2 = sig2  # keep alive until next tick (no-parent QObject needs explicit ref)
         task = _PollTask(folders, cutoff_ns, sig2)
-        self.scan_pool.start(task)
+        self._poll_pool.start(task)
 
     def _online_poll_multi(self):
         """Per-camera independent polling — each camera runs its own _CamPollTask in parallel."""
@@ -6777,7 +6972,6 @@ class Viewer(QWidget):
             self._cam_poll_running = [False] * n_cams
         if not hasattr(self, '_cam_poll_sigs') or len(self._cam_poll_sigs) != n_cams:
             self._cam_poll_sigs = [None] * n_cams
-
         poll_max_ts = getattr(self, '_cam_poll_max_ts', [0] * n_cams)
 
         for cam_i in range(n_cams):
@@ -6802,6 +6996,8 @@ class Viewer(QWidget):
                                 self._cam_folder_lists[cam_idx].append(nf)
                     if not new_items or cam_idx >= len(self._cam_items):
                         return
+                    _prev_merged_len = len(self.items)
+                    _prev_current_idx = self.current_idx
                     self._cam_items[cam_idx].extend(new_items)
                     self._cam_ts[cam_idx].extend(it.ts_ns for it in new_items)
                     # Cap per-camera list to ONLINE_MAX_ITEMS to prevent unbounded growth
@@ -6823,27 +7019,33 @@ class Viewer(QWidget):
                     self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
                     cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
                     if cam_ts_now:
-                        latest_frame = len(cam_ts_now) - 1
-                        latest_ts    = cam_ts_now[latest_frame]
-                        # Show latest frame if: auto-follow is on, OR the slider was already
-                        # at the newest frame before this poll (i.e. user is watching live).
+                        latest_ts = cam_ts_now[-1]
                         was_at_end = (
-                            self.current_idx is not None and
-                            self.items and
-                            self.current_idx >= len(self.items) - 1 - len(new_items)
+                            _prev_current_idx is not None and
+                            _prev_merged_len > 0 and
+                            _prev_current_idx >= _prev_merged_len - 1
                         )
-                        if self._auto_follow or was_at_end:
-                            self._per_cam_display_one(cam_idx, latest_ts)
-                            if cam_idx < len(self._per_cam_rows):
-                                sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
-                                self._per_cam_rows[cam_idx].set_value(sv)
-                            if cam_idx == self._per_cam_master_idx:
+                        is_master = (cam_idx == self._per_cam_master_idx)
+                        if is_master:
+                            # Master camera got new frame — update display for ALL cameras
+                            if self._auto_follow or was_at_end:
+                                self._per_cam_display_one(cam_idx, latest_ts)
+                                if cam_idx < len(self._per_cam_rows):
+                                    sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
+                                    self._per_cam_rows[cam_idx].set_value(sv)
                                 self.tickbar.set_cursor(latest_ts)
-                        else:
-                            # User is scrubbing history — refresh at current slider time only
-                            if self.items and self.current_idx is not None:
-                                t_ns = self.items[self.current_idx].ts_ns
-                                self._per_cam_display_one(cam_idx, t_ns)
+                                # Update all non-master cameras to the closest frame to master's ts
+                                for other_idx in range(len(self._cam_ts)):
+                                    if other_idx == cam_idx:
+                                        continue
+                                    self._per_cam_display_one(other_idx, latest_ts)
+                            else:
+                                # Scrubbing — show current slider time for all
+                                if self.items and self.current_idx is not None:
+                                    t_ns = self.items[self.current_idx].ts_ns
+                                    for other_idx in range(len(self._cam_ts)):
+                                        self._per_cam_display_one(other_idx, t_ns)
+                        # Non-master: data updated, display driven by master — do nothing
                 return on_cam_found
 
             sig.found.connect(make_callback(cam_i, gen))
@@ -7207,6 +7409,8 @@ class Viewer(QWidget):
             self._pending_online_mode = False
             self.lbl_scan_progress.setText("Online mode: active")
             self._start_online_mode()
+
+        QTimer.singleShot(0, self._pv_update_overlay)
 
     def open_by_date(self):
         dlg = DatePickerDialog(
@@ -7854,7 +8058,7 @@ class Viewer(QWidget):
     def _set_info_for(self, idx, axis_time_ns):
         it = self.items[idx]
         if self._is_multi_cam() and self._cam_items:
-            counts = " | ".join(
+            counts = "\n".join(
                 f"{self._cam_names[i] if i < len(self._cam_names) else f'cam{i}'}: "
                 f"{len(c)}"
                 for i, c in enumerate(self._cam_items)

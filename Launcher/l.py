@@ -66,14 +66,18 @@ TIMESTAMPED_EXE_RE = re.compile(
     re.IGNORECASE
 )
 
+_ARCHIVE_VER_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)__(\d{8})_(\d{6})", re.IGNORECASE)
+_ARCHIVE_LABEL_RE = re.compile(r"(v\d+\.\d+\.\d+)__(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
+_VER_ANYWHERE_RE = re.compile(r"(v\d+\.\d+\.\d+)", re.IGNORECASE)
+
 def _archive_exe_version(p: Path) -> tuple:
-    m = re.search(r"v(\d+)\.(\d+)\.(\d+)__(\d{8})_(\d{6})", p.stem, re.IGNORECASE)
+    m = _ARCHIVE_VER_RE.search(p.stem)
     if m:
         return tuple(map(int, m.groups()))
     return (0, 0, 0, 0, 0)
 
 def _archive_exe_label(p: Path) -> str:
-    m = re.search(r"(v\d+\.\d+\.\d+)__(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", p.stem, re.IGNORECASE)
+    m = _ARCHIVE_LABEL_RE.search(p.stem)
     if m:
         ver = m.group(1)
         date = f"{m.group(2)}-{m.group(3)}-{m.group(4)}"
@@ -285,7 +289,7 @@ def _build_version_list(current_exes: list[Path], program_dir: Path) -> list[dic
 
     # Aktuální verze – řadit podle vX.Y.Z
     for p in sorted(current_exes, key=_exe_version, reverse=True):
-        m = re.search(r"(v\d+\.\d+\.\d+)", p.stem, re.IGNORECASE)
+        m = _VER_ANYWHERE_RE.search(p.stem)
         label = m.group(1) if m else p.stem
         result.append({"exe_path": p, "label": label})
 
@@ -1117,35 +1121,60 @@ class Launcher(tk.Tk):
 
     def _launch_exe(self, exe_path: Path, program_dir: Path, py_path: Path | None = None):
         """Spusti archivni verzi programu.
-        Preferuje .py soubor (nepotrebuje _internal/). Pokud neni, spusti .exe primo."""
-        import subprocess, sys
+        Zkopiruje exe docasne do program_dir (kde je _internal/), pocka na dokonceni, pak temp kopii smaze."""
+        import subprocess
 
-        # Determine what to run
-        if py_path is not None and py_path.exists():
-            launch_py = py_path
-            label = py_path.name
+        internal_dir = program_dir / "_internal"
+        label = exe_path.name
+
+        if internal_dir.exists():
+            # Borrow _internal: copy exe to program_dir, run it, clean up after close
+            temp_exe = program_dir / exe_path.name
+
             def worker():
                 try:
-                    pythonw = Path(sys.executable).parent / "pythonw.exe"
-                    if not pythonw.exists():
-                        pythonw = Path(sys.executable)
-                    subprocess.Popen(
-                        [str(pythonw), str(launch_py)],
-                        cwd=str(launch_py.parent),
-                    )
+                    shutil.copy2(str(exe_path), str(temp_exe))
+                    self.after(0, self.status.configure, {"text": f"Running: {label}"})
+                    proc = subprocess.Popen([str(temp_exe)], cwd=str(program_dir))
+                    proc.wait()
+                except Exception as e:
+                    self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
+                    self.after(0, self.status.configure, {"text": "Launch failed."})
+                finally:
+                    try:
+                        temp_exe.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    self.after(0, self.status.configure, {"text": "Ready."})
+
+        elif py_path is not None and py_path.exists():
+            # Fallback: run .py via Python (needs Python in PATH)
+            import shutil as _shutil
+            launch_py = py_path
+
+            def worker():
+                try:
+                    if getattr(sys, "frozen", False):
+                        _py = (_shutil.which("pythonw") or _shutil.which("python")
+                               or _shutil.which("py"))
+                        if not _py:
+                            raise RuntimeError("Python interpreter not found in PATH.")
+                        pythonw = Path(_py)
+                    else:
+                        pythonw = Path(sys.executable).parent / "pythonw.exe"
+                        if not pythonw.exists():
+                            pythonw = Path(sys.executable)
+                    subprocess.Popen([str(pythonw), str(launch_py)], cwd=str(launch_py.parent))
                     self.after(0, self.status.configure, {"text": f"Started: {label}"})
                 except Exception as e:
                     self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
                     self.after(0, self.status.configure, {"text": "Launch failed."})
+
         else:
-            # Fallback: try to run .exe directly (may fail without _internal/)
-            label = exe_path.name
+            # Last resort: run .exe directly without _internal
             def worker():
                 try:
-                    subprocess.Popen(
-                        [str(exe_path)],
-                        cwd=str(exe_path.parent),
-                    )
+                    subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
                     self.after(0, self.status.configure, {"text": f"Started: {label}"})
                 except Exception as e:
                     self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")

@@ -10,7 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 
 import numpy as np
-from PIL import Image as _PilImg
+from PIL import Image as _PilImg, ImageDraw as _PilDraw
 
 from PySide6.QtCore import (
     Qt, QPoint, QPointF, QRect, QRectF, QSize, Signal, QObject,
@@ -525,12 +525,13 @@ class WorkshopCanvas(QWidget):
     def _paint_brush(self, p0: QPoint, p1: QPoint):
         self._ensure_rgb()
         arr = self._slot.current_arr
-        color = self._color_arr()
-        r = max(1, self.brush_size // 2)
-        h, w = arr.shape[:2]
-        for x, y in _bresenham(p0.x(), p0.y(), p1.x(), p1.y()):
-            arr[max(0, y-r):min(h, y+r+1),
-                max(0, x-r):min(w, x+r+1)] = color
+        color = tuple(self._color_arr())
+        pil_img = _PilImg.fromarray(arr)
+        _PilDraw.Draw(pil_img).line(
+            [(p0.x(), p0.y()), (p1.x(), p1.y())],
+            fill=color, width=max(1, self.brush_size),
+        )
+        arr[:] = np.asarray(pil_img)
         self._rebuild_qimage()
         self.image_changed.emit()
 
@@ -562,13 +563,13 @@ class WorkshopCanvas(QWidget):
     def _paint_line(self, p0: QPoint, p1: QPoint):
         self._ensure_rgb()
         arr = self._slot.current_arr
-        color = self._color_arr()
-        lw = max(1, self.line_width)
-        r = lw // 2
-        h, w = arr.shape[:2]
-        for x, y in _bresenham(p0.x(), p0.y(), p1.x(), p1.y()):
-            arr[max(0, y-r):min(h, y+r+1),
-                max(0, x-r):min(w, x+r+1)] = color
+        color = tuple(self._color_arr())
+        pil_img = _PilImg.fromarray(arr)
+        _PilDraw.Draw(pil_img).line(
+            [(p0.x(), p0.y()), (p1.x(), p1.y())],
+            fill=color, width=max(1, self.line_width),
+        )
+        arr[:] = np.asarray(pil_img)
         self._rebuild_qimage()
         self.image_changed.emit()
 

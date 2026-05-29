@@ -21,6 +21,7 @@ import shutil
 import tempfile
 import atexit
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, date, timezone
@@ -291,11 +292,10 @@ def _load_api_for_day(day: date, cols: "list[str]",
     # Per-column sample lists (API first, CSV fallback per column)
     per_col: dict[str, list[dict]] = {}
 
-    for col in cols:
+    def _fetch_one_col(col: str) -> tuple[str, list[dict]]:
         channel = CPVA_CHANNEL_MAP.get(col)
         col_rows: list[dict] = []
         if channel is not None:
-            # Try channel name as-is, then with ".value" suffix if 400
             channels_to_try = [channel]
             if not channel.endswith(".value"):
                 channels_to_try.append(channel + ".value")
@@ -326,12 +326,11 @@ def _load_api_for_day(day: date, cols: "list[str]",
                     col_rows.sort(key=lambda r: r["_dt"])
                     _log(f"  API {col} ({ch_try}): {len(samples)} raw → {parsed} parsed")
                     if parsed > 0:
-                        break  # success — don't try next variant
+                        break
                 except Exception as exc:
                     _log(f"  API {col} ({ch_try}) ERROR: {type(exc).__name__}: {exc}")
         else:
             _log(f"  {col}: no CPVA channel mapping, trying CSV only")
-        # CSV fallback when API returned nothing for this column
         if not col_rows:
             _, csv_per = _load_csv_for_day(day, [col], csv_root=csv_root)
             col_rows = csv_per.get(col, [])
@@ -339,8 +338,17 @@ def _load_api_for_day(day: date, cols: "list[str]",
                 _log(f"  CSV fallback {col}: {len(col_rows)} rows")
             else:
                 _log(f"  CSV fallback {col}: no data")
-        if col_rows:
-            per_col[col] = col_rows
+        return col, col_rows
+
+    with ThreadPoolExecutor(max_workers=max(1, len(cols))) as _aex:
+        _col_futs = {_aex.submit(_fetch_one_col, c): c for c in cols}
+        for _fut in as_completed(_col_futs):
+            try:
+                _col, _col_rows = _fut.result()
+                if _col_rows:
+                    per_col[_col] = _col_rows
+            except Exception as exc:
+                _log(f"  col fetch ERROR: {type(exc).__name__}: {exc}")
 
     # Merge all per-col rows into a single list keyed by _ns
     by_ts: dict[int, dict] = {}
@@ -1519,21 +1527,34 @@ class ShotFinderWidget(QWidget):
             seen: set[str] = set()
             cameras: list[str] = []
             base = images_root / str(day.year) / str(day.month) / str(day.day)
+
+            def _scan_hour(h: int) -> list[str]:
+                hour_dir = base / str(h)
+                try:
+                    if not hour_dir.exists() or not hour_dir.is_dir():
+                        return []
+                except Exception:
+                    return []
+                names: list[str] = []
+                try:
+                    for e in os.scandir(hour_dir):
+                        if e.is_dir():
+                            names.append(e.name)
+                except Exception:
+                    pass
+                return names
+
             try:
-                for h in range(0, 24):
-                    hour_dir = base / str(h)
-                    try:
-                        if not hour_dir.exists() or not hour_dir.is_dir():
-                            continue
-                    except Exception:
-                        continue
-                    try:
-                        for e in os.scandir(hour_dir):
-                            if e.is_dir() and e.name not in seen:
-                                seen.add(e.name)
-                                cameras.append(e.name)
-                    except Exception:
-                        continue
+                with ThreadPoolExecutor(max_workers=12) as _hex:
+                    _futs = [_hex.submit(_scan_hour, h) for h in range(24)]
+                    for _fut in as_completed(_futs):
+                        try:
+                            for _name in _fut.result():
+                                if _name not in seen:
+                                    seen.add(_name)
+                                    cameras.append(_name)
+                        except Exception:
+                            pass
             except Exception as exc:
                 self._sig_cam.log_msg.emit(f"Camera load error: {exc}")
             cameras.sort(key=str.lower)

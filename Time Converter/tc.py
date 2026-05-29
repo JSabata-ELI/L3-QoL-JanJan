@@ -425,7 +425,7 @@ def main():
         if getattr(_sys, "frozen", False):
             root.title(Path(_sys.executable).stem)
         else:
-            root.title("Timestamp Converter")
+            root.title("Time Converter")
     except Exception:
         pass
     try:

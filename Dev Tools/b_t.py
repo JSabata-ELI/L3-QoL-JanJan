@@ -584,6 +584,11 @@ class BuilderUI(ttk.Frame):
                 self.dist_root = self.root_folder.parent / "dist"
                 self.root_var.set(str(self.root_folder))
                 self._reload_projects(select_first=True)
+            # Sync CM tab so destinations panel reflects the new paths immediately
+            cm = getattr(self, "_cm_ref", None)
+            if cm is not None:
+                cm._build_dest_rows()
+                cm._load_programs()
             win.destroy()
             messagebox.showinfo("Paths saved", "Paths saved to %APPDATA%\\DevTools\\config.json")
 
@@ -694,6 +699,34 @@ class BuilderUI(ttk.Frame):
         return out
 
     # ----------------- BUILD CORE -----------------
+    def _build_internal_builder_sync(self, live_log=None) -> tuple[bool, str]:
+        """Synchronous build of _internal_builder — uses .spec if available, else __main__ block."""
+        import subprocess as _sp
+        builder_script = self.root_folder / "Internal Builder" / "_internal_builder.py"
+        if not builder_script.exists():
+            return False, f"Builder script not found:\n{builder_script}"
+        spec_file = builder_script.parent / "_internal_builder.spec"
+        if spec_file.exists():
+            cmd = [_sys.executable, "-m", "PyInstaller", "--noconfirm",
+                   "--distpath", r"C:\Dev\dist", str(spec_file)]
+        else:
+            cmd = [_sys.executable, str(builder_script)]
+        if live_log:
+            live_log(f"CMD: {' '.join(cmd)}\n")
+        try:
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                             cwd=str(builder_script.parent))
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line and live_log:
+                    live_log(line)
+            proc.wait()
+            if proc.returncode == 0:
+                return True, "Internal Builder build succeeded."
+            return False, f"Internal Builder build failed (rc={proc.returncode})"
+        except Exception as e:
+            return False, f"ERROR: {e}"
+
     def _build_one_project(self, p: Path, ver: str, live_log=None) -> tuple[bool, str]:
         """Postaví projekt pomocí PyInstalleru do dist/<projekt>/vX.X.X/."""
         name = p.name
@@ -964,7 +997,10 @@ class BuilderUI(ttk.Frame):
                 ver = versions_by_name[p.name]
                 self._log(f"Building: {p.name}  ->  v{ver}")
                 t0 = _time.perf_counter()
-                ok, msg = self._build_one_project(p, ver, live_log=self._log)
+                if p.name.lower() == "internal builder":
+                    ok, msg = self._build_internal_builder_sync(live_log=self._log)
+                else:
+                    ok, msg = self._build_one_project(p, ver, live_log=self._log)
                 elapsed_one = _time.perf_counter() - t0
                 if ok:
                     ok_count += 1

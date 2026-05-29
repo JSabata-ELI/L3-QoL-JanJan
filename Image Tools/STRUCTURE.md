@@ -4,10 +4,11 @@
 
 | Soubor | Popis |
 |--------|-------|
-| `main.py` | Entry point. Spouští `QApplication`, buildí hlavní okno s `QTabWidget` (záložky: Image Slider, Image Finder, Shot Finder). Detekuje verzi z názvu exe. |
+| `main.py` | Entry point. Spouští `QApplication`, buildí hlavní okno s `QTabWidget` (záložky: Image Finder, Image Slider, Shot Finder, Workshop). Detekuje verzi z názvu exe. |
 | `is_t.py` | **Image Slider** — prohlížeč časových sérií snímků z kamer. Scrubbing, pointing, SC, multi-cam, online mode. |
 | `if_t.py` | **Image Finder** — výběr kamer a snímků pro daný den, anotace energetickými daty z CPVA API + CSV. |
 | `sf_t.py` | **Shot Finder** — hledání snímků podle hodnoty PV (energie, waveplate…) v CPVA archiveru. |
+| `wk_t.py` | **Workshop** — editor obrázků přijatých z ostatních záložek. Jas/kontrast, palety, ořez, kreslení (brush/line/rect/text/eraser), diff vůči referenci, undo/redo, uložení PNG/TIFF. |
 
 ---
 
@@ -280,6 +281,50 @@ Matplotlib scatter + histogram pointing. Signal `point_clicked(int)`.
 **Palety:** index 0 = Default (orig.), index 1 = Grayscale, 2+ = LUT
 
 **Ukládání:** Default → `shutil.copy2`; ostatní → `load_image_scaled` + save; vždy `_copy_metadata_into_png`
+
+---
+
+## wk_t.py — Workshop
+
+### Datové struktury
+```python
+class _WorkshopSlot:
+    source: np.ndarray        # originální zdrojový obrázek (pro Reset to Source)
+    current: np.ndarray       # aktuálně upravená verze
+    label: str                # název pro UI combobox
+    source_path: Path | None  # cesta ke zdrojovému souboru (pokud existuje)
+    undo_stack / redo_stack   # list[np.ndarray] — undo/redo historie
+
+class WorkshopCanvas(QWidget):
+    # Interaktivní canvas pro zobrazení a editaci jednoho slotu
+    TOOL_NONE / TOOL_BRUSH / TOOL_ERASER / TOOL_LINE / TOOL_RECT
+    TOOL_TEXT / TOOL_CROP / TOOL_EYEDROPPER
+```
+
+### WorkshopWidget(QWidget)
+Hlavní widget záložky — přijímá obrázky z ostatních záložek přes `receive_image()`.
+
+**Levý panel (200 px, scrollovatelný):**
+- Info label (název souboru, rozměry)
+- Combo výběru aktivního slotu + Remove / Clear All
+- Selektor nástrojů (Pan, Brush, Eraser, Line, Rect, Text, Crop, Eyedropper)
+- Výběr barvy kreslení + velikost brush / tloušťka čáry
+- Jas / Kontrast (slidery + Reset + Auto B/C + Apply)
+- Palety (Default, Grayscale, Inferno, Plasma, Viridis, Hot, Binary…)
+- Reference diff: Load ref from file, Subtract ref, Abs diff ref
+- Undo / Redo / Reset to Source
+- Save PNG / Save TIFF
+
+**Klíčové metody:**
+| Metoda | Popis |
+|--------|-------|
+| `receive_image(arr, label, source_path)` | Vstupní bod z ostatních záložek — přidá nový slot a aktivuje ho |
+| `_activate_slot(idx)` | Přepne aktivní slot, synchronizuje canvas a ovládací prvky |
+| `_do_diff(absolute)` | Pixel-by-pixel odečtení referenčního snímku (relativní nebo absolutní) |
+| `_apply_bright_contrast()` | Aplikuje brightness/contrast posun na aktuální canvas array |
+| `_auto_bright_contrast()` | Automatické nastavení B/C (percentilový stretch) |
+| `_on_palette_changed(name)` | Aplikuje barevnou LUT paletu na grayscale obraz |
+| `_save(fmt)` | Uloží aktuální slot jako PNG nebo TIFF přes Pillow |
 
 ---
 

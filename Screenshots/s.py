@@ -39,6 +39,8 @@ def _set_dpi_awareness():
         pass
 
 HEADER_SUFFIX_RE = re.compile(r"-_-IMG$", re.IGNORECASE)
+_NORM_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_NORM_UPPER_RE = re.compile(r"[^A-Z0-9]+")
 
 def _norm_suffix_mode(raw: str) -> str:
     raw = raw.strip()
@@ -749,7 +751,7 @@ def _get_window_text(hwnd: int) -> str:
     return buf.value
 
 def _norm_win_title(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    return _NORM_ALNUM_RE.sub("", (s or "").lower())
 
 def find_window_by_title_substring(substr: str) -> int | None:
     if not substr:
@@ -879,7 +881,7 @@ def target_cpva_hour_dir(_day_root: Path) -> Path:
 
 
 def norm_folder(s: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "", s.upper())
+    return _NORM_UPPER_RE.sub("", s.upper())
 
 
 def tokenize_user(label: str) -> tuple[list[str], list[str], list[str]]:
@@ -1023,7 +1025,7 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 def norm_query(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    return _NORM_ALNUM_RE.sub("", (s or "").lower())
 
 def open_in_explorer(path: Path):
     path = Path(path)

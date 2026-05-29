@@ -94,7 +94,7 @@ Launcher = v0.9.1
 | `find_exe_in_folder(ver_folder, name, ver)` | Najde exe v dané verzi (onefile i onedir layout) |
 | `unique_path(p)` | Pokud cesta existuje, přidá `(2)`, `(3)`, ... |
 
-### CopyManagerUI (hlavní třída)
+### DeployGUI (hlavní třída)
 - Zobrazuje seznam programů z `dist/`
 - Pro každý program: aktuální nasazená verze, dostupné verze k nasazení
 - Deployment: zkopíruje exe + ikonu + README do `DESTINATION_ROOTS`
@@ -102,7 +102,7 @@ Launcher = v0.9.1
 - Sdílí log widget s Builderem
 
 ### dev_tools.py — Entry point
-- Vytvoří jedno okno s `QTabWidget` nebo rozděleným `ttk.Frame`
+- Vytvoří jedno okno s `ttk.Notebook` (dvě záložky: Builder, Copy Manager)
 - Vlevo: BuilderUI, vpravo: CopyManagerUI
 - Sdílený log widget pro oba nástroje
 

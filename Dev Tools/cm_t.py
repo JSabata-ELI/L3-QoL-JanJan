@@ -338,6 +338,113 @@ def show_icon_compare_dialog(parent, program_name: str, existing: Path, incoming
     win.wait_window()
     return result["replace"]
 
+def _fix_archive_dir(archive_dir: Path, log_fn=None):
+    """Move any flat files in archive/ into vX.Y.Z/ subfolders.
+    Handles: versioned+timestamp ('Name vX.Y.Z__TS.exe'), version-only ('Name vX.Y.Z.exe'),
+    and timestamp-only py files matched to a versioned exe.
+    Per version with timestamps: keeps only the LATEST build, deletes older ones.
+    """
+    import re as _re
+    from collections import defaultdict as _dd
+
+    _VERSIONED_TS_RE = _re.compile(r"^.+\s+(v\d+\.\d+\.\d+)__(\d{8}_\d{6})\.", _re.IGNORECASE)
+    _TS_ONLY_RE      = _re.compile(r"^.+__(\d{8}_\d{6})\.")
+
+    flat_files = [f for f in archive_dir.iterdir()
+                  if f.is_file() and f.suffix.lower() not in (".txt", ".log")]
+    if not flat_files:
+        return
+
+    # Two passes so ts_to_version is populated before processing ts-only files
+    ts_builds: dict = _dd(lambda: _dd(list))  # ver -> ts -> [files]
+    ver_only:  dict = _dd(list)               # ver -> [files]
+    ts_to_ver: dict = {}
+    unmatched = []
+
+    for f in flat_files:
+        m = _VERSIONED_TS_RE.match(f.name)
+        if m:
+            ver, ts = m.group(1).lower(), m.group(2)
+            ts_builds[ver][ts].append(f)
+            ts_to_ver[ts] = ver
+            continue
+        vm = VERSION_RE.search(f.stem)
+        if vm:
+            ver_only[vm.group(0).lower()].append(f)
+            continue
+        unmatched.append(f)
+
+    # Match ts-only files (e.g. if_t__20260407_081206.py) to a version via timestamp
+    still_unmatched = []
+    for f in unmatched:
+        m = _TS_ONLY_RE.match(f.name)
+        if m and m.group(1) in ts_to_ver:
+            ts_builds[ts_to_ver[m.group(1)]][m.group(1)].append(f)
+        else:
+            still_unmatched.append(f)
+
+    if not ts_builds and not ver_only:
+        return
+
+    changed = False
+    program_name = archive_dir.parent.name
+
+    if log_fn:
+        log_fn(f"[{program_name}] Fixing archive...")
+
+    # Versioned+timestamp: keep latest per version, delete older builds
+    for ver, ts_dict in sorted(ts_builds.items()):
+        sorted_ts = sorted(ts_dict.keys(), reverse=True)
+        latest_ts, older_ts = sorted_ts[0], sorted_ts[1:]
+        ver_dir = archive_dir / ver
+        ver_dir.mkdir(exist_ok=True)
+        for f in ts_dict[latest_ts]:
+            dst = unique_path(ver_dir / f.name)
+            try:
+                shutil.move(str(f), str(dst))
+                if log_fn: log_fn(f"[{program_name}]   {f.name} -> {ver}/")
+                changed = True
+            except Exception as e:
+                if log_fn: log_fn(f"[{program_name}]   WARN: {f.name}: {e}")
+        for ts in older_ts:
+            for f in ts_dict[ts]:
+                try:
+                    f.unlink()
+                    if log_fn: log_fn(f"[{program_name}]   deleted older build: {f.name}")
+                    changed = True
+                except Exception as e:
+                    if log_fn: log_fn(f"[{program_name}]   WARN delete: {f.name}: {e}")
+
+    # Version-only files: just move to subfolder
+    for ver, files in sorted(ver_only.items()):
+        ver_dir = archive_dir / ver
+        ver_dir.mkdir(exist_ok=True)
+        for f in files:
+            dst = unique_path(ver_dir / f.name)
+            try:
+                shutil.move(str(f), str(dst))
+                if log_fn: log_fn(f"[{program_name}]   {f.name} -> {ver}/")
+                changed = True
+            except Exception as e:
+                if log_fn: log_fn(f"[{program_name}]   WARN: {f.name}: {e}")
+
+    # Unversioned/unmatched: move to unknown/
+    if still_unmatched:
+        unk_dir = archive_dir / "unknown"
+        unk_dir.mkdir(exist_ok=True)
+        for f in still_unmatched:
+            dst = unique_path(unk_dir / f.name)
+            try:
+                shutil.move(str(f), str(dst))
+                if log_fn: log_fn(f"[{program_name}]   {f.name} -> unknown/")
+                changed = True
+            except Exception as e:
+                if log_fn: log_fn(f"[{program_name}]   WARN: {f.name}: {e}")
+
+    if changed and log_fn:
+        log_fn(f"[{program_name}]   archive OK")
+
+
 def move_existing_exes_to_archive(target_dir: Path, keep_name: str, logs: list[str], program_name: str):
     """
     Move ALL *.exe except keep_name into archive/vX.Y.Z/ subfolder.
@@ -638,14 +745,17 @@ class DeployGUI(ttk.Frame):
         self.programs_root_lbl.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         ttk.Button(top, text="Change…", command=self._change_root).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(top, text="⚙ Set paths", command=self._open_set_paths).grid(row=0, column=3, padx=(4, 0))
 
         top.bind("<Configure>", self._update_programs_root_wraplength)
         self.after(0, self._update_programs_root_wraplength)
 
         body = ttk.Frame(root)
-        body.pack(fill="both", expand=True, pady=(10, 10))
+        body.pack(fill="x", pady=(10, 6))
+        body.configure(height=260)
+        body.pack_propagate(False)
 
-        left = ttk.LabelFrame(body, text="Select programs + version (default = latest)")
+        left = ttk.LabelFrame(body, text="Select programs + version")
         left.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
         self.header = ttk.Frame(left)
@@ -666,35 +776,36 @@ class DeployGUI(ttk.Frame):
         right = ttk.LabelFrame(body, text="Destinations")
         right.pack(side="left", fill="y", expand=False)
 
-        right.configure(width=330)
+        right.configure(width=340)
         right.pack_propagate(False)
 
         self.dest_frame = ttk.Frame(right)
-        self.dest_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        self.dest_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
         self._build_dest_rows()
 
         self.after_idle(self._reflow_dest_paths)
 
         actions = ttk.Frame(root)
-        actions.pack(fill="x")
+        actions.pack(fill="x", pady=(6, 0))
 
-        ttk.Button(actions, text="Select ALL", command=self._select_all_programs).pack(side="left")
-        ttk.Button(actions, text="Select NEW", command=self._select_new_programs).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Clear", command=self._clear_programs).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="Refresh", command=self._refresh).pack(side="left", padx=(8, 0))
-        ttk.Button(actions, text="⚙ Set paths", command=self._open_set_paths).pack(side="left", padx=(8, 0))
+        # Group 1 — selection
+        ttk.Button(actions, text="Select All", command=self._select_all_programs).pack(side="left")
+        ttk.Button(actions, text="Select New", command=self._select_new_programs).pack(side="left", padx=(4, 0))
+        ttk.Button(actions, text="Clear", command=self._clear_programs).pack(side="left", padx=(4, 0))
+        ttk.Button(actions, text="Refresh", command=self._refresh).pack(side="left", padx=(4, 0))
 
+        # Group 2 — fix + deploy (gap before)
+        ttk.Button(actions, text="Fix", command=self._on_fix).pack(side="left", padx=(20, 0))
+        self.internal_btn = ttk.Button(actions, text="Deploy Libraries", command=self._on_deploy_internal)
+        self.internal_btn.pack(side="left", padx=(4, 0))
+
+        # Group 3 — copy (gap before, packed right-to-left)
         self.copy_btn = ttk.Button(actions, text="Copy", command=self._on_copy)
         self.copy_btn.pack(side="right")
-        self.readme_btn = ttk.Button(actions, text="Copy ReadMe only", command=self._on_copy_readme_only)
-        self.readme_btn.pack(side="right", padx=(0, 8))
-        self.fix_icons_btn = ttk.Button(actions, text="Fix icons", command=self._on_fix_icons)
-        self.fix_icons_btn.pack(side="right", padx=(0, 8))
-        self.internal_btn = ttk.Button(actions, text="Deploy libraries", command=self._on_deploy_internal)
-        self.internal_btn.pack(side="right", padx=(0, 8))
-        self.build_internal_btn = ttk.Button(actions, text="Build libraries", command=self._on_build_internal)
-        self.build_internal_btn.pack(side="right", padx=(0, 8))
+        self.readme_btn = ttk.Button(actions, text="Copy ReadMe Only", command=self._on_copy_readme_only)
+        self.readme_btn.pack(side="right", padx=(0, 4))
+        ttk.Frame(actions, width=16).pack(side="right")
 
         prog_frame = ttk.Frame(root)
         prog_frame.pack(fill="x", pady=(4, 0))
@@ -828,8 +939,8 @@ class DeployGUI(ttk.Frame):
             self._log(f"ERROR: programs root does not exist: {programs_root}")
             return
 
-        IGNORE = {"dist", "archive", "internal builder", ".venv", ".vscode", ".git",
-                  "matlab", "icons", "extractor"}
+        IGNORE = {"dist", "archive", "internal builder", "l3-qol-janjan", ".venv", ".vscode", ".git",
+                  "matlab", "icons", "extractor", "shift planner"}
         program_dirs = []
         for p in sorted(programs_root.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_dir():
@@ -890,11 +1001,12 @@ class DeployGUI(ttk.Frame):
 
             if not version_names:
                 ttk.Label(row, text="NEW", foreground="gray").grid(row=0, column=3, sticky="w")
+            elif is_new:
+                ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=3, sticky="w")
+            elif last_deployed:
+                ttk.Label(row, text="UTD", foreground="#cc0000").grid(row=0, column=3, sticky="w")
             else:
-                if is_new:
-                    ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=3, sticky="w")
-                else:
-                    ttk.Label(row, text="").grid(row=0, column=3, sticky="w")
+                ttk.Label(row, text="").grid(row=0, column=3, sticky="w")
 
             if last_deployed:
                 ttk.Label(row, text=f"last deployed: {last_deployed}", foreground="gray").grid(
@@ -926,6 +1038,73 @@ class DeployGUI(ttk.Frame):
     def _clear_programs(self):
         for var in self.program_vars.values():
             var.set(False)
+
+    def _on_fix(self):
+        """Fix archives (sort flat files into vX.Y.Z/ subfolders) + fix icons for all programs in all destinations."""
+        selected_roots = self._get_selected_destination_roots()
+        if not selected_roots:
+            from tkinter import messagebox
+            messagebox.showwarning("No destination", "Select at least one destination root.")
+            return
+
+        self._clear_log()
+        self._log("Fixing archives and icons...\n")
+        self._set_busy(True)
+
+        def worker():
+            for dst_root in selected_roots:
+                if not dst_root.exists():
+                    self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
+                    continue
+
+                for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
+                    if not program_dir.is_dir():
+                        continue
+                    if program_dir.name.lower() in ("archive", "dist"):
+                        continue
+
+                    program_name = program_dir.name
+
+                    # ── Fix archive ──────────────────────────────────────
+                    archive_dir = program_dir / "archive"
+                    if archive_dir.exists():
+                        _fix_archive_dir(archive_dir, lambda msg: self.after(0, self._log, msg))
+
+                    # ── Fix icons ────────────────────────────────────────
+                    dist_prog_dir = _dist_root() / program_name
+                    src_ico = None
+                    for vf in list_versions(dist_prog_dir)[:1]:
+                        cand = vf / "icon.ico"
+                        if cand.exists():
+                            src_ico = cand
+                            break
+                    if src_ico is None:
+                        cand = dist_prog_dir / "icon.ico"
+                        if cand.exists():
+                            src_ico = cand
+
+                    for png_name in ("icon.png", "Icon.png", "ICON.png"):
+                        png = program_dir / png_name
+                        if png.exists():
+                            try:
+                                png.unlink()
+                                self.after(0, self._log, f"[{program_name}] Removed: {png_name}")
+                            except Exception as e:
+                                self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
+
+                    if src_ico is not None and src_ico.exists():
+                        dst_ico = program_dir / "icon.ico"
+                        if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
+                            try:
+                                shutil.copy2(src_ico, dst_ico)
+                                self.after(0, self._log, f"[{program_name}] icon.ico updated")
+                            except Exception as e:
+                                self.after(0, self._log, f"[{program_name}] FAILED icon.ico: {e}")
+
+            self.after(0, self._log, "\nDone.")
+            self.after(0, self._set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _collect_icon_conflicts(
         self,
@@ -1118,6 +1297,7 @@ class DeployGUI(ttk.Frame):
             target_dir.mkdir(parents=True, exist_ok=True)
             archive_dir = target_dir / "archive"
             archive_dir.mkdir(parents=True, exist_ok=True)
+            _fix_archive_dir(archive_dir, log)
 
             log(f"[{program_name}] → {target_dir}")
 
@@ -1320,71 +1500,6 @@ class DeployGUI(ttk.Frame):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_fix_icons(self):
-        selected_roots = self._get_selected_destination_roots()
-        if not selected_roots:
-            messagebox.showwarning("No destination", "Select at least one destination root.")
-            return
-
-        self._clear_log()
-        self._log("Fixing icons...\n")
-        self._set_busy(True)
-
-        def worker():
-            for dst_root in selected_roots:
-                if not dst_root.exists():
-                    self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
-                    continue
-
-                for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
-                    if not program_dir.is_dir():
-                        continue
-                    if program_dir.name.lower() in ("archive", "dist"):
-                        continue
-
-                    program_name = program_dir.name
-                    # Look for icon.ico in dist (latest version folder), fallback to dist/program_name
-                    dist_prog_dir = _dist_root() / program_name
-                    src_ico = None
-                    for vf in list_versions(dist_prog_dir)[:1]:
-                        cand = vf / "icon.ico"
-                        if cand.exists():
-                            src_ico = cand
-                            break
-                    if src_ico is None:
-                        cand = dist_prog_dir / "icon.ico"
-                        if cand.exists():
-                            src_ico = cand
-
-                    # Smaž PNG ikony
-                    for png_name in ("icon.png", "Icon.png", "ICON.png"):
-                        png = program_dir / png_name
-                        if png.exists():
-                            try:
-                                png.unlink()
-                                self.after(0, self._log, f"[{program_name}] Removed: {png_name}")
-                            except Exception as e:
-                                self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
-
-                    # Kopíruj icon.ico pokud existuje ve zdroji
-                    if src_ico is not None and src_ico.exists():
-                        dst_ico = program_dir / "icon.ico"
-                        if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
-                            try:
-                                shutil.copy2(src_ico, dst_ico)
-                                self.after(0, self._log, f"[{program_name}] Copied icon.ico")
-                            except Exception as e:
-                                self.after(0, self._log, f"[{program_name}] FAILED icon.ico: {e}")
-                        else:
-                            self.after(0, self._log, f"[{program_name}] icon.ico OK (same size, skipped)")
-                    else:
-                        self.after(0, self._log, f"[{program_name}] No icon.ico in source, skipping")
-
-            self.after(0, self._log, "\nDone.")
-            self.after(0, self._set_busy, False)
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _on_build_internal(self):
         builder_script = _programs_root() / "Internal Builder" / "_internal_builder.py"
         if not builder_script.exists():
@@ -1394,7 +1509,6 @@ class DeployGUI(ttk.Frame):
         self._clear_log()
         self._log(f"Building _internal_builder...\n{builder_script}\n")
         self._set_busy(True)
-        self.build_internal_btn.configure(state="disabled")
 
         def worker():
             import subprocess
@@ -1432,7 +1546,6 @@ class DeployGUI(ttk.Frame):
                 self.after(0, self._log, f"ERROR: {e}")
             finally:
                 self.after(0, self._set_busy, False)
-                self.after(0, lambda: self.build_internal_btn.configure(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 

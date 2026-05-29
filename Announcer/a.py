@@ -115,7 +115,7 @@ class RegionSelector(tk.Toplevel):
 class ScreenTracker(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Screen Region Tracker")
+        self.title("Announcer")
 
         try:
             self.iconbitmap(self._get_icon_path())
@@ -181,7 +181,7 @@ class ScreenTracker(tk.Tk):
             base = Path(sys.executable).parent
         else:
             base = Path(__file__).parent
-        return str(base / "screen_tracker.ico")
+        return str(base / "icon.ico")
     
     def _load_sound_files(self):
         if getattr(sys, "frozen", False):

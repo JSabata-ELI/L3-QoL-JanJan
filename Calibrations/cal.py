@@ -1,11 +1,12 @@
 # cal.py
 import sys
 import csv
+from pathlib import Path
 import re
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt, QDate
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtGui import QColor, QBrush, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QMessageBox,
@@ -189,6 +190,12 @@ class CalibrationTable(QMainWindow):
         super().__init__()
         self.setWindowTitle("Calibrations")
         self.resize(1320, 760)
+        try:
+            _base = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+                     else Path(__file__).parent)
+            self.setWindowIcon(QIcon(str(_base / "icon.ico")))
+        except Exception:
+            pass
 
         # Columns:
         # 0 Waveplate, 1 QE95, 2 <Device>, 3 Cal Factor (read-only), 4 Note

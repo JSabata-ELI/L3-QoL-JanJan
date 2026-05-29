@@ -719,9 +719,9 @@ def _energy_api_for_day(
     # Per-column row lists: col -> list of (t_ns, dt_local, val)
     per_col_raw: dict[str, list[tuple[int, datetime, str]]] = {}
 
-    for col in cols:
+    def _fetch_one_col(col: str) -> tuple[str, list[tuple[int, datetime, str]]]:
         channel = CPVA_CHANNEL_MAP.get(col)
-        col_rows: list[tuple[int, datetime, str]] = []  # (ns, dt_local, val)
+        col_rows: list[tuple[int, datetime, str]] = []
 
         if channel is not None:
             channels_to_try = [channel]
@@ -766,7 +766,6 @@ def _energy_api_for_day(
             csv_rows = _load_energy_csv(csv_path)
             for r in csv_rows:
                 if col in r.values:
-                    # Convert Prague-naive dt to ns
                     if PRAGUE is not None:
                         t_ns = int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
                     else:
@@ -775,14 +774,22 @@ def _energy_api_for_day(
             if col_rows:
                 _log(f"  CSV fallback {col}: {len(col_rows)} rows")
 
-        if col_rows:
-            per_col_raw[col] = col_rows
+        return col, col_rows
 
-        for t_ns, dt_local, val in col_rows:
-            if t_ns not in by_ts:
-                by_ts[t_ns] = {}
-            by_ts[t_ns].setdefault("_dt", dt_local)
-            by_ts[t_ns][col] = val
+    with ThreadPoolExecutor(max_workers=max(1, len(cols))) as _aex:
+        _col_futs = {_aex.submit(_fetch_one_col, c): c for c in cols}
+        for _fut in as_completed(_col_futs):
+            try:
+                _col, _col_rows = _fut.result()
+                if _col_rows:
+                    per_col_raw[_col] = _col_rows
+                for t_ns, dt_local, val in _col_rows:
+                    if t_ns not in by_ts:
+                        by_ts[t_ns] = {}
+                    by_ts[t_ns].setdefault("_dt", dt_local)
+                    by_ts[t_ns][_col] = val
+            except Exception as exc:
+                _log(f"  col fetch ERROR: {type(exc).__name__}: {exc}")
 
     # Convert to _EnergyRow objects sorted by timestamp
     result: list[_EnergyRow] = []
@@ -3082,21 +3089,35 @@ class ImageFinderWidget(QWidget):
                 all_entries: list[Path] = []
                 found_any_hour = False
 
-                for h in range(24):
+                def _scan_hour(h: int) -> tuple[bool, list[Path]]:
                     hour_dir = day_dir / str(h)
                     try:
                         if not hour_dir.exists() or not hour_dir.is_dir():
-                            continue
+                            return False, []
                     except Exception:
-                        continue
-                    found_any_hour = True
+                        return False, []
+                    entries: list[Path] = []
                     try:
                         for e in os.scandir(hour_dir):
-                            if e.is_dir() and e.name not in seen:
-                                seen.add(e.name)
-                                all_entries.append(Path(e.path))
+                            if e.is_dir():
+                                entries.append(Path(e.path))
                     except Exception:
                         pass
+                    return True, entries
+
+                with ThreadPoolExecutor(max_workers=12) as _hex:
+                    _futs = [_hex.submit(_scan_hour, h) for h in range(24)]
+                    for _fut in as_completed(_futs):
+                        try:
+                            _existed, _entries = _fut.result()
+                            if _existed:
+                                found_any_hour = True
+                            for _p in _entries:
+                                if _p.name not in seen:
+                                    seen.add(_p.name)
+                                    all_entries.append(_p)
+                        except Exception:
+                            pass
 
                 if not found_any_hour:
                     _sig.not_found.emit(target_path)
@@ -4122,7 +4143,7 @@ class ImageFinderWidget(QWidget):
             )
             return folder, qty, chosen
 
-        max_workers = min(8, len(jobs))
+        max_workers = min(24, len(jobs))
         self._log_safe(f"COLLECT: parallel scan max_workers={max_workers}")
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(worker, f, q) for f, q in jobs]
@@ -4206,25 +4227,45 @@ class ImageFinderWidget(QWidget):
         # ── Correct the hour folder based on best_shot_ns ────────────────────
         # load_folders stores the first found hour for each camera (dedup by name),
         # which may differ from the hour containing the actual best shot.
+        import time as _time_cf
         best_shot_dt_utc = datetime.fromtimestamp(best_shot_ns / 1e9, tz=timezone.utc)
         correct_h = best_shot_dt_utc.hour
         correct_folder = folder.parent.parent / str(correct_h) / folder.name
         if correct_folder != folder:
-            if correct_folder.exists():
+            _t_cf = _time_cf.perf_counter()
+            _cf_exists = correct_folder.exists()
+            log(f"  correct_folder.exists() took {_time_cf.perf_counter()-_t_cf:.3f}s → {_cf_exists}")
+            if _cf_exists:
                 log(f"  correcting folder h{folder.parent.name} → h{correct_h}")
                 folder = correct_folder
             else:
                 log(f"  correct_folder h{correct_h} does not exist — using original")
 
-        # ── Step 3: listdir → parse ns → sort → bisect to anchor ─────────────
-        # os.scandir on this SMB share returns only ~177 files (SMB page limit).
-        # os.listdir fetches all names in one syscall without pagination issues.
+        # ── Step 3: fast exact-match glob → fallback full listdir ────────────
+        # Filenames encode nanoseconds at the end of the stem (SOURCE_RE = r"(\d+)$").
+        # Try an exact glob first — single SMB lookup, avoids listing huge directories.
         import bisect as _bisect
+        import time as _time
+
+        _t0_listdir = _time.perf_counter()
+
+        if qty == 1:
+            try:
+                exact_hits = list(folder.glob(f"*{best_shot_ns}.*"))
+                exact_hits = [p for p in exact_hits if is_valid_image_file(p.name)]
+                if exact_hits:
+                    log(f"  exact glob hit: {exact_hits[0].name} (Δ=0.0s) in {_time.perf_counter()-_t0_listdir:.3f}s")
+                    return [exact_hits[0]]
+            except Exception:
+                pass
+
         try:
             raw_names = os.listdir(folder)
         except Exception as e:
             log(f"  listdir error: {e}")
             return []
+
+        log(f"  listdir took {_time.perf_counter()-_t0_listdir:.3f}s, {len(raw_names)} entries")
 
         # Parse ns from every valid image filename
         items_ns: list[tuple[int, str]] = []

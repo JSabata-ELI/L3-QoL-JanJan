@@ -767,9 +767,17 @@ class _StatsShim:
 class CPVAExplorerApp:
     def __init__(self, root: tk.Tk):
         self.root   = root
-        self.root.title("CPVA Explorer")
+        self.root.title("CSS Logger")
         self.root.minsize(1200, 750)
         self.root.state("zoomed")
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _base = (_Path(_sys.executable).parent if getattr(_sys, "frozen", False)
+                     else _Path(__file__).parent)
+            self.root.iconbitmap(str(_base / "icon.ico"))
+        except Exception:
+            pass
 
         self.config = load_config()
 
