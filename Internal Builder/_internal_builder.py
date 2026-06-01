@@ -158,6 +158,7 @@ if __name__ == "__main__":
         "--collect-all", "python-dateutil",
         "--collect-all", "screeninfo",
         "--collect-all", "scipy",
+        "--collect-all", "numpy",
         "--collect-all", "orjson",
         "--collect-data", "certifi",
         "--hidden-import", "zoneinfo._tzdata",

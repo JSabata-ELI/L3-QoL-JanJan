@@ -3,7 +3,7 @@ CPVA Explorer  —  Interactive PV data explorer from CPVA archiver.
 """
 # cssl.py
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import threading
 import json
 import sys
@@ -15,6 +15,10 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import ssl
+import orjson
+import requests
+from matplotlib.widgets import RectangleSelector
+from copy import copy
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -35,6 +39,9 @@ def get_app_dir() -> Path:
 APP_DIR      = get_app_dir()
 CONFIG_FILE  = APP_DIR / "cpva_explorer_config.json"
 PRESETS_FILE = APP_DIR / "cpva_presets.json"
+CONDITIONS_PRESETS_FILE = APP_DIR / "cpva_conditions_presets.json"
+CUSTOM_PVS_FILE = APP_DIR / "custom_pvs.json"
+RAMPING_ARCHIVE_FILE = APP_DIR / "ramping_archive.json"
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +58,14 @@ IMAGE_ROOT             = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
 CHUNK_SIZE_NS = int(3600 * 1e9)   # 1 hour in nanoseconds
 
 # Rows within this many milliseconds of each other are merged into one.
-MERGE_WINDOW_MS = 100
+MERGE_WINDOW_MS = 140
 SAMPLE_HOLD_MIN_GAP_MS = 137
+MASTER_RAMP_PV = "L3-PFWP6-MTR03-1:RawPos"
+
+
+
+_SESSION = requests.Session()
+_SESSION.verify = False
 
 
 # ---------------------------------------------------------------------------
@@ -60,10 +73,16 @@ SAMPLE_HOLD_MIN_GAP_MS = 137
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    "pv_list":      [],
-    "time_from":    "",
-    "time_to":      "",
+    "pv_list": [],
+    "time_from": "",
+    "time_to": "",
     "http_timeout": 10.0,
+
+    "conditions": [],
+
+    "master_pv": MASTER_RAMP_PV,
+
+    "master_multiple": "",
 }
 
 
@@ -113,7 +132,6 @@ def save_presets(presets: list[dict]) -> None:
     with open(PRESETS_FILE, "w", encoding="utf-8") as f:
         json.dump({"presets": presets}, f, indent=2, ensure_ascii=False)
 
-
 # ---------------------------------------------------------------------------
 # CPVA API - HTTP
 # ---------------------------------------------------------------------------
@@ -122,12 +140,89 @@ _SSL_CONTEXT = ssl.create_default_context()
 _SSL_CONTEXT.check_hostname = False
 _SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
+def load_condition_presets() -> list[dict]:
+    if CONDITIONS_PRESETS_FILE.exists():
+        try:
+            with open(CONDITIONS_PRESETS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("presets"), list):
+                return data["presets"]
+        except Exception:
+            pass
+    return []
+
+
+def save_condition_presets(presets: list[dict]) -> None:
+    CONDITIONS_PRESETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONDITIONS_PRESETS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"presets": presets}, f, indent=2, ensure_ascii=False)
+
+def load_custom_pvs() -> list[dict]:
+
+    if CUSTOM_PVS_FILE.exists():
+        try:
+            with open(CUSTOM_PVS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if isinstance(data, dict):
+                return data.get("custom_pvs", [])
+        except Exception:
+            pass
+
+    return []
+
+
+def save_custom_pvs(custom_pvs: list[dict]) -> None:
+
+    CUSTOM_PVS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(CUSTOM_PVS_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"custom_pvs": custom_pvs},
+            f,
+            indent=2,
+            ensure_ascii=False
+        )        
+
+def load_ramping_archive() -> list[dict]:
+
+    if RAMPING_ARCHIVE_FILE.exists():
+        try:
+            with open(RAMPING_ARCHIVE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if isinstance(data, dict):
+                return data.get("archives", [])
+
+        except Exception:
+            pass
+
+    return []
+
+
+def save_ramping_archive(archives: list[dict]) -> None:
+
+    RAMPING_ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(RAMPING_ARCHIVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"archives": archives},
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
 
 def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw)
+
+    resp = _SESSION.get(
+        url,
+        timeout=timeout,
+        headers={"Accept": "application/json"},
+    )
+
+    resp.raise_for_status()
+
+    return orjson.loads(resp.content)
 
 
 def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
@@ -436,7 +531,7 @@ class DatePickerDialog(tk.Toplevel):
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
-
+        
         self._callback = on_ok_callback
 
         self._year  = tk.IntVar(value=init_dt.year)
@@ -767,17 +862,9 @@ class _StatsShim:
 class CPVAExplorerApp:
     def __init__(self, root: tk.Tk):
         self.root   = root
-        self.root.title("CSS Logger")
+        self.root.title("CPVA Explorer")
         self.root.minsize(1200, 750)
         self.root.state("zoomed")
-        try:
-            import sys as _sys
-            from pathlib import Path as _Path
-            _base = (_Path(_sys.executable).parent if getattr(_sys, "frozen", False)
-                     else _Path(__file__).parent)
-            self.root.iconbitmap(str(_base / "icon.ico"))
-        except Exception:
-            pass
 
         self.config = load_config()
 
@@ -787,7 +874,10 @@ class CPVAExplorerApp:
         self._last_pv_search: str             = ""
         self._col_full_names: dict[str, str]  = {}
         self._presets: list[dict]             = load_presets()
-
+        self._condition_presets: list[dict] = load_condition_presets()
+        self._custom_pvs: list[dict] = load_custom_pvs()
+        self._ramping_archive: list[dict] = load_ramping_archive()
+        self._custom_pv_counter = 1
         self._Figure, self._FigureCanvas = _try_import_matplotlib()
         self._mpl_canvas = None
         self._mpl_figure = None
@@ -801,13 +891,14 @@ class CPVAExplorerApp:
         self._xy_figure = None
         self._xy_x_var = tk.StringVar()
         self._xy_y_var = tk.StringVar()
-
+        self._xy_zoom_history = []
         self._graph_lines: list[list] = []   # outer list per PV, inner list: 1 or 2 Line2D objects
         self._graph_pvs:   list[str]  = []   # PV names corresponding to _graph_lines
         # Raw (times_num, values) per PV for cursor snapping — populated by _plot_graph/_update_graph_data
         self._graph_raw: list[tuple] = []   # list of (times_as_mpl_num_array, values_list)
         # Per-PV settings: keyed by PV name
         # Keys: show, display_name, color, axis, ymin, ymax, auto_scale, width, smooth, grid
+        self._xy_last_point_count = 0
         self._pv_settings: dict[str, dict] = {}
         self._pinned_ylim: "tuple | None" = None   # (ymin|None, ymax|None) set by Apply
         self._crosshair_vlines = []
@@ -823,8 +914,25 @@ class CPVAExplorerApp:
         self._ref_lines: list[dict] = []
         # Conditions for filtering visible data
         # each condition: {"pv": str, "min": float|None, "max": float|None}
-        self._conditions: list[dict] = []
+        self._conditions: list[dict] = copy(
+            self.config.get("conditions", [])
+        )
         self._table_rows_unfiltered: list = []
+        self._suspect_rows: set[int] = set()
+        # Master PV used for removing fake rows caused only by ramp/write updates.
+        # Default is L3-PFWP6-MTR03-1:RawPos.
+        self._master_pv_var = tk.StringVar(
+            value=self.config.get(
+                "master_pv",
+                MASTER_RAMP_PV
+            )
+        )
+        self._master_multiple_var = tk.StringVar(
+            value=self.config.get(
+                "master_multiple",
+                ""
+            )
+        )
         
         # Time state: two datetime objects
         now = datetime.now()
@@ -854,17 +962,20 @@ class CPVAExplorerApp:
 
         self.tab_graph = tk.Frame(self.notebook)
         self.tab_xy    = tk.Frame(self.notebook)
+       
         self.tab_table = tk.Frame(self.notebook)
         self.tab_log   = tk.Frame(self.notebook)
 
         self.notebook.add(self.tab_graph, text="  Graph  ")
         self.notebook.add(self.tab_xy,    text="  XY Plot  ")
+    
         self.notebook.add(self.tab_table, text="  Table  ")
         self.notebook.add(self.tab_log,   text="  Log    ")
         self.notebook.select(self.tab_graph)
 
         self._build_graph_tab()
         self._build_xy_tab()
+       
         self._build_table_tab()
         self._build_log_tab()
 
@@ -964,30 +1075,6 @@ class CPVAExplorerApp:
         self.lbl_pv_count = tk.Label(bar, text="0 PV", font=FONT_NORMAL, fg=COLOR_GRAY)
         self.lbl_pv_count.pack(anchor=tk.W, padx=8)
 
-        # -- Merge mode --------------------------------------------------------
-        ttk.Separator(bar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-
-        tk.Label(bar, text="MERGE MODE", font=FONT_HEADER,
-                fg=COLOR_BLUE, anchor=tk.W).pack(fill=tk.X, pady=(0, 4))
-
-        self._merge_mode_var = tk.StringVar(value="window")
-
-        tk.Radiobutton(
-            bar, text="Window merge",
-            variable=self._merge_mode_var,
-            value="window",
-            font=FONT_NORMAL,
-            anchor=tk.W
-        ).pack(fill=tk.X, padx=8)
-
-        tk.Radiobutton(
-            bar, text="Sample & hold",
-            variable=self._merge_mode_var,
-            value="sample_hold",
-            font=FONT_NORMAL,
-            anchor=tk.W
-        ).pack(fill=tk.X, padx=8)
-
         # -- Load button ------------------------------------------------------
         self.btn_load = _btn(bar, "LOAD DATA", self._on_load_clicked,
                              bg=COLOR_GREEN, fg="white", padx=12, pady=10,
@@ -1005,7 +1092,7 @@ class CPVAExplorerApp:
         self.btn_live.pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Label(live_row, text="Refresh interval:", font=FONT_NORMAL).pack(side=tk.LEFT)
-        self._live_interval_var = tk.StringVar(value="1")
+        self._live_interval_var = tk.StringVar(value="10")
         vcmd = (bar.register(lambda s: s == "" or (s.replace(".", "", 1).isdigit())), "%P")
         tk.Entry(live_row, textvariable=self._live_interval_var,
                  width=5, font=FONT_MONO, validate="key",
@@ -1031,6 +1118,14 @@ class CPVAExplorerApp:
 
         _btn(ctrl, "💾 Save graph", self._save_graph,
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 6))
+        
+        _btn(
+            ctrl,
+            "Save Ramping",
+            self._save_current_ramping,
+            padx=8,
+            pady=3
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_zoom_back = _btn(ctrl, "↩ Back", self._zoom_back,
                                    padx=8, pady=3)
@@ -1042,6 +1137,13 @@ class CPVAExplorerApp:
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 6))
         _btn(ctrl, "Conditions", self._open_conditions_dialog,
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 18))
+        _btn(
+            ctrl,
+            "Add custom PV",
+            self._open_custom_pv_dialog,
+            padx=8,
+            pady=3
+        ).pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Label(ctrl, text="Font:", font=FONT_NORMAL).pack(side=tk.LEFT, padx=(8, 2))
         self._font_size_var = tk.StringVar(value="11")
@@ -1105,9 +1207,36 @@ class CPVAExplorerApp:
 
         _btn(ctrl, "Plot XY", self._plot_xy,
             bg=COLOR_GREEN, fg="white", padx=10, pady=4).pack(side=tk.LEFT)
+        
+        _btn(
+            ctrl,
+            "Ramping Archive",
+            self._open_ramping_archive_dialog,
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         _btn(ctrl, "Clean XY", self._clear_xy_plot,
             padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
+
+        _btn(ctrl, "Conditions", self._open_conditions_dialog,
+            padx=10, pady=4).pack(side=tk.LEFT, padx=(12, 0))
+
+        _btn(
+            ctrl,
+            "↩ XY Back",
+            self._xy_zoom_back,
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        _btn(
+            ctrl,
+            "Add custom PV",
+            self._open_custom_pv_dialog,
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         self.xy_container = tk.Frame(tab, bg="#f5f5f5")
         self.xy_container.grid(row=1, column=0, sticky=tk.NSEW, padx=8, pady=6)
@@ -1122,7 +1251,6 @@ class CPVAExplorerApp:
             anchor=tk.W
         )
         self.lbl_xy_info.grid(row=2, column=0, sticky=tk.EW, padx=8, pady=(0, 6))
-
 
     def _refresh_xy_choices(self):
         if not hasattr(self, "xy_x_combo"):
@@ -1156,6 +1284,101 @@ class CPVAExplorerApp:
         if len(display_choices) >= 2 and self._xy_y_var.get() not in display_choices:
             self._xy_y_var.set(display_choices[1])
 
+
+
+    def _on_xy_scroll(self, event):
+
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        cur_xlim = ax.get_xlim()
+        cur_ylim = ax.get_ylim()
+
+        xdata = event.xdata
+        ydata = event.ydata
+
+        if xdata is None or ydata is None:
+            return
+
+        # uložit zoom history
+        self._xy_zoom_history.append(
+            (cur_xlim, cur_ylim)
+        )
+
+        scale_factor = 0.9 if event.button == "up" else 1.1
+
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+
+        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
+        rely = (cur_ylim[1] - ydata) / (cur_ylim[1] - cur_ylim[0])
+
+        ax.set_xlim([
+            xdata - new_width * (1 - relx),
+            xdata + new_width * relx
+        ])
+
+        ax.set_ylim([
+            ydata - new_height * (1 - rely),
+            ydata + new_height * rely
+        ])
+
+        self._xy_canvas.draw_idle()
+
+
+    def _on_xy_rect_zoom(self, eclick, erelease):
+
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        x1 = eclick.xdata
+        y1 = eclick.ydata
+
+        x2 = erelease.xdata
+        y2 = erelease.ydata
+
+        if None in (x1, y1, x2, y2):
+            return
+
+        if abs(x2 - x1) < 1e-12:
+            return
+
+        if abs(y2 - y1) < 1e-12:
+            return
+
+        self._xy_zoom_history.append(
+            (
+                ax.get_xlim(),
+                ax.get_ylim()
+            )
+        )
+
+        ax.set_xlim(min(x1, x2), max(x1, x2))
+        ax.set_ylim(min(y1, y2), max(y1, y2))
+
+        self._xy_canvas.draw_idle()
+
+
+    def _xy_zoom_back(self):
+
+        if not self._xy_zoom_history:
+            return
+
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        xlim, ylim = self._xy_zoom_history.pop()
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
+        self._xy_canvas.draw_idle()
 
     def _on_tab_changed(self, event=None):  # noqa: ARG002
         selected = self.notebook.select()
@@ -1269,6 +1492,43 @@ class CPVAExplorerApp:
         else:
             self.lbl_graph_stats.config(text="No data in selection.", fg=COLOR_GRAY)
 
+
+    def _get_available_custom_pvs(self):
+
+        loaded = set(self._pv_order)
+
+        available = []
+
+        for cpv in self._custom_pvs:
+
+            required = set(cpv.get("required_pvs", []))
+
+            if required.issubset(loaded):
+
+                available.append(cpv)
+
+        return available
+
+    def _save_runtime_state(self):
+
+        self.config["pv_list"] = self._get_pv_list()
+
+        self.config["conditions"] = copy(self._conditions)
+
+        self.config["master_pv"] = self._master_pv_var.get()
+
+        self.config["master_multiple"] = self._master_multiple_var.get()
+
+        self.config["time_from"] = self._dt_from.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        self.config["time_to"] = self._dt_to.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        save_config(self.config)
+
     def _plot_graph(self):
         if self._Figure is None:
             messagebox.showerror("matplotlib missing",
@@ -1374,17 +1634,19 @@ class CPVAExplorerApp:
         self._graph_raw   = []
         for i, (pv, ax) in enumerate(zip(numeric_pvs, axes)):
             # Use UTC-aware datetimes so matplotlib epoch math is always correct
-            condition_ok_ts = self._condition_ok_timestamps()
-
+           
             pairs = []
-            for ts, v, _ in self._samples_by_pv[pv]:
-                if not isinstance(v, (int, float)):
+
+            for ts_ns, row_dict in self._table_rows:
+                if pv not in row_dict:
                     continue
 
-                if self._conditions and ts not in condition_ok_ts:
-                    pairs.append((ts, None))
-                else:
-                    pairs.append((ts, v))
+                value, _units = row_dict[pv]
+
+                if not isinstance(value, (int, float)):
+                    continue
+
+                pairs.append((ts_ns, value))
 
             MAX_GRAPH_POINTS = 25000
 
@@ -1653,6 +1915,50 @@ class CPVAExplorerApp:
         # Refresh axis settings panel
         self._refresh_axis_settings_tv()
 
+    def _save_current_ramping(self):
+
+        if not self._graph_axes:
+            return
+
+        try:
+            xmin, xmax = self._graph_axes[0].get_xlim()
+
+            import matplotlib.dates as mdates
+
+            dt_min = mdates.num2date(xmin, tz=timezone.utc)
+            dt_max = mdates.num2date(xmax, tz=timezone.utc)
+
+            start_ns = int(dt_min.timestamp() * 1e9)
+            end_ns = int(dt_max.timestamp() * 1e9)
+
+            name = simpledialog.askstring(
+                "Save Ramping",
+                "Archive name:"
+            )
+
+            if not name:
+                return
+
+            self._ramping_archive.append({
+                "name": name,
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+            })
+
+            save_ramping_archive(self._ramping_archive)
+
+            self.lbl_status.config(
+                text=f"Ramping saved: {name}",
+                fg=COLOR_GREEN
+            )
+
+        except Exception as e:
+
+            messagebox.showerror(
+                "Save failed",
+                str(e)
+            )
+
     def _clean_graph(self):
         """Remove PV data from the graph (hide all lines) but keep the graph frame."""
         if self._mpl_canvas is None:
@@ -1694,7 +2000,7 @@ class CPVAExplorerApp:
             self.lbl_status.config(text=f"Graph saved: {path}", fg=COLOR_GREEN)
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
-
+    
     def _clear_graph(self):
         self._span_selector = None
         self._crosshair_vlines = []
@@ -2108,12 +2414,42 @@ class CPVAExplorerApp:
         dlg.transient(self.root)
         dlg.grab_set()
 
-        dlg.geometry("760x520")
+        dlg.geometry("900x650")
+
+        # Master PV row
+        master_row = tk.Frame(dlg)
+        master_row.pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        tk.Label(
+            master_row,
+            text="Master ramp PV:",
+            font=FONT_HEADER,
+            fg=COLOR_BLUE
+        ).pack(side=tk.LEFT)
+
+        tk.Entry(
+            master_row,
+            textvariable=self._master_pv_var,
+            font=FONT_MONO
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 6))
+
+        tk.Label(
+            master_row,
+            text="Keep only multiples of:",
+            font=FONT_NORMAL
+        ).pack(side=tk.LEFT, padx=(8, 4))
+
+        tk.Entry(
+            master_row,
+            textvariable=self._master_multiple_var,
+            font=FONT_MONO,
+            width=8
+        ).pack(side=tk.LEFT)
 
         self._cond_selected_pv = tk.StringVar(value="")
 
         top = tk.Frame(dlg)
-        top.pack(fill=tk.X, padx=10, pady=(10, 4))
+        top.pack(fill=tk.X, padx=10, pady=(6, 4))
 
         tk.Label(top, text="Condition PV:", font=FONT_HEADER, fg=COLOR_BLUE).pack(side=tk.LEFT)
 
@@ -2210,6 +2546,7 @@ class CPVAExplorerApp:
 
             self._conditions.append({"pv": pv, "min": vmin, "max": vmax})
             _refresh_conditions_list()
+            self._save_runtime_state()
 
         def _remove_condition():
             sel = tv.selection()
@@ -2220,22 +2557,137 @@ class CPVAExplorerApp:
                 if 0 <= idx < len(self._conditions):
                     self._conditions.pop(idx)
             _refresh_conditions_list()
+            self._save_runtime_state()
 
         def _clear_conditions():
             self._conditions = []
             _refresh_conditions_list()
+            self._save_runtime_state()
+
+        preset_row = tk.Frame(dlg)
+        preset_row.pack(fill=tk.X, padx=10, pady=(10, 4))
+
+        tk.Label(preset_row, text="Preset:", font=FONT_NORMAL).pack(side=tk.LEFT)
+
+        cond_preset_var = tk.StringVar()
+        cond_preset_combo = ttk.Combobox(
+            preset_row,
+            textvariable=cond_preset_var,
+            state="readonly",
+            font=FONT_NORMAL,
+            width=28
+        )
+        cond_preset_combo.pack(side=tk.LEFT, padx=(6, 6))
+
+        def _refresh_condition_preset_combo():
+            names = [p.get("name", "") for p in self._condition_presets]
+            cond_preset_combo["values"] = names
+            if names and cond_preset_var.get() not in names:
+                cond_preset_var.set(names[0])
+            elif not names:
+                cond_preset_var.set("")
+
+        def _load_condition_preset():
+            name = cond_preset_var.get()
+            preset = next((p for p in self._condition_presets if p.get("name") == name), None)
+            if not preset:
+                return
+            self._conditions = list(preset.get("conditions", []))
+            _refresh_conditions_list()
+
+        def _save_condition_preset():
+            name = cond_preset_var.get().strip()
+            if not name:
+                name = simpledialog.askstring("Save condition preset", "Preset name:", parent=dlg)
+                if not name:
+                    return
+
+            preset = {
+                "name": name,
+                "conditions": list(self._conditions),
+            }
+
+            existing = next((p for p in self._condition_presets if p.get("name") == name), None)
+            if existing:
+                existing.update(preset)
+            else:
+                self._condition_presets.append(preset)
+
+            save_condition_presets(self._condition_presets)
+            _refresh_condition_preset_combo()
+            cond_preset_var.set(name)
+
+        def _save_condition_preset_as():
+            name = simpledialog.askstring("Save condition preset as", "Preset name:", parent=dlg)
+            if not name:
+                return
+
+            preset = {
+                "name": name.strip(),
+                "conditions": list(self._conditions),
+            }
+
+            existing = next((p for p in self._condition_presets if p.get("name") == name.strip()), None)
+            if existing:
+                existing.update(preset)
+            else:
+                self._condition_presets.append(preset)
+
+            save_condition_presets(self._condition_presets)
+            _refresh_condition_preset_combo()
+            cond_preset_var.set(name.strip())
+
+        def _delete_condition_preset():
+            name = cond_preset_var.get()
+            if not name:
+                return
+            if not messagebox.askyesno("Delete preset", f'Delete condition preset "{name}"?', parent=dlg):
+                return
+
+            self._condition_presets = [
+                p for p in self._condition_presets
+                if p.get("name") != name
+            ]
+            save_condition_presets(self._condition_presets)
+            _refresh_condition_preset_combo()
+
+        _btn(preset_row, "Load", _load_condition_preset, bg=COLOR_BLUE, fg="white", padx=8, pady=3).pack(side=tk.LEFT)
+        _btn(preset_row, "Save", _save_condition_preset, padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 4))
+        _btn(preset_row, "Save as new…", _save_condition_preset_as, padx=8, pady=3).pack(side=tk.LEFT)
+        _btn(preset_row, "Delete", _delete_condition_preset, bg=COLOR_RED, fg="white", padx=8, pady=3).pack(side=tk.LEFT)
+
+        _refresh_condition_preset_combo()
 
         action_row = tk.Frame(dlg)
         action_row.pack(fill=tk.X, padx=10, pady=(4, 8))
 
-        _btn(action_row, "+ Add condition", _add_condition,
-            bg=COLOR_GREEN, fg="white", padx=10, pady=4).pack(side=tk.LEFT)
+        _btn(
+            action_row,
+            "+ Add condition",
+            _add_condition,
+            bg=COLOR_GREEN,
+            fg="white",
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT)
 
-        _btn(action_row, "Remove selected", _remove_condition,
-            padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
+        _btn(
+            action_row,
+            "Remove selected",
+            _remove_condition,
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
-        _btn(action_row, "Clear all", _clear_conditions,
-            padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
+        _btn(
+            action_row,
+            "Clear all",
+            _clear_conditions,
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+
 
         def _apply_and_close():
             self._apply_conditions_to_loaded_data()
@@ -2295,26 +2747,30 @@ class CPVAExplorerApp:
 
 
     def _apply_conditions_to_loaded_data(self):
-        """Apply current conditions to already loaded table and graph."""
+        """Apply current master PV filter and conditions to already loaded data."""
         if not self._table_rows_unfiltered:
             return
 
-        self._table_rows = self._apply_conditions_to_rows(self._table_rows_unfiltered)
+        rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+        self._table_rows = self._apply_conditions_to_rows(rows)
+        
         self._populate_table(self._pv_order)
-
-        self._populate_table(self._pv_order)
+        self._refresh_xy_choices()
 
         if self.notebook.select() == str(self.tab_graph):
             self._plot_graph()
 
-        if self.notebook.select() == str(self.tab_graph):
-            self._plot_graph()
+        if self.notebook.select() == str(self.tab_xy):
+            try:
+                self._plot_xy()
+            except Exception:
+                pass
 
         self.lbl_status.config(
-            text=f"Conditions applied: {len(self._table_rows)} row(s) remain.",
+            text=f"Filters applied: {len(self._table_rows)} row(s) remain.",
             fg=COLOR_BLUE
         )
-
+        self._save_runtime_state()
 
 
     def _pick_ref_line_color(self):
@@ -2710,11 +3166,13 @@ class CPVAExplorerApp:
         self._tree_menu.add_command(label="Copy cell",  command=self._copy_cell)
         self._tree_menu.add_command(label="Copy row",   command=self._copy_row)
         self._tree_menu.add_separator()
+        self._tree_menu.add_command(label="Delete row", command=self._delete_selected_row)
         self._tree_menu.add_command(label="Open image", command=self._open_image_from_selection)
 
         self.tree.bind("<Button-3>",       self._on_tree_right_click)
         self.tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.tree.bind("<Motion>",          self._on_tree_motion)
+        self.tree.bind("<Delete>", lambda _: self._delete_selected_row())
 
         self._clicked_col_id: str | None = None
 
@@ -2733,8 +3191,21 @@ class CPVAExplorerApp:
         self.lbl_table_info = tk.Label(info, text="No data - click 'Load data'.",
                                          font=FONT_NORMAL, fg=COLOR_GRAY, anchor=tk.W)
         self.lbl_table_info.pack(side=tk.LEFT)
+
         self.btn_export_csv = _btn(info, "Export CSV...", self._export_csv, padx=8, pady=2)
         self.btn_export_csv.pack(side=tk.RIGHT)
+
+        _btn(info, "Conditions", self._open_conditions_dialog,
+            padx=8, pady=2).pack(side=tk.RIGHT, padx=(0, 6))
+        
+        _btn(
+            info,
+            "Add custom PV",
+            self._open_custom_pv_dialog,
+            padx=8,
+            pady=2
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+
 
     # -- Log tab --------------------------------------------------------------
 
@@ -3281,6 +3752,8 @@ class CPVAExplorerApp:
                         on_close_callback=lambda t: setattr(self, "_last_pv_search", t),
                         x=btn.winfo_rootx(),
                         y=btn.winfo_rooty() + btn.winfo_height() + 2)
+        
+    
 
     def _add_pvs_from_browser(self, pv_names: list[str]):
         existing = set(self._get_pv_list())
@@ -3388,6 +3861,18 @@ class CPVAExplorerApp:
         self._save_pv_list_to_config()
         # Optionally apply time window
         hours = preset.get("time_window_hours")
+
+        self._conditions = copy(
+            preset.get("conditions", [])
+        )
+
+        self._master_pv_var.set(
+            preset.get("master_pv", MASTER_RAMP_PV)
+        )
+
+        self._master_multiple_var.set(
+            preset.get("master_multiple", "")
+        )
         if hours:
             self._apply_preset(float(hours))
         self.lbl_status.config(text=f"Preset loaded: {name}", fg=COLOR_BLUE)
@@ -3409,6 +3894,13 @@ class CPVAExplorerApp:
             self._save_preset_as()
             return
         existing["pvs"] = list(pvs)
+
+        existing["conditions"] = copy(self._conditions)
+
+        existing["master_pv"] = self._master_pv_var.get()
+
+        existing["master_multiple"] = self._master_multiple_var.get()
+
         save_presets(self._presets)
         self._refresh_preset_combo()
         self._preset_var.set(name)
@@ -3497,8 +3989,21 @@ class CPVAExplorerApp:
         if existing:
             existing["pvs"] = pvs
             existing["time_window_hours"] = hours
+            existing["conditions"] = copy(self._conditions)
+            existing["master_pv"] = self._master_pv_var.get()
+            existing["master_multiple"] = self._master_multiple_var.get()
         else:
-            self._presets.append({"name": name, "pvs": pvs, "time_window_hours": hours})
+            self._presets.append({
+                "name": name,
+                "pvs": pvs,
+                "time_window_hours": hours,
+
+                "conditions": copy(self._conditions),
+
+                "master_pv": self._master_pv_var.get(),
+
+                "master_multiple": self._master_multiple_var.get(),
+            })
 
         save_presets(self._presets)
         self._refresh_preset_combo()
@@ -3700,18 +4205,34 @@ class CPVAExplorerApp:
         self._samples_by_pv = graph_samples_by_pv
         self._pv_order      = pv_order
 
-        if self._merge_mode_var.get() == "sample_hold":
-            self._table_rows = self._merge_samples_sample_hold(samples_by_pv, pv_order)
-        else:
-            self._table_rows = self._merge_samples_into_rows(samples_by_pv, pv_order)
-        
-        self._table_rows_unfiltered = list(self._table_rows)
-        
+        self._table_rows = self._merge_samples_sample_hold(
+            samples_by_pv,
+            pv_order
+        )
 
+        self._table_rows = self._remove_master_only_rows(self._table_rows)
+
+        self._table_rows = self._remove_fake_hour_boundary_rows(self._table_rows)
+
+        self._table_rows_unfiltered = self._table_rows
+
+        available_custom = self._get_available_custom_pvs()
+
+        for cpv in available_custom:
+
+            if cpv["name"] not in self._pv_order:
+                self._pv_order.append(cpv["name"])
+
+
+        self._rebuild_custom_pvs()
+
+        rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+        self._table_rows = self._apply_conditions_to_rows(rows)
+        
         start_ns = dt_to_ns(self._dt_from)
         end_ns = dt_to_ns(self._dt_to)
 
-        self._populate_table(pv_order)
+        self._populate_table(self._pv_order)
         self._refresh_xy_choices()
 
         # Refresh graph if graph tab is active or if live mode is running
@@ -3738,7 +4259,10 @@ class CPVAExplorerApp:
                 # --- XY plot auto refresh in live mode ---
             if xy_tab_active and self._xy_x_var.get() and self._xy_y_var.get():
                 try:
-                    self._plot_xy()
+                    if self._xy_canvas:
+                        self._update_xy_data()
+                    else:
+                        self._plot_xy()
                 except Exception:
                     pass
 
@@ -3832,90 +4356,203 @@ class CPVAExplorerApp:
     # Row merging
     # -------------------------------------------------------------------------
 
-    def _merge_samples_into_rows(self, samples_by_pv: dict, pv_order: list[str]) -> list:
-        """
-        Merge all PV events into rows, collapsing events that fall within
-        MERGE_WINDOW_MS milliseconds of each other into a single row.
-        Within a window, the last value for each PV wins.
-        Image-path PVs are never merged — each shot gets its own row.
-        """
-        # Detect which PVs carry image paths (check first non-None value)
-        image_pvs: set[str] = set()
-        for pv_name in pv_order:
-            for _, value, _ in samples_by_pv.get(pv_name, []):
-                if value is not None:
-                    if isinstance(value, str) and _looks_like_image_path(value):
-                        image_pvs.add(pv_name)
-                    break
-
-        # Events from non-image PVs go through the merge window
-        mergeable_events: list[tuple] = []
-        for pv_name in pv_order:
-            if pv_name in image_pvs:
-                continue
-            for ts_ns, value, units in samples_by_pv.get(pv_name, []):
-                mergeable_events.append((ts_ns, pv_name, value, units))
-
-        mergeable_events.sort(key=lambda e: e[0])
-
-        window_ns = MERGE_WINDOW_MS * 1_000_000
-        rows: list[tuple[int, dict]] = []
-        win_start: int | None = None
-        win_dict: dict = {}
-
-        for ts_ns, pv_name, value, units in mergeable_events:
-            if win_start is None:
-                win_start = ts_ns
-                win_dict  = {}
-
-            if ts_ns - win_start <= window_ns:
-                win_dict[pv_name] = (value, units)
-            else:
-                rows.append((win_start, win_dict))
-                win_start = ts_ns
-                win_dict  = {pv_name: (value, units)}
-
-        if win_start is not None:
-            rows.append((win_start, win_dict))
-
-        # Image PVs: each sample becomes its own individual row
-        for pv_name in pv_order:
-            if pv_name not in image_pvs:
-                continue
-            for ts_ns, value, units in samples_by_pv.get(pv_name, []):
-                rows.append((ts_ns, {pv_name: (value, units)}))
-
-        rows.sort(key=lambda r: r[0])
-        return rows
-
     def _merge_samples_sample_hold(self, samples_by_pv: dict, pv_order: list[str]) -> list:
+        """
+        Group detector updates that belong to one shot.
+
+        Logic:
+        - all PV events are sorted by timestamp
+        - events closer than SAMPLE_HOLD_MIN_GAP_MS belong to the same shot
+        - row timestamp is the LAST timestamp in that shot window
+        - row values are sample&hold values after applying all events in the shot
+        """
+
         events = []
 
         for pv_name in pv_order:
-            samples = samples_by_pv.get(pv_name, [])
-            events.extend((ts_ns, pv_name, value, units) for ts_ns, value, units in samples)
+            for ts_ns, value, units in samples_by_pv.get(pv_name, []):
+                events.append((ts_ns, pv_name, value, units))
 
         if not events:
             return []
 
         events.sort(key=lambda e: e[0])
 
-        min_gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
-        last_values = {}
+        merge_gap_ns = SAMPLE_HOLD_MIN_GAP_MS * 1_000_000
+
         rows = []
-        last_kept_ts = None
+        last_values = {}
+
+        group_start_ts = None
+        group_last_ts = None
+        group_events = []
+
+        def flush_group():
+            nonlocal group_events, group_last_ts
+
+            if not group_events:
+                return
+
+            for _ts_ns, pv_name, value, units in group_events:
+                last_values[pv_name] = (value, units)
+
+            rows.append((group_last_ts, copy(last_values)))
 
         for ts_ns, pv_name, value, units in events:
-            last_values[pv_name] = (value, units)
-
-            if last_kept_ts is not None and ts_ns - last_kept_ts < min_gap_ns:
+            if group_start_ts is None:
+                group_start_ts = ts_ns
+                group_last_ts = ts_ns
+                group_events = [(ts_ns, pv_name, value, units)]
                 continue
 
-            rows.append((ts_ns, dict(last_values)))
-            last_kept_ts = ts_ns
+            if ts_ns - group_last_ts <= merge_gap_ns:
+                group_last_ts = ts_ns
+                group_events.append((ts_ns, pv_name, value, units))
+            else:
+                flush_group()
+
+                group_start_ts = ts_ns
+                group_last_ts = ts_ns
+                group_events = [(ts_ns, pv_name, value, units)]
+
+        flush_group()
 
         return rows
 
+    def _remove_master_only_rows(self, rows: list) -> list:
+        """
+        Remove rows where only the selected master PV changed
+        and all other PV values stayed identical.
+
+        This removes fake rows caused only by ramp/master PV updates.
+        """
+
+        master_pv = self._master_pv_var.get().strip() or MASTER_RAMP_PV
+
+        if not rows or not master_pv:
+            return rows
+
+        filtered = [rows[0]]
+
+        for ts_ns, row_dict in rows[1:]:
+            _prev_ts, prev_row = filtered[-1]
+
+            keys = set(prev_row.keys()) | set(row_dict.keys())
+
+            same_other_values = True
+
+            for pv in keys:
+                if pv == master_pv:
+                    continue
+
+                if prev_row.get(pv) != row_dict.get(pv):
+                    same_other_values = False
+                    break
+
+            master_changed = prev_row.get(master_pv) != row_dict.get(master_pv)
+
+            if master_changed and same_other_values:
+                # Skip this row: only master PV changed.
+                continue
+
+            filtered.append((ts_ns, row_dict))
+
+        return filtered
+
+
+
+    def _remove_fake_hour_boundary_rows(self, rows: list) -> list:
+        """
+        Remove fake rows caused by CPVA chunk boundaries.
+
+        If two consecutive rows are separated by ~1 hour
+        (3599-3601 s) and at least 2 PV values are identical,
+        the newer row is considered fake and removed.
+        """
+
+        if len(rows) < 2:
+            return rows
+
+        filtered = [rows[0]]
+
+        MIN_DIFF_NS = int(3599 * 1e9)
+        MAX_DIFF_NS = int(3601 * 1e9)
+
+        for ts_ns, row_dict in rows[1:]:
+
+            prev_ts, prev_row = filtered[-1]
+
+            dt_ns = ts_ns - prev_ts
+
+            # only inspect ~1h gaps
+            if MIN_DIFF_NS <= dt_ns <= MAX_DIFF_NS:
+
+                same_count = 0
+
+                shared_pvs = set(prev_row.keys()) & set(row_dict.keys())
+
+                for pv in shared_pvs:
+
+                    if pv == self._master_pv_var.get().strip():
+                        continue
+
+                    prev_val = prev_row[pv][0]
+                    curr_val = row_dict[pv][0]
+
+                    if prev_val == curr_val:
+                        same_count += 1
+
+                    if same_count >= 2:
+                        break
+
+                if same_count >= 2:
+                    # fake row detected -> skip it
+                    continue
+
+            filtered.append((ts_ns, row_dict))
+
+        return filtered
+
+
+    def _filter_master_multiple_rows(self, rows: list) -> list:
+        """
+        Keep only rows where master PV is a multiple of selected number.
+        Empty value = no filtering.
+        """
+        master_pv = self._master_pv_var.get().strip() or MASTER_RAMP_PV
+        multiple_txt = self._master_multiple_var.get().strip()
+
+        if not rows or not multiple_txt:
+            return rows
+
+        try:
+            multiple = float(multiple_txt)
+        except ValueError:
+            return rows
+
+        if multiple <= 0:
+            return rows
+
+        filtered = []
+        tolerance = max(1e-6, abs(multiple) * 1e-9)
+
+        for ts_ns, row_dict in rows:
+            # Důležité: pokud master PV v řádku není, řádek nemá jak ověřit násobek.
+            # Proto ho smažeme.
+            if master_pv not in row_dict:
+                continue
+
+            value, _units = row_dict[master_pv]
+
+            if not isinstance(value, (int, float)):
+                continue
+
+            nearest_multiple = round(value / multiple) * multiple
+
+            if abs(value - nearest_multiple) <= tolerance:
+                filtered.append((ts_ns, row_dict))
+
+        return filtered
     # -------------------------------------------------------------------------
     # Table population
     # -------------------------------------------------------------------------
@@ -3971,7 +4608,7 @@ class CPVAExplorerApp:
             self.tree.column(col, width=max(w, 40), minwidth=40,
                              anchor=tk.W, stretch=False)
 
-        MAX_TABLE_ROWS = 25000
+        MAX_TABLE_ROWS = 100000
 
         shown_rows = all_rows[-MAX_TABLE_ROWS:]
 
@@ -4096,6 +4733,60 @@ class CPVAExplorerApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
 
+    def _delete_selected_row(self):
+        """Delete selected row from table data."""
+
+        sel = self.tree.selection()
+
+        if not sel:
+            return
+
+        item_id = sel[0]
+
+        values = self.tree.item(item_id, "values")
+
+        if not values:
+            return
+
+        ts_str = values[0]
+
+        # najdi odpovídající timestamp
+        delete_index = None
+
+        for i, (ts_ns, _row_dict) in enumerate(self._table_rows):
+            if ns_to_local_str(ts_ns) == ts_str:
+                delete_index = i
+                break
+
+        if delete_index is None:
+            return
+
+        # smaž z dat
+        self._table_rows.pop(delete_index)
+
+        # smaž i z unfiltered rows pokud existuje
+        if delete_index < len(self._table_rows_unfiltered):
+            self._table_rows_unfiltered.pop(delete_index)
+
+        # refresh table
+        self._populate_table(self._pv_order)
+
+        # refresh graph
+        if self.notebook.select() == str(self.tab_graph):
+            self._plot_graph()
+
+        # refresh xy
+        if self.notebook.select() == str(self.tab_xy):
+            try:
+                self._plot_xy()
+            except Exception:
+                pass
+
+        self.lbl_status.config(
+            text=f"Row deleted. Remaining rows: {len(self._table_rows)}",
+            fg=COLOR_RED
+        )
+
     def _open_image_from_selection(self):
         sel = self.tree.selection()
         if not sel:
@@ -4151,8 +4842,9 @@ class CPVAExplorerApp:
 
         x_vals = []
         y_vals = []
+        xy_rows = []
 
-        for _ts_ns, row_dict in self._table_rows:
+        for row_index, (_ts_ns, row_dict) in enumerate(self._table_rows):
             if x_pv not in row_dict or y_pv not in row_dict:
                 continue
 
@@ -4162,6 +4854,7 @@ class CPVAExplorerApp:
             if isinstance(x_val, (int, float)) and isinstance(y_val, (int, float)):
                 x_vals.append(x_val)
                 y_vals.append(y_val)
+                xy_rows.append(row_index)
 
         if not x_vals:
             messagebox.showinfo(
@@ -4175,7 +4868,58 @@ class CPVAExplorerApp:
         fig = self._Figure(figsize=(8, 5), dpi=96)
         ax = fig.add_subplot(111)
 
-        ax.plot(x_vals, y_vals, marker=".", linestyle="none", markersize=4)
+        # všechny starší body
+        normal_count = max(0, len(x_vals) - 10)
+
+        ax.scatter(
+            x_vals[:normal_count],
+            y_vals[:normal_count],
+            s=18,
+            color="#1988D2",
+            alpha=0.6,
+            picker=False
+        )
+
+        # posledních 10 bodů s fade gradientem
+        recent_x = x_vals[-10:]
+        recent_y = y_vals[-10:]
+
+        recent_colors = [
+            "#1976D2",  # starší modrá
+            "#2A6CC0",
+            "#3D62BA",
+            "#5058B4",
+            "#634EAE",
+            "#7644A8",
+            "#893AA2",
+            "#9C309C",
+            "#AF2696",
+            "#FF0000",  # nejnovější fialová
+        ]
+
+        # pokud je méně než 10 bodů
+        recent_colors = recent_colors[-len(recent_x):]
+
+        for i, (xv, yv) in enumerate(zip(recent_x, recent_y)):
+
+            ax.scatter(
+                [xv],
+                [yv],
+                s=70,
+                color=recent_colors[i],
+                edgecolors="black",
+                linewidths=1.0,
+                zorder=10
+            )
+
+        # picker scatter (neviditelný helper kvůli klikání)
+        scatter = ax.scatter(
+            x_vals,
+            y_vals,
+            s=18,
+            alpha=0,
+            picker=True
+        )
 
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
@@ -4189,9 +4933,422 @@ class CPVAExplorerApp:
 
         self._xy_canvas = canvas
         self._xy_figure = fig
+        self._xy_rows = xy_rows
+        self._xy_scatter = scatter
+
+
+        canvas.mpl_connect("pick_event", self._on_xy_pick)
+
+        canvas.mpl_connect(
+            "scroll_event",
+            self._on_xy_scroll
+        )
+
+        canvas.mpl_connect(
+            "button_press_event",
+            self._on_xy_mouse_press
+        )
 
         self.lbl_xy_info.config(
             text=f"XY Plot: {len(x_vals)} numeric pair(s).",
+            fg=COLOR_GREEN
+        )
+
+        self._xy_last_point_count = len(x_vals)
+
+        self._xy_rect_selector = RectangleSelector(
+            ax,
+            self._on_xy_rect_zoom,
+            useblit=False,
+            button=[3],  # pravé tlačítko
+            interactive=True,
+            drag_from_anywhere=True
+        )
+
+    def _update_xy_data(self):
+
+        if not self._xy_canvas or not self._xy_figure:
+            self._plot_xy()
+            return
+
+        x_label = self._xy_x_var.get()
+        y_label = self._xy_y_var.get()
+
+        x_pv = self._xy_choice_map.get(x_label)
+        y_pv = self._xy_choice_map.get(y_label)
+
+        if not x_pv or not y_pv:
+            return
+
+        x_vals = []
+        y_vals = []
+        xy_rows = []
+
+        for row_index, (_ts_ns, row_dict) in enumerate(self._table_rows):
+
+            if x_pv not in row_dict or y_pv not in row_dict:
+                continue
+
+            xv, _ = row_dict[x_pv]
+            yv, _ = row_dict[y_pv]
+
+            if isinstance(xv, (int, float)) and isinstance(yv, (int, float)):
+
+                x_vals.append(xv)
+                y_vals.append(yv)
+                xy_rows.append(row_index)
+
+        # NIC se nezměnilo → nedělej redraw
+        if len(x_vals) == self._xy_last_point_count:
+            return
+
+        self._xy_last_point_count = len(x_vals)
+
+        ax = self._xy_figure.axes[0]
+
+        ax.cla()
+
+        # ===== původní scatter logika =====
+
+        normal_count = max(0, len(x_vals) - 10)
+
+        ax.scatter(
+            x_vals[:normal_count],
+            y_vals[:normal_count],
+            s=18,
+            color="#1976D2",
+            alpha=0.6,
+            picker=False
+        )
+
+        recent_x = x_vals[-10:]
+        recent_y = y_vals[-10:]
+
+        recent_colors = [
+            "#1976D2",
+            "#2A6CC0",
+            "#3D62BA",
+            "#5058B4",
+            "#634EAE",
+            "#7644A8",
+            "#893AA2",
+            "#9C309C",
+            "#AF2696",
+            "#FF0000",
+        ]
+
+        recent_colors = recent_colors[-len(recent_x):]
+
+        for i, (xv, yv) in enumerate(zip(recent_x, recent_y)):
+
+            ax.scatter(
+                [xv],
+                [yv],
+                s=70,
+                color=recent_colors[i],
+                edgecolors="black",
+                linewidths=1.0,
+                zorder=10
+            )
+
+        self._xy_scatter = ax.scatter(
+            x_vals,
+            y_vals,
+            s=18,
+            alpha=0,
+            picker=True
+        )
+
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+
+        ax.grid(True)
+
+        ax.set_title(f"{y_label} vs {x_label}")
+
+        self._xy_rows = xy_rows
+
+        self._xy_canvas.draw_idle()
+
+        self.lbl_xy_info.config(
+            text=f"XY Plot: {len(x_vals)} numeric pair(s).",
+            fg=COLOR_GREEN
+        )
+
+
+    def _open_ramping_archive_dialog(self):
+
+        if not self._ramping_archive:
+            messagebox.showinfo(
+                "Empty archive",
+                "No saved rampings."
+            )
+            return
+
+        dlg = tk.Toplevel(self.root)
+
+        dlg.title("Ramping Archive")
+
+        dlg.geometry("500x400")
+
+        lb = tk.Listbox(
+            dlg,
+            font=FONT_MONO
+        )
+
+        lb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        for r in self._ramping_archive:
+
+            start = ns_to_local_str(r["start_ns"])
+            end = ns_to_local_str(r["end_ns"])
+
+            lb.insert(
+                tk.END,
+                f"{r['name']}   [{start} -> {end}]"
+            )
+
+        def _load_selected():
+
+            sel = lb.curselection()
+
+            if not sel:
+                return
+
+            archive = self._ramping_archive[sel[0]]
+
+            dlg.destroy()
+
+            self._load_ramping_archive_overlay(archive)
+
+        def _delete_selected():
+
+            sel = lb.curselection()
+
+            if not sel:
+                return
+
+            idx = sel[0]
+
+            archive = self._ramping_archive[idx]
+
+            if not messagebox.askyesno(
+                "Delete ramping",
+                f"Delete '{archive['name']}' ?",
+                parent=dlg
+            ):
+                return
+
+            self._ramping_archive.pop(idx)
+
+            save_ramping_archive(self._ramping_archive)
+
+            lb.delete(idx)
+
+            self.lbl_status.config(
+                text=f"Deleted ramping: {archive['name']}",
+                fg=COLOR_RED
+            )
+
+        tk.Button(
+            dlg,
+            text="Load",
+            bg=COLOR_GREEN,
+            fg="white",
+            command=_load_selected
+        ).pack(pady=(0, 10))
+
+        btn_row = tk.Frame(dlg)
+        btn_row.pack(pady=(0, 10))
+
+        tk.Button(
+            btn_row,
+            text="Delete",
+            bg=COLOR_RED,
+            fg="white",
+            command=_delete_selected
+        ).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(
+            btn_row,
+            text="Load",
+            bg=COLOR_GREEN,
+            fg="white",
+            command=_load_selected
+        ).pack(side=tk.LEFT, padx=6)
+
+    def _load_ramping_archive_overlay(self, archive: dict):
+
+        x_label = self._xy_x_var.get()
+        y_label = self._xy_y_var.get()
+
+        x_pv = self._xy_choice_map.get(x_label)
+        y_pv = self._xy_choice_map.get(y_label)
+
+        if not x_pv or not y_pv:
+            return
+
+        start_ns = archive["start_ns"]
+        end_ns = archive["end_ns"]
+
+        timeout = float(self.config.get("http_timeout", CPVA_HTTP_TIMEOUT))
+
+        # ---------------------------------------------------------
+        # collect required PVs
+        # ---------------------------------------------------------
+
+        required_pvs = {
+            x_pv,
+            y_pv,
+        }
+
+        master_pv = self._master_pv_var.get().strip()
+
+        if master_pv:
+            required_pvs.add(master_pv)
+
+        for cond in self._conditions:
+
+            pv = cond.get("pv")
+
+            if pv:
+                required_pvs.add(pv)
+
+        required_pvs = sorted(required_pvs)
+
+        # ---------------------------------------------------------
+        # fetch all required PVs
+        # ---------------------------------------------------------
+
+        samples_by_pv = {}
+
+        try:
+
+            for pv in required_pvs:
+
+                raw = cpva_fetch_samples_chunked(
+                    pv,
+                    start_ns,
+                    end_ns,
+                    timeout=timeout,
+                    max_workers=6
+                )
+
+                parsed = []
+
+                for s in raw:
+
+                    ts_ns = s.get("time")
+
+                    if ts_ns is None:
+                        continue
+
+                    parsed.append((
+                        int(ts_ns),
+                        cpva_decode_value(s),
+                        (s.get("metaData") or {}).get("units", "") or ""
+                    ))
+
+                samples_by_pv[pv] = parsed
+
+        except Exception as e:
+
+            messagebox.showerror(
+                "Archive load failed",
+                str(e)
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # merge exactly like live data
+        # ---------------------------------------------------------
+
+        rows = self._merge_samples_sample_hold(
+            samples_by_pv,
+            required_pvs
+        )
+
+        rows = self._remove_master_only_rows(rows)
+
+        rows = self._filter_master_multiple_rows(rows)
+
+        rows = self._apply_conditions_to_rows(rows)
+
+        # ---------------------------------------------------------
+        # build XY arrays
+        # ---------------------------------------------------------
+
+        xs = []
+        ys = []
+
+        for _ts_ns, row_dict in rows:
+
+            if x_pv not in row_dict:
+                continue
+
+            if y_pv not in row_dict:
+                continue
+
+            xv, _ = row_dict[x_pv]
+            yv, _ = row_dict[y_pv]
+
+            if not isinstance(xv, (int, float)):
+                continue
+
+            if not isinstance(yv, (int, float)):
+                continue
+
+            xs.append(xv)
+            ys.append(yv)
+
+        if not xs:
+            return
+
+        # ---------------------------------------------------------
+        # plot overlay
+        # ---------------------------------------------------------
+
+        ax = self._xy_figure.axes[0]
+
+        archive_colors = [
+            "#e53935",
+            "#8E24AA",
+            "#43A047",
+            "#FB8C00",
+            "#00897B",
+            "#6D4C41",
+        ]
+
+        archive_index = 0
+
+        for i, a in enumerate(self._ramping_archive):
+
+            if a["name"] == archive["name"]:
+                archive_index = i
+                break
+
+        color = archive_colors[archive_index % len(archive_colors)]
+
+        ax.scatter(
+            xs,
+            ys,
+            s=55,
+            marker="s",
+            color=color,
+            alpha=0.35,
+            edgecolors="white",
+            linewidths=1.2,
+            zorder=5,
+            label=archive["name"]
+        )
+
+        ax.legend(loc="best")
+
+        self._xy_canvas.draw_idle()
+
+        self.lbl_status.config(
+            text=f"Loaded archive overlay: {archive['name']}",
             fg=COLOR_GREEN
         )
 
@@ -4217,6 +5374,381 @@ class CPVAExplorerApp:
                 text="XY plot cleared.",
                 fg=COLOR_GRAY
             )
+
+    def _on_xy_pick(self, event):
+
+        if event.artist != self._xy_scatter:
+            return
+
+        if not event.ind:
+            return
+
+        point_index = event.ind[0]
+
+        if point_index >= len(self._xy_rows):
+            return
+
+        row_index = self._xy_rows[point_index]
+
+        children = self.tree.get_children()
+
+        if row_index >= len(children):
+            return
+
+        item_id = children[row_index]
+
+        self.notebook.select(self.tab_table)
+
+        self.tree.selection_set(item_id)
+        self.tree.focus(item_id)
+        self.tree.see(item_id)
+
+
+    def _open_custom_pv_dialog(self):
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Add custom PV")
+        dlg.geometry("750x550")
+
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        # ----------------------------------------------------
+
+        tk.Label(
+            dlg,
+            text="Custom PV name:",
+            font=FONT_HEADER
+        ).pack(anchor=tk.W, padx=10, pady=(10, 2))
+
+        name_var = tk.StringVar(
+            value=f"Custom{self._custom_pv_counter}"
+        )
+
+        tk.Entry(
+            dlg,
+            textvariable=name_var,
+            font=FONT_MONO
+        ).pack(fill=tk.X, padx=10)
+
+        # ----------------------------------------------------
+
+        tk.Label(
+            dlg,
+            text="Existing Custom PVs:",
+            font=FONT_HEADER
+        ).pack(anchor=tk.W, padx=10, pady=(10, 2))
+
+        existing_lb = tk.Listbox(
+            dlg,
+            font=FONT_MONO,
+            height=6
+        )
+
+        existing_lb.pack(fill=tk.X, padx=10)
+
+        def _delete_selected():
+
+            sel = existing_lb.curselection()
+
+            if not sel:
+                return
+
+            idx = sel[0]
+
+            dpv = self._custom_pvs[idx]
+
+            if not messagebox.askyesno(
+                "Delete Custom PV",
+                f"Delete '{dpv['name']}' ?",
+                parent=dlg
+            ):
+                return
+
+            self._custom_pvs.pop(idx)
+
+            save_custom_pvs(self._custom_pvs)
+
+            existing_lb.delete(idx)
+
+            # remove from pv order
+            if dpv["name"] in self._pv_order:
+                self._pv_order.remove(dpv["name"])
+
+            # remove from rows
+            for _ts_ns, row_dict in self._table_rows_unfiltered:
+                row_dict.pop(dpv["name"], None)
+
+            self._populate_table(self._pv_order)
+
+            try:
+                self._plot_graph()
+            except Exception:
+                pass
+
+            try:
+                self._plot_xy()
+            except Exception:
+                pass
+
+            self.lbl_status.config(
+                text=f"Custom PV deleted: {dpv['name']}",
+                fg=COLOR_RED
+            )
+
+        for dpv in self._custom_pvs:
+            existing_lb.insert(
+                tk.END,
+                f"{dpv['name']} = {dpv['expr']}"
+            )
+
+        _btn(
+            dlg,
+            "Delete selected Custom PV",
+            _delete_selected,
+            bg=COLOR_RED,
+            fg="white",
+            padx=8,
+            pady=3
+        ).pack(anchor=tk.W, padx=10, pady=(4, 8))
+
+        tk.Label(
+            dlg,
+            text="Expression:",
+            font=FONT_HEADER
+        ).pack(anchor=tk.W, padx=10, pady=(10, 2))
+
+        expr_var = tk.StringVar()
+
+        expr_entry = tk.Entry(
+            dlg,
+            textvariable=expr_var,
+            font=FONT_MONO
+        )
+
+        expr_entry.pack(fill=tk.X, padx=10)
+
+        # ----------------------------------------------------
+
+        tk.Label(
+            dlg,
+            text="Double-click PV alias",
+            font=FONT_NORMAL,
+            fg=COLOR_GRAY
+        ).pack(anchor=tk.W, padx=10, pady=(6, 2))
+
+        # ----------------------------------------------------
+
+        frame = tk.Frame(dlg)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        sb = tk.Scrollbar(frame)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        lb = tk.Listbox(
+            frame,
+            font=FONT_MONO,
+            yscrollcommand=sb.set
+        )
+
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        sb.config(command=lb.yview)
+
+        alias_map = {}
+
+        for i, pv in enumerate(self._pv_order):
+
+            alias = chr(65 + i)
+
+            alias_map[alias] = pv
+
+            lb.insert(
+                tk.END,
+                f"{alias} = {pv}"
+            )
+
+        def _insert_alias(event=None):
+
+            sel = lb.curselection()
+
+            if not sel:
+                return
+
+            line = lb.get(sel[0])
+
+            alias = line.split("=")[0].strip()
+
+            expr_entry.insert(tk.INSERT, alias)
+
+        lb.bind("<Double-Button-1>", _insert_alias)
+
+        # ----------------------------------------------------
+
+        def _add():
+
+            name = name_var.get().strip()
+            expr = expr_var.get().strip()
+
+            if not name:
+                return
+
+            if not expr:
+                return
+
+            used_aliases = {}
+
+            for alias, pv in alias_map.items():
+                if re.search(rf"\b{alias}\b", expr):
+                    used_aliases[alias] = pv
+
+            compiled = compile(expr, "<custom_pv>", "eval")
+
+            self._custom_pvs.append({
+                "name": name,
+                "expr": expr,
+                "aliases": used_aliases,
+                "required_pvs": list(used_aliases.values()),
+            })
+
+            save_custom_pvs(self._custom_pvs)
+
+            self._custom_pv_counter += 1
+
+            self._rebuild_custom_pvs()
+            self._refresh_xy_choices()
+            self._populate_table(self._pv_order)
+
+            if self.notebook.select() == str(self.tab_graph):
+                self._plot_graph()
+
+            try:
+                self._plot_xy()
+            except Exception:
+                pass
+
+            dlg.destroy()
+
+        bottom = tk.Frame(dlg)
+        bottom.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        tk.Button(
+            bottom,
+            text="Cancel",
+            command=dlg.destroy
+        ).pack(side=tk.RIGHT)
+
+        tk.Button(
+            bottom,
+            text="Add",
+            bg=COLOR_GREEN,
+            fg="white",
+            command=_add
+        ).pack(side=tk.RIGHT, padx=(0, 6))    
+
+    def _rebuild_custom_pvs(self):
+
+        if not self._custom_pvs:
+            return
+
+        # remove old Custom pv names first
+        custom_names = {d["name"] for d in self._custom_pvs}
+
+        self._pv_order = [
+            pv for pv in self._pv_order
+            if pv not in custom_names
+        ]
+
+        SAFE_GLOBALS = {
+            "__builtins__": {},
+            "abs": abs,
+            "min": min,
+            "max": max,
+            "round": round,
+        }
+
+        import math
+
+        SAFE_GLOBALS["math"] = math
+
+        for dpv in self._custom_pvs:
+
+            required = dpv.get("required_pvs", [])
+
+            if all(pv in self._samples_by_pv for pv in required):
+
+                if dpv["name"] not in self._pv_order:
+                    self._pv_order.append(dpv["name"])
+
+        for ts_ns, row_dict in self._table_rows_unfiltered:
+
+            for dpv in self._custom_pvs:
+
+                required = dpv.get("required_pvs", [])
+
+                if not all(pv in self._pv_order for pv in required):
+                    continue
+
+                local_vars = {}
+
+                ok = True
+
+                for alias, pv_name in dpv["aliases"].items():
+
+                    if pv_name not in row_dict:
+                        ok = False
+                        break
+
+                    value, _units = row_dict[pv_name]
+
+                    if not isinstance(value, (int, float)):
+                        ok = False
+                        break
+
+                    local_vars[alias] = value
+
+                if not ok:
+                    continue
+
+                try:
+                    compiled = compile(
+                        dpv["expr"],
+                        "<custom_pv>",
+                        "eval"
+                    )
+
+                    result = eval(
+                        compiled,
+                        SAFE_GLOBALS,
+                        local_vars
+                    )
+
+                    row_dict[dpv["name"]] = (
+                        result,
+                        ""
+                    )
+
+                except Exception:
+                    pass      
+        # rebuild samples for custom PVs
+        for dpv in self._custom_pvs:
+
+            custom_name = dpv["name"]
+
+            custom_samples = []
+
+            for ts_ns, row_dict in self._table_rows_unfiltered:
+
+                if custom_name not in row_dict:
+                    continue
+
+                value, units = row_dict[custom_name]
+
+                custom_samples.append(
+                    (ts_ns, value, units)
+                )
+
+            self._samples_by_pv[custom_name] = custom_samples          
     # -------------------------------------------------------------------------
     # CSV Export
     # -------------------------------------------------------------------------

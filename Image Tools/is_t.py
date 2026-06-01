@@ -177,11 +177,11 @@ def _pv_prev_date_key(date_key: str) -> str:
     return prev.strftime("%Y-%m-%d")
 
 
-def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
+def _pv_last_known(channel: str, ts_ns: int, max_lookback_days: int = 7) -> "float | None":
     """Return the last known value of channel at or before ts_ns.
 
-    Checks the current day first; if ts_ns lands before the first sample
-    (or the day has no data), falls back to the previous day's last sample.
+    Checks the current day first, then walks back up to max_lookback_days.
+    Slowly-changing PVs (e.g. waveplate) may not have data every day.
     """
     date_key = _pv_date_key(ts_ns)
     samples = _pv_load_day(channel, date_key)
@@ -190,11 +190,13 @@ def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
         idx = bisect.bisect_right(ts_list, ts_ns) - 1
         if idx >= 0:
             return samples[idx][1]
-    # No data yet today (or ts_ns is before first today sample) — try previous day
-    prev_key = _pv_prev_date_key(date_key)
-    prev_samples = _pv_load_day(channel, prev_key)
-    if prev_samples:
-        return prev_samples[-1][1]   # last known value of the previous day
+    # Walk back up to max_lookback_days for slowly-changing PVs
+    cur_key = date_key
+    for _ in range(max_lookback_days):
+        cur_key = _pv_prev_date_key(cur_key)
+        prev_samples = _pv_load_day(channel, cur_key)
+        if prev_samples:
+            return prev_samples[-1][1]
     return None
 
 
@@ -812,12 +814,17 @@ class SaveRangeSignals(QObject):
 
 class SaveRangeTask(QRunnable):
     def __init__(self, items, outp, name_fn, gradient_id=0, brighten=False, overlay_params=None,
-                 energy_map: "dict | None" = None):
+                 energy_map: "dict | None" = None,
+                 pv_channels: "dict | None" = None,
+                 pv_units: "dict | None" = None):
         super().__init__()
         self.items = items; self.outp = outp; self.name_fn = name_fn
         self.gradient_id = gradient_id; self.brighten = brighten
         self.overlay_params = overlay_params  # dict or None
         self.energy_map = energy_map or {}    # filename -> energy string
+        # {display_name: cpva_channel} for per-image PV lookup from archiver at save time.
+        self.pv_channels: dict = pv_channels or {}
+        self.pv_units: dict = pv_units or {}
         self.signals = SaveRangeSignals()
 
     def _draw_overlay_on_pixmap(self, src_path):
@@ -886,7 +893,27 @@ class SaveRangeTask(QRunnable):
                         continue
                     _copy_metadata_into_png(it.path, dst, save_txt=save_txt, extra_meta=extra_meta)
                 # Annotate version if overlay or PV text is requested
-                pv_text = (self.overlay_params or {}).get('pv_text', '')
+                # Per-image PV text: fetch from CPVA archiver at each image's timestamp.
+                # _pv_last_known() uses a day-level cache so only 1 HTTP request per
+                # channel per day — fast and adds zero runtime memory overhead.
+                if self.pv_channels:
+                    _parts = []
+                    for _name, _channel in self.pv_channels.items():
+                        try:
+                            _val = _pv_last_known(_channel, it.ts_ns)
+                        except Exception:
+                            _val = None
+                        if _val is not None:
+                            _units = self.pv_units.get(_name, "")
+                            _val_str = f"{_val:.4g}"
+                            _parts.append(f"{_name}: {_val_str} {_units}".strip())
+                    # If CPVA lookup returned nothing, fall back to the snapshot value
+                    # captured at save time so the PV bar is never silently omitted.
+                    pv_text = ("  |  ".join(_parts)
+                               if _parts
+                               else (self.overlay_params or {}).get('pv_text', ''))
+                else:
+                    pv_text = (self.overlay_params or {}).get('pv_text', '')
                 if self.overlay_params or pv_text:
                     # _annotated suffix only when PV annotation bar is present
                     _ann_suffix = "_annotated" if pv_text else ""
@@ -895,20 +922,79 @@ class SaveRangeTask(QRunnable):
                     if pix is not None:
                         if pv_text:
                             try:
+                                # PIL rendering is thread-safe (QPainter/QPixmap are not).
+                                # Same logic as Shot Finder: scale font 22→8px to fill the
+                                # white bar; split to 2 lines only if even 8px doesn't fit.
                                 from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF
                                 import tempfile as _tf
                                 with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _t:
                                     _tp = Path(_t.name)
                                 pix.save(str(_tp))
                                 _img = _PI.open(_tp)
-                                _bh = 26
-                                _new = _PI.new("RGB", (_img.width, _img.height + _bh), (255, 255, 255))
+                                _avail_w = _img.width - 20
+                                _display_text = pv_text
+                                _fn = None
+                                _fsize = 8
+                                # Try single line first
+                                for _fs in range(22, 7, -1):
+                                    try:
+                                        _f = _PF.truetype("arial.ttf", _fs)
+                                    except Exception:
+                                        try:
+                                            _f = _PF.truetype("DejaVuSans.ttf", _fs)
+                                        except Exception:
+                                            _f = _PF.load_default()
+                                    try:
+                                        _tw = _f.getlength(pv_text)
+                                    except Exception:
+                                        _tw = len(pv_text) * _fs * 0.6
+                                    if _tw <= _avail_w:
+                                        _fn, _fsize = _f, _fs
+                                        break
+                                if _fn is None:
+                                    # Split to 2 lines
+                                    _ps = pv_text.split("  |  ")
+                                    _mid = max(1, len(_ps) // 2)
+                                    _display_text = ("  |  ".join(_ps[:_mid]) + "\n" +
+                                                     "  |  ".join(_ps[_mid:]))
+                                    for _fs in range(18, 7, -1):
+                                        try:
+                                            _f = _PF.truetype("arial.ttf", _fs)
+                                        except Exception:
+                                            try:
+                                                _f = _PF.truetype("DejaVuSans.ttf", _fs)
+                                            except Exception:
+                                                _f = _PF.load_default()
+                                        try:
+                                            _mw = max(_f.getlength(_l) for _l in _display_text.split("\n"))
+                                        except Exception:
+                                            _mw = max(len(_l) * _fs * 0.6 for _l in _display_text.split("\n"))
+                                        if _mw <= _avail_w:
+                                            _fn, _fsize = _f, _fs
+                                            break
+                                    if _fn is None:
+                                        try:
+                                            _fn = _PF.truetype("arial.ttf", 7)
+                                        except Exception:
+                                            _fn = _PF.load_default()
+                                        _fsize = 7
+                                _lines = _display_text.split("\n")
+                                _lh = _fsize + 8
+                                _bar_h = max(38, _lh * len(_lines) + 16)
+                                _new = _PI.new("RGB", (_img.width, _img.height + _bar_h), (255, 255, 255))
                                 _new.paste(_img.convert("RGB"), (0, 0))
                                 _dr = _PD.Draw(_new)
-                                try: _fn = _PF.truetype("DejaVuSans.ttf", 14)
-                                except Exception: _fn = _PF.load_default()
-                                _dr.text((8, _img.height + 4), pv_text, fill=(0, 0, 0), font=_fn)
+                                _total_th = _lh * len(_lines)
+                                _y0 = _img.height + (_bar_h - _total_th) // 2
+                                for _li, _line in enumerate(_lines):
+                                    try:
+                                        _tw_l = _fn.getlength(_line)
+                                    except Exception:
+                                        _tw_l = len(_line) * _fsize * 0.6
+                                    _x = max(0, (_img.width - int(_tw_l)) // 2)
+                                    _dr.text((_x, _y0 + _li * _lh), _line, fill=(0, 0, 0), font=_fn)
                                 _new.save(str(ann_dst))
+                                _tp.unlink(missing_ok=True)
                                 _tp.unlink(missing_ok=True)
                             except Exception:
                                 pix.save(str(ann_dst))
@@ -4767,6 +4853,101 @@ class _CamPollSignals(QObject):
     found = Signal(int, list, list)  # cam_i, new_items, new_folders
 
 
+# ---------------------------------------------------------------------------
+# Real-time directory watcher via ReadDirectoryChangesW (Windows only).
+# Fires immediately when a new image file appears — no os.listdir() at all.
+# Falls back gracefully on non-Windows or when the SMB server doesn't support
+# change notifications.
+# ---------------------------------------------------------------------------
+
+import ctypes as _ct
+import ctypes.wintypes as _wt
+import threading as _threading
+
+try:
+    _k32 = _ct.windll.kernel32
+    _FILE_LIST_DIR        = 0x0001
+    _FILE_SHARE_ALL       = 0x07
+    _OPEN_EXISTING        = 3
+    _FILE_FLAG_BACKUP_SEM = 0x02000000
+    _FILE_NOTIFY_FILE     = 0x00000001   # FILE_NOTIFY_CHANGE_FILE_NAME
+    _FILE_ACTION_ADDED    = 1
+    _FILE_ACTION_RENAMED  = 5
+    _INVALID_HANDLE       = _ct.c_void_p(-1).value
+    _DIRWATCH_AVAILABLE   = True
+except AttributeError:
+    _DIRWATCH_AVAILABLE   = False
+
+
+class _DirWatchSignals(QObject):
+    new_file = Signal(int, str)   # cam_i, filename (no path, just name)
+
+
+class _DirWatcher(_threading.Thread):
+    """Background thread watching one folder with ReadDirectoryChangesW.
+    Emits new image filenames instantly — zero directory-enumeration cost."""
+
+    def __init__(self, cam_i: int, folder: "Path",
+                 signals: "_DirWatchSignals", img_ext: frozenset):
+        super().__init__(daemon=True, name=f"DirWatch-cam{cam_i}")
+        self._cam_i   = cam_i
+        self._folder  = folder
+        self._signals = signals
+        self._img_ext = img_ext
+        self._stop    = _threading.Event()
+        self._handle  = None
+
+    def stop(self):
+        self._stop.set()
+        h = self._handle
+        if h and h != _INVALID_HANDLE:
+            try:
+                _k32.CancelIoEx(h, None)
+            except Exception:
+                pass
+
+    def run(self):
+        if not _DIRWATCH_AVAILABLE:
+            return
+        h = _k32.CreateFileW(
+            str(self._folder),
+            _FILE_LIST_DIR,
+            _FILE_SHARE_ALL,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEM,
+            None,
+        )
+        if h == _INVALID_HANDLE:
+            return
+        self._handle = h
+        buf = _ct.create_string_buffer(65536)
+        br  = _wt.DWORD(0)
+        while not self._stop.is_set():
+            ok = _k32.ReadDirectoryChangesW(
+                h, buf, len(buf), False,
+                _FILE_NOTIFY_FILE,
+                _ct.byref(br), None, None,
+            )
+            if not ok or br.value == 0:
+                break
+            off = 0
+            while True:
+                nxt    = _wt.DWORD.from_buffer_copy(buf, off).value
+                action = _wt.DWORD.from_buffer_copy(buf, off + 4).value
+                nlen   = _wt.DWORD.from_buffer_copy(buf, off + 8).value
+                name   = buf.raw[off + 12: off + 12 + nlen].decode(
+                    "utf-16-le", errors="replace")
+                if action in (_FILE_ACTION_ADDED, _FILE_ACTION_RENAMED):
+                    if Path(name).suffix.lower() in self._img_ext:
+                        self._signals.new_file.emit(self._cam_i, name)
+                if nxt == 0:
+                    break
+                off += nxt
+        _k32.CloseHandle(h)
+        self._handle = None
+
+
 class _CamPollTask(QRunnable):
     """Scan one camera's folder list for new images since cutoff ts_ns.
     Also probes next UTC hour-folders for auto-discovery."""
@@ -5124,6 +5305,8 @@ class Viewer(QWidget):
         self._cam_ref_images: list        = []        # list of np.ndarray | None, per-camera subtraction reference
 
         # ── Online mode state ────────────────────────────────────────────────
+        self._dir_watch_sigs:  "_DirWatchSignals | None" = None
+        self._dir_watchers:    "dict[str, _DirWatcher]"  = {}  # folder_str → watcher
         self._online_mode    = False
         self._online_timer   = QTimer(self)
         self._online_timer.setInterval(200)
@@ -5809,6 +5992,17 @@ class Viewer(QWidget):
                     self.lbl_scan_progress]:
             lbl.setWordWrap(True)
             lbl.setStyleSheet(info_style)
+        from PySide6.QtCore import Qt as _Qt2
+        self.lbl_scan_progress.setTextFormat(_Qt2.TextFormat.RichText)
+
+        # Auto-hide labels when their text is empty so the INFO panel has no blank lines.
+        import types as _types
+        def _auto_setText(lbl_self, text):
+            QLabel.setText(lbl_self, text)
+            lbl_self.setVisible(bool(text.strip()))
+        for _lbl in (self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress):
+            _lbl.setText = _types.MethodType(_auto_setText, _lbl)
+
         self.lbl_ref_status.setStyleSheet("font-size: 10px; color: #666; padding: 1px 0;")
         self.lbl_selected_range.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; padding: 1px 0;")
         self.lbl_axis_time.setVisible(False)
@@ -5932,6 +6126,7 @@ class Viewer(QWidget):
         _idx_range_row.addWidget(self.lbl_selected_range, 1)
         ilay.addLayout(_idx_range_row)
         for lbl in [self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress]:
+            lbl.setVisible(bool(lbl.text()))
             ilay.addWidget(lbl)
         ilay.addWidget(self.prog)
         ilay.addWidget(self.btn_cancel_scan)
@@ -5981,10 +6176,27 @@ class Viewer(QWidget):
             btn.setEnabled(not busy)
 
     def _on_reset_zoom(self):
-        self.img_view.reset_zoom()
         if self._is_multi_cam():
-            for cv in self._multi_grid._cam_views:
+            selected = self._multi_grid.selected_cam_indices()
+            if not selected:
+                from PySide6.QtWidgets import QMessageBox
+                reply = QMessageBox.question(
+                    self, "Reset zoom",
+                    "No cameras selected — reset zoom for ALL cameras?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                targets = self._multi_grid._cam_views
+            else:
+                targets = [self._multi_grid._cam_views[i]
+                           for i in selected
+                           if i < len(self._multi_grid._cam_views)]
+            for cv in targets:
                 cv.img_view.reset_zoom()
+        else:
+            self.img_view.reset_zoom()
 
     def _toggle_draw_mode(self, mode: str):
         iv = self._active_img_view()
@@ -6799,8 +7011,101 @@ class Viewer(QWidget):
             else:
                 self._display_exact_index(last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
+    def _ensure_dir_watcher(self, cam_i: int, folder: "Path"):
+        """Start a _DirWatcher for folder if not already running."""
+        if not _DIRWATCH_AVAILABLE:
+            return
+        key = str(folder)
+        if key in self._dir_watchers:
+            return
+        if self._dir_watch_sigs is None:
+            return
+        w = _DirWatcher(cam_i, folder, self._dir_watch_sigs, IMG_EXT)
+        w.start()
+        self._dir_watchers[key] = w
+
+    def _stop_dir_watchers(self):
+        for w in self._dir_watchers.values():
+            try:
+                w.stop()
+            except Exception:
+                pass
+        self._dir_watchers.clear()
+
+    def _on_dir_watch_new_file(self, cam_i: int, filename: str):
+        """Immediate handler for a new image file detected by _DirWatcher."""
+        if not self._online_mode or cam_i >= len(self._cam_items):
+            return
+        # Find the folder this file lives in (watcher key → folder path)
+        folder_lists = self._cam_folder_lists
+        if cam_i >= len(folder_lists):
+            return
+        folder = None
+        for f in folder_lists[cam_i]:
+            if str(f) in self._dir_watchers:
+                watcher = self._dir_watchers[str(f)]
+                if watcher._cam_i == cam_i and watcher._folder == f:
+                    folder = f
+                    break
+        if folder is None and folder_lists[cam_i]:
+            folder = folder_lists[cam_i][-1]  # best guess: most recently added
+        if folder is None:
+            return
+        p     = Path(folder) / filename
+        ts_ns = parse_unix_ns_from_name(p)
+        if ts_ns is None:
+            return
+        cutoff = (self._cam_poll_max_ts[cam_i]
+                  if hasattr(self, "_cam_poll_max_ts") and cam_i < len(self._cam_poll_max_ts)
+                  else 0)
+        if ts_ns <= cutoff:
+            return
+        # Delegate to existing on_cam_found logic via a minimal synthetic result.
+        # (Re-uses the same code path as _CamPollTask so display/timeline update is identical.)
+        item = Item(p, ts_ns)
+        # Use the make_callback closure result by directly calling the same update path.
+        _prev_merged_len  = len(self.items)
+        _prev_current_idx = self.current_idx
+        self._cam_items[cam_i].append(item)
+        self._cam_ts[cam_i].append(ts_ns)
+        if hasattr(self, "_cam_poll_max_ts") and cam_i < len(self._cam_poll_max_ts):
+            self._cam_poll_max_ts[cam_i] = ts_ns
+        if len(self._cam_items[cam_i]) > ONLINE_MAX_ITEMS:
+            trim = len(self._cam_items[cam_i]) - ONLINE_MAX_ITEMS
+            self._cam_items[cam_i] = self._cam_items[cam_i][trim:]
+            self._cam_ts[cam_i]    = self._cam_ts[cam_i][trim:]
+        self._online_last_new_ns = time.time()
+        self._extend_shared_timeline_from_cams()
+        total = sum(len(c) for c in self._cam_items)
+        self.lbl_scan_progress.setText(f"Frames: {total}")
+        cam_ts_now = self._cam_ts[cam_i]
+        if cam_ts_now:
+            latest_ts = cam_ts_now[-1]
+            was_at_end = (
+                _prev_current_idx is not None and
+                _prev_merged_len > 0 and
+                _prev_current_idx >= _prev_merged_len - 1
+            )
+            is_master = (cam_i == self._per_cam_master_idx)
+            if is_master and (self._auto_follow or was_at_end):
+                self._per_cam_display_one(cam_i, latest_ts)
+                if cam_i < len(self._per_cam_rows):
+                    sv = self._per_cam_ts_to_slider(cam_i, latest_ts)
+                    self._per_cam_rows[cam_i].set_value(sv)
+                self.tickbar.set_cursor(latest_ts)
+                for other in range(len(self._cam_ts)):
+                    if other != cam_i:
+                        self._per_cam_display_one(other, latest_ts)
+
     def _start_online_mode(self):
         self._online_mode = True
+        # Start real-time dir watchers for all known camera folders.
+        if _DIRWATCH_AVAILABLE:
+            self._dir_watch_sigs = _DirWatchSignals()
+            self._dir_watch_sigs.new_file.connect(self._on_dir_watch_new_file)
+            for cam_i, folder_list in enumerate(self._cam_folder_lists):
+                for folder in folder_list:
+                    self._ensure_dir_watcher(cam_i, folder)
         self._online_timer.start()
         self._btn_auto_follow.setEnabled(True)
         self._btn_auto_follow.blockSignals(True)
@@ -6816,11 +7121,13 @@ class Viewer(QWidget):
         self._cam_dot_timer.start()
         self._online_dot.setStyleSheet("font-size: 14px; color: #22cc22;")
         self._online_dot_top.setStyleSheet("font-size: 14px; color: #22cc22;")
-        self.lbl_scan_progress.setText("Online mode: active")
+        self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
         self._online_poll_running = False
 
     def _stop_online_mode(self):
         self._online_mode = False
+        self._stop_dir_watchers()
+        self._dir_watch_sigs = None
         self._online_timer.stop()
         self._online_blink_timer.stop()
         self._cam_dot_timer.stop()
@@ -6832,6 +7139,9 @@ class Viewer(QWidget):
         self._auto_follow = False
         self._online_lbl.setText("Inactive")
         self._online_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        self.lbl_scan_progress.setText(
+            "Online mode: <span style='color:#cc2222;font-weight:700;'>INACTIVE</span>"
+        )
         self._online_dot.setStyleSheet("font-size: 14px; color: #aaa;")
         self._online_dot_top.setStyleSheet("font-size: 14px; color: #aaa;")
         self._online_poll_running = False
@@ -6904,7 +7214,7 @@ class Viewer(QWidget):
                 self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
 
             self._online_last_new_ns = time.time()
-            self.lbl_scan_progress.setText("Online mode: active")
+            self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
             self.lbl_index.setText(
                 f"{(self.current_idx or 0) + 1} / {len(self.items)}")
 
@@ -7055,6 +7365,7 @@ class Viewer(QWidget):
                         for nf in new_folders:
                             if nf not in self._cam_folder_lists[cam_idx]:
                                 self._cam_folder_lists[cam_idx].append(nf)
+                                self._ensure_dir_watcher(cam_idx, nf)
                     if not new_items or cam_idx >= len(self._cam_items):
                         return
                     _prev_merged_len = len(self.items)
@@ -7462,7 +7773,7 @@ class Viewer(QWidget):
 
         if online:
             self._pending_online_mode = False
-            self.lbl_scan_progress.setText("Online mode: active")
+            self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
             self._start_online_mode()
 
         QTimer.singleShot(0, self._pv_update_overlay)
@@ -8938,6 +9249,19 @@ class Viewer(QWidget):
             sb.setVisible(show)
 
         if self._focus_mode:
+            # Save overlay relative positions before window resizes so we can
+            # restore them exactly afterwards (ensure_inside_parent would shift them).
+            self._focus_overlay_rel: dict = {}
+            for _ov in (getattr(self, "_pv_overlay", None),
+                        getattr(self, "_pv_overlay_multi", None)):
+                if _ov is not None:
+                    p = _ov.parentWidget()
+                    if p and p.width() > 0 and p.height() > 0:
+                        self._focus_overlay_rel[id(_ov)] = (
+                            _ov.x() / p.width(),
+                            _ov.y() / p.height(),
+                        )
+
             self._root_layout.setContentsMargins(0, 0, 0, 0)
             self._root_layout.setSpacing(0)
             if tab_w is not None:
@@ -8974,7 +9298,20 @@ class Viewer(QWidget):
             if getattr(self, "_focus_mode_was_maximized", False):
                 win.showMaximized()
 
-        QTimer.singleShot(0, self._pv_update_overlay)
+        def _restore_overlay_positions():
+            self._pv_update_overlay()
+            rel = getattr(self, "_focus_overlay_rel", {})
+            for _ov in (getattr(self, "_pv_overlay", None),
+                        getattr(self, "_pv_overlay_multi", None)):
+                if _ov is not None and id(_ov) in rel:
+                    p = _ov.parentWidget()
+                    if p and p.width() > 0 and p.height() > 0:
+                        rx, ry = rel[id(_ov)]
+                        nx = max(0, min(int(rx * p.width()),  p.width()  - _ov.width()))
+                        ny = max(0, min(int(ry * p.height()), p.height() - _ov.height()))
+                        _ov.move(nx, ny)
+
+        QTimer.singleShot(0, _restore_overlay_positions)
 
     def _toggle_watcher_mode(self):
         self._watcher_mode = not self._watcher_mode
@@ -9041,6 +9378,19 @@ class Viewer(QWidget):
         win = self.window()
 
         if ev_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            # Let PV overlay handle its own drag — check by global position (more
+            # reliable than object identity since child labels receive the event).
+            from PySide6.QtCore import QPoint as _QPoint
+            gpos = event.globalPosition().toPoint()
+            for _ov in (getattr(self, "_pv_overlay", None),
+                        getattr(self, "_pv_overlay_multi", None)):
+                if _ov is not None and _ov.isVisible():
+                    _ov_tl = _ov.mapToGlobal(_QPoint(0, 0))
+                    if QRect(_ov_tl, _ov.size()).contains(gpos):
+                        self._focus_click_on_overlay = True
+                        return False
+            self._focus_click_on_overlay = False
+
             gpos = event.globalPosition().toPoint()
             r = win.geometry()
             rx = gpos.x() - r.left();  ry = gpos.y() - r.top()
@@ -9068,6 +9418,9 @@ class Viewer(QWidget):
             nb = r.height() - ry < _RM
 
             if event.buttons() & Qt.MouseButton.LeftButton:
+                # If the drag started on the overlay, let the overlay handle moves.
+                if getattr(self, '_focus_click_on_overlay', False):
+                    return False
                 edge = getattr(self, '_focus_resize_edge', None)
                 if edge is not None:
                     # Resize
@@ -9352,7 +9705,7 @@ class Viewer(QWidget):
         dst, _ = QFileDialog.getSaveFileName(
             self, "Save pointing plot", "pointing_stability.png",
             "PNG Images (*.png);;PDF (*.pdf)",
-            options=QFileDialog.Option.DontUseNativeDialog)
+            options=QFileDialog.Option(0))
         if not dst: return
         try:
             self.pointing_panel.save_figure(dst)
@@ -9731,6 +10084,13 @@ class Viewer(QWidget):
         if self._is_multi_cam():
             master = self._per_cam_master_idx
             if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                # Use _cam_current_idx directly — exact frame timestamp, no slider rounding.
+                if hasattr(self, "_cam_current_idx") and master < len(self._cam_current_idx):
+                    fi = self._cam_current_idx[master]
+                    ts = self._cam_ts[master]
+                    if 0 <= fi < len(ts):
+                        return ts[fi]
+                # Fallback: derive from slider (original path)
                 row = self._per_cam_rows[master] if master < len(self._per_cam_rows) else None
                 if row is None:
                     return None
@@ -9840,7 +10200,7 @@ class Viewer(QWidget):
         total = i1 - i0 + 1
 
         out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
-            options=QFileDialog.Option.DontUseNativeDialog)
+            options=QFileDialog.Option(0))
         if not out_dir: return
         self._last_save_dir = Path(out_dir)
         self._show_copy_progress(total, f"Saving {total} frames around current…")
@@ -9902,7 +10262,7 @@ class Viewer(QWidget):
         suggested = str(self._last_save_dir / f"{stem_no_ext}_overlay.png")
         dst, _ = QFileDialog.getSaveFileName(
             self, "Save image with overlay", suggested, "PNG Images (*.png)",
-            options=QFileDialog.Option.DontUseNativeDialog)
+            options=QFileDialog.Option(0))
         if not dst: return
         self._last_save_dir = Path(dst).parent
 
@@ -10084,7 +10444,7 @@ class Viewer(QWidget):
             QMessageBox.information(self, "Save", "No frames to save.")
             return
         out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
-            options=QFileDialog.Option.DontUseNativeDialog)
+            options=QFileDialog.Option(0))
         if not out_dir:
             return
         out_path = Path(out_dir)
@@ -10177,7 +10537,7 @@ class Viewer(QWidget):
                 return
             suggested = str(self._last_save_dir / self._dst_name_with_prague_time(it))
             dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, f"Images (*{it.path.suffix})",
-                options=QFileDialog.Option.DontUseNativeDialog)
+                options=QFileDialog.Option(0))
             if not dst: return
             # Ensure the saved file extension matches the source format
             _src_ext = it.path.suffix.lower()
@@ -10194,7 +10554,7 @@ class Viewer(QWidget):
             stem_no_ext = Path(self._dst_name_with_prague_time(it)).stem
             suggested = str(self._last_save_dir / f"{stem_no_ext}.png")
             dst, _ = QFileDialog.getSaveFileName(self, "Save image", suggested, "PNG Images (*.png)",
-                options=QFileDialog.Option.DontUseNativeDialog)
+                options=QFileDialog.Option(0))
             if not dst: return
             if Path(dst).suffix.lower() not in (".png",):
                 dst = str(Path(dst).with_suffix(".png"))
@@ -10261,13 +10621,23 @@ class Viewer(QWidget):
         if b < a: a, b = b, a
         selected = self._multi_grid.selected_cam_indices()
         cam_indices = selected if selected else list(range(len(self._cam_items)))
+        def _cam_range(ts, a, b):
+            """Inclusive upper bound with tolerance for cameras slightly behind master."""
+            i0 = bisect.bisect_left(ts, a)
+            i1 = bisect.bisect_right(ts, b)
+            if i1 < len(ts):
+                gap = (ts[i1 - 1] - ts[i1 - 2]) if i1 >= 2 else (ts[i1] if ts else 500_000_000)
+                tolerance = max(abs(gap), 500_000_000)
+                if ts[i1] - b <= tolerance:
+                    i1 += 1
+            return i0, i1
+
         # Count total frames across cameras for warning
         total = 0
         for cam_i in cam_indices:
             if cam_i >= len(self._cam_items): continue
             ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else []
-            i0 = bisect.bisect_left(ts, a)
-            i1 = bisect.bisect_right(ts, b)
+            i0, i1 = _cam_range(ts, a, b)
             total += max(0, i1 - i0)
         if total == 0:
             QMessageBox.information(self, "Save range", "No frames inside From..To."); return
@@ -10278,7 +10648,7 @@ class Viewer(QWidget):
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes: return
         out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
-            options=QFileDialog.Option.DontUseNativeDialog)
+            options=QFileDialog.Option(0))
         if not out_dir: return
         out_path = Path(out_dir)
         self._last_save_dir = out_path
@@ -10291,8 +10661,7 @@ class Viewer(QWidget):
             cam_items = self._cam_items[cam_i]
             ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else [it.ts_ns for it in cam_items]
             cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else f"cam{cam_i}"
-            i0 = bisect.bisect_left(ts, a)
-            i1 = bisect.bisect_right(ts, b)
+            i0, i1 = _cam_range(ts, a, b)
             for it in cam_items[i0:i1]:
                 err = self._render_cam_frame(it, None, cam_name, out_path, gradient_id, brighten,
                                              save_metadata_txt=save_txt)
@@ -10308,9 +10677,32 @@ class Viewer(QWidget):
         a, b = self.mark_a_ns, self.mark_b_ns
         if b < a: a, b = b, a
         i0 = max(0, bisect.bisect_left(self.ts_list, a))
-        i1 = min(len(self.items) - 1, bisect.bisect_right(self.ts_list, b) - 1)
-        if i0 > i1: QMessageBox.information(self, "Save range", "No frames inside From..To."); return
-        total = i1 - i0 + 1
+        # Use bisect_right as exclusive upper bound (consistent with _save_multicam_range).
+        # The old pattern (bisect_right - 1 then slice [i0:i1+1]) can miss the last image
+        # when mark_b_ns is exactly equal to the last timestamp due to clamping interactions.
+        i1_excl = min(len(self.items), bisect.bisect_right(self.ts_list, b))
+        if i0 >= i1_excl: QMessageBox.information(self, "Save range", "No frames inside From..To."); return
+        total = i1_excl - i0
+
+        # Pre-warm CPVA cache before showing the file dialog so the background
+        # save task starts immediately without blocking on HTTP requests.
+        # The user spends a few seconds picking the output folder — enough time
+        # for all day-caches to be filled.
+        if self._pv_enabled:
+            _pv_chs_prefetch = {n: PV_CHANNEL_MAP[n]
+                                for n in self._pv_enabled if n in PV_CHANNEL_MAP}
+            if _pv_chs_prefetch and self.items and i0 < len(self.items):
+                _ts0 = self.items[i0].ts_ns
+                import threading as _thr
+                def _prefetch():
+                    for _ch in _pv_chs_prefetch.values():
+                        try:
+                            _pv_load_day(_ch, _pv_date_key(_ts0))
+                            _pv_load_day(_ch, _pv_prev_date_key(_pv_date_key(_ts0)))
+                        except Exception:
+                            pass
+                _thr.Thread(target=_prefetch, daemon=True).start()
+
         if total >= SAVE_RANGE_WARN_COUNT:
             reply = QMessageBox.warning(self, "Large range",
                 f"{total} files selected.\nContinue?",
@@ -10318,7 +10710,7 @@ class Viewer(QWidget):
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes: return
         out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", str(self._last_save_dir),
-            options=QFileDialog.Option.DontUseNativeDialog)
+            options=QFileDialog.Option(0))
         if not out_dir: return
         self._last_save_dir = Path(out_dir)
         self._show_copy_progress(total, "Saving range…")
@@ -10350,11 +10742,13 @@ class Viewer(QWidget):
         elif self._pv_text():
             overlay_params = {'pv_text': self._pv_text()}
         task = SaveRangeTask(
-            self.items[i0:i1+1], Path(out_dir), self._dst_name_with_prague_time,
+            self.items[i0:i1_excl], Path(out_dir), self._dst_name_with_prague_time,
             gradient_id=self.gradient_cb.currentIndex(),
             brighten=self.cb_bright.isChecked(),
             overlay_params=overlay_params,
             energy_map=dict(self._sf_energy_map),
+            pv_channels={n: PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP},
+            pv_units=dict(PV_UNITS),
         )
         task.save_txt = self.cb_save_metadata_txt.isChecked()
         self._save_task = task

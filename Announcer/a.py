@@ -274,7 +274,7 @@ class ScreenTracker(tk.Tk):
 
         # Pre-build Settings variables (popup builds widgets on first open)
         self.flash_color = tk.StringVar(value="#ff2222")
-        self.flash_duration = tk.DoubleVar(value=3.0)
+        self.flash_duration = tk.DoubleVar(value=0.0)
         self.sound_enabled = tk.BooleanVar(value=True)
         self.sound_freq = tk.IntVar(value=1500)
         self.sound_duration = tk.IntVar(value=500)
@@ -332,8 +332,11 @@ class ScreenTracker(tk.Tk):
         if not name or name not in self._presets:
             messagebox.showwarning("No preset", "Select a preset first.", parent=self)
             return
+        if self.tracking:
+            self._stop_tracking()
         coords = self._presets[name]
         self._region_selected(tuple(coords))
+        self._set_ui_visible(True)
 
     def _delete_preset(self):
         name = self._preset_var.get()
@@ -623,10 +626,12 @@ class ScreenTracker(tk.Tk):
             self._mon_frame.pack(side="left", before=self._canvas_circle)
             self._settings_btn.pack(side="left", padx=(4, 0))
             self._btn_frame.grid()
+            self._preset_frame.grid()
         else:
             self._mon_frame.pack_forget()
             self._settings_btn.pack_forget()
             self._btn_frame.grid_remove()
+            self._preset_frame.grid_remove()
 
     def _pick_flash_color(self):
         from tkinter.colorchooser import askcolor

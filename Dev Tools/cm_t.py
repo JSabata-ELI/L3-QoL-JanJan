@@ -1068,6 +1068,18 @@ class DeployGUI(ttk.Frame):
 
                     program_name = program_dir.name
 
+                    # ── Archive old exes from main folder — keep only newest ─
+                    _all_exes = sorted(
+                        [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)],
+                        key=_exe_version, reverse=True,
+                    )
+                    if len(_all_exes) > 1:
+                        _keep = _all_exes[0]
+                        _logs: list[str] = []
+                        move_existing_exes_to_archive(program_dir, _keep.name, _logs, program_name)
+                        for _msg in _logs:
+                            self.after(0, self._log, _msg)
+
                     # ── Fix archive ──────────────────────────────────────
                     archive_dir = program_dir / "archive"
                     if archive_dir.exists():
@@ -1634,6 +1646,13 @@ class DeployGUI(ttk.Frame):
                 with _zf2.ZipFile(zip_path, "r") as _zcheck:
                     _zcount = sum(1 for m in _zcheck.infolist() if not m.filename.endswith("/"))
                 self.after(0, self._log, f"ZIP created: {zip_path.name} — {_zcount} files\n")
+                # Recalculate total_steps from the actual ZIP file count so the
+                # progress bar maximum is always accurate (n_files from rglob can
+                # differ from the final ZIP entry count when extra binaries were
+                # added to _internal at build time).
+                total_steps = _zcount + _zcount * len(selected)
+                done_steps = _zcount  # ZIP phase is complete
+                self.after(0, lambda: self._prog_bar.configure(maximum=max(1, total_steps)))
             except Exception as e:
                 self.after(0, self._log, f"ERROR creating ZIP: {e}")
                 self.after(0, self._set_busy, False)
@@ -1676,8 +1695,12 @@ class DeployGUI(ttk.Frame):
                                 continue
                             expected_rel.add(rel)
                             dst_file = old_internal / rel.replace("/", os.sep)
-                            # Skip if file exists and size matches (avoid OneDrive sync storm)
-                            if dst_file.exists() and dst_file.stat().st_size == member.file_size:
+                            # Skip if file exists and size matches (avoid OneDrive sync storm).
+                            # Never skip .pyd files — same size doesn't mean same binary
+                            # (e.g. numpy 2.4.2 vs 2.4.6 produce identical-sized but
+                            # differently-compiled extensions that link different DLL hashes).
+                            _is_pyd = dst_file.suffix.lower() == ".pyd"
+                            if not _is_pyd and dst_file.exists() and dst_file.stat().st_size == member.file_size:
                                 done_steps += 1
                                 self.after(0, lambda d=done_steps, t=total_steps, n=program_dir.name: self._progress_update(d, t, n))
                                 continue

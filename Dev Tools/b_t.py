@@ -902,6 +902,14 @@ class BuilderUI(ttk.Frame):
             except Exception as e:
                 print(f"Warning: could not rename exe: {e}")
 
+        # Kopíruj icon.ico vedle exe (tkinter iconbitmap ho potřebuje jako fyzický soubor)
+        _ico_src = p / "icon.ico"
+        if _ico_src.exists():
+            try:
+                shutil.copy2(str(_ico_src), str(verdir / "icon.ico"))
+            except Exception:
+                pass
+
         # Kopíruj main .py a ostatní zdrojáky
         try:
             py_dst = verdir / f"{name} v{ver}.py"
