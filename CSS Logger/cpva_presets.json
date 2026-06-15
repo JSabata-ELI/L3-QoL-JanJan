@@ -1,29 +1,6 @@
 {
   "presets": [
     {
-      "name": "test",
-      "pvs": [
-        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-        "HAPLS-ENER_IN_PFM8_LT1_DIAG2:Energy"
-      ],
-      "time_window_hours": 3.0
-    },
-    {
-      "name": "JSab",
-      "pvs": [
-        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-        "L3-PFWP6-MTR03-1:RawPos",
-        "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
-        "L3-PM03-023:Energy",
-        "L3-PM03-025:Energy",
-        "L3-VCS-LN36:OPEN",
-        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      ],
-      "time_window_hours": 10.0
-    },
-    {
       "name": "SpectralCentroid",
       "pvs": [
         "HAPLS-SPEC_CENT_PD1M1_LT7_DIAG1:SpectralCentroid",
@@ -83,6 +60,33 @@
         "L3-PCC1X-MTR03-85:RawPos"
       ],
       "time_window_hours": null
+    },
+    {
+      "name": "Chiller Performance Tracker",
+      "pvs": [
+        "L3-UTIL-CHL03-001:Flow_GPM",
+        "L3-UTIL-CHL03-001:Temp",
+        "L3-UTIL-CHL03-002:Flow_GPM",
+        "L3-UTIL-CHL03-002:Temp",
+        "L3-UTIL-CHL03-003:Flow_GPM",
+        "L3-UTIL-CHL03-003:Temp",
+        "L3-UTIL-CHL03-004:Flow_GPM",
+        "L3-UTIL-CHL03-004:Temp",
+        "L3-UTIL-CHL03-005:Flow_GPM",
+        "L3-UTIL-CHL03-005:Temp",
+        "L3-UTIL-CHL03-006:Flow_GPM",
+        "L3-UTIL-CHL03-006:Temp",
+        "L3-UTIL-CHL03-001:PumpON",
+        "L3-UTIL-CHL03-002:PumpON",
+        "L3-UTIL-CHL03-003:PumpON",
+        "L3-UTIL-CHL03-004:PumpON",
+        "L3-UTIL-CHL03-005:PumpON",
+        "L3-UTIL-CHL03-006:PumpON"
+      ],
+      "time_window_hours": null,
+      "conditions": [],
+      "master_pv": "L3-PFWP6-MTR03-1:RawPos",
+      "master_multiple": ""
     }
   ]
 }
