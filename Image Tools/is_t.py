@@ -887,7 +887,7 @@ class SaveRangeTask(QRunnable):
                         errors += 1
                         self.signals.progress.emit(done, total, it.path.name)
                         continue
-                    if not QPixmap.fromImage(img).save(str(dst)):
+                    if not img.save(str(dst)):  # QImage.save is thread-safe unlike QPixmap
                         errors += 1
                         self.signals.progress.emit(done, total, it.path.name)
                         continue
@@ -922,78 +922,104 @@ class SaveRangeTask(QRunnable):
                     if pix is not None:
                         if pv_text:
                             try:
-                                # PIL rendering is thread-safe (QPainter/QPixmap are not).
-                                # Same logic as Shot Finder: scale font 22→8px to fill the
-                                # white bar; split to 2 lines only if even 8px doesn't fit.
+                                # Exact copy of Shot Finder's PIL bar rendering (sf_t.py).
+                                # Key fix: use full Windows font paths so PIL actually loads
+                                # a real font instead of falling back to load_default().
                                 from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF
                                 import tempfile as _tf
                                 with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _t:
                                     _tp = Path(_t.name)
                                 pix.save(str(_tp))
-                                _img = _PI.open(_tp)
-                                _avail_w = _img.width - 20
-                                _display_text = pv_text
-                                _fn = None
-                                _fsize = 8
-                                # Try single line first
-                                for _fs in range(22, 7, -1):
-                                    try:
-                                        _f = _PF.truetype("arial.ttf", _fs)
-                                    except Exception:
+                                _pil_img = _PI.open(_tp).convert("RGB")
+
+                                _tmp_draw = _PD.Draw(_PI.new("RGB", (1, 1)))
+                                _parts_list = pv_text.split("  |  ")
+                                _chosen_font = None
+                                _display_lines = [pv_text]
+
+                                for _fsize in range(20, 7, -1):
+                                    _f2 = None
+                                    for _fname in (
+                                        "C:/Windows/Fonts/arial.ttf",
+                                        "C:/Windows/Fonts/segoeui.ttf",
+                                        "C:/Windows/Fonts/calibri.ttf",
+                                        "DejaVuSans.ttf",
+                                    ):
                                         try:
-                                            _f = _PF.truetype("DejaVuSans.ttf", _fs)
-                                        except Exception:
-                                            _f = _PF.load_default()
-                                    try:
-                                        _tw = _f.getlength(pv_text)
-                                    except Exception:
-                                        _tw = len(pv_text) * _fs * 0.6
-                                    if _tw <= _avail_w:
-                                        _fn, _fsize = _f, _fs
-                                        break
-                                if _fn is None:
-                                    # Split to 2 lines
-                                    _ps = pv_text.split("  |  ")
-                                    _mid = max(1, len(_ps) // 2)
-                                    _display_text = ("  |  ".join(_ps[:_mid]) + "\n" +
-                                                     "  |  ".join(_ps[_mid:]))
-                                    for _fs in range(18, 7, -1):
-                                        try:
-                                            _f = _PF.truetype("arial.ttf", _fs)
-                                        except Exception:
-                                            try:
-                                                _f = _PF.truetype("DejaVuSans.ttf", _fs)
-                                            except Exception:
-                                                _f = _PF.load_default()
-                                        try:
-                                            _mw = max(_f.getlength(_l) for _l in _display_text.split("\n"))
-                                        except Exception:
-                                            _mw = max(len(_l) * _fs * 0.6 for _l in _display_text.split("\n"))
-                                        if _mw <= _avail_w:
-                                            _fn, _fsize = _f, _fs
+                                            _f2 = _PF.truetype(_fname, _fsize)
                                             break
-                                    if _fn is None:
-                                        try:
-                                            _fn = _PF.truetype("arial.ttf", 7)
                                         except Exception:
-                                            _fn = _PF.load_default()
-                                        _fsize = 7
-                                _lines = _display_text.split("\n")
-                                _lh = _fsize + 8
-                                _bar_h = max(38, _lh * len(_lines) + 16)
-                                _new = _PI.new("RGB", (_img.width, _img.height + _bar_h), (255, 255, 255))
-                                _new.paste(_img.convert("RGB"), (0, 0))
-                                _dr = _PD.Draw(_new)
-                                _total_th = _lh * len(_lines)
-                                _y0 = _img.height + (_bar_h - _total_th) // 2
-                                for _li, _line in enumerate(_lines):
+                                            continue
+                                    if _f2 is None:
+                                        _f2 = _PF.load_default()
+
+                                    # Try single line
                                     try:
-                                        _tw_l = _fn.getlength(_line)
+                                        _bb = _tmp_draw.textbbox((0, 0), pv_text, font=_f2)
+                                        if (_bb[2] - _bb[0]) <= _pil_img.width - 20:
+                                            _chosen_font = _f2
+                                            _display_lines = [pv_text]
+                                            break
                                     except Exception:
-                                        _tw_l = len(_line) * _fsize * 0.6
-                                    _x = max(0, (_img.width - int(_tw_l)) // 2)
-                                    _dr.text((_x, _y0 + _li * _lh), _line, fill=(0, 0, 0), font=_fn)
-                                _new.save(str(ann_dst))
+                                        pass
+
+                                    # Try splitting into 2, 3, 4… lines
+                                    _fitted = False
+                                    for _n_lines in range(2, len(_parts_list) + 1):
+                                        _chunk = max(1, len(_parts_list) // _n_lines)
+                                        _lines_try = []
+                                        for _i in range(0, len(_parts_list), _chunk):
+                                            _lines_try.append("  |  ".join(_parts_list[_i:_i + _chunk]))
+                                        _max_w = 0
+                                        try:
+                                            for _ln in _lines_try:
+                                                _bb2 = _tmp_draw.textbbox((0, 0), _ln, font=_f2)
+                                                _max_w = max(_max_w, _bb2[2] - _bb2[0])
+                                        except Exception:
+                                            _max_w = _pil_img.width
+                                        if _max_w <= _pil_img.width - 20:
+                                            _chosen_font = _f2
+                                            _display_lines = _lines_try
+                                            _fitted = True
+                                            break
+                                    if _fitted:
+                                        break
+
+                                if _chosen_font is None:
+                                    try:
+                                        _chosen_font = _PF.truetype("C:/Windows/Fonts/arial.ttf", 8)
+                                    except Exception:
+                                        _chosen_font = _PF.load_default()
+
+                                # Measure actual line height with "Ag"
+                                try:
+                                    _bb_ag = _tmp_draw.textbbox((0, 0), "Ag", font=_chosen_font)
+                                    _line_h = _bb_ag[3] - _bb_ag[1]
+                                except Exception:
+                                    _line_h = 14
+                                _pad = 8
+                                _bar_h = max(30, _line_h * len(_display_lines) +
+                                             _pad * (len(_display_lines) + 1))
+
+                                _bar = _PI.new("RGB", (_pil_img.width, _bar_h), (255, 255, 255))
+                                _draw = _PD.Draw(_bar)
+                                _total_th2 = (_line_h * len(_display_lines) +
+                                              _pad * (len(_display_lines) - 1))
+                                _y2 = (_bar_h - _total_th2) // 2
+                                for _ln2 in _display_lines:
+                                    try:
+                                        _bb3 = _draw.textbbox((0, 0), _ln2, font=_chosen_font)
+                                        _tw3 = _bb3[2] - _bb3[0]
+                                    except Exception:
+                                        _tw3 = 0
+                                    _x2 = max(8, (_pil_img.width - _tw3) // 2)
+                                    _draw.text((_x2, _y2), _ln2, fill=(0, 0, 0), font=_chosen_font)
+                                    _y2 += _line_h + _pad
+
+                                _combined = _PI.new("RGB", (_pil_img.width, _pil_img.height + _bar_h))
+                                _combined.paste(_pil_img, (0, 0))
+                                _combined.paste(_bar, (0, _pil_img.height))
+                                _combined.save(str(ann_dst))
                                 _tp.unlink(missing_ok=True)
                                 _tp.unlink(missing_ok=True)
                             except Exception:
@@ -5217,6 +5243,13 @@ class _PvOverlayPanel(QWidget):
 class Viewer(QWidget):
     def __init__(self):
         super().__init__()
+        # Pre-warm Qt6's QPixmap/raster/GPU subsystem on the main thread.
+        # Without this, the FIRST QPixmap operation in any background thread
+        # blocks the main thread for ~30 s while Qt initialises the subsystem.
+        try:
+            QPixmap(1, 1)
+        except Exception:
+            pass
         # Title is set by the parent window (main.py)
         # self.setWindowTitle("Image Slider")
 
