@@ -1,0 +1,1488 @@
+{
+  "rampings": [
+    {
+      "file": "ramping_2026_05_26-13_11.parquet",
+      "timestamp": "2026-05-26 13:11",
+      "rows": 13,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_26-13_11.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_26-11_09.parquet",
+      "timestamp": "2026-05-26 11:09",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_26-11_09.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_22-13_02.parquet",
+      "timestamp": "2026-05-22 13:02",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_22-13_02.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_20-17_00.parquet",
+      "timestamp": "2026-05-20 17:00",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_20-17_00.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_15-16_52.parquet",
+      "timestamp": "2026-05-15 16:52",
+      "rows": 8,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_15-16_52.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_15-13_47.parquet",
+      "timestamp": "2026-05-15 13:47",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_15-13_47.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_15-12_03.parquet",
+      "timestamp": "2026-05-15 12:03",
+      "rows": 7,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_15-12_03.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_15-08_23.parquet",
+      "timestamp": "2026-05-15 08:23",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_15-08_23.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_14-07_52.parquet",
+      "timestamp": "2026-05-14 07:52",
+      "rows": 16,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_14-07_52.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_13-13_34.parquet",
+      "timestamp": "2026-05-13 13:34",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_13-13_34.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_13-12_32.parquet",
+      "timestamp": "2026-05-13 12:32",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_13-12_32.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_13-08_18.parquet",
+      "timestamp": "2026-05-13 08:18",
+      "rows": 22,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_13-08_18.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_12-14_10.parquet",
+      "timestamp": "2026-05-12 14:10",
+      "rows": 11,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_12-14_10.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_12-10_57.parquet",
+      "timestamp": "2026-05-12 10:57",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_12-10_57.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_11-09_34.parquet",
+      "timestamp": "2026-05-11 09:34",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_11-09_34.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_11-09_33.parquet",
+      "timestamp": "2026-05-11 09:33",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_11-09_33.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_07-18_26.parquet",
+      "timestamp": "2026-05-07 18:26",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_07-18_26.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_07-15_13.parquet",
+      "timestamp": "2026-05-07 15:13",
+      "rows": 7,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_07-15_13.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_07-08_21.parquet",
+      "timestamp": "2026-05-07 08:21",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_07-08_21.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_06-13_27.parquet",
+      "timestamp": "2026-05-06 13:27",
+      "rows": 15,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_06-13_27.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_06-08_57.parquet",
+      "timestamp": "2026-05-06 08:57",
+      "rows": 12,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_06-08_57.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_06-08_56.parquet",
+      "timestamp": "2026-05-06 08:56",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_06-08_56.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_05-16_14.parquet",
+      "timestamp": "2026-05-05 16:14",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_05-16_14.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_05-14_43.parquet",
+      "timestamp": "2026-05-05 14:43",
+      "rows": 12,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_05-14_43.xlsx"
+    },
+    {
+      "file": "ramping_2026_05_04-09_14.parquet",
+      "timestamp": "2026-05-04 09:14",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_05_04-09_14.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_30-08_43.parquet",
+      "timestamp": "2026-04-30 08:43",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_30-08_43.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_29-08_22.parquet",
+      "timestamp": "2026-04-29 08:22",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_29-08_22.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_28-11_45.parquet",
+      "timestamp": "2026-04-28 11:45",
+      "rows": 12,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_28-11_45.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_28-08_12.parquet",
+      "timestamp": "2026-04-28 08:12",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_28-08_12.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_27-17_38.parquet",
+      "timestamp": "2026-04-27 17:38",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_27-17_38.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_27-10_10.parquet",
+      "timestamp": "2026-04-27 10:10",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_27-10_10.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_24-09_41.parquet",
+      "timestamp": "2026-04-24 09:41",
+      "rows": 24,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_24-09_41.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_23-08_31.parquet",
+      "timestamp": "2026-04-23 08:31",
+      "rows": 21,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_23-08_31.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_22-19_34.parquet",
+      "timestamp": "2026-04-22 19:34",
+      "rows": 26,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_22-19_34.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_22-08_07.parquet",
+      "timestamp": "2026-04-22 08:07",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_22-08_07.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_21-10_11.parquet",
+      "timestamp": "2026-04-21 10:11",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_21-10_11.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_21-08_36.parquet",
+      "timestamp": "2026-04-21 08:36",
+      "rows": 21,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_21-08_36.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_20-18_19.parquet",
+      "timestamp": "2026-04-20 18:19",
+      "rows": 8,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_20-18_19.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_20-15_32.parquet",
+      "timestamp": "2026-04-20 15:32",
+      "rows": 7,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_20-15_32.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_20-10_11.parquet",
+      "timestamp": "2026-04-20 10:11",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_20-10_11.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_17-14_06.parquet",
+      "timestamp": "2026-04-17 14:06",
+      "rows": 15,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_17-14_06.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_02-08_35.parquet",
+      "timestamp": "2026-04-02 08:35",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_02-08_35.xlsx"
+    },
+    {
+      "file": "ramping_2026_04_01-16_49.parquet",
+      "timestamp": "2026-04-01 16:49",
+      "rows": 21,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_04_01-16_49.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_31-14_57.parquet",
+      "timestamp": "2026-03-31 14:57",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_31-14_57.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_31-09_25.parquet",
+      "timestamp": "2026-03-31 09:25",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_31-09_25.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_30-16_55.parquet",
+      "timestamp": "2026-03-30 16:55",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_30-16_55.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_30-08_58.parquet",
+      "timestamp": "2026-03-30 08:58",
+      "rows": 12,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_30-08_58.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_27-16_55.parquet",
+      "timestamp": "2026-03-27 16:55",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_27-16_55.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_27-09_48.parquet",
+      "timestamp": "2026-03-27 09:48",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_27-09_48.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_26-14_59.parquet",
+      "timestamp": "2026-03-26 14:59",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_26-14_59.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_26-08_36.parquet",
+      "timestamp": "2026-03-26 08:36",
+      "rows": 21,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_26-08_36.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_25-10_23.parquet",
+      "timestamp": "2026-03-25 10:23",
+      "rows": 21,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_25-10_23.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_24-09_54.parquet",
+      "timestamp": "2026-03-24 09:54",
+      "rows": 22,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_24-09_54.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_23-14_08.parquet",
+      "timestamp": "2026-03-23 14:08",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_23-14_08.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_23-09_18.parquet",
+      "timestamp": "2026-03-23 09:18",
+      "rows": 25,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_23-09_18.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_20-17_47.parquet",
+      "timestamp": "2026-03-20 17:47",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_20-17_47.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_20-13_50.parquet",
+      "timestamp": "2026-03-20 13:50",
+      "rows": 11,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_20-13_50.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_20-13_15.parquet",
+      "timestamp": "2026-03-20 13:15",
+      "rows": 10,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_20-13_15.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_20-09_07.parquet",
+      "timestamp": "2026-03-20 09:07",
+      "rows": 21,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_20-09_07.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_19-11_30.parquet",
+      "timestamp": "2026-03-19 11:30",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_19-11_30.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_18-13_23.parquet",
+      "timestamp": "2026-03-18 13:23",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_18-13_23.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_17-13_10.parquet",
+      "timestamp": "2026-03-17 13:10",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_17-13_10.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_17-08_43.parquet",
+      "timestamp": "2026-03-17 08:43",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_17-08_43.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_16-14_27.parquet",
+      "timestamp": "2026-03-16 14:27",
+      "rows": 7,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_16-14_27.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_16-11_58.parquet",
+      "timestamp": "2026-03-16 11:58",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_16-11_58.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_13-10_43.parquet",
+      "timestamp": "2026-03-13 10:43",
+      "rows": 24,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_13-10_43.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_12-17_12.parquet",
+      "timestamp": "2026-03-12 17:12",
+      "rows": 8,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_12-17_12.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_12-16_27.parquet",
+      "timestamp": "2026-03-12 16:27",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_12-16_27.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_11-13_07.parquet",
+      "timestamp": "2026-03-11 13:07",
+      "rows": 11,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_11-13_07.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_11-11_41.parquet",
+      "timestamp": "2026-03-11 11:41",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_11-11_41.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_11-08_33.parquet",
+      "timestamp": "2026-03-11 08:33",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_11-08_33.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_10-17_24.parquet",
+      "timestamp": "2026-03-10 17:24",
+      "rows": 6,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_10-17_24.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_10-15_06.parquet",
+      "timestamp": "2026-03-10 15:06",
+      "rows": 16,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_10-15_06.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_10-08_40.parquet",
+      "timestamp": "2026-03-10 08:40",
+      "rows": 12,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_10-08_40.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_09-17_48.parquet",
+      "timestamp": "2026-03-09 17:48",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_09-17_48.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_06-11_45.parquet",
+      "timestamp": "2026-03-06 11:45",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_06-11_45.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_05-12_24.parquet",
+      "timestamp": "2026-03-05 12:24",
+      "rows": 23,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_05-12_24.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_04-13_49.parquet",
+      "timestamp": "2026-03-04 13:49",
+      "rows": 10,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_04-13_49.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_04-12_25.parquet",
+      "timestamp": "2026-03-04 12:25",
+      "rows": 18,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_04-12_25.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_03-18_36.parquet",
+      "timestamp": "2026-03-03 18:36",
+      "rows": 8,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_03-18_36.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_03-08_56.parquet",
+      "timestamp": "2026-03-03 08:56",
+      "rows": 24,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_03-08_56.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_02-15_20.parquet",
+      "timestamp": "2026-03-02 15:20",
+      "rows": 24,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_02-15_20.xlsx"
+    },
+    {
+      "file": "ramping_2026_03_02-13_32.parquet",
+      "timestamp": "2026-03-02 13:32",
+      "rows": 15,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_03_02-13_32.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_26-13_22.parquet",
+      "timestamp": "2026-02-26 13:22",
+      "rows": 16,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_26-13_22.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_16-15_46.parquet",
+      "timestamp": "2026-02-16 15:46",
+      "rows": 13,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_16-15_46.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_10-15_02.parquet",
+      "timestamp": "2026-02-10 15:02",
+      "rows": 7,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_10-15_02.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_09-09_24.parquet",
+      "timestamp": "2026-02-09 09:24",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_09-09_24.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_06-08_36.parquet",
+      "timestamp": "2026-02-06 08:36",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_06-08_36.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_05-09_50.parquet",
+      "timestamp": "2026-02-05 09:50",
+      "rows": 20,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_05-09_50.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_04-15_31.parquet",
+      "timestamp": "2026-02-04 15:31",
+      "rows": 8,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_04-15_31.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_04-13_47.parquet",
+      "timestamp": "2026-02-04 13:47",
+      "rows": 15,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_04-13_47.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_03-14_25.parquet",
+      "timestamp": "2026-02-03 14:25",
+      "rows": 10,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_03-14_25.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_03-12_22.parquet",
+      "timestamp": "2026-02-03 12:22",
+      "rows": 16,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_03-12_22.xlsx"
+    },
+    {
+      "file": "ramping_2026_02_02-17_19.parquet",
+      "timestamp": "2026-02-02 17:19",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_02_02-17_19.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_30-10_33.parquet",
+      "timestamp": "2026-01-30 10:33",
+      "rows": 15,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_30-10_33.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_29-16_08.parquet",
+      "timestamp": "2026-01-29 16:08",
+      "rows": 19,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_29-16_08.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_28-16_00.parquet",
+      "timestamp": "2026-01-28 16:00",
+      "rows": 16,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_28-16_00.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_27-16_03.parquet",
+      "timestamp": "2026-01-27 16:03",
+      "rows": 11,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_27-16_03.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_26-15_14.parquet",
+      "timestamp": "2026-01-26 15:14",
+      "rows": 12,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_26-15_14.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_23-17_56.parquet",
+      "timestamp": "2026-01-23 17:56",
+      "rows": 6,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_23-17_56.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_23-15_08.parquet",
+      "timestamp": "2026-01-23 15:08",
+      "rows": 9,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_23-15_08.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_23-10_23.parquet",
+      "timestamp": "2026-01-23 10:23",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_23-10_23.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_22-18_43.parquet",
+      "timestamp": "2026-01-22 18:43",
+      "rows": 6,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_22-18_43.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_22-17_20.parquet",
+      "timestamp": "2026-01-22 17:20",
+      "rows": 14,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_22-17_20.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_22-11_47.parquet",
+      "timestamp": "2026-01-22 11:47",
+      "rows": 16,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_22-11_47.xlsx"
+    },
+    {
+      "file": "ramping_2026_01_20-17_42.parquet",
+      "timestamp": "2026-01-20 17:42",
+      "rows": 17,
+      "columns": [
+        "waveplate",
+        "ptm1",
+        "pcm2",
+        "pcm4",
+        "pap1",
+        "sbw4"
+      ],
+      "source_xlsx": "ramping_2026_01_20-17_42.xlsx"
+    }
+  ]
+}
