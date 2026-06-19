@@ -862,9 +862,18 @@ class _StatsShim:
 class CPVAExplorerApp:
     def __init__(self, root: tk.Tk):
         self.root   = root
-        self.root.title("CPVA Explorer")
+        self.root.title("CSS Logger")
         self.root.minsize(1200, 750)
         self.root.state("zoomed")
+        _base = (Path(sys.executable).resolve().parent
+                 if getattr(sys, "frozen", False)
+                 else Path(__file__).resolve().parent)
+        _ico = _base / "icon.ico"
+        if _ico.exists():
+            try:
+                self.root.iconbitmap(str(_ico))
+            except Exception:
+                pass
 
         self.config = load_config()
 
@@ -5891,6 +5900,11 @@ class CPVAExplorerApp:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    try:
+        import ctypes as _ct
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.CSSLogger")
+    except Exception:
+        pass
     root = tk.Tk()
     app  = CPVAExplorerApp(root)
     root.mainloop()

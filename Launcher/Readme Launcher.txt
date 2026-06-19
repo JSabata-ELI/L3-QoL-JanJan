@@ -1,7 +1,7 @@
-Launcher v1.6.2 — Information
-Created by Jan Moučka, ELI Beamlines
+﻿Launcher — Information
+Created by Jan Moučka, ELI Laser
 
-Bugs / suggestions: jan.moucka@eli-beams.eu
+Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
 
 Central hub for launching all QoL tools. Scans the selected

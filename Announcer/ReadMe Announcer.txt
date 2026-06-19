@@ -1,7 +1,7 @@
-Announcer v1.2.0 — Information
-Created by Jan Moučka, ELI Beamlines
+﻿Announcer — Information
+Created by Jan Moučka, ELI Laser
 
-Bugs / suggestions: jan.moucka@eli-beams.eu
+Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
 
 Real-time screen region change monitor. Watches a selected area

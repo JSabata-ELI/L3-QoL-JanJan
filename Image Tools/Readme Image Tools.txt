@@ -1,11 +1,11 @@
-Image Tools v1.6.1 — Information
-Created by Jan Moučka, ELI Beamlines
+﻿Image Tools — Information
+Created by Jan Moučka, ELI Laser
 
-Bugs / suggestions: jan.moucka@eli-beams.eu
+Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
 
 Image Tools is a multi-tab application for browsing, analysing and
-exporting camera images from ELI Beamlines experiments.
+exporting camera images from ELI Laser experiments.
 It consists of three integrated tools accessible via tabs at the top.
 
 

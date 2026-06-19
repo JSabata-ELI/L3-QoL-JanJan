@@ -9,6 +9,9 @@
 | `if_t.py` | **Image Finder** — výběr kamer a snímků pro daný den, anotace energetickými daty z CPVA API + CSV. |
 | `sf_t.py` | **Shot Finder** — hledání snímků podle hodnoty PV (energie, waveplate…) v CPVA archiveru. |
 | `wk_t.py` | **Workshop** — editor obrázků přijatých z ostatních záložek. Jas/kontrast, palety, ořez, kreslení (brush/line/rect/text/eraser), diff vůči referenci, undo/redo, uložení PNG/TIFF. |
+| `sp_t.py` | ⚠️ **Není součástí aplikace** — `main.py` ho neimportuje a nikde se nereferencuje. Osiřelá kopie programu Spectra; lze smazat nebo přesunout do Archive. |
+
+> **Aktuální velikosti (2026-06-19):** main.py 255 ř. · if_t.py 6624 ř. · is_t.py 11238 ř. · sf_t.py 2682 ř. · wk_t.py 1283 ř. Detailní line-by-line mapa je v `image_tools_structure.md`.
 
 ---
 
@@ -335,3 +338,30 @@ Hlavní widget záložky — přijímá obrázky z ostatních záložek přes `r
 - `scipy` — SC hole-filling (volitelné)
 - `zoneinfo` — Prague timezone
 - `ssl`, `urllib` — CPVA archiver API (bez ověření certifikátu)
+
+---
+
+## KNOWN ISSUES (review 2026-06-19 — ověřeno ve zdroji)
+
+### Funkční bugy
+1. ✅ **OPRAVENO (if_t.py)** — odstraněna redundantní funkce `_NoScrollCalendar`, která překrývala wheel-blocking třídu z L539. Kalendáře teď opět ignorují kolečko.
+2. ✅ **OPRAVENO (if_t.py L4710)** — except větev v `_compare_memory` nyní emituje `self._compare_sig.error`.
+3. ✅ **OPRAVENO (sf_t.py L391 `_find_best_match`)** — odstraněno druhé dělení 0.749; `target` už přichází v CSV jednotkách z `_to_csv_units`.
+4. **wk_t.py L936** — `rgb.astype(np.uint8)` bez škálování ořezává 16bit data; `_redo` (L1067) není napojen na žádné tlačítko ani zkratku (celá redo logika nedosažitelná z UI). *(neopraveno)*
+5. **wk_t.py L107** — `_TZ_PRAGUE` natvrdo +2h → v zimě (CET=+1) jsou timestampy v názvech uložených souborů o hodinu posunuté. *(neopraveno)*
+
+### Efektivita / responzivita
+- **Síťové IO a PNG enkódování na hlavním vlákně** v save / try-again / open-in-slider cestách (if_t `_try_again_*`/`_save_items`, sf_t `_save_results`/`_open_in_slider`/`_on_day_result`) → zamrzání UI na pomalém síťovém disku. Patří do worker vlákna se signály.
+- **`open_folder`/`_reload_with_last_cameras` (is_t)** busy-wait s `processEvents()` + `sleep` blokuje GUI až 3 s a hrozí re-entrancí.
+- **Žádná cache výpisu adresářů** — if_t `load_folders` i sf_t `_load_cameras` skenují všech 24 hodinových složek znovu při každé změně hodiny/zdroje/data.
+- **`_cpva_fetch_samples` serializuje vše přes jeden zámek/spojení** (if_t L149) — per-column ThreadPool tím pádem neběží paralelně.
+- **Bez cancel/generation tokenu** u sf_t search a camera-load workerů → výsledky zastaralých běhů přepíšou tabulku.
+
+### Duplikace / mrtvý kód
+- if_t: třída `_NoScrollCalendar` (L539, mrtvá), `MIN_FULL_FILES`, `_range_gen`, ignorované parametry `select_images_from_folder`, 3× anotační font/wrap rutina, `_get_csv_best_hour_for_day` (pravděpodobně mrtvá).
+- is_t: `_LazyDirModel` stub, overlay-draw kód 4× kopírovaný, camera-scan worker 3× kopírovaný.
+- sf_t: `_setup_calendar` (dup `_make_cal`), `GRADIENTS_SF`, legacy skryté widgety.
+
+### Ostatní
+- Časté `except Exception: pass` napříč všemi moduly skrývá reálné chyby (zejm. `ScanTask.run` v is_t obaluje celý sken).
+- Míchání češtiny a angličtiny v komentářích — viz pravidlo English-only.

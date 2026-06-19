@@ -1,3 +1,14 @@
 {
-  "root_folder": "C:\\Users\\jan.moucka.eli-laser\\OneDrive - ELI ERIC\\ELI Beamlines\\Python\\programy\\L3-QoL-JanJan"
+  "root_folder": "C:\\Users\\jan.moucka.eli-laser\\OneDrive - ELI ERIC\\ELI Beamlines\\Python\\programy\\L3-QoL-JanJan",
+  "project_groups": {
+    "Spectra": "Side project",
+    "Calibrations": "Ignored project",
+    "Extractor": "Ignored project",
+    "Internal Builder": "Side project",
+    "Launcher": "Side project",
+    "Screenshots": "Side project",
+    "Shift planner": "Ignored project",
+    "Time Converter": "Side project",
+    "Announcer": "Side project"
+  }
 }

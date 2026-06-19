@@ -7,6 +7,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import json
 import time
+import threading
+import urllib.parse
+import urllib.request
+import ssl
 from PIL import ImageGrab, ImageTk, ImageChops, ImageStat
 import screeninfo
 import sys
@@ -17,6 +21,18 @@ POLL_INTERVAL_MS = 500      # how often to check (ms)
 CHANGE_THRESHOLD = 2        # average pixel deviation (0-255)
 FLASH_DURATION_MS = 3000    # how long to flash after detection
 FLASH_INTERVAL_MS = 300     # flash blink speed
+
+# --- PV monitoring ---
+PV_AVG_COUNT = 25   # number of recent values to average
+PV_POLL_MS   = 500  # how often to read PVs (ms)
+
+# (pv_name, display_label, orange_threshold, red_threshold, unit)  — alert when avg < orange_threshold
+_PV_MONITORS = [
+    ("L3-UTIL-HEB03-001:PressOut_PSI", "Helium volume", 46, 45.5, "PSI"),
+    ("HAPLS-VOLT_IN_CGL-SEEDER_ER3_ALPHA1:SeederPZTVoltage", "Alpha voltage", 1.2, 1.1, "V"),
+]
+
+_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry"}
 
 
 class RegionSelector(tk.Toplevel):
@@ -113,6 +129,11 @@ class RegionSelector(tk.Toplevel):
 
 class ScreenTracker(tk.Tk):
     def __init__(self):
+        try:
+            import ctypes as _ct
+            _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Announcer")
+        except Exception:
+            pass
         super().__init__()
         self.title("Announcer")
 
@@ -147,6 +168,11 @@ class ScreenTracker(tk.Tk):
         self._preview_pinned = False
         self.status_var = tk.StringVar(value="Select a region on a monitor.")
 
+        # PV monitoring state
+        self._pv_poll_job = None
+        self._pv_alert_rows: list[tk.Frame] = []
+        self._pv_alert_labels: list[tk.Label] = []
+
         if getattr(sys, "frozen", False):
             _base = Path(sys.executable).parent
         else:
@@ -154,10 +180,21 @@ class ScreenTracker(tk.Tk):
         self._presets_path = _base / "presets.json"
         self._presets = self._load_presets()
 
+        pv_saved = self._presets.get("pv_thresholds", {})
+        self._pv_thr_vars = []
+        for pv_name, _label, default_orange, default_red, _unit in _PV_MONITORS:
+            saved = pv_saved.get(pv_name, {})
+            orange_var = tk.DoubleVar(value=saved.get("orange", default_orange))
+            red_var    = tk.DoubleVar(value=saved.get("red",    default_red))
+            orange_var.trace_add("write", lambda *_: self._save_pv_thresholds())
+            red_var.trace_add(   "write", lambda *_: self._save_pv_thresholds())
+            self._pv_thr_vars.append((orange_var, red_var))
+
         self._build_ui()
         self.bind("<Button-1>", self._on_any_click)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.geometry("350x310")
+        saved_geom = self._presets.get("window_geometry")
+        self.geometry(saved_geom if saved_geom else "350x150")
 
     # ------------------------------------------------------------------
     # UI
@@ -272,6 +309,20 @@ class ScreenTracker(tk.Tk):
         ttk.Button(self._preset_frame, text="Delete",
                    command=self._delete_preset, width=6).grid(row=0, column=3, padx=(0, 6), pady=6)
 
+        # PV alert panel (row=3) — individual rows shown only when condition breached
+        self._pv_frame = ttk.Frame(self)
+        self._pv_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self._pv_frame.grid_remove()
+        self.columnconfigure(0, weight=1)
+
+        for _pv_name, _label, _orange_thr, _red_thr, _unit in _PV_MONITORS:
+            row_frame = tk.Frame(self._pv_frame, bg="#cc6600", padx=8, pady=5)
+            lbl = tk.Label(row_frame, text="", bg="#cc6600", fg="white",
+                           font=("Segoe UI", 9, "bold"), anchor="w")
+            lbl.pack()
+            self._pv_alert_rows.append(row_frame)
+            self._pv_alert_labels.append(lbl)
+
         # Pre-build Settings variables (popup builds widgets on first open)
         self.flash_color = tk.StringVar(value="#ff2222")
         self.flash_duration = tk.DoubleVar(value=0.0)
@@ -299,8 +350,22 @@ class ScreenTracker(tk.Tk):
         self._presets_path.write_text(
             json.dumps(self._presets, indent=2), encoding="utf-8")
 
+    def _save_pv_thresholds(self):
+        thr = {}
+        for i, (pv_name, _label, _o, _r, _unit) in enumerate(_PV_MONITORS):
+            orange_var, red_var = self._pv_thr_vars[i]
+            try:
+                thr[pv_name] = {"orange": orange_var.get(), "red": red_var.get()}
+            except tk.TclError:
+                pass
+        self._presets["pv_thresholds"] = thr
+        self._save_presets_file()
+
+    def _preset_names(self):
+        return sorted(k for k in self._presets if k not in _RESERVED_PRESET_KEYS)
+
     def _refresh_preset_combo(self):
-        names = sorted(self._presets.keys())
+        names = self._preset_names()
         self._preset_combo["values"] = names
         if names and self._preset_var.get() not in names:
             self._preset_var.set(names[0])
@@ -322,7 +387,11 @@ class ScreenTracker(tk.Tk):
                                        f'Preset "{name}" already exists. Overwrite?',
                                        parent=self):
                 return
-        self._presets[name] = list(self.region)
+        existing = self._presets.get(name)
+        if isinstance(existing, dict):
+            existing["region"] = list(self.region)
+        else:
+            self._presets[name] = list(self.region)
         self._save_presets_file()
         self._refresh_preset_combo()
         self._preset_var.set(name)
@@ -334,9 +403,22 @@ class ScreenTracker(tk.Tk):
             return
         if self.tracking:
             self._stop_tracking()
-        coords = self._presets[name]
+        data = self._presets[name]
+        if isinstance(data, list):
+            coords = data
+            preset_geom = None
+        elif isinstance(data, dict):
+            coords = data.get("region") or []
+            preset_geom = data.get("window_geometry")
+        else:
+            return
+        if not coords:
+            return
         self._region_selected(tuple(coords))
         self._set_ui_visible(True)
+        geom = preset_geom or self._presets.get("window_geometry")
+        if geom:
+            self.geometry(geom)
 
     def _delete_preset(self):
         name = self._preset_var.get()
@@ -420,19 +502,46 @@ class ScreenTracker(tk.Tk):
             self._sound_combo.current(self._sound_files.index(self.sound_file.get()))
         self._sound_combo.grid(row=3, column=1, padx=(0,6), pady=(0,6))
 
-        # Close when clicking outside
-        popup.bind("<FocusOut>", lambda *_: self.after(100, self._check_close_settings))
+        # PV Limits
+        pv_lim_frame = ttk.LabelFrame(frame, text="PV Limits  (alert when value drops below)")
+        pv_lim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
-    def _check_close_settings(self):
+        for i, (_pv_name, label, default_orange, _default_red, unit) in enumerate(_PV_MONITORS):
+            orange_var, red_var = self._pv_thr_vars[i]
+            inc = 0.01 if default_orange < 10 else 0.1
+            fmt = "%.2f" if default_orange < 10 else "%.1f"
+            ttk.Label(pv_lim_frame, text=f"{label} ({unit}):").grid(
+                row=i, column=0, padx=(6, 4), pady=(4, 4), sticky="w")
+            ttk.Label(pv_lim_frame, text="Warn <").grid(row=i, column=1, padx=(0, 2))
+            ttk.Spinbox(pv_lim_frame, from_=0, to=9999, increment=inc,
+                        textvariable=orange_var, width=7, format=fmt).grid(
+                row=i, column=2, padx=(0, 10))
+            ttk.Label(pv_lim_frame, text="Alarm <").grid(row=i, column=3, padx=(0, 2))
+            ttk.Spinbox(pv_lim_frame, from_=0, to=9999, increment=inc,
+                        textvariable=red_var, width=7, format=fmt).grid(
+                row=i, column=4, padx=(0, 6), pady=(4, 4))
+
+        # Window position & size
+        win_frame = ttk.LabelFrame(frame, text="Window position & size")
+        win_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(win_frame,
+                  text="Move and resize the Announcer window, then save its position.").grid(
+            row=0, column=0, padx=(6, 4), pady=(4, 4), sticky="w")
+        ttk.Button(win_frame, text="Set location and size of this window",
+                   command=self._start_window_recording).grid(
+            row=0, column=1, padx=(0, 6), pady=(4, 4))
+
+        # Close when clicking on the main window background (not on popup or its dropdowns)
+        self._settings_close_bind = self.bind("<Button-1>", self._on_main_click_close_settings, "+")
+
+    def _on_main_click_close_settings(self, _event):
         if self._settings_popup and self._settings_popup.winfo_exists():
-            try:
-                focused = self.focus_get()
-                if focused and str(focused).startswith(str(self._settings_popup)):
-                    return
-            except Exception:
-                pass
             self._settings_popup.destroy()
             self._settings_popup = None
+        try:
+            self.unbind("<Button-1>", self._settings_close_bind)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Identify monitors
@@ -521,17 +630,24 @@ class ScreenTracker(tk.Tk):
             return
         self.tracking = True
         self.changed = False
-
         self.status_var.set("Tracking active…")
         self._poll()
         self._update_circle()
         self._set_ui_visible(False)
+        self._pv_frame.grid()
+        self._poll_pvs()
 
     def _stop_tracking(self):
         self.tracking = False
         if self._poll_job:
             self.after_cancel(self._poll_job)
             self._poll_job = None
+        if self._pv_poll_job:
+            self.after_cancel(self._pv_poll_job)
+            self._pv_poll_job = None
+        for row in self._pv_alert_rows:
+            row.pack_forget()
+        self._pv_frame.grid_remove()
         self.status_var.set("Tracking stopped.")
         self._update_circle()
         self._set_ui_visible(True)
@@ -639,6 +755,65 @@ class ScreenTracker(tk.Tk):
         if color and color[1]:
             self.flash_color.set(color[1])
             self._flash_color_btn.config(bg=color[1])
+
+    def _start_window_recording(self):
+        if self._settings_popup and self._settings_popup.winfo_exists():
+            self._settings_popup.destroy()
+            self._settings_popup = None
+
+        rec_win = tk.Toplevel(self)
+        rec_win.title("Set window position & size")
+        rec_win.attributes("-topmost", True)
+        rec_win.resizable(False, False)
+
+        ttk.Label(rec_win,
+                  text="Move and resize the Announcer window\nto the desired position, then click DONE.",
+                  justify="center").pack(padx=16, pady=(12, 8))
+
+        scope_var = tk.StringVar(value="global")
+        scope_frame = ttk.LabelFrame(rec_win, text="Save for")
+        scope_frame.pack(padx=12, pady=(0, 8), fill="x")
+        ttk.Radiobutton(scope_frame, text="All presets (global)",
+                        variable=scope_var, value="global").pack(anchor="w", padx=8, pady=(4, 2))
+
+        current_preset = self._preset_var.get()
+        if current_preset and current_preset in self._presets:
+            ttk.Radiobutton(scope_frame,
+                            text=f'Selected preset only: "{current_preset}"',
+                            variable=scope_var, value="preset").pack(anchor="w", padx=8, pady=(0, 4))
+        else:
+            ttk.Label(scope_frame, text="(select a preset to enable preset-only save)",
+                      foreground="gray").pack(anchor="w", padx=8, pady=(0, 4))
+
+        btn_frame = ttk.Frame(rec_win)
+        btn_frame.pack(pady=(0, 12))
+
+        def on_done():
+            geom = self.geometry()
+            self._save_window_geometry(geom, scope_var.get(), current_preset)
+            rec_win.destroy()
+
+        ttk.Button(btn_frame, text="DONE", command=on_done, width=10).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_frame, text="Cancel", command=rec_win.destroy, width=10).pack(side="left")
+
+        self.update_idletasks()
+        rec_win.update_idletasks()
+        rx = self.winfo_rootx()
+        ry = self.winfo_rooty()
+        rw = self.winfo_width()
+        rec_win.geometry(f"+{rx + rw + 10}+{ry}")
+
+    def _save_window_geometry(self, geom, scope, preset_name):
+        if scope == "global":
+            self._presets["window_geometry"] = geom
+        elif scope == "preset" and preset_name and preset_name in self._presets:
+            data = self._presets[preset_name]
+            if isinstance(data, list):
+                self._presets[preset_name] = {"region": data, "window_geometry": geom}
+            elif isinstance(data, dict):
+                data["window_geometry"] = geom
+        self._save_presets_file()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -715,8 +890,78 @@ class ScreenTracker(tk.Tk):
         else:
             self._hide_preview_popup()
 
+    def _poll_pvs(self):
+        if not self.tracking:
+            return
+
+        _CPVA = "https://10.78.0.57:8443/api/1.0/cpva/samples"
+        _ssl  = ssl.create_default_context()
+        _ssl.check_hostname = False
+        _ssl.verify_mode    = ssl.CERT_NONE
+
+        def worker():
+            now_ns   = int(time.time() * 1e9)
+            start_ns = now_ns - 60 * 1_000_000_000   # last 60 s
+            results  = []
+            for pv_name, _label, _orange_thr, _red_thr, _unit in _PV_MONITORS:
+                try:
+                    params = urllib.parse.urlencode({
+                        "channelName": pv_name,
+                        "start": str(start_ns),
+                        "end":   str(now_ns),
+                    })
+                    req = urllib.request.Request(
+                        f"{_CPVA}?{params}",
+                        headers={"Accept": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=2.0, context=_ssl) as resp:
+                        data = json.loads(resp.read())
+                    vals = []
+                    for sample in data:
+                        v = sample.get("value")
+                        if isinstance(v, (int, float)):
+                            vals.append(float(v))
+                        elif isinstance(v, list) and v and isinstance(v[0], (int, float)):
+                            vals.append(float(v[0]))
+                    recent = vals[-PV_AVG_COUNT:]
+                    avg = sum(recent) / len(recent) if recent else None
+                except Exception as e:
+                    print(f"[PV] {pv_name}: {e}")
+                    avg = None
+                results.append(avg)
+            self.after(0, lambda r=results: self._update_pv_display(r))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._pv_poll_job = self.after(PV_POLL_MS, self._poll_pvs)
+
+    def _update_pv_display(self, results: list):
+        for i, (avg, (_, label, _o, _r, unit)) in enumerate(zip(results, _PV_MONITORS)):
+            orange_thr = self._pv_thr_vars[i][0].get()
+            red_thr    = self._pv_thr_vars[i][1].get()
+            row = self._pv_alert_rows[i]
+            lbl = self._pv_alert_labels[i]
+            if avg is not None and avg < red_thr:
+                bg = "#cc2200"
+            elif avg is not None and avg < orange_thr:
+                bg = "#cc6600"
+            else:
+                bg = None
+
+            if bg is not None:
+                suffix = f" {unit}" if unit else ""
+                fmt = ".2f" if unit else ".3f"
+                row.configure(bg=bg)
+                lbl.configure(bg=bg, text=f"⚠  {label}: {avg:{fmt}}{suffix}")
+                if not row.winfo_ismapped():
+                    row.pack(anchor="w", pady=(0, 2))
+            else:
+                if row.winfo_ismapped():
+                    row.pack_forget()
+
     def _on_close(self):
         self.tracking = False
+        if self._pv_poll_job:
+            self.after_cancel(self._pv_poll_job)
         self.destroy()
 
 

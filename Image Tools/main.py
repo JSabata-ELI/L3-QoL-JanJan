@@ -193,7 +193,7 @@ def _open_folder_in_slider(viewer, tabs: QTabWidget, folder: Path):
 
 # ── entry point ───────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Image Tools — Image Finder + Image Slider")
+    ap = argparse.ArgumentParser(description="Image Tools — Image Finder + Image Slider + Shot Finder + Workshop")
     ap.add_argument(
         "folder", nargs="?", default=None,
         help="Open this folder in Image Slider at startup"

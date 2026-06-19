@@ -1,11 +1,16 @@
 # l.py
 import os
 import re
+import shutil
+import socket
+import subprocess
+import sys
 import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
+from PIL import Image, ImageTk
 
 # ---------------- CONFIG ----------------
 _ONEDRIVE = Path.home() / "OneDrive - ELI Beamlines"
@@ -138,6 +143,9 @@ def _exe_version(p: Path):
     m = VERSION_RE.search(p.stem)
     return tuple(map(int, m.groups())) if m else (0, 0, 0)
 
+def _ver_str(ver: tuple) -> str:
+    return f"v{ver[0]}.{ver[1]}.{ver[2]}"
+
 def parse_version(name: str):
     m = VERSION_RE.fullmatch(name)
     return tuple(map(int, m.groups())) if m else None
@@ -220,6 +228,7 @@ SCRIPTS = {
     "Dev Tools",
     "Announcer",
     "CSS Logger",
+    "Chiller log",
 }
 
 PARTS = {
@@ -549,6 +558,11 @@ class Launcher(tk.Tk):
         self._scan_gen = 0
         self._config = _load_config()
         self._root_options = _apply_config_to_root_options(self._config)
+        try:
+            _hn = socket.gethostname().upper().strip()
+        except Exception:
+            _hn = ""
+        self._is_lab_machine = any(kw in _hn for kw in ("OPR", "VIS"))
         self.style = ttk.Style(self)
 
         # Modern Windows theme (nejlíp vypadá na Win10/11)
@@ -585,7 +599,7 @@ class Launcher(tk.Tk):
         self.style.configure(
             "Update.Prog.TButton",
             padding=(8, 6),
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 9),
             anchor="w",
             background="#ffa500",
             foreground="#000000",
@@ -601,13 +615,11 @@ class Launcher(tk.Tk):
         self.style.configure("Info.TButton", padding=(5, 2), font=("Segoe UI", 8))
         self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         self.style.configure("TLabel", font=("Segoe UI", 10))
-        import sys
         if getattr(sys, "frozen", False):
             self.title(Path(sys.executable).stem)
         else:
             self.title("Software Launcher")
         try:
-            import sys
             if getattr(sys, "frozen", False):
                 _base = Path(sys.executable).resolve().parent
             else:
@@ -624,6 +636,8 @@ class Launcher(tk.Tk):
         self._icon_cache: dict[str, tk.PhotoImage] = {}
         self._known_versions: dict[str, tuple] = {}   # program_name → (major, minor, patch)
         self._update_available: set[str] = set()       # programs with newer version on disk
+        self._pending_updates: dict[str, Path] = {}    # name → newer exe path (not yet acknowledged)
+        self._prog_buttons: dict[str, ttk.Button] = {} # current button widget per program
         # Acknowledged versions: {program_name: version_str} — persisted in config
         # Once a user launches or clicks ✓, the version is acknowledged and highlight clears.
         self._acknowledged: dict[str, str] = self._config.get("acknowledged_versions", {})
@@ -635,11 +649,29 @@ class Launcher(tk.Tk):
 
         self._build_ui()
         self._set_idle_state()
+        self._auto_select_root()
         self._schedule_version_poll()
+
+    def _auto_select_root(self):
+        try:
+            hostname = socket.gethostname().upper().strip()
+        except Exception:
+            hostname = ""
+        # OPR / VIS stations → Lab - Scratch (index 0); everything else → Office - Scratch (index 1)
+        if any(kw in hostname for kw in ("OPR", "VIS")):
+            preferred = 0
+        else:
+            preferred = 1  # CZOW and all others
+        opts = self._root_options
+        idx = preferred if preferred < len(opts) and opts[preferred][1] is not None else \
+              next((i for i, (_, p, _) in enumerate(opts) if p is not None), -1)
+        if idx >= 0:
+            self.root_choice.set(idx)
+            self.refresh()
 
     def _calc_group_cols(self) -> int:
         # kolik sloupců se vejde do aktuální šířky okna
-        w = self.sf.inner.winfo_width()
+        w = self.sf.canvas.winfo_width()
         if w <= 50:
             return self._group_cols
 
@@ -667,7 +699,7 @@ class Launcher(tk.Tk):
                 variable=self.root_choice,
                 value=i,
                 command=self.refresh,
-                state="normal" if path is not None else "disabled",
+                state="normal" if (path is not None and not (self._is_lab_machine and label.lower().startswith("office"))) else "disabled",
             )
             rb.pack(side="left", padx=6)
             self._rb_widgets.append(rb)
@@ -744,6 +776,14 @@ class Launcher(tk.Tk):
         self.current_root_label = root_label
         self.current_root_path = selected_root
         self._update_available.clear()
+        self._pending_updates.clear()
+        # Startup check: flag programs whose on-disk version differs from last acknowledged
+        for name, info in self.programs.items():
+            ack_ver = self._acknowledged.get(name)
+            if ack_ver is None:
+                continue  # never acknowledged → no baseline to compare against
+            if _ver_str(_exe_version(info.get("exe_path"))) != ack_ver:
+                self._update_available.add(name)
         self._rebuild_buttons()
         self.status.configure(text=f"Source: {selected_root} | Found: {len(self.programs)} programs.")
 
@@ -786,7 +826,6 @@ class Launcher(tk.Tk):
             if _ip and str(_ip) not in self._icon_cache:
                 _key = str(_ip)
                 try:
-                    from PIL import Image, ImageTk
                     _pil = Image.open(_key)
                     if getattr(_pil, "format", "") == "ICO":
                         _sizes = _pil.info.get("sizes", [])
@@ -873,7 +912,6 @@ class Launcher(tk.Tk):
                 key = str(ip)
                 if key not in self._icon_cache:
                     try:
-                        from PIL import Image, ImageTk
                         pil_img = Image.open(key)
                         if getattr(pil_img, "format", "") == "ICO":
                             sizes = pil_img.info.get("sizes", [])
@@ -888,7 +926,7 @@ class Launcher(tk.Tk):
                 img = self._icon_cache.get(key)
 
             btn_style = "Update.Prog.TButton" if name in self._update_available else "Prog.TButton"
-            btn_text = ui_label(info["label"]) + (" ↑" if name in self._update_available else "")
+            btn_text = ui_label(info["label"])
             btn = ttk.Button(
                 cell,
                 text=btn_text,
@@ -900,6 +938,7 @@ class Launcher(tk.Tk):
             )
             btn.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 6))
             btn.bind("<Button-3>", lambda e, n=name: self._show_group_menu(e, n))
+            self._prog_buttons[name] = btn
 
             sub = ttk.Frame(cell)
             sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
@@ -909,23 +948,13 @@ class Launcher(tk.Tk):
             sub.grid_rowconfigure(1, weight=0)
 
             if info.get("readme_path"):
-                readme_colspan = 1 if name in self._update_available else 2
                 info_btn = ttk.Button(
                     sub, text="ReadMe", style="Info.TButton",
                     command=lambda n=name: self.open_readme(n),
                 )
-                info_btn.grid(row=0, column=0, columnspan=readme_colspan, sticky="ew", pady=(0, 2))
+                info_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
             else:
                 ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
-            if name in self._update_available:
-                ack_btn = ttk.Button(
-                    sub, text="✓", style="Info.TButton", width=3,
-                    command=lambda n=name: self._acknowledge_update(n),
-                )
-                ack_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
-                ack_btn.configure(cursor="hand2")
-                ack_btn.bind("<Enter>", lambda _e, b=ack_btn: b.configure(text="✓ ack"))
-                ack_btn.bind("<Leave>", lambda _e, b=ack_btn: b.configure(text="✓"))
 
             folder_btn = ttk.Button(
                 sub, text="📂", style="Info.TButton", width=3,
@@ -977,6 +1006,12 @@ class Launcher(tk.Tk):
         current_gkey = self._custom_groups.get(
             program_name, group_for_program(program_name))
         menu = tk.Menu(self, tearoff=0)
+        if program_name in self._update_available:
+            menu.add_command(
+                label="✓  Acknowledge update",
+                command=lambda: self._acknowledge_update(program_name),
+            )
+            menu.add_separator()
         menu.add_command(
             label="Move to group:",
             state="disabled",
@@ -1004,12 +1039,14 @@ class Launcher(tk.Tk):
             self._custom_groups[program_name] = gkey
         self._config["custom_groups"] = self._custom_groups
         _save_config(self._config)
+        scroll_pos = self.sf.canvas.yview()[0]
         self._rebuild_buttons()
+        self.after_idle(lambda: self.sf.canvas.yview_moveto(scroll_pos))
 
     def _rebuild_radiobuttons(self):
         for i, (label, path, configurable) in enumerate(self._root_options):
             if i < len(self._rb_widgets):
-                state = "normal" if path is not None else "disabled"
+                state = "normal" if (path is not None and not (self._is_lab_machine and label.lower().startswith("office"))) else "disabled"
                 self._rb_widgets[i].configure(state=state)
 
     # -------- version update polling --------
@@ -1069,16 +1106,30 @@ class Launcher(tk.Tk):
     def _apply_version_updates(self, updates: set[str], refreshed: dict[str, tuple]):
         for name, (best_exe, archive_vers) in refreshed.items():
             if name in self.programs:
-                self.programs[name]["exe_path"] = best_exe
+                if name in updates:
+                    # Newer version found — keep exe_path at current (launched) version
+                    # so the next poll still sees a version difference. Store newer path
+                    # separately so launch() can use it.
+                    self._pending_updates[name] = best_exe
+                else:
+                    # No update: safe to advance exe_path to best known
+                    self.programs[name]["exe_path"] = best_exe
                 self.programs[name]["archive_versions"] = archive_vers
         # Filter out programs where the user has already acknowledged this version
         filtered = set()
         for name in updates:
-            info = self.programs.get(name, {})
-            new_ver = _exe_version(info.get("exe_path"))
+            new_ver = _exe_version(self._pending_updates.get(name) or self.programs.get(name, {}).get("exe_path"))
             ack_ver = self._acknowledged.get(name)
-            if ack_ver is None or ack_ver != str(new_ver):
+            if ack_ver is None or ack_ver != _ver_str(new_ver):
                 filtered.add(name)
+        # Also retain programs already in _update_available (e.g. flagged at startup)
+        # that are still unacknowledged — poll won't detect them since exe_path == best_exe
+        for name in self._update_available:
+            if name not in filtered:
+                exe = self._pending_updates.get(name) or self.programs.get(name, {}).get("exe_path")
+                ack_ver = self._acknowledged.get(name)
+                if ack_ver is not None and _ver_str(_exe_version(exe)) != ack_ver:
+                    filtered.add(name)
         changed = filtered != self._update_available
         self._update_available = filtered
         if changed:
@@ -1086,15 +1137,22 @@ class Launcher(tk.Tk):
         self._schedule_version_poll()
 
     def _acknowledge_update(self, program_name: str):
-        """Mark the current update for program_name as seen — clears orange highlight."""
+        """Mark the current update for program_name as seen — clears highlight and blink."""
         info = self.programs.get(program_name, {})
+        # Advance exe_path to the newer version and forget the pending entry
+        pending = self._pending_updates.pop(program_name, None)
+        if pending and program_name in self.programs:
+            self.programs[program_name]["exe_path"] = pending
+            info = self.programs[program_name]
         ver = _exe_version(info.get("exe_path"))
-        self._acknowledged[program_name] = str(ver)
+        self._acknowledged[program_name] = _ver_str(ver)
         self._config["acknowledged_versions"] = self._acknowledged
         _save_config(self._config)
         if program_name in self._update_available:
             self._update_available.discard(program_name)
+            scroll_pos = self.sf.canvas.yview()[0]
             self._rebuild_buttons()
+            self.after_idle(lambda: self.sf.canvas.yview_moveto(scroll_pos))
 
     # -------- launch --------
 
@@ -1104,7 +1162,8 @@ class Launcher(tk.Tk):
             messagebox.showerror("Not found", f"Program not found: {program_name}")
             return
 
-        exe_path: Path = info["exe_path"]
+        # Use pending (newer) exe if available, otherwise current
+        exe_path: Path = self._pending_updates.get(program_name, info["exe_path"])
         self.status.configure(text=f"Starting: {program_name} ...")
 
         def worker():
@@ -1122,8 +1181,6 @@ class Launcher(tk.Tk):
     def _launch_exe(self, exe_path: Path, program_dir: Path, py_path: Path | None = None):
         """Spusti archivni verzi programu.
         Zkopiruje exe docasne do program_dir (kde je _internal/), pocka na dokonceni, pak temp kopii smaze."""
-        import subprocess
-
         internal_dir = program_dir / "_internal"
         label = exe_path.name
 
@@ -1149,14 +1206,13 @@ class Launcher(tk.Tk):
 
         elif py_path is not None and py_path.exists():
             # Fallback: run .py via Python (needs Python in PATH)
-            import shutil as _shutil
             launch_py = py_path
 
             def worker():
                 try:
                     if getattr(sys, "frozen", False):
-                        _py = (_shutil.which("pythonw") or _shutil.which("python")
-                               or _shutil.which("py"))
+                        _py = (shutil.which("pythonw") or shutil.which("python")
+                               or shutil.which("py"))
                         if not _py:
                             raise RuntimeError("Python interpreter not found in PATH.")
                         pythonw = Path(_py)

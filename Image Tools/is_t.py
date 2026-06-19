@@ -177,11 +177,69 @@ def _pv_prev_date_key(date_key: str) -> str:
     return prev.strftime("%Y-%m-%d")
 
 
+def _pv_query_range(channel: str, start_ns: int, end_ns: int) -> "list[tuple[int, float]]":
+    """One archiver query for samples in [start_ns, end_ns], sorted by time.
+    Unlike _pv_load_day this is not day-aligned/cached — used for wide look-backs."""
+    params = urllib.parse.urlencode({
+        "channelName": channel, "start": str(int(start_ns)), "end": str(int(end_ns)),
+    })
+    url = f"{CPVA_BASE_URL}/samples?{params}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=CPVA_HTTP_TIMEOUT, context=_pv_ssl_ctx()) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+    result: list[tuple[int, float]] = []
+    for s in raw if isinstance(raw, list) else []:
+        t = s.get("time")
+        val = s.get("value")
+        if isinstance(val, list):
+            val = val[0] if val else None
+        try:
+            result.append((int(t), float(val)))
+        except (TypeError, ValueError):
+            continue
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+# Cache of "last value at or before this day" per (channel, date_key) — so a whole
+# save range of older images reuses one wide look-back query instead of N.
+_pv_before_cache: dict[tuple[str, str], "float | None"] = {}
+_pv_before_lock = threading.Lock()
+# Progressively widening windows (days). Stop at the first that has data, so a slow
+# PV that last changed a month (or more) ago is still resolved — in 1–4 queries.
+_PV_LOOKBACK_WINDOWS_DAYS = (2, 8, 32, 120, 400)
+_DAY_NS = 86_400 * 1_000_000_000
+
+
+def _pv_value_at_or_before(channel: str, ts_ns: int) -> "float | None":
+    """Last sample value at or before ts_ns, searching progressively further back
+    in time (covers PVs whose last change was days/weeks/months earlier). Cached."""
+    ck = (channel, _pv_date_key(ts_ns))
+    with _pv_before_lock:
+        if ck in _pv_before_cache:
+            return _pv_before_cache[ck]
+    val: "float | None" = None
+    for d in _PV_LOOKBACK_WINDOWS_DAYS:
+        samples = _pv_query_range(channel, ts_ns - d * _DAY_NS, ts_ns)
+        if samples:
+            val = samples[-1][1]   # query end is ts_ns → all samples are ≤ ts_ns
+            break
+    with _pv_before_lock:
+        _pv_before_cache[ck] = val
+        if len(_pv_before_cache) > 256:
+            _pv_before_cache.pop(next(iter(_pv_before_cache)))
+    return val
+
+
 def _pv_last_known(channel: str, ts_ns: int, max_lookback_days: int = 7) -> "float | None":
     """Return the last known value of channel at or before ts_ns.
 
-    Checks the current day first, then walks back up to max_lookback_days.
-    Slowly-changing PVs (e.g. waveplate) may not have data every day.
+    Checks the image's own day first (fast, day-cached). If that day has no sample
+    at or before ts_ns, falls back to a progressively-widening look-back so even
+    slowly-changing PVs (e.g. waveplate set weeks/months earlier) resolve correctly.
     """
     date_key = _pv_date_key(ts_ns)
     samples = _pv_load_day(channel, date_key)
@@ -190,14 +248,154 @@ def _pv_last_known(channel: str, ts_ns: int, max_lookback_days: int = 7) -> "flo
         idx = bisect.bisect_right(ts_list, ts_ns) - 1
         if idx >= 0:
             return samples[idx][1]
-    # Walk back up to max_lookback_days for slowly-changing PVs
-    cur_key = date_key
-    for _ in range(max_lookback_days):
-        cur_key = _pv_prev_date_key(cur_key)
-        prev_samples = _pv_load_day(channel, cur_key)
-        if prev_samples:
-            return prev_samples[-1][1]
-    return None
+    return _pv_value_at_or_before(channel, ts_ns)
+
+
+def _format_pv_value(channel: str, val: float) -> str:
+    """Same numeric formatting as the live PV overlay (waveplate = integer)."""
+    return f"{val:.0f}" if "RawPos" in channel else f"{val:.3f}"
+
+
+def pv_text_for_ts(ts_ns: "int | None", enabled_names: "list[str]") -> str:
+    """Build the PV burn-in string from the archiver values at a SPECIFIC image
+    timestamp — so every saved frame gets the values that were actually present at
+    its own moment, not a single live snapshot. Same format/units as the overlay."""
+    if ts_ns is None or not enabled_names:
+        return ""
+    parts: list[str] = []
+    for name in enabled_names:
+        channel = PV_CHANNEL_MAP.get(name)
+        if not channel:
+            continue
+        try:
+            val = _pv_last_known(channel, ts_ns)
+        except Exception:
+            val = None
+        if val is None:
+            continue
+        units = PV_UNITS.get(name, "")
+        parts.append(f"{name}: {_format_pv_value(channel, val)} {units}".strip())
+    return "  |  ".join(parts)
+
+
+def pv_warm_days(channels: "list[str]", ts_values: "list[int]", lookback_days: int = 2) -> None:
+    """Pre-load (channel, day) archiver caches for every day spanned by ts_values,
+    plus a few days before the earliest (for slowly-changing PVs), all in PARALLEL.
+    After this the per-image pv_text_for_ts() calls are pure in-memory bisects, so a
+    save never stalls hitting one HTTP request after another. Safe to call twice —
+    already-cached days return instantly."""
+    if not channels or not ts_values:
+        return
+    date_keys = {_pv_date_key(t) for t in ts_values}
+    earliest = min(date_keys)
+    k = earliest
+    for _ in range(max(0, lookback_days)):
+        k = _pv_prev_date_key(k)
+        date_keys.add(k)
+    jobs = [(ch, dk) for ch in channels for dk in date_keys]
+    if not jobs:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
+            list(ex.map(lambda j: _pv_load_day(j[0], j[1]), jobs))
+    except Exception:
+        pass
+
+
+def _pv_bar_font(size: int):
+    """Load a real TrueType font at the given size, falling back across the common
+    Windows fonts so PIL never silently drops to its tiny bitmap default."""
+    from PIL import ImageFont as _PF
+    for fname in ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf",
+                  "C:/Windows/Fonts/calibri.ttf", "DejaVuSans.ttf"):
+        try:
+            return _PF.truetype(fname, size)
+        except Exception:
+            continue
+    return _PF.load_default()
+
+
+def render_pv_bar_below(pil_img, pv_text: str):
+    """Return a new RGB PIL image: pil_img with a white annotation bar appended
+    below it showing pv_text. The font is scaled up to fill the available width
+    (clamped to a readable range) and wrapped onto multiple centred lines when one
+    line will not fit — the same approach the Shot Finder uses, so 1 PV is big and
+    readable and many PVs wrap instead of staying tiny."""
+    from PIL import Image as _PI, ImageDraw as _PD
+    pil_img = pil_img.convert("RGB")
+    width = max(1, pil_img.width)
+    parts = [p for p in pv_text.split("  |  ") if p] or [pv_text]
+    measure = _PD.Draw(_PI.new("RGB", (1, 1)))
+
+    # Start large (proportional to image width) so a short bar fills the space.
+    start_fsize = max(22, min(64, width // 42))
+    avail = width - 20
+    # Keep everything on ONE line as long as it stays readable; only wrap when a
+    # single line would have to shrink below this floor (i.e. real overflow).
+    one_line_floor = max(18, start_fsize // 2)
+    chosen_font = None
+    lines = [pv_text]
+
+    # Pass 1 — single line preferred: largest font (down to the floor) that fits.
+    for fsize in range(start_fsize, one_line_floor - 1, -1):
+        f = _pv_bar_font(fsize)
+        try:
+            if measure.textbbox((0, 0), pv_text, font=f)[2] <= avail:
+                chosen_font, lines = f, [pv_text]
+                break
+        except Exception:
+            pass
+
+    # Pass 2 — overflow: wrap into the fewest lines, at the largest font that fits,
+    # then the layout is re-scaled to that size.
+    if chosen_font is None:
+        for fsize in range(start_fsize, 7, -1):
+            f = _pv_bar_font(fsize)
+            done = False
+            for n_lines in range(2, len(parts) + 1):
+                chunk = max(1, -(-len(parts) // n_lines))   # ceil → balanced lines
+                try_lines = ["  |  ".join(parts[i:i + chunk])
+                             for i in range(0, len(parts), chunk)]
+                try:
+                    max_w = max(measure.textbbox((0, 0), ln, font=f)[2] for ln in try_lines)
+                except Exception:
+                    max_w = width
+                if max_w <= avail:
+                    chosen_font, lines, done = f, try_lines, True
+                    break
+            if done:
+                break
+    if chosen_font is None:
+        chosen_font = _pv_bar_font(8)
+        lines = [pv_text]
+
+    try:
+        bb_ag = measure.textbbox((0, 0), "Ag", font=chosen_font)
+        line_h = bb_ag[3] - bb_ag[1]
+    except Exception:
+        line_h = 14
+    pad = max(8, line_h // 2)
+    bar_h = max(30, line_h * len(lines) + pad * (len(lines) + 1))
+
+    bar = _PI.new("RGB", (width, bar_h), (255, 255, 255))
+    draw = _PD.Draw(bar)
+    total_h = line_h * len(lines) + pad * (len(lines) - 1)
+    y = (bar_h - total_h) // 2
+    for ln in lines:
+        try:
+            bb = draw.textbbox((0, 0), ln, font=chosen_font)
+            tw = bb[2] - bb[0]
+        except Exception:
+            tw = 0
+        x = max(8, (width - tw) // 2)
+        draw.text((x, y), ln, fill=(0, 0, 0), font=chosen_font)
+        y += line_h + pad
+
+    combined = _PI.new("RGB", (width, pil_img.height + bar_h))
+    combined.paste(pil_img, (0, 0))
+    combined.paste(bar, (0, pil_img.height))
+    return combined
 
 
 # ---------------- GRADIENTS ----------------
@@ -417,6 +615,45 @@ def folder_hour_from_prague_hour(prague_hour: int, date: datetime | None = None)
     # Zjisti UTC offset pro daný den
     offset_hours = int(date.utcoffset().total_seconds() // 3600)
     return (prague_hour - offset_hours) % 24
+
+
+# In live mode only the most recently created hour folders can still receive new
+# images; older hour folders are sealed. Re-enumerating every accumulated folder
+# on every poll is what makes live updates slow down (and keep slowing down) over
+# a long session — so the online poller scans only the newest folders per camera.
+ONLINE_ACTIVE_FOLDER_COUNT = 2  # current hour + previous (grace for late writes at rollover)
+
+
+def _cam_folder_time_key(folder: Path) -> "tuple[int, int, int, int] | None":
+    """(year, month, day, hour) for a camera image folder  .../YYYY/MM/DD/HH/CAM,
+    or None if the path does not follow that layout."""
+    try:
+        hh = int(folder.parent.name)
+        dd = int(folder.parent.parent.name)
+        mm = int(folder.parent.parent.parent.name)
+        yy = int(folder.parent.parent.parent.parent.name)
+    except (ValueError, AttributeError):
+        return None
+    if not (0 <= hh <= 23):
+        return None
+    return (yy, mm, dd, hh)
+
+
+def active_scan_folders(all_folders: "list[Path]") -> "list[Path]":
+    """Return only the folders worth scanning for new images in live mode: the
+    newest ONLINE_ACTIVE_FOLDER_COUNT hour folders. Folders whose path can't be
+    parsed are always kept (defensive — never silently skip an unexpected layout)."""
+    keyed: "list[tuple[tuple, Path]]" = []
+    keyless: "list[Path]" = []
+    for f in all_folders:
+        k = _cam_folder_time_key(f)
+        if k is None:
+            keyless.append(f)
+        else:
+            keyed.append((k, f))
+    keyed.sort(key=lambda x: x[0])
+    active = [f for _, f in keyed[-ONLINE_ACTIVE_FOLDER_COUNT:]]
+    return active + keyless
 
 
 # ---------------- IMAGE SCALE READER ----------------
@@ -829,7 +1066,7 @@ class SaveRangeTask(QRunnable):
 
     def _draw_overlay_on_pixmap(self, src_path):
         """Load image, draw overlay, return QPixmap. Returns None on failure."""
-        p = self.overlay_params
+        p = self.overlay_params or {}
         img = load_image_scaled(src_path, 9999, self.brighten, self.gradient_id)
         if img.isNull(): return None
         pix = QPixmap.fromImage(img)
@@ -867,167 +1104,84 @@ class SaveRangeTask(QRunnable):
         painter.end()
         return pix
 
+    def _save_view(self, src_path, ts_ns, view_dst, pv_text, save_txt, extra_meta):
+        """Render the recoloured/overlay view of src_path (+ optional PV bar) to
+        view_dst. Returns True on success."""
+        pix = self._draw_overlay_on_pixmap(src_path)
+        if pix is None:
+            return False
+        if pv_text:
+            try:
+                from PIL import Image as _PI
+                import tempfile as _tf
+                with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _t:
+                    _tp = Path(_t.name)
+                pix.save(str(_tp))
+                _pil_img = _PI.open(_tp)
+                render_pv_bar_below(_pil_img, pv_text).save(str(view_dst))
+                _pil_img.close()
+                _tp.unlink(missing_ok=True)
+            except Exception:
+                pix.save(str(view_dst))
+        else:
+            pix.save(str(view_dst))
+        _copy_metadata_into_png(src_path, view_dst, save_txt=save_txt, extra_meta=extra_meta)
+        return True
+
     def run(self):
         n = 0; errors = 0; total = len(self.items)
         save_txt = getattr(self, 'save_txt', False)
+        # Warm the PV archiver caches for the whole range up front, in parallel, so
+        # the per-image loop below never stalls on one HTTP request after another
+        # (this is what made the first save_range click take so long).
+        if self.pv_channels and self.items:
+            self.signals.progress.emit(0, total, "Loading PV data…")
+            pv_warm_days(list(self.pv_channels.values()),
+                         [it.ts_ns for it in self.items])
+        p = self.overlay_params or {}
+        # A drawn shape (cross/circle/square) is the only thing that counts as a real
+        # "modification" — palette, brightness and the PV bar are just views/annotations.
+        has_shapes = bool(
+            (p.get('show_cross')  and p.get('cross_pos_norm')   is not None) or
+            (p.get('show_circle') and p.get('circle_center_norm') is not None) or
+            (p.get('show_square') and p.get('square_rect_norm') is not None)
+        )
+        is_recoloured = (self.gradient_id != GRADIENT_ID_DEFAULT) or self.brighten
         for done, it in enumerate(self.items, 1):
-            dst = self.outp / self.name_fn(it)
             energy_str = self.energy_map.get(it.path.name, "")
             extra_meta = {"Energy": energy_str} if energy_str else None
+            base = self.outp / self.name_fn(it)   # carries the original file suffix
+            # Per-image PV text: archiver values at each image's OWN timestamp
+            # (day-level cache → ~1 HTTP request per channel per day).
+            if self.pv_channels:
+                pv_text = (pv_text_for_ts(it.ts_ns, list(self.pv_channels.keys()))
+                           or (self.overlay_params or {}).get('pv_text', ''))
+            else:
+                pv_text = (self.overlay_params or {}).get('pv_text', '')
             try:
-                if self.gradient_id == GRADIENT_ID_DEFAULT and not self.brighten:
-                    # Default — copy original + metadata
-                    shutil.copy2(it.path, dst)
-                    _copy_metadata_into_png(it.path, dst, save_txt=save_txt, extra_meta=extra_meta)
-                else:
-                    # Color palette / brightened — save as PNG with metadata
-                    dst = dst.with_suffix('.png')
-                    img = load_image_scaled(it.path, 9999, self.brighten, self.gradient_id)
-                    if img.isNull():
+                need_view = has_shapes or is_recoloured or bool(pv_text)
+                if not need_view:
+                    # Untouched image — saved exactly once as the original.
+                    shutil.copy2(it.path, base)
+                    _copy_metadata_into_png(it.path, base, save_txt=save_txt, extra_meta=extra_meta)
+                    n += 1
+                elif has_shapes:
+                    # Real modification → keep BOTH the pristine original and the view.
+                    shutil.copy2(it.path, base)
+                    _copy_metadata_into_png(it.path, base, save_txt=save_txt, extra_meta=extra_meta)
+                    view_dst = base.parent / f"{base.stem}_annotated.png"
+                    if self._save_view(it.path, it.ts_ns, view_dst, pv_text, save_txt, extra_meta):
+                        n += 1
+                    else:
                         errors += 1
-                        self.signals.progress.emit(done, total, it.path.name)
-                        continue
-                    if not img.save(str(dst)):  # QImage.save is thread-safe unlike QPixmap
-                        errors += 1
-                        self.signals.progress.emit(done, total, it.path.name)
-                        continue
-                    _copy_metadata_into_png(it.path, dst, save_txt=save_txt, extra_meta=extra_meta)
-                # Annotate version if overlay or PV text is requested
-                # Per-image PV text: fetch from CPVA archiver at each image's timestamp.
-                # _pv_last_known() uses a day-level cache so only 1 HTTP request per
-                # channel per day — fast and adds zero runtime memory overhead.
-                if self.pv_channels:
-                    _parts = []
-                    for _name, _channel in self.pv_channels.items():
-                        try:
-                            _val = _pv_last_known(_channel, it.ts_ns)
-                        except Exception:
-                            _val = None
-                        if _val is not None:
-                            _units = self.pv_units.get(_name, "")
-                            _val_str = f"{_val:.4g}"
-                            _parts.append(f"{_name}: {_val_str} {_units}".strip())
-                    # If CPVA lookup returned nothing, fall back to the snapshot value
-                    # captured at save time so the PV bar is never silently omitted.
-                    pv_text = ("  |  ".join(_parts)
-                               if _parts
-                               else (self.overlay_params or {}).get('pv_text', ''))
                 else:
-                    pv_text = (self.overlay_params or {}).get('pv_text', '')
-                if self.overlay_params or pv_text:
-                    # _annotated suffix only when PV annotation bar is present
-                    _ann_suffix = "_annotated" if pv_text else ""
-                    ann_dst = dst.parent / f"{dst.stem}{_ann_suffix}.png"
-                    pix = self._draw_overlay_on_pixmap(it.path)
-                    if pix is not None:
-                        if pv_text:
-                            try:
-                                # Exact copy of Shot Finder's PIL bar rendering (sf_t.py).
-                                # Key fix: use full Windows font paths so PIL actually loads
-                                # a real font instead of falling back to load_default().
-                                from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF
-                                import tempfile as _tf
-                                with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _t:
-                                    _tp = Path(_t.name)
-                                pix.save(str(_tp))
-                                _pil_img = _PI.open(_tp).convert("RGB")
-
-                                _tmp_draw = _PD.Draw(_PI.new("RGB", (1, 1)))
-                                _parts_list = pv_text.split("  |  ")
-                                _chosen_font = None
-                                _display_lines = [pv_text]
-
-                                for _fsize in range(20, 7, -1):
-                                    _f2 = None
-                                    for _fname in (
-                                        "C:/Windows/Fonts/arial.ttf",
-                                        "C:/Windows/Fonts/segoeui.ttf",
-                                        "C:/Windows/Fonts/calibri.ttf",
-                                        "DejaVuSans.ttf",
-                                    ):
-                                        try:
-                                            _f2 = _PF.truetype(_fname, _fsize)
-                                            break
-                                        except Exception:
-                                            continue
-                                    if _f2 is None:
-                                        _f2 = _PF.load_default()
-
-                                    # Try single line
-                                    try:
-                                        _bb = _tmp_draw.textbbox((0, 0), pv_text, font=_f2)
-                                        if (_bb[2] - _bb[0]) <= _pil_img.width - 20:
-                                            _chosen_font = _f2
-                                            _display_lines = [pv_text]
-                                            break
-                                    except Exception:
-                                        pass
-
-                                    # Try splitting into 2, 3, 4… lines
-                                    _fitted = False
-                                    for _n_lines in range(2, len(_parts_list) + 1):
-                                        _chunk = max(1, len(_parts_list) // _n_lines)
-                                        _lines_try = []
-                                        for _i in range(0, len(_parts_list), _chunk):
-                                            _lines_try.append("  |  ".join(_parts_list[_i:_i + _chunk]))
-                                        _max_w = 0
-                                        try:
-                                            for _ln in _lines_try:
-                                                _bb2 = _tmp_draw.textbbox((0, 0), _ln, font=_f2)
-                                                _max_w = max(_max_w, _bb2[2] - _bb2[0])
-                                        except Exception:
-                                            _max_w = _pil_img.width
-                                        if _max_w <= _pil_img.width - 20:
-                                            _chosen_font = _f2
-                                            _display_lines = _lines_try
-                                            _fitted = True
-                                            break
-                                    if _fitted:
-                                        break
-
-                                if _chosen_font is None:
-                                    try:
-                                        _chosen_font = _PF.truetype("C:/Windows/Fonts/arial.ttf", 8)
-                                    except Exception:
-                                        _chosen_font = _PF.load_default()
-
-                                # Measure actual line height with "Ag"
-                                try:
-                                    _bb_ag = _tmp_draw.textbbox((0, 0), "Ag", font=_chosen_font)
-                                    _line_h = _bb_ag[3] - _bb_ag[1]
-                                except Exception:
-                                    _line_h = 14
-                                _pad = 8
-                                _bar_h = max(30, _line_h * len(_display_lines) +
-                                             _pad * (len(_display_lines) + 1))
-
-                                _bar = _PI.new("RGB", (_pil_img.width, _bar_h), (255, 255, 255))
-                                _draw = _PD.Draw(_bar)
-                                _total_th2 = (_line_h * len(_display_lines) +
-                                              _pad * (len(_display_lines) - 1))
-                                _y2 = (_bar_h - _total_th2) // 2
-                                for _ln2 in _display_lines:
-                                    try:
-                                        _bb3 = _draw.textbbox((0, 0), _ln2, font=_chosen_font)
-                                        _tw3 = _bb3[2] - _bb3[0]
-                                    except Exception:
-                                        _tw3 = 0
-                                    _x2 = max(8, (_pil_img.width - _tw3) // 2)
-                                    _draw.text((_x2, _y2), _ln2, fill=(0, 0, 0), font=_chosen_font)
-                                    _y2 += _line_h + _pad
-
-                                _combined = _PI.new("RGB", (_pil_img.width, _pil_img.height + _bar_h))
-                                _combined.paste(_pil_img, (0, 0))
-                                _combined.paste(_bar, (0, _pil_img.height))
-                                _combined.save(str(ann_dst))
-                                _tp.unlink(missing_ok=True)
-                                _tp.unlink(missing_ok=True)
-                            except Exception:
-                                pix.save(str(ann_dst))
-                        else:
-                            pix.save(str(ann_dst))
-                        _copy_metadata_into_png(it.path, ann_dst, save_txt=save_txt, extra_meta=extra_meta)
-                n += 1
+                    # Palette / brightness / PV only — not a modification → save once.
+                    suffix = "_annotated" if pv_text else ""
+                    view_dst = base.parent / f"{base.stem}{suffix}.png"
+                    if self._save_view(it.path, it.ts_ns, view_dst, pv_text, save_txt, extra_meta):
+                        n += 1
+                    else:
+                        errors += 1
             except Exception:
                 errors += 1
             self.signals.progress.emit(done, total, it.path.name)
@@ -2051,7 +2205,21 @@ class PointingPanel(QWidget):
         self._show_path = False
         self._select_mode = False
         self._rect_selector = None
-        self._hover_annot = None  # matplotlib annotation for hover tooltip
+        # User zoom/pan limits — kept across redraws so replay/point-deletion don't
+        # snap the view back to full sensor range (None = follow the default fit).
+        self._user_xlim = None
+        self._user_ylim = None
+        self._hover_annot = None  # kept for compat; actual tooltip is _qt_tooltip
+        # Qt tooltip parented to the CANVAS (not the panel): a child of the canvas
+        # always paints above the matplotlib drawing, so the timestamp can never end
+        # up hidden behind the histogram axes (a sibling of the native canvas would).
+        self._qt_tooltip = QLabel(self._canvas if self._canvas is not None else self)
+        self._qt_tooltip.setStyleSheet(
+            "background:#ffffcc; border:1px solid #888; border-radius:3px;"
+            " padding:2px 6px; font-size:11px; color:#333;"
+        )
+        self._qt_tooltip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._qt_tooltip.hide()
         if _MPL_OK and self._canvas is not None:
             self._canvas.installEventFilter(self)
 
@@ -2066,6 +2234,8 @@ class PointingPanel(QWidget):
         self._img_h = img_h       # sensor height in pixels
         self._mask = np.ones(len(cx_urad), dtype=bool)
         self._replay_ts = None    # reset replay on new data
+        self._user_xlim = None    # new data → fresh view (drop any previous zoom)
+        self._user_ylim = None
         self._select_mode = False
         self._rect_selector = None
         self._draw()
@@ -2226,6 +2396,9 @@ class PointingPanel(QWidget):
         shift_y =  dy_px / ax_h_px * yspan  # dy inverted: Qt Y down, data Y up
         ax.set_xlim(x0 + shift_x, x1 + shift_x)
         ax.set_ylim(y0 + shift_y, y1 + shift_y)
+        # Remember the view so replay/point-deletion redraws keep it (Task 6).
+        self._user_xlim = ax.get_xlim()
+        self._user_ylim = ax.get_ylim()
         self._canvas.draw_idle()
 
     def _handle_qt_zoom(self, qx: float, qy: float, delta: int):
@@ -2240,21 +2413,41 @@ class PointingPanel(QWidget):
         y0, y1 = ax.get_ylim()
         ax.set_xlim(xdata + (x0 - xdata) * factor, xdata + (x1 - xdata) * factor)
         ax.set_ylim(ydata + (y0 - ydata) * factor, ydata + (y1 - ydata) * factor)
+        # Remember the view so replay/point-deletion redraws keep it (Task 6).
+        self._user_xlim = ax.get_xlim()
+        self._user_ylim = ax.get_ylim()
         self._canvas.draw_idle()
+
+    def _fit_limits(self):
+        """(xlim, ylim) framed tightly around the point cloud so a small cluster
+        fills the plot instead of sitting as a dot in the full sensor frame.
+        Uses all non-deleted points (independent of replay) so the view is stable
+        while replaying. Returns (None, None) if there are no points."""
+        if self._cx is None or self._mask is None:
+            return None, None
+        cx = self._cx[self._mask]; cy = self._cy[self._mask]
+        if len(cx) == 0:
+            return None, None
+        xr = float(cx.max() - cx.min())
+        yr = float(cy.max() - cy.min())
+        pad = max(max(xr, yr) * 0.15, 2.0)   # ~15 % margin; floor avoids absurd zoom
+        xlim = (float(cx.min()) - pad, float(cx.max()) + pad)
+        ylim = (float(cy.max()) + pad, float(cy.min()) - pad)   # inverted Y (image coords)
+        return xlim, ylim
 
     def _reset_zoom(self):
         ax = self._get_ax_main()
         if ax is None:
             return
-        if self._img_w and self._img_h:
+        # Back to the default fit — forget any user zoom so redraws follow it again.
+        self._user_xlim = None
+        self._user_ylim = None
+        xlim, ylim = self._fit_limits()
+        if xlim is not None:
+            ax.set_xlim(xlim); ax.set_ylim(ylim)
+        elif self._img_w and self._img_h:
             ax.set_xlim(-self._img_w / 2, self._img_w / 2)
             ax.set_ylim(self._img_h / 2, -self._img_h / 2)
-        else:
-            if self._cx is not None and len(self._cx):
-                pad_x = max(float(np.std(self._cx)) * 3, 1.0)
-                pad_y = max(float(np.std(self._cy)) * 3, 1.0)
-                ax.set_xlim(self._cx.min() - pad_x, self._cx.max() + pad_x)
-                ax.set_ylim(self._cy.max() + pad_y, self._cy.min() - pad_y)
         self._canvas.draw_idle()
 
     def _handle_qt_click(self, qx: float, qy: float):
@@ -2311,32 +2504,39 @@ class PointingPanel(QWidget):
                 ts_ns = int(self._ts_int[orig_idx])
                 ts_str = fmt_prague_full_from_ns(ts_ns)
                 px, py = float(self._cx[orig_idx]), float(self._cy[orig_idx])
-                if self._hover_annot is None:
-                    self._hover_annot = ax.annotate(
-                        ts_str, xy=(px, py),
-                        xytext=(10, 10), textcoords="offset points",
-                        bbox=dict(boxstyle="round,pad=0.3", fc="#ffffcc", ec="#888", lw=0.8),
-                        fontsize=8, zorder=10)
-                else:
-                    self._hover_annot.set_text(ts_str)
-                    self._hover_annot.xy = (px, py)
-                self._hover_annot.set_visible(True)
-                need_draw = True
+                # Position Qt tooltip widget (always above all matplotlib axes)
+                try:
+                    disp = ax.transData.transform((px, py))
+                    cx_px = int(disp[0])
+                    cy_px = int(self._canvas.height() - disp[1])
+                except Exception:
+                    cx_px, cy_px = int(qx), int(qy)
+                self._qt_tooltip.setText(ts_str)
+                self._qt_tooltip.adjustSize()
+                host_w = self._canvas.width()  if self._canvas is not None else self.width()
+                host_h = self._canvas.height() if self._canvas is not None else self.height()
+                tip_x = cx_px + 12
+                tip_y = cy_px - self._qt_tooltip.height() - 4
+                tip_x = max(0, min(tip_x, host_w - self._qt_tooltip.width()))
+                tip_y = max(0, min(tip_y, host_h - self._qt_tooltip.height()))
+                self._qt_tooltip.move(tip_x, tip_y)
+                self._qt_tooltip.show()
+                self._qt_tooltip.raise_()
             else:
                 need_draw = self._clear_hover()
         if need_draw:
             self._canvas.draw_idle()
 
     def _clear_hover(self) -> bool:
-        if self._hover_annot is not None:
-            self._hover_annot.set_visible(False)
-            self._hover_annot = None
-            return True
+        if self._qt_tooltip.isVisible():
+            self._qt_tooltip.hide()
+            return False  # no canvas redraw needed
         return False
 
     def _draw(self):
         if not _MPL_OK: return
-        self._hover_annot = None  # annotation belongs to old axes — will be recreated
+        self._hover_annot = None
+        self._qt_tooltip.hide()
         self._fig.clear()
         self._render_to_fig(self._fig)
         self._canvas.draw()
@@ -2379,15 +2579,23 @@ class PointingPanel(QWidget):
                         rasterized=True)
         ax_main.axhline(0, color="#aaa", linewidth=0.8, linestyle="--")
         ax_main.axvline(0, color="#aaa", linewidth=0.8, linestyle="--")
-        ax_main.set_xlabel("X (px from centre)", fontsize=8)
-        ax_main.set_ylabel("Y (px from centre, ↓ positive)", fontsize=8)
+        ax_main.set_xlabel("X (px from center)", fontsize=8)
+        ax_main.set_ylabel("Y (px from center)", fontsize=8)
         ax_main.tick_params(labelsize=7)
-        # Fix axis limits to full sensor range so scatter is properly scaled
-        if self._img_w and self._img_h:
+        # Default view: frame the actual point cloud (zoom to the data) so a tight
+        # cluster fills the plot instead of being a dot in the full sensor frame.
+        fit_xlim, fit_ylim = self._fit_limits()
+        if fit_xlim is not None:
+            ax_main.set_xlim(fit_xlim); ax_main.set_ylim(fit_ylim)
+        elif self._img_w and self._img_h:
             ax_main.set_xlim(-self._img_w / 2, self._img_w / 2)
             ax_main.set_ylim(self._img_h / 2, -self._img_h / 2)  # inverted: +Y downward
         else:
             ax_main.invert_yaxis()
+        # Keep the user's zoom/pan across redraws (replay, point deletion) — Task 6.
+        if self._user_xlim is not None and self._user_ylim is not None:
+            ax_main.set_xlim(self._user_xlim)
+            ax_main.set_ylim(self._user_ylim)
 
         # ── Histogramy ───────────────────────────────────────────
         bins = min(32, max(8, n_shots // 10))
@@ -2422,7 +2630,7 @@ class PointingPanel(QWidget):
             pad_y = max(y_std * 0.5, 0.05)
             ax_path.set_xlim(cx_urad.min() - pad_x, cx_urad.max() + pad_x)
             ax_path.set_ylim(cy_urad.max() + pad_y, cy_urad.min() - pad_y)  # inverted: positive Y = down
-            ax_path.set_xlabel("X (px from centre)", fontsize=8)
+            ax_path.set_xlabel("X (px from center)", fontsize=8)
             ax_path.set_title("Beam path", fontsize=8, pad=3)
             ax_path.legend(fontsize=7, loc="upper right",
                            handlelength=1, borderpad=0.4)
@@ -2688,11 +2896,11 @@ class DatePickerDialog(QDialog):
                             continue
             except Exception:
                 pass
-            signals.finished.emit(cameras)
+            signals.finished.emit(cameras, "")
 
         _thr.Thread(target=worker, daemon=True).start()
 
-    def _on_cameras_preloaded(self, cameras: list):
+    def _on_cameras_preloaded(self, cameras: list, status: str = ""):
         self._preloaded = cameras
 
     def _reapply_weekend_format(self):
@@ -2822,7 +3030,7 @@ class DatePickerDialog(QDialog):
 # ---------------- CAMERA PICKER DIALOG ----------------
 # ---------------- CAMERA PICKER DIALOG ----------------
 class _CamLoaderSignals(QObject):
-    finished = Signal(list)
+    finished = Signal(list, str)   # (cameras, status: "" = ok, "no_data", "error")
 
 class CameraPickerDialog(QDialog):
     _PRESETS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_presets.json"
@@ -2930,11 +3138,13 @@ class CameraPickerDialog(QDialog):
 
         self._signals = _CamLoaderSignals()
         self._signals.finished.connect(self._on_cameras_loaded)
-        if preloaded_cameras is not None:
-            QTimer.singleShot(0, lambda: self._on_cameras_loaded(preloaded_cameras))
+        if preloaded_cameras:
+            # Non-empty preload from the background scan — use it directly.
+            QTimer.singleShot(0, lambda: self._on_cameras_loaded(list(preloaded_cameras)))
         else:
-            self._signals = _CamLoaderSignals()
-            self._signals.finished.connect(self._on_cameras_loaded)
+            # No preload, or it came back EMPTY (slow / failed / timed-out background
+            # scan). Load the camera list ourselves so the dialog is never stuck on an
+            # empty list — previously an empty preload skipped this fallback entirely.
             self._load_cameras_async()
 
         self._refresh_sel_table()
@@ -3026,36 +3236,57 @@ class CameraPickerDialog(QDialog):
 
         def worker():
             cameras: list[tuple[str, str]] = []
+            status = ""   # "" ok, "no_data" = archive ok but nothing here, "error" = can't read
             try:
-                base = Path(DEFAULT_OPEN_ROOT) / str(date_obj.year) / str(date_obj.month) / str(date_obj.day)
-                for hh in range(hour_from, hour_to + 1):
-                    ref_dt = datetime(date_obj.year, date_obj.month, date_obj.day,
-                                      hh, 0, 0, tzinfo=TZ_PRAGUE)
-                    folder_h = folder_hour_from_prague_hour(hh, ref_dt)
-                    hour_dir = base / str(folder_h)
-                    if hour_dir.exists() and hour_dir.is_dir():
+                root = Path(DEFAULT_OPEN_ROOT)
+                try:
+                    reachable = root.exists()
+                except OSError:
+                    reachable = False
+                if not reachable:
+                    status = "error"   # archive root unreachable → software/access error
+                else:
+                    base = root / str(date_obj.year) / str(date_obj.month) / str(date_obj.day)
+                    for hh in range(hour_from, hour_to + 1):
+                        ref_dt = datetime(date_obj.year, date_obj.month, date_obj.day,
+                                          hh, 0, 0, tzinfo=TZ_PRAGUE)
+                        folder_h = folder_hour_from_prague_hour(hh, ref_dt)
+                        hour_dir = base / str(folder_h)
                         try:
-                            subs = sorted(
-                                [p.name for p in hour_dir.iterdir() if p.is_dir()],
-                                key=str.lower)
-                            for name in subs:
-                                m = re.match(r"^C\d{2}-(\d{2,3})-", name)
-                                num = m.group(1) if m else ""
-                                if not any(n == name for _, n in cameras):
-                                    cameras.append((num, name))
-                        except Exception:
+                            if hour_dir.exists() and hour_dir.is_dir():
+                                subs = sorted(
+                                    [p.name for p in hour_dir.iterdir() if p.is_dir()],
+                                    key=str.lower)
+                                for name in subs:
+                                    m = re.match(r"^C\d{2}-(\d{2,3})-", name)
+                                    num = m.group(1) if m else ""
+                                    if not any(n == name for _, n in cameras):
+                                        cameras.append((num, name))
+                        except OSError:
                             continue
+                    if not cameras:
+                        status = "no_data"   # archive reachable, just nothing for this date/time
             except Exception:
-                pass
-            signals.finished.emit(cameras)
+                status = "error"
+            signals.finished.emit(cameras, status)
 
         _thr.Thread(target=worker, daemon=True).start()
 
-    def _on_cameras_loaded(self, cameras: list):
+    def _on_cameras_loaded(self, cameras: list, status: str = ""):
         self._all_cam_data = cameras
         self._populate_cam_table(cameras)
         n = len(cameras)
-        self._status_lbl.setText(f"{n} cameras available." if n else "No cameras found.")
+        if n:
+            self._status_lbl.setText(f"{n} cameras available.")
+            self._status_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        elif status == "error":
+            # Couldn't read the archive at all → software / access problem.
+            self._status_lbl.setText("⚠ Could not read the camera archive (network / path error).")
+            self._status_lbl.setStyleSheet("font-size: 10px; color: #c0392b; font-weight: 700;")
+        else:
+            # Archive reachable, just no camera folders for this date/time.
+            self._status_lbl.setText("No camera records for this date / time.")
+            self._status_lbl.setStyleSheet("font-size: 10px; color: #555;")
         self._highlight_selected()
 
     def _populate_cam_table(self, cameras: list):
@@ -5168,6 +5399,9 @@ class _PvOverlayPanel(QWidget):
 
         self._content = QLabel()
         self._content.setTextFormat(Qt.TextFormat.PlainText)
+        # Clicks on the text must reach the panel itself (which owns the drag),
+        # not get swallowed by the child label.
+        self._content.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         lay.addWidget(self._content)
         self._apply_style()
 
@@ -5752,14 +5986,14 @@ class Viewer(QWidget):
         row_thr_mag.addWidget(QLabel("Thr:"))
         self.pointing_threshold_sb = QSpinBox()
         self.pointing_threshold_sb.setRange(0, 99)
-        self.pointing_threshold_sb.setValue(10)
+        self.pointing_threshold_sb.setValue(70)
         self.pointing_threshold_sb.setSuffix(" %")
         self.pointing_threshold_sb.setFixedWidth(62)
         self.pointing_threshold_sb.setToolTip(
-            "Threshold as % of peak intensity (after background subtraction).\n"
-            "Pixels below this fraction of the peak are ignored for centroid.\n"
-            "10% = ignore everything below 10% of brightest pixel.\n"
-            "Raise if noise affects centroid; lower if beam is cut off.")
+            "Threshold as % of the peak intensity (after background subtraction).\n"
+            "Only pixels brighter than this fraction of the peak feed the centroid.\n"
+            "70% = ignore everything below 70% of the brightest pixel (bright core only).\n"
+            "Raise if noise pulls the centroid; lower if the beam gets cut off.")
         row_thr_mag.addWidget(self.pointing_threshold_sb)
         row_thr_mag.addSpacing(6)
         row_thr_mag.addWidget(QLabel("M:"))
@@ -5768,7 +6002,10 @@ class Viewer(QWidget):
         self.pointing_m_sb.setValue(1.0)
         self.pointing_m_sb.setDecimals(3)
         self.pointing_m_sb.setFixedWidth(65)
-        self.pointing_m_sb.setToolTip("Magnification — optical magnification factor of the camera setup")
+        self.pointing_m_sb.setToolTip(
+            "Multiplier applied to the measured X/Y pointing offsets.\n"
+            "1 = raw sensor pixels (the plot axes are in pixels).\n"
+            "Set a calibration factor to scale the values, e.g. pixels → µrad or mm.")
         row_thr_mag.addWidget(self.pointing_m_sb)
         row_thr_mag.addStretch(1)
         llay.addLayout(row_thr_mag)
@@ -6910,15 +7147,32 @@ class Viewer(QWidget):
             if iv:
                 iv.set_pixmap(cached)
             self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
+            self._cam_want[cam_idx] = None   # we're current; drop any stale pending load
             return
 
+        self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
+        # Coalesced load: remember the latest wanted frame and only kick off a load if
+        # this camera isn't already loading one. Intermediate frames are skipped so the
+        # display tracks real time instead of replaying a growing backlog.
+        self._cam_want[cam_idx] = (cam_idx_f, it.path, max_side, brighten,
+                                   gradient_id, ref, sub_thr)
+        if not self._cam_busy[cam_idx]:
+            self._start_cam_load(cam_idx)
+
+    def _start_cam_load(self, cam_idx: int):
+        """Kick off the latest pending load for one camera (see _per_cam_display_one)."""
+        want = self._cam_want[cam_idx] if cam_idx < len(self._cam_want) else None
+        if want is None:
+            return
+        self._cam_want[cam_idx] = None
+        self._cam_busy[cam_idx] = True
+        cam_idx_f, path, max_side, brighten, gradient_id, ref, sub_thr = want
         pool = self._cam_pools[cam_idx]
         sig  = self._cam_signals[cam_idx]
         pool.start(LoadTask(
             self._gen, 0, cam_idx_f,
-            it.path, max_side, brighten, gradient_id,
+            path, max_side, brighten, gradient_id,
             sig, self._brightness_offset, ref, sub_thr))
-        self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
 
     def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
         """Synchronizuje slave kamery na master_ts_ns.
@@ -6989,6 +7243,12 @@ class Viewer(QWidget):
         self._cam_caches       = [PixCache(80) for _ in range(n)]
         self._cam_ref_images   = [None] * n
         self._cam_current_idx  = [0] * n   # per-camera frame index currently displayed
+        # Per-camera load coalescing: at most ONE image load in flight per camera so
+        # the load pool never backs up at live frame rates (which made the shown frame
+        # fall further and further behind real time). _cam_want holds the latest frame
+        # still waiting to be loaded.
+        self._cam_busy = [False] * n
+        self._cam_want = [None] * n
         self._cam_pools      = []
         self._cam_signals    = []
         for i in range(n):
@@ -7065,6 +7325,16 @@ class Viewer(QWidget):
                 pass
         self._dir_watchers.clear()
 
+    def _prune_dir_watchers(self, keep_keys: "set[str]"):
+        """Stop and drop dir-watchers for folders no longer being actively scanned."""
+        for key in [k for k in self._dir_watchers if k not in keep_keys]:
+            w = self._dir_watchers.pop(key, None)
+            if w is not None:
+                try:
+                    w.stop()
+                except Exception:
+                    pass
+
     def _on_dir_watch_new_file(self, cam_i: int, filename: str):
         """Immediate handler for a new image file detected by _DirWatcher."""
         if not self._online_mode or cam_i >= len(self._cam_items):
@@ -7110,7 +7380,8 @@ class Viewer(QWidget):
         self._online_last_new_ns = time.time()
         self._extend_shared_timeline_from_cams()
         total = sum(len(c) for c in self._cam_items)
-        self.lbl_scan_progress.setText(f"Frames: {total}")
+        if not self._online_mode:
+            self.lbl_scan_progress.setText(f"Frames: {total}")
         cam_ts_now = self._cam_ts[cam_i]
         if cam_ts_now:
             latest_ts = cam_ts_now[-1]
@@ -7126,6 +7397,12 @@ class Viewer(QWidget):
                     sv = self._per_cam_ts_to_slider(cam_i, latest_ts)
                     self._per_cam_rows[cam_i].set_value(sv)
                 self.tickbar.set_cursor(latest_ts)
+                sv_main = self._time_to_slider_value(latest_ts)
+                self.slider.blockSignals(True)
+                self.slider.setValue(sv_main)
+                self.slider.blockSignals(False)
+                if self.items:
+                    self.current_idx = len(self.items) - 1
                 for other in range(len(self._cam_ts)):
                     if other != cam_i:
                         self._per_cam_display_one(other, latest_ts)
@@ -7137,7 +7414,7 @@ class Viewer(QWidget):
             self._dir_watch_sigs = _DirWatchSignals()
             self._dir_watch_sigs.new_file.connect(self._on_dir_watch_new_file)
             for cam_i, folder_list in enumerate(self._cam_folder_lists):
-                for folder in folder_list:
+                for folder in active_scan_folders(folder_list):
                     self._ensure_dir_watcher(cam_i, folder)
         self._online_timer.start()
         self._btn_auto_follow.setEnabled(True)
@@ -7210,7 +7487,9 @@ class Viewer(QWidget):
     def _online_poll_single_bg(self):
         """Spustí background scan pro single-camera — neblokuje UI."""
         self._online_poll_running = True
-        folders = self.opened_folders[:]
+        # Only the newest hour folders can still receive frames — scanning the whole
+        # accumulated list every tick is what made live mode lag grow over time.
+        folders = active_scan_folders(self.opened_folders)
         gen = self._gen
         # Use ts_ns cutoff instead of path set — much faster O(n) single pass
         cutoff_ns = self.ts_list[-1] if self.ts_list else 0
@@ -7374,11 +7653,22 @@ class Viewer(QWidget):
             self._cam_poll_sigs = [None] * n_cams
         poll_max_ts = getattr(self, '_cam_poll_max_ts', [0] * n_cams)
 
+        # Keep dir-watchers only on the folders we still actively scan, so a long
+        # session does not leak one open SMB handle + thread per elapsed hour.
+        active_keys: set[str] = set()
+        for cam_i in range(n_cams):
+            for f in active_scan_folders(folder_lists[cam_i]):
+                active_keys.add(str(f))
+        self._prune_dir_watchers(active_keys)
+
         for cam_i in range(n_cams):
             if self._cam_poll_running[cam_i]:
                 continue  # this camera's previous task still running — skip tick
 
-            folders  = list(folder_lists[cam_i])
+            # Only the newest hour folders can still receive frames — scanning the
+            # whole accumulated list every 200 ms is what made live mode lag worse
+            # the longer it ran.
+            folders  = active_scan_folders(folder_lists[cam_i])
             cutoff   = poll_max_ts[cam_i] if cam_i < len(poll_max_ts) else 0
             cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else ""
 
@@ -7417,7 +7707,10 @@ class Viewer(QWidget):
                     self._online_last_new_ns = time.time()
                     self._extend_shared_timeline_from_cams()
                     total_frames = sum(len(c) for c in self._cam_items)
-                    self.lbl_scan_progress.setText(f"Frames: {total_frames}")
+                    if self._online_mode:
+                        self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
+                    else:
+                        self.lbl_scan_progress.setText(f"Frames: {total_frames}")
                     self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
                     cam_ts_now = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
                     if cam_ts_now:
@@ -7436,6 +7729,12 @@ class Viewer(QWidget):
                                     sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
                                     self._per_cam_rows[cam_idx].set_value(sv)
                                 self.tickbar.set_cursor(latest_ts)
+                                sv_main = self._time_to_slider_value(latest_ts)
+                                self.slider.blockSignals(True)
+                                self.slider.setValue(sv_main)
+                                self.slider.blockSignals(False)
+                                if self.items:
+                                    self.current_idx = len(self.items) - 1
                                 # Update all non-master cameras to the closest frame to master's ts
                                 for other_idx in range(len(self._cam_ts)):
                                     if other_idx == cam_idx:
@@ -8967,7 +9266,12 @@ class Viewer(QWidget):
         brightness_offset: int, img: QImage
     ):
         """Callback pro načtený snímek jedné kamery v multi-cam módu."""
+        # Release the busy flag on EVERY path (incl. stale gen / null image) so the
+        # coalescing pipeline never deadlocks, then pull the next pending frame.
+        if cam_i < len(self._cam_busy):
+            self._cam_busy[cam_i] = False
         if gen != self._gen or img.isNull():
+            self._start_cam_load(cam_i)
             return
         # Reconstruct cache key using current per-camera ref (image already has subtraction baked in)
         subtract = self.cb_subtract.isChecked()
@@ -8977,16 +9281,22 @@ class Viewer(QWidget):
         key = (idx, max_side, brighten, gradient_id, brightness_offset, ref_id, sub_thr)
         if cam_i < len(self._cam_caches):
             self._cam_caches[cam_i].put(key, QPixmap.fromImage(img))
-        iv = self._multi_grid.get_img_view(cam_i)
-        if iv:
-            iv.set_pixmap(QPixmap.fromImage(img))
-        if (cam_i < len(self._cam_items) and idx < len(self._cam_items[cam_i])):
-            ts = self._cam_items[cam_i][idx].ts_ns
-            self._multi_grid.set_cam_timestamp(cam_i, fmt_hhmmss_ms_from_ns(ts))
+        # Don't paint a frame that is already older than the latest target — avoids the
+        # view flashing backwards while it catches up to live.
+        cur = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else idx
+        if idx >= cur:
+            iv = self._multi_grid.get_img_view(cam_i)
+            if iv:
+                iv.set_pixmap(QPixmap.fromImage(img))
+            if (cam_i < len(self._cam_items) and idx < len(self._cam_items[cam_i])):
+                ts = self._cam_items[cam_i][idx].ts_ns
+                self._multi_grid.set_cam_timestamp(cam_i, fmt_hhmmss_ms_from_ns(ts))
         # Track per-camera last update for refresh dot
         while len(self._cam_last_update_ts) <= cam_i:
             self._cam_last_update_ts.append(0.0)
         self._cam_last_update_ts[cam_i] = time.monotonic()
+        # Load the most recent frame that arrived while this one was loading.
+        self._start_cam_load(cam_i)
 
     def _on_cam_dot_blink(self):
         """Aktualizuje blikající refresh doty u každé kamery."""
@@ -9411,36 +9721,38 @@ class Viewer(QWidget):
         win = self.window()
 
         if ev_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            # Let PV overlay handle its own drag — check by global position (more
-            # reliable than object identity since child labels receive the event).
-            from PySide6.QtCore import QPoint as _QPoint
             gpos = event.globalPosition().toPoint()
+            # Check if clicking on a PV overlay — handle drag entirely here using
+            # global coords so child-widget event routing cannot interfere.
             for _ov in (getattr(self, "_pv_overlay", None),
                         getattr(self, "_pv_overlay_multi", None)):
                 if _ov is not None and _ov.isVisible():
-                    _ov_tl = _ov.mapToGlobal(_QPoint(0, 0))
+                    _ov_tl = _ov.mapToGlobal(QPoint(0, 0))
                     if QRect(_ov_tl, _ov.size()).contains(gpos):
+                        # Let the overlay handle its OWN drag: by NOT consuming this
+                        # press, Qt establishes the implicit mouse grab on the panel
+                        # and its proven mouse handlers move it reliably. We only flag
+                        # the gesture so the window move/resize logic stays out of it.
                         self._focus_click_on_overlay = True
+                        self._focus_overlay_ref      = _ov
                         return False
             self._focus_click_on_overlay = False
+            self._focus_overlay_ref      = None
 
-            gpos = event.globalPosition().toPoint()
             r = win.geometry()
             rx = gpos.x() - r.left();  ry = gpos.y() - r.top()
             nl = rx < _RM;  nt = ry < _RM
             nr = r.width()  - rx < _RM
             nb = r.height() - ry < _RM
             if nl or nt or nr or nb:
-                # Start resize
                 self._focus_resize_edge  = (nl, nt, nr, nb)
                 self._focus_resize_gpos0 = gpos
                 self._focus_resize_rect0 = QRect(r)
                 self._focus_drag_start   = None
             else:
-                # Start drag (or plain click → consume to suppress camera selection)
                 self._focus_resize_edge = None
                 self._focus_drag_start  = gpos
-            return True   # always consume in focus mode
+            return True
 
         elif ev_type == QEvent.Type.MouseMove:
             gpos = event.globalPosition().toPoint()
@@ -9451,12 +9763,11 @@ class Viewer(QWidget):
             nb = r.height() - ry < _RM
 
             if event.buttons() & Qt.MouseButton.LeftButton:
-                # If the drag started on the overlay, let the overlay handle moves.
                 if getattr(self, '_focus_click_on_overlay', False):
+                    # The overlay's own mouse handlers move it — never drag the window.
                     return False
                 edge = getattr(self, '_focus_resize_edge', None)
                 if edge is not None:
-                    # Resize
                     _nl, _nt, _nr, _nb = edge
                     r0 = self._focus_resize_rect0
                     g0 = self._focus_resize_gpos0
@@ -9469,7 +9780,6 @@ class Viewer(QWidget):
                     win.setGeometry(nr_rect)
                     return True
                 elif getattr(self, '_focus_drag_start', None) is not None:
-                    # Drag to move
                     delta = gpos - self._focus_drag_start
                     if delta.manhattanLength() > 6:
                         self._focus_drag_start = None
@@ -9478,16 +9788,31 @@ class Viewer(QWidget):
                             wh.startSystemMove()
                         return True
             else:
-                # Cursor feedback when hovering edges
-                if nl and nt:   win.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                elif nr and nb: win.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                elif nl and nb: win.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                elif nt and nr: win.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                elif nl or nr:  win.setCursor(Qt.CursorShape.SizeHorCursor)
-                elif nt or nb:  win.setCursor(Qt.CursorShape.SizeVerCursor)
-                else:           win.setCursor(Qt.CursorShape.ArrowCursor)
+                # Cursor feedback: overlay → SizeAllCursor; edges → resize; center → arrow
+                over_overlay = False
+                for _ov in (getattr(self, "_pv_overlay", None),
+                            getattr(self, "_pv_overlay_multi", None)):
+                    if _ov is not None and _ov.isVisible():
+                        _ov_tl = _ov.mapToGlobal(QPoint(0, 0))
+                        if QRect(_ov_tl, _ov.size()).contains(gpos):
+                            win.setCursor(Qt.CursorShape.SizeAllCursor)
+                            over_overlay = True
+                            break
+                if not over_overlay:
+                    if nl and nt:   win.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                    elif nr and nb: win.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                    elif nl and nb: win.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                    elif nt and nr: win.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                    elif nl or nr:  win.setCursor(Qt.CursorShape.SizeHorCursor)
+                    elif nt or nb:  win.setCursor(Qt.CursorShape.SizeVerCursor)
+                    else:           win.setCursor(Qt.CursorShape.ArrowCursor)
 
         elif ev_type == QEvent.Type.MouseButtonRelease:
+            if getattr(self, '_focus_click_on_overlay', False):
+                # Overlay drag finished — let its own release handler clear state.
+                self._focus_click_on_overlay = False
+                self._focus_overlay_ref      = None
+                return False
             self._focus_drag_start  = None
             self._focus_resize_edge = None
             win.setCursor(Qt.CursorShape.ArrowCursor)
@@ -9576,8 +9901,10 @@ class Viewer(QWidget):
         if not items:
             QMessageBox.information(self, "Pointing Analysis", "No images to analyse."); return
 
-        M = self.pointing_m_sb.value()
-        pixel_mm = 4.5e-3 * M
+        # M is a plain multiplier applied to the measured offsets (1.0 = raw pixels);
+        # it is applied once to the result arrays in _on_pointing_finished.
+        self._pointing_m = self.pointing_m_sb.value()
+        pixel_mm = self._pointing_m
         threshold = self.pointing_threshold_sb.value()
 
         # Stop replay if it's running before starting new analysis
@@ -9643,11 +9970,14 @@ class Viewer(QWidget):
             self.lbl_pointing_status.setText("No results — try lowering the threshold."); return
 
         ts_arr  = np.array([r[0] for r in results], dtype=np.int64)
-        # r[1], r[2] are centroid offsets from image centre in original pixels
-        cx_px   = np.array([r[1] for r in results])
-        cy_px   = np.array([r[2] for r in results])
-        img_w   = int(results[0][3]) if len(results[0]) > 3 else None
-        img_h   = int(results[0][4]) if len(results[0]) > 4 else None
+        # r[1], r[2] are centroid offsets from image centre in original pixels;
+        # scale by the user multiplier M (1.0 = raw pixels).
+        m = getattr(self, '_pointing_m', 1.0)
+        cx_px   = np.array([r[1] for r in results]) * m
+        cy_px   = np.array([r[2] for r in results]) * m
+        # Sensor extent must be in the same (scaled) unit as the offsets above.
+        img_w   = int(results[0][3] * m) if len(results[0]) > 3 else None
+        img_h   = int(results[0][4] * m) if len(results[0]) > 4 else None
 
         n = len(results)
         sx = float(np.std(cx_px))
@@ -10194,30 +10524,31 @@ class Viewer(QWidget):
     def _dst_name_with_prague_time(self, it):
         return replace_unix_ns_with_prague_in_filename(it.path, it.ts_ns)
 
-    def _pv_save_append_bar(self, pix: "QPixmap", dst: "str | Path") -> bool:
-        """Save pix to dst with PV values appended as a bar below the image using PIL.
-        Returns True on success. Falls back to plain pix.save(dst) on PIL error."""
-        pv_text = self._pv_text()
+    def _pv_text_for_ts(self, ts_ns: "int | None") -> str:
+        """Per-image PV burn-in text: archiver values at THIS frame's own timestamp,
+        falling back to the live snapshot if a per-timestamp lookup yields nothing."""
+        text = pv_text_for_ts(ts_ns, list(self._pv_enabled))
+        return text or self._pv_text()
+
+    def _pv_save_append_bar(self, pix: "QPixmap", dst: "str | Path",
+                            ts_ns: "int | None" = None) -> bool:
+        """Save pix to dst with a PV-values bar appended below the image (PIL).
+        When ts_ns is given the bar shows the values present at that frame's own
+        timestamp; the font is scaled to the image width and wrapped so it stays
+        readable. Returns True on success; falls back to a plain save on any error."""
+        pv_text = self._pv_text_for_ts(ts_ns) if ts_ns is not None else self._pv_text()
         dst = str(dst)
         if not pv_text:
             return bool(pix.save(dst))
         try:
-            from PIL import Image as _PilImg, ImageDraw as _PilDraw, ImageFont as _PilFont
+            from PIL import Image as _PilImg
             import tempfile as _tf
             with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _tmp:
                 _tmp_path = Path(_tmp.name)
             pix.save(str(_tmp_path))
             _img = _PilImg.open(_tmp_path)
-            _bar_h = 40
-            _new = _PilImg.new("RGB", (_img.width, _img.height + _bar_h), (255, 255, 255))
-            _new.paste(_img.convert("RGB"), (0, 0))
-            _draw = _PilDraw.Draw(_new)
-            try:
-                _font = _PilFont.truetype("DejaVuSans.ttf", 14)
-            except Exception:
-                _font = _PilFont.load_default()
-            _draw.text((8, _img.height + 8), pv_text, fill=(0, 0, 0), font=_font)
-            _new.save(dst)
+            render_pv_bar_below(_img, pv_text).save(dst)
+            _img.close()
             _tmp_path.unlink(missing_ok=True)
             return True
         except Exception:
@@ -10270,6 +10601,9 @@ class Viewer(QWidget):
             brighten=self.cb_bright.isChecked(),
             overlay_params=overlay_params,
             energy_map=dict(self._sf_energy_map),
+            # Per-image PV lookup (each frame gets the values at its own timestamp).
+            pv_channels={n: PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP},
+            pv_units=dict(PV_UNITS),
         )
         task.save_txt = self.cb_save_metadata_txt.isChecked()
         self._save_task = task
@@ -10401,64 +10735,81 @@ class Viewer(QWidget):
                           gradient_id: int, brighten: bool,
                           save_metadata_txt: bool = False) -> str | None:
         """Render and save one camera frame into out_dir. Returns error string or None."""
-        has_overlay = iv is not None and (
-            iv.show_cross or iv.show_circle or iv.show_square or bool(iv.energy_text))
-        has_annotation_bar = iv is not None and bool(iv.energy_text)
+        has_shapes = iv is not None and (iv.show_cross or iv.show_circle or iv.show_square)
+        is_recoloured = (gradient_id != GRADIENT_ID_DEFAULT) or brighten
+        pv_text = self._pv_text_for_ts(it.ts_ns)
+        has_bar = bool(pv_text)
         stem = Path(self._dst_name_with_prague_time(it)).stem
-        ann_suffix = "_annotated" if has_annotation_bar else ""
+        need_view = has_shapes or is_recoloured or has_bar
 
-        if gradient_id == GRADIENT_ID_DEFAULT and not has_overlay:
+        if not need_view:
+            # Untouched image — saved exactly once as the original.
             dst = out_dir / f"{stem}{it.path.suffix}"
             try:
                 shutil.copy2(it.path, dst)
             except Exception as e:
                 return str(e)
-        else:
-            dst = out_dir / f"{stem}{ann_suffix}.png"
-            if has_overlay and iv is not None and iv._pix is not None and not iv._pix.isNull():
-                pix = iv._pix.copy()
-                painter = QPainter(pix)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-                w, h = pix.width(), pix.height()
-                if iv.show_cross:
-                    cx = int(iv.cross_pos_norm.x() * w) if iv.cross_pos_norm else w // 2
-                    cy = int(iv.cross_pos_norm.y() * h) if iv.cross_pos_norm else h // 2
-                    sz = self._overlay_cross_size
-                    pen = QPen(self._overlay_cross_color)
-                    pen.setWidth(max(self._overlay_cross_thick, w // 500))
-                    painter.setPen(pen)
-                    painter.drawLine(cx - sz, cy, cx + sz, cy)
-                    painter.drawLine(cx, cy - sz, cx, cy + sz)
-                if iv.show_circle and iv.circle_center_norm is not None:
-                    cx = int(iv.circle_center_norm.x() * w)
-                    cy = int(iv.circle_center_norm.y() * h)
-                    if iv.circle_rx_norm is not None:
-                        rx = int(iv.circle_rx_norm * w); ry = int(iv.circle_ry_norm * h)
-                    else:
-                        r = int(iv.circle_r_norm * min(w, h)); rx = ry = r
-                    pen = QPen(self._overlay_circle_color)
-                    pen.setWidth(max(self._overlay_circle_thick, w // 500))
-                    painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
-                if iv.show_square and iv.square_rect_norm is not None:
-                    ln, tn, rn, bn = iv.square_rect_norm
-                    sx = int(ln * w); sy = int(tn * h)
-                    sw = int((rn - ln) * w); sh = int((bn - tn) * h)
-                    pen = QPen(self._overlay_square_color)
-                    pen.setWidth(max(self._overlay_square_thick, w // 500))
-                    painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRect(sx, sy, sw, sh)
-                painter.end()
-                if not self._pv_save_append_bar(pix, dst):
-                    return f"Could not save {dst.name}"
-            else:
-                img = load_image_scaled(it.path, SCRUB_MAX_SIDE, brighten, gradient_id)
-                if img.isNull():
-                    return f"Could not load {it.path.name}"
-                pix_plain = QPixmap.fromImage(img)
-                if not self._pv_save_append_bar(pix_plain, dst):
-                    return f"Could not save {dst.name}"
             _copy_metadata_into_png_bg(it.path, dst, save_txt=save_metadata_txt)
+            return None
+
+        # A drawn shape (cross/circle/square) is the only real modification — when one
+        # is present keep the pristine original alongside the annotated view. Palette,
+        # brightness and the PV bar are not modifications, so they save a single file.
+        if has_shapes:
+            orig_dst = out_dir / f"{stem}{it.path.suffix}"
+            try:
+                shutil.copy2(it.path, orig_dst)
+                _copy_metadata_into_png_bg(it.path, orig_dst, save_txt=save_metadata_txt)
+            except Exception:
+                pass
+            dst = out_dir / f"{stem}_annotated.png"
+        else:
+            dst = out_dir / (f"{stem}_annotated.png" if has_bar else f"{stem}.png")
+
+        if has_shapes and iv is not None and iv._pix is not None and not iv._pix.isNull():
+            pix = iv._pix.copy()
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            w, h = pix.width(), pix.height()
+            if iv.show_cross:
+                cx = int(iv.cross_pos_norm.x() * w) if iv.cross_pos_norm else w // 2
+                cy = int(iv.cross_pos_norm.y() * h) if iv.cross_pos_norm else h // 2
+                sz = self._overlay_cross_size
+                pen = QPen(self._overlay_cross_color)
+                pen.setWidth(max(self._overlay_cross_thick, w // 500))
+                painter.setPen(pen)
+                painter.drawLine(cx - sz, cy, cx + sz, cy)
+                painter.drawLine(cx, cy - sz, cx, cy + sz)
+            if iv.show_circle and iv.circle_center_norm is not None:
+                cx = int(iv.circle_center_norm.x() * w)
+                cy = int(iv.circle_center_norm.y() * h)
+                if iv.circle_rx_norm is not None:
+                    rx = int(iv.circle_rx_norm * w); ry = int(iv.circle_ry_norm * h)
+                else:
+                    r = int(iv.circle_r_norm * min(w, h)); rx = ry = r
+                pen = QPen(self._overlay_circle_color)
+                pen.setWidth(max(self._overlay_circle_thick, w // 500))
+                painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
+            if iv.show_square and iv.square_rect_norm is not None:
+                ln, tn, rn, bn = iv.square_rect_norm
+                sx = int(ln * w); sy = int(tn * h)
+                sw = int((rn - ln) * w); sh = int((bn - tn) * h)
+                pen = QPen(self._overlay_square_color)
+                pen.setWidth(max(self._overlay_square_thick, w // 500))
+                painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(sx, sy, sw, sh)
+            painter.end()
+            if not self._pv_save_append_bar(pix, dst, it.ts_ns):
+                return f"Could not save {dst.name}"
+        else:
+            img = load_image_scaled(it.path, SCRUB_MAX_SIDE, brighten, gradient_id)
+            if img.isNull():
+                return f"Could not load {it.path.name}"
+            pix_plain = QPixmap.fromImage(img)
+            if not self._pv_save_append_bar(pix_plain, dst, it.ts_ns):
+                return f"Could not save {dst.name}"
+        _copy_metadata_into_png_bg(it.path, dst, save_txt=save_metadata_txt)
         return None
 
     def _save_multicam_current(self):
@@ -10638,7 +10989,7 @@ class Viewer(QWidget):
                     painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(sx, sy, sw, sh)
                 painter.end()
-                self._pv_save_append_bar(pix, ann_dst)
+                self._pv_save_append_bar(pix, ann_dst, it.ts_ns)
                 _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt, extra_meta=_extra_meta)
 
         msg = f"Saved.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}"
@@ -10665,15 +11016,31 @@ class Viewer(QWidget):
                     i1 += 1
             return i0, i1
 
-        # Count total frames across cameras for warning
-        total = 0
+        # Collect every frame to save first (also gives us the total for the warning).
+        jobs: "list[tuple]" = []   # (item, cam_name)
         for cam_i in cam_indices:
             if cam_i >= len(self._cam_items): continue
-            ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else []
+            cam_items = self._cam_items[cam_i]
+            ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else [it.ts_ns for it in cam_items]
+            cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else f"cam{cam_i}"
             i0, i1 = _cam_range(ts, a, b)
-            total += max(0, i1 - i0)
+            for it in cam_items[i0:i1]:
+                jobs.append((it, cam_name))
+        total = len(jobs)
         if total == 0:
             QMessageBox.information(self, "Save range", "No frames inside From..To."); return
+
+        # Warm the PV archiver caches in parallel, in the background, while the user
+        # picks the output folder — so the per-frame loop doesn't stall on HTTP (the
+        # main reason save range felt frozen). Never blocks the UI thread.
+        if self._pv_enabled and jobs:
+            _pv_chs = [PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP]
+            if _pv_chs:
+                import threading as _thr
+                _thr.Thread(target=pv_warm_days,
+                            args=(_pv_chs, [it.ts_ns for it, _ in jobs]),
+                            daemon=True).start()
+
         if total >= SAVE_RANGE_WARN_COUNT:
             reply = QMessageBox.warning(self, "Large range",
                 f"{total} files selected across {len(cam_indices)} camera(s).\nContinue?",
@@ -10688,18 +11055,26 @@ class Viewer(QWidget):
         gradient_id = self.gradient_cb.currentIndex()
         brighten = self.cb_bright.isChecked()
         save_txt = self.cb_save_metadata_txt.isChecked()
+
+        # The render path uses QPixmap (not safe off the main thread), so the loop
+        # stays here — but a modal, cancelable progress dialog keeps the UI alive.
+        from PySide6.QtWidgets import QProgressDialog
+        prog = QProgressDialog("Saving frames…", "Cancel", 0, len(jobs), self)
+        prog.setWindowTitle("Save range")
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
         saved_total = 0
-        for cam_i in cam_indices:
-            if cam_i >= len(self._cam_items): continue
-            cam_items = self._cam_items[cam_i]
-            ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else [it.ts_ns for it in cam_items]
-            cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else f"cam{cam_i}"
-            i0, i1 = _cam_range(ts, a, b)
-            for it in cam_items[i0:i1]:
-                err = self._render_cam_frame(it, None, cam_name, out_path, gradient_id, brighten,
-                                             save_metadata_txt=save_txt)
-                if err is None:
-                    saved_total += 1
+        for idx, (it, cam_name) in enumerate(jobs, 1):
+            if prog.wasCanceled():
+                break
+            err = self._render_cam_frame(it, None, cam_name, out_path, gradient_id, brighten,
+                                         save_metadata_txt=save_txt)
+            if err is None:
+                saved_total += 1
+            prog.setValue(idx)
+            if idx % 5 == 0:
+                QApplication.processEvents()
+        prog.close()
         QMessageBox.information(self, "Saved", f"Saved {saved_total} frame(s) to:\n{out_dir}")
 
     def save_range(self):
@@ -10717,24 +11092,15 @@ class Viewer(QWidget):
         if i0 >= i1_excl: QMessageBox.information(self, "Save range", "No frames inside From..To."); return
         total = i1_excl - i0
 
-        # Pre-warm CPVA cache before showing the file dialog so the background
-        # save task starts immediately without blocking on HTTP requests.
-        # The user spends a few seconds picking the output folder — enough time
-        # for all day-caches to be filled.
+        # Pre-warm CPVA cache (in parallel) while the user picks the output folder,
+        # so the background save starts without stalling on HTTP requests.
         if self._pv_enabled:
-            _pv_chs_prefetch = {n: PV_CHANNEL_MAP[n]
-                                for n in self._pv_enabled if n in PV_CHANNEL_MAP}
-            if _pv_chs_prefetch and self.items and i0 < len(self.items):
-                _ts0 = self.items[i0].ts_ns
+            _pv_chs = [PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP]
+            _ts_vals = [it.ts_ns for it in self.items[i0:i1_excl]]
+            if _pv_chs and _ts_vals:
                 import threading as _thr
-                def _prefetch():
-                    for _ch in _pv_chs_prefetch.values():
-                        try:
-                            _pv_load_day(_ch, _pv_date_key(_ts0))
-                            _pv_load_day(_ch, _pv_prev_date_key(_pv_date_key(_ts0)))
-                        except Exception:
-                            pass
-                _thr.Thread(target=_prefetch, daemon=True).start()
+                _thr.Thread(target=pv_warm_days, args=(_pv_chs, _ts_vals),
+                            daemon=True).start()
 
         if total >= SAVE_RANGE_WARN_COUNT:
             reply = QMessageBox.warning(self, "Large range",

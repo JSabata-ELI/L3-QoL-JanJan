@@ -418,6 +418,11 @@ def copy_one(args):
 
 # --------- main ----------
 def main():
+    try:
+        import ctypes as _ct
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.TimeConverter")
+    except Exception:
+        pass
     root = Tk()
     root.withdraw()
     try:

@@ -1,7 +1,7 @@
-Time Converter v1.3.6 — Information
-Created by Jan Moučka, ELI Beamlines
+﻿Time Converter — Information
+Created by Jan Moučka, ELI Laser
 
-Bugs / suggestions: jan.moucka@eli-beams.eu
+Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
 
 Batch file renaming utility that converts UNIX nanosecond

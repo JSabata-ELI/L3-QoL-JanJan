@@ -1,400 +1,279 @@
 ---
 name: Image Tools structure map
-description: Line-by-line class/function map of all 4 files in Image Tools — read this before editing to avoid re-reading ~14 000 lines.
+description: Line-by-line class/function map of all files in Image Tools — read this before editing to avoid re-reading ~23 000 lines.
 ---
 
 Image Tools — PySide6 multi-tab image viewer
-Files: `main.py` (243 L) | `if_t.py` (5406 L) | `sf_t.py` (2008 L) | `is_t.py` (6194 L)
+Files (verified 2026-06-19): `main.py` (255 L) | `if_t.py` (6624 L) | `is_t.py` (11238 L) | `sf_t.py` (2682 L) | `wk_t.py` (1283 L)
+Orphan: `sp_t.py` (1072 L) — NOT imported by main.py; stray copy of the Spectra program, not part of this app.
+
+Line numbers below are approximate anchors — they drift as the files change. Re-grep the symbol name if an offset looks wrong.
 
 ---
 
-## main.py
+## main.py — entry point & window assembly
 
 | Line | Name | What it does |
 |------|------|-------------|
-| L28 | `_VER_RE` | regex to extract version from exe name |
-| L30 | `_detect_version()` | extracts semantic version string |
-| L41 | `APP_VERSION`, `APP_TITLE` | version + title constants |
-| L46 | `build_main_window(folder_arg)` | creates main window, 3 tabs, wires inter-tab integration |
-| L198 | `_open_folder_in_slider(viewer, tabs, folder)` | switches to slider tab and loads folder |
-| L206 | `main()` | entry point: parse args, build window, event loop |
+| L6  | frozen `sys.path` fixup | strips user site-packages, prepends `_internal`, writes debug_syspath/debug_pil txt |
+| L28 | `_VER_RE` | regex `v#.#.#` extracted from exe name |
+| L30 | `_detect_version()` / `APP_VERSION` / `APP_TITLE` | version string from exe/file name |
+| L46 | `build_main_window(folder_arg)` | loads if/is/sf/wk via importlib (`if`/`is` are keywords), builds `QTabWidget` (4 tabs), wires inter-tab refs, Stop-All button in status bar |
+| L55 | `_load_module(name, filename)` | importlib loader, frozen-aware base dir |
+| L187 | `_open_folder_in_slider(viewer, tabs, folder)` | switch to Slider tab + load folder |
+| L195 | `main()` | argparse, AppUserModelID, Fusion style + global QSS, `showMaximized` |
 
-**Inter-tab wiring:** ImageFinder's "Open in Slider" calls `_open_folder_in_slider` which calls `Viewer.open_folders()`.
+**Inter-tab wiring (L123-138):** finder/shot_finder get `_slider_ref`, `_tab_widget`; all tabs get `_workshop_ref` + `_workshop_tab_idx`. Slider auto-starts online mode on first activation of tab index 1 (L177).
 
 ---
 
-## if_t.py — Image Finder tab (5406 L)
+## if_t.py — Image Finder tab (6624 L)
 
 ### Key constants
-
 | Line | Name | Note |
 |------|------|------|
-| L38 | `IMAGES_ROOT` | network path to image archive |
-| L40–43 | `RAMPING_CANDIDATES` | list of `[name, path]` ramping CSV sources |
-| L47–56 | scan/sample config | scanning tolerances, sample steps |
-| L58–60 | `IMAGE_EXTS`, `CAM_33HZ` | file extensions, high-freq camera IDs |
-| L62–63 | `FINAL_RE`, `SOURCE_RE` | filename parsing regexes |
-| L70–108 | energy CSV config | paths, column names, display names, tolerances |
-| L110–116 | CPVA archiver config | `CPVA_BASE_URL`, `CPVA_HTTP_TIMEOUT`, `CPVA_SHOT_CHANNEL`, `CPVA_SBW4_CHANNEL` |
-| L111–129 | `INFO_TEXT` | help text shown in info dialog |
-| L161–181 | `GRADIENTS`, `GRADIENT_NAMES` | color LUT definitions |
+| L50 | `_IS_LAB` | hostname OPR1/2/3, VIS01/02 → lab |
+| L53 | `IMAGES_ROOT_BASE` | `//users-L3.tier0.lcs.local` |
+| L55 | `RAMPING_CANDIDATES` | Lab `//hapls-share…/2026_alldata`, Office `Z:\…` |
+| L66 | `MAX_SCAN_FILES` = 2000 | cap on stat() per folder (silent truncation, see review) |
+| L68 | `MIN_FULL_FILES` = 1 | **unused** |
+| L73 | `IMAGE_EXTS` | png/jpg/jpeg/tif/tiff/bmp |
+| L74 | `CAM_33HZ` | set of 33 Hz camera numbers |
+| L82 | `ENERGY_CSV_ROOT` / L86 `ENERGY_CSV_NAME_FMT` | `dataof%Y%b_%d` |
+| L90/96/102 | `ENERGY_COLUMNS_AVAILABLE` / `_DEFAULT` (`[]`) / `_DISPLAY` | column picker data |
+| L118 | `ENERGY_MATCH_TOL_S` = 2.0 | image↔PV match tolerance |
+| L121 | `CPVA_BASE_URL` / L122 `CPVA_HTTP_TIMEOUT`=10 | archiver REST |
+| L125 | `CPVA_SHOT_CHANNEL` / L126 `CPVA_SBW4_CHANNEL` | best-shot channels |
+| L129 | `CPVA_CHANNEL_MAP` | col → channel |
+| L149-151 | `_cpva_conn_lock` / `_cpva_conn` / `_CPVA_HOST` | **single** serialized persistent HTTPS conn |
+| L404/417 | `GRADIENTS` / `GRADIENT_NAMES` | LUT palettes |
 
 ### Module-level helpers
+| Line | Function | Purpose |
+|------|----------|---------|
+| L140 | `_cpva_ssl_ctx` | SSL ctx, verification off |
+| L154 | `_cpva_fetch_samples` | archiver GET, reuse conn, 1 retry |
+| L188 | `_cpva_best_shot_ns` | highest-energy sample ns in window |
+| L221 | `_cam_totalpower_channel` | folder → `:TotalPower` channel |
+| L234 | `_cpva_active_windows_ns` | merged active windows from TotalPower |
+| L445 | `_read_img_max_value` | imgMaxValue from PNG tEXt (12th-chunk heuristic — fragile) |
+| L593-642 | `is_valid_image_file` / `extract_display_label` / `extract_folder_number` / `extract_ns_from_stem` / `convert_timestamp` | filename helpers |
+| L644 | `_energy_csv_path` / L663 `_load_energy_csv` | daily CSV → `[_EnergyRow]` |
+| L713 | `_energy_api_for_day` | CPVA per-col (ThreadPool) + CSV fallback |
+| L843 | `_find_energy_match` | bisect nearest CSV row in tol |
+| L874 | `_find_closest_per_col_value` | per-col nearest within tol |
+| L918 | `_format_energy_value` | unit format (sbw4 ×0.749, J→mJ) |
+| L953 | `_annotate_image_with_energy` / L1104 `_write_annotated_with_text` / L1508 `_write_annotated_from_pil` | white-bar annotation (3 near-dup font/wrap routines) |
+| L5155 | `_section_label` | small-caps label |
+| **L5160** | `def _NoScrollCalendar()` | ⚠️ **shadows** the class at L539 — see KNOWN ISSUES |
+| L6605 | `main` | standalone entry |
 
-| Line | Name | What it does |
-|------|------|-------------|
-| L118 | `_cpva_ssl_ctx()` | creates SSL context (cert verification off) |
-| L123 | `_cpva_fetch_samples(channel, start_ns, end_ns)` | fetch archiver JSON samples for one channel |
-| L137 | `_cpva_best_shot_ns(start_ns, end_ns)` | returns ns timestamp of highest-energy shot |
-| L173 | `_cam_totalpower_channel(cam_name)` | derives TotalPower channel from camera folder name |
-| L186 | `_cpva_active_windows_ns(channel, start_ns, end_ns, ...)` | returns active time windows (10× baseline threshold); supports `active_from_ns` filter |
-| L275 | `_hsep()` | horizontal separator widget |
-| L282 | `_group_label(text)` | styled group header label |
-| L291 | `is_valid_image_file(name)` | checks extension |
-| L298 | `extract_display_label(folder_name)` | camera label from folder name |
-| L308 | `extract_folder_number(folder_name)` | camera number from folder name |
-| L319 | `extract_ns_from_stem(stem)` | Unix ns timestamp from filename |
-| L325 | `convert_timestamp(ns, use_prague_time)` | ns → formatted string |
-| L330 | `build_new_name(stem, use_prague_time)` | new filename with Prague timestamp |
-| L342 | `_energy_csv_path(dt)` | builds path to daily energy CSV |
-| L361 | `_load_energy_csv(csv_path)` | loads + parses daily CSV |
-| L411 | `_find_energy_match(rows, img_ts_ns, tol_s)` | best CSV row for image timestamp |
-| L442 | `_format_energy_diff_s(diff_s)` | formats time difference |
-| L449 | `_format_energy_value(col, raw_val)` | formats CSV value with units |
-| L484 | `_annotate_image_with_energy(src, dst, ...)` | adds annotation bar to image |
-| L860 | `_write_annotated_from_pil(img, dst, text)` | adds white annotation bar below a PIL image and saves it; used by `MultiDayPreviewWindow._save_items` |
+### Classes
+| Line | Class | Base | Purpose |
+|------|-------|------|---------|
+| L475 | `_WeekendDelegate` | QStyledItemDelegate | red weekends |
+| L510 | `_CalBorderDelegate` | _WeekendDelegate | + From/To border |
+| **L539** | `_NoScrollCalendar` (class) | QCalendarWidget | wheel-block — **DEAD, shadowed by func L5160** |
+| L571 | `_NoScrollComboBox` | QComboBox | ignore wheel |
+| L654 | `_EnergyRow` | (slots) | one CSV row (ts_dt, values) |
+| L1161 | `_ThumbView` | QWidget | thumbnail + circle/square/cross overlay |
+| L1615-1697 | `_EnergyLoadSignals`/`_EnergyLoadTask`/`EnergyColumnDialog`/`_LoadSignals`/`_CollectSignals`/`_CompareSignals`/`_AutoHourSignals`/`_LogSignals`/`_PreviewSignals` | signals + column dialog |
+| **L1702** | `ImageFinderWidget` | QWidget | main widget |
+| L4830 | `_MultiDaySetupDialog` | QDialog | range/camera/hour picker |
+| L5168 | `MultiDayPreviewWindow` | QWidget | results grid, palette/overlay/save/try-again |
 
-### Small helper classes
+### `ImageFinderWidget` key methods
+| Line | Method | Purpose |
+|------|--------|---------|
+| L1711 | `__init__` | `_load_gen=0`, energy caches, pools |
+| L1782/1790/1798 | `_set_busy` / `_log` / `_log_safe` | `_log_safe` = thread-safe via signal |
+| L1806 | `_schedule_autoload` | debounced load_folders |
+| L1815 | `_build_ui` | full UI |
+| L2239-2317 | `_preview_*` | inline row preview (gen-checked at L2307) |
+| L2490/2497 | `_auto_select_today` / `_on_calendar_selected` | day selection |
+| L2525 | `_pick_energy_columns` | column dialog |
+| L2535 | `_get_energy_rows_for_dt` | cached API→CSV |
+| L2563 | `_lookup_energy_for_files` | per-file match (7-tuple) |
+| L2815 | `_get_ramping_for_day_cached` | ramping CSV, 1 s thread timeout |
+| L2883 | `_pick_best_block_real_hour` | segment-based auto-hour |
+| L2974 | `_apply_auto_hour_for_selected_day` | default hour + bg refine |
+| L3043 | `_build_datetime` / L3057 `_build_target_path` | UI → UTC folder path (`max(year,2025)`) |
+| L3082 | `load_folders` | scan all 24 hours (12 threads), fill table |
+| L3177 | `_on_load_done` | gen-checked table fill |
+| L3358 | `_nearest_file_for_ns` | probe ns offsets via exists(), scandir fallback |
+| L3447 | `_find_image_for_day_cam` | TotalPower→file, blind-scan fallback |
+| L3703 | `_on_multiday_search` | multi-day search |
+| L3841 | `_get_csv_best_hour_for_day` | count-based best hour (**likely dead**) |
+| L3924 | `_get_items_cached` | scandir + sampled stat, `_namecache` |
+| L4002 | `select_images_from_folder` | size/segment selection (params window/tol_kb/sample_* **ignored**) |
+| L4130/4343 | `_collect_primary_files_now` / `_async` | parallel collect (24 threads) |
+| L4189 | `_select_by_totalpower` | energy-anchored pick |
+| L4383/4447 | `view_primary_files` / `save_primary_files_as` | View / Save |
+| L4673/4655/4714 | `_compare_memory` / `_align_images` / `_show_compare_window` | A/B diff |
 
+---
+
+## is_t.py — Image Slider tab (11238 L)
+
+### Key constants
+| Line | Name | Note |
+|------|------|------|
+| L46-63 | `IMG_EXT`, `SLIDER_MAX`=1e6, `SCRUB_*`/`PLAY_*` sides, `CACHE_SIZE`=320, `PREFETCH_*`, `ONLINE_MAX_ITEMS`=50000 | operational tuning |
+| L72-89 | `CPVA_BASE_URL`/`CPVA_HTTP_TIMEOUT`=8, `PV_CHANNEL_MAP`, `PV_UNITS` | PV archiver |
+| L101-214 | `_pv_day_cache`(+lock,TTL) / `_pv_before_cache`(+lock) | day & look-back PV caches |
+| L477-492 | `GRADIENTS`/`GRADIENT_NAMES`, `GRADIENT_ID_DEFAULT`=0/`_GRAYSCALE`=1 | palettes |
+| L498-512 | `CIRCLE_*` calib, `DEFAULT_OPEN_DIR/ROOT`, `DEFAULT_SAVE_DIR` | calib + paths |
+| L624 | `ONLINE_ACTIVE_FOLDER_COUNT`=2 | live-poll hour folders |
+| L1124-1136 | `_k32`, `_FILE_*`, `_DIRWATCH_AVAILABLE` | Win32 ReadDirectoryChangesW |
+
+### Module-level helpers
+| Line | Function | Purpose |
+|------|----------|---------|
+| L92-254 | `_pv_ssl_ctx`/`_pv_date_key`/`_pv_load_day`/`_pv_query_range`/`_pv_value_at_or_before`/`_pv_last_known`/`_format_pv_value` | PV fetch + cache |
+| L259 | `pv_text_for_ts` / L281 `pv_warm_days` | PV burn-in string + parallel pre-warm |
+| L319 | `render_pv_bar_below` | white PV text bar under PIL image |
+| L402/435 | `_copy_metadata_into_png` (+`_bg`) | embed source metadata |
+| L447-465 | `_make_lut`/`_make_binary_lut`/`_make_stepped_lut` | LUTs |
+| L529-563 | `parse_unix_ns_from_name`, `_dt_from_sec`(lru), `_dt_from_ns`, `fmt_*`, `prague_stamp_for_filename` | ts parse/format |
+| L741/760 | `_autostretch_gray` / `_apply_brightness_offset` | contrast/brightness |
+| L776 | `load_image_scaled` | **core** decode/scale/gradient/subtract pipeline |
+| L889 | `_apply_lut` | RGB LUT onto Grayscale8 |
+| L3389 | `_fit_circle_kasa` | Kåsa circle fit |
+
+### QRunnable workers + Signals
+| Signals (L) | Worker (L) | run() purpose |
+|------|--------|---------------|
+| `_PvSignals` 927 | (Viewer fetch) | `result(gen, dict)` |
+| `LoaderSignals` 930 | `LoadTask` 933 | decode one image (run 942) |
+| `ScanSignals` 950 | `ScanTask` 957 | scan folders → items (run 966; whole body wrapped in `except: pass` L1005) |
+| `RefreshScanSignals` 1014 | `RefreshScanTask` 1017 | incremental rescan (run 1025) |
+| `SaveRangeSignals` 1048 | `SaveRangeTask` 1052 | batch save A→B w/ overlay+PV (run 1131) |
+| `PointingAnalysisSignals` 1191 | `PointingAnalysisTask` 1196 | centroid per frame (run 1266) |
+| `_SCSignals` 2006 | `_SCTask` 2010 | spatial contrast (run 2040, otsu 2145) |
+| `_CamPollSignals` 5109 | `_CamPollTask` 5208 | poll one cam's folders (run 5222) |
+| `_DirWatchSignals` 5139 | `_DirWatcher`(Thread) 5143 | ReadDirectoryChangesW (run 5166) |
+
+### Widget / dialog classes
 | Line | Class | Purpose |
 |------|-------|---------|
-| L202 | `_WeekendDelegate` | colors weekend dates red in calendar |
-| L237 | `_NoScrollCalendar` | QCalendarWidget that ignores mousewheel |
-| L269 | `_NoScrollComboBox` | QComboBox that ignores mousewheel |
-| L352 | `_EnergyRow` | data container: timestamp + column values dict |
-| L637 | `_EnergyLoadSignals` | Qt signals for CSV loading |
-| L640 | `_EnergyLoadTask` | QRunnable: loads energy CSV in background |
-| L654 | `EnergyColumnDialog` | dialog to pick which energy columns to display |
-| L698 | `_LoadSignals` | signals for folder loading |
-| L703 | `_CollectSignals` | signals for file collection |
-| L706 | `_CompareSignals` | signals for memory comparison |
-| L710 | `_AutoHourSignals` | signals for auto-hour detection |
+| L1304/1473/1625/1795 | `_SCHistogramWidget`/`Dialog`, `_SCExclusionEditor`/`Canvas` | SC threshold + exclusion regions |
+| L2174 | `PointingPanel` | mpl scatter/hist/path + Qt interaction |
+| L2654/2685 | `WeekendDelegate`, `DatePickerDialog` | calendar + date/hour/multiday |
+| L3035 | `CameraPickerDialog` | camera selection + presets |
+| L3409 | `ImageView` | image display + overlays + zoom + calibration (paintEvent 3778) |
+| L4289/4398 | `CameraView` / `MultiCameraGrid` | 2–4 cam grid |
+| L4645 | `TickBar` | time axis / cursor / marks (paintEvent 4680) |
+| L4921/4936 | `_DirItem` / `LazyDirModel`, L5031 `FolderPickerDialog` | lazy folder tree |
+| L4929 | `_LazyDirModel` | **dead stub (`pass`)** |
+| L5300 | `_CamSliderRow` | per-cam master radio + slider |
+| L5372 | `_PvOverlayPanel` | floating draggable PV panel |
 
-### Class: _ThumbView  (L860 — ~340 lines)
-
-Custom QWidget used as thumbnail in `MultiDayPreviewWindow`. Copied interaction model from `ImageView` in is_t.py.
-
-| Feature | Detail |
-|---------|--------|
-| Overlays | Circle, square, cross — all independent, any combination active simultaneously |
-| Coordinates | Normalised 0–1 relative to `_img_rect()` (letterboxed displayed image) |
-| Drawing | QPainter in `paintEvent` — NOT baked into pixmap |
-| Drag-to-create | Hold+drag sets shape size; Shift = proportional |
-| Drag handles | Circle: move + N/S/E/W; Square: move + 8 corners/edges |
-| Colors | Circle: yellow (255,255,0,230); Square: cyan (0,200,255,230); Cross: green (0,255,0,220) |
-| Signals | `clicked`, `dbl_clicked`, `hovered_in`, `hovered_out` |
-| Selection border | `set_selected(on)` → blue border |
-| Key fields | `show_circle`, `circle_center_norm` (QPointF), `circle_rx_norm`, `circle_ry_norm` |
-|            | `show_square`, `square_rect_norm` (tuple x0,y0,x1,y1) |
-|            | `show_cross`, `cross_pos_norm` (QPointF) |
-|            | `circle_color`, `square_color`, `cross_color` (QColor) |
-
-### Class: ImageFinderWidget  (L717–2533+)
-
-Main widget for the Image Finder tab.
-
-| Line | Method | Note |
-|------|--------|------|
-| L726 | `__init__` | init + `_build_ui()` |
-| L777 | `_set_busy` | enable/disable controls during ops |
-| L784 | `_log` | append to log box |
-| L792 | `_schedule_autoload` | delayed folder load |
-| L801 | `_build_ui` | full layout: calendars, tables, buttons, controls |
-| L1086 | `_get_original` | original folder name for row |
-| L1090 | `_get_qty` | quantity value for row |
-| L1095 | `_set_check_visual` | update checkbox appearance |
-| L1103 | `_on_cell_clicked` | toggle selection |
-| L1108 | `_on_cell_double_clicked` | edit quantity |
-| L1114 | `_on_cell_changed` | handle quantity edit |
-| L1118 | `_on_header_clicked` | toggle all rows |
-| L1123 | `_toggle_row` | toggle single checkbox |
-| L1129 | `_toggle_all` | toggle all checkboxes |
-| L1143 | `_refresh_master_checkbox` | update master state |
-| L1150 | `_capture_selection_state` | save selection for restore |
-| L1158 | `_refresh_selected_table` | rebuild selected cameras table |
-| L1176 | `_on_sel_table_double_clicked` | deselect camera |
-| L1185 | `_apply_search` | filter camera list |
-| L1193 | `sort_subfolders_by_label` | sort by camera label |
-| L1202 | `sort_subfolders_by_camnum` | sort by camera number |
-| L1219 | `_reorder_table_rows` | reorder + restore selection |
-| L1241 | `_on_calendar_selected` | date selected → load cameras |
-| L1248 | `_on_hour_change` | hour slider changed |
-| L1253 | `_on_labtime_toggle` | Prague vs lab time toggle |
-| L1261 | `_on_ramping_source_change` | switch CSV source |
-| L1268 | `_on_gradient_changed` | update color gradient |
-| L1274 | `_pick_energy_columns` | open column-selector dialog |
-| L1284 | `_get_energy_rows_for_dt` | load CSV rows for datetime |
-| L1301 | `_lookup_energy_for_files` | match CSV rows to image files |
-| L1338 | `_refresh_energy_info` | update energy display |
-| L1346 | `_on_nav_mode_changed` | navigation mode toggle |
-| L1353 | `_energy_nav_prev` | navigate to previous energy row |
-| L1368 | `_energy_nav_next` | navigate to next energy row |
-| L1383 | `_refresh_energy_info_single` | update energy for single row |
-| L1420 | `_build_ui` | full layout (inner rebuild) |
-| L1491 | `_ensure_ramping_root` | validate ramping CSV source |
-| L1499 | `_parse_timestamp` | parse timestamp string from CSV |
-| L1511 | `_read_ramping_csv_rows` | read all rows from ramping CSV |
-| L1543 | `_get_ramping_for_day_cached` | load + cache ramping data |
-| L1609 | `_pick_best_block_real_hour` | find best hour by activity |
-| L1688 | `_apply_auto_hour_for_selected_day` | auto-set hour from ramping data |
-| L1729 | `_apply_auto_hour_ui` | update UI with auto-determined hour |
-| L1762 | `_build_datetime` | construct target datetime from UI |
-| L1776 | `_build_target_path` | build image folder path for datetime |
-| L1779 | `_log_selected_datetime_preview` | debug log |
-| L1797 | `load_folders` | scan camera folders for selected datetime |
-| L1872 | `_on_load_not_found` | handle missing folder |
-| L1877 | `_on_load_error` | handle loading error |
-| L1881 | `_on_load_done` | update tables after scan |
-| L1932 | `open_in_slider` | load selected cameras into Slider tab |
-| L1948 | `_open_first_in_slider` | load first camera into Slider tab |
-| L1960 | `open_folder_in_explorer` | open folder in Windows Explorer |
-| L1976 | `_snapshot_collect_jobs` | create list of folders to collect |
-| L1987 | `_get_items_cached` | cached file list for folder |
-| L2026 | `select_images_from_folder` | subset selection by criteria |
-| L2097 | `_cleanup_view_temp` | cleanup temp view folder |
-| L2109 | `_apply_gradient_to_image` | apply color gradient to PIL image |
-| L2121 | `_make_view_copy_with_readable_name` | copy image with readable timestamp name |
-| L2146 | `_collect_primary_files_now` | synchronous file collection; passes `folder` from `_row_to_path` to `_select_by_totalpower` |
-| L2177 | `_collect_primary_files_async` | async file collection |
-| L4109 | `_select_by_totalpower` | finds best shot via CPVA TotalPower/SBW4/PTM1 API; after resolving `best_shot_ns`, corrects `folder` to the proper UTC hour (fixes mismatch where `_row_to_path` stores the first-found hour which may differ from the best-shot hour) |
-| L2211 | `view_primary_files` | collect + display images |
-| L2297 | `_run_energy_lookup_async` | async energy lookup for files |
-| L2323 | `save_primary_files_as` | save images to user folder |
-| L2417 | `show_info` | display info/help dialog |
-| L2426 | `_save_to_memory` | save image set to memory slot |
-| L2440 | `_do_save_to_memory_slot` | save folder to named slot |
-| L2460 | `_clear_slot` | clear memory slot |
-| L2468 | `_clear_memory` | clear all slots |
-| L2477 | `_align_images` | align two numpy arrays for comparison |
-| L2495 | `_compare_memory` | compare two memory slots |
-| L2533 | `_show_compare_window` | show comparison in new window |
-
-### Class: MultiDayPreviewWindow  (L4141+)
-
-Multi-day multi-camera thumbnail grid with overlays, undo, annotated save.
-
-| Line | Method | Note |
-|------|--------|------|
-| L4182 | `_build_ui` | two toolbar rows + thumbnail grid |
-| L4597 | `_display_state` | snapshot all display state for undo (per-ThumbView overlay coords + global colors) |
-| L4617 | `_undo_last` | pop last undo snapshot and restore |
-| L4680 | `_reset_display` | clear all overlays + display effects (with confirmation) |
-| L5096 | `_open_save_dialog` | 2×2 save grid: Selected/All × Original/Annotated |
-| L5161 | `_bake_overlay_to_pil` | convert normalised `_ThumbView` overlay coords to PIL draw calls for saving |
-| L5222 | `_save_items` | save images: applies `_apply_display_effects` + `_bake_overlay_to_pil`, adds `_annotated` suffix |
-
-**State fields (set in `_build_ui`):**
-- `_draw_circle`, `_draw_square`, `_draw_cross` — independent booleans
-- `_rotation` — current rotation (0/90/180/270)
-- `_auto_bright` — auto brightness flag
-- `_circle_qcolor`, `_square_qcolor`, `_cross_qcolor` — current overlay colors
-- `_thumb_views: dict[tuple, _ThumbView]` — `(cam_name, date)` → widget
-- `_thumb_camnames: dict[tuple, str]` — key → camera name
-- `_undo_stack: list[dict]` — max 50 snapshots
+### `Viewer` (L5477, QWidget) — main tab, method groups
+| Group | Methods (anchor L) |
+|-------|--------------------|
+| init/UI | `__init__` 5478, `_build_ui` 5616, `resizeEvent` 6433 |
+| overlays | `_on_reset_zoom` 6448, `_toggle_draw_mode` 6471, `_remove_all_overlays` 6490, `_apply_overlay_settings` 6596, calibrate circle/cross/square 8524/8535/8546 |
+| PV | `_open_pv_config` 6618, `_pv_trigger_fetch` 6663, `_pv_on_result` 6754, `_pv_update_overlay` 6761 |
+| multi-cam | `_is_multi_cam` 6894, `_switch_to_multi/single_view` 6947/6954, `_build_per_cam_sliders` 6967, `_setup_multi_cam` 7228 |
+| online | `_on_auto_follow_toggled` 7283, dir-watchers 7307/7320/7328/7338, `_start/_stop_online_mode` 7410/7437, `_online_poll`/`_single_bg`/`_multi` 7472/7487/7642, timeline 7756/7790 |
+| open/scan | `open_folder` 7841, `_start_multi_cam_scan` 7931, `open_by_date` 8113, `auto_start_online` 8253, `open_folder_path` 8266, `open_file_list` 8274, `refresh_folder` 8347, `_start_scan` 8848, `_choose_axis` 8904 |
+| brightness/subtract | `_on_brightness_slider_changed` 8558, `_load_raw_arr` 8578, `_set_reference_frame` 8591, `_on_subtract_changed` 8654, `_on_gradient_changed` 8678 |
+| slider↔time | `_slider_to_time_ns` 8729, `_time_to_nearest_index` 8749, `_set_info_for` 8755 |
+| display/load | `_load_or_cache` 9104, `_display_exact_index` 9137, `_display_multicam_at_time/_index` 9148/9171, `_on_cam_loaded` 9262, `_request_pixmap` 9345, prefetch 9358/9365, `_on_loaded` 9372 |
+| playback | `play` 9401, `stop` 9424, `_autoplay_step` 9433, `step_frame` 9521, `keyPressEvent` 9537 |
+| focus/watcher | `_toggle_focus_mode` 9572, `_toggle_watcher_mode` 9659, `eventFilter` 9705 |
+| timestamps | `_save_current_timestamp` 9823, `_goto_saved_timestamp` 9847 |
+| pointing | `run_pointing_analysis` 9881, `_on_pointing_finished` 9961, `_save_pointing_plot` 10067 |
+| spatial contrast | `_run_sc_auto_threshold` 10144, `_open_sc_histogram` 10170, `_open_sc_exclusion_editor` 10218, `_run_spatial_contrast` 10294, `_update_sc_topn_overlay` 10394 |
+| marks/save | `set_mark_a/b` 10469/10475, `save_around_current` 10557, `save_current_with_overlay` 10617, `_render_cam_frame` 10734, `_send_to_workshop` 10853, `save_current` 10900, `save_range` 11080 |
 
 ---
 
-## sf_t.py — Shot Finder tab (2008 L)
-
-Data source: **CPVA archiver HTTP API** (no CSV files).
-Channels queried per PV column: see `CPVA_CHANNEL_MAP`.
+## sf_t.py — Shot Finder tab (2682 L)
 
 ### Key constants
-
 | Line | Name | Note |
 |------|------|------|
-| L88 | `IMAGES_ROOT` | network path to image archive |
-| L91 | `CPVA_BASE_URL` | archiver API base URL |
-| L92 | `CPVA_HTTP_TIMEOUT` | HTTP timeout (15 s) |
-| L95–101 | `CPVA_CHANNEL_MAP` | maps PV column name → CPVA channel (ptm1, pcm2, pcm4, pap1, sbw4) |
-| L103–118 | `PV_COLUMNS`, `MJ_COLUMNS` | display names, mJ columns |
-| L119–120 | SBW4 config | `SBW4_TRANSMISSION`, `SBW4_WARNING_THRESHOLD_J` |
+| L81-92 | `SF_GRADIENTS` | LUT dict |
+| L105-117 | `IMAGES_ROOT_OPTIONS`, `ENERGY_CSV_ROOT_OPTIONS`, `ENERGY_CSV_NAME_FMT` | Lab/Office roots |
+| L119 | `EXTRA_COL_MATCH_TOL_S` = 5.0 | closest-value tol for extra cols |
+| L122-134 | `CPVA_BASE_URL`/`CPVA_HTTP_TIMEOUT`=15, `CPVA_CHANNEL_MAP` | archiver |
+| L136 | `PV_COLUMNS` | col → `"… [J]"` label |
+| L146 | `MJ_COLUMNS` = {Back_Ref, pap1} | shown ×1000 mJ |
+| L148-149 | `SBW4_TRANSMISSION`=0.749, `SBW4_WARNING_THRESHOLD_J`=0.5 | |
 
 ### Module-level helpers
+| Line | Function | Purpose |
+|------|----------|---------|
+| L153 | `_read_img_max_value` | imgMaxValue (12th-chunk heuristic) |
+| L182/189 | `_cpva_ssl_ctx` / `_cpva_fetch_samples` | archiver GET → (list, url) |
+| L203 | `_load_csv_for_day` | daily CSV → merged + per-col |
+| L261 | `_load_api_for_day` | CPVA per-col (ThreadPool) + CSV fallback, merge by `_ns` |
+| L366 | `_find_closest_col_value` | bisect closest within tol |
+| L391 | `_find_best_match` | min \|val−target\|; ⚠️ **re-divides sbw4 by 0.749** (double-scale, see KNOWN ISSUES) |
+| L408 | `_folder_hour_from_prague` | Prague→UTC folder hour (hardcoded −1 when no zoneinfo → DST bug) |
+| L417 | `_find_hour_folder` | probe `root/Y/M/D/h` offsets [0,−1,1,−2,2] |
+| L432 | `_find_image_for_ts` | scan folder, closest ns (docstring says 5 s, code uses 10 s) |
+| L483 | `_format_value` | per-col format |
 
-| Line | Name | What it does |
-|------|------|-------------|
-| L124 | `_cpva_ssl_ctx()` | SSL context (no cert verification) |
-| L126 | `_cpva_fetch_samples(channel, start_ns, end_ns)` | fetch archiver JSON for one channel |
-| L133 | `_load_api_for_day(day, cols)` | query all requested PV columns for a full day; returns unified row list with `_dt` (Prague-naive), `_ns` (exact UTC ns), and column values as strings |
-| L194 | `_find_best_match(rows, col, target)` | row closest to target value |
-| L211 | `_folder_hour_from_prague(prague_hour, ref_date)` | Prague hour → UTC folder hour |
-| L220 | `_find_hour_folder(day, hour_utc)` | fuzzy-match ±2h to find hour folder |
-| L230 | `_find_image_for_ts(cam_folder, ts_dt, ts_ns_override)` | find image ≤5 s from timestamp; `ts_ns_override` uses exact UTC ns directly |
-| L284 | `_format_value(col, raw)` | format PV value with units |
-| L368 | `_hsep()` | horizontal separator |
-| L376 | `_group_label(text)` | group header label |
-
-### Small helper classes
-
-| Line | Class | Purpose |
-|------|-------|---------|
-| L298 | `_SearchSignals` | Qt signals: result, done, log_msg, progress |
-| L305 | `_CamLoadSignals` | signals for camera loading |
-| L309 | `_PreviewSignals` | signals for preview |
-| L314 | `_WeekendDelegate` | colors weekends red |
-| L331 | `_NoScrollCalendar` | calendar ignoring mousewheel |
-| L358 | `_NoScrollComboBox` | combobox ignoring mousewheel |
-| L384 | `_DayResult` | result container: day, best_row, col, actual, diff, target_csv, hour_folder, rows_in_tol, ts_ns |
-| L403 | `_PreviewWidget` | centered image preview widget |
-
-### Class: ShotFinderWidget  (L459+)
-
-| Line | Method | Note |
-|------|--------|------|
-| L461 | `__init__` | init + `_build_ui()` |
-| L463 | `_cleanup_temp` | cleanup temp files |
-| L470 | `resizeEvent` | handle resize |
-| L474 | `_show_preview` | display image preview |
-| L585 | `_set_busy` | enable/disable controls |
-| L590 | `_log` | log message |
-| L599 | `_build_ui` | full UI: calendars, tables, buttons |
-| L862 | `_setup_calendar` | configure calendar styling |
-| L900 | `_on_date_changed` | date selection |
-| L904 | `_on_pv_changed_rb` | update units for PV |
-| L923 | `_update_date_info` | update date range label |
-| L933 | `_on_selection_changed` | result table row selection → preview |
-| L1009 | `_load_and_show_preview` | background preview load |
-| L1013 | `_rescale_preview` | rescale to fit widget |
-| L1018 | `_on_gradient_changed` | gradient selection |
-| L1025 | `_qdate_to_date` | QDate → date |
-| L1028 | `_selected_days` | list of selected days |
-| L1042 | `_load_cameras` | background camera list load |
-| L1075 | `_on_cameras_loaded` | populate camera list |
-| L1084 | `_on_cam_search_changed` | filter camera dropdown |
-| L1114 | `_on_cam_dropdown_clicked` | select from dropdown |
-| L1134 | `_on_cam_selected_clicked` | select from selected list |
-| L1140 | `_on_cam_remove` | remove camera |
-| L1160 | `_start_search` | start background search (queries API per day) |
-| L1303 | `_on_day_result` | update table with result |
-| L1410 | `_on_table_double_clicked` | show detail dialog (uses cached rows_in_tol) |
-| L1616 | `_open_in_slider` | open results in Slider tab |
-| L1616 | `_on_search_done` | finish search + update UI |
-| L1743 | `_save_results` | save images to user folder |
+### Classes & key methods
+| Line | Class / method | Purpose |
+|------|---------------|---------|
+| L497-509 | `_SearchSignals`/`_CamLoadSignals`/`_PreviewSignals` | signals |
+| L513/530/557 | `_WeekendDelegate`/`_NoScrollCalendar`/`_NoScrollComboBox` | calendar/combo |
+| L583 | `_DayResult` | result container, computes `ts_ns` |
+| L609 | `_PreviewWidget` | centered painter |
+| L646 | `_TimeWindowDialog` | start/end date+hour |
+| **L786** | `ShotFinderWidget` | main tab |
+| L921 | `_build_ui` | full UI |
+| L1203 | `_setup_calendar` | **dup of `_make_cal`, likely unused** |
+| L1268 | `_rebuild_criteria_rows` | per-PV target/tol rows |
+| L1370 | `_on_selection_changed` | row → find image + energy + preview thread |
+| L1436 | `_load_and_show_preview` | bg load/normalize/LUT → QImage |
+| L1517 | `_load_cameras` | bg, ThreadPool scans 24 hours (no cancel token) |
+| L1649 | `_start_search` | build criteria, worker per-day API/CSV + match (no cancel token) |
+| L1843 | `_on_day_result` | populate row (does network IO on main thread) |
+| L1958 | `_on_table_double_clicked` | all in-tol shots dialog |
+| L2222 | `_open_in_slider` | copy 1 img/day to temp → slider |
+| L2360 | `_save_results` | save annotated PNGs (main-thread encode) |
+| L2614 | `_send_to_workshop` | array → Workshop |
 
 ---
 
-## is_t.py — Image Slider tab (6194 L)
+## wk_t.py — Workshop tab (1283 L)
 
-### Key constants
-
-| Line | Name | Note |
-|------|------|------|
-| L45 | `IMG_EXT` | supported image extensions |
-| L46 | `TZ_PRAGUE` | Prague timezone |
-| L47–60 | UI/cache config | timing, scaling, cache size, `AXIS_TOLERANCE_S` |
-| L124–139 | `GRADIENTS`, `GRADIENT_NAMES`, `ONE_HOUR_NS` | color LUTs, 1h reference |
-| L142–155 | calibration params | circle calibration defaults, default open dirs |
-
-### Module-level helpers
-
-| Line | Name | What it does |
-|------|------|-------------|
-| L63 | `_copy_metadata_into_png` | embed metadata into PNG |
-| L91 | `_save_png_metadata_txt` | alias for metadata copy |
-| L94 | `_make_lut(stops)` | RGB gradient lookup table |
-| L107 | `_make_binary_lut()` | binary threshold gradient |
-| L112 | `_make_stepped_lut(stops)` | stepped color gradient |
-| L172 | `parse_unix_ns_from_name(p)` | ns timestamp from filename |
-| L184 | `_dt_from_ns(ts_ns)` | ns → datetime in Prague TZ |
-| L187 | `fmt_hhmm_from_ns` | ns → `HH:MM` |
-| L190 | `fmt_hhmmss_ms_from_ns` | ns → `HH:MM:SS.MS` |
-| L196 | `fmt_prague_full_from_ns` | ns → full date+time string |
-| L202 | `prague_stamp_for_filename` | ns → filename-safe timestamp |
-| L208 | `replace_unix_ns_with_prague_in_filename` | rename with Prague timestamp |
-| L215 | `ns_from_dt(dt)` | datetime → ns |
-| L218 | `floor_to_hour(dt)` | floor to hour start |
-| L221 | `axis_from_hour_folder_exact(folder)` | time axis from hour folder path |
-| L236 | `axis_from_any_folder(folder)` | time axis from any parent folder |
-| L245 | `folder_hour_from_prague_hour` | Prague hour → UTC folder hour |
-| L255 | `_read_tiff_max_sample` | read MaxSampleValue from TIFF |
-| L277 | `_autostretch_gray` | auto-stretch grayscale contrast |
-| L296 | `_apply_brightness_offset` | constant brightness offset |
-| L312 | `load_image_scaled` | load + process image (scale, brighten, gradient) |
-| L379 | `_apply_lut` | apply RGB gradient to image |
-| L1288 | `_fit_circle_kasa` | fit circle to point cloud (Kasa method) |
-
-### Dataclass + cache
-
+### Constants & helpers
 | Line | Name | Purpose |
 |------|------|---------|
-| L167 | `Item` | immutable: `path: Path`, `ts_ns: int` |
-| L398 | `PixCache` | LRU cache for QPixmap objects |
+| L35-62 | `_wk_make_lut`/`_make_binary_lut`/`_make_stepped_lut` | LUT builders |
+| L64 | `WK_GRADIENTS` | name → LUT (Grayscale=None …) |
+| L81/92/101 | `_np_to_qimage` / `_qimage_to_np` / `_arr_to_pil` | conversions |
+| L107 | `_TZ_PRAGUE` | ⚠️ **hardcoded +2h** (wrong in winter, CET=+1) |
+| L111 | `_build_save_stem` | `{cam}_{YYYY-MM-DD_HH-MM-SS-mmm}` |
+| L162 | `_SLOT_UNDO_LIMIT` = 30 | |
+| L202 | `_bresenham` | integer line points |
 
-### Background task classes
-
-| Line | Class | Purpose |
+### Classes
+| Line | Class | Members |
 |------|-------|---------|
-| L417 | `LoaderSignals` / `LoadTask` | load single image |
-| L437 | `ScanSignals` / `ScanTask` | scan folder for images |
-| L487 | `RefreshScanSignals` / `RefreshScanTask` | re-scan folder |
-| L521 | `SaveRangeSignals` / `SaveRangeTask` | save image range |
-| L559 | `PointingAnalysisSignals` / `PointingAnalysisTask` | pointing analysis per image |
-
-### UI widget classes
-
-| Line | Class | Purpose |
-|------|-------|---------|
-| L656 | `PointingPanel` | matplotlib panel: pointing scatter plot, toggle path, save figure |
-| L799 | `WeekendDelegate` | colors weekends red in calendar |
-| L830 | `DatePickerDialog` | select date range + hour range; `selected_folders` property |
-| L1072 | `CameraPickerDialog` | select cameras from list; multi-select + filter |
-| L1269 | `PopupBelowComboBox` | combobox that opens popup below, ignores mousewheel |
-| L1308 | `ImageView` | display image + pointing calibration overlays (circle/cross/square handles, normalised coords) |
-| L2041 | `CameraView` | single camera: image + timestamp label + selection highlight |
-| L2125 | `MultiCameraGrid` | N cameras in grid; `selected_cam_index`, `selected_img_view` |
-| L2294 | `TickBar` | timeline tick marks widget |
-| L2437 | `_DirItem` / `LazyDirModel` | lazy-loading file tree model for folder picker |
-| L2547 | `FolderPickerDialog` | browse + select folder dialog |
-| L2625 | `_CamPollSignals` / `_CamPollTask` | background camera polling |
-
-### Class: Viewer  (L2724+)
-
-Main image slider widget. Handles:
-- Folder loading + scanning
-- Timeline scrubbing (slider + keyboard navigation)
-- Multi-camera grid display
-- Brightness / gradient controls
-- Image comparison modes
-- Pointing calibration (circle/cross/square)
-- Save range of images
-- Online ("now") refresh mode
-
-Key public methods (call from main.py):
-- `open_folders(folders)` — load image folders into slider
-- `save_image(path)` — save current view
+| L164 | `_WorkshopSlot` (dataclass) | `source_arr`/`current_arr`/`undo_stack`/`redo_stack`/`source_path`; `push_undo` 173, `undo` 179, `redo` 186, `reset_to_source` 193 |
+| L224 | `WorkshopCanvas(QWidget)` | TOOL_* 228-235; `set_slot` 269, `_rebuild_qimage` 274, `fit_to_view` 315, `paintEvent` 348, mouse 404/440/464, `_paint_brush` 525, `_paint_eraser` 538, `_paint_line` 563, `_paint_rect` 576, `_commit_text` 598, `_do_crop` 631 |
+| L664 | `WorkshopWidget(QWidget)` | `_build_ui` 678, `receive_image` 928 (⚠️ forces uint8), `_activate_slot` 969, `_undo` 1059, `_redo` 1067 (⚠️ **not wired to UI**), `_on_bc_changed` 1086, `_apply_bright_contrast` 1121, `_auto_bright_contrast` 1139, `_on_palette_changed` 1158, `_do_diff` 1204, `_save` 1230 |
 
 ---
 
-## Architecture overview
+## Shared conventions
+- Timezone: `ZoneInfo("Europe/Prague")` (is_t/if_t/sf_t); wk_t hardcodes +2h (bug).
+- CPVA archiver `https://10.78.0.57:8443/api/1.0/cpva`, SSL verification disabled.
+- Filename timestamps: UTC nanoseconds (19-digit), parsed by `extract_ns_from_stem`/`parse_unix_ns_from_name`.
+- Network roots: UNC `//users-L3.tier0.lcs.local` (Lab) or `Z:\` (Office).
+- Checkboxes: `_CHECKBOX_STYLE` — QSS on `::indicator` only.
+- Background threads must log via `_log_safe`/signal, never touch widgets directly.
 
-```
-main.py
-  └── build_main_window()
-        ├── tab 0: ImageFinderWidget   (if_t.py)
-        ├── tab 1: Viewer              (is_t.py)
-        └── tab 2: ShotFinderWidget    (sf_t.py)
-
-ImageFinder → _open_folder_in_slider() → Viewer.open_folders()
-ShotFinder  → _open_in_slider()        → Viewer.open_folders()
-```
-
-All modules: PySide6 + threading for background work.
-Image timestamps: Unix nanoseconds in filename, displayed in Prague TZ.
-Folder layout: `IMAGES_ROOT / YYYY / MM / DD / HH_utc / CAM_NAME / *.png`
-
-**Overlay system (ThumbView + ImageView):**
-Overlays (circle/square/cross) are drawn by QPainter in `paintEvent` using normalised 0–1 coordinates relative to the letterboxed image rect (`_img_rect()`). They are never baked into the pixmap until save, at which point `_bake_overlay_to_pil()` translates normalised coords to full-resolution pixel coordinates.
-
-**CPVA Archiver API:**
-Both if_t.py (for TotalPower active-window detection) and sf_t.py (for PV value search) query the archiver at `CPVA_BASE_URL` via `_cpva_fetch_samples(channel, start_ns, end_ns)`. The channel names follow the pattern `HAPLS-ENER_IN_<SENSOR>_LT7_DIAG2:Energy`.
+## KNOWN ISSUES (review 2026-06-19, verified in source)
+- ✅ FIXED — **if_t**: removed redundant `def _NoScrollCalendar()` that shadowed the wheel-block class L539.
+- ✅ FIXED — **if_t L4710**: `_compare_memory` except branch now emits `_compare_sig.error`.
+- ✅ FIXED — **sf_t L391 `_find_best_match`**: removed the second `/0.749` (caller already passes target_csv).
+- **wk_t L936**: 16-bit input truncated to uint8 (no scaling); `_redo` (L1067) unreachable — no UI/shortcut.
+- Main-thread network IO / PNG encoding in if_t & sf_t save / try-again / open-in-slider paths → UI freeze on slow shares.
+- Duplicated logic: overlay-draw (is_t, 4 copies), camera-scan worker (3 copies), annotation font/wrap (if_t, 3 copies).

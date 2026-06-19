@@ -17,6 +17,11 @@ def main():
     from b_t import BuilderUI
     from cm_t import DeployGUI
 
+    try:
+        import ctypes as _ct
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.DevTools")
+    except Exception:
+        pass
     root = tk.Tk()
     if getattr(sys, "frozen", False):
         root.title(Path(sys.executable).stem)

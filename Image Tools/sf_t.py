@@ -389,16 +389,18 @@ def _find_closest_col_value(per_col: "dict[str, list[dict]]", col: str,
 
 
 def _find_best_match(rows: list[dict], col: str, target: float) -> dict | None:
+    # NOTE: `target` is already in CSV units (callers pass target_csv, i.e.
+    # the sbw4/0.749 and mJ conversions are applied upstream in _to_csv_units).
+    # Do NOT re-convert here, or sbw4 would be divided by 0.749 twice.
     best = None
     best_diff = float("inf")
-    target_csv = target / SBW4_TRANSMISSION if col == "sbw4" else target
     for row in rows:
         raw = row.get(col, "")
         try:
             val = float(raw)
         except (ValueError, TypeError):
             continue
-        diff = abs(val - target_csv)
+        diff = abs(val - target)
         if diff < best_diff:
             best_diff = diff
             best = row

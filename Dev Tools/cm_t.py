@@ -736,26 +736,25 @@ class DeployGUI(ttk.Frame):
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
 
-        top = ttk.Frame(root)
+        top = ttk.LabelFrame(root, text="Root folder")
         top.pack(fill="x")
 
-        top.grid_columnconfigure(0, weight=0)
-        top.grid_columnconfigure(1, weight=1)
+        top_row = ttk.Frame(top)
+        top_row.pack(fill="x", padx=10, pady=8)
+        top_row.grid_columnconfigure(0, weight=1)
 
-        ttk.Label(top, text="Root folder:").grid(row=0, column=0, sticky="w")
+        self.programs_root_lbl = ttk.Label(top_row, text=str(_programs_root()), justify="left", anchor="w")
+        self.programs_root_lbl.grid(row=0, column=0, sticky="ew")
 
-        self.programs_root_lbl = ttk.Label(top, text=str(_programs_root()), justify="left", anchor="w")
-        self.programs_root_lbl.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Button(top_row, text="Change…", command=self._change_root).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(top_row, text="⚙ Set paths", command=self._open_set_paths).grid(row=0, column=2, padx=(4, 0))
 
-        ttk.Button(top, text="Change…", command=self._change_root).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(top, text="⚙ Set paths", command=self._open_set_paths).grid(row=0, column=3, padx=(4, 0))
-
-        top.bind("<Configure>", self._update_programs_root_wraplength)
+        top_row.bind("<Configure>", self._update_programs_root_wraplength)
         self.after(0, self._update_programs_root_wraplength)
 
         body = ttk.Frame(root)
         body.pack(fill="x", pady=(10, 6))
-        body.configure(height=260)
+        body.configure(height=320)
         body.pack_propagate(False)
 
         left = ttk.LabelFrame(body, text="Select programs + version")
@@ -792,23 +791,27 @@ class DeployGUI(ttk.Frame):
         actions = ttk.Frame(root)
         actions.pack(fill="x", pady=(6, 0))
 
+        # Group 3 — copy (packed right first so expand can fill the middle)
+        self.copy_btn = ttk.Button(actions, text="Copy", command=self._on_copy)
+        self.copy_btn.pack(side="right")
+        self.readme_btn = ttk.Button(actions, text="Copy ReadMe Only", command=self._on_copy_readme_only)
+        self.readme_btn.pack(side="right", padx=(0, 4))
+        ttk.Frame(actions, width=16).pack(side="right")
+
         # Group 1 — selection
         ttk.Button(actions, text="Select All", command=self._select_all_programs).pack(side="left")
         ttk.Button(actions, text="Select New", command=self._select_new_programs).pack(side="left", padx=(4, 0))
         ttk.Button(actions, text="Clear", command=self._clear_programs).pack(side="left", padx=(4, 0))
         ttk.Button(actions, text="Refresh", command=self._refresh).pack(side="left", padx=(4, 0))
 
-        # Group 2 — fix + deploy (gap before)
-        ttk.Button(actions, text="Fix", command=self._on_fix).pack(side="left", padx=(20, 0))
-        self.internal_btn = ttk.Button(actions, text="Deploy Libraries", command=self._on_deploy_internal)
+        # Group 2 — fix + deploy (centered between group 1 and group 3)
+        _center = ttk.Frame(actions)
+        _center.pack(side="left", expand=True, fill="x")
+        _fix_row = ttk.Frame(_center)
+        ttk.Button(_fix_row, text="Fix", command=self._on_fix).pack(side="left")
+        self.internal_btn = ttk.Button(_fix_row, text="Deploy Libraries", command=self._on_deploy_internal)
         self.internal_btn.pack(side="left", padx=(4, 0))
-
-        # Group 3 — copy (gap before, packed right-to-left)
-        self.copy_btn = ttk.Button(actions, text="Copy", command=self._on_copy)
-        self.copy_btn.pack(side="right")
-        self.readme_btn = ttk.Button(actions, text="Copy ReadMe Only", command=self._on_copy_readme_only)
-        self.readme_btn.pack(side="right", padx=(0, 4))
-        ttk.Frame(actions, width=16).pack(side="right")
+        _fix_row.pack(expand=True)
 
         prog_frame = ttk.Frame(root)
         prog_frame.pack(fill="x", pady=(4, 0))
@@ -1300,7 +1303,7 @@ class DeployGUI(ttk.Frame):
 
         log(f"[{program_name}] Version: {version_name}")
         log(f"[{program_name}] EXE: {src_exe.name}")
-        log(f"[{program_name}] ReadMe: {src_readme.name}")
+        log(f"[{program_name}] ReadMe: {src_readme.name if src_readme else '(none — skipped)'}")
         log(f"[{program_name}] Extra files: {[x.name for x in src_extras]}")
         log(f"[{program_name}] PY files: {[x.name for x in src_py_files]}")
 
@@ -1309,9 +1312,19 @@ class DeployGUI(ttk.Frame):
 
         for dst_root in destination_roots:
             target_dir = dst_root / program_name
-            target_dir.mkdir(parents=True, exist_ok=True)
-            archive_dir = target_dir / "archive"
-            archive_dir.mkdir(parents=True, exist_ok=True)
+            # Create the program folder if it doesn't exist yet (mkdir -p). Only a
+            # genuinely unreachable destination (drive not mounted / network down)
+            # fails here — then skip THIS destination and continue with the others,
+            # instead of stalling or aborting the whole copy.
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                archive_dir = target_dir / "archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                log(f"[{program_name}] SKIP — destination not accessible: {dst_root} ({e})")
+                flog("skipped", str(dst_root), "not accessible")
+                stats["exe_failed"] += 1
+                continue
             _fix_archive_dir(archive_dir, log)
 
             log(f"[{program_name}] → {target_dir}")
@@ -1379,6 +1392,9 @@ class DeployGUI(ttk.Frame):
             # ── Kopíruj nový .exe ────────────────────────────────────
             dst_exe = target_dir / f"{program_name} {ver}.exe"
             try:
+                # Logged BEFORE the copy so a stall (slow/flaky scratch) is visible:
+                # if the log stops on this line, the copy itself is hanging.
+                log(f"[{program_name}] Copying EXE ({src_exe.stat().st_size // 1024} KB) → {dst_exe.name} …")
                 shutil.copy2(src_exe, dst_exe)
                 log(f"[{program_name}] Copied EXE -> {dst_exe.name}")
                 flog("copied", src_exe.name, str(dst_exe.relative_to(dst_root)))
@@ -1484,34 +1500,44 @@ class DeployGUI(ttk.Frame):
 
         dist_root = _dist_root()
         def worker():
-            for src_dir in selected_programs:
-                program_dir = dist_root / src_dir.name
-                try:
-                    # Search: version_folder → program_dir → scratch/program_name
-                    src_readme = None
-                    version_folders = list_versions(program_dir)
-                    search_dirs = (version_folders[:1] if version_folders else []) + [program_dir]
-                    for dst_root in selected_roots:
-                        search_dirs.append(dst_root / program_dir.name)
-                    for _d in search_dirs:
-                        try:
-                            src_readme = find_readme_or_raise(_d, program_dir.name)
-                            break
-                        except FileNotFoundError:
-                            pass
-                    if src_readme is None:
-                        self.after(0, self._log, f"[{program_dir.name}] WARNING: ReadMe not found — skipped")
-                        continue
-                    for dst_root in selected_roots:
-                        target_dir = dst_root / program_dir.name
-                        target_dir.mkdir(parents=True, exist_ok=True)
-                        dst_readme = target_dir / src_readme.name
-                        shutil.copy2(src_readme, dst_readme)
-                        self.after(0, self._log, f"[{program_dir.name}] ReadMe copied -> {dst_readme}")
-                except Exception as e:
-                    self.after(0, self._log, f"[{program_dir.name}] ERROR: {e}")
-            self.after(0, self._log, "\nDone.")
-            self.after(0, self._set_busy, False)
+            try:
+                for src_dir in selected_programs:
+                    program_dir = dist_root / src_dir.name
+                    try:
+                        # Search: version_folder → program_dir → scratch/program_name
+                        src_readme = None
+                        version_folders = list_versions(program_dir)
+                        search_dirs = (version_folders[:1] if version_folders else []) + [program_dir]
+                        for dst_root in selected_roots:
+                            search_dirs.append(dst_root / program_dir.name)
+                        for _d in search_dirs:
+                            try:
+                                src_readme = find_readme_or_raise(_d, program_dir.name)
+                                break
+                            except FileNotFoundError:
+                                pass
+                        if src_readme is None:
+                            self.after(0, self._log, f"[{program_dir.name}] WARNING: ReadMe not found — skipped")
+                            continue
+                        for dst_root in selected_roots:
+                            try:
+                                if not dst_root.exists():
+                                    self.after(0, self._log, f"[{program_dir.name}] SKIP — not accessible: {dst_root}")
+                                    continue
+                            except OSError:
+                                self.after(0, self._log, f"[{program_dir.name}] SKIP — not accessible: {dst_root}")
+                                continue
+                            target_dir = dst_root / program_dir.name
+                            target_dir.mkdir(parents=True, exist_ok=True)
+                            dst_readme = target_dir / src_readme.name
+                            shutil.copy2(src_readme, dst_readme)
+                            self.after(0, self._log, f"[{program_dir.name}] ReadMe copied -> {dst_readme}")
+                    except Exception as e:
+                        self.after(0, self._log, f"[{program_dir.name}] ERROR: {e}")
+                self.after(0, self._log, "\nDone.")
+            finally:
+                # Always re-enable the buttons, even if a copy hung-then-failed.
+                self.after(0, self._set_busy, False)
 
         threading.Thread(target=worker, daemon=True).start()
 

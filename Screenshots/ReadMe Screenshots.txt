@@ -1,11 +1,11 @@
-Screenshots v2.0.3 — Information
-Created by Jan Moučka, ELI Beamlines
+﻿Screenshots — Information
+Created by Jan Moučka, ELI Laser
 
-Bugs / suggestions: jan.moucka@eli-beams.eu
+Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
 
 Screenshot capture utility for archiving camera images and monitor
-screenshots from ELI Beamlines experiment sessions.
+screenshots from ELI Laser experiment sessions.
 
 
 =================================================================

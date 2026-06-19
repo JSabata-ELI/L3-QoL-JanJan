@@ -1,5 +1,5 @@
-Image Finder (python script) — Information
-Created by Jan Moučka, ELI-Beamlines
+﻿Image Finder (python script) — Information
+Created by Jan Moučka, ELI Laser
 ---------------------------------
 Do you want to calibrate some of the energy detectors?
 
@@ -13,4 +13,4 @@ Calibration tool
   new_offset        = offset1 * average_cal_factor
   int_multiplicator1 == 1 -> stays 1, else * average_cal_factor
 
-If you have suggestions for improvement or encounter some bugs, please let me know - jan.moucka@eli-beams.eu
+If you have suggestions for improvement or encounter some bugs, please let me know - jan.moucka@eli-laser.eu

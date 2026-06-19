@@ -1041,6 +1041,11 @@ QTableWidget::item:selected:!active {
 
 
 def main():
+    try:
+        import ctypes as _ct
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Calibrations")
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     win = CalibrationTable()
     win.show()

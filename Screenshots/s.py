@@ -2,6 +2,7 @@
 import os
 import sys
 import re
+import json
 import shutil
 import socket
 import threading
@@ -1122,7 +1123,9 @@ class ToolTip:
         self._tip = tk.Toplevel(self.widget)
         self._tip.overrideredirect(True)
         self._tip.attributes("-topmost", True)
-        lbl = ttk.Label(self._tip, text=txt, padding=(8, 5))
+        lbl = tk.Label(self._tip, text=txt, bg="#ffffcc", fg="#333333",
+                       relief="solid", borderwidth=1, padx=8, pady=4,
+                       font=("Segoe UI", 9))
         lbl.pack()
         self._position()
 
@@ -2096,6 +2099,11 @@ class PreviewWindow(tk.Toplevel):
 # ---------------- App ----------------
 class App(tk.Tk):
     def __init__(self):
+        try:
+            import ctypes as _ct
+            _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Screenshots")
+        except Exception:
+            pass
         super().__init__()
         if getattr(sys, "frozen", False):
             self.title(Path(sys.executable).stem)
@@ -2168,6 +2176,14 @@ class App(tk.Tk):
         self._preset_mon_ref: dict[int, int] = {}
         self._preset_all_screens_ref: int = 0
         self._preset_cached_monitors: dict[str, list[int]] = {}  # preset_name → monitory zjištěné při _preset_add
+        self._custom_presets: dict[str, dict] = {}
+        _cp_path = self._custom_presets_path()
+        if _cp_path.exists():
+            try:
+                _raw = json.loads(_cp_path.read_text(encoding="utf-8"))
+                self._custom_presets = dict(_raw)
+            except Exception:
+                pass
 
         self.camera_vars: dict[str, tk.BooleanVar] = {}
         for _cat, cams in CAM_CATEGORIES.items():
@@ -2486,56 +2502,56 @@ class App(tk.Tk):
         top_row.columnconfigure(0, weight=1)
         top_row.columnconfigure(1, weight=0)
 
-        dest_box = ttk.LabelFrame(top_row, text="Destination", padding=(8,4))
+        dest_box = ttk.LabelFrame(top_row, text="Settings", padding=(8,4))
         dest_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         dest_box.columnconfigure(0, weight=1)
         dest_box.grid_columnconfigure(0, weight=1)
         dest_box.grid_columnconfigure(1, weight=0)
         dest_box.grid_columnconfigure(2, weight=0)
         dest_box.grid_columnconfigure(3, weight=0)
-        ttk.Entry(dest_box, textvariable=self.dest_dir, width=10).grid(row=0, column=0, columnspan=4, sticky="we")
+        ttk.Label(dest_box, text="Destination", font=("Segoe UI", 8), foreground="#555").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        ttk.Entry(dest_box, textvariable=self.dest_dir, width=10).grid(row=1, column=0, columnspan=4, sticky="we")
         _dest_btn_frame = ttk.Frame(dest_box)
-        _dest_btn_frame.grid(row=0, column=0, columnspan=4, sticky="e")
+        _dest_btn_frame.grid(row=1, column=0, columnspan=4, sticky="e")
         ttk.Button(_dest_btn_frame, text="...", width=4, command=self.pick_dest).pack(side="left")
         ttk.Button(_dest_btn_frame, text="📂", width=4, command=self.open_dest).pack(side="left", padx=(4, 0))
-        ttk.Label(dest_box, textvariable=self._name_label_var).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(dest_box, textvariable=self._name_label_var).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self._run_name_entry = ttk.Entry(dest_box, textvariable=self.run_name_var, width=10)
-        self._run_name_entry.grid(row=2, column=0, sticky="we")
+        self._run_name_entry.grid(row=3, column=0, sticky="we")
         self._run_name_entry.bind("<Control-BackSpace>", lambda e: self._ctrl_backspace(e))
-        ttk.Button(dest_box, text="Copy", command=self.on_copy).grid(row=2, column=1, padx=(6, 0))
-        ttk.Button(dest_box, text="Labels", command=self.on_labels).grid(row=2, column=2, padx=(4, 0))
-        ttk.Button(dest_box, text="Detail", command=self.on_detail).grid(row=2, column=3, padx=(4, 0))
-        ttk.Checkbutton(dest_box, text="Preview", variable=self._preview_enabled).grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Button(dest_box, text="Copy", command=self.on_copy).grid(row=3, column=1, padx=(6, 0))
+        ttk.Button(dest_box, text="Labels", command=self.on_labels).grid(row=3, column=2, padx=(4, 0))
+        ttk.Button(dest_box, text="Detail", command=self.on_detail).grid(row=3, column=3, padx=(4, 0))
+        ttk.Checkbutton(dest_box, text="Preview", variable=self._preview_enabled).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         # Auto-copy řádek
         auto_row = ttk.Frame(dest_box)
-        auto_row.grid(row=4, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        auto_row.grid(row=5, column=0, columnspan=4, sticky="we", pady=(6, 0))
         ttk.Label(auto_row, text="Auto every").pack(side="left")
         self._auto_interval_var = tk.IntVar(value=60)
         ttk.Spinbox(auto_row, from_=5, to=3600, textvariable=self._auto_interval_var,
                     width=6).pack(side="left", padx=(4, 2))
         ttk.Label(auto_row, text="s  max").pack(side="left")
         self._auto_cycles_var = tk.IntVar(value=0)
-        ttk.Spinbox(auto_row, from_=0, to=999, textvariable=self._auto_cycles_var,
-                    width=5).pack(side="left", padx=(4, 2))
-        ttk.Label(auto_row, text="cycles (0=∞)").pack(side="left", padx=(0, 8))
+        _cycles_sb = ttk.Spinbox(auto_row, from_=0, to=999, textvariable=self._auto_cycles_var,
+                                  width=5)
+        _cycles_sb.pack(side="left", padx=(4, 2))
+        ToolTip(_cycles_sb, lambda: "0 = ∞ cycles")
+        ttk.Label(auto_row, text="cycles").pack(side="left", padx=(0, 8))
         self._auto_btn = ttk.Button(auto_row, text="▶ Start auto",
                                      command=self._toggle_auto_copy)
         self._auto_btn.pack(side="left")
+        self._live_btn = ttk.Button(auto_row, text="⏺ Start live",
+                                    command=self._toggle_live)
+        self._live_btn.pack(side="left", padx=(6, 0))
         self._auto_status_var = tk.StringVar(value="")
         ttk.Label(auto_row, textvariable=self._auto_status_var,
                   foreground="gray", font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
-
-        # Live mód řádek
-        live_row = ttk.Frame(dest_box)
-        live_row.grid(row=5, column=0, columnspan=4, sticky="we", pady=(4, 0))
-        ttk.Label(live_row, text="Live:").pack(side="left")
-        self._live_btn = ttk.Button(live_row, text="⏺ Start live",
-                                    command=self._toggle_live)
-        self._live_btn.pack(side="left", padx=(6, 0))
         self._live_status_var = tk.StringVar(value="")
-        ttk.Label(live_row, textvariable=self._live_status_var,
-                  foreground="gray", font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
+        ttk.Label(auto_row, textvariable=self._live_status_var,
+                  foreground="gray", font=("Segoe UI", 8)).pack(side="left", padx=(4, 0))
+        ttk.Button(auto_row, text="Clear all", command=self._clear_all_selections).pack(side="right", padx=(8, 0))
+        ttk.Button(auto_row, text="Config presets", command=self._open_preset_manager).pack(side="right", padx=(4, 0))
 
         src_box = ttk.LabelFrame(top_row, text="Source", padding=6)
         src_box.grid(row=0, column=1, sticky="nsew")
@@ -2583,19 +2599,17 @@ class App(tk.Tk):
         presets_wrap.grid_propagate(False)
         presets_wrap.configure(width=_PRESET_FIXED_W)
 
-        presets_inner = ttk.Frame(presets_wrap)
-        presets_inner.pack(anchor="w")
-        preset_names = list(PRESETS.keys())
+        self._presets_inner = ttk.Frame(presets_wrap)
+        self._presets_inner.pack(anchor="w")
+        self._preset_names = list(PRESETS.keys()) + [k for k in self._custom_presets if k not in PRESETS]
 
-        clear_row = ttk.Frame(presets_wrap)
-        clear_row.pack(fill="x", pady=(0, 4))
-        ttk.Button(clear_row, text="Clear all", command=self._clear_all_selections).pack(side="left")
-
-        for name in preset_names:
-            btn = ttk.Button(presets_inner, text=name, style="Preset.TButton",
+        _all_presets_dict = {**PRESETS, **self._custom_presets}  # custom overrides built-in
+        for name in self._preset_names:
+            btn = ttk.Button(self._presets_inner, text=name, style="Preset.TButton",
                              command=lambda n=name: self.toggle_preset(n))
+            _cams = _all_presets_dict.get(name, {}).get("cams", [])
+            ToolTip(btn, lambda c=_cams: "\n".join(c) if c else "No cameras")
             btn.update_idletasks()
-            btn_w = btn.winfo_reqwidth()
             btn.configure(width=0)
             btn.grid_propagate(False)
             self.preset_buttons[name] = btn
@@ -2606,16 +2620,17 @@ class App(tk.Tk):
             for b in self.preset_buttons.values():
                 b.grid_forget()
             cols = max(1, min(cols, 6))
-            # Zjisti maximální šířku tlačítka v normálním fontu
             self.update_idletasks()
             max_w = max((b.winfo_reqwidth() for b in self.preset_buttons.values()), default=80)
             for c in range(cols):
-                presets_inner.columnconfigure(c, minsize=max_w + 6, weight=0)
-            for i, n in enumerate(preset_names):
+                self._presets_inner.columnconfigure(c, minsize=max_w + 6, weight=0)
+            for i, n in enumerate(self._preset_names):
                 r = i // cols
                 c = i % cols
                 self.preset_buttons[n].grid(row=r, column=c, sticky="we", padx=(0, 6), pady=(0, 4))
             self._refresh_preset_button_styles()
+
+        self._place_presets_fn = _place_presets
 
         def _refresh_presets_layout():
             _place_presets(6)
@@ -2657,7 +2672,7 @@ class App(tk.Tk):
         self._prog_label_widget.pack_forget()
 
         # LEFT: Diagnostics
-        diag = ttk.LabelFrame(left, text="Diagnostics (copyable)", padding=(8, 6))
+        diag = ttk.LabelFrame(left, text="Diagnostics", padding=(8, 6))
         diag.pack(fill="both", expand=True, pady=(10, 0))
         xsb = ttk.Scrollbar(diag, orient="horizontal")
         xsb.pack(side="bottom", fill="x")
@@ -2890,7 +2905,7 @@ class App(tk.Tk):
             btn.configure(style="PresetOn.TButton" if n in self._active_presets else "Preset.TButton")
 
     def _preset_add(self, name: str):
-        data = PRESETS.get(name, {})
+        data = self._custom_presets.get(name) or PRESETS.get(name, {})
         cams = list(data.get("cams", []))
         self._programmatic_cam_update = True
         try:
@@ -2913,7 +2928,7 @@ class App(tk.Tk):
         self._apply_monitor_effective()
 
     def _preset_remove(self, name: str):
-        data = PRESETS.get(name, {})
+        data = self._custom_presets.get(name) or PRESETS.get(name, {})
         cams = list(data.get("cams", []))
         self._programmatic_cam_update = True
         try:
@@ -2949,6 +2964,208 @@ class App(tk.Tk):
             self._update_category_check(cat)
         self._sync_sections_to_selected_cams()
         self._update_name_label()
+
+    def _custom_presets_path(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent / "custom_presets.json"
+        return Path(__file__).resolve().parent / "custom_presets.json"
+
+    def _save_custom_presets(self):
+        try:
+            self._custom_presets_path().write_text(
+                json.dumps(self._custom_presets, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _rebuild_preset_buttons(self):
+        for btn in self.preset_buttons.values():
+            btn.destroy()
+        self.preset_buttons.clear()
+        self._preset_names = list(PRESETS.keys()) + [k for k in self._custom_presets if k not in PRESETS]
+        _all = {**PRESETS, **self._custom_presets}  # custom overrides built-in
+        for name in self._preset_names:
+            btn = ttk.Button(self._presets_inner, text=name, style="Preset.TButton",
+                             command=lambda n=name: self.toggle_preset(n))
+            _cams = _all.get(name, {}).get("cams", [])
+            ToolTip(btn, lambda c=_cams: "\n".join(c) if c else "No cameras")
+            btn.update_idletasks()
+            btn.configure(width=0)
+            btn.grid_propagate(False)
+            self.preset_buttons[name] = btn
+        self._place_presets_fn(6)
+        self._refresh_preset_button_styles()
+
+    def _open_preset_manager(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Preset Manager")
+        dlg.resizable(True, True)
+        dlg.geometry("800x540")
+        dlg.grab_set()
+
+        all_cams = [cam for cams in CAM_CATEGORIES.values() for cam in cams]
+        cam_vars: dict[str, tk.BooleanVar] = {c: tk.BooleanVar(value=False) for c in all_cams}
+        _current_names: list[str] = []
+
+        def _all_names() -> list[str]:
+            return list(PRESETS.keys()) + [k for k in self._custom_presets if k not in PRESETS]
+
+        def _effective_cams(name: str) -> set[str]:
+            data = self._custom_presets.get(name) or PRESETS.get(name, {})
+            return set(data.get("cams", []))
+
+        # ── LEFT: Treeview preset list ──────────────────────────────────────
+        left = ttk.LabelFrame(dlg, text="Presets", padding=6)
+        left.pack(side="left", fill="y", padx=(8, 4), pady=8)
+
+        tree_frame = ttk.Frame(left)
+        tree_frame.pack(fill="both", expand=True)
+        tree_sb = ttk.Scrollbar(tree_frame, orient="vertical")
+        tree = ttk.Treeview(tree_frame, columns=("label",), show="headings",
+                            selectmode="browse", yscrollcommand=tree_sb.set)
+        tree.heading("label", text="Preset")
+        tree.column("label", width=175, anchor="w")
+        tree_sb.config(command=tree.yview)
+        tree_sb.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+
+        # ── RIGHT: name + camera grid ────────────────────────────────────────
+        right = ttk.Frame(dlg)
+        right.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=8)
+
+        ttk.Label(right, text="Name:").pack(anchor="w")
+        name_var = tk.StringVar()
+        ttk.Entry(right, textvariable=name_var, width=30).pack(fill="x")
+
+        ttk.Label(right, text="Cameras:").pack(anchor="w", pady=(8, 2))
+
+        cam_area = ttk.Frame(right)
+        cam_area.pack(fill="both", expand=True)
+        cam_vsb = ttk.Scrollbar(cam_area, orient="vertical")
+        cam_canvas = tk.Canvas(cam_area, highlightthickness=0, yscrollcommand=cam_vsb.set)
+        cam_vsb.config(command=cam_canvas.yview)
+        cam_vsb.pack(side="right", fill="y")
+        cam_canvas.pack(side="left", fill="both", expand=True)
+        cam_inner = ttk.Frame(cam_canvas)
+        _cam_win = cam_canvas.create_window((0, 0), window=cam_inner, anchor="nw")
+
+        CAM_COLS = 3
+        for i, cam in enumerate(all_cams):
+            r, c = divmod(i, CAM_COLS)
+            ttk.Checkbutton(cam_inner, text=cam, variable=cam_vars[cam]).grid(
+                row=r, column=c, sticky="w", padx=(4, 14), pady=1)
+
+        def _update_scroll_region(*_):
+            cam_canvas.configure(scrollregion=cam_canvas.bbox("all"))
+            cam_canvas.itemconfigure(_cam_win, width=cam_canvas.winfo_width())
+
+        cam_inner.bind("<Configure>", _update_scroll_region)
+        cam_canvas.bind("<Configure>", _update_scroll_region)
+        cam_canvas.bind("<MouseWheel>",
+                        lambda e: cam_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        cam_inner.bind("<MouseWheel>",
+                       lambda e: cam_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+
+        # ── Callbacks ────────────────────────────────────────────────────────
+        del_text = tk.StringVar(value="Delete")
+        del_btn = None  # set after on_delete is defined
+
+        def _refresh_tree(select_name: str | None = None):
+            nonlocal _current_names
+            _current_names = _all_names()
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for i, nm in enumerate(_current_names):
+                overridden = nm in self._custom_presets
+                is_builtin = nm in PRESETS
+                suffix = " *" if (is_builtin and overridden) else (" +" if not is_builtin else "")
+                tree.insert("", "end", iid=str(i), values=(nm + suffix,))
+            if select_name and select_name in _current_names:
+                iid = str(_current_names.index(select_name))
+                tree.selection_set(iid)
+                tree.see(iid)
+
+        def _selected_name() -> str | None:
+            sel = tree.selection()
+            if not sel:
+                return None
+            idx = int(sel[0])
+            return _current_names[idx] if idx < len(_current_names) else None
+
+        def _load(preset_name: str):
+            name_var.set(preset_name)
+            for v in cam_vars.values():
+                v.set(False)
+            for cam in _effective_cams(preset_name):
+                if cam in cam_vars:
+                    cam_vars[cam].set(True)
+            if preset_name in PRESETS:
+                del_text.set("Reset to default")
+                if del_btn:
+                    del_btn.state(["!disabled"] if preset_name in self._custom_presets else ["disabled"])
+            else:
+                del_text.set("Delete")
+                if del_btn:
+                    del_btn.state(["!disabled"])
+
+        def on_select():
+            nm = _selected_name()
+            if nm:
+                _load(nm)
+
+        def on_new():
+            tree.selection_set([])
+            name_var.set("")
+            for v in cam_vars.values():
+                v.set(False)
+            del_text.set("Delete")
+            if del_btn:
+                del_btn.state(["disabled"])
+
+        def on_save():
+            n = name_var.get().strip()
+            if not n:
+                return
+            old_name = _selected_name()
+            if old_name and old_name not in PRESETS and old_name != n and old_name in self._custom_presets:
+                del self._custom_presets[old_name]
+                self._active_presets.discard(old_name)
+            self._custom_presets[n] = {"cams": [c for c, v in cam_vars.items() if v.get()], "mons": None}
+            self._save_custom_presets()
+            self._rebuild_preset_buttons()
+            _refresh_tree(select_name=n)
+            _load(n)
+
+        def on_delete():
+            nm = _selected_name()
+            if not nm or nm not in self._custom_presets:
+                return
+            self._active_presets.discard(nm)
+            del self._custom_presets[nm]
+            self._save_custom_presets()
+            self._rebuild_preset_buttons()
+            if nm in PRESETS:
+                _refresh_tree(select_name=nm)
+                _load(nm)
+            else:
+                _refresh_tree()
+                on_new()
+
+        _refresh_tree()
+        tree.bind("<<TreeviewSelect>>", lambda *_: on_select())
+
+        # ── Action buttons ───────────────────────────────────────────────────
+        btn_row = ttk.Frame(right)
+        btn_row.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_row, text="New", command=on_new).pack(side="left")
+        ttk.Button(btn_row, text="Save", command=on_save).pack(side="left", padx=(6, 0))
+        del_btn = ttk.Button(btn_row, textvariable=del_text, command=on_delete)
+        del_btn.pack(side="left", padx=(6, 0))
+        del_btn.state(["disabled"])
+        ttk.Button(btn_row, text="Close", command=dlg.destroy).pack(side="right")
+
+        ttk.Label(right, text="* modified built-in   + custom", foreground="#888",
+                  font=("Segoe UI", 7)).pack(anchor="w", pady=(4, 0))
 
     def _selected_cameras(self) -> list[str]:
         return [name for name, var in self.camera_vars.items() if var.get()]
@@ -3114,9 +3331,9 @@ class App(tk.Tk):
     def _update_name_label(self):
         total = self._planned_output_count(self._selected_monitors(), self._selected_cameras())
         if total <= 1:
-            self._name_label_var.set("File name (if empty => timestamp only):")
+            self._name_label_var.set("File name:")
         else:
-            self._name_label_var.set("Folder name (if empty => timestamp only):")
+            self._name_label_var.set("Folder name:")
         self._refresh_selected_cams_table()
 
     def _refresh_selected_cams_table(self):

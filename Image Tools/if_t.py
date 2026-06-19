@@ -4707,7 +4707,7 @@ class ImageFinderWidget(QWidget):
                 img_disp_ba = PilImage.fromarray(norm(diff_ba))
                 self._compare_sig.done.emit(img_disp_ab, img_disp_ba, diff_ab, diff_ba)
             except Exception as e:
-                self._load_sig.error.emit(f"{type(e).__name__}: {e}")
+                self._compare_sig.error.emit(f"{type(e).__name__}: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5156,13 +5156,6 @@ def _section_label(text: str) -> QLabel:
     lbl = QLabel(text.upper())
     lbl.setStyleSheet("font-size:10px;color:#888;font-weight:700;letter-spacing:1px;")
     return lbl
-
-def _NoScrollCalendar():
-    """Return a plain QCalendarWidget (no scroll noise)."""
-    cal = QCalendarWidget()
-    cal.setGridVisible(False)
-    return cal
-
 
 # ── MULTI-DAY PREVIEW WINDOW ──────────────────────────────────────────────────
 class MultiDayPreviewWindow(QWidget):
