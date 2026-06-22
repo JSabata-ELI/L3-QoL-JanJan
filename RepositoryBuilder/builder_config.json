@@ -15,7 +15,7 @@
         }
       ],
 
-    "start_date": "2026-01-19",
+    "start_date": "2026-06-14",
     "pvs": {
         "waveplate": "L3-PFWP6-MTR03-1:RawPos",
         "ptm1": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",

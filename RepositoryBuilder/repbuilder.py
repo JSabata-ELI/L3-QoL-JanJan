@@ -31,6 +31,20 @@ CHUNK_SIZE_NS = int(3600 * 1e9)
 
 SAMPLE_HOLD_MIN_GAP_MS = 137
 
+SUSPICIOUS_DETECTOR_ALIASES = [
+    "sbw4",
+    "ptm1",
+    "pap1",
+]
+
+SUSPICIOUS_CONTROL_ALIASES = [
+    "waveplate",
+    "ln36",
+]
+
+SUSPICIOUS_PCM2_ALIAS = "pcm2"
+
+
 print(CONFIG_FILE)
 print(CONFIG_FILE.exists())
 
@@ -377,6 +391,45 @@ def filter_master_multiple_rows(
 
     return filtered
 
+def remove_ln36_only_rows(
+    rows: list,
+    ln36_pv: str = "ln36"
+) -> list:
+    """
+    Remove rows where the only change compared to the previous row
+    is ln36 (and naturally timestamp).
+
+    Keeps the first row and removes the newer duplicate row.
+    """
+
+    if len(rows) < 2:
+        return rows
+
+    filtered = [rows[0]]
+
+    for ts_ns, row_dict in rows[1:]:
+
+        _prev_ts, prev_row = filtered[-1]
+
+        keys = set(prev_row.keys()) | set(row_dict.keys())
+
+        only_ln36_changed = True
+
+        for pv in keys:
+
+            if pv == ln36_pv:
+                continue
+
+            if prev_row.get(pv) != row_dict.get(pv):
+                only_ln36_changed = False
+                break
+
+        if only_ln36_changed:
+            continue
+
+        filtered.append((ts_ns, row_dict))
+
+    return filtered
 
 def apply_conditions(rows, conditions):
 
@@ -418,6 +471,106 @@ def apply_conditions(rows, conditions):
             filtered.append((ts_ns, row_dict))
 
     return filtered
+
+def values_equal(a, b):
+
+    if a is None and b is None:
+        return True
+
+    try:
+        if pd.isna(a) and pd.isna(b):
+            return True
+    except Exception:
+        pass
+
+    return a == b
+
+
+def values_changed(a, b):
+
+    return not values_equal(a, b)
+
+
+def get_alias_value(row_dict, alias):
+
+    pv_name = CONFIG["pvs"].get(alias)
+
+    if pv_name is None:
+        return None
+
+    if pv_name not in row_dict:
+        return None
+
+    value, _units = row_dict[pv_name]
+
+    return value
+
+
+def remove_suspicious_rows(rows: list) -> list:
+    """
+    Remove rows detected as fake/suspicious.
+
+    Rules copied from detect_suspicious.py:
+
+    Rule A:
+    - detector values sbw4, ptm1, pap1 are unchanged
+    - control values waveplate or ln36 changed
+    => remove current row
+
+    Rule B:
+    - pcm2 is exactly 0
+    => remove current row
+    """
+
+    if len(rows) < 2:
+        return rows
+
+    filtered = [rows[0]]
+    removed_count = 0
+
+    for ts_ns, row_dict in rows[1:]:
+
+        _prev_ts, prev_row = filtered[-1]
+
+        detectors_same = all(
+            values_equal(
+                get_alias_value(row_dict, alias),
+                get_alias_value(prev_row, alias)
+            )
+            for alias in SUSPICIOUS_DETECTOR_ALIASES
+        )
+
+        controls_changed = any(
+            values_changed(
+                get_alias_value(row_dict, alias),
+                get_alias_value(prev_row, alias)
+            )
+            for alias in SUSPICIOUS_CONTROL_ALIASES
+        )
+
+        if detectors_same and controls_changed:
+            removed_count += 1
+            continue
+
+        pcm2_value = get_alias_value(
+            row_dict,
+            SUSPICIOUS_PCM2_ALIAS
+        )
+
+        if (
+            pcm2_value is not None
+            and pcm2_value == 0
+        ):
+            removed_count += 1
+            continue
+
+        filtered.append((ts_ns, row_dict))
+
+    if removed_count:
+        print(f"Removed suspicious rows: {removed_count}")
+
+    return filtered
+
 
 def process_day(day):
 
@@ -499,6 +652,14 @@ def process_day(day):
         CONFIG.get("conditions", [])
     )
 
+    rows = remove_ln36_only_rows(
+        rows,
+        CONFIG["pvs"].get("ln36", "ln36")
+    )
+
+    rows = remove_suspicious_rows(
+        rows
+    )
 
     print(
         f"Downloading {day:%Y-%m-%d}"
@@ -591,14 +752,16 @@ today = datetime.now()
 
 current_day = start_day
 
-while current_day.date() < today.date():
+while current_day.date() <= today.date():
 
     process_day(current_day)
 
-    state["last_processed_day"] = (
-        current_day.strftime("%Y-%m-%d")
-    )
+    if current_day.date() < today.date():
 
-    save_state(state)
+        state["last_processed_day"] = (
+            current_day.strftime("%Y-%m-%d")
+        )
+
+        save_state(state)
 
     current_day += timedelta(days=1)
