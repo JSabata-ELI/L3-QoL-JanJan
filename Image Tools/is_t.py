@@ -5760,11 +5760,11 @@ class Viewer(QWidget):
 
         s_src  = _add_section("source",   "Source",           True)
         s_tl   = _add_section("timeline", "Timeline & Range", True)
+        s_pv   = _add_section("pv",       "PV Values",        True)
         s_save = _add_section("save",     "Save",             True)
         s_disp = _add_section("display",  "Image / Display",  False)
         s_ovl  = _add_section("overlays", "Overlays",         False)
         s_an   = _add_section("analysis", "Analysis",         False)
-        s_pv   = _add_section("pv",       "PV Values",        False)
 
         # ══════════════════ Section: SOURCE ═══════════════════════
         self.btn_date = QPushButton("Time window")

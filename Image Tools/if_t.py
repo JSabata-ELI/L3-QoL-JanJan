@@ -2816,12 +2816,23 @@ class ImageFinderWidget(QWidget):
         if ctrl and shift:
             anchor  = self._last_cal_click or d
             allowed = {i for i, cb in enumerate(self._wd_checks) if cb.isChecked()}
-            rng      = [x for x in self._date_range(anchor, d)
-                        if (x.dayOfWeek() - 1) in allowed]
-            rng_keys = {self._qkey(x) for x in rng}
-            keep = [x for x in cur if self._qkey(x) not in rng_keys]   # deselect overlap
-            add  = [x for x in rng if self._qkey(x) not in cur_keys]   # select the rest
-            new_dates = keep + add
+            rng     = [x for x in self._date_range(anchor, d)
+                       if (x.dayOfWeek() - 1) in allowed]
+            # XOR the gated range into the selection (so a repeat deselects what
+            # it selected) — but the anchor (the first click) is NEVER touched:
+            # click Mon then Ctrl+Shift Fri keeps Mon and adds Tue–Fri.
+            result = {self._qkey(x): x for x in cur}
+            akey   = self._qkey(anchor)
+            for x in rng:
+                k = self._qkey(x)
+                if k == akey:
+                    continue            # anchor is handled below — never toggled off
+                if k in result:
+                    del result[k]       # was selected → toggle off
+                else:
+                    result[k] = x       # was not selected → toggle on
+            result[akey] = anchor       # anchor always stays selected
+            new_dates = list(result.values())
         elif ctrl:
             if self._is_weekend(d):
                 self._log("Calendar: weekends can only be selected by a plain click.")
@@ -3847,6 +3858,8 @@ class ImageFinderWidget(QWidget):
                 return None, None
             real_h = ns_to_real_h(target_ns)
             folder_h = real_to_folder_h(real_h)
+            if not (0 <= folder_h <= 23):
+                return None, None   # maps outside this day's folders
             dt_eff = datetime(year, month, day_n, folder_h)
             cam_folder = self._build_target_path(dt_eff) / cam_name
             log(f"scan folder h={folder_h:02d}  {cam_folder}")
@@ -4008,7 +4021,11 @@ class ImageFinderWidget(QWidget):
 
                 if p is not None:
                     return p, h, _no_meta, "found"
-                return None, None, _no_meta, "not_found"
+                # The chosen window's hour has no folder/image for this camera —
+                # fall through to the CSV-guided + blind scan below instead of
+                # giving up, so a camera active in another hour is still found.
+                log("  TotalPower window had no image for this camera — trying CSV/blind scan")
+                raise _FallbackToBlindScan()
 
             except _FallbackToBlindScan:
                 pass   # no active windows — continue to blind scan below
@@ -4066,6 +4083,8 @@ class ImageFinderWidget(QWidget):
             if is_cancelled():
                 return None, None, _no_meta, "cancelled"
             folder_h = real_to_folder_h(real_h)
+            if not (0 <= folder_h <= 23):
+                continue   # maps to an adjacent day's folder — skip
             dt_eff   = datetime(year, month, day_n, folder_h)
             cam_folder = self._build_target_path(dt_eff) / cam_name
             exists = bc(lambda cf=cam_folder: cf.exists(), cancelled)
