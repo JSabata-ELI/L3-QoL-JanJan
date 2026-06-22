@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QLabel, QSlider, QPushButton, QFileDialog, QMessageBox, QProgressBar,
     QComboBox, QCheckBox, QDialog, QCalendarWidget, QDialogButtonBox, QFileSystemModel,
     QSpinBox, QFrame, QSizePolicy, QStyledItemDelegate, QAbstractItemView, QTreeView, QLineEdit,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout, QColorDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout, QColorDialog, QToolButton,
 )
 
 # ---------------- CONFIG ----------------
@@ -4918,6 +4918,73 @@ def _group_label(text: str) -> QLabel:
     lbl.setStyleSheet("font-size: 10px; color: #777; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; padding-top: 2px;")
     return lbl
 
+class CollapsibleSection(QWidget):
+    """Collapsible panel section: clickable header (left accent stripe + bold
+    UPPERCASE title + ▾/▸ arrow) over a body that hides/shows on toggle.
+
+    API:
+        sec = CollapsibleSection("Source", "source", expanded=True)
+        sec.body_layout.addWidget(...) / addLayout(...)
+        sec.set_expanded(bool)
+        sec.toggled -> Signal(key: str, expanded: bool)
+    """
+    toggled = Signal(str, bool)
+
+    _ACCENT = "#4a78c0"
+    _HEADER_QSS = (
+        "QToolButton {"
+        "  text-align: left; border: none;"
+        "  border-left: 3px solid %(accent)s; padding: 5px 6px;"
+        "  margin-top: 4px; font-weight: 700; font-size: 11px;"
+        "  letter-spacing: 1px; color: #333; background: transparent;"
+        "}"
+        "QToolButton:hover { background: #d8e8ff; }"
+    ) % {"accent": _ACCENT}
+
+    def __init__(self, title: str, key: str, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self._key = key
+        self._title = title
+        self._expanded = expanded
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._header = QToolButton()
+        self._header.setCheckable(True)
+        self._header.setChecked(expanded)
+        self._header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._header.setStyleSheet(self._HEADER_QSS)
+        self._header.clicked.connect(self._on_header_clicked)
+        lay.addWidget(self._header)
+
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(8, 2, 0, 6)
+        self.body_layout.setSpacing(4)
+        lay.addWidget(self.body)
+
+        self.body.setVisible(expanded)
+        self._update_header()
+
+    def _update_header(self):
+        arrow = "▾" if self._expanded else "▸"
+        # Escape '&' so QToolButton does not treat it as a mnemonic accelerator.
+        title = self._title.upper().replace("&", "&&")
+        self._header.setText(f"{arrow}  {title}")
+
+    def _on_header_clicked(self):
+        self.set_expanded(self._header.isChecked())
+        self.toggled.emit(self._key, self._expanded)
+
+    def set_expanded(self, expanded: bool):
+        self._expanded = bool(expanded)
+        self._header.setChecked(self._expanded)
+        self.body.setVisible(self._expanded)
+        self._update_header()
+
 class _DirItem:
     """Lazy node pro stromový model složek."""
     def __init__(self, path: Path, parent=None):
@@ -5612,6 +5679,35 @@ class Viewer(QWidget):
         self._overlay_square_color  = QColor(0, 200, 255, 230)
         self._overlay_square_thick  = 2
 
+    # ------------------------------------------------ collapsible UI state
+    _UI_STATE_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "slider_ui_state.json"
+
+    def _load_ui_state(self) -> dict:
+        try:
+            if self._UI_STATE_PATH.exists():
+                return json.loads(self._UI_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_ui_state(self):
+        try:
+            self._UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._UI_STATE_PATH.write_text(
+                json.dumps(self._ui_state, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _on_section_toggled(self, key: str, expanded: bool):
+        self._ui_state[key] = expanded
+        self._save_ui_state()
+
+    def _set_all_sections(self, expanded: bool):
+        for key, sec in self._sections.items():
+            sec.set_expanded(expanded)
+            self._ui_state[key] = expanded
+        self._save_ui_state()
+
     # ---------------------------------------------------------------- build UI
     def _build_ui(self):
         root = QHBoxLayout(self)
@@ -5636,8 +5732,41 @@ class Viewer(QWidget):
         llay.setContentsMargins(0, 0, 0, 0)
         llay.setSpacing(4)
 
-        # ── Group 1: Settings ──────────────────────────────────────
-        llay.addWidget(_group_label("Settings"))
+        # ── Collapsible sections scaffolding ───────────────────────
+        self._ui_state = self._load_ui_state()
+        self._sections: "dict[str, CollapsibleSection]" = {}
+
+        def _add_section(key, title, default_expanded):
+            expanded = bool(self._ui_state.get(key, default_expanded))
+            sec = CollapsibleSection(title, key, expanded)
+            sec.toggled.connect(self._on_section_toggled)
+            self._sections[key] = sec
+            llay.addWidget(sec)
+            return sec
+
+        _exp_row = QHBoxLayout()
+        _exp_row.setSpacing(4)
+        _btn_expand_all = QPushButton("Expand all")
+        _btn_expand_all.setToolTip("Expand all sections")
+        _btn_expand_all.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+        _btn_expand_all.clicked.connect(lambda: self._set_all_sections(True))
+        _btn_collapse_all = QPushButton("Collapse all")
+        _btn_collapse_all.setToolTip("Collapse all sections")
+        _btn_collapse_all.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+        _btn_collapse_all.clicked.connect(lambda: self._set_all_sections(False))
+        _exp_row.addWidget(_btn_expand_all)
+        _exp_row.addWidget(_btn_collapse_all)
+        llay.addLayout(_exp_row)
+
+        s_src  = _add_section("source",   "Source",           True)
+        s_tl   = _add_section("timeline", "Timeline & Range", True)
+        s_save = _add_section("save",     "Save",             True)
+        s_disp = _add_section("display",  "Image / Display",  False)
+        s_ovl  = _add_section("overlays", "Overlays",         False)
+        s_an   = _add_section("analysis", "Analysis",         False)
+        s_pv   = _add_section("pv",       "PV Values",        False)
+
+        # ══════════════════ Section: SOURCE ═══════════════════════
         self.btn_date = QPushButton("Time window")
         self.btn_date.setToolTip("Select a date and hour range to load images from")
         self.btn_date.clicked.connect(self.open_by_date)
@@ -5656,132 +5785,13 @@ class Viewer(QWidget):
             "Disabled automatically when you move the slider.")
         self._btn_auto_follow.toggled.connect(self._on_auto_follow_toggled)
         row = QHBoxLayout(); row.addWidget(self.btn_date); row.addWidget(self.btn_open)
-        llay.addLayout(row)
+        s_src.body_layout.addLayout(row)
         row_ref_follow = QHBoxLayout()
         row_ref_follow.addWidget(self.btn_refresh)
         row_ref_follow.addWidget(self._btn_auto_follow)
-        llay.addLayout(row_ref_follow)
-        self.btn_set_a = QPushButton("Set From"); self.btn_set_a.setEnabled(False)
-        self.btn_set_a.setToolTip("Set range start (From) to current position")
-        self.btn_set_a.clicked.connect(self.set_mark_a)
-        self.btn_set_b = QPushButton("Set To"); self.btn_set_b.setEnabled(False)
-        self.btn_set_b.setToolTip("Set range end (To) to current position")
-        self.btn_set_b.clicked.connect(self.set_mark_b)
-        self.btn_clear_marks = QPushButton("Clear"); self.btn_clear_marks.setEnabled(False)
-        self.btn_clear_marks.setToolTip("Clear From/To marks")
-        self.btn_clear_marks.clicked.connect(self.clear_marks)
-        row_marks = QHBoxLayout()
-        row_marks.addWidget(self.btn_set_a); row_marks.addWidget(self.btn_set_b); row_marks.addWidget(self.btn_clear_marks)
-        llay.addLayout(row_marks)
-        llay.addWidget(_hsep())
+        s_src.body_layout.addLayout(row_ref_follow)
 
-        # ── Group 2: Save & Marks ──────────────────────────────────
-        llay.addWidget(_group_label("Save & Marks"))
-        self.btn_save = QPushButton("Save Image"); self.btn_save.setEnabled(False)
-        self.btn_save.setToolTip("Save current image to disk")
-        self.btn_save.clicked.connect(self.save_current)
-        self.btn_save_range = QPushButton("Save Range"); self.btn_save_range.setEnabled(False)
-        self.btn_save_range.setToolTip("Save all images between Set From and Set To marks")
-        self.btn_save_range.clicked.connect(self.save_range)
-        row2a = QHBoxLayout()
-        row2a.addWidget(self.btn_save)
-        row2a.addWidget(self.btn_save_range)
-        llay.addLayout(row2a)
-        self.btn_send_workshop = QPushButton("➤ Workshop")
-        self.btn_send_workshop.setEnabled(False)
-        self.btn_send_workshop.setToolTip("Send current image to Workshop tab for editing")
-        self.btn_send_workshop.clicked.connect(self._send_to_workshop)
-        llay.addWidget(self.btn_send_workshop)
-        row2c = QHBoxLayout()
-        self.cb_save_overlay = QCheckBox("Save with overlay")
-        self.cb_save_overlay.setToolTip("When saving, burn overlays (cross/circle/square) into the image")
-        self.cb_save_overlay.setStyleSheet(_CHECKBOX_STYLE)
-        row2c.addWidget(self.cb_save_overlay)
-        self.save_around_n_sb = QSpinBox()
-        self.save_around_n_sb.setRange(0, 10000)
-        self.save_around_n_sb.setValue(0)
-        self.save_around_n_sb.setFixedWidth(48)
-        self.save_around_n_sb.setToolTip("Number of frames before and after current to save (0 = only current)")
-        row2c.addWidget(self.save_around_n_sb)
-        row2c.addWidget(QLabel("±"))
-        llay.addLayout(row2c)
-        self.cb_save_metadata_txt = QCheckBox("Save metadata .txt")
-        self.cb_save_metadata_txt.setToolTip("Also write a sidecar .txt file with the original image metadata")
-        self.cb_save_metadata_txt.setStyleSheet(_CHECKBOX_STYLE)
-        llay.addWidget(self.cb_save_metadata_txt)
-        self.cb_save_original = QCheckBox("Save original (unmodified)")
-        self.cb_save_original.setToolTip("When saving with default palette and no overlay, save the original unmodified file instead of skipping")
-        self.cb_save_original.setStyleSheet(_CHECKBOX_STYLE)
-        self.cb_save_original.setChecked(True)
-        llay.addWidget(self.cb_save_original)
-
-        llay.addWidget(_hsep())
-        llay.addWidget(_group_label("Timestamps"))
-        self.btn_save_ts = QPushButton("Save Timestamp")
-        self.btn_save_ts.setToolTip("Save current timestamp for cross-camera lookup. You can save more timestamps.")
-        self.btn_save_ts.setEnabled(False)
-        self.btn_save_ts.clicked.connect(self._save_current_timestamp)
-        self.btn_goto_ts = QPushButton("⇢ Go to Saved")
-        self.btn_goto_ts.setToolTip("Jump to nearest frame matching a saved timestamp")
-        self.btn_goto_ts.setEnabled(False)
-        self.btn_goto_ts.clicked.connect(self._goto_saved_timestamp)
-        self.btn_clear_ts = QPushButton("✕ Clear")
-        self.btn_clear_ts.setToolTip("Clear all saved timestamps")
-        self.btn_clear_ts.setEnabled(False)
-        self.btn_clear_ts.clicked.connect(self._clear_timestamps)
-        row_ts1 = QHBoxLayout()
-        row_ts1.addWidget(self.btn_save_ts)
-        row_ts1.addWidget(self.btn_goto_ts)
-        row_ts1.addWidget(self.btn_clear_ts)
-        llay.addLayout(row_ts1)
-        self.lbl_ts_status = QLabel("No timestamps saved.")
-        self.lbl_ts_status.setWordWrap(True)
-        self.lbl_ts_status.setStyleSheet("font-size: 10px; color: #555;")
-        llay.addWidget(self.lbl_ts_status)
-        llay.addWidget(_hsep())
-
-        # ── Group: PV Values ──────────────────────────────────────────────
-        pv_header_row = QHBoxLayout()
-        pv_header_row.addWidget(_group_label("PV Values"))
-        self._btn_pv_cfg = QPushButton("⚙")
-        self._btn_pv_cfg.setFixedWidth(26)
-        self._btn_pv_cfg.setToolTip("Select which PV channels to display")
-        self._btn_pv_cfg.clicked.connect(self._open_pv_config)
-        pv_header_row.addWidget(self._btn_pv_cfg)
-        self._btn_pv_refresh = QPushButton("↻")
-        self._btn_pv_refresh.setFixedWidth(26)
-        self._btn_pv_refresh.setToolTip("Refresh PV values for current frame")
-        self._btn_pv_refresh.clicked.connect(self._pv_force_refresh)
-        pv_header_row.addWidget(self._btn_pv_refresh)
-        self._btn_pv_overlay_settings = QPushButton("⚙ overlay")
-        self._btn_pv_overlay_settings.setToolTip("PV overlay display settings")
-        self._btn_pv_overlay_settings.clicked.connect(self._open_pv_overlay_settings)
-        pv_header_row.addWidget(self._btn_pv_overlay_settings)
-        pv_header_row.addStretch(1)
-        llay.addLayout(pv_header_row)
-
-        self._pv_table = QTableWidget(0, 2)
-        self._pv_table.setHorizontalHeaderLabels(["PV", "Value"])
-        self._pv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self._pv_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._pv_table.verticalHeader().setVisible(False)
-        self._pv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._pv_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self._pv_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._pv_table.setMaximumHeight(120)
-        self._pv_table.setVisible(False)
-        self._pv_table.setStyleSheet("font-size: 11px;")
-        llay.addWidget(self._pv_table)
-
-        self._pv_no_pv_lbl = QLabel("No PVs selected. Click ⚙ to configure.")
-        self._pv_no_pv_lbl.setStyleSheet("font-size: 10px; color: #888; padding: 2px 0;")
-        self._pv_no_pv_lbl.setWordWrap(True)
-        llay.addWidget(self._pv_no_pv_lbl)
-
-        llay.addWidget(_hsep())
-
-        # ── Group 3: Playback ──────────────────────────────────────
-        llay.addWidget(_group_label("Playback  (speed = % of images / s)"))
+        # ══════════════════ Section: TIMELINE & RANGE ═════════════
         self.btn_prev = QPushButton("◀"); self.btn_prev.setToolTip("Previous image (←)"); self.btn_prev.setEnabled(False)
         self.btn_prev.setFixedWidth(32)
         self.btn_prev.clicked.connect(lambda: self.step_frame(-1))
@@ -5794,14 +5804,10 @@ class Viewer(QWidget):
         self.btn_stop = QPushButton("Stop"); self.btn_stop.setEnabled(False)
         self.btn_stop.setToolTip("Stop playback")
         self.btn_stop.clicked.connect(self.stop)
-        self.btn_reset_zoom = QPushButton("⤢ Reset zoom")
-        self.btn_reset_zoom.setToolTip("Reset zoom to full image (right-click drag to zoom in)")
-        self.btn_reset_zoom.clicked.connect(self._on_reset_zoom)
         row3a = QHBoxLayout()
         row3a.addWidget(self.btn_prev); row3a.addWidget(self.btn_next)
         row3a.addWidget(self.btn_play); row3a.addWidget(self.btn_stop)
-        row3a.addWidget(self.btn_reset_zoom)
-        llay.addLayout(row3a)
+        s_tl.body_layout.addLayout(row3a)
 
         self.speed_cb = PopupBelowComboBox()
         self.speed_cb.setToolTip(
@@ -5824,25 +5830,172 @@ class Viewer(QWidget):
             "QComboBox { padding: 3px 6px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }"
             "QComboBox QAbstractItemView { background: #fff; }")
         row3b = QHBoxLayout(); row3b.addWidget(QLabel("Speed:")); row3b.addWidget(self.speed_cb, 1)
-        llay.addLayout(row3b)
-        llay.addWidget(_hsep())
+        s_tl.body_layout.addLayout(row3b)
 
-# ── Group 4: Overlays + Draw (grid 3 sloupce) ─────────────
-        llay.addWidget(_group_label("Overlays & Draw"))
+        # range marks (moved here from old Settings group, next to playback)
+        self.btn_set_a = QPushButton("Set From"); self.btn_set_a.setEnabled(False)
+        self.btn_set_a.setToolTip("Set range start (From) to current position")
+        self.btn_set_a.clicked.connect(self.set_mark_a)
+        self.btn_set_b = QPushButton("Set To"); self.btn_set_b.setEnabled(False)
+        self.btn_set_b.setToolTip("Set range end (To) to current position")
+        self.btn_set_b.clicked.connect(self.set_mark_b)
+        self.btn_clear_marks = QPushButton("Clear"); self.btn_clear_marks.setEnabled(False)
+        self.btn_clear_marks.setToolTip("Clear From/To marks")
+        self.btn_clear_marks.clicked.connect(self.clear_marks)
+        row_marks = QHBoxLayout()
+        row_marks.addWidget(self.btn_set_a); row_marks.addWidget(self.btn_set_b); row_marks.addWidget(self.btn_clear_marks)
+        s_tl.body_layout.addLayout(row_marks)
 
+        # timestamps (nested under Timeline & Range)
+        s_tl.body_layout.addWidget(_group_label("Timestamps"))
+        self.btn_save_ts = QPushButton("Save Timestamp")
+        self.btn_save_ts.setToolTip("Save current timestamp for cross-camera lookup. You can save more timestamps.")
+        self.btn_save_ts.setEnabled(False)
+        self.btn_save_ts.clicked.connect(self._save_current_timestamp)
+        self.btn_goto_ts = QPushButton("⇢ Go to Saved")
+        self.btn_goto_ts.setToolTip("Jump to nearest frame matching a saved timestamp")
+        self.btn_goto_ts.setEnabled(False)
+        self.btn_goto_ts.clicked.connect(self._goto_saved_timestamp)
+        self.btn_clear_ts = QPushButton("✕ Clear")
+        self.btn_clear_ts.setToolTip("Clear all saved timestamps")
+        self.btn_clear_ts.setEnabled(False)
+        self.btn_clear_ts.clicked.connect(self._clear_timestamps)
+        row_ts1 = QHBoxLayout()
+        row_ts1.addWidget(self.btn_save_ts)
+        row_ts1.addWidget(self.btn_goto_ts)
+        row_ts1.addWidget(self.btn_clear_ts)
+        s_tl.body_layout.addLayout(row_ts1)
+        self.lbl_ts_status = QLabel("No timestamps saved.")
+        self.lbl_ts_status.setWordWrap(True)
+        self.lbl_ts_status.setStyleSheet("font-size: 10px; color: #555;")
+        s_tl.body_layout.addWidget(self.lbl_ts_status)
+
+        # ══════════════════ Section: SAVE ═════════════════════════
+        self.btn_save = QPushButton("Save Image"); self.btn_save.setEnabled(False)
+        self.btn_save.setToolTip("Save current image to disk")
+        self.btn_save.clicked.connect(self.save_current)
+        self.btn_save_range = QPushButton("Save Range"); self.btn_save_range.setEnabled(False)
+        self.btn_save_range.setToolTip("Save all images between Set From and Set To marks")
+        self.btn_save_range.clicked.connect(self.save_range)
+        row2a = QHBoxLayout()
+        row2a.addWidget(self.btn_save)
+        row2a.addWidget(self.btn_save_range)
+        s_save.body_layout.addLayout(row2a)
+        self.btn_send_workshop = QPushButton("➤ Workshop")
+        self.btn_send_workshop.setEnabled(False)
+        self.btn_send_workshop.setToolTip("Send current image to Workshop tab for editing")
+        self.btn_send_workshop.clicked.connect(self._send_to_workshop)
+        s_save.body_layout.addWidget(self.btn_send_workshop)
+        row2c = QHBoxLayout()
+        self.cb_save_overlay = QCheckBox("Save with overlay")
+        self.cb_save_overlay.setToolTip("When saving, burn overlays (cross/circle/square) into the image")
+        self.cb_save_overlay.setStyleSheet(_CHECKBOX_STYLE)
+        row2c.addWidget(self.cb_save_overlay)
+        self.save_around_n_sb = QSpinBox()
+        self.save_around_n_sb.setRange(0, 10000)
+        self.save_around_n_sb.setValue(0)
+        self.save_around_n_sb.setFixedWidth(48)
+        self.save_around_n_sb.setToolTip("Number of frames before and after current to save (0 = only current)")
+        row2c.addWidget(self.save_around_n_sb)
+        row2c.addWidget(QLabel("±"))
+        s_save.body_layout.addLayout(row2c)
+        self.cb_save_metadata_txt = QCheckBox("Save metadata .txt")
+        self.cb_save_metadata_txt.setToolTip("Also write a sidecar .txt file with the original image metadata")
+        self.cb_save_metadata_txt.setStyleSheet(_CHECKBOX_STYLE)
+        s_save.body_layout.addWidget(self.cb_save_metadata_txt)
+        self.cb_save_original = QCheckBox("Save original (unmodified)")
+        self.cb_save_original.setToolTip("When saving with default palette and no overlay, save the original unmodified file instead of skipping")
+        self.cb_save_original.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_save_original.setChecked(True)
+        s_save.body_layout.addWidget(self.cb_save_original)
+
+        # ══════════════════ Section: IMAGE / DISPLAY ══════════════
+        self.cb_bright = QCheckBox("Auto-stretch contrast"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_bright.setToolTip("Auto-stretch contrast for better visibility")
+        self.cb_bright.stateChanged.connect(self._on_brightness_changed)
+        self.gradient_cb = PopupBelowComboBox()
+        self.gradient_cb.setToolTip("Color gradient for image display")
+        for name in GRADIENT_NAMES:
+            self.gradient_cb.addItem(name)
+        self.gradient_cb.setCurrentIndex(2)  # default: Gradient (0=Default, 1=Grayscale, 2+=palettes)
+        self.gradient_cb.setStyleSheet(
+            "QComboBox { padding: 3px 6px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }"
+            "QComboBox QAbstractItemView { background: #fff; }")
+        self.gradient_cb.currentIndexChanged.connect(self._on_gradient_changed)
+        row_bright_grad = QHBoxLayout()
+        row_bright_grad.addWidget(self.cb_bright)
+        row_bright_grad.addWidget(self.gradient_cb, 1)
+        s_disp.body_layout.addLayout(row_bright_grad)
+        row_bright_slider = QHBoxLayout()
+        row_bright_slider.addWidget(QLabel("Brightness offset:"))
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(-255, 255)
+        self.brightness_slider.setValue(0)
+        self.brightness_slider.setToolTip("Manual brightness offset (-255 to +255)")
+        self.brightness_slider.valueChanged.connect(self._on_brightness_slider_changed)
+        row_bright_slider.addWidget(self.brightness_slider, 1)
+        self.btn_brightness_reset = QPushButton("↺")
+        self.btn_brightness_reset.setFixedWidth(28)
+        self.btn_brightness_reset.setToolTip("Reset brightness")
+        self.btn_brightness_reset.clicked.connect(self._reset_brightness_slider)
+        row_bright_slider.addWidget(self.btn_brightness_reset)
+        s_disp.body_layout.addLayout(row_bright_slider)
+        row_sub = QHBoxLayout()
+        self.cb_subtract = QCheckBox("Subtraction")
+        self.cb_subtract.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_subtract.setToolTip("Show absolute difference from reference frame")
+        self.cb_subtract.stateChanged.connect(self._on_subtract_changed)
+        row_sub.addWidget(self.cb_subtract)
+        self.btn_set_ref = QPushButton("Set ref")
+        self.btn_set_ref.setFixedWidth(65)
+        self.btn_set_ref.setEnabled(False)
+        self.btn_set_ref.setToolTip("Set current frame as subtraction reference")
+        self.btn_set_ref.clicked.connect(self._set_reference_frame)
+        row_sub.addWidget(self.btn_set_ref)
+        row_sub.addStretch(1)
+        s_disp.body_layout.addLayout(row_sub)
+        row_sub_thr = QHBoxLayout()
+        row_sub_thr.addWidget(QLabel("Diff threshold:"))
+        self.sub_threshold_sb = QSpinBox()
+        self.sub_threshold_sb.setRange(0, 255)
+        self.sub_threshold_sb.setValue(0)
+        self.sub_threshold_sb.setFixedWidth(55)
+        self.sub_threshold_sb.setToolTip(
+            "Pixels with |current − reference| below this value are shown as black.\n"
+            "0 = show all differences (default).\n"
+            "Useful for ignoring noise and tiny fluctuations.")
+        self.sub_threshold_sb.valueChanged.connect(self._on_subtract_changed)
+        row_sub_thr.addWidget(self.sub_threshold_sb)
+        row_sub_thr.addStretch(1)
+        s_disp.body_layout.addLayout(row_sub_thr)
+        # reset zoom (moved here from old Playback group)
+        self.btn_reset_zoom = QPushButton("⤢ Reset zoom")
+        self.btn_reset_zoom.setToolTip("Reset zoom to full image (right-click drag to zoom in)")
+        self.btn_reset_zoom.clicked.connect(self._on_reset_zoom)
+        s_disp.body_layout.addWidget(self.btn_reset_zoom)
+        # camera label size (moved here from old Camera Labels Settings group)
+        row_cam_font = QHBoxLayout()
+        row_cam_font.addWidget(QLabel("Label size:"))
+        self._cam_label_size_sb = QSpinBox()
+        self._cam_label_size_sb.setRange(8, 32)
+        self._cam_label_size_sb.setValue(20)
+        self._cam_label_size_sb.setSuffix(" px")
+        self._cam_label_size_sb.valueChanged.connect(self._on_cam_label_size_changed)
+        row_cam_font.addWidget(self._cam_label_size_sb)
+        row_cam_font.addStretch(1)
+        s_disp.body_layout.addLayout(row_cam_font)
+
+        # ══════════════════ Section: OVERLAYS ═════════════════════
         self.cb_cross  = QCheckBox("Cross");  self.cb_cross.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_cross.setToolTip("Show cross overlay on image")
         self.cb_circle = QCheckBox("Circle"); self.cb_circle.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_circle.setToolTip("Show circle overlay on image")
         self.cb_square = QCheckBox("Square"); self.cb_square.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_square.setToolTip("Show square overlay on image")
-        self.cb_bright = QCheckBox("Auto-stretch contrast"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
-        self.cb_bright.setToolTip("Auto-stretch contrast for better visibility")
 
         self.cb_cross.stateChanged.connect(self._on_overlay_changed)
         self.cb_circle.stateChanged.connect(self._on_overlay_changed)
         self.cb_square.stateChanged.connect(self._on_overlay_changed)
-        self.cb_bright.stateChanged.connect(self._on_brightness_changed)
 
         self.btn_draw_cross  = QPushButton("✚ Draw")
         self.btn_draw_circle = QPushButton("◯ Draw")
@@ -5868,7 +6021,6 @@ class Viewer(QWidget):
         self.btn_cal_cross.setToolTip("Auto-detect center of brightness (centroid)")
         self.btn_cal_cross.clicked.connect(self.calibrate_cross)
 
-        from PySide6.QtWidgets import QGridLayout
         grid = QGridLayout()
         grid.setSpacing(3)
         #              col 0          col 1              col 2
@@ -5882,9 +6034,8 @@ class Viewer(QWidget):
         grid.addWidget(self.btn_cal_circle,  2, 1)
         grid.addWidget(self.btn_cal_square,  2, 2)
         grid.addWidget(self.btn_cal_cross,   2, 0)
-        llay.addLayout(grid)
+        s_ovl.body_layout.addLayout(grid)
 
-        # ── Overlay settings ──────────────────────────────────────
         overlay_settings_row = QHBoxLayout()
         overlay_settings_row.setSpacing(4)
         btn_overlay_settings = QPushButton("⚙ Overlay settings")
@@ -5895,65 +6046,7 @@ class Viewer(QWidget):
         btn_remove_all_overlays.setToolTip("Remove all overlays from selected camera(s)")
         btn_remove_all_overlays.clicked.connect(self._remove_all_overlays)
         overlay_settings_row.addWidget(btn_remove_all_overlays, 1)
-        llay.addLayout(overlay_settings_row)
-
-        row_bright_grad = QHBoxLayout()
-        row_bright_grad.addWidget(self.cb_bright)
-        # brightness slider pod auto brightness
-        self.gradient_cb = PopupBelowComboBox()
-        self.gradient_cb.setToolTip("Color gradient for image display")
-        for name in GRADIENT_NAMES:
-            self.gradient_cb.addItem(name)
-        self.gradient_cb.setCurrentIndex(2)  # default: Gradient (0=Default, 1=Grayscale, 2+=palettes)
-        self.gradient_cb.setStyleSheet(
-            "QComboBox { padding: 3px 6px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }"
-            "QComboBox QAbstractItemView { background: #fff; }")
-        self.gradient_cb.currentIndexChanged.connect(self._on_gradient_changed)
-        row_bright_grad.addWidget(self.gradient_cb, 1)
-        llay.addLayout(row_bright_grad)
-        row_sub = QHBoxLayout()
-        self.cb_subtract = QCheckBox("Subtraction")
-        self.cb_subtract.setStyleSheet(_CHECKBOX_STYLE)
-        self.cb_subtract.setToolTip("Show absolute difference from reference frame")
-        self.cb_subtract.stateChanged.connect(self._on_subtract_changed)
-        row_sub.addWidget(self.cb_subtract)
-        self.btn_set_ref = QPushButton("Set ref")
-        self.btn_set_ref.setFixedWidth(65)
-        self.btn_set_ref.setEnabled(False)
-        self.btn_set_ref.setToolTip("Set current frame as subtraction reference")
-        self.btn_set_ref.clicked.connect(self._set_reference_frame)
-        row_sub.addWidget(self.btn_set_ref)
-        row_sub.addStretch(1)
-        llay.addLayout(row_sub)
-        row_sub_thr = QHBoxLayout()
-        row_sub_thr.addWidget(QLabel("Diff threshold:"))
-        self.sub_threshold_sb = QSpinBox()
-        self.sub_threshold_sb.setRange(0, 255)
-        self.sub_threshold_sb.setValue(0)
-        self.sub_threshold_sb.setFixedWidth(55)
-        self.sub_threshold_sb.setToolTip(
-            "Pixels with |current − reference| below this value are shown as black.\n"
-            "0 = show all differences (default).\n"
-            "Useful for ignoring noise and tiny fluctuations.")
-        self.sub_threshold_sb.valueChanged.connect(self._on_subtract_changed)
-        row_sub_thr.addWidget(self.sub_threshold_sb)
-        row_sub_thr.addStretch(1)
-        llay.addLayout(row_sub_thr)
-        row_bright_slider = QHBoxLayout()
-        row_bright_slider.addWidget(QLabel("Brightness offset:"))
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(-255, 255)
-        self.brightness_slider.setValue(0)
-        self.brightness_slider.setToolTip("Manual brightness offset (-255 to +255)")
-        self.brightness_slider.valueChanged.connect(self._on_brightness_slider_changed)
-        row_bright_slider.addWidget(self.brightness_slider, 1)
-        self.btn_brightness_reset = QPushButton("↺")
-        self.btn_brightness_reset.setFixedWidth(28)
-        self.btn_brightness_reset.setToolTip("Reset brightness")
-        self.btn_brightness_reset.clicked.connect(self._reset_brightness_slider)
-        row_bright_slider.addWidget(self.btn_brightness_reset)
-        llay.addLayout(row_bright_slider)
-        llay.addWidget(_hsep())
+        s_ovl.body_layout.addLayout(overlay_settings_row)
 
         # _online_dot and _online_lbl kept as non-visible widgets for backward compat
         self._online_dot = QLabel("●")
@@ -5963,25 +6056,9 @@ class Viewer(QWidget):
         self._online_lbl.setStyleSheet("font-size: 10px; color: #555;")
         self._online_lbl.hide()
 
-        # ── Group: Multi-Camera Layout ─────────────────────────────
-        llay.addWidget(_group_label("Camera Labels Settings"))
-
-        row_cam_font = QHBoxLayout()
-        row_cam_font.addWidget(QLabel("Label size:"))
-        self._cam_label_size_sb = QSpinBox()
-        self._cam_label_size_sb.setRange(8, 32)
-        self._cam_label_size_sb.setValue(20)
-        self._cam_label_size_sb.setSuffix(" px")
-        self._cam_label_size_sb.valueChanged.connect(self._on_cam_label_size_changed)
-        row_cam_font.addWidget(self._cam_label_size_sb)
-        llay.addLayout(row_cam_font)
-        llay.addWidget(_hsep())
-
-        # ── Group: Image Analysis ─────────────────────────────────────
-        llay.addWidget(_group_label("Image Analysis"))
-
+        # ══════════════════ Section: ANALYSIS ═════════════════════
         # ── Subgroup: Pointing Analysis ───────────────────────────────
-        llay.addWidget(_group_label("  Pointing Analysis"))
+        s_an.body_layout.addWidget(_group_label("Pointing Analysis"))
         row_thr_mag = QHBoxLayout()
         row_thr_mag.addWidget(QLabel("Thr:"))
         self.pointing_threshold_sb = QSpinBox()
@@ -6008,7 +6085,7 @@ class Viewer(QWidget):
             "Set a calibration factor to scale the values, e.g. pixels → µrad or mm.")
         row_thr_mag.addWidget(self.pointing_m_sb)
         row_thr_mag.addStretch(1)
-        llay.addLayout(row_thr_mag)
+        s_an.body_layout.addLayout(row_thr_mag)
 
         self.btn_pointing = QPushButton("▶ Run Analysis")
         self.btn_pointing.setToolTip("Run pointing stability analysis on current images set by timestamps (Set From and Set To)")
@@ -6029,7 +6106,7 @@ class Viewer(QWidget):
         row_pa.addWidget(self.btn_pointing)
         row_pa.addWidget(self.btn_pointing_live)
         row_pa.addWidget(self.btn_pointing_cancel)
-        llay.addLayout(row_pa)
+        s_an.body_layout.addLayout(row_pa)
 
         # Replay speed control
         row_replay_speed = QHBoxLayout()
@@ -6043,7 +6120,7 @@ class Viewer(QWidget):
             "Replay speed as % of max (100% = 200 fps, 10% = 20 fps, 1% = 2 fps)")
         row_replay_speed.addWidget(self._pointing_replay_fps_sb)
         row_replay_speed.addStretch(1)
-        llay.addLayout(row_replay_speed)
+        s_an.body_layout.addLayout(row_replay_speed)
 
         self.btn_pointing_save = QPushButton("💾 Save Plot")
         self.btn_pointing_save.setToolTip("Save pointing plot as PNG or PDF")
@@ -6056,7 +6133,7 @@ class Viewer(QWidget):
         row_pa2 = QHBoxLayout()
         row_pa2.addWidget(self.btn_pointing_save)
         row_pa2.addWidget(self.btn_pointing_path)
-        llay.addLayout(row_pa2)
+        s_an.body_layout.addLayout(row_pa2)
         self.btn_pointing_select = QPushButton("◻ Select & Delete")
         self.btn_pointing_select.setToolTip("Drag a rectangle on the scatter plot to delete those points")
         self.btn_pointing_select.setEnabled(False)
@@ -6069,22 +6146,22 @@ class Viewer(QWidget):
         row_pa3 = QHBoxLayout()
         row_pa3.addWidget(self.btn_pointing_select)
         row_pa3.addWidget(self.btn_pointing_restore)
-        llay.addLayout(row_pa3)
+        s_an.body_layout.addLayout(row_pa3)
         self.btn_pointing_close = QPushButton("✕ Close graph")
         self.btn_pointing_close.setEnabled(False)
         self.btn_pointing_close.setToolTip("Hide the pointing analysis graph")
         self.btn_pointing_close.clicked.connect(self._close_pointing_panel)
-        llay.addWidget(self.btn_pointing_close)
+        s_an.body_layout.addWidget(self.btn_pointing_close)
 
         self.lbl_pointing_status = QLabel("")
         self.lbl_pointing_status.setWordWrap(True)
         self.lbl_pointing_status.setStyleSheet("font-size: 10px; color: #555;")
-        llay.addWidget(self.lbl_pointing_status)
+        s_an.body_layout.addWidget(self.lbl_pointing_status)
 
-        llay.addWidget(_hsep())
+        s_an.body_layout.addWidget(_hsep())
 
         # ── Subgroup: Spatial Contrast ────────────────────────────────
-        llay.addWidget(_group_label("  Spatial Contrast"))
+        s_an.body_layout.addWidget(_group_label("Spatial Contrast"))
 
         # Camera selector (visible only in multi-cam mode)
         sc_cam_row = QHBoxLayout()
@@ -6096,7 +6173,7 @@ class Viewer(QWidget):
         sc_cam_row_widget.setLayout(sc_cam_row)
         sc_cam_row_widget.setVisible(False)
         self._sc_cam_row_widget = sc_cam_row_widget
-        llay.addWidget(sc_cam_row_widget)
+        s_an.body_layout.addWidget(sc_cam_row_widget)
 
         # Threshold row
         sc_thr_row = QHBoxLayout()
@@ -6128,7 +6205,7 @@ class Viewer(QWidget):
         self._btn_sc_hist.clicked.connect(self._open_sc_histogram)
         sc_thr_row.addWidget(self._btn_sc_hist)
         sc_thr_row.addStretch(1)
-        llay.addLayout(sc_thr_row)
+        s_an.body_layout.addLayout(sc_thr_row)
 
         # Measure + Draw exclusions buttons
         sc_btn_row = QHBoxLayout()
@@ -6141,7 +6218,7 @@ class Viewer(QWidget):
             "Open exclusion editor — draw regions to exclude from the measurement")
         self._btn_sc_draw.clicked.connect(self._open_sc_exclusion_editor)
         sc_btn_row.addWidget(self._btn_sc_draw, 1)
-        llay.addLayout(sc_btn_row)
+        s_an.body_layout.addLayout(sc_btn_row)
 
         # "Show top intensity pixels: N" — circle top-N highest-intensity pixels on the image
         sc_topn_row = QHBoxLayout()
@@ -6157,7 +6234,7 @@ class Viewer(QWidget):
         sc_topn_row.addWidget(self._sc_topn_sb)
         sc_topn_row.addWidget(QLabel("px"))
         sc_topn_row.addStretch(1)
-        llay.addLayout(sc_topn_row)
+        s_an.body_layout.addLayout(sc_topn_row)
 
         # Marker appearance: radius + thickness
         sc_marker_row = QHBoxLayout()
@@ -6178,7 +6255,7 @@ class Viewer(QWidget):
         self._sc_marker_thick_sb.valueChanged.connect(self._on_sc_marker_style_changed)
         sc_marker_row.addWidget(self._sc_marker_thick_sb)
         sc_marker_row.addStretch(1)
-        llay.addLayout(sc_marker_row)
+        s_an.body_layout.addLayout(sc_marker_row)
 
         self._sc_topn_points: "list[tuple[int,int]] | None" = None  # (x,y) pixel coords in full image
 
@@ -6227,26 +6304,63 @@ class Viewer(QWidget):
         self._sc_val_sc.setToolTip("Double-click to copy")
         _sc_grid.addWidget(sc_lbl_full,     2, 0)
         _sc_grid.addWidget(self._sc_val_sc, 2, 1, 1, 3)
-        llay.addLayout(_sc_grid)
+        s_an.body_layout.addLayout(_sc_grid)
 
         self._sc_cam_lbl = QLabel("")
         self._sc_cam_lbl.setStyleSheet("font-size: 10px; color: #555;")
-        llay.addWidget(self._sc_cam_lbl)
+        s_an.body_layout.addWidget(self._sc_cam_lbl)
 
         self._sc_status_lbl = QLabel("")
         self._sc_status_lbl.setWordWrap(True)
         self._sc_status_lbl.setStyleSheet("font-size: 10px; color: #c00;")
-        llay.addWidget(self._sc_status_lbl)
+        s_an.body_layout.addWidget(self._sc_status_lbl)
 
         # Preview label (shows beam mask overlay, hidden until first measurement)
         self._sc_preview_lbl = _SCPreviewLabel()
         self._sc_preview_lbl.hide()
-        llay.addWidget(self._sc_preview_lbl)
+        s_an.body_layout.addWidget(self._sc_preview_lbl)
         self._sc_preview_pixmap: "QPixmap | None" = None
         self._sc_task_running = False
         self._sc_pending      = False
         self._sc_topn_points: "list[tuple[int,int]]" = []
         self._sc_topn_img_shape: "tuple[int,int] | None" = None
+
+        # ══════════════════ Section: PV VALUES ════════════════════
+        pv_header_row = QHBoxLayout()
+        self._btn_pv_cfg = QPushButton("⚙")
+        self._btn_pv_cfg.setFixedWidth(26)
+        self._btn_pv_cfg.setToolTip("Select which PV channels to display")
+        self._btn_pv_cfg.clicked.connect(self._open_pv_config)
+        pv_header_row.addWidget(self._btn_pv_cfg)
+        self._btn_pv_refresh = QPushButton("↻")
+        self._btn_pv_refresh.setFixedWidth(26)
+        self._btn_pv_refresh.setToolTip("Refresh PV values for current frame")
+        self._btn_pv_refresh.clicked.connect(self._pv_force_refresh)
+        pv_header_row.addWidget(self._btn_pv_refresh)
+        self._btn_pv_overlay_settings = QPushButton("⚙ overlay")
+        self._btn_pv_overlay_settings.setToolTip("PV overlay display settings")
+        self._btn_pv_overlay_settings.clicked.connect(self._open_pv_overlay_settings)
+        pv_header_row.addWidget(self._btn_pv_overlay_settings)
+        pv_header_row.addStretch(1)
+        s_pv.body_layout.addLayout(pv_header_row)
+
+        self._pv_table = QTableWidget(0, 2)
+        self._pv_table.setHorizontalHeaderLabels(["PV", "Value"])
+        self._pv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._pv_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._pv_table.verticalHeader().setVisible(False)
+        self._pv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._pv_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._pv_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pv_table.setMaximumHeight(120)
+        self._pv_table.setVisible(False)
+        self._pv_table.setStyleSheet("font-size: 11px;")
+        s_pv.body_layout.addWidget(self._pv_table)
+
+        self._pv_no_pv_lbl = QLabel("No PVs selected. Click ⚙ to configure.")
+        self._pv_no_pv_lbl.setStyleSheet("font-size: 10px; color: #888; padding: 2px 0;")
+        self._pv_no_pv_lbl.setWordWrap(True)
+        s_pv.body_layout.addWidget(self._pv_no_pv_lbl)
 
         # ── Info labels (definice — zobrazí se v ukotvené sekci nahoře) ───
         info_style = "font-size: 11px; color: #222; padding: 1px 0;"

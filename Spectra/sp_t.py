@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
     QCalendarWidget, QMessageBox, QMainWindow, QTabWidget, QComboBox,
     QProgressBar, QStyledItemDelegate, QAbstractItemView, QInputDialog,
     QToolButton, QMenu, QStyle, QTableWidget, QTableWidgetItem, QHeaderView,
-    QLineEdit, QListWidget, QListWidgetItem,
+    QLineEdit, QListWidget, QListWidgetItem, QRadioButton, QDoubleSpinBox,
 )
 
 import matplotlib
@@ -123,6 +123,7 @@ def _save_search_presets(presets: list):
     except Exception:
         pass
 
+SIDEBAR_W       = 340          # fixed width of the left control panel
 LIVE_INTERVAL_S = 3            # poll period in live mode
 LIVE_BUF_MAX    = 2000         # max spectra kept in the rolling buffer
 DEFAULT_LIVE_N  = 100          # default "average last N" value
@@ -260,13 +261,23 @@ _cpva_channel_cache: list = []   # module-level cache shared between dialogs
 
 def _cpva_load_all_channels() -> list:
     """Fetch every archived channel name from CPVA (no filter — filter locally).
-    Returns a sorted list of strings; empty on failure."""
-    url = f"{CPVA_URL}/channels"
+    Uses the /channels-by-pattern endpoint (pattern=** → all ~9600 channels).
+    The response is a JSON list of names, or of dicts carrying the name under
+    channelName / name / channel. Returns a sorted list of strings; [] on failure."""
+    url = f"{CPVA_URL}/channels-by-pattern?" + urllib.parse.urlencode({"pattern": "**"})
     try:
-        req = urllib.request.urlopen(url, context=_ssl_ctx(), timeout=15)
+        req = urllib.request.urlopen(url, context=_ssl_ctx(), timeout=20)
         data = json.loads(req.read())
+        names = []
         if isinstance(data, list):
-            return sorted(str(x) for x in data if x)
+            for x in data:
+                if isinstance(x, str):
+                    names.append(x)
+                elif isinstance(x, dict):
+                    n = x.get("channelName") or x.get("name") or x.get("channel")
+                    if n:
+                        names.append(str(n))
+        return sorted(set(names))
     except Exception:
         pass
     return []
@@ -312,6 +323,154 @@ def _sigma_clipped_mean(stack: np.ndarray, sigma: float = 3.0) -> np.ndarray:
     return np.where(np.isnan(clipped), mean, clipped)
 
 
+def _trapz(y, x) -> float:
+    """Trapezoidal integral, compatible with both NumPy 1.x (trapz) and 2.x (trapezoid)."""
+    fn = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+    return float(fn(y, x))
+
+
+def _fwhm(x: np.ndarray, y: np.ndarray) -> "float | None":
+    """Full width at half maximum (above baseline), with linear edge interpolation."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if y.size < 2 or x.size != y.size:
+        return None
+    base, peak = float(np.min(y)), float(np.max(y))
+    if peak <= base:
+        return None
+    half = base + (peak - base) / 2.0
+    idx = np.where(y >= half)[0]
+    if idx.size == 0:
+        return None
+    iL, iR = int(idx[0]), int(idx[-1])
+
+    def _edge(i_in: int, i_out: int) -> float:
+        if i_out < 0 or i_out >= len(x) or y[i_in] == y[i_out]:
+            return float(x[i_in])
+        t = (half - y[i_out]) / (y[i_in] - y[i_out])
+        return float(x[i_out] + t * (x[i_in] - x[i_out]))
+
+    return abs(_edge(iR, iR + 1) - _edge(iL, iL - 1))
+
+
+def _spectral_metrics(x: np.ndarray, y: np.ndarray) -> dict:
+    """Peak / width metrics for a single (already range-masked) spectrum."""
+    out = {"peak_wl": None, "peak_int": None, "centroid": None,
+           "fwhm": None, "rms_bw": None, "area": None}
+    if x is None or y is None:
+        return out
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size < 2 or y.size != x.size:
+        return out
+    imax = int(np.argmax(y))
+    out["peak_int"] = float(y[imax])
+    out["peak_wl"] = float(x[imax])
+    out["area"] = _trapz(y, x)
+    yb = y - float(np.min(y))            # baseline-subtract for centroid / width
+    tot = float(np.sum(yb))
+    if tot > 0:
+        centroid = float(np.sum(x * yb) / tot)
+        out["centroid"] = centroid
+        out["rms_bw"] = float(np.sqrt(max(0.0, np.sum(yb * (x - centroid) ** 2) / tot)))
+    out["fwhm"] = _fwhm(x, y)
+    return out
+
+
+def _smooth(y: np.ndarray, win: int) -> np.ndarray:
+    """Savitzky-Golay (quadratic) smoothing without scipy; edge-padded.
+    Falls back to a moving average if the coefficient solve fails."""
+    y = np.asarray(y, dtype=float)
+    n = y.size
+    if win < 3 or n < 3:
+        return y
+    if win % 2 == 0:
+        win += 1
+    win = min(win, n if n % 2 == 1 else n - 1)
+    if win < 3:
+        return y
+    half = win // 2
+    k = np.arange(-half, half + 1)
+    A = np.vstack([k ** 0, k ** 1, k ** 2]).T
+    try:
+        coef = np.linalg.pinv(A)[0]                  # SG smoothing weights
+    except Exception:
+        coef = np.full(win, 1.0 / win)
+    ypad = np.pad(y, half, mode="edge")
+    return np.convolve(ypad, coef[::-1], mode="valid")
+
+
+def _parse_number_list(text: str) -> list[float]:
+    """Parse a list of numbers from free text, auto-detecting the delimiter so both
+    of these export styles work:
+      • comma-separated integers on one line  → '595,595,596,...'  (comma = separator)
+      • whitespace/semicolon-separated values with Czech decimal commas
+                                               → '593,27 593,54'    (comma = decimal)
+    """
+    import re
+    text = text.strip()
+    if not text:
+        return []
+    has_ws = bool(re.search(r"\s", text))
+    if ";" in text:                          # semicolons separate; comma = decimal
+        parts = [p.replace(",", ".") for p in text.split(";")]
+    elif "," in text and not has_ws:         # comma-separated values, no spaces
+        parts = text.split(",")              #   → comma is the separator
+    elif has_ws:                             # whitespace separates; comma = decimal
+        parts = [p.replace(",", ".") for p in re.split(r"\s+", text)]
+    else:
+        parts = [text]
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            out.append(float(p))
+        except ValueError:
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", p.replace(",", "."))
+            if m:
+                out.append(float(m.group()))
+    return out
+
+
+def _reconstruct_wavelength_axis(vals: np.ndarray) -> np.ndarray:
+    """Rebuild a strictly-increasing wavelength axis from values whose decimals were
+    lost on export (so each integer nm repeats 3–4×). Each run of an equal integer
+    N of length k becomes N + (i+0.5)/k, preserving the per-nm count while making the
+    axis monotonic. If the values already carry decimals, they are returned unchanged.
+    """
+    vals = np.asarray(vals, dtype=float)
+    if vals.size == 0:
+        return vals
+    if np.any(np.abs(vals - np.round(vals)) > 1e-6):
+        return vals                      # already has real decimals — trust them
+    out = np.empty_like(vals)
+    i, n = 0, vals.size
+    while i < n:
+        j = i
+        while j < n and vals[j] == vals[i]:
+            j += 1
+        k = j - i
+        out[i:j] = vals[i] + (np.arange(k) + 0.5) / k
+        i = j
+    return out
+
+
+def _load_x_csv(path: str) -> "np.ndarray | None":
+    """Load a wavelength axis from a CSV/text file, repairing decimals stripped on
+    export (see _reconstruct_wavelength_axis). Returns None on failure."""
+    try:
+        with open(path, encoding="utf-8-sig", errors="ignore") as f:
+            text = f.read()
+    except Exception:
+        return None
+    vals = _parse_number_list(text)
+    if not vals:
+        return None
+    return _reconstruct_wavelength_axis(np.asarray(vals, dtype=float))
+
+
 def _compute_stats(arrs: list[np.ndarray]) -> dict | None:
     """Combine a list of waveforms (keeping only the most common length).
 
@@ -332,6 +491,8 @@ def _compute_stats(arrs: list[np.ndarray]) -> dict | None:
         "trimmed": _trimmed_mean(stack, 0.1),
         "sigma":   _sigma_clipped_mean(stack, 3.0),
         "std":     stack.std(axis=0),
+        "p10":     np.percentile(stack, 10, axis=0),
+        "p90":     np.percentile(stack, 90, axis=0),
         "stack":   stack,          # individual spectra (feature: show all spectra)
         "n":       len(arrs),
     }
@@ -606,9 +767,13 @@ def _make_calendar(initial: "QDate | None" = None) -> "tuple[QFrame, QCalendarWi
 class DatePickerDialog(QDialog):
     """Single-calendar date picker.
 
-    Plain click   → toggle that day (adds if unselected, removes if selected).
-    Ctrl+click    → add the inclusive range from the last click (or today if
-                    this is the first interaction) to the clicked day.
+    Plain click        → select exactly that one day (replaces the selection).
+    Ctrl+click         → toggle that single day in/out of a multi-day selection.
+    Ctrl+Shift+click   → range from the last click to the clicked day, XOR-ed into
+                         the selection (so a repeat over the same range deselects
+                         what it selected — an "anti-selection").
+    Weekends (Sat/Sun) can ONLY be picked by a plain click — Ctrl and Ctrl+Shift
+    skip them.
 
     Uses QCalendarWidget.clicked(QDate) — reliable across all PySide6 versions.
     """
@@ -651,30 +816,51 @@ class DatePickerDialog(QDialog):
 
     # ── Click handler ─────────────────────────────────────────────────────────
     def _on_date_clicked(self, d: QDate):
-        ctrl = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier)
-        if ctrl:
-            # Ctrl+click: ADD the range [anchor … d] to existing selection.
-            anchor = self._last_click if self._last_click is not None else QDate.currentDate()
-            new_dates = sorted(
-                set(self._dates) | set(self._date_range(anchor, d)),
-                key=lambda x: (x.year(), x.month(), x.day()),
-            )
-        else:
-            # Plain click: toggle d.
-            key = (d.year(), d.month(), d.day())
-            existing_keys = {(x.year(), x.month(), x.day()) for x in self._dates}
-            if key in existing_keys:
-                new_dates = [x for x in self._dates
-                             if (x.year(), x.month(), x.day()) != key]
-            else:
-                new_dates = sorted(
-                    self._dates + [d],
-                    key=lambda x: (x.year(), x.month(), x.day()),
-                )
+        mods  = QApplication.keyboardModifiers()
+        ctrl  = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        new_dates = self._compute_click(d, ctrl, shift)
         self._last_click = d
+        if new_dates is None:    # ignored (Ctrl on a weekend)
+            self._lbl_info.setText("Weekends can only be selected by a plain click.")
+            return
         self._apply_selection(new_dates)
 
+    def _compute_click(self, d: QDate, ctrl: bool, shift: bool) -> "list[QDate] | None":
+        """Pure selection logic. Returns the new selection, or None if the click
+        should be ignored (Ctrl on a weekend)."""
+        cur      = list(self._dates)
+        cur_keys = {self._key(x) for x in cur}
+        if ctrl and shift:
+            # Range [anchor … d], weekdays only, XOR-ed into the current selection.
+            anchor = self._last_click if self._last_click is not None else d
+            rng = [x for x in self._date_range(anchor, d) if not self._is_weekend(x)]
+            rng_keys = {self._key(x) for x in rng}
+            keep = [x for x in cur if self._key(x) not in rng_keys]   # deselect overlap
+            add  = [x for x in rng if self._key(x) not in cur_keys]   # select the rest
+            new_dates = keep + add
+        elif ctrl:
+            # Toggle a single weekday; weekends are plain-click only.
+            if self._is_weekend(d):
+                return None
+            if self._key(d) in cur_keys:
+                new_dates = [x for x in cur if self._key(x) != self._key(d)]
+            else:
+                new_dates = cur + [d]
+        else:
+            # Plain click: exactly one day (weekends allowed).
+            new_dates = [d]
+        return sorted(new_dates, key=lambda x: (x.year(), x.month(), x.day()))
+
     # ── Helpers ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _key(d: QDate) -> tuple:
+        return (d.year(), d.month(), d.day())
+
+    @staticmethod
+    def _is_weekend(d: QDate) -> bool:
+        return d.dayOfWeek() >= 6   # 6=Sat, 7=Sun
+
     @staticmethod
     def _date_range(d1: QDate, d2: QDate) -> "list[QDate]":
         if d2 < d1:
@@ -694,7 +880,7 @@ class DatePickerDialog(QDialog):
             self._cal.setSelectedDate(dates[-1])
         n = len(dates)
         if n == 0:
-            self._lbl_info.setText("No date selected")
+            self._lbl_info.setText("Click = 1 day · Ctrl+click = multi · Ctrl+Shift+click = range")
         elif n == 1:
             self._lbl_info.setText(f"Selected: {dates[0].toString('yyyy-MM-dd')}")
         else:
@@ -803,6 +989,197 @@ class PvSearchDialog(QDialog):
     def added_pvs(self) -> list:
         """Returns list of (label, channel) tuples."""
         return self._added
+
+
+# ── XAxisSourceDialog ───────────────────────────────────────────────────────--
+class XAxisSourceDialog(QDialog):
+    """Ask how to build the wavelength (X) axis for a spectrum PV that has no
+    matching _X channel: copy from another PV, copy + linear transform, or use
+    the plain sample index."""
+
+    def __init__(self, base_pv: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Wavelength axis")
+        self.setMinimumSize(460, 420)
+        self._all_channels: list = list(_cpva_channel_cache)
+        self._result: dict | None = None
+        self._build_ui(base_pv)
+        if self._all_channels:
+            self._lbl_status.setText(f"{len(self._all_channels)} channels. Type to filter.")
+        else:
+            self._kick_load()
+
+    def _build_ui(self, base_pv: str):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(6)
+        info = QLabel(
+            f"<b>{base_pv}</b> has no matching <b>_X</b> channel in the archive.<br>"
+            "Choose how to build the wavelength axis:"
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        self._grp = QButtonGroup(self)
+        self._rb_pv     = QRadioButton("Copy X axis from another PV")
+        self._rb_linear = QRadioButton("Copy from a PV, then apply a linear transform")
+        self._rb_csv    = QRadioButton("Load X axis from a CSV / text file")
+        self._rb_index  = QRadioButton("Use the sample index (0, 1, 2 …)")
+        self._rb_pv.setChecked(True)
+        for rb in (self._rb_pv, self._rb_linear, self._rb_csv, self._rb_index):
+            self._grp.addButton(rb)
+            lay.addWidget(rb)
+            rb.toggled.connect(self._sync_enabled)
+
+        # CSV file picker (mode 'csv')
+        row_csv = QHBoxLayout()
+        row_csv.addSpacing(20)
+        self._edit_csv = QLineEdit()
+        self._edit_csv.setPlaceholderText("Path to a .csv / .txt wavelength file…")
+        row_csv.addWidget(self._edit_csv, stretch=1)
+        self._btn_browse = QPushButton("Browse…")
+        self._btn_browse.clicked.connect(self._browse_csv)
+        row_csv.addWidget(self._btn_browse)
+        lay.addLayout(row_csv)
+        note_csv = QLabel(
+            "Decimals lost on export (e.g. each nm repeated 3–4×) are rebuilt "
+            "automatically into an increasing axis."
+        )
+        note_csv.setWordWrap(True)
+        note_csv.setStyleSheet("color: #888; font-size: 10px; margin-left: 20px;")
+        lay.addWidget(note_csv)
+
+        # linear transform spins
+        row_lin = QHBoxLayout()
+        row_lin.addSpacing(20)
+        row_lin.addWidget(QLabel("x' ="))
+        self._sb_scale = QDoubleSpinBox()
+        self._sb_scale.setRange(-1e6, 1e6)
+        self._sb_scale.setDecimals(6)
+        self._sb_scale.setValue(1.0)
+        row_lin.addWidget(self._sb_scale)
+        row_lin.addWidget(QLabel("· x +"))
+        self._sb_offset = QDoubleSpinBox()
+        self._sb_offset.setRange(-1e6, 1e6)
+        self._sb_offset.setDecimals(6)
+        self._sb_offset.setValue(0.0)
+        row_lin.addWidget(self._sb_offset)
+        row_lin.addWidget(QLabel("nm"))
+        row_lin.addStretch(1)
+        lay.addLayout(row_lin)
+
+        # channel picker (shared by 'pv' and 'linear')
+        self._edit = QLineEdit()
+        self._edit.setPlaceholderText("Type part of an _X channel name…")
+        self._edit.textEdited.connect(self._filter)
+        lay.addWidget(self._edit)
+        self._lbl_status = QLabel("Loading channels from CPVA…")
+        self._lbl_status.setStyleSheet("color: #666; font-size: 10px;")
+        lay.addWidget(self._lbl_status)
+        self._lst = QListWidget()
+        self._lst.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        lay.addWidget(self._lst, stretch=1)
+
+        row = QHBoxLayout()
+        btn_ok = QPushButton("OK")
+        btn_ok.setStyleSheet(_BTN_PRIMARY)
+        btn_ok.clicked.connect(self._on_ok)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        row.addStretch(1)
+        row.addWidget(btn_ok)
+        row.addWidget(btn_cancel)
+        lay.addLayout(row)
+        self._sync_enabled()
+
+    def _sync_enabled(self, *_):
+        need_pv = self._rb_pv.isChecked() or self._rb_linear.isChecked()
+        self._edit.setEnabled(need_pv)
+        self._lst.setEnabled(need_pv)
+        lin = self._rb_linear.isChecked()
+        self._sb_scale.setEnabled(lin)
+        self._sb_offset.setEnabled(lin)
+        csv = self._rb_csv.isChecked()
+        self._edit_csv.setEnabled(csv)
+        self._btn_browse.setEnabled(csv)
+
+    def _browse_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select wavelength CSV", "",
+            "CSV / text files (*.csv *.txt *.dat);;All files (*)",
+        )
+        if path:
+            self._edit_csv.setText(path)
+            self._rb_csv.setChecked(True)
+
+    def _kick_load(self):
+        sig = _Sig(self)
+        sig.done.connect(self._on_loaded)
+        sig.error.connect(lambda e: self._lbl_status.setText(f"Load failed: {e}"))
+        def _work():
+            try:
+                sig.done.emit(_cpva_load_all_channels())
+            except Exception as exc:
+                sig.error.emit(str(exc))
+        _bg(_work)
+
+    def _on_loaded(self, channels: list):
+        global _cpva_channel_cache
+        _cpva_channel_cache = channels
+        self._all_channels = channels
+        self._lbl_status.setText(
+            f"{len(channels)} channels. Type to filter."
+            if channels else "CPVA returned no channels."
+        )
+        self._filter(self._edit.text())
+
+    def _filter(self, text: str):
+        q = text.strip().lower()
+        self._lst.clear()
+        if not q or not self._all_channels:
+            return
+        matches = [ch for ch in self._all_channels if q in ch.lower()]
+        for ch in matches[:300]:
+            self._lst.addItem(ch)
+        extra = " (top 300)" if len(matches) > 300 else ""
+        self._lbl_status.setText(
+            f"{len(matches)} match(es){extra}." if matches else "No matches."
+        )
+
+    def _on_ok(self):
+        if self._rb_index.isChecked():
+            self._result = {"mode": "index"}
+            self.accept()
+            return
+        if self._rb_csv.isChecked():
+            path = self._edit_csv.text().strip()
+            if not path or not os.path.isfile(path):
+                QMessageBox.information(self, "Wavelength axis",
+                                        "Pick a valid CSV / text file first.")
+                return
+            arr = _load_x_csv(path)
+            if arr is None or arr.size == 0:
+                QMessageBox.warning(self, "Wavelength axis",
+                                    "No numbers could be read from that file.")
+                return
+            self._result = {"mode": "csv", "csv_path": path}
+            self.accept()
+            return
+        items = self._lst.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Wavelength axis",
+                                    "Pick a source channel from the list first.")
+            return
+        src = items[0].text()
+        if self._rb_linear.isChecked():
+            self._result = {"mode": "linear", "source_pv": src,
+                            "scale": float(self._sb_scale.value()),
+                            "offset": float(self._sb_offset.value())}
+        else:
+            self._result = {"mode": "pv", "source_pv": src}
+        self.accept()
+
+    def result_cfg(self) -> "dict | None":
+        return self._result
 
 
 # ── PresetEditDialog ──────────────────────────────────────────────────────────
@@ -1224,9 +1601,12 @@ class SpectraWidget(QWidget):
         self._search_pvs:       list[tuple[str, str]]    = self._load_search_pvs()
         # Waveform PVs used for spectrum analysis (X = wavelength axis, Y = intensity).
         # User picks any _X or _Y variant; the base and both axes are auto-derived.
-        self._spec_base_pv:     str                      = self._load_spec_base()
+        self._spec_y_pv:        str                      = self._load_spec_y()
+        self._spec_base_pv:     str                      = _strip_xy_suffix(self._spec_y_pv)
         self._spec_x_pv:        str                      = self._spec_base_pv + "_X"
-        self._spec_y_pv:        str                      = self._spec_base_pv + "_Y"
+        # How to build the wavelength axis when {base}_X is missing.
+        # {"mode": "native"|"pv"|"linear"|"index", "source_pv": str, "scale", "offset"}
+        self._x_axis_cfg:       dict                     = self._load_x_axis_cfg()
         self._color_mode:       str                      = "order"   # order | gdd | tod
         self._energy_data:      list[tuple[int, float]]  = []
         self._x_data:           np.ndarray | None        = None
@@ -1255,24 +1635,39 @@ class SpectraWidget(QWidget):
         self._cancel            = threading.Event()
         self._colorbar_bot:     object | None            = None
         self._colorbar_info:    dict   | None            = None
+        self._twin_bot:         object | None            = None   # ratio compare axis
         self._last_saved_layout: dict                    = {}
 
         self._build_ui()
         self._connect_signals()
         self._connect_zoom_tracking()
         self._load_layout()
+        self._update_active_card()
+        self._ensure_channels_loaded()   # warm the cache for inline search / _X checks
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         root = QHBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(4)
-        root.addWidget(self._make_sidebar())
+        # The sidebar lives in a vertical scroll area so that on a small monitor
+        # its controls scroll instead of being squeezed / overlapping each other.
+        self._sidebar_scroll = QScrollArea()
+        self._sidebar_scroll.setWidget(self._make_sidebar())
+        self._sidebar_scroll.setWidgetResizable(True)
+        self._sidebar_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._sidebar_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sbw = self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent)
+        self._sidebar_scroll.setFixedWidth(SIDEBAR_W + sbw + 2)
+        root.addWidget(self._sidebar_scroll)
         root.addWidget(self._make_graphs(), stretch=1)
 
     def _make_sidebar(self) -> QWidget:
         sb = QWidget()
-        sb.setFixedWidth(276)
+        sb.setFixedWidth(SIDEBAR_W)
         lay = QVBoxLayout(sb)
         lay.setContentsMargins(2, 4, 2, 4)
         lay.setSpacing(6)
@@ -1312,37 +1707,117 @@ class SpectraWidget(QWidget):
         g_search = QGroupBox("Search data by")
         g_search.setStyleSheet(_GROUP_STYLE)
         sl = QVBoxLayout(g_search)
-        sl.setSpacing(4)
+        sl.setSpacing(5)
 
-        # Preset row
+        # ── Currently-selected card (all search PVs + spectrum PV) ──────
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame { background: #f1f6fb; border: 1px solid #cfe0f0; border-radius: 4px; }"
+            "QLabel { border: none; background: transparent; }"
+        )
+        card_l = QVBoxLayout(card)
+        card_l.setContentsMargins(8, 6, 8, 6)
+        card_l.setSpacing(2)
+
+        lbl_sp = QLabel("Searching by:")
+        lbl_sp.setStyleSheet("color:#555; border:none;")
+        card_l.addWidget(lbl_sp)
+        self._lbl_active_search = QLabel("—")
+        self._lbl_active_search.setWordWrap(True)
+        self._lbl_active_search.setStyleSheet("font-weight: 700; color: #0D47A1; border: none;")
+        card_l.addWidget(self._lbl_active_search)
+
+        sep_card = QFrame()
+        sep_card.setFrameShape(QFrame.Shape.HLine)
+        sep_card.setStyleSheet("color: #cfe0f0;")
+        card_l.addWidget(sep_card)
+
+        row_sp = QHBoxLayout()
+        row_sp.setSpacing(5)
+        lbl_spec = QLabel("Spectrum:")
+        lbl_spec.setStyleSheet("color:#555; border:none;")
+        row_sp.addWidget(lbl_spec)
+        self._lbl_spec_base = QLineEdit(self._spec_base_pv)
+        self._lbl_spec_base.setReadOnly(True)
+        self._lbl_spec_base.setToolTip(
+            f"X axis: {self._x_axis_summary()}\nY axis: {self._spec_y_pv}"
+        )
+        self._lbl_spec_base.setStyleSheet(
+            "font-size: 9px; color: #222; border: 1px solid #cfe0f0; background: #fff;"
+        )
+        row_sp.addWidget(self._lbl_spec_base, stretch=1)
+        self._btn_spec = QPushButton("Change…")
+        self._btn_spec.setFixedWidth(62)
+        self._btn_spec.setToolTip(
+            "Search CPVA for a spectrum PV. Pick any _X or _Y variant — both axes "
+            "are paired automatically. If the _X channel is missing you can build "
+            "the wavelength axis from another PV or a CSV file."
+        )
+        row_sp.addWidget(self._btn_spec)
+        card_l.addLayout(row_sp)
+        self._lbl_spec_pair = QLabel(f"→ X: {self._x_axis_summary()}   /   Y: {self._spec_y_pv}")
+        self._lbl_spec_pair.setStyleSheet("font-size: 9px; color: #888; border: none;")
+        self._lbl_spec_pair.setWordWrap(True)
+        card_l.addWidget(self._lbl_spec_pair)
+        sl.addWidget(card)
+
+        # ── Preset row (load + inline manage: add / rename / delete) ────
         row_preset = QHBoxLayout()
+        row_preset.setSpacing(3)
         row_preset.addWidget(QLabel("Preset:"))
         self._cmb_preset = QComboBox()
-        self._cmb_preset.setToolTip("Load a saved set of PVs into the list below.")
+        self._cmb_preset.setToolTip("Load a saved set of PVs. The chosen preset stays "
+                                    "selected so you can rename or delete it.")
         self._cmb_preset.addItem("-- select preset --")
         for p in _load_search_presets():
             self._cmb_preset.addItem(p["name"])
         row_preset.addWidget(self._cmb_preset, stretch=1)
-        self._btn_edit_presets = QPushButton("Edit…")
-        self._btn_edit_presets.setFixedWidth(46)
-        self._btn_edit_presets.setToolTip("Save the current PV list as a preset, or load / delete presets.")
-        row_preset.addWidget(self._btn_edit_presets)
+        self._btn_preset_add = QPushButton("+")
+        self._btn_preset_add.setFixedWidth(26)
+        self._btn_preset_add.setToolTip("Save the current PV list as a new preset.")
+        self._btn_preset_ren = QPushButton("✎")
+        self._btn_preset_ren.setFixedWidth(26)
+        self._btn_preset_ren.setToolTip("Rename the selected preset and update it to the current PV list.")
+        self._btn_preset_del = QPushButton("🗑")
+        self._btn_preset_del.setFixedWidth(26)
+        self._btn_preset_del.setToolTip("Delete the selected preset.")
+        for b in (self._btn_preset_add, self._btn_preset_ren, self._btn_preset_del):
+            row_preset.addWidget(b)
         sl.addLayout(row_preset)
 
-        # PV table
+        # ── Inline channel search (fast add) ───────────────────────────
+        self._edit_pv_search = QLineEdit()
+        self._edit_pv_search.setPlaceholderText("🔍  filter CPVA channels…")
+        self._edit_pv_search.setToolTip("Type part of a channel name; click a result to add it to the list.")
+        sl.addWidget(self._edit_pv_search)
+        self._lst_pv_search = QListWidget()
+        self._lst_pv_search.setFixedHeight(72)
+        self._lst_pv_search.setVisible(False)
+        self._lst_pv_search.setToolTip("Click a channel to add it to the list below.")
+        sl.addWidget(self._lst_pv_search)
+
+        # ── Selected-PV table ──────────────────────────────────────────
         self._tbl_pvs = QTableWidget(0, 2)
         self._tbl_pvs.setHorizontalHeaderLabels(["Label", "Channel"])
-        self._tbl_pvs.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self._tbl_pvs.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._tbl_pvs.setColumnWidth(0, 100)
+        # Columns size to their content and a horizontal scrollbar appears when the
+        # full channel name is wider than the panel — so nothing is silently elided.
+        hdr = self._tbl_pvs.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setStretchLastSection(False)
+        self._tbl_pvs.setColumnWidth(0, 90)
+        self._tbl_pvs.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._tbl_pvs.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._tbl_pvs.setWordWrap(False)
         self._tbl_pvs.verticalHeader().setVisible(False)
         self._tbl_pvs.verticalHeader().setDefaultSectionSize(22)
         self._tbl_pvs.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._tbl_pvs.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._tbl_pvs.setFixedHeight(90)
+        self._tbl_pvs.setFixedHeight(104)
         self._tbl_pvs.setToolTip(
             "Click a row to plot that PV in the search graph. "
-            "Double-click a label to rename it."
+            "Double-click a label to rename it. The full channel is also shown in the "
+            "card above and on hover."
         )
         for i, (lbl, ch) in enumerate(self._search_pvs):
             self._tbl_pvs.insertRow(i)
@@ -1359,8 +1834,8 @@ class SpectraWidget(QWidget):
 
         # Add / Remove buttons
         row_pv = QHBoxLayout()
-        self._btn_add_pv = QPushButton("+ Add PV")
-        self._btn_add_pv.setToolTip("Search CPVA channels and add one or more to the list.")
+        self._btn_add_pv = QPushButton("+ Add PV…")
+        self._btn_add_pv.setToolTip("Open a full CPVA channel search to add one or more PVs.")
         self._btn_rem_pv = QPushButton("✕ Remove")
         self._btn_rem_pv.setToolTip("Remove the selected PV from the list.")
         self._btn_rem_pv.setEnabled(bool(self._search_pvs))
@@ -1387,36 +1862,6 @@ class SpectraWidget(QWidget):
         row_m.addWidget(self._btn_archive)
         row_m.addWidget(self._btn_live_mode)
         lay.addWidget(g_mode)
-
-        # ── Spectrum PV ────────────────────────────────────────────────
-        g_spec = QGroupBox("Spectrum PV")
-        g_spec.setStyleSheet(_GROUP_STYLE)
-        spec_l = QVBoxLayout(g_spec)
-        spec_l.setSpacing(4)
-
-        row_sp = QHBoxLayout()
-        self._lbl_spec_base = QLineEdit(self._spec_base_pv)
-        self._lbl_spec_base.setReadOnly(True)
-        self._lbl_spec_base.setToolTip(
-            f"X axis: {self._spec_x_pv}\nY axis: {self._spec_y_pv}"
-        )
-        self._lbl_spec_base.setStyleSheet("font-size: 9px; color: #555;")
-        row_sp.addWidget(self._lbl_spec_base, stretch=1)
-        self._btn_spec = QPushButton("Change…")
-        self._btn_spec.setFixedWidth(62)
-        self._btn_spec.setToolTip(
-            "Search CPVA for a spectrum PV. Pick any _X or _Y variant — "
-            "both axes are paired automatically."
-        )
-        row_sp.addWidget(self._btn_spec)
-        spec_l.addLayout(row_sp)
-
-        self._lbl_spec_pair = QLabel(f"→ {self._spec_x_pv}  /  {self._spec_y_pv}")
-        self._lbl_spec_pair.setStyleSheet("font-size: 9px; color: #888;")
-        self._lbl_spec_pair.setWordWrap(True)
-        spec_l.addWidget(self._lbl_spec_pair)
-
-        lay.addWidget(g_spec)
 
         # ── Live controls ──────────────────────────────────────────────
         self._g_live = QGroupBox("Live")
@@ -1476,23 +1921,66 @@ class SpectraWidget(QWidget):
         )
         row_color.addWidget(self._cmb_color, stretch=1)
         disp_l.addLayout(row_color)
-        self._chk_normalize = QCheckBox("Normalize to peak")
-        self._chk_std       = QCheckBox("Standard deviation (±1σ)")
+        # Normalization mode
+        row_norm = QHBoxLayout()
+        row_norm.addWidget(QLabel("Normalize:"))
+        self._cmb_norm = QComboBox()
+        self._cmb_norm.addItems(["None", "Peak", "Area"])
+        self._cmb_norm.setToolTip(
+            "Scale each spectrum before plotting:\n"
+            "• None — raw intensity\n"
+            "• Peak — divide by its maximum (peak = 1)\n"
+            "• Area — divide by the integrated area (unit area under the curve)"
+        )
+        row_norm.addWidget(self._cmb_norm, stretch=1)
+        disp_l.addLayout(row_norm)
+
+        # Variation band (±1σ or percentile)
+        row_band = QHBoxLayout()
+        self._chk_std = QCheckBox("Variation band")
+        self._chk_std.setStyleSheet(_CHK_STYLE)
+        self._chk_std.setToolTip("Shade a spread band around each averaged spectrum.")
+        row_band.addWidget(self._chk_std)
+        self._cmb_band = QComboBox()
+        self._cmb_band.addItems(["±1σ", "10–90 pct"])
+        self._cmb_band.setToolTip(
+            "Band type:\n"
+            "• ±1σ — one standard deviation (sensitive to outliers)\n"
+            "• 10–90 pct — robust percentile band"
+        )
+        row_band.addWidget(self._cmb_band, stretch=1)
+        disp_l.addLayout(row_band)
+
+        # Smoothing
+        row_sm = QHBoxLayout()
+        self._chk_smooth = QCheckBox("Smooth")
+        self._chk_smooth.setStyleSheet(_CHK_STYLE)
+        self._chk_smooth.setToolTip("Savitzky–Golay (quadratic) smoothing of the displayed curve.")
+        row_sm.addWidget(self._chk_smooth)
+        row_sm.addWidget(QLabel("window:"))
+        self._sb_smooth = QSpinBox()
+        self._sb_smooth.setRange(3, 201)
+        self._sb_smooth.setSingleStep(2)
+        self._sb_smooth.setValue(11)
+        row_sm.addWidget(self._sb_smooth)
+        row_sm.addStretch(1)
+        disp_l.addLayout(row_sm)
+
         self._chk_show_energy = QCheckBox("Show search graph")
         self._chk_show_energy.setChecked(True)
         self._chk_show_energy.setToolTip(
             "Uncheck to minimize the top search graph — the spectra graph then fills "
             "the whole window."
         )
-        for c in (self._chk_normalize, self._chk_std, self._chk_show_energy):
-            c.setStyleSheet(_CHK_STYLE)
-            disp_l.addWidget(c)
+        self._chk_show_energy.setStyleSheet(_CHK_STYLE)
+        disp_l.addWidget(self._chk_show_energy)
         lay.addWidget(g_disp)
 
         # ── X range ────────────────────────────────────────────────────
         g_xr = QGroupBox("Spectrum range [nm]")
         g_xr.setStyleSheet(_GROUP_STYLE)
-        xr_l = QHBoxLayout(g_xr)
+        xr_v = QVBoxLayout(g_xr)
+        xr_l = QHBoxLayout()
         xr_l.addWidget(QLabel("From:"))
         self._sb_x_min = QSpinBox()
         self._sb_x_min.setRange(-9999, 9999)
@@ -1503,10 +1991,43 @@ class SpectraWidget(QWidget):
         self._sb_x_max.setRange(-9999, 9999)
         self._sb_x_max.setValue(900)
         xr_l.addWidget(self._sb_x_max)
+        xr_v.addLayout(xr_l)
+        self._chk_autofit = QCheckBox("Auto-fit range to data on Analyze")
+        self._chk_autofit.setChecked(True)
+        self._chk_autofit.setStyleSheet(_CHK_STYLE)
+        self._chk_autofit.setToolTip(
+            "After each Analyze, set From/To to the wavelength span that actually "
+            "contains signal. Uncheck to keep your manual values."
+        )
+        xr_v.addWidget(self._chk_autofit)
         lay.addWidget(g_xr)
 
+        # ── Compare two regions ────────────────────────────────────────
+        g_cmp = QGroupBox("Compare regions")
+        g_cmp.setStyleSheet(_GROUP_STYLE)
+        cmp_l = QVBoxLayout(g_cmp)
+        cmp_l.setSpacing(3)
+        self._chk_compare = QCheckBox("Show comparison curve")
+        self._chk_compare.setStyleSheet(_CHK_STYLE)
+        self._chk_compare.setToolTip(
+            "Plot the difference (A−B) or ratio (A÷B) of two analyzed spectra."
+        )
+        cmp_l.addWidget(self._chk_compare)
+        row_cmp = QHBoxLayout()
+        row_cmp.addWidget(QLabel("A:"))
+        self._cmb_cmp_a = QComboBox()
+        row_cmp.addWidget(self._cmb_cmp_a, stretch=1)
+        row_cmp.addWidget(QLabel("B:"))
+        self._cmb_cmp_b = QComboBox()
+        row_cmp.addWidget(self._cmb_cmp_b, stretch=1)
+        cmp_l.addLayout(row_cmp)
+        self._cmb_cmp_mode = QComboBox()
+        self._cmb_cmp_mode.addItems(["A − B (difference)", "A ÷ B (ratio)"])
+        cmp_l.addWidget(self._cmb_cmp_mode)
+        lay.addWidget(g_cmp)
+
         # ── Selected regions (list + analyze + progress) ───────────────
-        # Lives here, under "Spectrum range", to save horizontal space.
+        # Lives here, under "Compare regions", to save horizontal space.
         lay.addWidget(self._make_region_panel(), stretch=1)
 
         # ── Export ─────────────────────────────────────────────────────
@@ -1672,6 +2193,9 @@ class SpectraWidget(QWidget):
         self._regions_scroll = QScrollArea()
         self._regions_scroll.setWidget(self._regions_w)
         self._regions_scroll.setWidgetResizable(True)
+        # Keep a usable minimum so the list never collapses into the buttons below;
+        # when the whole sidebar is too tall it scrolls as a unit instead.
+        self._regions_scroll.setMinimumHeight(120)
         self._regions_scroll.setStyleSheet(
             "QScrollArea { border: 1px solid #b0b0b0; border-radius: 4px; background: white; }"
         )
@@ -1736,8 +2260,15 @@ class SpectraWidget(QWidget):
         self._btn_analyze.clicked.connect(self._run_analysis)
         self._btn_clear_regs.clicked.connect(self._clear_regions)
         self._btn_export.clicked.connect(self._export)
-        self._chk_normalize.stateChanged.connect(self._redraw_spectra)
+        self._cmb_norm.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_std.stateChanged.connect(self._redraw_spectra)
+        self._cmb_band.currentIndexChanged.connect(self._redraw_spectra)
+        self._chk_smooth.stateChanged.connect(self._redraw_spectra)
+        self._sb_smooth.valueChanged.connect(self._redraw_spectra)
+        self._chk_compare.stateChanged.connect(self._redraw_spectra)
+        self._cmb_cmp_a.currentIndexChanged.connect(self._redraw_spectra)
+        self._cmb_cmp_b.currentIndexChanged.connect(self._redraw_spectra)
+        self._cmb_cmp_mode.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_show_energy.toggled.connect(self._update_top_visibility)
         self._cmb_method.currentIndexChanged.connect(self._redraw_spectra)
         self._sb_x_min.valueChanged.connect(self._redraw_spectra)
@@ -1749,7 +2280,11 @@ class SpectraWidget(QWidget):
         self._btn_rem_pv.clicked.connect(self._remove_selected_pv)
         self._btn_spec.clicked.connect(self._change_spec_pv)
         self._cmb_preset.currentIndexChanged.connect(self._on_preset_combo_changed)
-        self._btn_edit_presets.clicked.connect(self._open_edit_presets_dialog)
+        self._btn_preset_add.clicked.connect(self._preset_add)
+        self._btn_preset_ren.clicked.connect(self._preset_rename)
+        self._btn_preset_del.clicked.connect(self._preset_delete)
+        self._edit_pv_search.textEdited.connect(self._on_inline_search)
+        self._lst_pv_search.itemClicked.connect(self._on_inline_result_clicked)
         self._cmb_color.currentIndexChanged.connect(self._on_color_mode_changed)
         self._splitter.splitterMoved.connect(self._save_layout)
         self._tb_top.subplot_params_changed.connect(self._save_layout)
@@ -1883,53 +2418,127 @@ class SpectraWidget(QWidget):
         except Exception:
             pass
 
-    def _load_spec_base(self) -> str:
-        """Load the saved spectrum base PV, stripping any _X/_Y suffix."""
+    def _load_spec_y(self) -> str:
+        """Load the saved spectrum Y (intensity) channel. Supports both the new
+        'y' key (full channel name) and the legacy 'base' key (which implied a
+        _X/_Y pair, i.e. Y = base + '_Y')."""
         try:
             with open(_spec_pvs_config_path(), encoding="utf-8") as f:
                 data = json.load(f)
+            y = data.get("y")
+            if y:
+                return str(y).strip()
             base = str(data.get("base", "") or "").strip()
             if base:
-                return base
+                return base + "_Y"
         except Exception:
             pass
-        return _strip_xy_suffix(PV_SPEC_X)
+        return PV_SPEC_Y
+
+    def _load_x_axis_cfg(self) -> dict:
+        """Load the saved wavelength-axis build config (default: native _X)."""
+        try:
+            with open(_spec_pvs_config_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = data.get("x_axis")
+            if isinstance(cfg, dict) and cfg.get("mode") in (
+                "native", "pv", "linear", "csv", "index"
+            ):
+                return cfg
+        except Exception:
+            pass
+        return {"mode": "native"}
 
     def _save_spec_base(self):
         try:
             p = _spec_pvs_config_path()
             os.makedirs(os.path.dirname(p), exist_ok=True)
             with open(p, "w", encoding="utf-8") as f:
-                json.dump({"base": self._spec_base_pv}, f, indent=2)
+                json.dump({"y": self._spec_y_pv, "base": self._spec_base_pv,
+                           "x_axis": self._x_axis_cfg}, f, indent=2)
         except Exception:
             pass
 
+    def _x_axis_summary(self) -> str:
+        """Human-readable description of the current wavelength-axis source."""
+        cfg = self._x_axis_cfg or {"mode": "native"}
+        mode = cfg.get("mode", "native")
+        if mode == "native":
+            return self._spec_x_pv
+        if mode == "index":
+            return "sample index (0, 1, 2 …)"
+        if mode == "csv":
+            return f"CSV: {os.path.basename(cfg.get('csv_path', '?'))}"
+        src = cfg.get("source_pv", "?")
+        if mode == "linear":
+            return f"{cfg.get('scale', 1.0)}·({src}) + {cfg.get('offset', 0.0)}"
+        return src
+
+    def _resolve_x_data(self, start_ns: int, end_ns: int) -> "np.ndarray | None":
+        """Fetch / build the wavelength axis according to self._x_axis_cfg.
+        Returns None when the axis should fall back to the sample index."""
+        cfg = self._x_axis_cfg or {"mode": "native"}
+        mode = cfg.get("mode", "native")
+        if mode == "index":
+            return None
+        if mode == "csv":
+            return _load_x_csv(cfg.get("csv_path", ""))
+        src = self._spec_x_pv if mode == "native" else cfg.get("source_pv")
+        if not src:
+            return None
+        wf = _fetch_waveforms(src, start_ns, end_ns)
+        if not wf:
+            return None
+        x = np.asarray(wf[-1][1], dtype=float)
+        if mode == "linear":
+            x = float(cfg.get("scale", 1.0)) * x + float(cfg.get("offset", 0.0))
+        return x
+
     def _change_spec_pv(self):
-        """Open PvSearchDialog; derive _X/_Y pair from whatever the user picks."""
+        """Open PvSearchDialog and set the spectrum Y (intensity) channel.
+
+        • A channel ending in _X or _Y is treated as one half of a paired
+          waveform: Y = base+'_Y', X = base+'_X'.
+        • Any other channel (e.g. …:FundY) IS the Y waveform itself, and almost
+          never has a matching _X — so we ask how to build the wavelength axis.
+        """
         dlg = PvSearchDialog(self)
-        dlg.setWindowTitle("Select spectrum PV  (pick any _X or _Y variant)")
+        dlg.setWindowTitle("Select spectrum PV  (an _X/_Y pair, or a standalone waveform)")
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         added = dlg.added_pvs()
         if not added:
             return
         ch = added[0][1]
+        paired = ch.endswith("_X") or ch.endswith("_Y")
         base = _strip_xy_suffix(ch)
         self._spec_base_pv = base
         self._spec_x_pv    = base + "_X"
-        self._spec_y_pv    = base + "_Y"
+        self._spec_y_pv    = (base + "_Y") if paired else ch
         self._x_data       = None   # invalidate cached X axis
+
+        # Decide how the wavelength axis is built.
+        native_x_exists = self._spec_x_pv in _cpva_channel_cache
+        if native_x_exists or (paired and not _cpva_channel_cache):
+            self._x_axis_cfg = {"mode": "native"}
+        else:
+            xdlg = XAxisSourceDialog(base, self)
+            if xdlg.exec() == QDialog.DialogCode.Accepted and xdlg.result_cfg():
+                self._x_axis_cfg = xdlg.result_cfg()
+            else:
+                self._x_axis_cfg = {"mode": "index"}
+
         self._lbl_spec_base.setText(base)
         self._lbl_spec_base.setToolTip(
-            f"X axis: {self._spec_x_pv}\nY axis: {self._spec_y_pv}"
+            f"X axis: {self._x_axis_summary()}\nY axis: {self._spec_y_pv}"
         )
-        self._lbl_spec_pair.setText(f"→ {self._spec_x_pv}  /  {self._spec_y_pv}")
+        self._lbl_spec_pair.setText(f"→ X: {self._x_axis_summary()}   /   Y: {self._spec_y_pv}")
         self._save_spec_base()
         if self._live:
             self._stop_live()
             self._set_status(f"Spectrum PV changed to {base} — live stopped.")
         else:
-            self._set_status(f"Spectrum PV: {base}  (→ _X / _Y)")
+            self._set_status(f"Spectrum PV: {base}  (X: {self._x_axis_summary()})")
 
     def _save_layout(self, *_):
         """Persist splitter sizes and (when manually adjusted) subplot margins."""
@@ -2002,7 +2611,11 @@ class SpectraWidget(QWidget):
         if self._search_pvs:
             self._tbl_pvs.selectRow(min(max(select_row, 0), len(self._search_pvs) - 1))
         self._tbl_pvs.blockSignals(False)
-        self._on_search_pv_changed()
+        # The PV *set* changed → reload all search PVs for the loaded day.
+        self._update_active_card()
+        self._btn_rem_pv.setEnabled(self._tbl_pvs.currentRow() >= 0)
+        if not self._live and self._selected_days:
+            self._load_day_energy()
 
     def _update_preset_combo(self):
         self._cmb_preset.blockSignals(True)
@@ -2014,6 +2627,8 @@ class SpectraWidget(QWidget):
         self._cmb_preset.blockSignals(False)
 
     def _on_preset_combo_changed(self, idx: int):
+        # Loads the preset's PVs but KEEPS the preset selected, so the rename /
+        # delete buttons know which preset to act on.
         if idx <= 0:
             return
         presets = _load_search_presets()
@@ -2026,9 +2641,118 @@ class SpectraWidget(QWidget):
             self._search_pvs = pvs
             self._save_search_pvs()
             self._refresh_pv_table(select_row=0)
+
+    def _selected_preset_index(self) -> int:
+        """Index into the preset list of the combo's current item (-1 = none)."""
+        return self._cmb_preset.currentIndex() - 1
+
+    def _reload_preset_combo(self, select_name: "str | None" = None):
         self._cmb_preset.blockSignals(True)
-        self._cmb_preset.setCurrentIndex(0)
+        self._cmb_preset.clear()
+        self._cmb_preset.addItem("-- select preset --")
+        names = [p["name"] for p in _load_search_presets()]
+        for n in names:
+            self._cmb_preset.addItem(n)
+        if select_name and select_name in names:
+            self._cmb_preset.setCurrentIndex(names.index(select_name) + 1)
+        else:
+            self._cmb_preset.setCurrentIndex(0)
         self._cmb_preset.blockSignals(False)
+
+    def _preset_add(self):
+        name, ok = QInputDialog.getText(self, "New preset",
+                                        "Save the current PV list as preset named:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        presets = _load_search_presets()
+        pvs = [{"label": l, "channel": c} for l, c in self._search_pvs]
+        for p in presets:
+            if p["name"] == name:
+                p["pvs"] = pvs
+                break
+        else:
+            presets.append({"name": name, "pvs": pvs})
+        _save_search_presets(presets)
+        self._reload_preset_combo(select_name=name)
+        self._set_status(f"Preset '{name}' saved ({len(pvs)} PV(s)).")
+
+    def _preset_rename(self):
+        pidx = self._selected_preset_index()
+        presets = _load_search_presets()
+        if not (0 <= pidx < len(presets)):
+            QMessageBox.information(self, "Preset", "Select a preset to update first.")
+            return
+        cur = presets[pidx]["name"]
+        name, ok = QInputDialog.getText(
+            self, "Update preset",
+            "New name (also saves the current PV list into this preset):", text=cur)
+        if not ok or not name.strip():
+            return
+        presets[pidx]["name"] = name.strip()
+        presets[pidx]["pvs"] = [{"label": l, "channel": c} for l, c in self._search_pvs]
+        _save_search_presets(presets)
+        self._reload_preset_combo(select_name=name.strip())
+        self._set_status(f"Preset '{name.strip()}' updated.")
+
+    def _preset_delete(self):
+        pidx = self._selected_preset_index()
+        presets = _load_search_presets()
+        if not (0 <= pidx < len(presets)):
+            QMessageBox.information(self, "Preset", "Select a preset to delete first.")
+            return
+        name = presets[pidx]["name"]
+        if QMessageBox.question(
+            self, "Delete preset", f"Delete preset '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        del presets[pidx]
+        _save_search_presets(presets)
+        self._reload_preset_combo()
+        self._set_status(f"Preset '{name}' deleted.")
+
+    # ── Inline CPVA channel search (fast add) ──────────────────────────────
+    def _ensure_channels_loaded(self):
+        if _cpva_channel_cache:
+            return
+        sig = _Sig(self)
+        sig.done.connect(self._on_channels_loaded)
+        def _work():
+            try:
+                sig.done.emit(_cpva_load_all_channels())
+            except Exception:
+                sig.done.emit([])
+        _bg(_work)
+
+    def _on_channels_loaded(self, channels: list):
+        global _cpva_channel_cache
+        if channels:
+            _cpva_channel_cache = channels
+        self._on_inline_search(self._edit_pv_search.text())
+
+    def _on_inline_search(self, text: str):
+        q = text.strip().lower()
+        self._lst_pv_search.clear()
+        if not q:
+            self._lst_pv_search.setVisible(False)
+            return
+        if not _cpva_channel_cache:
+            self._ensure_channels_loaded()
+            self._lst_pv_search.setVisible(False)
+            return
+        matches = [ch for ch in _cpva_channel_cache if q in ch.lower()]
+        for ch in matches[:200]:
+            self._lst_pv_search.addItem(ch)
+        self._lst_pv_search.setVisible(bool(matches))
+
+    def _on_inline_result_clicked(self, item: QListWidgetItem):
+        ch = item.text()
+        if ch not in {c for _, c in self._search_pvs}:
+            self._search_pvs.append((ch, ch))
+            self._save_search_pvs()
+            self._refresh_pv_table(select_row=len(self._search_pvs) - 1)
+            self._set_status(f"Added {ch}.")
 
     def _open_add_pv_dialog(self):
         dlg = PvSearchDialog(self)
@@ -2083,10 +2807,24 @@ class SpectraWidget(QWidget):
         self._save_search_pvs()
         self._refresh_pv_table(select_row=0)
 
+    def _update_active_card(self):
+        # All PVs in the table are searched together, so list them all.
+        if self._search_pvs:
+            self._lbl_active_search.setText(
+                ", ".join(lbl for lbl, _ in self._search_pvs))
+            self._lbl_active_search.setToolTip(
+                "\n".join(f"{lbl}  →  {ch}" for lbl, ch in self._search_pvs))
+        else:
+            self._lbl_active_search.setText("—")
+            self._lbl_active_search.setToolTip("")
+
     def _on_search_pv_changed(self, *_):
+        # Selecting a different row only changes which trace is emphasized — all
+        # search PVs are plotted together, so just redraw (no refetch).
         self._btn_rem_pv.setEnabled(self._tbl_pvs.currentRow() >= 0)
-        if not self._live and self._selected_days:
-            self._load_day_energy()
+        self._update_active_card()
+        if not self._live and self._energy_data:
+            self._refresh_energy_view()
 
     def _on_color_mode_changed(self, *_):
         idx = self._cmb_color.currentIndex()
@@ -2121,9 +2859,11 @@ class SpectraWidget(QWidget):
         start_ns, _ = _day_range_ns(days[0])
         _, end_ns   = _day_range_ns(days[-1])
         self._day_start_ns, self._day_end_ns = start_ns, end_ns
-        channel = self._active_search_channel()
-        label   = self._active_search_label()
-        self._set_status(f"Loading {label}…")
+        pvs = list(self._search_pvs)
+        if not pvs:
+            self._draw_top_empty("Add a search PV to plot")
+            return
+        self._set_status(f"Loading {len(pvs)} search PV(s)…")
         self._btn_pick_day.setEnabled(False)
 
         sig = _Sig(self)
@@ -2132,29 +2872,43 @@ class SpectraWidget(QWidget):
 
         def _work():
             try:
-                sig.done.emit(_fetch_scalars(channel, start_ns, end_ns))
+                series = []
+                for lbl, ch in pvs:
+                    if self._cancel.is_set():
+                        break
+                    series.append({"label": lbl, "channel": ch,
+                                   "data": _fetch_scalars(ch, start_ns, end_ns)})
+                sig.done.emit(series)
             except Exception as e:
                 sig.error.emit(str(e))
 
         self._cancel.clear()
         _bg(_work)
 
-    def _on_energy_loaded(self, data: list):
+    def _on_energy_loaded(self, series: list):
         self._btn_pick_day.setEnabled(True)
         if self._cancel.is_set():
             self._set_status("Load cancelled.")
             return
         # Drop the "last value before start" sample EPICS returns, so the axis
         # is clamped to the selected day instead of stretching to the previous day.
-        data = [(t, v) for (t, v) in data
-                if self._day_start_ns <= t <= self._day_end_ns]
-        self._energy_data = data
-        label = self._active_search_label()
-        if not data:
-            self._set_status(f"No data for {label} on this day.")
-            self._draw_top_empty(f"No data for {label}")
+        out = []
+        for i, s in enumerate(series):
+            d = [(t, v) for (t, v) in s["data"]
+                 if self._day_start_ns <= t <= self._day_end_ns]
+            out.append({"label": s["label"], "channel": s["channel"],
+                        "color": _REGION_COLORS[i % len(_REGION_COLORS)], "data": d})
+        self._energy_data = out
+        total = sum(len(s["data"]) for s in out)
+        if total == 0:
+            self._set_status("No data for the selected PV(s) on this day.")
+            self._draw_top_empty("No data for the selected PV(s)")
             return
-        self._set_status(f"Loaded {len(data)} samples of {label}.")
+        empties = [s["label"] for s in out if not s["data"]]
+        msg = f"Loaded {total} samples across {len(out) - len(empties)} PV(s)."
+        if empties:
+            msg += f"  No data for: {', '.join(empties)}."
+        self._set_status(msg)
         self._draw_energy()
         self._install_span()
 
@@ -2191,14 +2945,32 @@ class SpectraWidget(QWidget):
             self._top_user_ylim = None
         self._top_redrawing = True
         ax.clear()
-        if not self._energy_data:
+        series = [s for s in self._energy_data if s.get("data")]
+        if not series:
+            self._top_redrawing = False
             return
-        # sort by time so the connecting line follows chronological order
-        data = sorted(self._energy_data, key=lambda tv: tv[0])
-        times = [mdates.date2num(_ns_to_dt(t)) for t, _ in data]
-        vals  = [v for _, v in data]
-        ax.plot(times, vals, "-", lw=1.0, color="#1565C0", alpha=0.85,
-                marker=".", ms=3, mfc="#0D47A1", mec="#0D47A1")
+        # With more than one PV the units differ wildly (J vs fs² vs …), so each
+        # trace is min–max normalized to 0–1 for visibility; the real range is
+        # shown in the legend. A single PV keeps its real values.
+        normalize = len(series) > 1
+        active_ch = self._active_search_channel()
+        for s in series:
+            data = sorted(s["data"], key=lambda tv: tv[0])
+            times = [mdates.date2num(_ns_to_dt(t)) for t, _ in data]
+            vals  = np.array([v for _, v in data], dtype=float)
+            disp, lab = vals, s["label"]
+            if normalize:
+                vmin, vmax = float(vals.min()), float(vals.max())
+                rng = vmax - vmin
+                disp = (vals - vmin) / rng if rng > 0 else np.full_like(vals, 0.5)
+                lab = f"{s['label']}  [{vmin:.3g}…{vmax:.3g}]"
+            is_active = (s["channel"] == active_ch)
+            # Archived values hold until the next sample (zero-order hold), so a
+            # step-after line reflects the real signal — no false linear ramps.
+            ax.plot(times, disp, "-", drawstyle="steps-post",
+                    lw=2.0 if is_active else 1.0,
+                    color=s["color"], alpha=0.9, marker=".", ms=3,
+                    label=lab, zorder=5 if is_active else 3)
 
         days = self._selected_days or ([self._selected_day] if self._selected_day else [])
         multi = len(days) > 1
@@ -2216,10 +2988,11 @@ class SpectraWidget(QWidget):
             ax.set_xlabel(f"Time   —   {date_str}")
         else:
             ax.set_xlabel("Time")
-        label = self._active_search_label()
-        ax.set_ylabel(label)
-        ax.set_title(f"{label} — drag to select time region(s), then click Analyze")
+        ax.set_ylabel("Signals (each normalized 0–1)" if normalize else series[0]["label"])
+        ax.set_title("Drag to select time region(s), then click Analyze")
         ax.grid(True, alpha=0.25)
+        if len(series) > 1:
+            ax.legend(fontsize=8, loc="best")
         self._paint_region_spans(ax)
         self._top_redrawing = False
         if self._top_user_xlim is not None:
@@ -2294,6 +3067,7 @@ class SpectraWidget(QWidget):
 
         for i, r in enumerate(self._regions):
             self._regions_lay.addWidget(self._make_region_row(i, r))
+        self._refresh_compare_combos()
 
     def _make_region_row(self, i: int, r: dict) -> QWidget:
         rid = r["id"]
@@ -2349,7 +3123,8 @@ class SpectraWidget(QWidget):
         details.setVisible(r["expanded"])
         v.addWidget(details)
 
-        self._row_widgets[rid] = {"name": btn_name, "eye": btn_eye, "details": details}
+        self._row_widgets[rid] = {"name": btn_name, "eye": btn_eye, "details": details,
+                                  "metrics": getattr(details, "_metric_label", None)}
         self._apply_visibility_style(rid, r["visible"])
         return box
 
@@ -2393,6 +3168,19 @@ class SpectraWidget(QWidget):
             val = orders.get(label)
             add(f"<b>{label}:</b> {round(val)}"
                 if val is not None else f"<b>{label}:</b> n/a")
+
+        # Spectral metrics (peak λ / centroid / FWHM / RMS bandwidth / area).
+        # Filled in / refreshed by _update_metric_labels() after each redraw,
+        # since they depend on the current range, method and smoothing.
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #ddd;")
+        lay.addWidget(sep)
+        metric_lbl = QLabel(self._metrics_html(r.get("_metrics")))
+        metric_lbl.setWordWrap(True)
+        metric_lbl.setVisible(bool(r.get("_metrics")))
+        lay.addWidget(metric_lbl)
+        w._metric_label = metric_lbl
 
         if r.get("n", 0) > 0 and r.get("stack") is not None:
             chk = QCheckBox(f"Show all {r['n']} spectra in graph")
@@ -2530,7 +3318,6 @@ class SpectraWidget(QWidget):
         sig.progress_n.connect(self._on_analysis_progress)
 
         x_cached  = self._x_data
-        spec_x_ch = self._spec_x_pv
         spec_y_ch = self._spec_y_pv
 
         def _work():
@@ -2538,13 +3325,10 @@ class SpectraWidget(QWidget):
             if x_data is None:
                 sig.progress.emit("Loading spectrometer X axis…")
                 r0 = snap[0]
-                wf = _fetch_waveforms(
-                    spec_x_ch,
+                x_data = self._resolve_x_data(
                     r0["t_start"] - int(10 * 60 * 1e9),
                     r0["t_end"]   + int(10 * 60 * 1e9),
                 )
-                if wf:
-                    x_data = wf[-1][1]
 
             results = []
             for i, r in enumerate(snap):
@@ -2614,6 +3398,8 @@ class SpectraWidget(QWidget):
         if empties:
             msg += f"  No spectra in: {', '.join(empties)}."
         self._set_status(msg)
+        if self._chk_autofit.isChecked():
+            self._auto_fit_range()      # snap range to the data span (signals blocked)
         self._rebuild_regions_ui()      # populate details (energy, orders, n)
         self._redraw_spectra()
 
@@ -2635,30 +3421,59 @@ class SpectraWidget(QWidget):
         ax.set_yticks([])
         self._canvas_bot.draw_idle()
 
-    def _plot_spectrum(self, ax, x, avg, std, color, label, normalize, std_band, lw=1.6):
-        if x is None or len(x) != len(avg):
-            x = np.arange(len(avg))
+    # ── Display-option helpers ─────────────────────────────────────────────
+    def _norm_mode(self) -> str:
+        return {0: "none", 1: "peak", 2: "area"}.get(self._cmb_norm.currentIndex(), "none")
+
+    def _band_kind(self) -> str:
+        return "pct" if self._cmb_band.currentIndex() == 1 else "std"
+
+    def _smooth_win(self) -> int:
+        return self._sb_smooth.value() if self._chk_smooth.isChecked() else 0
+
+    def _norm_scale(self, xp, yp, norm: str) -> float:
+        if yp is None or len(yp) == 0:
+            return 1.0
+        if norm == "peak":
+            m = float(np.max(yp))
+            return m if m > 0 else 1.0
+        if norm == "area":
+            a = _trapz(yp, xp) if len(yp) > 1 else 0.0
+            return a if a > 0 else 1.0
+        return 1.0
+
+    def _prep_curve(self, x, y, smooth_win: int = 0):
+        """Mask a curve to the current range, optionally smoothing it.
+        Returns (xp, yp, mask)."""
+        y = np.asarray(y, dtype=float)
+        if x is None or len(x) != len(y):
+            x = np.arange(len(y))
         x = np.asarray(x, dtype=float)
         mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
-        xp, yp = x[mask], avg[mask]
-        ys = std[mask] if std is not None else None
-        if normalize and yp.size and yp.max() > 0:
-            peak = yp.max()
-            yp = yp / peak
-            if ys is not None:
-                ys = ys / peak
+        xp, yp = x[mask], y[mask]
+        if smooth_win and xp.size:
+            yp = _smooth(yp, smooth_win)
+        return xp, yp, mask
+
+    def _plot_spectrum(self, ax, x, avg, std, color, label, norm, band_lo, band_hi,
+                       lw=1.6, smooth_win=0):
+        xp, yp, mask = self._prep_curve(x, avg, smooth_win)
+        ys = np.asarray(std, dtype=float)[mask] if std is not None else None
+        lo = np.asarray(band_lo, dtype=float)[mask] if band_lo is not None else None
+        hi = np.asarray(band_hi, dtype=float)[mask] if band_hi is not None else None
+        scale = self._norm_scale(xp, yp, norm)
+        if scale and scale != 1.0:
+            yp = yp / scale
+            if ys is not None: ys = ys / scale
+            if lo is not None: lo = lo / scale
+            if hi is not None: hi = hi / scale
         ax.plot(xp, yp, color=color, label=label, lw=lw)
-        if std_band and ys is not None:
+        if lo is not None and hi is not None:
+            ax.fill_between(xp, lo, hi, alpha=0.18, color=color)
+        elif ys is not None:
             ax.fill_between(xp, yp - ys, yp + ys, alpha=0.18, color=color)
 
-    def _masked_peak(self, x, avg, x_min, x_max) -> float:
-        if x is None or len(x) != len(avg):
-            x = np.arange(len(avg))
-        x = np.asarray(x, dtype=float)
-        yp = np.asarray(avg)[(x >= x_min) & (x <= x_max)]
-        return float(yp.max()) if yp.size else 0.0
-
-    def _plot_individual(self, ax, x, stack, color, normalize, ref_peak):
+    def _plot_individual(self, ax, x, stack, color, ref_scale):
         """Overlay the individual spectra of a region as faint thin lines."""
         if stack is None or len(stack) == 0:
             return
@@ -2667,7 +3482,7 @@ class SpectraWidget(QWidget):
         x = np.asarray(x, dtype=float)
         mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
         xp = x[mask]
-        scale = ref_peak if (normalize and ref_peak and ref_peak > 0) else 1.0
+        scale = ref_scale if (ref_scale and ref_scale > 0) else 1.0
         # subsample so we never draw thousands of lines
         rows = stack
         if len(stack) > MAX_INDIVIDUAL_LINES:
@@ -2712,10 +3527,100 @@ class SpectraWidget(QWidget):
         self._colorbar_info = {"cmap": cmap, "vmin": vmin, "vmax": vmax, "label": order_label}
         return colors
 
+    def _intensity_label(self, norm: str) -> str:
+        return {"peak": "Intensity (norm. to peak)",
+                "area": "Intensity (norm. to area)"}.get(norm, "Intensity")
+
+    @staticmethod
+    def _metrics_html(m: dict) -> str:
+        """Format spectral metrics dict as a small HTML block for region details."""
+        if not m:
+            return ""
+        def nm(v):  return f"{v:.2f} nm" if v is not None else "n/a"
+        def sci(v): return f"{v:.3g}"    if v is not None else "n/a"
+        return (
+            f"<b>Peak λ:</b> {nm(m.get('peak_wl'))} "
+            f"<span style='color:#888'>@ {sci(m.get('peak_int'))}</span><br>"
+            f"<b>Centroid:</b> {nm(m.get('centroid'))}<br>"
+            f"<b>FWHM:</b> {nm(m.get('fwhm'))} &nbsp; "
+            f"<b>RMS bw:</b> {nm(m.get('rms_bw'))}<br>"
+            f"<b>Area:</b> {sci(m.get('area'))}"
+        )
+
+    def _update_metric_labels(self):
+        """Refresh the per-region metric labels without rebuilding the whole UI."""
+        for r in self._regions:
+            refs = self._row_widgets.get(r["id"])
+            if not refs:
+                continue
+            lbl = refs.get("metrics")
+            if lbl is None:
+                continue
+            m = r.get("_metrics")
+            lbl.setText(self._metrics_html(m) if m else "")
+            lbl.setVisible(bool(m))
+
+    def _refresh_compare_combos(self):
+        """Repopulate the A/B comparison combos from the analyzed regions,
+        preserving the current selection where possible."""
+        analyzed = [(i, r) for i, r in enumerate(self._regions) if r.get("analyzed")]
+        for cmb in (self._cmb_cmp_a, self._cmb_cmp_b):
+            prev = cmb.currentData()
+            cmb.blockSignals(True)
+            cmb.clear()
+            for i, r in analyzed:
+                cmb.addItem(self._region_label(i), r["id"])
+            if prev is not None:
+                idx = cmb.findData(prev)
+                if idx >= 0:
+                    cmb.setCurrentIndex(idx)
+            cmb.blockSignals(False)
+        # default B to the second region when nothing was chosen yet
+        if len(analyzed) >= 2 and self._cmb_cmp_b.currentIndex() == self._cmb_cmp_a.currentIndex():
+            self._cmb_cmp_b.setCurrentIndex(1)
+
+    def _auto_fit_range(self):
+        """Set From/To to the wavelength span that actually contains signal,
+        across all analyzed regions (selected averaging method)."""
+        method = self._method()
+        lo_c, hi_c = [], []
+        for r in self._regions:
+            if not r.get("analyzed"):
+                continue
+            y = r.get(method)
+            if y is None:
+                continue
+            y = np.asarray(y, dtype=float)
+            x = r.get("x")
+            if x is None or len(x) != len(y):
+                x = np.arange(len(y))
+            x = np.asarray(x, dtype=float)
+            base = float(np.median(np.sort(y)[:max(1, len(y) // 5)]))
+            peak = float(np.max(y))
+            if peak <= base:
+                continue
+            idx = np.where(y > base + 0.01 * (peak - base))[0]
+            if idx.size:
+                lo_c.append(float(x[idx[0]]))
+                hi_c.append(float(x[idx[-1]]))
+        if not lo_c:
+            return
+        lo, hi = min(lo_c), max(hi_c)
+        pad = 0.02 * (hi - lo) if hi > lo else 1.0
+        lo, hi = lo - pad, hi + pad
+        self._sb_x_min.blockSignals(True)
+        self._sb_x_max.blockSignals(True)
+        self._sb_x_min.setValue(int(np.floor(lo)))
+        self._sb_x_max.setValue(int(np.ceil(hi)))
+        self._sb_x_min.blockSignals(False)
+        self._sb_x_max.blockSignals(False)
+
     def _redraw_spectra(self):
-        normalize = self._chk_normalize.isChecked()
-        std_band  = self._chk_std.isChecked()
-        method    = self._method()
+        norm       = self._norm_mode()
+        band_on    = self._chk_std.isChecked()
+        band_kind  = self._band_kind()
+        smooth_win = self._smooth_win()
+        method     = self._method()
         x_min, x_max = self._sb_x_min.value(), self._sb_x_max.value()
         color_for   = self._compute_region_colors()  # also sets self._colorbar_info
         order_label = self._color_order_label()
@@ -2724,6 +3629,9 @@ class SpectraWidget(QWidget):
         if self._colorbar_bot is not None:
             self._colorbar_bot.remove()
             self._colorbar_bot = None
+        if self._twin_bot is not None:
+            self._twin_bot.remove()
+            self._twin_bot = None
         ax.clear()
         any_drawn = False
 
@@ -2734,35 +3642,51 @@ class SpectraWidget(QWidget):
             center = r.get(method)
             if center is None:
                 continue
+            # metrics computed on the masked, smoothed (un-normalized) curve
+            xp_m, yp_m, _ = self._prep_curve(r.get("x"), center, smooth_win)
+            r["_metrics"] = _spectral_metrics(xp_m, yp_m)
             col = color_for.get(r["id"], r["color"])
             label = f"{self._region_label(i)} (n={r.get('n', 0)})"
             if order_label is not None:
                 v = (r.get("orders") or {}).get(order_label)
                 if v is not None:
                     label = f"{self._region_label(i)}  {order_label}={round(float(v))}"
+            band_lo = band_hi = std_arg = None
+            if band_on and band_kind == "pct":
+                band_lo, band_hi = r.get("p10"), r.get("p90")
+            elif band_on:
+                std_arg = r.get("std")
             if r.get("show_individual") and r.get("stack") is not None:
-                ref_peak = self._masked_peak(r.get("x"), center, x_min, x_max)
-                self._plot_individual(ax, r.get("x"), r["stack"], col,
-                                      normalize, ref_peak)
-            self._plot_spectrum(ax, r.get("x"), center, r.get("std"),
-                                 col, label, normalize, std_band)
+                ref_scale = self._norm_scale(xp_m, yp_m, norm)
+                self._plot_individual(ax, r.get("x"), r["stack"], col, ref_scale)
+            self._plot_spectrum(ax, r.get("x"), center, std_arg, col, label, norm,
+                                 band_lo, band_hi, smooth_win=smooth_win)
             any_drawn = True
 
         # live: only the last N shots (newest red, older faint blue, average black)
         if self._live and self._live_buf:
             n_avg  = self._sb_live_n.value()
             buf = list(self._live_buf)[-n_avg:]
-            self._plot_live_spectra(ax, buf, normalize)
+            self._plot_live_spectra(ax, buf, norm)
             st = _compute_stats([a for _, a in buf])
             if st is not None:
-                self._plot_spectrum(ax, self._x_data, st[method], st["std"],
+                band_lo = band_hi = std_arg = None
+                if band_on and band_kind == "pct":
+                    band_lo, band_hi = st.get("p10"), st.get("p90")
+                elif band_on:
+                    std_arg = st["std"]
+                self._plot_spectrum(ax, self._x_data, st[method], std_arg,
                                     "#000000", f"Live {method} (n={st['n']})",
-                                    normalize, std_band, lw=2.4)
+                                    norm, band_lo, band_hi, lw=2.4, smooth_win=smooth_win)
             any_drawn = True
+
+        # comparison curve (difference / ratio of two analyzed regions)
+        if self._chk_compare.isChecked():
+            any_drawn = self._plot_comparison(ax, method, smooth_win) or any_drawn
 
         if any_drawn:
             ax.set_xlabel("Wavelength [nm]")
-            ax.set_ylabel("Intensity (norm.)" if normalize else "Intensity")
+            ax.set_ylabel(self._intensity_label(norm))
             ax.set_title("Live spectra" if self._live else "Averaged spectra")
             ax.set_xlim(x_min, x_max)
             ax.grid(True, alpha=0.25)
@@ -2790,8 +3714,42 @@ class SpectraWidget(QWidget):
         if self._bot_user_ylim is not None:
             ax.set_ylim(self._bot_user_ylim)
         self._canvas_bot.draw_idle()
+        self._update_metric_labels()
 
-    def _plot_live_spectra(self, ax, buf, normalize):
+    def _plot_comparison(self, ax, method: str, smooth_win: int) -> bool:
+        """Overlay the difference (A−B) or ratio (A÷B) of two analyzed regions.
+        Difference is drawn on the main axis; ratio on a right-hand twin axis."""
+        ra = self._find_region(self._cmb_cmp_a.currentData())
+        rb = self._find_region(self._cmb_cmp_b.currentData())
+        if not ra or not rb or ra is rb:
+            return False
+        ya, yb = ra.get(method), rb.get(method)
+        if ya is None or yb is None:
+            return False
+        xa, ca, _ = self._prep_curve(ra.get("x"), ya, smooth_win)
+        # interpolate B onto A's masked wavelength grid
+        xb_full = ra.get("x") if (rb.get("x") is None) else rb.get("x")
+        yb = np.asarray(yb, dtype=float)
+        xb = np.asarray(xb_full, dtype=float) if (
+            xb_full is not None and len(xb_full) == len(yb)) else np.arange(len(yb))
+        if smooth_win and yb.size:
+            yb = _smooth(yb, smooth_win)
+        cb = np.interp(xa, xb, yb)
+        if xa.size == 0:
+            return False
+        if self._cmb_cmp_mode.currentIndex() == 1:    # ratio on twin axis
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where(cb != 0, ca / cb, np.nan)
+            self._twin_bot = ax.twinx()
+            self._twin_bot.plot(xa, ratio, color="#6A1B9A", lw=1.8, ls="--",
+                                label="A ÷ B")
+            self._twin_bot.set_ylabel("A ÷ B ratio", color="#6A1B9A", fontsize=9)
+            self._twin_bot.tick_params(axis="y", labelcolor="#6A1B9A", labelsize=8)
+        else:                                          # difference on main axis
+            ax.plot(xa, ca - cb, color="#000000", lw=1.8, ls="--", label="A − B")
+        return True
+
+    def _plot_live_spectra(self, ax, buf, norm):
         """Older shots faint light-blue; the newest measured spectrum solid red."""
         arrs = [a for _, a in buf]
         if not arrs:
@@ -2805,9 +3763,8 @@ class SpectraWidget(QWidget):
 
         def _y(a):
             yp = a[mask]
-            if normalize and yp.size and yp.max() > 0:
-                yp = yp / yp.max()
-            return yp
+            scale = self._norm_scale(xp, yp, norm)
+            return yp / scale if scale and scale != 1.0 else yp
 
         older = arrs[:-1]
         if len(older) > MAX_INDIVIDUAL_LINES:
@@ -2852,11 +3809,8 @@ class SpectraWidget(QWidget):
             sig_x = _Sig(self)
             sig_x.done.connect(lambda arr: setattr(self, "_x_data", arr) if arr is not None else None)
 
-            spec_x_ch = self._spec_x_pv
-
             def _fetch_x():
-                wfs = _fetch_waveforms(spec_x_ch, t0, t1)
-                sig_x.done.emit(wfs[-1][1] if wfs else None)
+                sig_x.done.emit(self._resolve_x_data(t0, t1))
 
             _bg(_fetch_x)
 
@@ -3025,32 +3979,41 @@ class SpectraWidget(QWidget):
             w = csv.writer(f, delimiter=";")
 
             # ── details block ───────────────────────────────────────────
+            metric_cols = ["Peak λ [nm]", "Peak intensity", "Centroid [nm]",
+                           "FWHM [nm]", "RMS bandwidth [nm]", "Area"]
+            metric_keys = ["peak_wl", "peak_int", "centroid", "fwhm", "rms_bw", "area"]
             w.writerow(["# Spectrum details"])
             w.writerow(["Spectrum", "Date", "Start", "End", "# of spectra",
-                        "Method", "SBW4 Output energy [J]"] + order_labels)
+                        "Method", "SBW4 Output energy [J]"] + order_labels + metric_cols)
             for i, r in regs:
                 d0, d1 = _fmt_date(r["t_start"]), _fmt_date(r["t_end"])
                 date_str = d0 if d0 == d1 else f"{d0}…{d1}"
                 ea = r.get("energy_avg")
                 orders = r.get("orders") or {}
+                m = r.get("_metrics") or {}
                 w.writerow([
                     self._region_label(i), date_str,
                     _fmt_hms(r["t_start"]), _fmt_hms(r["t_end"]),
                     r.get("n", 0), method,
                     self._fmt_full(ea) if ea is not None else "",
                 ] + [self._fmt_full(orders.get(lbl)) if orders.get(lbl) is not None
-                     else "" for lbl in order_labels])
+                     else "" for lbl in order_labels]
+                  + [self._fmt_full(m.get(k)) if m.get(k) is not None else ""
+                     for k in metric_keys])
             if live_ok:
                 t0, t1 = live_ok[0][0], live_ok[-1][0]
                 d0, d1 = _fmt_date(t0), _fmt_date(t1)
                 date_str = d0 if d0 == d1 else f"{d0}…{d1}"
                 w.writerow([f"Live shots (last {len(live_ok)})", date_str,
                             _fmt_hms(t0), _fmt_hms(t1),
-                            len(live_ok), "individual", "", *[""] * len(order_labels)])
+                            len(live_ok), "individual", "",
+                            *[""] * len(order_labels), *[""] * len(metric_cols)])
 
             w.writerow([])   # blank separator line
 
             # ── curve table ─────────────────────────────────────────────
+            cmp_name, cmp_vals = self._export_comparison_curve(x, method)
+
             w.writerow(["# Curve data"])
             header = ["wavelength_nm"]
             for i, _ in regs:
@@ -3058,6 +4021,8 @@ class SpectraWidget(QWidget):
                 header.append(f"{self._region_label(i)} std")
             for t, _ in live_ok:
                 header.append(f"Live {_fmt_hms(t)}")
+            if cmp_name:
+                header.append(cmp_name)
             w.writerow(header)
 
             for j in range(nx):
@@ -3068,7 +4033,39 @@ class SpectraWidget(QWidget):
                     row.append(self._fmt_full(s[j]) if s is not None and j < len(s) else "")
                 for _, a in live_ok:
                     row.append(self._fmt_full(a[j]))
+                if cmp_vals is not None:
+                    v = cmp_vals[j]
+                    row.append("" if (v is None or np.isnan(v)) else self._fmt_full(v))
                 w.writerow(row)
+
+    def _export_comparison_curve(self, x, method: str):
+        """Difference (A−B) or ratio (A÷B) of the two compared regions, sampled on
+        the export wavelength grid. Returns (column_name, values) or (None, None)
+        when comparison is off or the regions aren't both analyzed."""
+        if not self._chk_compare.isChecked():
+            return None, None
+        ra = self._find_region(self._cmb_cmp_a.currentData())
+        rb = self._find_region(self._cmb_cmp_b.currentData())
+        if not ra or not rb or ra is rb:
+            return None, None
+        ya, yb = ra.get(method), rb.get(method)
+        if ya is None or yb is None:
+            return None, None
+        ya = np.asarray(ya, dtype=float)
+        yb = np.asarray(yb, dtype=float)
+        xa = ra.get("x"); xb = rb.get("x")
+        xa = np.asarray(xa, float) if (xa is not None and len(xa) == len(ya)) else np.arange(len(ya))
+        xb = np.asarray(xb, float) if (xb is not None and len(xb) == len(yb)) else np.arange(len(yb))
+        xg = np.asarray(x, dtype=float)
+        ca = np.interp(xg, xa, ya)
+        cb = np.interp(xg, xb, yb)
+        la = self._region_label(self._regions.index(ra))
+        lb = self._region_label(self._regions.index(rb))
+        if self._cmb_cmp_mode.currentIndex() == 1:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                vals = np.where(cb != 0, ca / cb, np.nan)
+            return f"{la} / {lb} (ratio)", vals
+        return f"{la} - {lb} (difference)", ca - cb
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     def _set_status(self, msg: str):

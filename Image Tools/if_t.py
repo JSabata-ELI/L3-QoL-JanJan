@@ -21,8 +21,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image as PilImage
 
-from PySide6.QtCore import Qt, QTimer, QDate, QRunnable, QThreadPool, QObject, Signal, QPointF, QRect
-from PySide6.QtGui import QColor, QTextCharFormat, QPixmap, QImage, QFont, QCursor, QPainter, QPen
+from PySide6.QtCore import Qt, QTimer, QDate, QRunnable, QThreadPool, QObject, Signal, QPointF, QRect, QLocale
+from PySide6.QtGui import QColor, QTextCharFormat, QPixmap, QImage, QFont, QCursor, QPainter, QPen, QPalette
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QCheckBox, QSlider,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QAbstractItemView, QCalendarWidget, QDialog,
     QFileDialog, QMessageBox, QLineEdit, QMainWindow, QStyledItemDelegate,
     QDialogButtonBox, QSizePolicy, QSplitter, QTabWidget, QProgressBar,
-    QButtonGroup, QSpinBox,
+    QButtonGroup, QSpinBox, QToolButton, QMenu, QStyle,
 )
 
 try:
@@ -114,8 +114,12 @@ ENERGY_COLUMNS_DISPLAY: dict[str, str] = {
     "Back_Ref":  "Back Ref",
 }
 
-# Match tolerance in seconds: |t_image - t_csv| must be ≤ this value
-ENERGY_MATCH_TOL_S = 2.0
+# Match tolerance in seconds: |t_image - t_csv| must be ≤ this value.
+# The daily energy CSV is logged irregularly (~20 s median between rows, gaps up
+# to several minutes), NOT per shot — so a 2 s window left most images showing
+# "—". The energies (SBW4/PTM1/…) change slowly, so the nearest sample within a
+# couple of minutes is a faithful value for the image's shot.
+ENERGY_MATCH_TOL_S = 120.0
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
 CPVA_BASE_URL     = "https://10.78.0.57:8443/api/1.0/cpva"
@@ -567,6 +571,191 @@ class _NoScrollCalendar(QCalendarWidget):
         return super().eventFilter(obj, event)
 
 
+# ── MULTI-SELECT CALENDAR (ported from Spectra/sp_t.py) ───────────────────────
+_MS_CAL_STYLE = """
+QCalendarWidget QWidget { background: #ffffff; color: #111; }
+QCalendarWidget QAbstractItemView:enabled {
+    background: #ffffff; color: #111;
+    selection-background-color: #1565C0; selection-color: white;
+}
+QCalendarWidget QWidget#qt_calendar_navigationbar { background: #eeeeee; }
+QCalendarWidget QToolButton {
+    color: #222; background: transparent;
+    font-weight: 700; font-size: 13px;
+    border-radius: 3px; padding: 3px 6px;
+}
+QCalendarWidget QToolButton:hover { background: #d0d0d0; }
+QCalendarWidget QSpinBox {
+    color: #222; background: #eeeeee; border: none; font-weight: 700;
+}
+QCalendarWidget QMenu { color: #111; background: #fff; }
+"""
+
+
+class _MultiSelectDelegate(QStyledItemDelegate):
+    """Paint calendar cells: selected=blue background, Sat/Sun=red text.
+
+    Weekend detection uses index.column() (col 5=Sat, 6=Sun, Monday-first layout)
+    so spillover-month cells are coloured correctly too. initStyleOption strips
+    State_Selected for cells not in _selected_keys so Qt's own selection highlight
+    never bleeds through.
+    """
+    def __init__(self, cal: QCalendarWidget):
+        super().__init__(cal)
+        self._cal = cal
+        self._selected_keys: set = set()   # (year, month, day) tuples
+
+    def _date_for_index(self, index) -> "QDate | None":
+        if index.row() == 0:
+            return None
+        year, month = self._cal.yearShown(), self._cal.monthShown()
+        first = QDate(year, month, 1)
+        start = first.addDays(-(first.dayOfWeek() - 1))   # Monday of first displayed week
+        return start.addDays((index.row() - 1) * 7 + index.column())
+
+    def set_selected(self, dates: "list[QDate]"):
+        self._selected_keys = {(d.year(), d.month(), d.day()) for d in dates}
+        view = self._cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
+        if view is not None:
+            view.viewport().update()
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        d = self._date_for_index(index)
+        if d is not None and (d.year(), d.month(), d.day()) not in self._selected_keys:
+            option.state = option.state & ~QStyle.StateFlag.State_Selected
+
+    def paint(self, painter, option, index):
+        is_weekend = index.column() in (5, 6)   # Mon=0 … Sat=5, Sun=6
+        d = self._date_for_index(index)
+        if d is None:
+            super().paint(painter, option, index)
+            return
+        is_sel = (d.year(), d.month(), d.day()) in self._selected_keys
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        if is_sel:
+            painter.save()
+            painter.fillRect(option.rect, QColor("#1565C0"))
+            painter.setPen(QColor("#ffcccc") if is_weekend else QColor("#ffffff"))
+            painter.setFont(option.font)
+            painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
+            if is_weekend:
+                painter.save()
+                painter.setPen(QColor("#cc0000"))
+                painter.setFont(option.font)
+                painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, text)
+                painter.restore()
+
+
+def _make_multiselect_calendar(initial: "QDate | None" = None) -> "tuple[QFrame, QCalendarWidget]":
+    """Return (wrapper_frame, cal) — calendar with a custom gray day-name header,
+    a light-gray nav bar (month button + year spinbox) and the multi-select
+    weekend delegate installed. Selection state is layered on top by the caller
+    via cal._wk_delegate.set_selected()."""
+    cal = QCalendarWidget()
+    cal.setGridVisible(True)
+    cal.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedKingdom))
+    cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
+    cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+    cal.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader)
+    if initial:
+        cal.setSelectedDate(initial)
+    cal.setStyleSheet(_MS_CAL_STYLE)
+
+    nav_internal = cal.findChild(QWidget, "qt_calendar_navigationbar")
+    if nav_internal:
+        nav_internal.hide()
+
+    view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
+    if view is not None:
+        cal._wk_delegate = _MultiSelectDelegate(cal)
+        view.setItemDelegate(cal._wk_delegate)
+
+    _MONTHS = ["January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+    nav_row = QWidget()
+    nav_row.setAutoFillBackground(True)
+    nav_pal = nav_row.palette()
+    nav_pal.setColor(QPalette.ColorRole.Window, QColor("#eeeeee"))
+    nav_row.setPalette(nav_pal)
+    nav_lay = QHBoxLayout(nav_row)
+    nav_lay.setContentsMargins(4, 3, 4, 3)
+    nav_lay.setSpacing(4)
+
+    prev_btn = QToolButton(); prev_btn.setText("◀")
+    prev_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 18px; padding: 1px 6px; }"
+                           "QToolButton:hover { background: #d0d0d0; border-radius: 3px; }")
+    month_btn = QPushButton(); month_btn.setMinimumWidth(100)
+    month_btn.setStyleSheet(
+        "QPushButton { border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;"
+        " font-weight: bold; font-size: 12px; padding: 2px 10px; }"
+        "QPushButton:hover { background: #e0e0e0; }")
+    year_spin = QSpinBox()
+    year_spin.setRange(2000, 2100)
+    year_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+    year_spin.setStyleSheet(
+        "QSpinBox { border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;"
+        " padding: 1px 4px; font-weight: bold; font-size: 12px; }")
+    year_spin.setFixedWidth(60)
+    next_btn = QToolButton(); next_btn.setText("▶")
+    next_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 18px; padding: 1px 6px; }"
+                           "QToolButton:hover { background: #d0d0d0; border-radius: 3px; }")
+
+    nav_lay.addWidget(prev_btn); nav_lay.addStretch()
+    nav_lay.addWidget(month_btn); nav_lay.addWidget(year_spin)
+    nav_lay.addStretch(); nav_lay.addWidget(next_btn)
+
+    def _update_nav():
+        m, y = cal.monthShown(), cal.yearShown()
+        month_btn.setText(_MONTHS[m - 1])
+        year_spin.blockSignals(True)
+        year_spin.setValue(y)
+        year_spin.blockSignals(False)
+
+    def _on_month_btn():
+        menu = QMenu(month_btn)
+        for i, name in enumerate(_MONTHS, 1):
+            menu.addAction(name).setData(i)
+        chosen = menu.exec(month_btn.mapToGlobal(month_btn.rect().bottomLeft()))
+        if chosen:
+            cal.setCurrentPage(cal.yearShown(), chosen.data())
+
+    prev_btn.clicked.connect(cal.showPreviousMonth)
+    next_btn.clicked.connect(cal.showNextMonth)
+    month_btn.clicked.connect(_on_month_btn)
+    year_spin.valueChanged.connect(lambda y: cal.setCurrentPage(y, cal.monthShown()))
+    cal.currentPageChanged.connect(lambda _y, _m: _update_nav())
+    _update_nav()
+
+    hdr_row = QWidget()
+    hdr_row.setAutoFillBackground(True)
+    hdr_pal = hdr_row.palette()
+    hdr_pal.setColor(QPalette.ColorRole.Window, QColor("#757575"))
+    hdr_row.setPalette(hdr_pal)
+    hdr_lay = QHBoxLayout(hdr_row)
+    hdr_lay.setContentsMargins(0, 0, 0, 0)
+    hdr_lay.setSpacing(0)
+    for name in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
+        lbl = QLabel(name)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet("color: #111111; font-weight: 700; padding: 4px 0;")
+        hdr_lay.addWidget(lbl, stretch=1)
+
+    wrapper = QFrame()
+    wrapper.setStyleSheet("QFrame { border: 1px solid #b0b0b0; border-radius: 3px; }")
+    w_lay = QVBoxLayout(wrapper)
+    w_lay.setContentsMargins(0, 0, 0, 0)
+    w_lay.setSpacing(0)
+    w_lay.addWidget(nav_row)
+    w_lay.addWidget(hdr_row)
+    w_lay.addWidget(cal)
+    return wrapper, cal
+
+
 # ── NO-SCROLL COMBOBOX ────────────────────────────────────────────────────────
 class _NoScrollComboBox(QComboBox):
     """QComboBox that ignores mousewheel — prevents accidental value changes."""
@@ -906,6 +1095,26 @@ def _find_closest_per_col_value(
     if best_val is not None and best_diff <= tol_ns:
         return best_val
     return "—"
+
+
+def _build_per_col_from_rows(
+    rows: "list[_EnergyRow]",
+) -> "dict[str, list[_EnergyRow]]":
+    """
+    Build the per-column closest-timestamp lookup table from plain CSV rows.
+
+    Returns {col: [rows with a non-empty value for col]} — each list keeps the
+    chronological order of `rows` (which _load_energy_csv already sorts by ts),
+    so _find_closest_per_col_value can binary-search it directly.
+    """
+    per_col: dict[str, list[_EnergyRow]] = {}
+    for r in rows:
+        for col, val in r.values.items():
+            if col == "Timestamp":
+                continue
+            if val is not None and str(val).strip() not in ("", "—"):
+                per_col.setdefault(col, []).append(r)
+    return per_col
 
 
 def _format_energy_diff_s(diff_s: float) -> str:
@@ -1780,7 +1989,7 @@ class ImageFinderWidget(QWidget):
 
     # ── LOGGING ───────────────────────────────────────────────────────────────
     def _set_busy(self, busy: bool):
-        for btn in [self._btn_view, self._btn_save, self._btn_range,
+        for btn in [self._btn_view, self._btn_save,
                     self._btn_open_folder,
                     self._btn_compare, self._btn_energy_cols,
                     self._gradient_cb, self._hour_cb,
@@ -1844,52 +2053,19 @@ class ImageFinderWidget(QWidget):
 
         ll.addWidget(_group_label("Time"))
 
-        # calendar — delegate + styling copied from is.py DatePickerDialog
-        self._cal = _NoScrollCalendar()
-        self._cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-        self._cal.setGridVisible(True)
-        self._cal.setNavigationBarVisible(True)
-        self._cal.setVerticalHeaderFormat(
-            QCalendarWidget.VerticalHeaderFormat.ISOWeekNumbers)
+        # Embedded multi-select calendar (ported from Spectra).
+        # Plain click = toggle a day; Ctrl+click = add the range from the last click.
+        # self._cal stays a QCalendarWidget so all existing selectedDate()/
+        # setSelectedDate()/yearShown() calls keep working; the multi-day set is
+        # tracked in self._selected_days and painted by the delegate.
+        _today = QDate.currentDate()
+        self._cal_frame, self._cal = _make_multiselect_calendar(_today)
         self._cal.setMinimumWidth(238)
-
-        # Install weekend delegate on internal table view
-        _cal_view = self._cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if _cal_view:
-            _cal_view.setItemDelegate(_WeekendDelegate(_cal_view))
-
-        hf = QTextCharFormat(); hf.setForeground(QColor("#111111"))
-        self._cal.setHeaderTextFormat(hf)
-
-        wf = QTextCharFormat(); wf.setForeground(QColor("#111111"))
-        for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                    Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-            self._cal.setWeekdayTextFormat(day, wf)
-        wf_we = QTextCharFormat(); wf_we.setForeground(QColor("#cc0000"))
-        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-            self._cal.setWeekdayTextFormat(day, wf_we)
-
-        self._cal.setStyleSheet("""
-        QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
-        QCalendarWidget QAbstractItemView {
-            background: #fcfcfc; color: #111;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            alternate-background-color: #f2f2f2; gridline-color: #d8d8d8; }
-        QCalendarWidget QTableView {
-            background: #fcfcfc;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            gridline-color: #d8d8d8; outline: 0; }
-        QCalendarWidget QToolButton {
-            background: #efefef; border: 1px solid #c8c8c8;
-            padding: 4px 8px; border-radius: 4px; color: #111; }
-        QCalendarWidget QSpinBox, QCalendarWidget QComboBox {
-            background: #fff; border: 1px solid #c8c8c8; padding: 2px 6px; color: #111; }
-        QCalendarWidget QWidget#qt_calendar_navigationbar {
-            background: #efefef; }
-        QCalendarWidget QAbstractItemView:enabled { color: #111; }
-        """)
-        self._cal.selectionChanged.connect(self._on_calendar_selected)
-        ll.addWidget(self._cal)
+        self._selected_days: list[QDate] = [_today]
+        self._last_cal_click: QDate = _today
+        self._cal.clicked.connect(self._on_calendar_clicked)
+        self._apply_day_selection([_today], schedule=False)
+        ll.addWidget(self._cal_frame)
 
         # hour + lab time
         hour_row = QHBoxLayout(); hour_row.addWidget(QLabel("Hour:"))
@@ -1907,10 +2083,35 @@ class ImageFinderWidget(QWidget):
         hour_row.addWidget(self._status_dot)
         ll.addLayout(hour_row)
 
-        self._btn_range = QPushButton("Multi-day search...")
-        self._btn_range.setToolTip("Search images across multiple days for selected cameras")
-        self._btn_range.clicked.connect(self._on_multiday_search)
-        ll.addWidget(self._btn_range)
+        # Weekday gate for Ctrl+drag range selection. Only weekdays checked here
+        # are added when Ctrl+clicking a range; a plain click still selects ANY
+        # day (incl. weekends). Sat/Sun off by default so ranges skip weekends.
+        # Day names sit above each checkbox (weekends red, matching the calendar).
+        ll.addWidget(QLabel("Ctrl+Shift range adds:"))
+        wd_grid = QGridLayout()
+        wd_grid.setHorizontalSpacing(2); wd_grid.setVerticalSpacing(1)
+        wd_grid.setContentsMargins(0, 0, 0, 0)
+        _wd_tip = ("Click = one day (any, incl. weekends).\n"
+                   "Ctrl+click = toggle one weekday (weekends skipped).\n"
+                   "Ctrl+Shift+click = range from last click — only the weekdays\n"
+                   "checked here — XOR-ed into the selection (repeat deselects).")
+        self._wd_checks: list[QCheckBox] = []
+        for i, nm in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+            name_lbl = QLabel(nm)
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_lbl.setStyleSheet(
+                "font-size:9px; font-weight:700; color:%s;"
+                % ("#cc0000" if i >= 5 else "#555"))
+            name_lbl.setToolTip(_wd_tip)
+            wd_grid.addWidget(name_lbl, 0, i)
+            cb = QCheckBox()
+            cb.setChecked(i < 5)   # Mon–Fri on, Sat/Sun off
+            cb.setStyleSheet(_CHECKBOX_STYLE)
+            cb.setToolTip(_wd_tip)
+            wd_grid.addWidget(cb, 1, i, alignment=Qt.AlignmentFlag.AlignCenter)
+            wd_grid.setColumnStretch(i, 1)
+            self._wd_checks.append(cb)
+        ll.addLayout(wd_grid)
 
         ll.addWidget(_hsep())
         # ── Info tab (energy data) ────────────────────────────────────────────
@@ -1956,21 +2157,35 @@ class ImageFinderWidget(QWidget):
 
         # Row 2: Navigate images  |  Annotate energies
         cb_row = QHBoxLayout()
-        self._cb_nav_images = QCheckBox("Nav imgs")
-        self._cb_nav_images.setChecked(False)
-        self._cb_nav_images.setStyleSheet(_CHECKBOX_STYLE)
-        self._cb_nav_images.setToolTip(
-            "Checked: arrows move between loaded images.\n"
-            "Unchecked: arrows move through CSV rows around current image.")
-        self._cb_nav_images.stateChanged.connect(self._on_nav_mode_changed)
+        self._cb_pv_preview = QCheckBox("PVs in preview")
+        self._cb_pv_preview.setChecked(True)
+        self._cb_pv_preview.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_pv_preview.setToolTip(
+            "Show a white bar with the selected PV values below the image\n"
+            "in the preview above. Does not change the saved files.")
+        self._cb_pv_preview.stateChanged.connect(self._on_pv_preview_toggle)
         self._cb_annotate = QCheckBox("attach PVs")
         self._cb_annotate.setStyleSheet(_CHECKBOX_STYLE)
         self._cb_annotate.setToolTip(
-            "Add a white bar with energy values below the image.\n"
-            "Applied both when viewing and when saving.")
-        cb_row.addWidget(self._cb_nav_images, 1)
+            "Bake a white bar with the selected PV values below each\n"
+            "image when saving (Save As…).")
+        cb_row.addWidget(self._cb_pv_preview, 1)
         cb_row.addWidget(self._cb_annotate, 1)
         ll.addLayout(cb_row)
+
+        # Energy navigation mode toggle
+        cb_row2 = QHBoxLayout()
+        self._cb_nav_images = QCheckBox("Browse energy rows")
+        self._cb_nav_images.setChecked(False)
+        self._cb_nav_images.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_nav_images.setToolTip(
+            "Unchecked (default): the ◀ ▶ arrows step through the loaded "
+            "images, showing each image's PV values.\n"
+            "Checked: the arrows scroll through the CSV energy rows around "
+            "the current image, without changing the displayed image.")
+        self._cb_nav_images.stateChanged.connect(self._on_nav_mode_changed)
+        cb_row2.addWidget(self._cb_nav_images, 1)
+        ll.addLayout(cb_row2)
         ll.addWidget(_hsep())
         ll.addWidget(_group_label("Controls"))
 
@@ -2306,6 +2521,9 @@ class ImageFinderWidget(QWidget):
         """Slot called on main thread when background thread finishes loading."""
         if gen != self._preview_gen:
             return
+        energy_text = getattr(self, "_preview_energy_text", "")
+        if energy_text:
+            pm = self._paint_pv_bar(pm, energy_text)
         lbl = self._preview_lbl
         avail_w = max(lbl.width(),  200)
         avail_h = max(lbl.height(), 200)
@@ -2313,6 +2531,49 @@ class ImageFinderWidget(QWidget):
                        Qt.AspectRatioMode.KeepAspectRatio,
                        Qt.TransformationMode.SmoothTransformation)
         lbl.setPixmap(pm)
+
+    @staticmethod
+    def _paint_pv_bar(pm: QPixmap, energy_text: str) -> QPixmap:
+        """Return a new pixmap = image + a white bar with centered black PV text.
+        Adaptive font fit / 2-line split, ported from Shot Finder."""
+        from PySide6.QtGui import QFontMetrics
+        available_w = pm.width() - 20
+        font = QFont()
+        display_text = energy_text
+        fitted = False
+        for fsize in range(22, 8, -1):
+            font.setPixelSize(fsize)
+            fm = QFontMetrics(font)
+            if fm.horizontalAdvance(energy_text) <= available_w:
+                fitted = True
+                break
+        if not fitted:
+            parts_split = energy_text.split("  |  ")
+            mid = len(parts_split) // 2
+            display_text = ("  |  ".join(parts_split[:mid]) + "\n" +
+                            "  |  ".join(parts_split[mid:]))
+            for fsize in range(18, 8, -1):
+                font.setPixelSize(fsize)
+                fm = QFontMetrics(font)
+                max_line = max(fm.horizontalAdvance(l) for l in display_text.split("\n"))
+                if max_line <= available_w:
+                    break
+        fm = QFontMetrics(font)
+        line_count = display_text.count("\n") + 1
+        bar_h = max(38, fm.height() * line_count + 16)
+        combined = QPixmap(pm.width(), pm.height() + bar_h)
+        combined.fill(QColor(255, 255, 255))
+        painter = QPainter(combined)
+        painter.drawPixmap(0, 0, pm)
+        bar_rect = QRect(0, pm.height(), pm.width(), bar_h)
+        painter.fillRect(bar_rect, QColor(255, 255, 255))
+        painter.setFont(font)
+        painter.setPen(QColor(0, 0, 0))
+        painter.drawText(bar_rect,
+                         Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter,
+                         display_text)
+        painter.end()
+        return combined
 
     def _preview_show(self):
         if not self._preview_paths:
@@ -2345,6 +2606,15 @@ class ImageFinderWidget(QWidget):
         else:
             ts_str = path.stem
         self._preview_ts_lbl.setText(ts_str)
+
+        # PV overlay text for the bar painted in _on_preview_ready (main thread).
+        self._preview_energy_text = ""
+        if (self._cb_pv_preview.isChecked() and self._energy_selected_cols):
+            entry = self._energy_entry_for_path(path)
+            if entry is not None:
+                parts = self._energy_parts_for_path(path, entry)
+                self._preview_energy_text = "  |  ".join(parts)
+
         self._preview_gen += 1
         gen = self._preview_gen
         sig = self._preview_sig
@@ -2487,24 +2757,98 @@ class ImageFinderWidget(QWidget):
         self._table.blockSignals(False)
 
     # ── EVENTS ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _date_range(d1: QDate, d2: QDate) -> "list[QDate]":
+        if d2 < d1:
+            d1, d2 = d2, d1
+        days, d = [], d1
+        while d <= d2:
+            days.append(d)
+            d = d.addDays(1)
+        return days
+
+    def _apply_day_selection(self, dates: "list[QDate]", schedule: bool = True):
+        """Update the calendar's multi-day selection, repaint, set the primary
+        day (last clicked) and — when schedule=True — reload the camera table."""
+        dates = sorted(dates, key=lambda x: (x.year(), x.month(), x.day()))
+        self._selected_days = dates
+        delegate = getattr(self._cal, "_wk_delegate", None)
+        if delegate is not None:
+            delegate.set_selected(dates)
+        if dates:
+            self._cal.blockSignals(True)
+            self._cal.setSelectedDate(dates[-1])
+            self._cal.blockSignals(False)
+        if schedule and dates:
+            self._user_has_selected_day = True
+            self._status_dot.setStyleSheet("color: gray; font-size: 12px;")
+            # Pick a sensible hour for the primary day (does not reload the table).
+            self._apply_auto_hour_for_selected_day()
+            # Reload the camera table as the union over all effective days.
+            self._schedule_autoload(150)
+
+    def _effective_days(self) -> "list[QDate]":
+        """The days actually used (camera-table union + View) — the explicit
+        selection. Weekends only appear if the user added them by hand."""
+        return list(self._selected_days)
+
+    @staticmethod
+    def _qkey(d: QDate) -> tuple:
+        return (d.year(), d.month(), d.day())
+
+    @staticmethod
+    def _is_weekend(d: QDate) -> bool:
+        return d.dayOfWeek() >= 6   # 6=Sat, 7=Sun
+
+    def _on_calendar_clicked(self, d: QDate):
+        """Selection logic mirrored from Spectra's DatePickerDialog:
+          plain click      → exactly that one day (replaces the selection)
+          Ctrl+click       → toggle one weekday in/out (weekends plain-click only)
+          Ctrl+Shift+click → range from last click, XOR-ed into the selection;
+                             gated to the weekdays checked below (default Mon–Fri).
+        """
+        mods  = QApplication.keyboardModifiers()
+        ctrl  = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        cur      = list(self._selected_days)
+        cur_keys = {self._qkey(x) for x in cur}
+
+        if ctrl and shift:
+            anchor  = self._last_cal_click or d
+            allowed = {i for i, cb in enumerate(self._wd_checks) if cb.isChecked()}
+            rng      = [x for x in self._date_range(anchor, d)
+                        if (x.dayOfWeek() - 1) in allowed]
+            rng_keys = {self._qkey(x) for x in rng}
+            keep = [x for x in cur if self._qkey(x) not in rng_keys]   # deselect overlap
+            add  = [x for x in rng if self._qkey(x) not in cur_keys]   # select the rest
+            new_dates = keep + add
+        elif ctrl:
+            if self._is_weekend(d):
+                self._log("Calendar: weekends can only be selected by a plain click.")
+                return
+            if self._qkey(d) in cur_keys:
+                new_dates = [x for x in cur if self._qkey(x) != self._qkey(d)]
+            else:
+                new_dates = cur + [d]
+        else:
+            new_dates = [d]   # plain click — exactly one day (weekends allowed)
+
+        self._last_cal_click = d
+        self._apply_day_selection(sorted(new_dates, key=self._qkey))
+        self._log(f"Calendar: {len(new_dates)} day(s) selected")
+
     def _auto_select_today(self):
         """Called once after startup — simulate selecting today's date."""
         self._user_has_selected_day = True
         qd = self._cal.selectedDate()
         self._log(f"Auto-selecting today: {qd.day():02d}.{qd.month():02d}.{qd.year()}")
         self._apply_auto_hour_for_selected_day()
-
-    def _on_calendar_selected(self):
-        self._user_has_selected_day = True
-        self._status_dot.setStyleSheet("color: gray; font-size: 12px;")
-        qd = self._cal.selectedDate()
-        self._log(f"Calendar selected: {qd.day():02d}.{qd.month():02d}.{qd.year()}")
-        self._apply_auto_hour_for_selected_day()
+        self._schedule_autoload(150)
 
     def _on_hour_change(self):
+        # No auto-load: the camera table lists cameras across all hours, so the
+        # hour selector does not change it. Search starts only from View.
         self._log_selected_datetime_preview()
-        if self._user_has_selected_day:
-            self._schedule_autoload(150)
 
     def _on_labtime_toggle(self):
         self._log(f"Lab time toggled -> {self._lab_time_cb.isChecked()}")
@@ -2553,7 +2897,9 @@ class ImageFinderWidget(QWidget):
         csv_path = _energy_csv_path(dt)
         rows = _load_energy_csv(csv_path)
         self._energy_cache[day_key] = rows
-        self._energy_per_col_cache[day_key] = {}  # no per_col from CSV fallback
+        # Build the per-column closest-timestamp lookup from the CSV rows so that
+        # _find_closest_per_col_value works identically for CSV and API data.
+        self._energy_per_col_cache[day_key] = _build_per_col_from_rows(rows)
         if rows:
             self._log_safe(f"ENERGY: {len(rows)} rows from CSV {csv_path.name}")
         else:
@@ -2600,6 +2946,41 @@ class ImageFinderWidget(QWidget):
             results.append((path, match, before, after, rows, match_idx, per_col))
         return results
 
+    def _energy_parts_for_path(self, path: Path, entry: tuple) -> list[str]:
+        """
+        Return ['<label>=<value>', ...] for the selected PV columns of one image.
+
+        For each selected column it takes the nearest CSV/API sample within
+        ENERGY_MATCH_TOL_S (via _find_closest_per_col_value), falling back to the
+        matched row's raw value when no per-column sample is in tolerance.
+        Single source of truth for the info panel, the preview overlay and saves.
+        """
+        match    = entry[1] if len(entry) > 1 else None
+        per_col  = entry[6] if len(entry) > 6 else {}
+        img_ns   = extract_ns_from_stem(path.stem) or 0
+        parts: list[str] = []
+        for col in self._energy_selected_cols:
+            raw_val = _find_closest_per_col_value(
+                per_col, col, img_ns, tol_s=ENERGY_MATCH_TOL_S)
+            if (not raw_val or raw_val == "—") and match is not None:
+                raw_val = match.values.get(col, "—")
+            val   = _format_energy_value(col, raw_val)
+            label = ENERGY_COLUMNS_DISPLAY.get(col, col)
+            parts.append(f"{label}={val}")
+        return parts
+
+    def _energy_entry_for_path(self, path: Path) -> "tuple | None":
+        """Return the energy-results entry (path, match, …, per_col) for a file."""
+        for entry in (self._energy_results or []):
+            if entry and entry[0] == path:
+                return entry
+        return None
+
+    def _on_pv_preview_toggle(self):
+        """Re-render the current preview so the PV bar appears/disappears."""
+        if self._preview_paths:
+            self._preview_show()
+
     def _refresh_energy_info(self):
         """Reset navigation to first result and display it."""
         self._energy_nav_index = 0
@@ -2607,6 +2988,9 @@ class ImageFinderWidget(QWidget):
         self._energy_csv_anchor_idx = None
         self._energy_csv_anchor_rows = []
         self._refresh_energy_info_single()
+        # PV values may now be available — repaint the preview bar.
+        if self._preview_paths:
+            self._preview_show()
 
     def _on_nav_mode_changed(self):
         """Reset CSV offset when switching navigation mode."""
@@ -2618,8 +3002,8 @@ class ImageFinderWidget(QWidget):
     def _energy_nav_prev(self):
         if not self._energy_results:
             return
-        if self._cb_nav_images.isChecked():
-            # Image navigation mode — move between loaded images
+        if not self._cb_nav_images.isChecked():
+            # Step-through-images mode (checkbox OFF = default)
             if self._energy_nav_index > 0:
                 self._energy_nav_index -= 1
                 self._energy_csv_offset = 0
@@ -2633,8 +3017,8 @@ class ImageFinderWidget(QWidget):
     def _energy_nav_next(self):
         if not self._energy_results:
             return
-        if self._cb_nav_images.isChecked():
-            # Image navigation mode — move between loaded images
+        if not self._cb_nav_images.isChecked():
+            # Step-through-images mode (checkbox OFF = default)
             if self._energy_nav_index < len(self._energy_results) - 1:
                 self._energy_nav_index += 1
                 self._energy_csv_offset = 0
@@ -2671,7 +3055,7 @@ class ImageFinderWidget(QWidget):
             self._energy_csv_anchor_idx = match_idx
             self._energy_csv_anchor_rows = csv_rows
 
-        nav_images = self._cb_nav_images.isChecked()
+        nav_images = not self._cb_nav_images.isChecked()  # checkbox OFF = step images
         csv_offset = self._energy_csv_offset
         base_idx   = self._energy_csv_anchor_idx
 
@@ -2694,19 +3078,10 @@ class ImageFinderWidget(QWidget):
             self._btn_energy_prev.setEnabled(can_prev)
             self._btn_energy_next.setEnabled(can_next)
 
-        # ── Filename → Prague time ────────────────────────────────────────
-        ns_stem = extract_ns_from_stem(path.stem)
-        if ns_stem is not None:
-            dt_utc  = datetime.fromtimestamp(ns_stem / 1_000_000_000, tz=timezone.utc)
-            dt_local = dt_utc.astimezone(PRAGUE) if PRAGUE else dt_utc
-            name = dt_local.strftime("%H:%M:%S.%f")[:-3]
-        else:
-            name = path.name
-
         lines = []
 
         if not nav_images and csv_offset != 0 and base_idx is not None and csv_rows:
-            # ── CSV navigation mode — show neighbouring row ───────────────
+            # ── CSV browse mode — show a neighbouring CSV row (by time) ────
             target_csv_idx = base_idx + csv_offset
             if 0 <= target_csv_idx < len(csv_rows):
                 row = csv_rows[target_csv_idx]
@@ -2716,46 +3091,14 @@ class ImageFinderWidget(QWidget):
                     label = ENERGY_COLUMNS_DISPLAY.get(col, col)
                     parts.append(f"{label}={val}")
                 ts = row.ts_dt.strftime("%H:%M:%S.%f")[:-3]
-                lines.append(f"CSV {ts}  (outside set)\n  " + "  |  ".join(parts))
+                lines.append(f"{ts}  (CSV row)\n  " + "  |  ".join(parts))
             else:
                 lines.append("(no more CSV rows)")
 
-        elif match is not None:
-            # ── Matched image ─────────────────────────────────────────────
-            img_ns = ns_stem or 0
-            parts = []
-            for col in self._energy_selected_cols:
-                raw_val = match.values.get(col, "")
-                if not raw_val or raw_val == "—":
-                    # Fallback: search per_col for nearest value within 2s
-                    raw_val = _find_closest_per_col_value(
-                        per_col_for_entry, col, img_ns, tol_s=2.0)
-                val   = _format_energy_value(col, raw_val)
-                label = ENERGY_COLUMNS_DISPLAY.get(col, col)
-                parts.append(f"{label}={val}")
-            lines.append(f"📷 {name}\n  " + "  |  ".join(parts))
-
         else:
-            # ── No match ──────────────────────────────────────────────────
-            img_ns  = ns_stem or 0
-            img_dt2 = datetime.fromtimestamp(img_ns / 1_000_000_000, tz=timezone.utc)
-            img_dt2 = img_dt2.astimezone(PRAGUE).replace(tzinfo=None) if PRAGUE else img_dt2.replace(tzinfo=None)
-            parts   = [f"📷 {name}:  No CSV match"]
-            if before:
-                ts   = before.ts_dt.strftime("%H:%M:%S.%f")[:-3]
-                diff = _format_energy_diff_s(abs((img_dt2 - before.ts_dt).total_seconds()))
-                vals = "  |  ".join(
-                    f"{ENERGY_COLUMNS_DISPLAY.get(c,c)}={_format_energy_value(c, before.values.get(c,'—'))}"
-                    for c in self._energy_selected_cols)
-                parts.append(f"  before: {ts} (−{diff})\n    {vals}")
-            if after:
-                ts   = after.ts_dt.strftime("%H:%M:%S.%f")[:-3]
-                diff = _format_energy_diff_s(abs((after.ts_dt - img_dt2).total_seconds()))
-                vals = "  |  ".join(
-                    f"{ENERGY_COLUMNS_DISPLAY.get(c,c)}={_format_energy_value(c, after.values.get(c,'—'))}"
-                    for c in self._energy_selected_cols)
-                parts.append(f"  after:  {ts} (+{diff})\n    {vals}")
-            lines.append("\n".join(parts))
+            # ── Current image — PV values only ────────────────────────────
+            parts = self._energy_parts_for_path(path, entry)
+            lines.append("  |  ".join(parts) if parts else "(no PVs selected)")
 
         self._energy_info.setPlainText("\n\n".join(lines))
 
@@ -2978,13 +3321,13 @@ class ImageFinderWidget(QWidget):
             return
         self._auto_hour_last_day = day
 
-        # Immediately set default hour and start loading — don't wait for CSV.
+        # Set a sensible default hour now; the camera table load is driven by
+        # the day selection, not by the hour, so do not trigger a load here.
         self._hour_cb.blockSignals(True)
         self._hour_cb.setCurrentIndex(self._DEFAULT_HOUR)
         self._hour_cb.blockSignals(False)
-        self._schedule_autoload(50)
 
-        # In background: try CSV auto-hour; if it differs from default, reload.
+        # In background: try CSV auto-hour and update the hour combo if it differs.
         self._ensure_ramping_root()
         self._auto_hour_sig = _AutoHourSignals()
         self._auto_hour_sig.log_msg.connect(self._log)
@@ -3035,9 +3378,8 @@ class ImageFinderWidget(QWidget):
             f"{(ui_hour - (0 if use_lab else utc_offset_h)) % 24:02d}:00"
         )
         self._log_selected_datetime_preview()
-        # Only reload if auto-hour changed from what we already loaded
-        if hour_changed:
-            self._schedule_autoload(50)
+        # No reload here: the camera table is hour-independent. The hour combo
+        # only affects the effective target path / View collection.
 
     # ── DATETIME / PATH LOGIC ─────────────────────────────────────────────────
     def _build_datetime(self) -> datetime:
@@ -3095,7 +3437,13 @@ class ImageFinderWidget(QWidget):
 
         dt          = self._build_datetime()
         target_path = self._build_target_path(dt)
-        self._log(f"Load -> effective_dt={dt.isoformat(sep=' ')} | target={target_path}")
+        # Camera table = union of cameras across ALL effective (weekday-filtered)
+        # selected days. A day with fewer cameras no longer hides cameras that
+        # appear on other selected days.
+        eff_days = [(d.year(), d.month(), d.day()) for d in self._effective_days()]
+        if not eff_days:
+            eff_days = [(dt.year, dt.month, dt.day)]
+        self._log(f"Load -> {len(eff_days)} day(s) | primary target={target_path}")
 
         self._load_sig = _LoadSignals()
         self._load_sig.done.connect(self._on_load_done)
@@ -3106,19 +3454,13 @@ class ImageFinderWidget(QWidget):
 
         def worker():
             try:
-                # Collect camera folders from ALL hours in the selected day.
-                # This mirrors Shot Finder behaviour so cameras active at any
-                # hour of the day are visible regardless of the hour selector.
-                year = dt.year
-                container_year = max(year, 2025)
-                root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{container_year}"
-                day_dir = root / str(year) / str(dt.month) / str(dt.day)
-
+                # Collect camera folders from ALL hours of EVERY effective day.
+                # Cameras are deduplicated by folder name across days/hours.
                 seen: set[str] = set()
                 all_entries: list[Path] = []
                 found_any_hour = False
 
-                def _scan_hour(h: int) -> tuple[bool, list[Path]]:
+                def _scan_hour(day_dir: Path, h: int) -> tuple[bool, list[Path]]:
                     hour_dir = day_dir / str(h)
                     try:
                         if not hour_dir.exists() or not hour_dir.is_dir():
@@ -3134,26 +3476,30 @@ class ImageFinderWidget(QWidget):
                         pass
                     return True, entries
 
-                with ThreadPoolExecutor(max_workers=12) as _hex:
-                    _futs = [_hex.submit(_scan_hour, h) for h in range(24)]
-                    for _fut in as_completed(_futs):
-                        try:
-                            _existed, _entries = _fut.result()
-                            if _existed:
-                                found_any_hour = True
-                            for _p in _entries:
-                                if _p.name not in seen:
-                                    seen.add(_p.name)
-                                    all_entries.append(_p)
-                        except Exception:
-                            pass
+                for (yy, mm, dd) in eff_days:
+                    container_year = max(yy, 2025)
+                    root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{container_year}"
+                    day_dir = root / str(yy) / str(mm) / str(dd)
+                    with ThreadPoolExecutor(max_workers=12) as _hex:
+                        _futs = [_hex.submit(_scan_hour, day_dir, h) for h in range(24)]
+                        for _fut in as_completed(_futs):
+                            try:
+                                _existed, _entries = _fut.result()
+                                if _existed:
+                                    found_any_hour = True
+                                for _p in _entries:
+                                    if _p.name not in seen:
+                                        seen.add(_p.name)
+                                        all_entries.append(_p)
+                            except Exception:
+                                pass
 
                 if not found_any_hour:
                     _sig.not_found.emit(target_path)
                     return
 
                 subfolders = sorted(all_entries, key=lambda x: x.name.lower())
-                _sig.log_msg.emit(f"LOAD: scanned all hours in {day_dir.name}, found {len(subfolders)} cameras")
+                _sig.log_msg.emit(f"LOAD: scanned {len(eff_days)} day(s), found {len(subfolders)} cameras")
                 _sig.done.emit(subfolders, saved_sel, current_gen)
             except Exception as e:
                 _sig.error.emit(f"{type(e).__name__}: {e}")
@@ -3673,60 +4019,103 @@ class ImageFinderWidget(QWidget):
             if not _tp_no_windows:
                 log("  TotalPower failed, falling back to blind scan")
 
-        # ── Method 2: Blind hour-by-hour scan (no TotalPower channel) ─────────
-        log(f"method2: blind scan h={start_hour_real}–{max_hour_real}")
+        # ── Energy-CSV guidance (CPVA dead → use logged SBW4/PTM1) ────────────
+        # The daily energy CSV records when the laser was actually firing.
+        def _en(r, col):
+            try:
+                return float((r.values.get(col) or "").strip())
+            except Exception:
+                return 0.0
+
+        def _row_ns(r):
+            if PRAGUE is not None:
+                return int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1e9)
+            return int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1e9)
+
+        erows = self._energy_rows_for_day_cached(year, month, day_n)
+        shots = sorted((r for r in erows if _en(r, "sbw4") > 0 or _en(r, "ptm1") > 0),
+                       key=lambda r: (_en(r, "sbw4"), _en(r, "ptm1")), reverse=True)
+
+        # Best (highest-SBW4) shot per folder-hour — used to aim the blind scan.
+        best_shot_by_h: dict = {}
+        for r in shots:
+            fh = real_to_folder_h(ns_to_real_h(_row_ns(r)))
+            if fh not in best_shot_by_h:
+                best_shot_by_h[fh] = r   # shots is energy-desc, so first = strongest
+
+        # ── Method 2a: jump straight to the strongest shots ───────────────────
+        if shots:
+            log(f"method2a: CSV-guided, {len(shots)} energetic shots in CSV")
+            for r in shots[:15]:
+                if is_cancelled():
+                    return None, None, _no_meta, "cancelled"
+                p, h = try_timestamp(_row_ns(r))
+                if p is not None:
+                    meta = {"ptm1": _en(r, "ptm1") or None,
+                            "sbw4": _en(r, "sbw4") or None}
+                    log(f"  CSV-guided: shot {r.ts_dt.strftime('%H:%M:%S')} "
+                        f"sbw4={_en(r,'sbw4'):.3f} ptm1={_en(r,'ptm1'):.2f}")
+                    return p, h, meta, "found"
+
+        # ── Method 2b: blind hour-by-hour scan (guaranteed fallback) ──────────
+        # Always return SOMETHING if the camera has any image that day. Where the
+        # CSV has a shot in this hour, aim at it (image with laser data) instead
+        # of just grabbing the first file in the folder.
+        log(f"method2b: blind scan h={start_hour_real}–{max_hour_real}")
         for real_h in range(start_hour_real, max_hour_real + 1):
             if is_cancelled():
                 return None, None, _no_meta, "cancelled"
             folder_h = real_to_folder_h(real_h)
             dt_eff   = datetime(year, month, day_n, folder_h)
             cam_folder = self._build_target_path(dt_eff) / cam_name
-            log(f"  blind h={real_h:02d}  {cam_folder}")
-            t_exist = time.perf_counter()
             exists = bc(lambda cf=cam_folder: cf.exists(), cancelled)
             if is_cancelled():
                 return None, None, _no_meta, "cancelled"
             if not exists:
-                log(f"  not found  ({time.perf_counter()-t_exist:.2f}s)")
                 continue
-            t0 = time.perf_counter()
-            found_file = bc(lambda cf=cam_folder: self._any_image_from_folder(cf),
-                            cancelled)
+            best_r = best_shot_by_h.get(folder_h)
+            if best_r is not None:
+                tns = _row_ns(best_r)
+                found_file = bc(lambda cf=cam_folder, t=tns: self._nearest_file_for_ns(cf, t),
+                                cancelled)
+                meta = {"ptm1": _en(best_r, "ptm1") or None, "sbw4": _en(best_r, "sbw4") or None}
+            else:
+                found_file = bc(lambda cf=cam_folder: self._any_image_from_folder(cf),
+                                cancelled)
+                meta = _no_meta
             if is_cancelled():
                 return None, None, _no_meta, "cancelled"
-            log(f"  scan {time.perf_counter()-t0:.2f}s  →  {found_file.name if found_file else 'nothing'}")
+            log(f"  blind h={real_h:02d}  →  {found_file.name if found_file else 'nothing'}")
             if found_file:
-                return found_file, real_h, _no_meta, "found"
+                return found_file, real_h, meta, "found"
 
         return None, None, _no_meta, "not_found"
 
-    def _on_multiday_search(self):
-        """Open multi-day search setup dialog."""
-        # Build camera list from checked rows in the main table
-        all_cams = []
-        for r in range(self._table.rowCount()):
-            if not self._checked.get(r, False):
-                continue
-            folder = self._row_to_path.get(r)
-            if folder is None:
-                continue
-            label_item = self._table.item(r, 4)
-            cam_label = label_item.text() if label_item and label_item.text() else folder.name
-            all_cams.append((folder.name, cam_label, folder))
+    def _energy_rows_for_day_cached(self, year: int, month: int, day: int) -> "list[_EnergyRow]":
+        """Load (and cache) the daily energy CSV rows for the multi-day engine.
+        Uses the CSV directly (no CPVA) so it works while the API is dead."""
+        key = (year, month, day)
+        cache = getattr(self, "_md_energy_cache", None)
+        if cache is None:
+            cache = self._md_energy_cache = {}
+        if key not in cache:
+            try:
+                cache[key] = _load_energy_csv(_energy_csv_path(datetime(year, month, day)))
+            except Exception:
+                cache[key] = []
+        return cache[key]
 
-        if not all_cams:
-            QMessageBox.information(self, "Multi-day search",
-                                    "No cameras checked in the table. Check at least one camera first."); return
+    def _run_multiday_search(self, cfg: dict):
+        """Run the multi-day image search for the given config and surface the
+        results in the inline preview + MultiDayPreviewWindow.
 
-        dlg = _MultiDaySetupDialog(all_cams, self._cal.selectedDate(), self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        cfg = dlg.get_config()
+        cfg = {cameras: [(folder_name, label, folder)], days: [date,…],
+               start_hour: int, max_hour: int, use_lab_time: bool}
+        """
         if not cfg["cameras"]:
             QMessageBox.information(self, "Multi-day search", "Select at least one camera."); return
         if not cfg["days"]:
-            QMessageBox.information(self, "Multi-day search", "No days in selected range."); return
+            QMessageBox.information(self, "Multi-day search", "No days selected."); return
 
         use_lab         = cfg["use_lab_time"]
         start_hour_real = cfg["start_hour"]
@@ -3828,6 +4217,12 @@ class ImageFinderWidget(QWidget):
                 key=lambda x: x.name)
             if found_paths:
                 self._preview_set_files(found_paths, "Multi-day")
+                # Look up PV values so the preview/info panel show them.
+                def _after_energy(res: list):
+                    self._energy_results = res
+                    self._refresh_energy_info()
+                self._energy_info.setPlainText("Loading energy data…")
+                self._run_energy_lookup_async(found_paths, on_done=_after_energy)
             # Also open the full multi-day window
             preview = MultiDayPreviewWindow(results, cfg["cameras"],
                                             use_lab, self)
@@ -3906,8 +4301,9 @@ class ImageFinderWidget(QWidget):
         if not self.isVisible():
             return
         qdate = QDate(day.year, day.month, day.day)
-        self._cal.setSelectedDate(qdate)
-        self._cal.activated.emit(qdate)
+        # Replace the multi-day selection with just this day and reload the table.
+        self._last_cal_click = qdate
+        self._apply_day_selection([qdate])
 
     # ── COLLECT JOBS ──────────────────────────────────────────────────────────
     def _snapshot_collect_jobs(self) -> list[tuple[Path, int]]:
@@ -4380,7 +4776,42 @@ class ImageFinderWidget(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     # ── VIEW / SAVE ───────────────────────────────────────────────────────────
+    def _checked_cameras(self) -> list:
+        """Return [(folder_name, label, folder)] for every checked table row."""
+        cams = []
+        for r in range(self._table.rowCount()):
+            if not self._checked.get(r, False):
+                continue
+            folder = self._row_to_path.get(r)
+            if folder is None:
+                continue
+            label_item = self._table.item(r, 4)
+            cam_label = label_item.text() if label_item and label_item.text() else folder.name
+            cams.append((folder.name, cam_label, folder))
+        return cams
+
     def view_primary_files(self):
+        # Multi-day: more than one effective (weekday-filtered) day selected →
+        # run the multi-day search engine instead of the single-day collect.
+        eff_days = self._effective_days()
+        if len(eff_days) > 1:
+            cams = self._checked_cameras()
+            if not cams:
+                QMessageBox.information(self, "Info", "No cameras checked in the table."); return
+            # Search the whole day: the engine uses the energy CSV (sbw4/ptm1) to
+            # jump to the hour the laser was firing, and blind-scans the rest as a
+            # fallback, so a camera active in any hour is still found.
+            cfg = {
+                "cameras":      cams,
+                "days":         [datetime(d.year(), d.month(), d.day()).date() for d in eff_days],
+                "start_hour":   0,
+                "max_hour":     23,
+                "use_lab_time": self._lab_time_cb.isChecked(),
+            }
+            self._log(f"VIEW (multi-day): {len(cams)} cams × {len(cfg['days'])} days, full-day search")
+            self._run_multiday_search(cfg)
+            return
+
         jobs      = self._snapshot_collect_jobs()
         requested = sum(qty for _, qty in jobs)
         if requested <= 0:
@@ -6439,6 +6870,7 @@ class MultiDayPreviewWindow(QWidget):
         QApplication.processEvents()
 
         updated = []
+        need_rebuild = False
         for idx, (cam_name, date) in enumerate(keys):
             plbl.setText(f"{cam_name}  {date.strftime('%d.%m.%Y')}")
             pbar.setValue(idx)
@@ -6461,7 +6893,8 @@ class MultiDayPreviewWindow(QWidget):
                 chosen = parent_finder.select_images_from_folder(cam_folder, 1)
                 if chosen:
                     self._try_hour[(cam_name, date)] = real_h
-                    self._update_thumb_result(cam_name, date, (cam_name, date), real_h, chosen[0])
+                    if self._update_thumb_result(cam_name, date, (cam_name, date), real_h, chosen[0]):
+                        need_rebuild = True
                     updated.append(f"{cam_name} {date.strftime('%d.%m')}: found {real_h:02d}:00")
                     found = True
                     break
@@ -6469,6 +6902,8 @@ class MultiDayPreviewWindow(QWidget):
                 updated.append(f"{cam_name} {date.strftime('%d.%m')}: no image from {chosen_hour:02d}:00")
 
         prog.accept()
+        if need_rebuild:
+            self._rebuild_grids()
         if updated:
             QMessageBox.information(self, "Search again", "\n".join(updated))
 
@@ -6510,7 +6945,8 @@ class MultiDayPreviewWindow(QWidget):
             chosen = parent_finder.select_images_from_folder(cam_folder, 1)
             if chosen:
                 self._try_hour[key] = real_h
-                self._update_thumb_result(cam_name, date, key, real_h, chosen[0])
+                if self._update_thumb_result(cam_name, date, key, real_h, chosen[0]):
+                    self._rebuild_grids()
                 QMessageBox.information(
                     self, "Search again",
                     f"{cam_name}  {date.strftime('%d.%m.%Y')}: found {real_h:02d}:00\n{chosen[0].name}")
@@ -6559,11 +6995,42 @@ class MultiDayPreviewWindow(QWidget):
         for d, h, _p, _m, _s in entries:
             if d == date:
                 real_h = h; break
-        self._update_thumb_result(cam_name, date, key, real_h, chosen)
+        if self._update_thumb_result(cam_name, date, key, real_h, chosen):
+            self._rebuild_grids()
+
+    def _clear_grid(self, grid):
+        """Remove and delete every widget in a QGridLayout."""
+        while grid.count():
+            item = grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _rebuild_grids(self):
+        """Tear down and repopulate all tab grids from self._results.
+
+        Needed when a 'Not found' placeholder becomes a real image: placeholders
+        are plain QLabels not tracked in _thumb_views_all, so they cannot be
+        upgraded in place. Selection (self._selected) is preserved by key."""
+        for d in (self._thumb_views, self._thumb_views_all, self._thumb_widgets,
+                  self._thumb_labels, self._popup_anchor,
+                  self._thumb_paths, self._thumb_camnames):
+            d.clear()
+        self._clear_grid(self._tab_day[1])
+        for fn in self._cam_tabs:
+            self._clear_grid(self._cam_tabs[fn][1])
+        self._populate_day_tab()
+        for fn in self._cam_tabs:
+            self._populate_cam_tab(fn)
 
     def _update_thumb_result(self, cam_name: str, date, key: tuple,
-                             real_h: int, chosen: Path):
-        """Update results dict, raw cache, pixmap and all TVs for a given key."""
+                             real_h: int, chosen: Path) -> bool:
+        """Update results dict, raw cache, pixmap and all TVs for a given key.
+
+        Returns True when the cell was a 'Not found' placeholder (no tracked
+        thumb view) — the caller must then call _rebuild_grids() to show it."""
+        needs_rebuild = not self._thumb_views_all.get(key)
         entries = self._results.get(cam_name, [])
         no_meta: dict = {"ptm1": None, "sbw4": None}
         for i, (d, _, _p, _m, _s2) in enumerate(entries):
@@ -6592,6 +7059,7 @@ class MultiDayPreviewWindow(QWidget):
             new_text = f"{date.strftime('%d.%m.%Y')}  {ts_str}"
             for lbl in self._thumb_labels.get(key, []):
                 lbl.setText(new_text)
+        return needs_rebuild
 
 
 # ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────

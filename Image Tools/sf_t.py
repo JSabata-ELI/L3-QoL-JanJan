@@ -18,6 +18,7 @@ import re as _re
 import ssl
 import sys as _sys
 import shutil
+import subprocess
 import tempfile
 import atexit
 import threading
@@ -115,8 +116,14 @@ ENERGY_CSV_ROOT_OPTIONS = {
 # CSV fallback — same root / format as Image Finder
 ENERGY_CSV_ROOT     = ENERGY_CSV_ROOT_OPTIONS["Lab"]
 ENERGY_CSV_NAME_FMT = "dataof%Y%b_%d"   # e.g. dataof2026Mar_24
-# Tolerance for closest-timestamp extra-column matching (seconds)
-EXTRA_COL_MATCH_TOL_S = 5.0
+# Tolerance for closest-timestamp extra-column matching (seconds).
+# PV channels (esp. Back_Ref / waveplate) are sampled sparsely, so a too-tight
+# window made secondary/extra PVs show "—" even when valid data existed nearby.
+EXTRA_COL_MATCH_TOL_S = 30.0
+# Tolerance (ns) for matching a camera image filename timestamp to a shot.
+# Widened from 10 s — per-day clock drift between archiver and camera filenames
+# could exceed 10 s and blank the preview.
+IMG_MATCH_TOL_NS = 30_000_000_000
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
 CPVA_BASE_URL     = "https://10.78.0.57:8443/api/1.0/cpva"
@@ -198,6 +205,27 @@ def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout, context=_cpva_ssl_ctx()) as resp:
         return json.loads(resp.read().decode("utf-8")), url
+
+
+def _cpva_fetch_channels(pattern: str = "**",
+                         timeout: float = CPVA_HTTP_TIMEOUT) -> "list[str]":
+    """Return all archiver channel names matching `pattern` (default: all)."""
+    params = urllib.parse.urlencode({"pattern": pattern})
+    url = f"{CPVA_BASE_URL}/channels-by-pattern?{params}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_cpva_ssl_ctx()) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    # Endpoint may return a bare list of names or a list of dicts.
+    out: list[str] = []
+    if isinstance(data, list):
+        for d in data:
+            if isinstance(d, str):
+                out.append(d)
+            elif isinstance(d, dict):
+                name = d.get("channelName") or d.get("name") or d.get("channel")
+                if name:
+                    out.append(str(name))
+    return out
 
 
 def _load_csv_for_day(day: date, cols: "list[str]",
@@ -293,9 +321,10 @@ def _load_api_for_day(day: date, cols: "list[str]",
     per_col: dict[str, list[dict]] = {}
 
     def _fetch_one_col(col: str) -> tuple[str, list[dict]]:
-        channel = CPVA_CHANNEL_MAP.get(col)
+        # Preset cols map to a friendly channel; arbitrary cols ARE the channel.
+        channel = CPVA_CHANNEL_MAP.get(col, col)
         col_rows: list[dict] = []
-        if channel is not None:
+        if channel:
             channels_to_try = [channel]
             if not channel.endswith(".value"):
                 channels_to_try.append(channel + ".value")
@@ -360,17 +389,25 @@ def _load_api_for_day(day: date, cols: "list[str]",
             by_ts[t_ns][col] = r[col]
 
     merged = [by_ts[k] for k in sorted(by_ts)]
+    counts = ", ".join(f"{c}={len(per_col.get(c, []))}" for c in cols)
+    _log(f"  {day}: merged {len(merged)} rows; samples per col: {counts}")
+    for c in cols:
+        if not per_col.get(c):
+            _log(f"  ⚠ {day}: NO data for '{c}' (API+CSV both empty)")
     return merged, per_col
 
 
 def _find_closest_col_value(per_col: "dict[str, list[dict]]", col: str,
-                             target_ns: int, tol_s: float = EXTRA_COL_MATCH_TOL_S) -> str:
+                             target_ns: int, tol_s: float = EXTRA_COL_MATCH_TOL_S,
+                             log=None) -> str:
     """
     Find the closest-timestamp value for `col` within tol_s seconds of target_ns.
     Returns formatted value string or "—" if no match.
     """
     rows = per_col.get(col)
     if not rows:
+        if log is not None:
+            log(f"  closest '{col}': no samples loaded → —")
         return "—"
     ts_list = [r["_ns"] for r in rows]
     idx = bisect.bisect_left(ts_list, target_ns)
@@ -385,6 +422,9 @@ def _find_closest_col_value(per_col: "dict[str, list[dict]]", col: str,
     tol_ns = int(tol_s * 1_000_000_000)
     if best is not None and best_diff <= tol_ns:
         return best.get(col, "—")
+    if log is not None and best is not None:
+        log(f"  closest '{col}': nearest sample {best_diff/1e9:.1f}s away "
+            f"(> {tol_s:.0f}s window) → —")
     return "—"
 
 
@@ -477,7 +517,7 @@ def _find_image_for_ts(cam_folder: Path, ts_dt: datetime,
     except Exception:
         pass
 
-    if best_file is not None and best_diff < 10_000_000_000:
+    if best_file is not None and best_diff < IMG_MATCH_TOL_NS:
         return best_file
     return None
 
@@ -489,7 +529,11 @@ def _format_value(col: str, raw: str) -> str:
             return f"{v * 1000:.2f} mJ"
         if col == "sbw4":
             return f"{v * SBW4_TRANSMISSION:.4f} J"
-        return f"{v:.4f} J" if col != "waveplate" else f"{v:.0f}"
+        if col == "waveplate":
+            return f"{v:.0f}"
+        if col in PV_COLUMNS:          # known energy preset
+            return f"{v:.4f} J"
+        return f"{v:.4g}"             # arbitrary channel — raw, no unit assumption
     except (ValueError, TypeError):
         return raw or "—"
 
@@ -508,7 +552,11 @@ class _CamLoadSignals(QObject):
     log_msg  = Signal(str)
 
 class _PreviewSignals(QObject):
-    show = Signal(object, str, int)  # (QImage | None, energy_text, gen)
+    show    = Signal(object, str, int)  # (QImage | None, energy_text, gen)
+    log_msg = Signal(str)
+
+class _ChannelSignals(QObject):
+    loaded = Signal(list)  # archiver channel names
 
 # ── CALENDAR DELEGATE ─────────────────────────────────────────────────────────
 
@@ -815,6 +863,7 @@ class ShotFinderWidget(QWidget):
         self._preview_sig = _PreviewSignals()
         self._current_preview_path: "Path | None" = None
         self._preview_sig.show.connect(self._on_preview_ready)
+        self._preview_sig.log_msg.connect(self._log)
         atexit.register(self._cleanup_temp)
         self._last_save_dir: "Path | None" = None
 
@@ -968,42 +1017,46 @@ class ShotFinderWidget(QWidget):
         ll.addWidget(self._date_info_lbl)
         ll.addWidget(_hsep())
 
-        # PV selector
+        # ── PV search state ───────────────────────────────────────────────
+        # Ordered lists of selected columns (preset key or raw channel name).
+        self._criteria_cols: list[str] = []   # PVs to search by
+        self._extra_cols_sel: list[str] = []  # PVs to also show
+        self._custom_labels: dict[str, str] = {}  # custom col → display label
+        self._all_pv_channels: list[str] = []     # fetched archiver channels
+        self._pv_suggestions: list[tuple[str, str]] = []  # (display, col_key)
+        self._rebuild_pv_suggestions()
+
+        # PV search — search criteria
         ll.addWidget(_group_label("Search criteria"))
-        pv_grid = QGridLayout()
-        pv_grid.setSpacing(2)
-        self._pv_buttons: dict[str, QCheckBox] = {}
-        for i, (col, label) in enumerate(PV_COLUMNS.items()):
-            short = label.split(" [")[0]
-            cb = QCheckBox(short)
-            cb.setToolTip(label)
-            cb.setStyleSheet(_CHECKBOX_STYLE_SM)
-            self._pv_buttons[col] = cb
-            pv_grid.addWidget(cb, i // 3, i % 3)
-            cb.stateChanged.connect(lambda state, c=col: self._on_pv_changed_rb(c, bool(state)))
-        list(self._pv_buttons.values())[0].setChecked(True)
-        ll.addLayout(pv_grid)
+        self._pv_search = QLineEdit()
+        self._pv_search.setPlaceholderText("search PV to add… (e.g. SBW4, Energy)")
+        self._pv_search.textEdited.connect(self._on_pv_search_changed)
+        self._pv_search.returnPressed.connect(self._on_pv_search_return)
+        ll.addWidget(self._pv_search)
+        self._pv_dropdown = self._make_pv_dropdown(self._on_pv_dropdown_clicked)
 
-        ll.addWidget(QLabel("Also show:"))
-        self._extra_pv_checks: dict[str, QCheckBox] = {}
-        extra_grid = QGridLayout()
-        extra_grid.setSpacing(2)
-        for i, (col, label) in enumerate(PV_COLUMNS.items()):
-            short = label.split(" [")[0]
-            cb = QCheckBox(short)
-            cb.setStyleSheet(_CHECKBOX_STYLE_SM)
-            cb.setToolTip(f"Also show {label} in results")
-            self._extra_pv_checks[col] = cb
-            extra_grid.addWidget(cb, i // 3, i % 3)
-        ll.addLayout(extra_grid)
-
-        # Criteria container — dynamic rows, one per checked PV
+        # Criteria container — dynamic rows, one per selected search PV
         self._criteria: list[dict] = []  # [{col, target, tol}, ...]
         self._criteria_container = QWidget()
         self._criteria_container_layout = QVBoxLayout(self._criteria_container)
         self._criteria_container_layout.setContentsMargins(0, 0, 0, 0)
         self._criteria_container_layout.setSpacing(2)
         ll.addWidget(self._criteria_container)
+
+        # PV search — also show
+        ll.addWidget(QLabel("Also show:"))
+        self._extra_search = QLineEdit()
+        self._extra_search.setPlaceholderText("search PV to also show…")
+        self._extra_search.textEdited.connect(self._on_extra_search_changed)
+        self._extra_search.returnPressed.connect(self._on_extra_search_return)
+        ll.addWidget(self._extra_search)
+        self._extra_dropdown = self._make_pv_dropdown(self._on_extra_dropdown_clicked)
+
+        self._extra_container = QWidget()
+        self._extra_container_layout = QVBoxLayout(self._extra_container)
+        self._extra_container_layout.setContentsMargins(0, 0, 0, 0)
+        self._extra_container_layout.setSpacing(2)
+        ll.addWidget(self._extra_container)
 
         # Hidden legacy spinboxes — kept so existing code that references them still works
         self._target_sb = QDoubleSpinBox()
@@ -1186,6 +1239,7 @@ class ShotFinderWidget(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self._table.doubleClicked.connect(self._on_table_double_clicked)
+        self._table.cellClicked.connect(self._on_table_cell_clicked)
         rl.addWidget(self._table, 1)
 
         root_layout.addWidget(left_scroll)
@@ -1197,10 +1251,12 @@ class ShotFinderWidget(QWidget):
         root_layout.addWidget(self._preview_widget, 1)
 
         # Init
-        self._on_pv_changed_rb("sbw4", True)
+        self._criteria_cols = ["sbw4"]       # default search PV
         self._rebuild_criteria_rows()
+        self._rebuild_extra_rows()
         self._update_date_info()
         QTimer.singleShot(300, self._load_cameras)
+        QTimer.singleShot(400, self._fetch_channel_list)
 
     def _setup_calendar(self, cal: _NoScrollCalendar):
         cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
@@ -1245,51 +1301,210 @@ class ShotFinderWidget(QWidget):
         self._update_date_info()
         self._load_cameras()
 
-    def _on_pv_changed_rb(self, col: str, checked: bool):
-        if not hasattr(self, "_unit_lbl"):
+    # ── PV column helpers ─────────────────────────────────────────────────
+    def _col_label(self, col: str) -> str:
+        return PV_COLUMNS.get(col) or self._custom_labels.get(col, col)
+
+    def _col_short(self, col: str) -> str:
+        return self._col_label(col).split(" [")[0]
+
+    def _col_unit(self, col: str) -> str:
+        if col in MJ_COLUMNS:
+            return "mJ"
+        if col == "waveplate":
+            return "—"
+        if col in PV_COLUMNS:
+            return "J"
+        return ""   # arbitrary channel — no assumed unit
+
+    # ── PV search bar / suggestions ───────────────────────────────────────
+    def _rebuild_pv_suggestions(self):
+        """Build the (display, col_key) suggestion list: presets first, then
+        any fetched archiver channels not already covered by a preset."""
+        seen_channels = set()
+        sugg: list[tuple[str, str]] = []
+        for col, label in PV_COLUMNS.items():
+            sugg.append((label, col))
+            ch = CPVA_CHANNEL_MAP.get(col)
+            if ch:
+                seen_channels.add(ch)
+        for ch in self._all_pv_channels:
+            if ch in seen_channels:
+                continue
+            sugg.append((ch, ch))
+        self._pv_suggestions = sugg
+
+    def _fetch_channel_list(self):
+        if self._all_pv_channels:
             return
-        # Zjisti všechny aktuálně vybrané sloupce
-        selected = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
-        if not selected:
-            return
-        # Jednotky ukazuj podle prvního vybraného
-        first = selected[0]
-        if first in MJ_COLUMNS:
-            self._unit_lbl.setText("mJ")
-            self._tol_unit_lbl.setText("mJ")
-        elif first == "waveplate":
-            self._unit_lbl.setText("—")
-            self._tol_unit_lbl.setText("—")
+        sig = self._chan_sig = _ChannelSignals()
+        sig.loaded.connect(self._on_channels_loaded)
+
+        def worker():
+            try:
+                chans = _cpva_fetch_channels("**")
+            except Exception as exc:
+                self._chan_err = f"{type(exc).__name__}: {exc}"
+                chans = []
+            sig.loaded.emit(chans)
+
+        self._chan_err = ""
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_channels_loaded(self, chans: list):
+        self._all_pv_channels = list(chans)
+        self._rebuild_pv_suggestions()
+        if chans:
+            self._log(f"PV channels available: {len(chans)}")
         else:
-            self._unit_lbl.setText("J")
-            self._tol_unit_lbl.setText("J")
-        # Rebuild dynamic criteria rows
-        if hasattr(self, "_criteria_container"):
+            self._log(f"PV channel list unavailable ({self._chan_err or 'empty'}); "
+                      "presets + free-typed channels still work.")
+
+    def _make_pv_dropdown(self, callback):
+        """Floating, focus-free filtered list — same pattern as the camera search."""
+        dd = QTableWidget(0, 1)
+        dd.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        dd.horizontalHeader().setVisible(False)
+        dd.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        dd.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        dd.verticalHeader().setVisible(False)
+        dd.setWindowFlags(
+            Qt.WindowType.Tool |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint)
+        dd.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        dd.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        dd.clicked.connect(callback)
+        dd.setStyleSheet(
+            "QTableWidget { border: 1px solid #2d7dff; background: #fff; }"
+            "QTableWidget::item:selected { background: #2d7dff; color: #fff; }")
+        return dd
+
+    def _populate_pv_dropdown(self, text, dropdown, anchor, exclude):
+        q = text.strip().lower()
+        dropdown.hide()
+        dropdown.setRowCount(0)
+        if not q:
+            return
+        matches = [(disp, key) for disp, key in self._pv_suggestions
+                   if key not in exclude and (q in disp.lower() or q in key.lower())]
+        if not matches:
+            return
+        for disp, key in matches[:40]:
+            r = dropdown.rowCount()
+            dropdown.insertRow(r)
+            it = QTableWidgetItem(disp)
+            it.setData(Qt.ItemDataRole.UserRole, key)
+            dropdown.setItem(r, 0, it)
+        n_rows = min(len(matches), 40)
+        row_h = max(22, dropdown.verticalHeader().defaultSectionSize())
+        popup_h = min(n_rows * row_h + 6, 360)
+        popup_w = max(300, anchor.width() + 20)
+        pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        dropdown.setGeometry(pos.x(), pos.y(), popup_w, popup_h)
+        dropdown.show()
+        dropdown.raise_()
+        QTimer.singleShot(0, anchor.setFocus)
+
+    def _on_pv_search_changed(self, text: str):
+        self._populate_pv_dropdown(text, self._pv_dropdown, self._pv_search,
+                                   set(self._criteria_cols))
+
+    def _on_extra_search_changed(self, text: str):
+        self._populate_pv_dropdown(text, self._extra_dropdown, self._extra_search,
+                                   set(self._extra_cols_sel))
+
+    def _on_pv_dropdown_clicked(self, index):
+        it = self._pv_dropdown.item(index.row(), 0)
+        if it is None:
+            return
+        key = it.data(Qt.ItemDataRole.UserRole) or it.text()
+        self._pv_dropdown.hide()
+        self._pv_search.clear()
+        self._add_criteria_col(key)
+
+    def _on_extra_dropdown_clicked(self, index):
+        it = self._extra_dropdown.item(index.row(), 0)
+        if it is None:
+            return
+        key = it.data(Qt.ItemDataRole.UserRole) or it.text()
+        self._extra_dropdown.hide()
+        self._extra_search.clear()
+        self._add_extra_col(key)
+
+    def _on_pv_search_return(self):
+        txt = self._pv_search.text().strip()
+        if txt:
+            self._pv_dropdown.hide()
+            self._pv_search.clear()
+            self._add_criteria_col(txt)
+
+    def _on_extra_search_return(self):
+        txt = self._extra_search.text().strip()
+        if txt:
+            self._extra_dropdown.hide()
+            self._extra_search.clear()
+            self._add_extra_col(txt)
+
+    def _register_col(self, col: str) -> str:
+        col = (col or "").strip()
+        if col and col not in PV_COLUMNS and col not in self._custom_labels:
+            self._custom_labels[col] = col   # arbitrary channel; label == name
+        return col
+
+    def _add_criteria_col(self, col: str):
+        col = self._register_col(col)
+        if not col or col in self._criteria_cols:
+            return
+        self._criteria_cols.append(col)
+        self._rebuild_criteria_rows()
+
+    def _remove_criteria_col(self, col: str):
+        if col in self._criteria_cols:
+            self._criteria_cols.remove(col)
             self._rebuild_criteria_rows()
 
+    def _add_extra_col(self, col: str):
+        col = self._register_col(col)
+        if not col or col in self._extra_cols_sel:
+            return
+        self._extra_cols_sel.append(col)
+        self._rebuild_extra_rows()
+
+    def _remove_extra_col(self, col: str):
+        if col in self._extra_cols_sel:
+            self._extra_cols_sel.remove(col)
+            self._rebuild_extra_rows()
+
+    def _make_remove_btn(self, slot) -> QPushButton:
+        btn = QPushButton("✕")
+        btn.setFixedSize(20, 20)
+        btn.setToolTip("Remove")
+        btn.setStyleSheet(
+            "QPushButton { color: #cc0000; font-weight: 700; border: none; }"
+            "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
+        btn.clicked.connect(slot)
+        return btn
+
     def _rebuild_criteria_rows(self):
-        """Rebuild the dynamic criteria row widgets to match currently checked PV checkboxes."""
-        # Sync current spinbox values into self._criteria before destroying widgets
+        """Rebuild the dynamic criteria rows to match self._criteria_cols."""
+        # Sync current spinbox values before destroying widgets
         existing: dict = {d["col"]: d.copy() for d in self._criteria}
         for r in getattr(self, "_criteria_rows", []):
-            col = r["col"]
-            existing[col] = {
-                "col":    col,
+            existing[r["col"]] = {
+                "col":    r["col"],
                 "target": r["target_sb"].value(),
                 "tol":    r["tol_sb"].value(),
             }
 
-        # Clear existing widgets
         while self._criteria_container_layout.count():
             item = self._criteria_container_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
-        selected = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
-
-        self._criteria_rows: list[dict] = []  # list of {col, target_sb, tol_sb}
-        for col in selected:
+        self._criteria_rows: list[dict] = []
+        for col in self._criteria_cols:
             prev = existing.get(col, {})
             prev_target = prev.get("target", 10.0)
             prev_tol    = prev.get("tol", 0.0)
@@ -1299,10 +1514,10 @@ class ShotFinderWidget(QWidget):
             row_l.setContentsMargins(0, 0, 0, 0)
             row_l.setSpacing(3)
 
-            short = PV_COLUMNS.get(col, col).split(" [")[0]
-            lbl = QLabel(f"{short}:")
+            lbl = QLabel(f"{self._col_short(col)}:")
             lbl.setStyleSheet("font-size: 10px; font-weight: 600;")
-            lbl.setFixedWidth(52)
+            lbl.setFixedWidth(64)
+            lbl.setToolTip(self._col_label(col))
             row_l.addWidget(lbl)
 
             row_l.addWidget(QLabel("T:"))
@@ -1321,27 +1536,40 @@ class ShotFinderWidget(QWidget):
             tol_sb.setFixedWidth(60)
             row_l.addWidget(tol_sb)
 
-            # Unit label
-            if col in MJ_COLUMNS:
-                unit = "mJ"
-            elif col == "waveplate":
-                unit = "—"
-            else:
-                unit = "J"
-            row_l.addWidget(QLabel(unit))
+            row_l.addWidget(QLabel(self._col_unit(col)))
             row_l.addStretch(1)
+            row_l.addWidget(self._make_remove_btn(
+                lambda _=False, c=col: self._remove_criteria_col(c)))
 
             self._criteria_container_layout.addWidget(row_w)
             self._criteria_rows.append({"col": col, "target_sb": t_sb, "tol_sb": tol_sb})
 
         # Update self._criteria from current rows
-        self._criteria = []
-        for r in self._criteria_rows:
-            self._criteria.append({
-                "col":    r["col"],
-                "target": r["target_sb"].value(),
-                "tol":    r["tol_sb"].value(),
-            })
+        self._criteria = [
+            {"col": r["col"], "target": r["target_sb"].value(), "tol": r["tol_sb"].value()}
+            for r in self._criteria_rows
+        ]
+
+    def _rebuild_extra_rows(self):
+        """Rebuild the 'also show' rows to match self._extra_cols_sel."""
+        while self._extra_container_layout.count():
+            item = self._extra_container_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for col in self._extra_cols_sel:
+            row_w = QWidget()
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(3)
+            lbl = QLabel(self._col_short(col))
+            lbl.setStyleSheet("font-size: 10px;")
+            lbl.setToolTip(self._col_label(col))
+            row_l.addWidget(lbl)
+            row_l.addStretch(1)
+            row_l.addWidget(self._make_remove_btn(
+                lambda _=False, c=col: self._remove_extra_col(c)))
+            self._extra_container_layout.addWidget(row_w)
 
     def _get_criteria(self) -> "list[dict]":
         """Read current spinbox values and return list of {col, target, tol} dicts."""
@@ -1368,6 +1596,20 @@ class ShotFinderWidget(QWidget):
             self._date_info_lbl.setText(f"1 day  {start_s}\n→ {end_s}")
         else:
             self._date_info_lbl.setText(f"{n} days  {start_s}\n→ {end_s}")
+
+    def _build_energy_text(self, dr, row: dict, row_ns) -> str:
+        """Multi-PV preview caption: search PVs + 'also show' PVs at this shot.
+        Used by both the main-table preview and the per-shot dialog preview so
+        an expanded shot keeps the same backreflection / extra-PV info."""
+        search_cols = list(self._criteria_cols)
+        extra_cols = [c for c in self._extra_cols_sel if c not in search_cols]
+        parts = []
+        for sc in search_cols + extra_cols:
+            raw = row.get(sc, "")
+            if not raw and row_ns is not None:
+                raw = _find_closest_col_value(dr.per_col, sc, row_ns)
+            parts.append(f"{self._col_short(sc)}: {_format_value(sc, raw)}")
+        return "  |  ".join(parts)
 
     def _on_selection_changed(self):
         has_sel = bool(self._table.selectedItems())
@@ -1402,30 +1644,11 @@ class ShotFinderWidget(QWidget):
         img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
         if img is None:
             self._preview_widget.set_pixmap(None)
+            self._log(f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s in "
+                      f"{cam_folder} for {dt_obj}")
             return
 
-        search_cols = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
-        search_cols_set = set(search_cols)
-        extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c not in search_cols_set]
-        parts = []
-        for sc in search_cols:
-            if sc == dr.col:
-                val = _format_value(sc, dr.best_row.get(sc, ""))
-            elif ts_ns_direct is not None:
-                raw = _find_closest_col_value(dr.per_col, sc, ts_ns_direct)
-                val = _format_value(sc, raw)
-            else:
-                val = _format_value(sc, dr.best_row.get(sc, ""))
-            short = PV_COLUMNS.get(sc, sc).split(" [")[0]
-            parts.append(f"{short}: {val}")
-        if ts_ns_direct is not None:
-            for ec in extra_cols:
-                raw_ec = _find_closest_col_value(dr.per_col, ec, ts_ns_direct)
-                ev = _format_value(ec, raw_ec)
-                short = PV_COLUMNS.get(ec, ec).split(" [")[0]
-                parts.append(f"{short}: {ev}")
-        energy_text = "  |  ".join(parts)
+        energy_text = self._build_energy_text(dr, dr.best_row, ts_ns_direct)
 
         self._current_preview_path = img
         self._preview_gen += 1
@@ -1478,7 +1701,10 @@ class ShotFinderWidget(QWidget):
             if gen != self._preview_gen:
                 return
             self._preview_sig.show.emit(out_img, energy_text, gen)
-        except Exception:
+        except Exception as exc:
+            self._preview_sig.log_msg.emit(
+                f"⚠ preview load failed for {Path(img_path).name}: "
+                f"{type(exc).__name__}: {exc}")
             self._preview_sig.show.emit(None, energy_text, gen)
 
     def _rescale_preview(self):
@@ -1660,10 +1886,8 @@ class ShotFinderWidget(QWidget):
         # Read multi-criteria from dynamic UI rows
         criteria = self._get_criteria()
         if not criteria:
-            # Fallback: use first checked PV with legacy spinbox values
-            search_cols_fb = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
-            if not search_cols_fb:
-                search_cols_fb = ["sbw4"]
+            # Fallback: use selected search cols with legacy spinbox values
+            search_cols_fb = list(self._criteria_cols) or ["sbw4"]
             criteria = []
             for sc in search_cols_fb:
                 t_ui = self._target_sb.value()
@@ -1672,8 +1896,7 @@ class ShotFinderWidget(QWidget):
 
         search_cols = [c["col"] for c in criteria]
         col = search_cols[0]  # primary column
-        extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c not in search_cols]
+        extra_cols = [c for c in self._extra_cols_sel if c not in search_cols]
 
         # Convert UI-unit criteria to CSV units for each column
         def _to_csv_units(c_col, c_val):
@@ -1884,45 +2107,63 @@ class ShotFinderWidget(QWidget):
 
         folder_str = str(folder_path) if folder_path else "Not found"
 
-        raw_val    = best_row.get(col, "")
-        val_str    = _format_value(col, raw_val)
-        # Extra columns — closest-timestamp match
+        prague_str = dt_obj.strftime("%H:%M:%S.%f")[:-3]
+        best_ns    = best_row.get("_ns")
+
+        criteria_csv_res = result.get("criteria_csv", [])
+        if not criteria_csv_res:
+            criteria_csv_res = [{"col": col, "target_csv": result["target_csv"],
+                                 "tol_ui": self._tol_sb.value()}]
+
+        def _val_at(cc):
+            raw = best_row.get(cc, "")
+            if not raw and best_ns is not None:
+                raw = _find_closest_col_value(per_col, cc, best_ns)
+            return raw
+
+        def _diff_ui(cc, target_csv):
+            """Return (diff_in_ui_units, formatted_str)."""
+            try:
+                v = float(_val_at(cc))
+            except (ValueError, TypeError):
+                return None, "—"
+            d = abs(v - target_csv)
+            if cc == "sbw4":
+                return d * SBW4_TRANSMISSION, f"{d * SBW4_TRANSMISSION:.4f} J"
+            if cc in MJ_COLUMNS:
+                return d * 1000, f"{d * 1000:.2f} mJ"
+            if cc == "waveplate":
+                return d, f"{d:.0f}"
+            if cc in PV_COLUMNS:
+                return d, f"{d:.4f} J"
+            return d, f"{d:.4g}"
+
+        # One line per search PV across the PV / Value / Δ columns
+        pv_lines, val_lines, diff_lines, off_pvs = [], [], [], []
+        for crit in criteria_csv_res:
+            cc = crit["col"]
+            short = self._col_short(cc)
+            pv_lines.append(short)
+            val_lines.append(f"{short}: {_format_value(cc, _val_at(cc))}")
+            dval, dstr = _diff_ui(cc, crit["target_csv"])
+            diff_lines.append(f"{short}: {dstr}")
+            if dval is not None and dval > crit.get("tol_ui", 0.0):
+                off_pvs.append(f"{short} off {dstr}")
+
+        # 'Also show' PVs appended to the Value cell
         extra_cols = result.get("extra_cols", [])
-        best_ns = best_row.get("_ns")
-        if extra_cols and best_ns is not None:
-            extra_parts = []
+        if best_ns is not None:
             for ec in extra_cols:
                 raw_ec = _find_closest_col_value(per_col, ec, best_ns)
-                ev = _format_value(ec, raw_ec)
-                short = PV_COLUMNS.get(ec, ec).split(" [")[0]
-                extra_parts.append(f"{short}: {ev}")
-            val_str += "\n" + "  |  ".join(extra_parts)
-        prague_str = dt_obj.strftime("%H:%M:%S.%f")[:-3]
-        diff       = result["diff"]
+                val_lines.append(f"{self._col_short(ec)}: {_format_value(ec, raw_ec)}")
 
-        # Primary tolerance from criteria_csv (for warn check)
-        criteria_csv_res = result.get("criteria_csv", [])
-        primary_tol_ui = (criteria_csv_res[0]["tol_ui"]
-                          if criteria_csv_res else self._tol_sb.value())
-
-        # diff v user jednotkách
-        if col == "sbw4" and diff is not None:
-            diff_actual = diff * SBW4_TRANSMISSION
-            diff_str = f"{diff_actual:.4f} J"
-            warn = diff_actual > primary_tol_ui
-        elif col in MJ_COLUMNS and diff is not None:
-            diff_str = f"{diff * 1000:.2f} mJ"
-            warn = diff * 1000 > primary_tol_ui
-        elif diff is not None:
-            diff_str = f"{diff:.4f}"
-            warn = diff > primary_tol_ui
-        else:
-            diff_str = "—"
-            warn = False
+        pv_str   = "\n".join(pv_lines)
+        val_str  = "\n".join(val_lines)
+        diff_str = "\n".join(diff_lines)
 
         n_tol = len(rows_in_tol)
-        if warn:
-            status_str   = f"⚠ outside ±{primary_tol_ui:.2f}"
+        if off_pvs:
+            status_str   = "⚠ " + "; ".join(off_pvs)
             status_color = QColor("#856404")
             row_bg       = QColor("#fff3cd")
         elif n_tol > 1:
@@ -1939,7 +2180,7 @@ class ShotFinderWidget(QWidget):
         cells = [
             day.strftime("%Y-%m-%d"),
             prague_str,
-            PV_COLUMNS.get(col, col),
+            pv_str,
             val_str,
             diff_str,
             status_str,
@@ -1951,11 +2192,35 @@ class ShotFinderWidget(QWidget):
                 item.setBackground(row_bg)
             if c == 5:
                 item.setForeground(status_color)
-            if folder_path is None and c == 6:
-                item.setForeground(QColor("#cc0000"))
+            if c == 6:
+                if folder_path is not None:
+                    item.setData(Qt.ItemDataRole.UserRole, str(folder_path))
+                    item.setForeground(QColor("#2d7dff"))
+                    item.setToolTip("Click to open this folder in Explorer")
+                else:
+                    item.setForeground(QColor("#cc0000"))
             self._table.setItem(r, c, item)
-            if extra_cols:
-                self._table.setRowHeight(r, 36)
+        # Row height scales with the number of stacked lines
+        n_lines = max(len(pv_lines), len(val_lines), len(diff_lines), 1)
+        if n_lines > 1:
+            self._table.setRowHeight(r, 18 * n_lines + 8)
+
+    def _on_table_cell_clicked(self, row: int, col: int):
+        """Click the Folder cell (col 6) to open that folder in Explorer."""
+        if col != 6:
+            return
+        item = self._table.item(row, col)
+        if item is None:
+            return
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        try:
+            subprocess.Popen(["explorer", str(path)])
+            self._log(f"EXPLORER: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error",
+                                 f"Could not open folder:\n{type(e).__name__}: {e}")
 
     def _on_table_double_clicked(self, index):
         """Double-click na řádek — zobraz všechny shoty daného dne v dialogu."""
@@ -1983,12 +2248,17 @@ class ShotFinderWidget(QWidget):
         lbl = QLabel(f"{len(rows_in_tol)} shot(s) in range on {dr.day}:")
         lay.addWidget(lbl)
 
-        # Determine extra cols to show in dialog (other PVs that were loaded)
-        extra_cols_in_tol = [c for c in PV_COLUMNS if c != col and c in dr.per_col]
+        # Extra cols shown in dialog: secondary search PVs + 'also show' PVs +
+        # any other loaded PV — ordered, deduped, excluding the primary col.
+        extra_cols_in_tol: list[str] = []
+        for c in (list(self._criteria_cols) + list(self._extra_cols_sel)
+                  + list(dr.per_col.keys())):
+            if c != col and c in dr.per_col and c not in extra_cols_in_tol:
+                extra_cols_in_tol.append(c)
         n_extra = len(extra_cols_in_tol)
         tbl = QTableWidget(0, 3 + n_extra)
         base_headers = ["Prague Time", "Value", "Δ from target"]
-        extra_headers = [PV_COLUMNS.get(c, c).split(" [")[0] for c in extra_cols_in_tol]
+        extra_headers = [self._col_short(c) for c in extra_cols_in_tol]
         tbl.setHorizontalHeaderLabels(base_headers + extra_headers)
         tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -2023,7 +2293,7 @@ class ShotFinderWidget(QWidget):
             # Extra PV columns
             row_ns = row.get("_ns", 0)
             for ec_idx, ec in enumerate(extra_cols_in_tol):
-                raw_ec = _find_closest_col_value(dr.per_col, ec, row_ns, tol_s=5.0)
+                raw_ec = _find_closest_col_value(dr.per_col, ec, row_ns)
                 ec_str = _format_value(ec, raw_ec)
                 tbl.setItem(r2, 3 + ec_idx, QTableWidgetItem(ec_str))
 
@@ -2059,10 +2329,8 @@ class ShotFinderWidget(QWidget):
             img2 = _find_image_for_ts(cam_folder_ref[0], dt_obj2,
                                        ts_ns_override=row.get("_ns"))
             if img2:
-                raw2 = row.get(col, "")
-                val2 = _format_value(col, raw2)
-                short2 = PV_COLUMNS.get(col, col).split(" [")[0]
-                energy2 = f"{short2}: {val2}"
+                # Full multi-PV caption (search + also-show), same as main table
+                energy2 = self._build_energy_text(dr, row, row.get("_ns"))
                 _gen2 = self._preview_gen + 1
                 self._preview_gen = _gen2
                 _gname2 = self._gradient_cb.currentText()
@@ -2315,10 +2583,10 @@ class ShotFinderWidget(QWidget):
 
         # Sestav energy map — filename -> text pro zobrazení v slideru
         energy_map: dict[str, str] = {}
-        search_cols_slider = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
+        search_cols_slider = list(self._criteria_cols)
         search_cols_slider_set = set(search_cols_slider)
-        extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c not in search_cols_slider_set]
+        extra_cols = [c for c in self._extra_cols_sel
+                      if c not in search_cols_slider_set]
 
         for src, dst, i in copied_files:
             if i >= len(results_to_open):
@@ -2386,10 +2654,10 @@ class ShotFinderWidget(QWidget):
         else:
             results_to_save = self._day_results
 
-        search_cols_save = [c for c, cb in self._pv_buttons.items() if cb.isChecked()]
+        search_cols_save = list(self._criteria_cols)
         search_cols_save_set = set(search_cols_save)
-        extra_cols = [c for c, cb in self._extra_pv_checks.items()
-                      if cb.isChecked() and c not in search_cols_save_set]
+        extra_cols = [c for c in self._extra_cols_sel
+                      if c not in search_cols_save_set]
 
         copied = 0
         errors = 0
