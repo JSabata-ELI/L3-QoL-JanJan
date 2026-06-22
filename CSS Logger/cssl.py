@@ -10,6 +10,7 @@ import sys
 import re
 import fnmatch
 import os
+import numpy as np
 import subprocess
 import urllib3
 import urllib.parse
@@ -572,6 +573,7 @@ class DatePickerDialog(tk.Toplevel):
         self._min  = tk.StringVar(value=f"{init_dt.minute:02d}")
         self._sec  = tk.StringVar(value=f"{init_dt.second:02d}")
 
+
         self._build_ui()
         self._draw_calendar()
 
@@ -921,6 +923,27 @@ class CPVAExplorerApp:
         # --- XY PLOT ---------------------------------------------------
         self._xy_canvas = None
         self._xy_figure = None
+        # --- PV TIME PLOT -----------------------------------------
+        self._pv_time_df = None
+        self._pv_time_canvas = None
+        self._pv_time_figure = None
+        self._pv_time_condition_rows = []
+        
+        self._pv_time_columns = [
+            "waveplate",
+            "ptm1",
+            "pcm2",
+            "pcm4",
+            "pap1",
+            "sbw4",
+            "green",
+            "sbw4_green",
+            "green_ptm1",
+            "ptm1_pap1",
+            "pcm2_green",
+            "sbw4_ptm1",
+        ]
+
         self._xy_x_var = tk.StringVar()
         self._xy_y_var = tk.StringVar()
         self._xy_zoom_history = []
@@ -1000,12 +1023,14 @@ class CPVAExplorerApp:
 
         self.tab_graph = tk.Frame(self.notebook)
         self.tab_xy    = tk.Frame(self.notebook)
+        self.tab_pv_time = tk.Frame(self.notebook)
        
         self.tab_table = tk.Frame(self.notebook)
         self.tab_log   = tk.Frame(self.notebook)
 
         self.notebook.add(self.tab_graph, text="  Graph  ")
         self.notebook.add(self.tab_xy,    text="  XY Plot  ")
+        self.notebook.add(self.tab_pv_time, text="  PV Time Plot  ")
     
         self.notebook.add(self.tab_table, text="  Table  ")
         self.notebook.add(self.tab_log,   text="  Log    ")
@@ -1013,6 +1038,7 @@ class CPVAExplorerApp:
 
         self._build_graph_tab()
         self._build_xy_tab()
+        self._build_pv_time_tab()
        
         self._build_table_tab()
         self._build_log_tab()
@@ -1296,7 +1322,214 @@ class CPVAExplorerApp:
         )
         self.lbl_xy_info.grid(row=2, column=0, sticky=tk.EW, padx=8, pady=(0, 6))
 
-    
+    def _build_pv_time_tab(self):
+
+        tab = self.tab_pv_time
+
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        ctrl = tk.Frame(tab)
+        ctrl.grid(
+            row=0,
+            column=0,
+            sticky=tk.EW,
+            padx=8,
+            pady=8
+        )
+
+        tk.Label(
+            ctrl,
+            text="Y Variable:"
+        ).pack(side=tk.LEFT)
+
+        self._pv_time_y_var = tk.StringVar(
+            value="sbw4"
+        )
+
+        self._pv_time_y_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self._pv_time_y_var,
+            width=20,
+            state="readonly"
+        )
+
+        self._pv_time_y_combo.pack(
+            side=tk.LEFT,
+            padx=(5, 20)
+        )
+
+        tk.Label(
+            ctrl,
+            text="From:"
+        ).pack(side=tk.LEFT)
+
+        self._pv_time_from_var = tk.StringVar(
+            value="2026-01-01"
+        )
+
+        tk.Entry(
+            ctrl,
+            textvariable=self._pv_time_from_var,
+            width=12
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(
+            ctrl,
+            text="To:"
+        ).pack(side=tk.LEFT)
+
+        self._pv_time_to_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d")
+        )
+
+        tk.Entry(
+            ctrl,
+            textvariable=self._pv_time_to_var,
+            width=12
+        ).pack(side=tk.LEFT, padx=5)
+
+        self._pv_time_mode = tk.StringVar(
+            value="Daily distribution"
+        )
+
+        ttk.Combobox(
+            ctrl,
+            textvariable=self._pv_time_mode,
+            values=[
+                "Raw shots",
+                "Daily distribution"
+            ],
+            width=18,
+            state="readonly"
+        ).pack(side=tk.LEFT, padx=(20, 20))
+
+        cond_frame = tk.LabelFrame(
+            tab,
+            text="Conditions"
+        )
+
+        cond_frame.grid(
+            row=2,
+            column=0,
+            sticky=tk.EW,
+            padx=8,
+            pady=4
+        )
+
+        self._pv_time_conditions_frame = cond_frame
+
+        _btn(
+            ctrl,
+            "Plot",
+            self._plot_pv_time,
+            bg=COLOR_GREEN,
+            fg="white"
+        ).pack(side=tk.LEFT)
+
+        _btn(
+            ctrl,
+            "+ Condition",
+            self._pv_time_add_condition_row
+        ).pack(side=tk.LEFT, padx=(6,0))
+
+        self.pv_time_container = tk.Frame(
+            tab,
+            bg="#f5f5f5"
+        )
+
+        self.pv_time_container.grid(
+            row=1,
+            column=0,
+            sticky=tk.NSEW,
+            padx=8,
+            pady=8
+        )
+
+        self.pv_time_container.columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.pv_time_container.rowconfigure(
+            0,
+            weight=1
+        )    
+
+        self._pv_time_add_condition_row()
+
+
+    def _pv_time_add_condition_row(self):
+
+        frame = self._pv_time_conditions_frame
+
+        row = len(self._pv_time_condition_rows)
+
+        enabled = tk.BooleanVar(
+            value=True
+        )
+
+        variable = tk.StringVar(
+            value="green"
+        )
+
+        target = tk.StringVar(
+            value="70"
+        )
+
+        tolerance = tk.StringVar(
+            value="10"
+        )
+
+        tk.Checkbutton(
+            frame,
+            variable=enabled
+        ).grid(
+            row=row,
+            column=0
+        )
+
+        ttk.Combobox(
+            frame,
+            textvariable=variable,
+            values=self._pv_time_columns,
+            width=20,
+            state="readonly"
+        ).grid(
+            row=row,
+            column=1,
+            padx=4
+        )
+
+        tk.Entry(
+            frame,
+            textvariable=target,
+            width=10
+        ).grid(
+            row=row,
+            column=2,
+            padx=4
+        )
+
+        tk.Entry(
+            frame,
+            textvariable=tolerance,
+            width=10
+        ).grid(
+            row=row,
+            column=3,
+            padx=4
+        )
+
+        self._pv_time_condition_rows.append(
+            {
+                "enabled": enabled,
+                "variable": variable,
+                "target": target,
+                "tolerance": tolerance,
+            }
+        )
+
     def _refresh_xy_choices(self):
         if not hasattr(self, "xy_x_combo"):
             return
@@ -2168,6 +2401,175 @@ class CPVAExplorerApp:
             self._x_cursor_ann.set_visible(False)
         self._blit_bg = self._mpl_canvas.copy_from_bbox(self._mpl_figure.bbox)
 
+
+    def _draw_daily_distribution(
+        self,
+        df,
+        y_variable
+    ):
+
+        if self._pv_time_canvas:
+
+            self._pv_time_canvas.get_tk_widget().destroy()
+
+            self._pv_time_canvas = None
+
+        fig = self._Figure(
+            figsize=(10, 5),
+            dpi=100
+        )
+
+        ax = fig.add_subplot(111)
+
+        df[y_variable] = pd.to_numeric(
+            df[y_variable],
+            errors="coerce"
+        )
+
+        df = df.dropna(
+            subset=[y_variable]
+        )
+
+        df["day"] = (
+            df["timestamp"]
+            .dt.floor("D")
+        )
+
+        days = sorted(
+            df["day"].unique()
+        )
+
+        values = []
+
+        labels = []
+
+        for day in days:
+
+            vals = df.loc[
+                df["day"] == day,
+                y_variable
+            ].dropna()
+
+            if len(vals) < 2:
+                continue
+
+            values.append(vals.values)
+
+            labels.append(
+                pd.to_datetime(day).strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+        if not values:
+            return
+
+        ax.violinplot(
+            values,
+            showmedians=True
+        )
+
+        ax.set_xticks(
+            range(1, len(labels) + 1)
+        )
+
+        ax.set_xticklabels(
+            labels,
+            rotation=45
+        )
+
+        ax.set_ylabel(
+            y_variable
+        )
+
+        ax.set_title(
+            f"{y_variable} daily distribution"
+        )
+
+        ax.grid(True)
+
+        canvas = self._FigureCanvas(
+            fig,
+            master=self.pv_time_container
+        )
+
+        canvas.draw()
+
+        canvas.get_tk_widget().grid(
+            row=0,
+            column=0,
+            sticky=tk.NSEW
+        )
+
+        self._pv_time_canvas = canvas
+        self._pv_time_figure = fig
+
+    def _plot_pv_time(self):
+
+        df = self._load_repository_cache()
+
+        y_variable = self._pv_time_y_var.get()
+
+        if y_variable not in df.columns:
+            messagebox.showwarning(
+                "Missing column",
+                y_variable
+            )
+            return
+
+        from_date = pd.to_datetime(
+            self._pv_time_from_var.get()
+        )
+
+        to_date = pd.to_datetime(
+            self._pv_time_to_var.get()
+        )
+
+        filtered = df[
+            (df["timestamp"] >= from_date)
+            &
+            (df["timestamp"] <= to_date)
+        ].copy()
+
+        if filtered.empty:
+            return
+
+        for cond in self._pv_time_condition_rows:
+
+            if not cond["enabled"].get():
+                continue
+
+            variable = cond["variable"].get()
+
+            target = float(
+                cond["target"].get()
+            )
+
+            tolerance = float(
+                cond["tolerance"].get()
+            )
+
+            lower = target * (
+                1 - tolerance / 100
+            )
+
+            upper = target * (
+                1 + tolerance / 100
+            )
+
+            filtered = filtered[
+                filtered[variable].between(
+                    lower,
+                    upper
+                )
+            ]
+
+        self._draw_daily_distribution(
+            filtered,
+            y_variable
+        )
+
+
     def _load_ramping_repository(self):
 
         self._ramping_repository = load_ramping_repository()
@@ -2176,6 +2578,121 @@ class CPVAExplorerApp:
             key=lambda r: r.get("timestamp", ""),
             reverse=True
         )
+
+    def _load_repository_cache(self):
+
+        if self._pv_time_df is not None:
+            return self._pv_time_df
+
+        tables = []
+
+        for file in sorted(
+            DATA_REPOSITORY_DIR.glob("*/*.parquet")
+        ):
+
+            try:
+
+                df = pd.read_parquet(file)
+                df = self._pv_time_add_features(df)
+
+                df["timestamp"] = pd.to_datetime(
+                    df["timestamp"],
+                    unit="ns",
+                    errors="coerce"
+                )
+
+                tables.append(df)
+
+            except Exception as e:
+
+                print(file, e)
+
+        self._pv_time_df = pd.concat(
+            tables,
+            ignore_index=True
+        )
+
+        return self._pv_time_df        
+
+    def _pv_time_add_features(self, df):
+
+        df = df.copy()
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            unit="ns",
+            errors="coerce"
+        )
+
+        numeric_cols = [
+            "waveplate",
+            "ptm1",
+            "pcm2",
+            "pcm4",
+            "pap1",
+            "sbw4",
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
+                )
+
+        df["green"] = df["pcm2"] + df["pcm4"]
+
+        valid_sbw4_green = df[
+            ["sbw4", "pcm2", "pcm4"]
+        ].notna().all(axis=1)
+
+        valid_green_ptm1 = df[
+            ["pcm2", "pcm4", "ptm1"]
+        ].notna().all(axis=1)
+
+        valid_ptm1_pap1 = df[
+            ["ptm1", "pap1"]
+        ].notna().all(axis=1)
+
+        valid_pcm2_green = df[
+            ["pcm2", "pcm4"]
+        ].notna().all(axis=1)
+
+        valid_sbw4_ptm1 = df[
+            ["sbw4", "ptm1"]
+        ].notna().all(axis=1)
+
+        df["sbw4_green"] = np.where(
+            valid_sbw4_green,
+            safe_divide(df["sbw4"], df["green"]),
+            np.nan
+        )
+
+        df["green_ptm1"] = np.where(
+            valid_green_ptm1,
+            safe_divide(df["green"], df["ptm1"]),
+            np.nan
+        )
+
+        df["ptm1_pap1"] = np.where(
+            valid_ptm1_pap1,
+            safe_divide(df["ptm1"], df["pap1"]),
+            np.nan
+        )
+
+        df["pcm2_green"] = np.where(
+            valid_pcm2_green,
+            safe_divide(df["pcm2"], df["green"]),
+            np.nan
+        )
+
+        df["sbw4_ptm1"] = np.where(
+            valid_sbw4_ptm1,
+            safe_divide(df["sbw4"], df["ptm1"]),
+            np.nan
+        )
+
+        return df
 
     def _load_data_repository(self):
 
@@ -5163,6 +5680,22 @@ class CPVAExplorerApp:
 
         if live_callback is not None:
             live_callback()
+
+        if hasattr(self, "_pv_time_y_combo"):
+
+            choices = []
+
+            for pv in self._pv_order:
+
+                if pv in self._numeric_pvs:
+                    choices.append(pv)
+
+            self._pv_time_y_combo["values"] = self._pv_time_columns
+
+            if choices:
+                self._pv_time_y_var.set(
+                    choices[0]
+                )
 
     # -------------------------------------------------------------------------
     # Live mode

@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
-
+import numpy as np
 import pandas as pd
-
+from PySide6.QtWidgets import QMenu
 from PySide6.QtCore import Qt, QAbstractTableModel
 from PySide6.QtWidgets import (
     QApplication,
@@ -167,6 +167,10 @@ class RepositoryBrowser(QMainWindow):
         toolbar.addStretch()
         toolbar.addWidget(self.btn_save)
 
+        self.btn_fill = QPushButton("Fill Selected")
+        toolbar.addWidget(self.btn_fill)
+        self.btn_fill.clicked.connect(self.fill_selected_cells)
+
         layout.addLayout(toolbar)
 
         splitter = QSplitter()
@@ -204,6 +208,11 @@ class RepositoryBrowser(QMainWindow):
         # ==========================================
 
         self.table = QTableView()
+
+        self.table.setSelectionBehavior(QTableView.SelectItems)
+        self.table.setSelectionMode(QTableView.ExtendedSelection)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.open_table_menu)
 
         self.model = PandasModel(self.df)
 
@@ -298,6 +307,114 @@ class RepositoryBrowser(QMainWindow):
         self.table.scrollTo(index)
         self.table.setCurrentIndex(index)    
 
+    def open_table_menu(self, pos):
+
+        menu = QMenu(self)
+
+        fill_action = menu.addAction("Fill selected cells...")
+        nan_action = menu.addAction("Set selected cells to NaN")
+        column_nan_action = menu.addAction("Set current column to NaN")
+
+        action = menu.exec(self.table.viewport().mapToGlobal(pos))
+
+        if action == fill_action:
+            self.fill_selected_cells()
+
+        elif action == nan_action:
+            self.set_selected_cells_nan()
+
+        elif action == column_nan_action:
+            self.set_current_column_nan()
+
+
+    def fill_selected_cells(self):
+
+        if self.current_file is None:
+            return
+
+        indexes = self.table.selectedIndexes()
+
+        if not indexes:
+            return
+
+        text, ok = QInputDialog.getText(
+            self,
+            "Fill selected cells",
+            "New value:"
+        )
+
+        if not ok:
+            return
+
+        value = self.parse_user_value(text)
+
+        for index in indexes:
+            row = index.row()
+            col = index.column()
+            col_name = self.df.columns[col]
+            self.df.at[row, col_name] = value
+
+        self.model.update_dataframe(self.df)
+
+
+    def set_selected_cells_nan(self):
+
+        indexes = self.table.selectedIndexes()
+
+        if not indexes:
+            return
+
+        for index in indexes:
+            row = index.row()
+            col = index.column()
+            col_name = self.df.columns[col]
+            self.df.at[row, col_name] = np.nan
+
+        self.model.update_dataframe(self.df)
+
+
+    def set_current_column_nan(self):
+
+        index = self.table.currentIndex()
+
+        if not index.isValid():
+            return
+
+        col_name = self.df.columns[index.column()]
+
+        answer = QMessageBox.question(
+            self,
+            "Set column to NaN",
+            f"Set whole column '{col_name}' to NaN?"
+        )
+
+        if answer != QMessageBox.Yes:
+            return
+
+        self.df[col_name] = np.nan
+
+        self.model.update_dataframe(self.df)
+
+
+    def parse_user_value(self, text):
+
+        text = text.strip()
+
+        if text.lower() in ("nan", "none", "null", ""):
+            return np.nan
+
+        try:
+            return int(text)
+        except ValueError:
+            pass
+
+        try:
+            return float(text)
+        except ValueError:
+            pass
+
+        return text
+
     def save_file(self):
 
         if self.current_file is None:
@@ -323,6 +440,7 @@ class RepositoryBrowser(QMainWindow):
                 "Error",
                 str(e)
             )
+        self.df.replace({None: np.nan}, inplace=True)    
 
     # ======================================================
     # Row Operations
