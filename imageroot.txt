@@ -1,0 +1,1 @@
+IMAGE_ROOT             = r"\\users-L3.tier0.lcs.local\cpva-image-2026"

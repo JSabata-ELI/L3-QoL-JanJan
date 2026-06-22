@@ -1,0 +1,29 @@
+{
+    "master_pv": "L3-PFWP6-MTR03-1:RawPos",
+    "master_multiple": 1000,
+
+    "conditions":[
+        {
+          "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+          "min": 5.0,
+          "max": 150.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+          "min": 0.021,
+          "max": 1.0
+        }
+      ],
+
+    "start_date": "2026-06-14",
+    "pvs": {
+        "waveplate": "L3-PFWP6-MTR03-1:RawPos",
+        "ptm1": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "pcm2": "L3-PM03-025:Energy",
+        "pcm4": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+        "pap1": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+        "sbw4": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+        "Back_ref": "L3-PM03-023:Energy",
+        "ln36": "L3-VCS-LN36:OPEN"
+    }
+}

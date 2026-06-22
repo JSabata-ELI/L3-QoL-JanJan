@@ -1,0 +1,14 @@
+{
+  "derived_pvs": [
+    {
+      "name": "Sum of Green",
+      "expr": "E+F",
+      "aliases": {
+        "E": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+        "F": "L3-PM03-025:Energy"
+      },
+      "required_pvs": [
+        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+        "L3-PM03-025:Energy"
+      ],
+      "compiled": 

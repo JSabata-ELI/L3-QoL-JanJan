@@ -10,13 +10,17 @@ import sys
 import re
 import fnmatch
 import os
+import numpy as np
 import subprocess
+import urllib3
 import urllib.parse
 import urllib.request
 import urllib.error
 import ssl
 import orjson
 import requests
+import pandas as pd
+from matplotlib import colormaps
 from matplotlib.widgets import RectangleSelector
 from copy import copy
 from datetime import datetime, timedelta, timezone
@@ -24,7 +28,9 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 TZ_PRAGUE = ZoneInfo("Europe/Prague")
-
+urllib3.disable_warnings(
+    urllib3.exceptions.InsecureRequestWarning
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -41,9 +47,9 @@ CONFIG_FILE  = APP_DIR / "cpva_explorer_config.json"
 PRESETS_FILE = APP_DIR / "cpva_presets.json"
 CONDITIONS_PRESETS_FILE = APP_DIR / "cpva_conditions_presets.json"
 CUSTOM_PVS_FILE = APP_DIR / "custom_pvs.json"
-RAMPING_ARCHIVE_FILE = APP_DIR / "ramping_archive.json"
-
-
+RAMPING_REPOSITORY_DIR = APP_DIR.parent / "RampingRepository"
+DATA_REPOSITORY_DIR = APP_DIR.parent / "DataRepository"
+IMAGE_ROOT = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
 # ---------------------------------------------------------------------------
 # CPVA archiver API constants
 # ---------------------------------------------------------------------------
@@ -52,20 +58,42 @@ CPVA_BASE_URL          = "https://10.78.0.57:8443/api/1.0/cpva"
 CPVA_SAMPLES_ENDPOINT  = "/samples"
 CPVA_CHANNELS_ENDPOINT = "/channels"
 CPVA_HTTP_TIMEOUT      = 10.0
-IMAGE_ROOT             = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
 
 # The archiver only returns reliable data when the query window <= 1 h.
 CHUNK_SIZE_NS = int(3600 * 1e9)   # 1 hour in nanoseconds
 
 # Rows within this many milliseconds of each other are merged into one.
-MERGE_WINDOW_MS = 140
+
 SAMPLE_HOLD_MIN_GAP_MS = 137
 MASTER_RAMP_PV = "L3-PFWP6-MTR03-1:RawPos"
 
+RAMPING_PV_MAP = {
+    "waveplate": "L3-PFWP6-MTR03-1:RawPos",
+    "ptm1":      "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+    "pcm2":      "L3-PM03-025:Energy",
+    "pcm4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+    "pap1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+    "sbw4":      "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    "Back_ref":  "L3-PM03-023:Energy",
+    "ln36":      "L3-VCS-LN36:OPEN",
+}
 
+PV_TO_RAMPING = {
+    pv: short
+    for short, pv in RAMPING_PV_MAP.items()
+}
 
 _SESSION = requests.Session()
 _SESSION.verify = False
+
+
+def safe_divide(a, b):
+    """Element-wise a / b, returning NaN where the denominator is 0 or non-finite."""
+    return np.where(
+        (b != 0) & np.isfinite(b),
+        a / b,
+        np.nan,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +112,8 @@ DEFAULT_CONFIG = {
 
     "master_multiple": "",
 }
+
+
 
 
 def load_config() -> dict:
@@ -171,46 +201,56 @@ def load_custom_pvs() -> list[dict]:
 
     return []
 
-
 def save_custom_pvs(custom_pvs: list[dict]) -> None:
-
     CUSTOM_PVS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    clean = []
+    for cpv in custom_pvs:
+        d = dict(cpv)
+        d.pop("_compiled", None)
+        d.pop("compiled", None)
+        clean.append(d)
 
     with open(CUSTOM_PVS_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"custom_pvs": custom_pvs},
+            {"custom_pvs": clean},
             f,
             indent=2,
             ensure_ascii=False
-        )        
+        )      
 
-def load_ramping_archive() -> list[dict]:
+def _load_data_repository(self):
 
-    if RAMPING_ARCHIVE_FILE.exists():
-        try:
-            with open(RAMPING_ARCHIVE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+    self._data_repository = []
 
-            if isinstance(data, dict):
-                return data.get("archives", [])
+    for file in sorted(
+        DATA_REPOSITORY_DIR.rglob("*.parquet")
+    ):
 
-        except Exception:
-            pass
-
-    return []
-
-
-def save_ramping_archive(archives: list[dict]) -> None:
-
-    RAMPING_ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(RAMPING_ARCHIVE_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"archives": archives},
-            f,
-            indent=2,
-            ensure_ascii=False
+        self._data_repository.append(
+            {
+                "date": file.stem,
+                "file": file
+            }
         )
+
+
+def load_ramping_repository() -> list[dict]:
+
+    index_file = RAMPING_REPOSITORY_DIR / "index.json"
+
+    if not index_file.exists():
+        return []
+
+    try:
+        with open(index_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        return data.get("rampings", [])
+
+    except Exception:
+        return []
+
 
 def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT):
 
@@ -542,6 +582,7 @@ class DatePickerDialog(tk.Toplevel):
         self._hour = tk.StringVar(value=f"{init_dt.hour:02d}")
         self._min  = tk.StringVar(value=f"{init_dt.minute:02d}")
         self._sec  = tk.StringVar(value=f"{init_dt.second:02d}")
+
 
         self._build_ui()
         self._draw_calendar()
@@ -885,7 +926,10 @@ class CPVAExplorerApp:
         self._presets: list[dict]             = load_presets()
         self._condition_presets: list[dict] = load_condition_presets()
         self._custom_pvs: list[dict] = load_custom_pvs()
-        self._ramping_archive: list[dict] = load_ramping_archive()
+        self._compile_custom_pvs()
+        self._repository_overlays = []
+        self._repository_artists  = []
+        self._repository_edit_mode = tk.BooleanVar(value=False) 
         self._custom_pv_counter = 1
         self._Figure, self._FigureCanvas = _try_import_matplotlib()
         self._mpl_canvas = None
@@ -898,6 +942,27 @@ class CPVAExplorerApp:
         # --- XY PLOT ---------------------------------------------------
         self._xy_canvas = None
         self._xy_figure = None
+        # --- PV TIME PLOT -----------------------------------------
+        self._pv_time_df = None
+        self._pv_time_canvas = None
+        self._pv_time_figure = None
+        self._pv_time_condition_rows = []
+        
+        self._pv_time_columns = [
+            "waveplate",
+            "ptm1",
+            "pcm2",
+            "pcm4",
+            "pap1",
+            "sbw4",
+            "green",
+            "sbw4_green",
+            "green_ptm1",
+            "ptm1_pap1",
+            "pcm2_green",
+            "sbw4_ptm1",
+        ]
+
         self._xy_x_var = tk.StringVar()
         self._xy_y_var = tk.StringVar()
         self._xy_zoom_history = []
@@ -918,6 +983,12 @@ class CPVAExplorerApp:
         # Live-mode countdown progress bar state
         self._live_countdown_id: str | None = None
         self._live_countdown_elapsed_ms: int = 0
+
+        # Ramping Repository
+        self._ramping_repository = load_ramping_repository()
+        self._load_ramping_repository()
+
+        self._load_data_repository()
 
         # Reference lines for graph
         self._ref_lines: list[dict] = []
@@ -971,12 +1042,14 @@ class CPVAExplorerApp:
 
         self.tab_graph = tk.Frame(self.notebook)
         self.tab_xy    = tk.Frame(self.notebook)
+        self.tab_pv_time = tk.Frame(self.notebook)
        
         self.tab_table = tk.Frame(self.notebook)
         self.tab_log   = tk.Frame(self.notebook)
 
         self.notebook.add(self.tab_graph, text="  Graph  ")
         self.notebook.add(self.tab_xy,    text="  XY Plot  ")
+        self.notebook.add(self.tab_pv_time, text="  PV Time Plot  ")
     
         self.notebook.add(self.tab_table, text="  Table  ")
         self.notebook.add(self.tab_log,   text="  Log    ")
@@ -984,6 +1057,7 @@ class CPVAExplorerApp:
 
         self._build_graph_tab()
         self._build_xy_tab()
+        self._build_pv_time_tab()
        
         self._build_table_tab()
         self._build_log_tab()
@@ -1128,14 +1202,6 @@ class CPVAExplorerApp:
         _btn(ctrl, "💾 Save graph", self._save_graph,
              padx=8, pady=3).pack(side=tk.LEFT, padx=(0, 6))
         
-        _btn(
-            ctrl,
-            "Save Ramping",
-            self._save_current_ramping,
-            padx=8,
-            pady=3
-        ).pack(side=tk.LEFT, padx=(0, 6))
-
         self.btn_zoom_back = _btn(ctrl, "↩ Back", self._zoom_back,
                                    padx=8, pady=3)
         self.btn_zoom_back.pack(side=tk.LEFT, padx=(0, 6))
@@ -1219,18 +1285,32 @@ class CPVAExplorerApp:
         
         _btn(
             ctrl,
-            "Ramping Archive",
-            self._open_ramping_archive_dialog,
+            "Ramping Repository",
+            self._open_ramping_repository_dialog,
             padx=10,
             pady=4
         ).pack(side=tk.LEFT, padx=(6, 0))
+
+        _btn(
+            ctrl,
+            "Data Repository",
+            self._open_data_repository_dialog,
+            padx=10,
+            pady=4
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        tk.Checkbutton(
+            ctrl,
+            text="Repository Edit",
+            variable=self._repository_edit_mode
+        ).pack(side=tk.LEFT, padx=(10,0))
 
         _btn(ctrl, "Clean XY", self._clear_xy_plot,
             padx=10, pady=4).pack(side=tk.LEFT, padx=(6, 0))
 
         _btn(ctrl, "Conditions", self._open_conditions_dialog,
             padx=10, pady=4).pack(side=tk.LEFT, padx=(12, 0))
-
+       
         _btn(
             ctrl,
             "↩ XY Back",
@@ -1261,24 +1341,241 @@ class CPVAExplorerApp:
         )
         self.lbl_xy_info.grid(row=2, column=0, sticky=tk.EW, padx=8, pady=(0, 6))
 
+    def _build_pv_time_tab(self):
+
+        tab = self.tab_pv_time
+
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        ctrl = tk.Frame(tab)
+        ctrl.grid(
+            row=0,
+            column=0,
+            sticky=tk.EW,
+            padx=8,
+            pady=8
+        )
+
+        tk.Label(
+            ctrl,
+            text="Y Variable:"
+        ).pack(side=tk.LEFT)
+
+        self._pv_time_y_var = tk.StringVar(
+            value="sbw4"
+        )
+
+        self._pv_time_y_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self._pv_time_y_var,
+            width=20,
+            state="readonly"
+        )
+
+        self._pv_time_y_combo.pack(
+            side=tk.LEFT,
+            padx=(5, 20)
+        )
+
+        tk.Label(
+            ctrl,
+            text="From:"
+        ).pack(side=tk.LEFT)
+
+        self._pv_time_from_var = tk.StringVar(
+            value="2026-01-01"
+        )
+
+        tk.Entry(
+            ctrl,
+            textvariable=self._pv_time_from_var,
+            width=12
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Label(
+            ctrl,
+            text="To:"
+        ).pack(side=tk.LEFT)
+
+        self._pv_time_to_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d")
+        )
+
+        tk.Entry(
+            ctrl,
+            textvariable=self._pv_time_to_var,
+            width=12
+        ).pack(side=tk.LEFT, padx=5)
+
+        self._pv_time_mode = tk.StringVar(
+            value="Daily distribution"
+        )
+
+        ttk.Combobox(
+            ctrl,
+            textvariable=self._pv_time_mode,
+            values=[
+                "Raw shots",
+                "Daily distribution"
+            ],
+            width=18,
+            state="readonly"
+        ).pack(side=tk.LEFT, padx=(20, 20))
+
+        cond_frame = tk.LabelFrame(
+            tab,
+            text="Conditions"
+        )
+
+        cond_frame.grid(
+            row=2,
+            column=0,
+            sticky=tk.EW,
+            padx=8,
+            pady=4
+        )
+
+        self._pv_time_conditions_frame = cond_frame
+
+        _btn(
+            ctrl,
+            "Plot",
+            self._plot_pv_time,
+            bg=COLOR_GREEN,
+            fg="white"
+        ).pack(side=tk.LEFT)
+
+        _btn(
+            ctrl,
+            "+ Condition",
+            self._pv_time_add_condition_row
+        ).pack(side=tk.LEFT, padx=(6,0))
+
+        self.pv_time_container = tk.Frame(
+            tab,
+            bg="#f5f5f5"
+        )
+
+        self.pv_time_container.grid(
+            row=1,
+            column=0,
+            sticky=tk.NSEW,
+            padx=8,
+            pady=8
+        )
+
+        self.pv_time_container.columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.pv_time_container.rowconfigure(
+            0,
+            weight=1
+        )    
+
+        self._pv_time_add_condition_row()
+
+
+    def _pv_time_add_condition_row(self):
+
+        frame = self._pv_time_conditions_frame
+
+        row = len(self._pv_time_condition_rows)
+
+        enabled = tk.BooleanVar(
+            value=True
+        )
+
+        variable = tk.StringVar(
+            value="green"
+        )
+
+        target = tk.StringVar(
+            value="70"
+        )
+
+        tolerance = tk.StringVar(
+            value="10"
+        )
+
+        tk.Checkbutton(
+            frame,
+            variable=enabled
+        ).grid(
+            row=row,
+            column=0
+        )
+
+        ttk.Combobox(
+            frame,
+            textvariable=variable,
+            values=self._pv_time_columns,
+            width=20,
+            state="readonly"
+        ).grid(
+            row=row,
+            column=1,
+            padx=4
+        )
+
+        tk.Entry(
+            frame,
+            textvariable=target,
+            width=10
+        ).grid(
+            row=row,
+            column=2,
+            padx=4
+        )
+
+        tk.Entry(
+            frame,
+            textvariable=tolerance,
+            width=10
+        ).grid(
+            row=row,
+            column=3,
+            padx=4
+        )
+
+        self._pv_time_condition_rows.append(
+            {
+                "enabled": enabled,
+                "variable": variable,
+                "target": target,
+                "tolerance": tolerance,
+            }
+        )
+
     def _refresh_xy_choices(self):
         if not hasattr(self, "xy_x_combo"):
             return
+        pv_candidates = list(self._pv_order)
 
+        for cpv in self._custom_pvs:
+            name = cpv.get("name")
+            if name and name not in pv_candidates:
+                pv_candidates.append(name)
         choices = []
+        numeric_pvs = getattr(self, "_numeric_pvs", set())
 
-        for pv in self._pv_order:
-            has_numeric = False
-
-            for _ts_ns, row_dict in self._table_rows:
-                if pv in row_dict:
-                    value, _units = row_dict[pv]
-                    if isinstance(value, (int, float)):
-                        has_numeric = True
-                        break
-
-            if has_numeric:
+        for pv in pv_candidates:
+            if pv in self._numeric_pvs:
                 choices.append(pv)
+                continue
+
+            # fallback hlavně pro Custom PV
+            for _ts_ns, row_dict in self._table_rows:
+                if pv not in row_dict:
+                    continue
+
+                value, _units = row_dict[pv]
+
+                if isinstance(value, (int, float)):
+                    choices.append(pv)
+                    break
 
         display_choices = [shorten_pv_name(pv) for pv in choices]
 
@@ -1287,12 +1584,122 @@ class CPVAExplorerApp:
         self.xy_x_combo["values"] = display_choices
         self.xy_y_combo["values"] = display_choices
 
+        self.xy_x_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._refresh_xy_overlays()
+        )
+
+        self.xy_y_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self._refresh_xy_overlays()
+        )
+
         if display_choices and self._xy_x_var.get() not in display_choices:
             self._xy_x_var.set(display_choices[0])
 
         if len(display_choices) >= 2 and self._xy_y_var.get() not in display_choices:
             self._xy_y_var.set(display_choices[1])
 
+    def _refresh_xy_overlays(self):
+
+        if self._xy_figure is None:
+            return
+
+        self._draw_repository_overlays()
+
+    def _on_xy_scroll(self, event):
+
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        cur_xlim = ax.get_xlim()
+        cur_ylim = ax.get_ylim()
+
+        xdata = event.xdata
+        ydata = event.ydata
+
+        if xdata is None or ydata is None:
+            return
+
+        # uložit zoom history
+        self._xy_zoom_history.append(
+            (cur_xlim, cur_ylim)
+        )
+
+        scale_factor = 0.9 if event.button == "up" else 1.1
+
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+        new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+
+        relx = (cur_xlim[1] - xdata) / (cur_xlim[1] - cur_xlim[0])
+        rely = (cur_ylim[1] - ydata) / (cur_ylim[1] - cur_ylim[0])
+
+        ax.set_xlim([
+            xdata - new_width * (1 - relx),
+            xdata + new_width * relx
+        ])
+
+        ax.set_ylim([
+            ydata - new_height * (1 - rely),
+            ydata + new_height * rely
+        ])
+
+        self._xy_canvas.draw_idle()
+
+
+    def _on_xy_rect_zoom(self, eclick, erelease):
+
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        x1 = eclick.xdata
+        y1 = eclick.ydata
+
+        x2 = erelease.xdata
+        y2 = erelease.ydata
+
+        if None in (x1, y1, x2, y2):
+            return
+
+        if abs(x2 - x1) < 1e-12:
+            return
+
+        if abs(y2 - y1) < 1e-12:
+            return
+
+        self._xy_zoom_history.append(
+            (
+                ax.get_xlim(),
+                ax.get_ylim()
+            )
+        )
+
+        ax.set_xlim(min(x1, x2), max(x1, x2))
+        ax.set_ylim(min(y1, y2), max(y1, y2))
+
+        self._xy_canvas.draw_idle()
+
+
+    def _xy_zoom_back(self):
+
+        if not self._xy_zoom_history:
+            return
+
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        xlim, ylim = self._xy_zoom_history.pop()
+
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+
+        self._xy_canvas.draw_idle()
 
 
     def _on_xy_scroll(self, event):
@@ -1549,9 +1956,14 @@ class CPVAExplorerApp:
 
         self._clear_graph()
 
-        numeric_pvs = [pv for pv in self._pv_order
-                       if any(isinstance(v, (int, float))
-                              for _, v, _ in self._samples_by_pv.get(pv, []))]
+        numeric_pvs = [
+            pv for pv in self._pv_order
+            if self._pv_settings.get(pv, {}).get("show", True)
+            and any(
+                isinstance(v, (int, float))
+                for _, v, _ in self._samples_by_pv.get(pv, [])
+            )
+        ]
 
         if not numeric_pvs:
             self.lbl_graph_info.config(
@@ -1924,50 +2336,6 @@ class CPVAExplorerApp:
         # Refresh axis settings panel
         self._refresh_axis_settings_tv()
 
-    def _save_current_ramping(self):
-
-        if not self._graph_axes:
-            return
-
-        try:
-            xmin, xmax = self._graph_axes[0].get_xlim()
-
-            import matplotlib.dates as mdates
-
-            dt_min = mdates.num2date(xmin, tz=timezone.utc)
-            dt_max = mdates.num2date(xmax, tz=timezone.utc)
-
-            start_ns = int(dt_min.timestamp() * 1e9)
-            end_ns = int(dt_max.timestamp() * 1e9)
-
-            name = simpledialog.askstring(
-                "Save Ramping",
-                "Archive name:"
-            )
-
-            if not name:
-                return
-
-            self._ramping_archive.append({
-                "name": name,
-                "start_ns": start_ns,
-                "end_ns": end_ns,
-            })
-
-            save_ramping_archive(self._ramping_archive)
-
-            self.lbl_status.config(
-                text=f"Ramping saved: {name}",
-                fg=COLOR_GREEN
-            )
-
-        except Exception as e:
-
-            messagebox.showerror(
-                "Save failed",
-                str(e)
-            )
-
     def _clean_graph(self):
         """Remove PV data from the graph (hide all lines) but keep the graph frame."""
         if self._mpl_canvas is None:
@@ -2146,6 +2514,1026 @@ class CPVAExplorerApp:
         if self._x_cursor_ann is not None:
             self._x_cursor_ann.set_visible(False)
         self._blit_bg = self._mpl_canvas.copy_from_bbox(self._mpl_figure.bbox)
+
+
+    def _draw_daily_distribution(
+        self,
+        df,
+        y_variable
+    ):
+
+        if self._pv_time_canvas:
+
+            self._pv_time_canvas.get_tk_widget().destroy()
+
+            self._pv_time_canvas = None
+
+        fig = self._Figure(
+            figsize=(10, 5),
+            dpi=100
+        )
+
+        ax = fig.add_subplot(111)
+
+        df[y_variable] = pd.to_numeric(
+            df[y_variable],
+            errors="coerce"
+        )
+
+        df = df.dropna(
+            subset=[y_variable]
+        )
+
+        df["day"] = (
+            df["timestamp"]
+            .dt.floor("D")
+        )
+
+        days = sorted(
+            df["day"].unique()
+        )
+
+        values = []
+
+        labels = []
+
+        for day in days:
+
+            vals = df.loc[
+                df["day"] == day,
+                y_variable
+            ].dropna()
+
+            if len(vals) < 2:
+                continue
+
+            values.append(vals.values)
+
+            labels.append(
+                pd.to_datetime(day).strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+        if not values:
+            return
+
+        ax.violinplot(
+            values,
+            showmedians=True
+        )
+
+        ax.set_xticks(
+            range(1, len(labels) + 1)
+        )
+
+        ax.set_xticklabels(
+            labels,
+            rotation=45
+        )
+
+        ax.set_ylabel(
+            y_variable
+        )
+
+        ax.set_title(
+            f"{y_variable} daily distribution"
+        )
+
+        ax.grid(True)
+
+        canvas = self._FigureCanvas(
+            fig,
+            master=self.pv_time_container
+        )
+
+        canvas.draw()
+
+        canvas.get_tk_widget().grid(
+            row=0,
+            column=0,
+            sticky=tk.NSEW
+        )
+
+        self._pv_time_canvas = canvas
+        self._pv_time_figure = fig
+
+    def _plot_pv_time(self):
+
+        df = self._load_repository_cache()
+
+        y_variable = self._pv_time_y_var.get()
+
+        if y_variable not in df.columns:
+            messagebox.showwarning(
+                "Missing column",
+                y_variable
+            )
+            return
+
+        from_date = pd.to_datetime(
+            self._pv_time_from_var.get()
+        )
+
+        to_date = pd.to_datetime(
+            self._pv_time_to_var.get()
+        )
+
+        filtered = df[
+            (df["timestamp"] >= from_date)
+            &
+            (df["timestamp"] <= to_date)
+        ].copy()
+
+        if filtered.empty:
+            return
+
+        for cond in self._pv_time_condition_rows:
+
+            if not cond["enabled"].get():
+                continue
+
+            variable = cond["variable"].get()
+
+            target = float(
+                cond["target"].get()
+            )
+
+            tolerance = float(
+                cond["tolerance"].get()
+            )
+
+            lower = target * (
+                1 - tolerance / 100
+            )
+
+            upper = target * (
+                1 + tolerance / 100
+            )
+
+            filtered = filtered[
+                filtered[variable].between(
+                    lower,
+                    upper
+                )
+            ]
+
+        self._draw_daily_distribution(
+            filtered,
+            y_variable
+        )
+
+
+    def _load_ramping_repository(self):
+
+        self._ramping_repository = load_ramping_repository()
+
+        self._ramping_repository.sort(
+            key=lambda r: r.get("timestamp", ""),
+            reverse=True
+        )
+
+    def _load_repository_cache(self):
+
+        if self._pv_time_df is not None:
+            return self._pv_time_df
+
+        tables = []
+
+        for file in sorted(
+            DATA_REPOSITORY_DIR.glob("*/*.parquet")
+        ):
+
+            try:
+
+                df = pd.read_parquet(file)
+                df = self._pv_time_add_features(df)
+
+                df["timestamp"] = pd.to_datetime(
+                    df["timestamp"],
+                    unit="ns",
+                    errors="coerce"
+                )
+
+                tables.append(df)
+
+            except Exception as e:
+
+                print(file, e)
+
+        self._pv_time_df = pd.concat(
+            tables,
+            ignore_index=True
+        )
+
+        return self._pv_time_df        
+
+    def _pv_time_add_features(self, df):
+
+        df = df.copy()
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            unit="ns",
+            errors="coerce"
+        )
+
+        numeric_cols = [
+            "waveplate",
+            "ptm1",
+            "pcm2",
+            "pcm4",
+            "pap1",
+            "sbw4",
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(
+                    df[col],
+                    errors="coerce"
+                )
+
+        df["green"] = df["pcm2"] + df["pcm4"]
+
+        valid_sbw4_green = df[
+            ["sbw4", "pcm2", "pcm4"]
+        ].notna().all(axis=1)
+
+        valid_green_ptm1 = df[
+            ["pcm2", "pcm4", "ptm1"]
+        ].notna().all(axis=1)
+
+        valid_ptm1_pap1 = df[
+            ["ptm1", "pap1"]
+        ].notna().all(axis=1)
+
+        valid_pcm2_green = df[
+            ["pcm2", "pcm4"]
+        ].notna().all(axis=1)
+
+        valid_sbw4_ptm1 = df[
+            ["sbw4", "ptm1"]
+        ].notna().all(axis=1)
+
+        df["sbw4_green"] = np.where(
+            valid_sbw4_green,
+            safe_divide(df["sbw4"], df["green"]),
+            np.nan
+        )
+
+        df["green_ptm1"] = np.where(
+            valid_green_ptm1,
+            safe_divide(df["green"], df["ptm1"]),
+            np.nan
+        )
+
+        df["ptm1_pap1"] = np.where(
+            valid_ptm1_pap1,
+            safe_divide(df["ptm1"], df["pap1"]),
+            np.nan
+        )
+
+        df["pcm2_green"] = np.where(
+            valid_pcm2_green,
+            safe_divide(df["pcm2"], df["green"]),
+            np.nan
+        )
+
+        df["sbw4_ptm1"] = np.where(
+            valid_sbw4_ptm1,
+            safe_divide(df["sbw4"], df["ptm1"]),
+            np.nan
+        )
+
+        return df
+
+    def _load_data_repository(self):
+
+        self._data_repository = []
+
+        if not DATA_REPOSITORY_DIR.exists():
+            return
+
+        for file in sorted(DATA_REPOSITORY_DIR.rglob("*.parquet")):
+
+            self._data_repository.append(
+                {
+                    "date": file.stem,
+                    "file": file
+                }
+            )
+
+
+
+    def _open_ramping_repository_dialog(self):
+
+        if not self._ramping_repository:
+
+            messagebox.showinfo(
+                "Empty repository",
+                "No rampings found in repository."
+            )
+            return
+
+        dlg = tk.Toplevel(self.root)
+
+        dlg.title("Ramping Repository")
+        dlg.geometry("900x600")
+
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        # --------------------------------------------------
+        # Search
+        # --------------------------------------------------
+
+        search_var = tk.StringVar()
+
+        top = tk.Frame(dlg)
+        top.pack(fill=tk.X, padx=10, pady=10)
+
+        tk.Label(
+            top,
+            text="Search:",
+            font=FONT_NORMAL
+        ).pack(side=tk.LEFT)
+
+        search_entry = tk.Entry(
+            top,
+            textvariable=search_var,
+            font=FONT_MONO
+        )
+
+        search_entry.pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+            padx=(6, 0)
+        )
+
+        # --------------------------------------------------
+        # Treeview
+        # --------------------------------------------------
+
+        frame = tk.Frame(dlg)
+        frame.pack(
+            fill=tk.BOTH,
+            expand=True,
+            padx=10,
+            pady=(0, 10)
+        )
+
+        columns = (
+            "timestamp",
+            "rows",
+            "file"
+        )
+
+        tv = ttk.Treeview(
+            frame,
+            columns=columns,
+            show="headings"
+        )
+
+        tv.heading("timestamp", text="Timestamp")
+        tv.heading("rows", text="Rows")
+        tv.heading("file", text="File")
+
+        tv.column("timestamp", width=180)
+        tv.column("rows", width=70, anchor=tk.CENTER)
+        tv.column("file", width=500)
+
+        sb = ttk.Scrollbar(
+            frame,
+            orient=tk.VERTICAL,
+            command=tv.yview
+        )
+
+        tv.configure(
+            yscrollcommand=sb.set
+        )
+
+        tv.pack(
+            side=tk.LEFT,
+            fill=tk.BOTH,
+            expand=True
+        )
+
+        sb.pack(
+            side=tk.RIGHT,
+            fill=tk.Y
+        )
+
+        # --------------------------------------------------
+        # Fill tree
+        # --------------------------------------------------
+
+        def refresh():
+
+            for item in tv.get_children():
+                tv.delete(item)
+
+            pattern = search_var.get().strip().lower()
+
+            for rec in self._ramping_repository:
+
+                text = (
+                    rec.get("timestamp", "")
+                    + " "
+                    + rec.get("file", "")
+                ).lower()
+
+                if pattern and pattern not in text:
+                    continue
+
+                tv.insert(
+                    "",
+                    tk.END,
+                    iid=rec["file"],
+                    values=(
+                        rec.get("timestamp", ""),
+                        rec.get("rows", ""),
+                        rec.get("file", "")
+                    )
+                )
+
+        refresh()
+
+        search_var.trace_add(
+            "write",
+            lambda *_: refresh()
+        )
+
+        # --------------------------------------------------
+        # Load selected
+        # --------------------------------------------------
+
+        def load_selected():
+
+            sel = tv.selection()
+
+            if not sel:
+                return
+
+            file_name = sel[0]
+
+            record = next(
+                (
+                    r
+                    for r in self._ramping_repository
+                    if r["file"] == file_name
+                ),
+                None
+            )
+
+            if record is None:
+                return
+
+            dlg.destroy()
+
+            self._load_ramping_repository_overlay(
+                record
+            )
+
+        tv.bind(
+            "<Double-Button-1>",
+            lambda e: load_selected()
+        )
+
+        # --------------------------------------------------
+        # Buttons
+        # --------------------------------------------------
+
+        bottom = tk.Frame(dlg)
+        bottom.pack(
+            fill=tk.X,
+            padx=10,
+            pady=(0, 10)
+        )
+
+        tk.Button(
+            bottom,
+            text="Cancel",
+            command=dlg.destroy
+        ).pack(side=tk.RIGHT)
+
+        tk.Button(
+            bottom,
+            text="Load",
+            bg=COLOR_GREEN,
+            fg="white",
+            command=load_selected
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+
+    def _open_data_repository_dialog(self):
+
+        if not self._data_repository:
+
+            messagebox.showinfo(
+                "Empty repository",
+                "No data found in DataRepository."
+            )
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Data Repository")
+        dlg.geometry("850x600")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        search_var = tk.StringVar()
+
+        top = tk.Frame(dlg)
+        top.pack(fill=tk.X, padx=10, pady=10)
+
+        tk.Label(
+            top,
+            text="Search:",
+            font=FONT_NORMAL
+        ).pack(side=tk.LEFT)
+
+        search_entry = tk.Entry(
+            top,
+            textvariable=search_var,
+            font=FONT_MONO
+        )
+        search_entry.pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+            padx=(6, 6)
+        )
+
+        def clear_search():
+            search_var.set("")
+
+        tk.Button(
+            top,
+            text="Clear",
+            command=clear_search
+        ).pack(side=tk.LEFT)
+
+        frame = tk.Frame(dlg)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        columns = (
+            "show",
+            "date",
+            "rows",
+            "file"
+        )
+
+        tv = ttk.Treeview(
+            frame,
+            columns=columns,
+            show="headings",
+            selectmode="extended"
+        )
+
+        tv.heading("show", text="Show")
+        tv.heading("date", text="Date")
+        tv.heading("rows", text="Rows")
+        tv.heading("file", text="File")
+
+        tv.column("show", width=70, anchor=tk.CENTER)
+        tv.column("date", width=120)
+        tv.column("rows", width=80, anchor=tk.CENTER)
+        tv.column("file", width=520)
+
+        sb = ttk.Scrollbar(
+            frame,
+            orient=tk.VERTICAL,
+            command=tv.yview
+        )
+
+        tv.configure(yscrollcommand=sb.set)
+
+        tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def overlay_is_shown(record):
+            name = record["date"]
+            return any(
+                ov.get("name") == name
+                for ov in self._repository_overlays
+            )
+
+        def refresh():
+
+            for item in tv.get_children():
+                tv.delete(item)
+
+            pattern = search_var.get().strip().lower()
+
+            for rec in self._data_repository:
+
+                text = (
+                    rec.get("date", "")
+                    + " "
+                    + str(rec.get("file", ""))
+                ).lower()
+
+                if pattern and pattern not in text:
+                    continue
+
+                shown = overlay_is_shown(rec)
+
+                tv.insert(
+                    "",
+                    tk.END,
+                    iid=rec["date"],
+                    values=(
+                        "☑" if shown else "☐",
+                        rec.get("date", ""),
+                        rec.get("rows", ""),
+                        rec.get("file", "")
+                    )
+                )
+
+        def get_record_by_date(date_text):
+            return next(
+                (
+                    r for r in self._data_repository
+                    if r.get("date") == date_text
+                ),
+                None
+            )
+
+        def toggle_selected():
+
+            sel = tv.selection()
+
+            if not sel:
+                return
+
+            for date_text in sel:
+
+                record = get_record_by_date(date_text)
+
+                if record is None:
+                    continue
+
+                name = record["date"]
+
+                existing = next(
+                    (
+                        ov for ov in self._repository_overlays
+                        if ov.get("name") == name
+                    ),
+                    None
+                )
+
+                if existing:
+                    self._repository_overlays.remove(existing)
+                else:
+                    self._load_data_repository_overlay(record)
+
+            self._draw_repository_overlays()
+            refresh()
+
+        def on_click(event):
+
+            region = tv.identify_region(event.x, event.y)
+
+            if region != "cell":
+                return
+
+            col = tv.identify_column(event.x)
+
+            if col != "#1":
+                return
+
+            row = tv.identify_row(event.y)
+
+            if not row:
+                return
+
+            tv.selection_set(row)
+            toggle_selected()
+
+        tv.bind("<Button-1>", on_click)
+        tv.bind("<Double-Button-1>", lambda e: toggle_selected())
+
+        search_var.trace_add(
+            "write",
+            lambda *_: refresh()
+        )
+
+        bottom = tk.Frame(dlg)
+        bottom.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        tk.Button(
+            bottom,
+            text="Close",
+            command=dlg.destroy
+        ).pack(side=tk.RIGHT)
+
+        tk.Button(
+            bottom,
+            text="Toggle selected",
+            bg=COLOR_GREEN,
+            fg="white",
+            command=toggle_selected
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+
+        refresh()
+
+    def _load_data_repository_overlay(self, record):
+
+        name = record["date"]
+
+        for overlay in self._repository_overlays:
+            if overlay.get("name") == name:
+                return
+
+        if self._xy_figure is None:
+            return
+
+        file = record["file"]
+
+        try:
+            df = pd.read_parquet(file)
+
+            rows = []
+
+            for _, r in df.iterrows():
+
+                row_dict = {}
+
+                for alias, pv_name in RAMPING_PV_MAP.items():
+
+                    if alias not in r:
+                        continue
+
+                    value = r[alias]
+
+                    if pd.isna(value):
+                        continue
+
+                    row_dict[pv_name] = (
+                        value,
+                        ""
+                    )
+
+                ts_ns = int(r["timestamp"])
+
+                rows.append(
+                    (
+                        ts_ns,
+                        row_dict
+                    )
+                )
+            rows = self._apply_custom_pvs_to_rows(rows)
+
+        except Exception as e:
+
+            messagebox.showerror(
+                "Read failed",
+                str(e)
+            )
+            return
+
+        rows = self._apply_conditions_to_rows(rows)
+
+        overlay = {
+            "name": record["date"],
+            "rows": rows,
+            "file": str(file),
+        }
+
+        self._repository_overlays.append(
+            overlay
+        )
+
+        self._repository_overlays.sort(
+            key=lambda x: x["name"]
+        )
+
+        self._repository_overlays = (
+            self._repository_overlays[-75:]
+        )
+
+        self._draw_repository_overlays()
+
+    def _open_repbrowser_at_row(self, file_path, timestamp_ns):
+
+        repbrowser = APP_DIR.parent / "RepositoryBrowser" / "repbrowser.py"
+
+        if not repbrowser.exists():
+            messagebox.showerror(
+                "Repository Browser not found",
+                str(repbrowser)
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(repbrowser),
+                    "--file",
+                    str(file_path),
+                    "--timestamp",
+                    str(timestamp_ns),
+                ],
+                cwd=str(repbrowser.parent)
+            )
+
+        except Exception as e:
+            messagebox.showerror(
+                "Cannot open Repository Browser",
+                str(e)
+            )    
+
+    def _load_ramping_repository_overlay(self, record):
+
+        parquet_file = (
+            RAMPING_REPOSITORY_DIR /
+            record["file"]
+        )
+
+        if not parquet_file.exists():
+
+            messagebox.showerror(
+                "Missing file",
+                str(parquet_file)
+            )
+            return
+
+        try:
+
+            df = pd.read_parquet(
+                parquet_file
+            )
+
+        except Exception as e:
+
+            messagebox.showerror(
+                "Read failed",
+                str(e)
+            )
+            return
+
+        x_label = self._xy_x_var.get()
+        y_label = self._xy_y_var.get()
+
+        x_pv = self._xy_choice_map.get(x_label)
+        y_pv = self._xy_choice_map.get(y_label)
+
+        if not x_pv or not y_pv:
+            return
+        
+        repo_x = PV_TO_RAMPING.get(x_pv)
+        repo_y = PV_TO_RAMPING.get(y_pv)
+
+        if not repo_x or not repo_y:
+
+            messagebox.showwarning(
+                "Not mapped",
+                f"{x_pv}\n{y_pv}"
+            )
+            return
+        if repo_x not in df.columns:
+            return  
+
+        if repo_y not in df.columns:
+            return
+        valid = df[[repo_x, repo_y]].dropna()
+
+        xs = valid[repo_x].tolist()
+        ys = valid[repo_y].tolist()
+
+        if not xs:
+            return
+        
+        if self._xy_figure is None:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        overlay = {
+            "name": record["timestamp"],
+            "xs": xs,
+            "ys": ys,
+        }
+
+        for existing in self._repository_overlays:
+            if existing["name"] == record["timestamp"]:
+                return
+
+        self._repository_overlays.append(
+            overlay
+        )
+        self._draw_repository_overlays()
+
+        ax.legend(loc="best")
+
+        self._xy_canvas.draw_idle()
+
+    def _draw_repository_overlays(self):
+
+        for artist in self._repository_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+
+        self._repository_artists.clear()
+
+        if self._xy_figure is None:
+            return
+
+        x_label = self._xy_x_var.get()
+        y_label = self._xy_y_var.get()
+
+        x_pv = self._xy_choice_map.get(x_label)
+        y_pv = self._xy_choice_map.get(y_label)
+
+        if not x_pv or not y_pv:
+            return
+
+        ax = self._xy_figure.axes[0]
+
+        self._repository_overlays.sort(
+            key=lambda x: x["name"]
+        )
+
+        n = len(self._repository_overlays)
+
+        turbo = colormaps["turbo"]
+
+        handles = []
+        labels = []
+
+        for i, overlay in enumerate(self._repository_overlays):
+
+            xs = []
+            ys = []
+            row_indices = []
+
+            rows = self._apply_conditions_to_rows(
+                overlay.get("rows", [])
+            )
+
+            for row_idx, (_ts_ns, row_dict) in enumerate(rows):
+
+                if x_pv not in row_dict:
+                    continue
+
+                if y_pv not in row_dict:
+                    continue
+
+                xv, _ = row_dict[x_pv]
+                yv, _ = row_dict[y_pv]
+
+                if not isinstance(xv, (int, float)):
+                    continue
+
+                if not isinstance(yv, (int, float)):
+                    continue
+
+                xs.append(xv)
+                ys.append(yv)
+                row_indices.append(row_idx)
+
+            if not xs:
+                continue
+
+            if n <= 1:
+                color = turbo(0.5)
+            else:
+                color = turbo(i / (n - 1))
+
+            artist = ax.scatter(
+                xs,
+                ys,
+                s=45,
+                marker="o",
+                facecolors=color,
+                edgecolors=color,
+                linewidths=1,
+                zorder=1,
+                label=overlay["name"],
+                picker=True
+            )
+
+            artist._repository_overlay = overlay
+            artist._repository_rows = rows
+            artist._repository_row_indices = row_indices
+
+            self._repository_artists.append(artist)
+            handles.append(artist)
+            labels.append(overlay["name"])
+
+        if handles:
+            ax.legend(handles, labels, loc="best")
+        else:
+            leg = ax.get_legend()
+            if leg:
+                leg.remove()
+
+        self._xy_canvas.draw_idle()
 
     def _on_graph_mouse_move(self, event):
         if not self._mpl_canvas or not self._crosshair_vlines:
@@ -2822,7 +4210,7 @@ class CPVAExplorerApp:
         colors = ["#1976D2", "#e53935", "#4CAF50", "#FF9800", "#9C27B0",
                   "#00BCD4", "#FF5722", "#607D8B", "#795548", "#009688"]
         s = self._pv_settings.setdefault(pv, {})
-        s.setdefault("show",         True)
+        s.setdefault("show", True)
         s.setdefault("display_name", shorten_pv_name(pv))
         s.setdefault("color",        colors[idx % len(colors)])
         s.setdefault("cursor_val",   "")
@@ -2841,6 +4229,7 @@ class CPVAExplorerApp:
         """Repopulate the axis settings treeview from _pv_settings."""
         if not hasattr(self, "_axis_tv"):
             return
+
         tv = self._axis_tv
 
         # Destroy old swatch canvases
@@ -2849,40 +4238,71 @@ class CPVAExplorerApp:
                 c.destroy()
             except Exception:
                 pass
+
         self._axis_tv_swatches = []
-        # Store pv→color for swatch reposition
-        self._axis_tv_swatch_colors: dict[str, str] = {}
+        self._axis_tv_swatch_colors = {}
 
         for item in tv.get_children():
             tv.delete(item)
 
-        numeric_pvs = [pv for pv in self._pv_order
-                       if any(isinstance(v, (int, float))
-                              for _, v, _ in self._samples_by_pv.get(pv, []))]
+        # --------------------------------------------------
+        # zobraz VŠECHNY PV, nejen aktuálně vykreslené
+        # --------------------------------------------------
+
+        all_pvs = list(
+            dict.fromkeys(
+                list(self._pv_order) +
+                list(self._pv_settings.keys())
+            )
+        )
+
+        # jen PV která mají někdy numerická data
+        numeric_pvs = []
+
+        for pv in all_pvs:
+
+            has_numeric = any(
+                isinstance(v, (int, float))
+                for _, v, _ in self._samples_by_pv.get(pv, [])
+            )
+
+            if has_numeric or pv in self._pv_settings:
+                numeric_pvs.append(pv)
+
+        # --------------------------------------------------
 
         for idx, pv in enumerate(numeric_pvs):
+
             s = self._get_pv_default_settings(pv, idx)
+
             hex_color = s["color"]
+
             self._axis_tv_swatch_colors[pv] = hex_color
 
             row = (
-                "☑" if s["show"]       else "☐",
+                "☑" if s["show"] else "☐",
                 pv,
                 s["display_name"],
-                "",                                # color column — covered by Canvas swatch
+                "",
                 s.get("cursor_val", ""),
                 s.get("side", "left"),
-                "" if s["ymin"]       is None else str(s["ymin"]),
-                "" if s["ymax"]       is None else str(s["ymax"]),
+                "" if s["ymin"] is None else str(s["ymin"]),
+                "" if s["ymax"] is None else str(s["ymax"]),
                 "☑" if s["auto_scale"] else "☐",
-                "" if s["width"]      is None else str(s["width"]),
-                "" if s["smooth"]     is None else str(s["smooth"]),
-                "☑" if s["grid"]    else "☐",
+                "" if s["width"] is None else str(s["width"]),
+                "" if s["smooth"] is None else str(s["smooth"]),
+                "☑" if s["grid"] else "☐",
             )
-            tv.insert("", tk.END, iid=pv, values=row)
 
-        # Draw Canvas swatches over the "color" column cells
+            tv.insert(
+                "",
+                tk.END,
+                iid=pv,
+                values=row
+            )
+
         tv.update_idletasks()
+
         self._reposition_tv_swatches()
 
     def _reposition_tv_swatches(self):
@@ -2942,10 +4362,16 @@ class CPVAExplorerApp:
 
         if col_name == "show":
             pv = row_id
-            s  = self._pv_settings.get(pv, {})
+
+            s = self._pv_settings.get(pv, {})
+
             s["show"] = not s.get("show", True)
+
             self._pv_settings[pv] = s
-            self._apply_pv_settings_to_graph()
+
+            # kompletní přepočet os
+            self._plot_graph()
+
             self._refresh_axis_settings_tv()
 
         elif col_name == "auto_scale":
@@ -3094,42 +4520,111 @@ class CPVAExplorerApp:
         """Push current _pv_settings to the live graph lines without full redraw."""
         if self._mpl_canvas is None:
             return
-        for i, (pv, ax, pv_lines) in enumerate(zip(
-                self._graph_pvs, self._graph_axes, self._graph_lines)):
+
+        for i, (pv, ax, pv_lines) in enumerate(
+            zip(self._graph_pvs, self._graph_axes, self._graph_lines)
+        ):
             s = self._pv_settings.get(pv, {})
+
             color   = s.get("color")
             visible = s.get("show", True)
             width   = s.get("width")
             grid    = s.get("grid", True)
+
+            # --------------------------------------------------
+            # Lines
+            # --------------------------------------------------
+
             for line in pv_lines:
                 if color:
                     line.set_color(color)
+
                 if width is not None:
                     line.set_linewidth(width)
-                line.set_visible(visible)
-            ax.grid(grid)
 
+                line.set_visible(visible)
+
+            # --------------------------------------------------
+            # Axis visibility
+            # --------------------------------------------------
+
+            ax.yaxis.label.set_visible(visible)
+
+            for tick in ax.get_yticklabels():
+                tick.set_visible(visible)
+
+            side = s.get("side", "left")
+
+            if side == "left":
+                ax.tick_params(
+                    axis="y",
+                    left=visible,
+                    labelleft=visible
+                )
+
+                ax.spines["left"].set_visible(visible)
+
+            else:
+                ax.tick_params(
+                    axis="y",
+                    right=visible,
+                    labelright=visible
+                )
+
+                ax.spines["right"].set_visible(visible)
+
+            # grid jen pokud je PV viditelný
+            ax.grid(grid and visible)
+
+            # --------------------------------------------------
             # Y limits
+            # --------------------------------------------------
+
             auto_scale = s.get("auto_scale", True)
+
             ymin = s.get("ymin")
             ymax = s.get("ymax")
+
             if not auto_scale and (ymin is not None or ymax is not None):
                 ax.set_ylim(ymin, ymax)
+
             elif auto_scale:
                 ax.set_ylim(auto=True)
                 ax.relim()
                 ax.autoscale_view(scaley=True)
 
-            # Ylabel and colour
+            # --------------------------------------------------
+            # Y label
+            # --------------------------------------------------
+
             disp = s.get("display_name", shorten_pv_name(pv))
-            line_color = s.get("color", ax.get_ylabel())
+
+            line_color = s.get(
+                "color",
+                ax.yaxis.label.get_color()
+            )
+
             try:
-                _fs = max(5, int(self._font_size_var.get() or "7"))
+                _fs = max(
+                    5,
+                    int(self._font_size_var.get() or "7")
+                )
             except (ValueError, AttributeError):
                 _fs = 7
-            ax.set_ylabel(disp, color=line_color if color else ax.yaxis.label.get_color(),
-                          fontsize=_fs, rotation=90, labelpad=2)
-            ax.tick_params(axis="y", labelsize=_fs, labelrotation=90)
+
+            ax.set_ylabel(
+                disp,
+                color=line_color,
+                fontsize=_fs,
+                rotation=90,
+                labelpad=2
+            )
+
+            ax.tick_params(
+                axis="y",
+                labelsize=_fs,
+                labelrotation=90
+            )
 
         self._mpl_canvas.draw_idle()
 
@@ -4144,7 +5639,7 @@ class CPVAExplorerApp:
                 raw = cpva_fetch_samples_chunked(
                     pv_name, start_ns, end_ns, timeout=timeout,
                     log_fn=None,
-                    max_workers=8)
+                    max_workers=4)
                 parsed = []
                 for s in raw:
                     t_ns = s.get("time")
@@ -4169,7 +5664,7 @@ class CPVAExplorerApp:
             errors: list[str] = []
 
             # menší počet PV vláken, protože každý PV uvnitř může tahat chunky
-            max_workers = min(len(pv_list), 6)
+            max_workers = min(len(pv_list), 4)
 
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(fetch_one, pv): pv for pv in pv_list}
@@ -4212,6 +5707,17 @@ class CPVAExplorerApp:
             ]
 
         self._samples_by_pv = graph_samples_by_pv
+
+        self._numeric_pvs = set()
+
+        for pv, samples in self._samples_by_pv.items():
+
+            if any(
+                isinstance(v, (int, float))
+                for _, v, _ in samples
+            ):
+                self._numeric_pvs.add(pv)
+
         self._pv_order      = pv_order
 
         self._table_rows = self._merge_samples_sample_hold(
@@ -4288,6 +5794,22 @@ class CPVAExplorerApp:
 
         if live_callback is not None:
             live_callback()
+
+        if hasattr(self, "_pv_time_y_combo"):
+
+            choices = []
+
+            for pv in self._pv_order:
+
+                if pv in self._numeric_pvs:
+                    choices.append(pv)
+
+            self._pv_time_y_combo["values"] = self._pv_time_columns
+
+            if choices:
+                self._pv_time_y_var.set(
+                    choices[0]
+                )
 
     # -------------------------------------------------------------------------
     # Live mode
@@ -4596,20 +6118,26 @@ class CPVAExplorerApp:
         col_widths = {c: 0 for c in columns}
 
         all_rows: list[tuple[list[str], bool]] = []
-        for ts_ns, row_dict in self._table_rows:
+        WIDTH_SAMPLE_ROWS = 500
+
+        for row_idx, (ts_ns, row_dict) in enumerate(self._table_rows):
             vals = [ns_to_local_str(ts_ns)]
+
             for pv in pv_order:
                 if pv in row_dict:
                     v, u = row_dict[pv]
                     vals += [self._format_value(v), u]
                 else:
                     vals += ["", ""]
+
             row_ok = self._row_matches_conditions(row_dict)
             all_rows.append((vals, row_ok))
-            for c, cell in zip(columns, vals):
-                w = self._text_px(cell)
-                if w > col_widths[c]:
-                    col_widths[c] = w
+
+            if row_idx < WIDTH_SAMPLE_ROWS:
+                for c, cell in zip(columns, vals):
+                    w = self._text_px(cell)
+                    if w > col_widths[c]:
+                        col_widths[c] = w
 
         for col in columns:
             self.tree.heading(col, text=display[col])
@@ -4953,11 +6481,6 @@ class CPVAExplorerApp:
             self._on_xy_scroll
         )
 
-        canvas.mpl_connect(
-            "button_press_event",
-            self._on_xy_mouse_press
-        )
-
         self.lbl_xy_info.config(
             text=f"XY Plot: {len(x_vals)} numeric pair(s).",
             fg=COLOR_GREEN
@@ -5085,282 +6608,6 @@ class CPVAExplorerApp:
         )
 
 
-    def _open_ramping_archive_dialog(self):
-
-        if not self._ramping_archive:
-            messagebox.showinfo(
-                "Empty archive",
-                "No saved rampings."
-            )
-            return
-
-        dlg = tk.Toplevel(self.root)
-
-        dlg.title("Ramping Archive")
-
-        dlg.geometry("500x400")
-
-        lb = tk.Listbox(
-            dlg,
-            font=FONT_MONO
-        )
-
-        lb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        for r in self._ramping_archive:
-
-            start = ns_to_local_str(r["start_ns"])
-            end = ns_to_local_str(r["end_ns"])
-
-            lb.insert(
-                tk.END,
-                f"{r['name']}   [{start} -> {end}]"
-            )
-
-        def _load_selected():
-
-            sel = lb.curselection()
-
-            if not sel:
-                return
-
-            archive = self._ramping_archive[sel[0]]
-
-            dlg.destroy()
-
-            self._load_ramping_archive_overlay(archive)
-
-        def _delete_selected():
-
-            sel = lb.curselection()
-
-            if not sel:
-                return
-
-            idx = sel[0]
-
-            archive = self._ramping_archive[idx]
-
-            if not messagebox.askyesno(
-                "Delete ramping",
-                f"Delete '{archive['name']}' ?",
-                parent=dlg
-            ):
-                return
-
-            self._ramping_archive.pop(idx)
-
-            save_ramping_archive(self._ramping_archive)
-
-            lb.delete(idx)
-
-            self.lbl_status.config(
-                text=f"Deleted ramping: {archive['name']}",
-                fg=COLOR_RED
-            )
-
-        tk.Button(
-            dlg,
-            text="Load",
-            bg=COLOR_GREEN,
-            fg="white",
-            command=_load_selected
-        ).pack(pady=(0, 10))
-
-        btn_row = tk.Frame(dlg)
-        btn_row.pack(pady=(0, 10))
-
-        tk.Button(
-            btn_row,
-            text="Delete",
-            bg=COLOR_RED,
-            fg="white",
-            command=_delete_selected
-        ).pack(side=tk.LEFT, padx=6)
-
-        tk.Button(
-            btn_row,
-            text="Load",
-            bg=COLOR_GREEN,
-            fg="white",
-            command=_load_selected
-        ).pack(side=tk.LEFT, padx=6)
-
-    def _load_ramping_archive_overlay(self, archive: dict):
-
-        x_label = self._xy_x_var.get()
-        y_label = self._xy_y_var.get()
-
-        x_pv = self._xy_choice_map.get(x_label)
-        y_pv = self._xy_choice_map.get(y_label)
-
-        if not x_pv or not y_pv:
-            return
-
-        start_ns = archive["start_ns"]
-        end_ns = archive["end_ns"]
-
-        timeout = float(self.config.get("http_timeout", CPVA_HTTP_TIMEOUT))
-
-        # ---------------------------------------------------------
-        # collect required PVs
-        # ---------------------------------------------------------
-
-        required_pvs = {
-            x_pv,
-            y_pv,
-        }
-
-        master_pv = self._master_pv_var.get().strip()
-
-        if master_pv:
-            required_pvs.add(master_pv)
-
-        for cond in self._conditions:
-
-            pv = cond.get("pv")
-
-            if pv:
-                required_pvs.add(pv)
-
-        required_pvs = sorted(required_pvs)
-
-        # ---------------------------------------------------------
-        # fetch all required PVs
-        # ---------------------------------------------------------
-
-        samples_by_pv = {}
-
-        try:
-
-            for pv in required_pvs:
-
-                raw = cpva_fetch_samples_chunked(
-                    pv,
-                    start_ns,
-                    end_ns,
-                    timeout=timeout,
-                    max_workers=6
-                )
-
-                parsed = []
-
-                for s in raw:
-
-                    ts_ns = s.get("time")
-
-                    if ts_ns is None:
-                        continue
-
-                    parsed.append((
-                        int(ts_ns),
-                        cpva_decode_value(s),
-                        (s.get("metaData") or {}).get("units", "") or ""
-                    ))
-
-                samples_by_pv[pv] = parsed
-
-        except Exception as e:
-
-            messagebox.showerror(
-                "Archive load failed",
-                str(e)
-            )
-
-            return
-
-        # ---------------------------------------------------------
-        # merge exactly like live data
-        # ---------------------------------------------------------
-
-        rows = self._merge_samples_sample_hold(
-            samples_by_pv,
-            required_pvs
-        )
-
-        rows = self._remove_master_only_rows(rows)
-
-        rows = self._filter_master_multiple_rows(rows)
-
-        rows = self._apply_conditions_to_rows(rows)
-
-        # ---------------------------------------------------------
-        # build XY arrays
-        # ---------------------------------------------------------
-
-        xs = []
-        ys = []
-
-        for _ts_ns, row_dict in rows:
-
-            if x_pv not in row_dict:
-                continue
-
-            if y_pv not in row_dict:
-                continue
-
-            xv, _ = row_dict[x_pv]
-            yv, _ = row_dict[y_pv]
-
-            if not isinstance(xv, (int, float)):
-                continue
-
-            if not isinstance(yv, (int, float)):
-                continue
-
-            xs.append(xv)
-            ys.append(yv)
-
-        if not xs:
-            return
-
-        # ---------------------------------------------------------
-        # plot overlay
-        # ---------------------------------------------------------
-
-        ax = self._xy_figure.axes[0]
-
-        archive_colors = [
-            "#e53935",
-            "#8E24AA",
-            "#43A047",
-            "#FB8C00",
-            "#00897B",
-            "#6D4C41",
-        ]
-
-        archive_index = 0
-
-        for i, a in enumerate(self._ramping_archive):
-
-            if a["name"] == archive["name"]:
-                archive_index = i
-                break
-
-        color = archive_colors[archive_index % len(archive_colors)]
-
-        ax.scatter(
-            xs,
-            ys,
-            s=55,
-            marker="s",
-            color=color,
-            alpha=0.35,
-            edgecolors="white",
-            linewidths=1.2,
-            zorder=5,
-            label=archive["name"]
-        )
-
-        ax.legend(loc="best")
-
-        self._xy_canvas.draw_idle()
-
-        self.lbl_status.config(
-            text=f"Loaded archive overlay: {archive['name']}",
-            fg=COLOR_GREEN
-        )
-
     def _clear_xy_plot(self):
         if self._xy_canvas:
             self._xy_canvas.get_tk_widget().destroy()
@@ -5385,6 +6632,12 @@ class CPVAExplorerApp:
             )
 
     def _on_xy_pick(self, event):
+
+        if self._repository_edit_mode.get():
+
+            self._on_repository_point_pick(event)
+
+            return
 
         if event.artist != self._xy_scatter:
             return
@@ -5412,6 +6665,157 @@ class CPVAExplorerApp:
         self.tree.focus(item_id)
         self.tree.see(item_id)
 
+    def _on_repository_point_pick(self, event):
+
+        if not event.ind:
+            return
+
+        artist = event.artist
+
+        if not hasattr(artist, "_repository_overlay"):
+            return
+
+        point_index = event.ind[0]
+
+        overlay = artist._repository_overlay
+        rows = artist._repository_rows
+        row_indices = artist._repository_row_indices
+
+        if point_index >= len(row_indices):
+            return
+
+        row_idx = row_indices[point_index]
+
+        if row_idx >= len(rows):
+            return
+
+        ts_ns, _row_dict = rows[row_idx]
+
+        file_path = overlay.get("file")
+
+        if not file_path:
+            messagebox.showerror(
+                "Missing file",
+                "Repository overlay does not contain source file path."
+            )
+            return
+
+        self._open_repbrowser_at_row(
+            file_path,
+            ts_ns
+        )
+
+    def _open_repository_row_editor(self, center_index):
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Repository Row Editor")
+        dlg.geometry("1200x450")
+        dlg.transient(self.root)
+
+        frame = tk.Frame(dlg)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        tv = ttk.Treeview(frame, show="headings")
+        tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tv.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        tv.configure(yscrollcommand=sb.set)
+
+        start = max(0, center_index - 5)
+        end = min(len(self._table_rows), center_index + 6)
+
+        columns = ["timestamp"] + self._pv_order
+        tv["columns"] = columns
+
+        for c in columns:
+            tv.heading(c, text=shorten_pv_name(c) if c != "timestamp" else "timestamp")
+            tv.column(c, width=140, anchor=tk.W)
+
+        for idx in range(start, end):
+
+            ts_ns, row_dict = self._table_rows[idx]
+
+            values = [ns_to_local_str(ts_ns)]
+
+            for pv in self._pv_order:
+                if pv in row_dict:
+                    values.append(row_dict[pv][0])
+                else:
+                    values.append("")
+
+            tag = "selected" if idx == center_index else ""
+
+            tv.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=values,
+                tags=(tag,)
+            )
+
+        tv.tag_configure(
+            "selected",
+            background="#ffcccc"
+        )
+
+        tv.selection_set(str(center_index))
+        tv.focus(str(center_index))
+        tv.see(str(center_index))
+
+        def delete_selected():
+
+            sel = tv.selection()
+
+            if not sel:
+                return
+
+            idx = int(sel[0])
+
+            if not messagebox.askyesno(
+                "Delete row",
+                "Delete selected row?",
+                parent=dlg
+            ):
+                return
+
+            self._table_rows.pop(idx)
+
+            if idx < len(self._table_rows_unfiltered):
+                self._table_rows_unfiltered.pop(idx)
+
+            dlg.destroy()
+
+            self._populate_table(self._pv_order)
+
+            if self.notebook.select() == str(self.tab_graph):
+                self._plot_graph()
+
+            if self.notebook.select() == str(self.tab_xy):
+                self._plot_xy()
+
+            self.lbl_status.config(
+                text=f"Row deleted. Remaining rows: {len(self._table_rows)}",
+                fg=COLOR_RED
+            )
+
+        bottom = tk.Frame(dlg)
+        bottom.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        tk.Button(
+            bottom,
+            text="Close",
+            command=dlg.destroy
+        ).pack(side=tk.RIGHT)
+
+        tk.Button(
+            bottom,
+            text="Delete selected row",
+            bg=COLOR_RED,
+            fg="white",
+            command=delete_selected
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+   
 
     def _open_custom_pv_dialog(self):
 
@@ -5611,16 +7015,19 @@ class CPVAExplorerApp:
                 if re.search(rf"\b{alias}\b", expr):
                     used_aliases[alias] = pv
 
-            compiled = compile(expr, "<custom_pv>", "eval")
-
             self._custom_pvs.append({
                 "name": name,
                 "expr": expr,
+                "_compiled": compile(expr, "<custom_pv>", "eval"),
                 "aliases": used_aliases,
                 "required_pvs": list(used_aliases.values()),
+                "show_default": False,
             })
 
             save_custom_pvs(self._custom_pvs)
+            self._pv_settings[name] = {
+                "show": False
+            }
 
             self._custom_pv_counter += 1
 
@@ -5654,6 +7061,14 @@ class CPVAExplorerApp:
             fg="white",
             command=_add
         ).pack(side=tk.RIGHT, padx=(0, 6))    
+
+    def _compile_custom_pvs(self):
+        for cpv in self._custom_pvs:
+            try:
+                cpv["_compiled"] = compile(cpv["expr"], "<custom_pv>", "eval")
+            except Exception:
+                cpv["_compiled"] = None
+
 
     def _rebuild_custom_pvs(self):
 
@@ -5689,6 +7104,11 @@ class CPVAExplorerApp:
                 if dpv["name"] not in self._pv_order:
                     self._pv_order.append(dpv["name"])
 
+                if dpv["name"] not in self._pv_settings:
+                    self._pv_settings[dpv["name"]] = {
+                        "show": False
+                    }
+
         for ts_ns, row_dict in self._table_rows_unfiltered:
 
             for dpv in self._custom_pvs:
@@ -5720,17 +7140,12 @@ class CPVAExplorerApp:
                     continue
 
                 try:
-                    compiled = compile(
-                        dpv["expr"],
-                        "<custom_pv>",
-                        "eval"
-                    )
+                    compiled = dpv.get("_compiled")
+                    if compiled is None:
+                        compiled = compile(dpv["expr"], "<custom_pv>", "eval")
+                        dpv["_compiled"] = compiled
 
-                    result = eval(
-                        compiled,
-                        SAFE_GLOBALS,
-                        local_vars
-                    )
+                    result = eval(compiled, SAFE_GLOBALS, local_vars)
 
                     row_dict[dpv["name"]] = (
                         result,
@@ -5741,23 +7156,83 @@ class CPVAExplorerApp:
                     pass      
         # rebuild samples for custom PVs
         for dpv in self._custom_pvs:
-
             custom_name = dpv["name"]
-
             custom_samples = []
 
             for ts_ns, row_dict in self._table_rows_unfiltered:
-
                 if custom_name not in row_dict:
                     continue
 
                 value, units = row_dict[custom_name]
 
-                custom_samples.append(
-                    (ts_ns, value, units)
-                )
+                if isinstance(value, (int, float)):
+                    custom_samples.append((ts_ns, value, units))
 
-            self._samples_by_pv[custom_name] = custom_samples          
+            self._samples_by_pv[custom_name] = custom_samples
+            self._numeric_pvs.add(custom_name)
+
+    def _apply_custom_pvs_to_rows(self, rows: list) -> list:
+        """
+        Spočítá Custom PV nad libovolnými rows.
+        Použije se pro live CPVA data i pro DataRepository overlay.
+        """
+
+        if not self._custom_pvs:
+            return rows
+
+        SAFE_GLOBALS = {
+            "__builtins__": {},
+            "abs": abs,
+            "min": min,
+            "max": max,
+            "round": round,
+        }
+
+        import math
+        SAFE_GLOBALS["math"] = math
+
+        for _ts_ns, row_dict in rows:
+
+            for cpv in self._custom_pvs:
+
+                local_vars = {}
+                ok = True
+
+                for alias, pv_name in cpv.get("aliases", {}).items():
+
+                    if pv_name not in row_dict:
+                        ok = False
+                        break
+
+                    value, _units = row_dict[pv_name]
+
+                    if not isinstance(value, (int, float)):
+                        ok = False
+                        break
+
+                    local_vars[alias] = value
+
+                if not ok:
+                    continue
+
+                try:
+                    compiled = cpv.get("_compiled")
+                    if compiled is None:
+                        compiled = compile(cpv["expr"], "<custom_pv>", "eval")
+                        cpv["_compiled"] = compiled
+
+                    result = eval(compiled, SAFE_GLOBALS, local_vars)
+
+                    if isinstance(result, (int, float)):
+                        row_dict[cpv["name"]] = (
+                            result,
+                            ""
+                        )
+
+                except Exception:
+                    pass
+
+        return rows
     # -------------------------------------------------------------------------
     # CSV Export
     # -------------------------------------------------------------------------

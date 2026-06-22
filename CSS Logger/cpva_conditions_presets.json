@@ -1,0 +1,129 @@
+{
+  "presets": [
+    {
+      "name": "ptm1 filter",
+      "conditions": [
+        {
+          "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+          "min": 5.0,
+          "max": 150.0
+        }
+      ]
+    },
+    {
+      "name": "Ramping",
+      "conditions": [
+        {
+          "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+          "min": 5.0,
+          "max": 150.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+          "min": 0.2,
+          "max": 100.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+          "min": 0.021,
+          "max": 1.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+          "min": 0.15,
+          "max": 40.0
+        }
+      ]
+    },
+    {
+      "name": "Operation",
+      "conditions": [
+        {
+          "pv": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+          "min": 5.0,
+          "max": 150.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+          "min": 0.2,
+          "max": 100.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+          "min": 0.021,
+          "max": 1.0
+        },
+        {
+          "pv": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+          "min": 0.15,
+          "max": 40.0
+        },
+        {
+          "pv": "L3-VCS-LN36:OPEN",
+          "min": 1.0,
+          "max": 1.0
+        }
+      ]
+    },
+    {
+      "name": "Chillers",
+      "conditions": [
+        {
+          "pv": "L3-UTIL-CHL03-001:PumpON",
+          "min": 1.0,
+          "max": 1.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-002:PumpON",
+          "min": 1.0,
+          "max": 1.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-003:PumpON",
+          "min": 1.0,
+          "max": 1.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-004:PumpON",
+          "min": 1.0,
+          "max": 1.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-005:PumpON",
+          "min": 1.0,
+          "max": 1.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-006:PumpON",
+          "min": 1.0,
+          "max": 1.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-006:Temp",
+          "min": 19.85,
+          "max": 20.15
+        },
+        {
+          "pv": "L3-UTIL-CHL03-003:Temp",
+          "min": 5.0,
+          "max": 12.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-004:Temp",
+          "min": 5.0,
+          "max": 12.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-005:Temp",
+          "min": 14.0,
+          "max": 18.0
+        },
+        {
+          "pv": "L3-UTIL-CHL03-001:Temp",
+          "min": 14.0,
+          "max": 17.5
+        }
+      ]
+    }
+  ]
+}
