@@ -983,6 +983,7 @@ class CPVAExplorerApp:
         # Live-mode countdown progress bar state
         self._live_countdown_id: str | None = None
         self._live_countdown_elapsed_ms: int = 0
+        self._live_last_ts: int | None = None   # ns ts of last fetched sample (incremental mode)
 
         # Ramping Repository
         self._ramping_repository = load_ramping_repository()
@@ -5837,6 +5838,7 @@ class CPVAExplorerApp:
             self._live_autoscroll = True   # always start with auto-scroll on
             self.btn_live.config(text="⏹ Stop Live", bg="#cc3300",
                                  fg="white", activebackground="#aa2200")
+            self._live_last_ts = None   # reset so first tick does a full load
             self.lbl_status.config(text="Live mode on — loading…", fg=COLOR_BLUE)
             self._refresh_time_info_labels()
             self._live_tick()
@@ -5844,19 +5846,126 @@ class CPVAExplorerApp:
     def _live_tick(self):
         if not self._live_mode:
             return
-        # Shift time window: to = now, from = now - current window length
-        now = datetime.now()
-        span = self._dt_to - self._dt_from
-        self._dt_to   = now
-        self._dt_from = now - span
-        self._refresh_time_labels()
-        # Trigger load; after finish, schedule next tick
-        self._on_load_clicked(live_callback=self._schedule_live_tick)
+        if self._live_last_ts is None:
+            # First tick: full load of the current window, then switch to incremental
+            now = datetime.now()
+            span = self._dt_to - self._dt_from
+            self._dt_to   = now
+            self._dt_from = now - span
+            self._refresh_time_labels()
+            self._on_load_clicked(live_callback=self._after_live_initial_load)
+        else:
+            # Subsequent ticks: only fetch data newer than the last seen sample
+            self._live_fetch_incremental()
+
+    def _after_live_initial_load(self):
+        """Called after the first full load; finds the latest timestamp and switches to incremental."""
+        if not self._live_mode:
+            return
+        max_ts = 0
+        for samples in self._samples_by_pv.values():
+            for ts_ns, _, _ in samples:
+                if ts_ns > max_ts:
+                    max_ts = ts_ns
+        self._live_last_ts = max_ts if max_ts > 0 else now_ns()
+        self._schedule_live_tick()
+
+    def _live_fetch_incremental(self):
+        """Fetch only samples newer than _live_last_ts and append them."""
+        if not self._live_mode:
+            return
+        pv_list = self._get_pv_list()
+        if not pv_list:
+            return
+        fetch_start_ns = self._live_last_ts
+        fetch_end_ns   = now_ns()
+        timeout = float(self.config.get("http_timeout", CPVA_HTTP_TIMEOUT))
+
+        def fetch_one(pv_name: str) -> tuple[str, list, str | None]:
+            try:
+                raw = cpva_fetch_samples_chunked(
+                    pv_name, fetch_start_ns, fetch_end_ns, timeout=timeout)
+                parsed = []
+                for s in raw:
+                    t_ns = s.get("time")
+                    if t_ns is None:
+                        continue
+                    value = cpva_decode_value(s)
+                    units = (s.get("metaData") or {}).get("units", "") or ""
+                    parsed.append((int(t_ns), value, units))
+                return pv_name, parsed, None
+            except Exception as e:
+                return pv_name, [], f"{type(e).__name__}: {e}"
+
+        def worker():
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            new_by_pv: dict[str, list] = {}
+            with ThreadPoolExecutor(max_workers=min(len(pv_list), 6)) as pool:
+                futures = {pool.submit(fetch_one, pv): pv for pv in pv_list}
+                for fut in as_completed(futures):
+                    pv, samples, _err = fut.result()
+                    new_by_pv[pv] = samples
+            self.root.after(0, lambda: self._on_incremental_finished(new_by_pv))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_incremental_finished(self, new_samples_by_pv: dict):
+        """Append truly new samples, re-merge, re-render, schedule next tick."""
+        if not self._live_mode:
+            return
+
+        prev_ts      = self._live_last_ts
+        new_max_ts   = prev_ts
+        added_count  = 0
+
+        for pv, new_samples in new_samples_by_pv.items():
+            truly_new = [(ts, v, u) for ts, v, u in new_samples if ts > prev_ts]
+            if not truly_new:
+                continue
+            added_count += len(truly_new)
+            if pv not in self._samples_by_pv:
+                self._samples_by_pv[pv] = []
+            self._samples_by_pv[pv].extend(truly_new)
+            self._samples_by_pv[pv].sort(key=lambda s: s[0])
+            for ts, _, _ in truly_new:
+                if ts > new_max_ts:
+                    new_max_ts = ts
+
+        if new_max_ts > prev_ts:
+            self._live_last_ts = new_max_ts
+            self._dt_to = datetime.now()
+
+        if added_count > 0:
+            self._table_rows = self._merge_samples_sample_hold(
+                self._samples_by_pv, self._pv_order)
+            self._table_rows = self._remove_master_only_rows(self._table_rows)
+            self._table_rows = self._remove_fake_hour_boundary_rows(self._table_rows)
+            self._table_rows_unfiltered = self._table_rows
+            self._rebuild_custom_pvs()
+            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+            self._table_rows = self._apply_conditions_to_rows(rows)
+            self._populate_table(self._pv_order)
+            self._refresh_xy_choices()
+            numeric_pvs_now = [pv for pv in self._pv_order
+                               if any(isinstance(v, (int, float))
+                                      for _, v, _ in self._samples_by_pv.get(pv, []))]
+            if (self._mpl_canvas is not None
+                    and set(self._graph_pvs) == set(numeric_pvs_now)
+                    and len(self._graph_pvs) == len(numeric_pvs_now)):
+                self._update_graph_data()
+            else:
+                self._plot_graph()
+            self.lbl_status.config(
+                text=f"Live — +{added_count} sample(s), {len(self._table_rows)} rows",
+                fg=COLOR_GREEN)
+        else:
+            self.lbl_status.config(text="Live — no new data", fg=COLOR_BLUE)
+
+        self._schedule_live_tick()
 
     def _schedule_live_tick(self):
         if not self._live_mode:
             return
-        self.lbl_status.config(text="Live — refreshing…", fg=COLOR_BLUE)
         self._start_live_countdown()
 
     def _start_live_countdown(self):
