@@ -10,8 +10,8 @@
     "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-06-22 00:00:00",
-  "time_to": "2026-06-22 14:10:39",
+  "time_from": "2026-06-23 14:06:12",
+  "time_to": "2026-06-23 14:16:12",
   "http_timeout": 10.0,
   "conditions": [
     {

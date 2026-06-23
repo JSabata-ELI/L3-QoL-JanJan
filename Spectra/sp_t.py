@@ -1625,6 +1625,7 @@ class SpectraWidget(QWidget):
         self._live_buf:         deque                    = deque(maxlen=LIVE_BUF_MAX)
         self._live_start_ns:    int                      = 0
         self._live_last_ns:     int                      = 0
+        self._live_autofit_done = False
         self._live_timer        = QTimer(self)
         self._live_timer.setSingleShot(True)
         self._live_timer.timeout.connect(self._live_tick)
@@ -1791,7 +1792,10 @@ class SpectraWidget(QWidget):
         self._edit_pv_search.setToolTip("Type part of a channel name; click a result to add it to the list.")
         sl.addWidget(self._edit_pv_search)
         self._lst_pv_search = QListWidget()
-        self._lst_pv_search.setFixedHeight(72)
+        # min/max instead of a hard fixed height so the panel can reflow on a
+        # short window (the whole sidebar scrolls as one unit).
+        self._lst_pv_search.setMinimumHeight(64)
+        self._lst_pv_search.setMaximumHeight(110)
         self._lst_pv_search.setVisible(False)
         self._lst_pv_search.setToolTip("Click a channel to add it to the list below.")
         sl.addWidget(self._lst_pv_search)
@@ -1813,7 +1817,10 @@ class SpectraWidget(QWidget):
         self._tbl_pvs.verticalHeader().setDefaultSectionSize(22)
         self._tbl_pvs.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._tbl_pvs.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._tbl_pvs.setFixedHeight(104)
+        # min/max instead of a hard fixed height so the table never squeezes over
+        # the controls below it on a short window — the sidebar scrolls instead.
+        self._tbl_pvs.setMinimumHeight(96)
+        self._tbl_pvs.setMaximumHeight(150)
         self._tbl_pvs.setToolTip(
             "Click a row to plot that PV in the search graph. "
             "Double-click a label to rename it. The full channel is also shown in the "
@@ -2085,12 +2092,22 @@ class SpectraWidget(QWidget):
         canvas.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         def _on_context_menu(pos, _fig=fig, _tb=tb, _canvas=canvas):
-            # Convert Qt coords (origin top-left, y↓) → display coords (origin bottom-left, y↑)
-            x_disp = pos.x()
-            y_disp = _canvas.height() - pos.y()
-            for ax in _fig.get_axes():
-                if not ax.get_window_extent().contains(x_disp, y_disp):
-                    continue
+            # Convert Qt coords (origin top-left, y↓, logical px) → matplotlib display
+            # coords (origin bottom-left, y↑, physical px). Multiplying by the device
+            # pixel ratio is what makes this work on a display-scaled monitor — without it
+            # get_window_extent().contains() fails at 125/150 % and no menu appears.
+            ratio  = getattr(_canvas, "device_pixel_ratio", 1) or 1
+            x_disp = pos.x() * ratio
+            y_disp = _canvas.figure.bbox.height - pos.y() * ratio
+            axes = _fig.get_axes()
+            # Pick the axis under the cursor; fall back to the first axis so a right-click
+            # on the labels / margins still opens the menu instead of silently doing nothing.
+            target = next(
+                (ax for ax in axes if ax.get_window_extent().contains(x_disp, y_disp)),
+                axes[0] if axes else None,
+            )
+            if target is not None:
+                ax = target
                 menu = QMenu(_canvas)
 
                 act_lim    = menu.addAction("Axis limits…")
@@ -2184,22 +2201,22 @@ class SpectraWidget(QWidget):
         head.addWidget(self._btn_expand_all)
         v.addLayout(head)
 
-        self._regions_w   = QWidget()
+        # The region list is a plain framed container (NOT its own scroll area):
+        # a scroll-inside-scroll behaves unpredictably on a short window. The whole
+        # sidebar lives in one outer QScrollArea, so the list just grows naturally
+        # and the single outer scrollbar handles overflow.
+        self._regions_w = QFrame()
+        self._regions_w.setObjectName("regionsBox")
+        # Scope to the object name so the border does NOT cascade onto the child
+        # region-row QFrames inside it.
+        self._regions_w.setStyleSheet(
+            "QFrame#regionsBox { border: 1px solid #b0b0b0; border-radius: 4px; background: white; }"
+        )
         self._regions_lay = QVBoxLayout(self._regions_w)
         self._regions_lay.setContentsMargins(0, 0, 0, 0)
         self._regions_lay.setSpacing(0)
         self._regions_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        self._regions_scroll = QScrollArea()
-        self._regions_scroll.setWidget(self._regions_w)
-        self._regions_scroll.setWidgetResizable(True)
-        # Keep a usable minimum so the list never collapses into the buttons below;
-        # when the whole sidebar is too tall it scrolls as a unit instead.
-        self._regions_scroll.setMinimumHeight(120)
-        self._regions_scroll.setStyleSheet(
-            "QScrollArea { border: 1px solid #b0b0b0; border-radius: 4px; background: white; }"
-        )
-        v.addWidget(self._regions_scroll, stretch=1)
+        v.addWidget(self._regions_w)
 
         row_btns = QHBoxLayout()
         self._btn_clear_regs = QPushButton("Clear all")
@@ -2271,8 +2288,8 @@ class SpectraWidget(QWidget):
         self._cmb_cmp_mode.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_show_energy.toggled.connect(self._update_top_visibility)
         self._cmb_method.currentIndexChanged.connect(self._redraw_spectra)
-        self._sb_x_min.valueChanged.connect(self._redraw_spectra)
-        self._sb_x_max.valueChanged.connect(self._redraw_spectra)
+        self._sb_x_min.valueChanged.connect(self._on_x_range_edited)
+        self._sb_x_max.valueChanged.connect(self._on_x_range_edited)
         self._sb_live_n.valueChanged.connect(self._redraw_spectra)
         self._tbl_pvs.itemSelectionChanged.connect(self._on_search_pv_changed)
         self._tbl_pvs.itemChanged.connect(self._on_pv_label_edited)
@@ -3579,6 +3596,43 @@ class SpectraWidget(QWidget):
         if len(analyzed) >= 2 and self._cmb_cmp_b.currentIndex() == self._cmb_cmp_a.currentIndex():
             self._cmb_cmp_b.setCurrentIndex(1)
 
+    def _on_x_range_edited(self, *_):
+        """User typed a new From/To: drop any saved manual zoom so the typed range
+        actually takes effect (otherwise _bot_user_xlim would override it), then redraw."""
+        self._bot_user_xlim = None
+        self._redraw_spectra()
+
+    def _signal_span(self, x, y) -> "tuple | None":
+        """Return the (lo, hi) wavelength span of (x, y) that actually contains
+        signal (1% of peak above the baseline), or None when there is no signal."""
+        y = np.asarray(y, dtype=float)
+        if x is None or len(x) != len(y):
+            x = np.arange(len(y))
+        x = np.asarray(x, dtype=float)
+        if y.size == 0:
+            return None
+        base = float(np.median(np.sort(y)[:max(1, len(y) // 5)]))
+        peak = float(np.max(y))
+        if peak <= base:
+            return None
+        idx = np.where(y > base + 0.01 * (peak - base))[0]
+        if not idx.size:
+            return None
+        return float(x[idx[0]]), float(x[idx[-1]])
+
+    def _apply_fit_span(self, lo: float, hi: float):
+        """Write a fitted span into the From/To spinboxes (padded a touch) and drop
+        any saved manual zoom so the new range actually takes effect."""
+        pad = 0.02 * (hi - lo) if hi > lo else 1.0
+        lo, hi = lo - pad, hi + pad
+        self._sb_x_min.blockSignals(True)
+        self._sb_x_max.blockSignals(True)
+        self._sb_x_min.setValue(int(np.floor(lo)))
+        self._sb_x_max.setValue(int(np.ceil(hi)))
+        self._sb_x_min.blockSignals(False)
+        self._sb_x_max.blockSignals(False)
+        self._bot_user_xlim = None
+
     def _auto_fit_range(self):
         """Set From/To to the wavelength span that actually contains signal,
         across all analyzed regions (selected averaging method)."""
@@ -3590,30 +3644,30 @@ class SpectraWidget(QWidget):
             y = r.get(method)
             if y is None:
                 continue
-            y = np.asarray(y, dtype=float)
-            x = r.get("x")
-            if x is None or len(x) != len(y):
-                x = np.arange(len(y))
-            x = np.asarray(x, dtype=float)
-            base = float(np.median(np.sort(y)[:max(1, len(y) // 5)]))
-            peak = float(np.max(y))
-            if peak <= base:
-                continue
-            idx = np.where(y > base + 0.01 * (peak - base))[0]
-            if idx.size:
-                lo_c.append(float(x[idx[0]]))
-                hi_c.append(float(x[idx[-1]]))
+            span = self._signal_span(r.get("x"), y)
+            if span:
+                lo_c.append(span[0])
+                hi_c.append(span[1])
         if not lo_c:
             return
-        lo, hi = min(lo_c), max(hi_c)
-        pad = 0.02 * (hi - lo) if hi > lo else 1.0
-        lo, hi = lo - pad, hi + pad
-        self._sb_x_min.blockSignals(True)
-        self._sb_x_max.blockSignals(True)
-        self._sb_x_min.setValue(int(np.floor(lo)))
-        self._sb_x_max.setValue(int(np.ceil(hi)))
-        self._sb_x_min.blockSignals(False)
-        self._sb_x_max.blockSignals(False)
+        self._apply_fit_span(min(lo_c), max(hi_c))
+
+    def _auto_fit_live_range(self):
+        """Fit From/To to the live data on the current (possibly custom) X axis,
+        so a wavelength axis outside the default 700–900 nm is not masked away."""
+        if not self._live_buf:
+            return
+        n_avg = self._sb_live_n.value()
+        arrs  = [a for _, a in list(self._live_buf)[-n_avg:]]
+        st = _compute_stats(arrs)
+        if st is None:
+            return
+        span = self._signal_span(self._x_data, st[self._method()])
+        if span is None and self._x_data is not None and len(self._x_data):
+            # no clear signal: fall back to the full X-axis span so it is at least visible
+            span = (float(np.min(self._x_data)), float(np.max(self._x_data)))
+        if span:
+            self._apply_fit_span(*span)
 
     def _redraw_spectra(self):
         norm       = self._norm_mode()
@@ -3802,22 +3856,33 @@ class SpectraWidget(QWidget):
         now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
         self._live_start_ns = now_ns - int(LIVE_HISTORY_S * 1e9)
         self._live_last_ns  = self._live_start_ns
+        self._live_autofit_done = False
 
+        self._set_status(
+            f"Live started — preloading last {LIVE_HISTORY_S // 60} min of shots…"
+        )
+
+        # Resolve the (possibly custom) wavelength axis BEFORE polling Y, otherwise the
+        # first frames are drawn on a bare index axis and masked away by the From/To range.
         if self._x_data is None:
             t0 = self._live_start_ns - int(10 * 60 * 1e9)
             t1 = self._live_start_ns + int(60 * 1e9)
             sig_x = _Sig(self)
-            sig_x.done.connect(lambda arr: setattr(self, "_x_data", arr) if arr is not None else None)
+
+            def _on_x(arr):
+                if arr is not None:
+                    self._x_data = arr
+                if self._live:
+                    self._live_tick()
+
+            sig_x.done.connect(_on_x)
 
             def _fetch_x():
                 sig_x.done.emit(self._resolve_x_data(t0, t1))
 
             _bg(_fetch_x)
-
-        self._set_status(
-            f"Live started — preloading last {LIVE_HISTORY_S // 60} min of shots…"
-        )
-        self._live_tick()
+        else:
+            self._live_tick()
 
     def _stop_live(self):
         if not self._live:
@@ -3874,6 +3939,12 @@ class SpectraWidget(QWidget):
         for t, arr in wfs:
             self._live_buf.append((t, arr))
         self._live_last_ns = now_ns
+        # Once, on the first real live data: fit From/To to this X axis so a custom
+        # wavelength axis outside the default 700–900 nm is not masked to nothing.
+        if (not self._live_autofit_done and self._live_buf
+                and self._chk_autofit.isChecked()):
+            self._auto_fit_live_range()
+            self._live_autofit_done = True
         self._redraw_spectra()
         n_avg = min(self._sb_live_n.value(), len(self._live_buf))
         self._set_status(
@@ -4114,7 +4185,9 @@ if __name__ == "__main__":
 
     win = QMainWindow()
     win.setWindowTitle("Spectral analysis")
-    win.setMinimumSize(1050, 700)
+    # Keep this small enough to fit on a smaller / display-scaled monitor without the
+    # window overflowing off-screen; the left panel scrolls and the graph is Expanding.
+    win.setMinimumSize(860, 480)
 
     tabs = QTabWidget()
     tabs.setDocumentMode(True)

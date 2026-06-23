@@ -1033,13 +1033,20 @@ class CPVAExplorerApp:
         main = tk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        self.sidebar = tk.Frame(main, width=300)
-        self.sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        self.sidebar.pack_propagate(False)
+        # Horizontal splitter: drag the sash to set the sidebar (left column) width.
+        h_paned = tk.PanedWindow(main, orient=tk.HORIZONTAL, sashwidth=6,
+                                 sashrelief=tk.RAISED, bg="#cccccc")
+        h_paned.pack(fill=tk.BOTH, expand=True)
+
+        self.sidebar = tk.Frame(h_paned)
+        h_paned.add(self.sidebar, minsize=240, sticky="nsew")
         self._build_sidebar()
 
-        self.notebook = ttk.Notebook(main)
-        self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.notebook = ttk.Notebook(h_paned)
+        h_paned.add(self.notebook, minsize=400, stretch="always", sticky="nsew")
+
+        # Initial split ≈ 300 px sidebar; minsize on both panes prevents overlap.
+        self.root.after_idle(lambda: self._safe_sash_place(h_paned, 300, "x"))
 
         self.tab_graph = tk.Frame(self.notebook)
         self.tab_xy    = tk.Frame(self.notebook)
@@ -1071,6 +1078,45 @@ class CPVAExplorerApp:
         self.lbl_status = tk.Label(status, text="Ready.", font=FONT_NORMAL,
                                     fg=COLOR_GRAY, anchor=tk.W)
         self.lbl_status.pack(fill=tk.X)
+
+    def _safe_sash_place(self, paned: tk.PanedWindow, pos, axis: str):
+        """Set the initial sash position of a PanedWindow.
+
+        ``pos`` is an absolute pixel offset when >= 1, or a fraction of the
+        relevant dimension when between 0 and 1. ``axis`` is 'x' (horizontal
+        splitter) or 'y' (vertical splitter).
+        """
+        try:
+            paned.update_idletasks()
+            extent = paned.winfo_width() if axis == "x" else paned.winfo_height()
+            if pos >= 1:
+                offset = int(pos)
+            elif extent > 50:
+                offset = int(extent * pos)
+            else:
+                # Geometry not realized yet — retry shortly.
+                self.root.after(60, lambda: self._safe_sash_place(paned, pos, axis))
+                return
+            offset = max(40, offset)
+            if axis == "x":
+                paned.sash_place(0, offset, 0)
+            else:
+                paned.sash_place(0, 0, offset)
+        except Exception:
+            pass
+
+    def _proportion_graph_sash(self, paned: tk.PanedWindow, frac: float):
+        """Keep the vertical graph/table sash at ``frac`` of the height until the
+        user drags it. Called on every <Configure> so it settles correctly once
+        the window reaches its final (e.g. maximized) size."""
+        if getattr(self, "_graph_sash_user_set", False):
+            return
+        try:
+            h = paned.winfo_height()
+            if h > 100:
+                paned.sash_place(0, 0, int(h * frac))
+        except Exception:
+            pass
 
     # -- Sidebar --------------------------------------------------------------
 
@@ -1176,7 +1222,7 @@ class CPVAExplorerApp:
         self.btn_live.pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Label(live_row, text="Refresh interval:", font=FONT_NORMAL).pack(side=tk.LEFT)
-        self._live_interval_var = tk.StringVar(value="10")
+        self._live_interval_var = tk.StringVar(value="0.5")
         vcmd = (bar.register(lambda s: s == "" or (s.replace(".", "", 1).isdigit())), "%P")
         tk.Entry(live_row, textvariable=self._live_interval_var,
                  width=5, font=FONT_MONO, validate="key",
@@ -1190,8 +1236,7 @@ class CPVAExplorerApp:
     def _build_graph_tab(self):
         tab = self.tab_graph
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(1, weight=3)   # graph gets most of the space
-        tab.rowconfigure(3, weight=1)   # axis settings panel
+        tab.rowconfigure(1, weight=1)   # vertical splitter fills the rest
 
         ctrl = tk.Frame(tab)
         ctrl.grid(row=0, column=0, sticky=tk.EW, padx=4, pady=(4, 0))
@@ -1233,19 +1278,44 @@ class CPVAExplorerApp:
         self.lbl_graph_info = tk.Label(ctrl, text="", font=FONT_NORMAL, fg=COLOR_GRAY)
         self.lbl_graph_info.pack(side=tk.RIGHT, padx=8)
 
-        self.graph_container = tk.Frame(tab, bg="#f5f5f5")
-        self.graph_container.grid(row=1, column=0, sticky=tk.NSEW, padx=4, pady=4)
+        # Vertical splitter: drag the sash to set graph height vs. the bottom
+        # axis-settings table height.
+        v_paned = tk.PanedWindow(tab, orient=tk.VERTICAL, sashwidth=6,
+                                 sashrelief=tk.RAISED, bg="#cccccc")
+        v_paned.grid(row=1, column=0, sticky=tk.NSEW, padx=2, pady=2)
+
+        # Pane A: the graph plus the stats strip beneath it.
+        graph_pane = tk.Frame(v_paned)
+        graph_pane.columnconfigure(0, weight=1)
+        graph_pane.rowconfigure(0, weight=1)
+
+        self.graph_container = tk.Frame(graph_pane, bg="#f5f5f5")
+        self.graph_container.grid(row=0, column=0, sticky=tk.NSEW, padx=4, pady=4)
         self.graph_container.columnconfigure(0, weight=1)
         self.graph_container.rowconfigure(0, weight=1)
 
         # Stats area below graph — frame holds per-PV colored labels
-        self._stats_frame = tk.Frame(tab)
-        self._stats_frame.grid(row=2, column=0, sticky=tk.EW, padx=8, pady=(0, 4))
+        self._stats_frame = tk.Frame(graph_pane)
+        self._stats_frame.grid(row=1, column=0, sticky=tk.EW, padx=8, pady=(0, 4))
         # Compatibility shim: lbl_graph_stats.config(text=..., fg=...) still works
         self.lbl_graph_stats = _StatsShim(self._stats_frame)
 
-        # Axis settings panel (row 3)
-        self._build_axis_settings_panel(tab)
+        v_paned.add(graph_pane, minsize=200, stretch="always", sticky="nsew")
+
+        # Pane B: the axis-settings table.
+        axis_pane = tk.Frame(v_paned)
+        self._build_axis_settings_panel(axis_pane)
+        v_paned.add(axis_pane, minsize=90, sticky="nsew")
+
+        # Initial split ≈ 70 % graph / 30 % table. Re-proportion on every resize
+        # (a one-shot placement races with the window maximizing to its final
+        # size), but stop as soon as the user drags the sash themselves.
+        self._graph_sash_user_set = False
+        v_paned.bind("<B1-Motion>",
+                     lambda _: setattr(self, "_graph_sash_user_set", True), add="+")
+        v_paned.bind("<Configure>",
+                     lambda _: self._proportion_graph_sash(v_paned, 0.70), add="+")
+        self.root.after_idle(lambda: self._proportion_graph_sash(v_paned, 0.70))
 
         if self._Figure is None:
             tk.Label(self.graph_container,
@@ -1563,7 +1633,7 @@ class CPVAExplorerApp:
         numeric_pvs = getattr(self, "_numeric_pvs", set())
 
         for pv in pv_candidates:
-            if pv in self._numeric_pvs:
+            if pv in numeric_pvs:
                 choices.append(pv)
                 continue
 
@@ -2145,6 +2215,17 @@ class CPVAExplorerApp:
                              datetime.now(tz=timezone.utc))
             total_seconds = 0
 
+        # Honor the REQUESTED time window for the x-axis instead of the data
+        # extent, so e.g. "last 10 min" always shows a full 10-min axis even when
+        # the data is sparse or short. A full re-plot is never a zoom operation
+        # (manual zoom sets limits directly and resets the history right after),
+        # so this path can always reflect the window.
+        using_window = self._dt_to > self._dt_from
+        if using_window:
+            t_min = self._dt_from.astimezone(timezone.utc)
+            t_max = self._dt_to.astimezone(timezone.utc)
+            total_seconds = (t_max - t_min).total_seconds()
+
         from matplotlib.ticker import FuncFormatter, AutoMinorLocator
 
         # Determine date range
@@ -2216,7 +2297,11 @@ class CPVAExplorerApp:
         else:
             ax0.set_xlabel("Time (Prague)", fontsize=_fsize)
 
-        if total_seconds > 0:
+        if using_window:
+            # Pin the axis exactly to the requested window — no padding, so the
+            # span stays fixed (e.g. exactly 10 minutes).
+            ax0.set_xlim(t_min, t_max)
+        elif total_seconds > 0:
             pad = timedelta(seconds=max(total_seconds * 0.02, 5))
             ax0.set_xlim(t_min - pad, t_max + pad)
         ax0.tick_params(axis="x", which="major", labelsize=_fsize, rotation=0)
@@ -2453,15 +2538,13 @@ class CPVAExplorerApp:
                 pv_lines[0].set_xdata(times)
                 pv_lines[0].set_ydata(values)
 
-            # Rescale x axis
-            ax.relim()
-            ax.autoscale_view(scalex=True, scaley=False)
-
-            # Rescale y only if per-PV auto-scale is active
+            # Rescale y only if per-PV auto-scale is active. X is handled below as
+            # a fixed-width sliding window, so we never autoscale X here (that is
+            # what made the window grow instead of scrolling).
             pv_auto = pv_setting.get("auto_scale", True)
             if pv_auto:
                 ax.relim()
-                ax.autoscale_view(scalex=True, scaley=True)
+                ax.autoscale_view(scalex=False, scaley=True)
 
         self._graph_raw = new_graph_raw
 
@@ -2493,10 +2576,14 @@ class CPVAExplorerApp:
                     return dt.strftime("%H:%M")
 
             ax0.xaxis.set_major_formatter(_FuncFormatter(_fmt_x_live))
-            # Always update x limits in live mode so timeline scrolls forward
-            if total_seconds > 0:
-                pad = timedelta(seconds=max(total_seconds * 0.02, 5))
-                ax0.set_xlim(t_min - pad, t_max + pad)
+            # Fixed-width sliding window: keep the axis [now - span, now] so the
+            # timeline scrolls forward without growing. Skip while the user has
+            # manually zoomed in (their view holds until they press "↩ Back").
+            if not self._zoom_history:
+                span = getattr(self, "_live_window_span", None)
+                if span and span.total_seconds() > 0:
+                    now_local = datetime.now().astimezone(timezone.utc)
+                    ax0.set_xlim(now_local - span, now_local)
 
         self._mpl_canvas.draw_idle()
 
@@ -2722,12 +2809,17 @@ class CPVAExplorerApp:
 
                 print(file, e)
 
+        if not tables:
+            # No parquet files in DataRepository — return empty frame without
+            # caching so a later plot retries once files appear.
+            return pd.DataFrame()
+
         self._pv_time_df = pd.concat(
             tables,
             ignore_index=True
         )
 
-        return self._pv_time_df        
+        return self._pv_time_df
 
     def _pv_time_add_features(self, df):
 
@@ -3662,18 +3754,15 @@ class CPVAExplorerApp:
 
     def _build_axis_settings_panel(self, parent):
         """Build the always-visible 'Axis settings' treeview panel at the bottom of the graph tab."""
-        # Also update parent rowconfigure for row 4 (treeview)
-        parent.rowconfigure(4, weight=1)
-
         hdr = tk.Frame(parent)
-        hdr.grid(row=3, column=0, sticky=tk.EW, padx=4, pady=(2, 0))
+        hdr.pack(fill=tk.X, padx=4, pady=(2, 0))
         tk.Label(hdr, text="Axis settings", font=FONT_HEADER,
                  fg=COLOR_BLUE, anchor=tk.W).pack(side=tk.LEFT)
 
         self._axis_panel_visible = tk.BooleanVar(value=True)
 
         self._axis_settings_frame = tk.Frame(parent)
-        self._axis_settings_frame.grid(row=4, column=0, sticky=tk.NSEW, padx=4, pady=(0, 4))
+        self._axis_settings_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
         # Treeview columns — tree column (leftmost) carries the color image
         _COLS = ("show", "pv", "display_name", "color", "cursor_val",
@@ -3714,8 +3803,18 @@ class CPVAExplorerApp:
                                       height=5,
                                       yscrollcommand=tv_sb_y.set,
                                       xscrollcommand=tv_sb_x.set)
-        tv_sb_y.config(command=self._axis_tv.yview)
-        tv_sb_x.config(command=self._axis_tv.xview)
+        # Wrap the scrollbar commands so the color swatch overlays follow the
+        # cells when the table is scrolled.
+        def _yview(*a):
+            self._axis_tv.yview(*a)
+            self._reposition_tv_swatches()
+
+        def _xview(*a):
+            self._axis_tv.xview(*a)
+            self._reposition_tv_swatches()
+
+        tv_sb_y.config(command=_yview)
+        tv_sb_x.config(command=_xview)
         self._axis_tv.grid(row=0, column=0, sticky=tk.NSEW)
         tv_sb_y.grid(row=0, column=1, sticky=tk.NS)
         tv_sb_x.grid(row=1, column=0, sticky=tk.EW)
@@ -3728,6 +3827,12 @@ class CPVAExplorerApp:
         self._axis_tv.bind("<Button-1>",        self._on_axis_tv_single_click)
         self._axis_tv.bind("<Configure>",        lambda _: self._reposition_tv_swatches())
         self._axis_tv.bind("<<TreeviewSelect>>", lambda _: self._reposition_tv_swatches())
+        # Keep swatches aligned while/after a column border is dragged (resize or
+        # reorder) and when scrolling with the mouse wheel — these fire neither
+        # <Configure> nor <<TreeviewSelect>>.
+        self._axis_tv.bind("<B1-Motion>",        lambda _: self._reposition_tv_swatches(), add="+")
+        self._axis_tv.bind("<ButtonRelease-1>",  lambda _: self._reposition_tv_swatches(), add="+")
+        self._axis_tv.bind("<MouseWheel>",       lambda _: self.root.after_idle(self._reposition_tv_swatches), add="+")
 
         style = ttk.Style(self._axis_tv)
         self._axis_tv.configure(style="AxisTV.Treeview")
@@ -5850,6 +5955,9 @@ class CPVAExplorerApp:
             # First tick: full load of the current window, then switch to incremental
             now = datetime.now()
             span = self._dt_to - self._dt_from
+            # Remember the requested window width so live mode keeps a fixed-width,
+            # auto-scrolling x-axis ([now - span, now]) instead of growing.
+            self._live_window_span = span
             self._dt_to   = now
             self._dt_from = now - span
             self._refresh_time_labels()
@@ -5883,7 +5991,10 @@ class CPVAExplorerApp:
 
         def fetch_one(pv_name: str) -> tuple[str, list, str | None]:
             try:
-                raw = cpva_fetch_samples_chunked(
+                # Incremental live windows are tiny (sub-second to a few seconds),
+                # so use the lightweight single-request fetch — the chunked variant's
+                # 1-hour splitting / night-skip logic only adds latency here.
+                raw = cpva_fetch_samples(
                     pv_name, fetch_start_ns, fetch_end_ns, timeout=timeout)
                 parsed = []
                 for s in raw:
@@ -5933,7 +6044,13 @@ class CPVAExplorerApp:
 
         if new_max_ts > prev_ts:
             self._live_last_ts = new_max_ts
+            # Slide the requested window forward so the sidebar From/To labels and
+            # any full re-plot stay in sync with the scrolling x-axis.
             self._dt_to = datetime.now()
+            span = getattr(self, "_live_window_span", None)
+            if span and span.total_seconds() > 0:
+                self._dt_from = self._dt_to - span
+            self._refresh_time_labels()
 
         if added_count > 0:
             self._table_rows = self._merge_samples_sample_hold(
