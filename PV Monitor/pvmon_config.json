@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "settings": {
+    "teams_webhook_url": "",
+    "poll_interval_s": 30,
+    "avg_last_n": 25,
+    "sample_window_s": 60,
+    "http_timeout_s": 10.0,
+    "renotify_cooldown_minutes": 30,
+    "recovery_notify": true,
+    "debounce_count": 2,
+    "hysteresis_frac": 0.05,
+    "history_minutes": 720,
+    "learn_days_default": 7,
+    "warn_k_default": 3.0,
+    "alarm_k_default": 5.0,
+    "graph_window_minutes": 60,
+    "start_monitoring_on_launch": false
+  },
+  "pvs": [],
+  "window_geometry": "AdnQywADAAAAAALaAAABHQAAByUAAAQzAAAC2gAAATwAAAclAAAEMwAAAAAAAAAACgAAAALaAAABPAAAByUAAAQz"
+}

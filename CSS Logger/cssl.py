@@ -394,6 +394,24 @@ def ns_to_local_str(ts_ns: int) -> str:
     return f"{dt:%Y-%m-%d %H:%M:%S}.{ms:03d}"
 
 
+def _fmt_cursor_value(v: float) -> str:
+    """Format a cursor/annotation value without scientific e+N notation where avoidable."""
+    if v != v:           # NaN
+        return "nan"
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a >= 1e9:  return f"{v:.4e}"       # too large for comfortable fixed-point
+    if a >= 10000: return f"{v:,.0f}"     # e.g. 300000 → "300,000"
+    if a >= 1000:  return f"{v:.1f}"
+    if a >= 100:   return f"{v:.2f}"
+    if a >= 10:    return f"{v:.3f}"
+    if a >= 1:     return f"{v:.4f}"
+    if a >= 0.01:  return f"{v:.5f}"
+    if a >= 1e-4:  return f"{v:.6f}"
+    return f"{v:.4e}"                     # truly tiny — e-notation unavoidable
+
+
 def parse_user_datetime(s: str) -> datetime | None:
     s = s.strip()
     if not s:
@@ -1221,7 +1239,7 @@ class CPVAExplorerApp:
                              padx=8, pady=4)
         self.btn_live.pack(side=tk.LEFT, padx=(0, 8))
 
-        tk.Label(live_row, text="Refresh interval:", font=FONT_NORMAL).pack(side=tk.LEFT)
+        tk.Label(live_row, text="Poll interval:", font=FONT_NORMAL).pack(side=tk.LEFT)
         self._live_interval_var = tk.StringVar(value="0.5")
         vcmd = (bar.register(lambda s: s == "" or (s.replace(".", "", 1).isdigit())), "%P")
         tk.Entry(live_row, textvariable=self._live_interval_var,
@@ -2041,7 +2059,13 @@ class CPVAExplorerApp:
                 text="No numeric PVs to plot.", fg=COLOR_RED)
             return
 
-        fig = self._Figure(figsize=(10, 5), dpi=96)
+        # Adaptive figure size: fill the container so axes don't eat the data area.
+        _dpi = 96
+        _cw = self.graph_container.winfo_width() - 8   # subtract grid padx*2
+        _ch = self.graph_container.winfo_height() - 8
+        if _cw < 400: _cw = 960
+        if _ch < 100: _ch = 480
+        fig = self._Figure(figsize=(_cw / _dpi, _ch / _dpi), dpi=_dpi)
         n   = len(numeric_pvs)
         colors = ["#1976D2","#e53935","#4CAF50","#FF9800","#9C27B0",
                   "#00BCD4","#FF5722","#607D8B","#795548","#009688"]
@@ -2053,12 +2077,12 @@ class CPVAExplorerApp:
             _fsize = 7
 
         # Per-axis width in figure-fraction units.
-        # Rotated (90°) tick labels have height ≈ font_pt px; ylabel also rotated ≈ font_pt px.
-        # Add tick length (~4px) and padding (~6px).
-        # Figure width = 10in × 96dpi = 960px.
-        _fig_w_px = 10 * 96
-        _axis_px  = _fsize * 2.2 + 10      # tight estimate: rotated ticks + ylabel + padding
-        STEP_fig  = max(0.025, _axis_px / _fig_w_px)   # per-axis step in figure coords
+        # Rotated (90°) tick labels take ≈ character height in horizontal space.
+        # At 96 DPI, char height ≈ _fsize * 96/72 * 0.7 ≈ _fsize * 0.93 px.
+        # Budget: tick (5px) + pad (3px) + label_height + gap (5px) + ylabel_height + margin (2px).
+        _fig_w_px = _cw
+        _axis_px  = _fsize * 1.9 + 15      # rotated ticks + ylabel + tick marks + padding
+        STEP_fig  = max(0.018, _axis_px / _fig_w_px)   # per-axis step in figure coords
 
         # Count left vs right axes
         left_pvs  = [pv for pv in numeric_pvs
@@ -3701,9 +3725,10 @@ class CPVAExplorerApp:
                     idx = int(np.argmin(np.abs(arr - x_f)))
                     snap_val = float(vals[idx])
             if pv and pv in self._pv_settings:
-                self._pv_settings[pv]["cursor_val"] = f"{snap_val:.6g}" if snap_val is not None else ""
+                self._pv_settings[pv]["cursor_val"] = (
+                    _fmt_cursor_value(snap_val) if snap_val is not None else "")
 
-            # Y annotation
+            # Y annotation — stagger every other axis up by ~15 px to prevent overlap
             if ax_idx < len(self._crosshair_texts):
                 ann = self._crosshair_texts[ax_idx]
                 if ann is not None:
@@ -3712,8 +3737,19 @@ class CPVAExplorerApp:
                                   and ax_idx < len(self._graph_spine_xpos)
                                   else (0.0, "left"))
                     xfrac, side = spine_info
-                    txt = f" {y_mouse:.4g}" if side == "right" else f"{y_mouse:.4g} "
-                    ann.set_position((xfrac, y_mouse))
+                    val_str = _fmt_cursor_value(y_mouse)
+                    txt = f" {val_str}" if side == "right" else f"{val_str} "
+                    # Convert a 15-pixel vertical offset to data units for odd axes
+                    y_ann = y_mouse
+                    if ax_idx % 2 == 1:
+                        try:
+                            ylo, yhi = ax.get_ylim()
+                            h_px = ax.get_window_extent().height
+                            if h_px > 0:
+                                y_ann += (yhi - ylo) / h_px * 15
+                        except Exception:
+                            pass
+                    ann.set_position((xfrac, y_ann))
                     ann.set_text(txt)
                     ann.set_visible(True)
                     if bg is not None:
@@ -5782,18 +5818,27 @@ class CPVAExplorerApp:
                     if err:
                         errors.append(f"{pv_name}: {err}")
 
+            # Capture the window used for the fetch so the filter in _on_load_finished
+            # always trims to the same range that was requested — even if _dt_from/_dt_to
+            # are updated by a concurrent live tick before the callback fires.
+            _snap_start = start_ns
+            _snap_end   = end_ns
             self.root.after(0, lambda: self._on_load_finished(
-                samples_by_pv, pv_list, errors, live_callback=live_callback))
+                samples_by_pv, pv_list, errors, live_callback=live_callback,
+                start_ns=_snap_start, end_ns=_snap_end))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_load_finished(self, samples_by_pv, pv_order, errors, live_callback=None):
+    def _on_load_finished(self, samples_by_pv, pv_order, errors, live_callback=None,
+                          start_ns=None, end_ns=None):
         # Parallel fetch may return chunks out of order — sort every PV by timestamp
         for pv in samples_by_pv:
             samples_by_pv[pv].sort(key=lambda s: s[0])
 
-        start_ns = dt_to_ns(self._dt_from)
-        end_ns = dt_to_ns(self._dt_to)
+        if start_ns is None:
+            start_ns = dt_to_ns(self._dt_from)
+        if end_ns is None:
+            end_ns = dt_to_ns(self._dt_to)
 
 
         # In live mode: keep previous data for PVs that returned empty results this tick

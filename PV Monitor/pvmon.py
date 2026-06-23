@@ -250,7 +250,10 @@ class _PollWorker(QRunnable):
                 out[name] = (val, units, last_ts or end, "")
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
                 out[name] = (None, "", end, str(e))
-        self._sig.done.emit(out)
+        try:
+            self._sig.done.emit(out)
+        except RuntimeError:
+            pass  # window was closed before worker finished
 
 
 class _ChannelsSignals(QObject):
@@ -266,15 +269,29 @@ class _ChannelsWorker(QRunnable):
 
     def run(self):
         try:
-            self._sig.done.emit(api.cpva_fetch_channels(self._timeout))
+            channels = api.cpva_fetch_channels(self._timeout)
+            try:
+                self._sig.done.emit(channels)
+            except RuntimeError:
+                pass
         except Exception as e:  # noqa: BLE001
-            self._sig.error.emit(str(e))
+            try:
+                self._sig.error.emit(str(e))
+            except RuntimeError:
+                pass
 
 
 class _LearnSignals(QObject):
     done = Signal(object)   # dict of thresholds + stats
     error = Signal(str)
     log = Signal(str)
+
+
+def _safe_emit(sig_fn, value):
+    try:
+        sig_fn(value)
+    except RuntimeError:
+        pass  # signal source deleted (dialog closed while worker ran)
 
 
 class _LearnWorker(QRunnable):
@@ -292,9 +309,11 @@ class _LearnWorker(QRunnable):
         try:
             end = api.now_ns()
             start = end - int(self._days * 86400 * 1e9)
-            self._sig.log.emit(f"Fetching {self._days} d of history for {self._name}…")
+            _safe_emit(self._sig.log.emit,
+                       f"Fetching {self._days} d of history for {self._name}…")
             samples = api.cpva_fetch_samples_chunked(
-                self._name, start, end, self._timeout, log_fn=self._sig.log.emit)
+                self._name, start, end, self._timeout,
+                log_fn=lambda m: _safe_emit(self._sig.log.emit, m))
             vals = []
             units = ""
             for s in samples:
@@ -307,17 +326,17 @@ class _LearnWorker(QRunnable):
                     if u:
                         units = u
             if len(vals) < 30:
-                self._sig.error.emit(
-                    f"Insufficient history ({len(vals)} numeric points). "
-                    "Limits left unchanged.")
+                _safe_emit(self._sig.error.emit,
+                           f"Insufficient history ({len(vals)} numeric points). "
+                           "Limits left unchanged.")
                 return
             result = compute_baseline(np.asarray(vals), self._warn_k, self._alarm_k)
             result["units"] = units
             result["n"] = len(vals)
             result["days"] = self._days
-            self._sig.done.emit(result)
+            _safe_emit(self._sig.done.emit, result)
         except Exception as e:  # noqa: BLE001
-            self._sig.error.emit(str(e))
+            _safe_emit(self._sig.error.emit, str(e))
 
 
 def compute_baseline(v: np.ndarray, warn_k: float, alarm_k: float) -> dict:
