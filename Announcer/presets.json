@@ -1,11 +1,11 @@
 {
   "TEST": [
-    398,
-    350,
-    1096,
-    530
+    2919,
+    166,
+    3288,
+    349
   ],
-  "window_geometry": "604x301+231+806",
+  "window_geometry": "604x301+2900+504",
   "pv_thresholds": {
     "L3-UTIL-HEB03-001:PressOut_PSI": {
       "orange": 46.0,

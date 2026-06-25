@@ -12,6 +12,20 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_ROOT / "Spectra"))     # for sp_t / SpectraWidget
 
+# Make debug print() bullet-proof: a Windows console using cp1250 raises
+# UnicodeEncodeError on the "→" used in our log lines, and a frozen windowed
+# build has sys.stdout == None — either one would crash a handler mid-action.
+import io as _io
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is None:
+        setattr(sys, _stream_name, _io.StringIO())
+    else:
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # ── stdlib ─────────────────────────────────────────────────────────────────
 import csv
 import json
@@ -54,8 +68,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector, RectangleSelector
 
-# ── Non-UI helpers from cssl ───────────────────────────────────────────────
-from cssl import (
+# ── Non-UI helpers from cpva_core ──────────────────────────────────────────
+from cpva_core import (
     TZ_PRAGUE, now_ns, dt_to_ns, ns_to_local_str, _fmt_cursor_value,
     parse_user_datetime, shorten_pv_name, _matches_wildcard,
     cpva_fetch_samples, cpva_fetch_samples_chunked, cpva_decode_value,
@@ -71,7 +85,7 @@ from cssl import (
 )
 
 try:
-    from cssl import DATA_REPOSITORY_DIR
+    from cpva_core import DATA_REPOSITORY_DIR
 except ImportError:
     DATA_REPOSITORY_DIR = _ROOT / "Diagnostic" / "DataRepository"
 
@@ -1386,11 +1400,27 @@ class CSSLoggerWidget(QWidget):
     # ── Graph plotting ──────────────────────────────────────────────────────
 
     def _plot_graph(self):
+        """Safe wrapper: a plotting failure must never crash the app or leave a
+        stale graph — clear the canvas and show a message instead."""
+        try:
+            self._plot_graph_impl()
+        except Exception:
+            import traceback
+            self._log(f"[plot_graph]\n{traceback.format_exc()}")
+            try:
+                self._clear_graph()
+            except Exception:
+                pass
+            self._lbl_graph_info.setText("Graph error — see Log tab.")
+
+    def _plot_graph_impl(self):
+        # Always start from a clean canvas so an early return never leaves a
+        # stale graph sitting under a "no data" message.
+        self._clear_graph()
+
         if not self._samples_by_pv:
             self._lbl_graph_info.setText("Load data first.")
             return
-
-        self._clear_graph()
 
         # PVs with actual numeric samples
         numeric_pvs = [
@@ -2004,7 +2034,7 @@ class CSSLoggerWidget(QWidget):
 
         def _worker():
             try:
-                from cssl import cpva_fetch_samples_chunked, cpva_decode_value, cpva_fetch_samples
+                from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value, cpva_fetch_samples
                 samples_by_pv   = {}
                 pv_order        = []
                 errors          = []
@@ -2049,7 +2079,13 @@ class CSSLoggerWidget(QWidget):
                 import traceback; traceback.print_exc()
                 sig.error.emit(str(exc))
 
-        threading.Thread(target=_worker, daemon=True).start()
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            # Worker never started — make sure the button/progress are restored
+            # so the user can retry instead of facing a permanently disabled LOAD.
+            import traceback; traceback.print_exc()
+            self._on_load_error(f"Could not start loader thread: {exc}")
 
     def _on_load_error(self, e: str):
         self._log(f"Load error: {e}")
@@ -2222,12 +2258,12 @@ class CSSLoggerWidget(QWidget):
         self._live_init_sig = _LoadSig()
         sig = self._live_init_sig
         sig.done.connect(self._after_live_initial_load)
-        sig.error.connect(lambda e: self._log(f"Live initial load error: {e}"))
+        sig.error.connect(self._on_live_init_error)
         sig.progress.connect(lambda m: self._lbl_status.setText(m))
 
         def _worker():
             try:
-                from cssl import cpva_fetch_samples_chunked, cpva_decode_value
+                from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value
                 samples_by_pv = {}
                 pv_order = []
                 total = len(pvs)
@@ -2252,26 +2288,45 @@ class CSSLoggerWidget(QWidget):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _on_live_init_error(self, e: str):
+        """Live initial load failed — stop live cleanly so the UI isn't stuck."""
+        self._log(f"Live initial load error: {e}")
+        self._live_mode = False
+        self._live_timer.stop()
+        self._countdown_timer.stop()
+        self._btn_live.setText("⏵ Live")
+        self._btn_live.setStyleSheet("")
+        self._btn_load.setEnabled(True)
+        self._refresh_time_labels()
+        self._lbl_status.setText("Live init failed — see Log tab.")
+
     def _after_live_initial_load(self, result):
         if not self._live_mode: return
-        samples_by_pv, pv_order, _, start_ns, end_ns = result
-        self._samples_by_pv = samples_by_pv
-        self._pv_order      = pv_order
-        self._table_rows    = self._build_table_rows(samples_by_pv, pv_order)
-        self._table_rows_unfiltered = list(self._table_rows)
-        for i, pv in enumerate(pv_order):
-            if pv not in self._pv_settings:
-                self._pv_settings[pv] = self._get_pv_default_settings(pv, i)
-        # Find latest ts for incremental fetch
-        max_ts = 0
-        for samples in samples_by_pv.values():
-            if samples: max_ts = max(max_ts, samples[-1][0])
-        self._live_last_ts = max_ts if max_ts else end_ns
         self._btn_load.setEnabled(True)
-        self._plot_graph()
-        self._populate_table()
-        self._refresh_xy_choices()
-        self._schedule_live_tick()
+        try:
+            samples_by_pv, pv_order, _, start_ns, end_ns = result
+            self._samples_by_pv = samples_by_pv
+            self._pv_order      = pv_order
+            self._table_rows    = self._build_table_rows(samples_by_pv, pv_order)
+            self._table_rows_unfiltered = list(self._table_rows)
+            for i, pv in enumerate(pv_order):
+                if pv not in self._pv_settings:
+                    self._pv_settings[pv] = self._get_pv_default_settings(pv, i)
+            # Find latest ts for incremental fetch
+            max_ts = 0
+            for samples in samples_by_pv.values():
+                if samples: max_ts = max(max_ts, samples[-1][0])
+            self._live_last_ts = max_ts if max_ts else end_ns
+            self._plot_graph()
+            self._populate_table()
+            self._refresh_xy_choices()
+        except Exception:
+            import traceback
+            self._log(f"[live initial load]\n{traceback.format_exc()}")
+        finally:
+            # Always keep the live loop alive even if this paint failed.
+            if self._live_mode:
+                self._schedule_live_tick()
 
     def _live_tick(self):
         if not self._live_mode: return
@@ -2286,7 +2341,7 @@ class CSSLoggerWidget(QWidget):
 
         def _worker():
             try:
-                from cssl import cpva_fetch_samples_chunked, cpva_decode_value
+                from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value
                 new_samples: dict = {}
                 added_count = 0
                 for pv in pvs:
@@ -2312,32 +2367,38 @@ class CSSLoggerWidget(QWidget):
 
     def _on_incremental_finished(self, result):
         if not self._live_mode: return
-        new_samples, added_count, end_ns = result
-        self._live_last_ts = end_ns
+        try:
+            new_samples, added_count, end_ns = result
+            self._live_last_ts = end_ns
 
-        if added_count > 0:
-            for pv, pts in new_samples.items():
-                existing = self._samples_by_pv.get(pv, [])
-                existing.extend(pts)
-                # Trim to window
-                if self._live_window_span:
-                    cutoff_ns = int((datetime.now().astimezone(timezone.utc)
-                                     - self._live_window_span).timestamp() * 1e9)
-                    self._samples_by_pv[pv] = [s for s in existing if s[0] >= cutoff_ns]
-                else:
-                    self._samples_by_pv[pv] = existing
+            if added_count > 0:
+                for pv, pts in new_samples.items():
+                    existing = self._samples_by_pv.get(pv, [])
+                    existing.extend(pts)
+                    # Trim to window
+                    if self._live_window_span:
+                        cutoff_ns = int((datetime.now().astimezone(timezone.utc)
+                                         - self._live_window_span).timestamp() * 1e9)
+                        self._samples_by_pv[pv] = [s for s in existing if s[0] >= cutoff_ns]
+                    else:
+                        self._samples_by_pv[pv] = existing
 
-            self._table_rows = self._build_table_rows(
-                self._samples_by_pv, self._pv_order)
-            self._table_rows_unfiltered = list(self._table_rows)
-            self._apply_conditions_to_rows()
-            self._update_graph_data()
-            self._populate_table()
-            total_pts = sum(len(v) for v in self._samples_by_pv.values())
-            self._lbl_status.setText(
-                f"Live +{added_count} pts  |  total {total_pts}")
-
-        self._schedule_live_tick()
+                self._table_rows = self._build_table_rows(
+                    self._samples_by_pv, self._pv_order)
+                self._table_rows_unfiltered = list(self._table_rows)
+                self._apply_conditions_to_rows()
+                self._update_graph_data()
+                self._populate_table()
+                total_pts = sum(len(v) for v in self._samples_by_pv.values())
+                self._lbl_status.setText(
+                    f"Live +{added_count} pts  |  total {total_pts}")
+        except Exception:
+            # A failed incremental update must NOT kill the live loop or crash
+            # the Qt timer callback — log and keep polling.
+            import traceback
+            self._log(f"[live tick]\n{traceback.format_exc()}")
+        finally:
+            self._schedule_live_tick()
 
     def _schedule_live_tick(self):
         if not self._live_mode: return
@@ -2620,7 +2681,12 @@ class CSSLoggerWidget(QWidget):
             if _looks_like_image_path(str(val)):
                 path = _resolve_image_path(str(val))
                 if path and os.path.exists(path):
-                    _open_path(path); return
+                    try:
+                        _open_path(path)
+                    except Exception as exc:
+                        self._log(f"Could not open image:\n{path}\n{exc}")
+                        QMessageBox.warning(self, "Cannot open image", f"{path}\n\n{exc}")
+                    return
         self._log("No image path found in this row.")
 
     # ── Axis settings table ─────────────────────────────────────────────────
@@ -2682,6 +2748,17 @@ class CSSLoggerWidget(QWidget):
                 if self._mpl_canvas:
                     self._mpl_canvas.draw_idle()
 
+    @staticmethod
+    def _safe_float(txt, fallback=None):
+        """Parse a user-entered float; bad/blank input falls back instead of raising."""
+        txt = (txt or "").strip().replace(",", ".")
+        if not txt:
+            return None
+        try:
+            return float(txt)
+        except ValueError:
+            return fallback
+
     def _apply_axis_settings(self):
         _COL = list(self._axis_tv_cols)
         for row_i in range(self._axis_tv.rowCount()):
@@ -2700,12 +2777,9 @@ class CSSLoggerWidget(QWidget):
                     if c: s[col_name] = c
                 elif col_name in ("pv", "cursor_val"):
                     pass
-                elif col_name in ("ymin", "ymax"):
-                    txt = item.text().strip()
-                    s[col_name] = float(txt) if txt else None
-                elif col_name == "width":
-                    txt = item.text().strip()
-                    s[col_name] = float(txt) if txt else None
+                elif col_name in ("ymin", "ymax", "width"):
+                    # Bad numeric input keeps the previous value instead of crashing.
+                    s[col_name] = self._safe_float(item.text(), s.get(col_name))
                 elif col_name == "smooth":
                     txt = item.text().strip()
                     s[col_name] = int(txt) if txt.isdigit() else 1
@@ -2745,6 +2819,18 @@ class CSSLoggerWidget(QWidget):
             self._xy_y_combo.setCurrentIndex(2)
 
     def _plot_xy(self):
+        try:
+            self._plot_xy_impl()
+        except Exception:
+            import traceback
+            self._log(f"[plot_xy]\n{traceback.format_exc()}")
+            try:
+                self._clear_xy_plot()
+            except Exception:
+                pass
+            self._lbl_xy_info.setText("XY plot error — see Log tab.")
+
+    def _plot_xy_impl(self):
         x_label = self._xy_x_combo.currentText()
         y_label = self._xy_y_combo.currentText()
         x_pv    = self._xy_choice_map.get(x_label)
@@ -2822,7 +2908,22 @@ class CSSLoggerWidget(QWidget):
     # ── PV Time Plot ────────────────────────────────────────────────────────
 
     def _plot_pv_time(self):
-        from cssl import load_ramping_repository
+        try:
+            self._plot_pv_time_impl()
+        except Exception:
+            import traceback
+            self._log(f"[plot_pv_time]\n{traceback.format_exc()}")
+            try:
+                self._clear_pv_time_plot()
+            except Exception:
+                pass
+            QMessageBox.warning(
+                self, "PV Time Plot",
+                "Could not build the PV-time plot — see Log tab.\n"
+                "(Reading the ramping repository may require the 'pyarrow' package.)")
+
+    def _plot_pv_time_impl(self):
+        from cpva_core import load_ramping_repository
         y_col  = self._pv_time_y_combo.currentText()
         t_from = self._pv_time_from_edit.text().strip()
         t_to   = self._pv_time_to_edit.text().strip()
@@ -2909,7 +3010,7 @@ class CSSLoggerWidget(QWidget):
 
     def _load_data_repository(self):
         try:
-            from cssl import load_ramping_repository
+            from cpva_core import load_ramping_repository
             self._ramping_repository = load_ramping_repository()
             self._log(f"Repository: {len(self._ramping_repository)} entries loaded.")
         except Exception as exc:

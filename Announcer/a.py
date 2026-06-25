@@ -26,10 +26,10 @@ FLASH_INTERVAL_MS = 300     # flash blink speed
 PV_AVG_COUNT = 25   # number of recent values to average
 PV_POLL_MS   = 500  # how often to read PVs (ms)
 
-# (pv_name, display_label, orange_threshold, red_threshold, unit)  — alert when avg < orange_threshold
+# (pv_name, label, lo_orange, lo_red, hi_orange, hi_red, unit)
 _PV_MONITORS = [
-    ("L3-UTIL-HEB03-001:PressOut_PSI", "Helium volume", 46, 45.5, "PSI"),
-    ("HAPLS-VOLT_IN_CGL-SEEDER_ER3_ALPHA1:SeederPZTVoltage", "Alpha voltage", 1.2, 1.1, "V"),
+    ("L3-UTIL-HEB03-001:PressOut_PSI", "Helium volume", 46, 45.5, 57, 60, "PSI"),
+    ("HAPLS-VOLT_IN_CGL-SEEDER_ER3_ALPHA1:SeederPZTVoltage", "Alpha voltage", 1.2, 1.1, 1.9, 2.2, "V"),
 ]
 
 _RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry"}
@@ -182,13 +182,16 @@ class ScreenTracker(tk.Tk):
 
         pv_saved = self._presets.get("pv_thresholds", {})
         self._pv_thr_vars = []
-        for pv_name, _label, default_orange, default_red, _unit in _PV_MONITORS:
+        for pv_name, _label, def_lo_o, def_lo_r, def_hi_o, def_hi_r, _unit in _PV_MONITORS:
             saved = pv_saved.get(pv_name, {})
-            orange_var = tk.DoubleVar(value=saved.get("orange", default_orange))
-            red_var    = tk.DoubleVar(value=saved.get("red",    default_red))
-            orange_var.trace_add("write", lambda *_: self._save_pv_thresholds())
-            red_var.trace_add(   "write", lambda *_: self._save_pv_thresholds())
-            self._pv_thr_vars.append((orange_var, red_var))
+            # backward-compat: old keys were "orange"/"red"
+            lo_r_var = tk.DoubleVar(value=saved.get("lo_red",    saved.get("red",    def_lo_r)))
+            lo_o_var = tk.DoubleVar(value=saved.get("lo_orange", saved.get("orange", def_lo_o)))
+            hi_o_var = tk.DoubleVar(value=saved.get("hi_orange", def_hi_o))
+            hi_r_var = tk.DoubleVar(value=saved.get("hi_red",    def_hi_r))
+            for v in (lo_r_var, lo_o_var, hi_o_var, hi_r_var):
+                v.trace_add("write", lambda *_: self._save_pv_thresholds())
+            self._pv_thr_vars.append((lo_r_var, lo_o_var, hi_o_var, hi_r_var))
 
         self._build_ui()
         self.bind("<Button-1>", self._on_any_click)
@@ -315,7 +318,7 @@ class ScreenTracker(tk.Tk):
         self._pv_frame.grid_remove()
         self.columnconfigure(0, weight=1)
 
-        for _pv_name, _label, _orange_thr, _red_thr, _unit in _PV_MONITORS:
+        for _pv_name, _label, *_thresholds in _PV_MONITORS:
             row_frame = tk.Frame(self._pv_frame, bg="#cc6600", padx=8, pady=5)
             lbl = tk.Label(row_frame, text="", bg="#cc6600", fg="white",
                            font=("Segoe UI", 9, "bold"), anchor="w")
@@ -352,10 +355,15 @@ class ScreenTracker(tk.Tk):
 
     def _save_pv_thresholds(self):
         thr = {}
-        for i, (pv_name, _label, _o, _r, _unit) in enumerate(_PV_MONITORS):
-            orange_var, red_var = self._pv_thr_vars[i]
+        for i, (pv_name, *_rest) in enumerate(_PV_MONITORS):
+            lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
             try:
-                thr[pv_name] = {"orange": orange_var.get(), "red": red_var.get()}
+                thr[pv_name] = {
+                    "lo_red":    lo_r_var.get(),
+                    "lo_orange": lo_o_var.get(),
+                    "hi_orange": hi_o_var.get(),
+                    "hi_red":    hi_r_var.get(),
+                }
             except tk.TclError:
                 pass
         self._presets["pv_thresholds"] = thr
@@ -502,24 +510,43 @@ class ScreenTracker(tk.Tk):
             self._sound_combo.current(self._sound_files.index(self.sound_file.get()))
         self._sound_combo.grid(row=3, column=1, padx=(0,6), pady=(0,6))
 
-        # PV Limits
-        pv_lim_frame = ttk.LabelFrame(frame, text="PV Limits  (alert when value drops below)")
+        # PV Limits table
+        pv_lim_frame = ttk.LabelFrame(frame, text="PV Limits")
         pv_lim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
-        for i, (_pv_name, label, default_orange, _default_red, unit) in enumerate(_PV_MONITORS):
-            orange_var, red_var = self._pv_thr_vars[i]
-            inc = 0.01 if default_orange < 10 else 0.1
-            fmt = "%.2f" if default_orange < 10 else "%.1f"
-            ttk.Label(pv_lim_frame, text=f"{label} ({unit}):").grid(
-                row=i, column=0, padx=(6, 4), pady=(4, 4), sticky="w")
-            ttk.Label(pv_lim_frame, text="Warn <").grid(row=i, column=1, padx=(0, 2))
-            ttk.Spinbox(pv_lim_frame, from_=0, to=9999, increment=inc,
-                        textvariable=orange_var, width=7, format=fmt).grid(
-                row=i, column=2, padx=(0, 10))
-            ttk.Label(pv_lim_frame, text="Alarm <").grid(row=i, column=3, padx=(0, 2))
-            ttk.Spinbox(pv_lim_frame, from_=0, to=9999, increment=inc,
-                        textvariable=red_var, width=7, format=fmt).grid(
-                row=i, column=4, padx=(0, 6), pady=(4, 4))
+        # Zone legend strip
+        legend_fr = tk.Frame(pv_lim_frame)
+        legend_fr.grid(row=0, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 2))
+        for _txt, _bg in [("  RED  ", "#aa1c00"), ("  WARN  ", "#b85a00"),
+                          ("   OK   ", "#2a6030"), ("  WARN  ", "#b85a00"), ("  RED  ", "#aa1c00")]:
+            tk.Label(legend_fr, text=_txt, bg=_bg, fg="white",
+                     font=("Segoe UI", 7, "bold")).pack(side="left", padx=1)
+
+        # Column headers
+        ttk.Label(pv_lim_frame, text="Channel",
+                  font=("Segoe UI", 8, "bold")).grid(row=1, column=0, padx=(6, 8), pady=(0, 2), sticky="w")
+        for _col, (_htxt, _hbg) in enumerate(
+            [("< Red", "#aa1c00"), ("< Warn", "#b85a00"), ("Warn >", "#b85a00"), ("Red >", "#aa1c00")],
+            start=1,
+        ):
+            tk.Label(pv_lim_frame, text=f" {_htxt} ", bg=_hbg, fg="white",
+                     font=("Segoe UI", 8, "bold")).grid(row=1, column=_col, padx=3, pady=(0, 2))
+
+        ttk.Separator(pv_lim_frame, orient="horizontal").grid(
+            row=2, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 2))
+
+        # Data rows
+        for i, (_pv_name, label, default_lo_o, _lo_r, _hi_o, _hi_r, unit) in enumerate(_PV_MONITORS):
+            lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
+            inc = 0.01 if default_lo_o < 10 else 0.1
+            fmt = "%.2f" if default_lo_o < 10 else "%.1f"
+            row_idx = i + 3
+            ttk.Label(pv_lim_frame, text=f"{label} ({unit})", anchor="w").grid(
+                row=row_idx, column=0, padx=(6, 8), pady=(2, 4), sticky="w")
+            for _col, var in enumerate([lo_r_var, lo_o_var, hi_o_var, hi_r_var], start=1):
+                ttk.Spinbox(pv_lim_frame, from_=0, to=9999, increment=inc,
+                            textvariable=var, width=7, format=fmt).grid(
+                    row=row_idx, column=_col, padx=3, pady=(2, 4))
 
         # Window position & size
         win_frame = ttk.LabelFrame(frame, text="Window position & size")
@@ -903,7 +930,7 @@ class ScreenTracker(tk.Tk):
             now_ns   = int(time.time() * 1e9)
             start_ns = now_ns - 60 * 1_000_000_000   # last 60 s
             results  = []
-            for pv_name, _label, _orange_thr, _red_thr, _unit in _PV_MONITORS:
+            for pv_name, _label, *_thresholds in _PV_MONITORS:
                 try:
                     params = urllib.parse.urlencode({
                         "channelName": pv_name,
@@ -935,23 +962,28 @@ class ScreenTracker(tk.Tk):
         self._pv_poll_job = self.after(PV_POLL_MS, self._poll_pvs)
 
     def _update_pv_display(self, results: list):
-        for i, (avg, (_, label, _o, _r, unit)) in enumerate(zip(results, _PV_MONITORS)):
-            orange_thr = self._pv_thr_vars[i][0].get()
-            red_thr    = self._pv_thr_vars[i][1].get()
+        for i, (avg, (_, label, _lo_o, _lo_r, _hi_o, _hi_r, unit)) in enumerate(zip(results, _PV_MONITORS)):
+            lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
+            lo_r = lo_r_var.get()
+            lo_o = lo_o_var.get()
+            hi_o = hi_o_var.get()
+            hi_r = hi_r_var.get()
             row = self._pv_alert_rows[i]
             lbl = self._pv_alert_labels[i]
-            if avg is not None and avg < red_thr:
+
+            if avg is not None and (avg < lo_r or avg > hi_r):
                 bg = "#cc2200"
-            elif avg is not None and avg < orange_thr:
+            elif avg is not None and (avg < lo_o or avg > hi_o):
                 bg = "#cc6600"
             else:
                 bg = None
 
             if bg is not None:
                 suffix = f" {unit}" if unit else ""
-                fmt = ".2f" if unit else ".3f"
+                fmt = ".2f" if abs(avg) < 10 else ".1f"
+                arrow = " ↑" if avg > hi_o else " ↓"
                 row.configure(bg=bg)
-                lbl.configure(bg=bg, text=f"⚠  {label}: {avg:{fmt}}{suffix}")
+                lbl.configure(bg=bg, text=f"⚠  {label}: {avg:{fmt}}{suffix}{arrow}")
                 if not row.winfo_ismapped():
                     row.pack(anchor="w", pady=(0, 2))
             else:

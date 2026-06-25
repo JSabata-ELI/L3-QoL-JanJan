@@ -551,6 +551,76 @@ def prompt_move_misplaced(parent: tk.Tk, misplaced: list[tuple[Path, Path]]):
             parent=parent,
         )
 
+
+def find_programs_in_swap_state(programs: dict[str, dict]) -> list[tuple[str, Path, Path]]:
+    """Return (program_name, program_dir, temp_dir) for programs stuck mid old-version swap."""
+    stuck = []
+    for name, info in programs.items():
+        program_dir: Path = info.get("program_dir")
+        if not program_dir:
+            continue
+        temp_dir = program_dir / "archive" / "_temp_latest"
+        if temp_dir.exists() and temp_dir.is_dir():
+            stuck.append((name, program_dir, temp_dir))
+    return stuck
+
+
+def prompt_restore_swap_state(parent: tk.Tk, stuck: list[tuple[str, Path, Path]]):
+    """Dialog that offers to restore programs stuck in an incomplete old-version launch."""
+    lines = "\n".join(f"  {name}" for name, _, _ in stuck)
+    msg = (
+        f"The following programs have an incomplete old-version launch.\n"
+        f"Their latest files are stored in a temporary folder:\n\n"
+        f"{lines}\n\n"
+        f"Restore the latest versions now?"
+    )
+
+    confirmed = tk.BooleanVar(value=False)
+
+    dlg = tk.Toplevel(parent)
+    dlg.title("Incomplete old-version launch detected")
+    dlg.resizable(False, False)
+    dlg.grab_set()
+    dlg.focus_set()
+
+    ttk.Label(dlg, text=msg, justify="left", padding=(16, 12)).pack()
+
+    btn_row = ttk.Frame(dlg)
+    btn_row.pack(pady=(0, 12))
+
+    def on_yes():
+        confirmed.set(True)
+        dlg.destroy()
+
+    def on_no():
+        dlg.destroy()
+
+    ttk.Button(btn_row, text="Restore", width=10, command=on_yes).pack(side="left", padx=8)
+    ttk.Button(btn_row, text="Skip", width=10, command=on_no).pack(side="left", padx=8)
+
+    parent.wait_window(dlg)
+
+    if not confirmed.get():
+        return
+
+    errors = []
+    for name, program_dir, temp_dir in stuck:
+        try:
+            for f in list(temp_dir.iterdir()):
+                shutil.move(str(f), str(program_dir / f.name))
+            try:
+                temp_dir.rmdir()
+            except Exception:
+                pass
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    if errors:
+        messagebox.showerror(
+            "Restore failed",
+            "Some programs could not be restored:\n\n" + "\n".join(errors),
+            parent=parent,
+        )
+
 # ---------------- APP ----------------
 class Launcher(tk.Tk):
     def __init__(self):
@@ -791,15 +861,23 @@ class Launcher(tk.Tk):
         if misplaced:
             self.after(200, lambda: prompt_move_misplaced(self, misplaced))
 
+        stuck = find_programs_in_swap_state(self.programs)
+        if stuck:
+            self.after(400, lambda: prompt_restore_swap_state(self, stuck))
+
     def _run_cleanup(self):
         if not self.programs:
             messagebox.showinfo("Clean", "No programs loaded. Select a data source first.")
             return
         misplaced = find_misplaced_timestamped_exes(self.programs)
-        if not misplaced:
+        stuck = find_programs_in_swap_state(self.programs)
+        if not misplaced and not stuck:
             messagebox.showinfo("Clean", "No misplaced files found.")
             return
-        prompt_move_misplaced(self, misplaced)
+        if misplaced:
+            prompt_move_misplaced(self, misplaced)
+        if stuck:
+            prompt_restore_swap_state(self, stuck)
 
     def _rebuild_buttons(self):
         for w in self.sf.inner.winfo_children():
@@ -1185,23 +1263,51 @@ class Launcher(tk.Tk):
         label = exe_path.name
 
         if internal_dir.exists():
-            # Borrow _internal: copy exe to program_dir, run it, clean up after close
-            temp_exe = program_dir / exe_path.name
+            # Full swap: hide current version, place archive version in program_dir, restore after close.
+            temp_dir = program_dir / "archive" / "_temp_latest"
+            current_exes = [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)]
+            current_pys = list(program_dir.glob("*.py"))
+            staged_exe = program_dir / exe_path.name
+            staged_py = (program_dir / py_path.name) if py_path else None
 
             def worker():
+                swapped_files: list[Path] = []
+                did_swap = False
                 try:
-                    shutil.copy2(str(exe_path), str(temp_exe))
+                    if temp_dir.exists():
+                        self.after(0, messagebox.showerror, "Launch blocked",
+                                   f"A previous old-version launch of this program did not clean up.\n\n"
+                                   f"Use the Clean button or restart the launcher to restore it first.")
+                        self.after(0, self.status.configure, {"text": "Ready."})
+                        return
+                    temp_dir.mkdir(parents=True, exist_ok=True)
+                    for f in current_exes + current_pys:
+                        shutil.move(str(f), str(temp_dir / f.name))
+                    did_swap = True
+                    shutil.copy2(str(exe_path), str(staged_exe))
+                    swapped_files.append(staged_exe)
+                    if py_path and py_path.exists():
+                        shutil.copy2(str(py_path), str(staged_py))
+                        swapped_files.append(staged_py)
                     self.after(0, self.status.configure, {"text": f"Running: {label}"})
-                    proc = subprocess.Popen([str(temp_exe)], cwd=str(program_dir))
+                    proc = subprocess.Popen([str(staged_exe)], cwd=str(program_dir))
                     proc.wait()
                 except Exception as e:
                     self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
                     self.after(0, self.status.configure, {"text": "Launch failed."})
                 finally:
-                    try:
-                        temp_exe.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    for f in swapped_files:
+                        try:
+                            f.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    if did_swap and temp_dir.exists():
+                        try:
+                            for f in list(temp_dir.iterdir()):
+                                shutil.move(str(f), str(program_dir / f.name))
+                            temp_dir.rmdir()
+                        except Exception:
+                            pass
                     self.after(0, self.status.configure, {"text": "Ready."})
 
         elif py_path is not None and py_path.exists():
