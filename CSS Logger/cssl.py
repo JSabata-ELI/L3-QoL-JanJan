@@ -47,8 +47,8 @@ CONFIG_FILE  = APP_DIR / "cpva_explorer_config.json"
 PRESETS_FILE = APP_DIR / "cpva_presets.json"
 CONDITIONS_PRESETS_FILE = APP_DIR / "cpva_conditions_presets.json"
 CUSTOM_PVS_FILE = APP_DIR / "custom_pvs.json"
-RAMPING_REPOSITORY_DIR = APP_DIR.parent / "RampingRepository"
-DATA_REPOSITORY_DIR = APP_DIR.parent / "DataRepository"
+RAMPING_REPOSITORY_DIR = APP_DIR.parent / "Diagnostic" / "RampingRepository"
+DATA_REPOSITORY_DIR = APP_DIR.parent / "Diagnostic" / "DataRepository"
 IMAGE_ROOT = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
 # ---------------------------------------------------------------------------
 # CPVA archiver API constants

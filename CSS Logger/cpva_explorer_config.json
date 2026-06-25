@@ -10,8 +10,8 @@
     "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-06-23 14:06:12",
-  "time_to": "2026-06-23 14:16:12",
+  "time_from": "2026-06-25 15:36:01",
+  "time_to": "2026-06-25 16:36:01",
   "http_timeout": 10.0,
   "conditions": [
     {
@@ -36,5 +36,11 @@
     }
   ],
   "master_pv": "L3-PFWP6-MTR03-1:RawPos",
-  "master_multiple": "1000"
+  "master_multiple": "1000",
+  "suite_geometry": [
+    2560,
+    23,
+    2560,
+    1369
+  ]
 }

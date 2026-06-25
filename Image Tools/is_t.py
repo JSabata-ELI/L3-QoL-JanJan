@@ -177,6 +177,13 @@ def _pv_prev_date_key(date_key: str) -> str:
     return prev.strftime("%Y-%m-%d")
 
 
+def _pv_next_date_key(date_key: str) -> str:
+    """Return 'YYYY-MM-DD' for the day after date_key (Prague time)."""
+    y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
+    nxt = datetime(y, m, d, tzinfo=TZ_PRAGUE) + timedelta(days=1)
+    return nxt.strftime("%Y-%m-%d")
+
+
 def _pv_query_range(channel: str, start_ns: int, end_ns: int) -> "list[tuple[int, float]]":
     """One archiver query for samples in [start_ns, end_ns], sorted by time.
     Unlike _pv_load_day this is not day-aligned/cached — used for wide look-backs."""
@@ -213,6 +220,14 @@ _pv_before_lock = threading.Lock()
 _PV_LOOKBACK_WINDOWS_DAYS = (2, 8, 32, 120, 400)
 _DAY_NS = 86_400 * 1_000_000_000
 
+# Channels that should be matched by looking FORWARD from the image timestamp.
+# Waveplate: the motor settles AFTER the shot command, so the stable position
+# is recorded slightly after the image timestamp.
+_PV_FORWARD_CHANNELS: frozenset = frozenset({"L3-PFWP6-MTR03-1:RawPos"})
+# ±window (ns) used when searching for a "nearby" sample around the image timestamp.
+# Energy detectors fire within a second of the image; waveplate within tens of seconds.
+_PV_WINDOW_NS: int = 30 * 1_000_000_000  # 30 s
+
 
 def _pv_value_at_or_before(channel: str, ts_ns: int) -> "float | None":
     """Last sample value at or before ts_ns, searching progressively further back
@@ -234,21 +249,56 @@ def _pv_value_at_or_before(channel: str, ts_ns: int) -> "float | None":
     return val
 
 
-def _pv_last_known(channel: str, ts_ns: int, max_lookback_days: int = 7) -> "float | None":
-    """Return the last known value of channel at or before ts_ns.
+def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
+    """Return nearest sample to ts_ns within ±_PV_WINDOW_NS (30 s).
 
-    Checks the image's own day first (fast, day-cached). If that day has no sample
-    at or before ts_ns, falls back to a progressively-widening look-back so even
-    slowly-changing PVs (e.g. waveplate set weeks/months earlier) resolve correctly.
+    Strategy differs by channel type:
+    - Forward channels (waveplate): prefer the FIRST sample at or AFTER ts_ns
+      within the window (motor settles after the trigger); fall back to the
+      last-ever-known value if nothing is close.
+    - Energy channels: prefer the LAST sample at or BEFORE ts_ns within the
+      window (detector fires just before the image).  If ts_ns is slightly
+      before the first sample of the day, also accept the next sample within
+      the window.  Returns None when no sample is within 30 s — never shows a
+      value from a completely different session hours/days earlier.
     """
     date_key = _pv_date_key(ts_ns)
-    samples = _pv_load_day(channel, date_key)
-    if samples:
-        ts_list = [s[0] for s in samples]
-        idx = bisect.bisect_right(ts_list, ts_ns) - 1
-        if idx >= 0:
-            return samples[idx][1]
-    return _pv_value_at_or_before(channel, ts_ns)
+    # Collect candidates from same day + adjacent days (handles midnight boundary)
+    candidates: list[tuple[int, float]] = []
+    for dk in (_pv_prev_date_key(date_key), date_key, _pv_next_date_key(date_key)):
+        day = _pv_load_day(channel, dk)
+        if day:
+            candidates.extend(day)
+    if not candidates:
+        if channel in _PV_FORWARD_CHANNELS:
+            return _pv_value_at_or_before(channel, ts_ns)
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    ts_list = [s[0] for s in candidates]
+
+    if channel in _PV_FORWARD_CHANNELS:
+        # Primary: first sample >= ts_ns within window
+        idx_f = bisect.bisect_left(ts_list, ts_ns)
+        if idx_f < len(candidates) and (candidates[idx_f][0] - ts_ns) <= _PV_WINDOW_NS:
+            return candidates[idx_f][1]
+        # Secondary: last sample < ts_ns within window (small backward offset)
+        idx_b = bisect.bisect_right(ts_list, ts_ns) - 1
+        if idx_b >= 0 and (ts_ns - candidates[idx_b][0]) <= _PV_WINDOW_NS:
+            return candidates[idx_b][1]
+        # Fallback: last-known backward (waveplate position may be set days ago)
+        return _pv_value_at_or_before(channel, ts_ns)
+    else:
+        # Primary: last sample <= ts_ns within window
+        idx_b = bisect.bisect_right(ts_list, ts_ns) - 1
+        if idx_b >= 0 and (ts_ns - candidates[idx_b][0]) <= _PV_WINDOW_NS:
+            return candidates[idx_b][1]
+        # Secondary: first sample > ts_ns within window (image slightly ahead of PV)
+        idx_f = bisect.bisect_left(ts_list, ts_ns)
+        if idx_f < len(candidates) and (candidates[idx_f][0] - ts_ns) <= _PV_WINDOW_NS:
+            return candidates[idx_f][1]
+        # No sample within 30 s — don't show a stale value from hours/days ago
+        return None
 
 
 def _format_pv_value(channel: str, val: float) -> str:
@@ -3027,6 +3077,993 @@ class DatePickerDialog(QDialog):
             end   = datetime(y, m, day, h1 + 1, 0, 0, tzinfo=TZ_PRAGUE)
         return ns_from_dt(start), ns_from_dt(end)
 
+# ---------------- PDXM1 GRID CONFIG ----------------
+from dataclasses import dataclass as _dataclass, field as _field, asdict as _asdict
+
+_PDXM1_GRID_CONFIGS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "pdxm1_grid_configs.json"
+
+def _cam_type_key(cam_name: str) -> str:
+    """Return a config key for grid storage.
+    PDXM1/PDXM2 cameras share a type key (PD1M1, PD2M2, …).
+    All other cameras use their full name as key (per-camera config)."""
+    m = re.search(r'PD[1-4]M[12]', cam_name, re.IGNORECASE)
+    return m.group(0).upper() if m else cam_name.strip()
+
+def _load_pdxm1_grid_configs() -> dict:
+    try:
+        if _PDXM1_GRID_CONFIGS_PATH.exists():
+            return json.loads(_PDXM1_GRID_CONFIGS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def _save_pdxm1_grid_configs(data: dict):
+    try:
+        _PDXM1_GRID_CONFIGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PDXM1_GRID_CONFIGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+# Known camera types whose columns are displayed reversed
+_PDXM1_REVERSED_TYPES = {"PD2M1"}
+
+@_dataclass
+class Pdxm1GridConfig:
+    n_cols: int = 5
+    n_rows: int = 8
+    # Absolute fractions [0,1] of the full image — NOT relative to the grid borders.
+    # Length = n_cols-1 and n_rows-1 respectively.  [] = auto (equal spacing).
+    # Storing absolute positions makes every line truly independent: moving a
+    # border does NOT shift the inner dividers, and vice versa.
+    col_dividers: list = _field(default_factory=list)
+    row_dividers: list = _field(default_factory=list)
+    col_labels: list = _field(default_factory=list)   # [] = auto (A-E or reversed)
+    row_labels: list = _field(default_factory=list)   # [] = auto (1-8)
+    col_reversed: bool = False
+    line_width: int = 1
+    line_color: str = "#ffffff"
+    line_alpha: int = 90
+    font_size: int = 0                                 # 0 = auto
+    font_color: str = "#ffffff"
+    font_alpha: int = 210
+    font_outline: int = 1                             # 0 = no outline; >0 = outline thickness in px
+    show: bool = True                                # whether the grid overlay is visible
+    grid_left:   float = 0.0                         # left border as fraction of image width
+    grid_right:  float = 1.0                         # right border as fraction of image width
+    grid_top:    float = 0.0                         # top border as fraction of image height
+    grid_bottom: float = 1.0                         # bottom border as fraction of image height
+
+    def effective_col_labels(self) -> list:
+        if self.col_labels:
+            return self.col_labels
+        base = [chr(65 + i) for i in range(self.n_cols)]
+        return list(reversed(base)) if self.col_reversed else base
+
+    def effective_row_labels(self) -> list:
+        if self.row_labels:
+            return self.row_labels
+        return [str(i + 1) for i in range(self.n_rows)]
+
+    def effective_col_dividers(self) -> list:
+        """Absolute image-fraction positions of inner column dividers (len = n_cols-1)."""
+        n = self.n_cols
+        if self.col_dividers and len(self.col_dividers) == n - 1:
+            return list(self.col_dividers)
+        # Default: equal spacing within current grid borders
+        gl, gr = self.grid_left, self.grid_right
+        return [gl + (gr - gl) * i / n for i in range(1, n)]
+
+    def effective_row_dividers(self) -> list:
+        """Absolute image-fraction positions of inner row dividers (len = n_rows-1)."""
+        n = self.n_rows
+        if self.row_dividers and len(self.row_dividers) == n - 1:
+            return list(self.row_dividers)
+        gt, gb = self.grid_top, self.grid_bottom
+        return [gt + (gb - gt) * i / n for i in range(1, n)]
+
+
+def get_pdxm1_grid_config(cam_name: str) -> Pdxm1GridConfig:
+    """Return the Pdxm1GridConfig for a camera, loading saved data or returning defaults."""
+    key = _cam_type_key(cam_name)
+    saved = _load_pdxm1_grid_configs()
+    cfg = Pdxm1GridConfig()
+    # Non-PDXM1 cameras default to hidden grid; PDXM1 cameras default to visible.
+    is_pdxm1 = bool(re.search(r'PD[1-4]M1(?!\d)', cam_name, re.IGNORECASE))
+    cfg.show = is_pdxm1
+    cfg.col_reversed = key in _PDXM1_REVERSED_TYPES
+    if key in saved:
+        d = saved[key]
+        for f in ("n_cols","n_rows","col_dividers","row_dividers","col_labels","row_labels",
+                  "col_reversed","line_width","line_color","line_alpha",
+                  "font_size","font_color","font_alpha","font_outline","show",
+                  "grid_left","grid_right","grid_top","grid_bottom"):
+            if f in d:
+                setattr(cfg, f, d[f])
+        # Migrate from old format (col_widths/row_heights were proportional fractions
+        # within the grid area; convert to absolute image fractions).
+        if "col_widths" in d and not cfg.col_dividers:
+            gl = d.get("grid_left", 0.0)
+            gr = d.get("grid_right", 1.0)
+            ws = d["col_widths"]
+            acc = 0.0
+            divs = []
+            for w in ws[:-1]:
+                acc += w
+                divs.append(gl + acc * (gr - gl))
+            cfg.col_dividers = divs
+        if "row_heights" in d and not cfg.row_dividers:
+            gt = d.get("grid_top", 0.0)
+            gb = d.get("grid_bottom", 1.0)
+            hs = d["row_heights"]
+            acc = 0.0
+            divs = []
+            for h in hs[:-1]:
+                acc += h
+                divs.append(gt + acc * (gb - gt))
+            cfg.row_dividers = divs
+    return cfg
+
+
+def _draw_outlined_text(p, rect, align_flags, text, font, fill_color, outline_px: int):
+    """Draw text centred in rect; if outline_px > 0 draws a black stroke behind the fill."""
+    if not text:
+        return
+    from PySide6.QtGui import QPainterPath, QFontMetrics
+    p.setFont(font)
+    if outline_px <= 0:
+        p.setPen(fill_color)
+        p.drawText(rect, align_flags, text)
+        return
+    fm = QFontMetrics(font)
+    tw = fm.horizontalAdvance(text)
+    th = fm.height()
+    rx, ry, rw, rh = rect.x(), rect.y(), rect.width(), rect.height()
+    if align_flags & Qt.AlignmentFlag.AlignHCenter:
+        tx = rx + (rw - tw) / 2.0
+    elif align_flags & Qt.AlignmentFlag.AlignRight:
+        tx = float(rx + rw - tw)
+    else:
+        tx = float(rx)
+    if align_flags & Qt.AlignmentFlag.AlignVCenter:
+        ty = ry + (rh - th) / 2.0 + fm.ascent()
+    elif align_flags & Qt.AlignmentFlag.AlignBottom:
+        ty = float(ry + rh - fm.descent())
+    else:
+        ty = float(ry + fm.ascent())
+    path = QPainterPath()
+    path.addText(tx, ty, font, text)
+    pen = QPen(QColor(0, 0, 0), outline_px * 2)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    old_brush = p.brush()
+    p.strokePath(path, pen)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(fill_color)
+    p.drawPath(path)
+    p.setBrush(old_brush)
+
+
+class _GridPreviewWidget(QWidget):
+    """Interactive widget for editing a Pdxm1GridConfig.
+    The user can drag column/row dividers to change relative widths/heights."""
+
+    changed = Signal()  # emitted on every drag update
+
+    def __init__(self, cfg: Pdxm1GridConfig, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(300, 240)
+        self._cfg = cfg
+        self._drag_col: int = -1   # dragging inner col divider index
+        self._drag_row: int = -1   # dragging inner row divider index
+        self._drag_border: str = ''  # 'left','right','top','bottom'
+        self._drag_start_x: int = 0
+        self._drag_start_y: int = 0
+        self._drag_orig_divs_col: list = []   # absolute fractions at drag start
+        self._drag_orig_divs_row: list = []
+        self._drag_orig_left:   float = 0.0
+        self._drag_orig_right:  float = 1.0
+        self._drag_orig_top:    float = 0.0
+        self._drag_orig_bottom: float = 1.0
+        self.setMouseTracking(True)
+
+    MARGIN = 10
+    HANDLE_PX = 6  # pixels around a divider where hover/drag activates
+
+    def _col_x_positions(self):
+        """Pixel x positions of inner column dividers (absolute image fractions)."""
+        m = self.MARGIN
+        aw = self.width() - 2 * m
+        return [m + int(d * aw) for d in self._cfg.effective_col_dividers()]
+
+    def _row_y_positions(self):
+        """Pixel y positions of inner row dividers (absolute image fractions)."""
+        m = self.MARGIN
+        ah = self.height() - 2 * m
+        return [m + int(d * ah) for d in self._cfg.effective_row_dividers()]
+
+    def _grid_rect(self):
+        """Return (gx, gy, gw, gh) pixel coords of the grid area."""
+        m = self.MARGIN
+        aw = self.width()  - 2 * m
+        ah = self.height() - 2 * m
+        gx = m + int(self._cfg.grid_left  * aw)
+        gy = m + int(self._cfg.grid_top   * ah)
+        gw = max(4, int((self._cfg.grid_right  - self._cfg.grid_left)  * aw))
+        gh = max(4, int((self._cfg.grid_bottom - self._cfg.grid_top)   * ah))
+        return gx, gy, gw, gh
+
+    def _hit_col_divider(self, pos) -> int:
+        """Return col index (0-based, after col i) or -1."""
+        for i, x in enumerate(self._col_x_positions()):
+            if abs(pos.x() - x) <= self.HANDLE_PX:
+                return i
+        return -1
+
+    def _hit_row_divider(self, pos) -> int:
+        for i, y in enumerate(self._row_y_positions()):
+            if abs(pos.y() - y) <= self.HANDLE_PX:
+                return i
+        return -1
+
+    def _hit_border(self, pos) -> str:
+        """Return 'left','right','top','bottom' or '' for outer grid border lines."""
+        gx, gy, gw, gh = self._grid_rect()
+        h = self.HANDLE_PX
+        if abs(pos.x() - gx)       <= h and gy <= pos.y() <= gy + gh: return 'left'
+        if abs(pos.x() - (gx + gw)) <= h and gy <= pos.y() <= gy + gh: return 'right'
+        if abs(pos.y() - gy)       <= h and gx <= pos.x() <= gx + gw: return 'top'
+        if abs(pos.y() - (gy + gh)) <= h and gx <= pos.x() <= gx + gw: return 'bottom'
+        return ''
+
+    def mousePressEvent(self, event):
+        pos = event.position().toPoint()
+        ci = self._hit_col_divider(pos)
+        ri = self._hit_row_divider(pos)
+        bd = self._hit_border(pos)
+        if ci >= 0:
+            self._drag_col = ci
+            self._drag_start_x = pos.x()
+            self._drag_orig_divs_col = list(self._cfg.effective_col_dividers())
+        elif ri >= 0:
+            self._drag_row = ri
+            self._drag_start_y = pos.y()
+            self._drag_orig_divs_row = list(self._cfg.effective_row_dividers())
+        elif bd:
+            self._drag_border = bd
+            self._drag_start_x = pos.x()
+            self._drag_start_y = pos.y()
+            self._drag_orig_left   = self._cfg.grid_left
+            self._drag_orig_right  = self._cfg.grid_right
+            self._drag_orig_top    = self._cfg.grid_top
+            self._drag_orig_bottom = self._cfg.grid_bottom
+            # Freeze inner dividers at their current absolute positions so border
+            # movement doesn't shift them (effective_col/row_dividers recomputes from
+            # grid bounds when col/row_dividers is empty).
+            if not (self._cfg.col_dividers and
+                    len(self._cfg.col_dividers) == self._cfg.n_cols - 1):
+                self._cfg.col_dividers = list(self._cfg.effective_col_dividers())
+            if not (self._cfg.row_dividers and
+                    len(self._cfg.row_dividers) == self._cfg.n_rows - 1):
+                self._cfg.row_dividers = list(self._cfg.effective_row_dividers())
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self._drag_col >= 0:
+            aw = self.width() - 2 * self.MARGIN
+            if aw > 0:
+                dx = pos.x() - self._drag_start_x
+                delta_frac = dx / aw
+                divs = list(self._drag_orig_divs_col)
+                i = self._drag_col
+                MIN_SEP = 0.01
+                prev = self._cfg.grid_left if i == 0 else divs[i - 1]
+                nxt  = self._cfg.grid_right if i >= len(divs) - 1 else divs[i + 1]
+                divs[i] = max(prev + MIN_SEP, min(nxt - MIN_SEP,
+                              self._drag_orig_divs_col[i] + delta_frac))
+                self._cfg.col_dividers = divs
+                self.update(); self.changed.emit(); return
+        if self._drag_row >= 0:
+            ah = self.height() - 2 * self.MARGIN
+            if ah > 0:
+                dy = pos.y() - self._drag_start_y
+                delta_frac = dy / ah
+                divs = list(self._drag_orig_divs_row)
+                i = self._drag_row
+                MIN_SEP = 0.01
+                prev = self._cfg.grid_top if i == 0 else divs[i - 1]
+                nxt  = self._cfg.grid_bottom if i >= len(divs) - 1 else divs[i + 1]
+                divs[i] = max(prev + MIN_SEP, min(nxt - MIN_SEP,
+                              self._drag_orig_divs_row[i] + delta_frac))
+                self._cfg.row_dividers = divs
+                self.update(); self.changed.emit(); return
+        # Border drag — each line moves only itself
+        if self._drag_border:
+            m = self.MARGIN
+            aw = self.width()  - 2 * m
+            ah = self.height() - 2 * m
+            if aw > 0 and ah > 0:
+                dx = (pos.x() - self._drag_start_x) / aw
+                dy = (pos.y() - self._drag_start_y) / ah
+                MIN = 0.02
+                b = self._drag_border
+                if b == 'left':
+                    self._cfg.grid_left  = max(0.0, min(self._drag_orig_right - MIN,
+                                                         self._drag_orig_left + dx))
+                elif b == 'right':
+                    self._cfg.grid_right = max(self._drag_orig_left + MIN, min(1.0,
+                                                         self._drag_orig_right + dx))
+                elif b == 'top':
+                    self._cfg.grid_top    = max(0.0, min(self._drag_orig_bottom - MIN,
+                                                          self._drag_orig_top + dy))
+                elif b == 'bottom':
+                    self._cfg.grid_bottom = max(self._drag_orig_top + MIN, min(1.0,
+                                                          self._drag_orig_bottom + dy))
+                self.update(); self.changed.emit(); return
+        # Hover: change cursor near dividers / borders
+        ci = self._hit_col_divider(pos)
+        ri = self._hit_row_divider(pos)
+        bd = self._hit_border(pos)
+        if ci >= 0 or bd in ('left', 'right'):
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+        elif ri >= 0 or bd in ('top', 'bottom'):
+            self.setCursor(Qt.CursorShape.SplitVCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_col = -1
+        self._drag_row = -1
+        self._drag_border = ''
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QFont as _GF
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.fillRect(self.rect(), QColor(0x22, 0x22, 0x22))
+
+        m = self.MARGIN
+        avail_w = self.width()  - 2 * m
+        avail_h = self.height() - 2 * m
+        divs_col = self._cfg.effective_col_dividers()
+        divs_row = self._cfg.effective_row_dividers()
+        col_labels = self._cfg.effective_col_labels()
+        row_labels = self._cfg.effective_row_labels()
+
+        # Border pixel positions
+        gx = m + int(self._cfg.grid_left   * avail_w)
+        gy = m + int(self._cfg.grid_top    * avail_h)
+        gw = max(4, int((self._cfg.grid_right  - self._cfg.grid_left)  * avail_w))
+        gh = max(4, int((self._cfg.grid_bottom - self._cfg.grid_top)   * avail_h))
+
+        lc = QColor(self._cfg.line_color)
+        lc.setAlpha(self._cfg.line_alpha)
+        pen = QPen(lc); pen.setWidth(max(1, self._cfg.line_width)); p.setPen(pen)
+
+        # Build col/row pixel positions from absolute divider fractions
+        col_xs = [gx] + [m + int(d * avail_w) for d in divs_col] + [gx + gw]
+        row_ys = [gy] + [m + int(d * avail_h) for d in divs_row] + [gy + gh]
+
+        for x in col_xs:
+            p.drawLine(x, gy, x, gy + gh)
+        for y in row_ys:
+            p.drawLine(gx, y, gx + gw, y)
+
+        # Labels
+        fc = QColor(self._cfg.font_color)
+        fc.setAlpha(self._cfg.font_alpha)
+        n_cols_preview = len(col_xs) - 1
+        fsize = self._cfg.font_size if self._cfg.font_size > 0 else max(8, int(gw / max(1, n_cols_preview) * 0.45))
+        gf = _GF(); gf.setPixelSize(max(7, fsize)); gf.setBold(True)
+        for ci, lbl in enumerate(col_labels):
+            cx = col_xs[ci]; cw = col_xs[ci + 1] - col_xs[ci]
+            cell_h_px = row_ys[1] - row_ys[0]
+            _draw_outlined_text(p, QRect(cx, gy, cw, int(cell_h_px * 0.4)),
+                                Qt.AlignmentFlag.AlignCenter, lbl, gf, fc, self._cfg.font_outline)
+        for ri, lbl in enumerate(row_labels):
+            ry = row_ys[ri]; rh = row_ys[ri + 1] - row_ys[ri]
+            cell_w_px = col_xs[1] - col_xs[0]
+            _draw_outlined_text(p, QRect(gx, ry, int(cell_w_px * 0.4), rh),
+                                Qt.AlignmentFlag.AlignCenter, lbl, gf, fc, self._cfg.font_outline)
+
+        # Highlight draggable inner dividers (col/row)
+        dp = QPen(QColor(255, 200, 0, 120)); dp.setWidth(3); p.setPen(dp)
+        for x in col_xs[1:-1]:
+            p.drawLine(x, gy, x, gy + gh)
+        dp.setStyle(Qt.PenStyle.DashLine); p.setPen(dp)
+        for y in row_ys[1:-1]:
+            p.drawLine(gx, y, gx + gw, y)
+
+        # Highlight outer border lines as draggable (solid orange)
+        op = QPen(QColor(255, 140, 0, 180)); op.setWidth(4); p.setPen(op)
+        p.drawLine(col_xs[0],  gy,      col_xs[0],  gy + gh)   # left
+        p.drawLine(col_xs[-1], gy,      col_xs[-1], gy + gh)   # right
+        p.drawLine(gx,         row_ys[0],  gx + gw, row_ys[0])  # top
+        p.drawLine(gx,         row_ys[-1], gx + gw, row_ys[-1]) # bottom
+
+        p.end()
+
+
+class Pdxm1GridConfigDialog(QDialog):
+    """Dialog to configure the PDXM1 reference grid overlay."""
+
+    def __init__(self, cam_name: str, img_view=None, parent=None):
+        super().__init__(parent)
+        self._cam_name = cam_name
+        self._key = _cam_type_key(cam_name)
+        self._cfg = get_pdxm1_grid_config(cam_name)
+        self._img_view = img_view
+        self._orig_show_grid = img_view.show_pdxm1_grid if img_view is not None else True
+        # Push live config to the view immediately so it shows during dialog
+        if img_view is not None:
+            img_view._pdxm1_cfg_override = self._cfg
+            img_view.update()
+        self.setWindowTitle(f"Grid Config — {self._key}")
+        self.resize(520, 1120)
+        self.setStyleSheet("""
+            QDialog, QWidget#pdxm1_cfg_root { background-color: #f0f0f0; }
+            QLabel      { color: #111111; background: transparent; }
+            QCheckBox   { color: #111111; background: transparent; }
+            QSpinBox    { color: #111111; background-color: #ffffff;
+                          border: 1px solid #aaaaaa; padding: 1px 3px; }
+            QPushButton { color: #111111; background-color: #e0e0e0;
+                          border: 1px solid #aaaaaa; padding: 3px 10px; }
+            QPushButton:hover   { background-color: #d0d0d0; }
+            QPushButton:pressed { background-color: #c0c0c0; }
+        """)
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        cfg = self._cfg
+
+        # ── Grid structure ──
+        struct_row = QHBoxLayout()
+        struct_row.addWidget(QLabel("Columns:"))
+        self._ncols_sb = QSpinBox(); self._ncols_sb.setRange(1, 20); self._ncols_sb.setValue(cfg.n_cols)
+        self._ncols_sb.valueChanged.connect(self._on_struct_changed)
+        struct_row.addWidget(self._ncols_sb)
+        struct_row.addWidget(QLabel("  Rows:"))
+        self._nrows_sb = QSpinBox(); self._nrows_sb.setRange(1, 20); self._nrows_sb.setValue(cfg.n_rows)
+        self._nrows_sb.valueChanged.connect(self._on_struct_changed)
+        struct_row.addWidget(self._nrows_sb)
+        cb_rev = QCheckBox("Reverse columns (PD2M1)")
+        cb_rev.setChecked(cfg.col_reversed)
+        cb_rev.stateChanged.connect(lambda v: self._set_cfg_and_refresh(col_reversed=bool(v)))
+        struct_row.addWidget(cb_rev)
+        struct_row.addStretch()
+        self._show_cb = QCheckBox("Show grid")
+        self._show_cb.setChecked(cfg.show)
+        self._show_cb.stateChanged.connect(self._on_show_toggled)
+        struct_row.addWidget(self._show_cb)
+        lay.addLayout(struct_row)
+
+        # ── Draggable grid preview ──
+        hint = QLabel("Drag yellow dividers to adjust column widths / row heights:")
+        hint.setStyleSheet("font-size: 10px; color: #aaa;")
+        lay.addWidget(hint)
+        self._preview = _GridPreviewWidget(cfg, self)
+        self._preview.setMinimumHeight(220)
+        self._preview.changed.connect(self._live_update)
+        lay.addWidget(self._preview, 1)
+
+        btn_eq_cols = QPushButton("Equal columns")
+        btn_eq_rows = QPushButton("Equal rows")
+        btn_eq_cols.clicked.connect(self._reset_col_dividers)
+        btn_eq_rows.clicked.connect(self._reset_row_dividers)
+        eq_row = QHBoxLayout()
+        eq_row.addWidget(btn_eq_cols); eq_row.addWidget(btn_eq_rows); eq_row.addStretch()
+        lay.addLayout(eq_row)
+
+        # ── Appearance ──
+        app_row = QHBoxLayout()
+        app_row.addWidget(QLabel("Line width:"))
+        self._lw_sb = QSpinBox(); self._lw_sb.setRange(1, 10); self._lw_sb.setValue(cfg.line_width)
+        self._lw_sb.valueChanged.connect(lambda v: self._set_cfg_and_refresh(line_width=v))
+        app_row.addWidget(self._lw_sb)
+
+        app_row.addWidget(QLabel("  Line alpha (0–255):"))
+        self._la_sb = QSpinBox(); self._la_sb.setRange(0, 255); self._la_sb.setValue(cfg.line_alpha)
+        self._la_sb.valueChanged.connect(lambda v: self._set_cfg_and_refresh(line_alpha=v))
+        app_row.addWidget(self._la_sb)
+
+        app_row.addWidget(QLabel("  Line color:"))
+        self._lc_btn = QPushButton()
+        self._lc_btn.setFixedSize(28, 20)
+        self._lc_btn.setStyleSheet(f"background:{cfg.line_color};")
+        self._lc_btn.clicked.connect(self._pick_line_color)
+        app_row.addWidget(self._lc_btn)
+        app_row.addStretch()
+        lay.addLayout(app_row)
+
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Font size (0=auto):"))
+        self._fs_sb = QSpinBox(); self._fs_sb.setRange(0, 40); self._fs_sb.setValue(cfg.font_size)
+        self._fs_sb.valueChanged.connect(lambda v: self._set_cfg_and_refresh(font_size=v))
+        font_row.addWidget(self._fs_sb)
+
+        font_row.addWidget(QLabel("  Font alpha:"))
+        self._fa_sb = QSpinBox(); self._fa_sb.setRange(0, 255); self._fa_sb.setValue(cfg.font_alpha)
+        self._fa_sb.valueChanged.connect(lambda v: self._set_cfg_and_refresh(font_alpha=v))
+        font_row.addWidget(self._fa_sb)
+
+        font_row.addWidget(QLabel("  Font color:"))
+        self._fc_btn = QPushButton()
+        self._fc_btn.setFixedSize(28, 20)
+        self._fc_btn.setStyleSheet(f"background:{cfg.font_color};")
+        self._fc_btn.clicked.connect(self._pick_font_color)
+        font_row.addWidget(self._fc_btn)
+        font_row.addStretch()
+        lay.addLayout(font_row)
+
+        outline_row = QHBoxLayout()
+        outline_row.addWidget(QLabel("Font outline (px, 0=none):"))
+        self._fo_sb = QSpinBox(); self._fo_sb.setRange(0, 10); self._fo_sb.setValue(cfg.font_outline)
+        self._fo_sb.valueChanged.connect(lambda v: self._set_cfg_and_refresh(font_outline=v))
+        outline_row.addWidget(self._fo_sb)
+        outline_row.addStretch()
+        lay.addLayout(outline_row)
+
+        # ── OK/Cancel ──
+        btn_row = QHBoxLayout()
+        btn_reset = QPushButton("Reset defaults")
+        btn_reset.clicked.connect(self._reset_all)
+        btn_row.addWidget(btn_reset)
+        btn_row.addStretch()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self._on_reject)
+        btn_row.addWidget(btns)
+        lay.addLayout(btn_row)
+
+    # ── Live preview ─────────────────────────────────────────────────────────
+    def _live_update(self):
+        if self._img_view is not None:
+            self._img_view._pdxm1_cfg_override = self._cfg
+            self._img_view.update()
+
+    def _on_accept(self):
+        if self._img_view is not None:
+            self._img_view._pdxm1_cfg_override = None
+        self.accept()
+
+    def _on_reject(self):
+        if self._img_view is not None:
+            self._img_view.show_pdxm1_grid = self._orig_show_grid
+            self._img_view._pdxm1_cfg_override = None
+            self._img_view.update()
+        self.reject()
+
+    def _on_show_toggled(self, state: int):
+        checked = bool(state)
+        self._cfg.show = checked
+        if self._img_view is not None:
+            self._img_view.show_pdxm1_grid = checked
+            self._img_view.update()
+
+    # ── Config change handlers ────────────────────────────────────────────────
+    def _set_cfg_and_refresh(self, **kw):
+        for k, v in kw.items():
+            setattr(self._cfg, k, v)
+        self._preview.update()
+        self._live_update()
+
+    def _on_struct_changed(self):
+        self._cfg.n_cols = self._ncols_sb.value()
+        self._cfg.n_rows = self._nrows_sb.value()
+        self._cfg.col_dividers = []  # reset to equal spacing
+        self._cfg.row_dividers = []
+        self._preview.update()
+        self._live_update()
+
+    def _reset_col_dividers(self):
+        self._cfg.col_dividers = []
+        self._preview.update()
+        self._live_update()
+
+    def _reset_row_dividers(self):
+        self._cfg.row_dividers = []
+        self._preview.update()
+        self._live_update()
+
+    def _reset_all(self):
+        rev = self._key in _PDXM1_REVERSED_TYPES
+        self._cfg = Pdxm1GridConfig(col_reversed=rev)
+        self._preview._cfg = self._cfg
+        self._ncols_sb.setValue(self._cfg.n_cols)
+        self._nrows_sb.setValue(self._cfg.n_rows)
+        self._lw_sb.setValue(self._cfg.line_width)
+        self._la_sb.setValue(self._cfg.line_alpha)
+        self._fs_sb.setValue(self._cfg.font_size)
+        self._fa_sb.setValue(self._cfg.font_alpha)
+        self._lc_btn.setStyleSheet(f"background:{self._cfg.line_color};")
+        self._fc_btn.setStyleSheet(f"background:{self._cfg.font_color};")
+        self._fo_sb.setValue(self._cfg.font_outline)
+        self._show_cb.setChecked(self._cfg.show)
+        self._preview.update()
+        self._live_update()
+
+    def _pick_line_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(QColor(self._cfg.line_color), self, "Line color")
+        if c.isValid():
+            self._cfg.line_color = c.name()
+            self._lc_btn.setStyleSheet(f"background:{self._cfg.line_color};")
+            self._preview.update()
+            self._live_update()
+
+    def _pick_font_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(QColor(self._cfg.font_color), self, "Font color")
+        if c.isValid():
+            self._cfg.font_color = c.name()
+            self._fc_btn.setStyleSheet(f"background:{self._cfg.font_color};")
+            self._preview.update()
+            self._live_update()
+
+    def get_config(self) -> Pdxm1GridConfig:
+        return self._cfg
+
+    def save_config(self):
+        data = _load_pdxm1_grid_configs()
+        data[self._key] = _asdict(self._cfg)
+        _save_pdxm1_grid_configs(data)
+
+
+# ---------------- CAMERA LAYOUT CONFIG ----------------
+
+@_dataclass
+class CamLayoutEntry:
+    x: float = 0.0   # left edge fraction [0, 1]
+    y: float = 0.0   # top edge fraction [0, 1]
+    w: float = 1.0   # width fraction (0, 1]
+    h: float = 1.0   # height fraction (0, 1]
+
+@_dataclass
+class CamLayoutConfig:
+    entries: list = _field(default_factory=list)  # list[CamLayoutEntry]
+
+
+class _LayoutCanvasWidget(QWidget):
+    """Continuous free-form drag-resize canvas for camera layout.
+
+    Each tile stores position and size as fractions [0, 1] of the canvas —
+    no grid snapping, no discrete cells.  Tiles can overlap freely.
+    """
+
+    EDGE = 12        # pixel zone for resize handles
+    MIN_FRAC = 0.04  # minimum tile size fraction
+    TILE_COLORS = [
+        QColor(0x33, 0x55, 0x88, 210), QColor(0x33, 0x77, 0x55, 210),
+        QColor(0x77, 0x33, 0x55, 210), QColor(0x55, 0x33, 0x88, 210),
+        QColor(0x77, 0x55, 0x33, 210), QColor(0x33, 0x66, 0x77, 210),
+        QColor(0x66, 0x55, 0x22, 210), QColor(0x22, 0x55, 0x44, 210),
+    ]
+
+    def __init__(self, cam_names: list, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(480, 320)
+        self._cam_names = list(cam_names)
+        # tiles: [x, y, w, h] all in [0.0, 1.0] as fractions of canvas
+        self._tiles: list = []
+        self._reset_tiles()
+
+        self._drag_idx: int = -1
+        self._drag_mode: str = ''
+        self._drag_start_pos = None
+        self._drag_start_tile = None
+        self._selected: int = -1
+        self.setMouseTracking(True)
+
+    def _reset_tiles(self):
+        import math as _m
+        n = len(self._cam_names)
+        self._tiles = []
+        if n == 0:
+            return
+        cols = max(1, _m.ceil(_m.sqrt(n)))
+        rows = _m.ceil(n / cols)
+        tw = 1.0 / cols
+        th = 1.0 / rows
+        for i in range(n):
+            c = i % cols
+            r = i // cols
+            self._tiles.append([c * tw, r * th, tw, th])
+
+    def get_entries(self) -> list:
+        return [CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3]) for t in self._tiles]
+
+    # ── Geometry ─────────────────────────────────────────────────────────────
+    def _tile_rect(self, idx: int) -> QRect:
+        t = self._tiles[idx]
+        W, H = self.width(), self.height()
+        return QRect(int(t[0] * W), int(t[1] * H),
+                     max(30, int(t[2] * W)), max(20, int(t[3] * H)))
+
+    def _hit_test(self, pos) -> tuple:
+        for i in range(len(self._tiles) - 1, -1, -1):
+            r = self._tile_rect(i)
+            if not r.contains(pos):
+                continue
+            rx = pos.x() - r.left()
+            ry = pos.y() - r.top()
+            near_left   = rx <= self.EDGE
+            near_right  = (r.width()  - rx) <= self.EDGE
+            near_top    = ry <= self.EDGE
+            near_bottom = (r.height() - ry) <= self.EDGE
+            # Corners first (higher priority than edges)
+            if near_top    and near_left:  return i, 'top-left'
+            if near_top    and near_right: return i, 'top-right'
+            if near_bottom and near_left:  return i, 'bottom-left'
+            if near_bottom and near_right: return i, 'bottom-right'
+            # Edges
+            if near_left:   return i, 'left'
+            if near_right:  return i, 'right'
+            if near_top:    return i, 'top'
+            if near_bottom: return i, 'bottom'
+            return i, 'move'
+        return -1, ''
+
+    # ── Mouse ────────────────────────────────────────────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.position().toPoint()
+        idx, mode = self._hit_test(pos)
+        if idx >= 0:
+            self._drag_idx = idx
+            self._drag_mode = mode
+            self._drag_start_pos = pos
+            self._drag_start_tile = list(self._tiles[idx])
+            self._selected = idx
+            # bring to front
+            self._tiles.append(self._tiles.pop(idx))
+            self._cam_names.append(self._cam_names.pop(idx))
+            self._drag_idx = len(self._tiles) - 1
+            self._selected = self._drag_idx
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self._drag_idx < 0:
+            _, mode = self._hit_test(pos)
+            cursors = {
+                'top-left':    Qt.CursorShape.SizeFDiagCursor,
+                'bottom-right':Qt.CursorShape.SizeFDiagCursor,
+                'corner':      Qt.CursorShape.SizeFDiagCursor,
+                'top-right':   Qt.CursorShape.SizeBDiagCursor,
+                'bottom-left': Qt.CursorShape.SizeBDiagCursor,
+                'left':        Qt.CursorShape.SizeHorCursor,
+                'right':       Qt.CursorShape.SizeHorCursor,
+                'top':         Qt.CursorShape.SizeVerCursor,
+                'bottom':      Qt.CursorShape.SizeVerCursor,
+                'move':        Qt.CursorShape.SizeAllCursor,
+            }
+            self.setCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor))
+            return
+        W, H = self.width(), self.height()
+        if W < 1 or H < 1:
+            return
+        dx = (pos.x() - self._drag_start_pos.x()) / W
+        dy = (pos.y() - self._drag_start_pos.y()) / H
+        st = self._drag_start_tile
+        t  = self._tiles[self._drag_idx]
+        m  = self.MIN_FRAC
+        mode = self._drag_mode
+        if mode == 'move':
+            t[0] = max(0.0, min(1.0 - st[2], st[0] + dx))
+            t[1] = max(0.0, min(1.0 - st[3], st[1] + dy))
+        elif mode == 'right':
+            t[2] = max(m, min(1.0 - st[0], st[2] + dx))
+        elif mode == 'bottom':
+            t[3] = max(m, min(1.0 - st[1], st[3] + dy))
+        elif mode in ('bottom-right', 'corner'):
+            t[2] = max(m, min(1.0 - st[0], st[2] + dx))
+            t[3] = max(m, min(1.0 - st[1], st[3] + dy))
+        elif mode == 'left':
+            new_x = max(0.0, min(st[0] + st[2] - m, st[0] + dx))
+            t[2] = st[2] + (st[0] - new_x)
+            t[0] = new_x
+        elif mode == 'top':
+            new_y = max(0.0, min(st[1] + st[3] - m, st[1] + dy))
+            t[3] = st[3] + (st[1] - new_y)
+            t[1] = new_y
+        elif mode == 'top-left':
+            new_x = max(0.0, min(st[0] + st[2] - m, st[0] + dx))
+            t[2] = st[2] + (st[0] - new_x); t[0] = new_x
+            new_y = max(0.0, min(st[1] + st[3] - m, st[1] + dy))
+            t[3] = st[3] + (st[1] - new_y); t[1] = new_y
+        elif mode == 'top-right':
+            t[2] = max(m, min(1.0 - st[0], st[2] + dx))
+            new_y = max(0.0, min(st[1] + st[3] - m, st[1] + dy))
+            t[3] = st[3] + (st[1] - new_y); t[1] = new_y
+        elif mode == 'bottom-left':
+            new_x = max(0.0, min(st[0] + st[2] - m, st[0] + dx))
+            t[2] = st[2] + (st[0] - new_x); t[0] = new_x
+            t[3] = max(m, min(1.0 - st[1], st[3] + dy))
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_idx >= 0:
+            self._drag_idx = -1
+            self._drag_mode = ''
+            self.update()
+
+    # ── Paint ────────────────────────────────────────────────────────────────
+    def paintEvent(self, event):
+        p = QPainter(self)
+        W, H = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(0x18, 0x18, 0x18))
+
+        # Subtle guide lines at common fractions
+        gpen = QPen(QColor(0x33, 0x33, 0x33))
+        gpen.setStyle(Qt.PenStyle.DotLine)
+        p.setPen(gpen)
+        for frac in (1/4, 1/3, 1/2, 2/3, 3/4):
+            p.drawLine(int(frac * W), 0, int(frac * W), H)
+            p.drawLine(0, int(frac * H), W, int(frac * H))
+
+        # Canvas border
+        p.setPen(QPen(QColor(0x55, 0x55, 0x55)))
+        p.drawRect(0, 0, W - 1, H - 1)
+
+        # Tiles
+        font = p.font()
+        for i, tile in enumerate(self._tiles):
+            r = self._tile_rect(i)
+            color = self.TILE_COLORS[i % len(self.TILE_COLORS)]
+            p.fillRect(r, color)
+            sel = (i == self._selected)
+            bp = QPen(QColor(0x44, 0xaa, 0xff) if sel else QColor(0x88, 0xbb, 0xff))
+            bp.setWidth(2 if sel else 1)
+            p.setPen(bp)
+            p.drawRect(r)
+            font.setPixelSize(max(9, int(min(r.width(), r.height()) * 0.22)))
+            p.setFont(font)
+            p.setPen(QColor(0xee, 0xee, 0xee))
+            short = self._cam_names[i].split("-")[-1] if "-" in self._cam_names[i] else self._cam_names[i]
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, short)
+            # Resize handles — L-shapes at all 4 corners + tick on all 4 edges
+            hp = QPen(QColor(0xff, 0xcc, 0x00, 200))
+            hp.setWidth(3); p.setPen(hp)
+            e = self.EDGE
+            # Corners: top-left
+            p.drawLine(r.left(), r.top(), r.left() + e, r.top())
+            p.drawLine(r.left(), r.top(), r.left(), r.top() + e)
+            # top-right
+            p.drawLine(r.right() - e, r.top(), r.right(), r.top())
+            p.drawLine(r.right(), r.top(), r.right(), r.top() + e)
+            # bottom-left
+            p.drawLine(r.left(), r.bottom() - e, r.left(), r.bottom())
+            p.drawLine(r.left(), r.bottom(), r.left() + e, r.bottom())
+            # bottom-right
+            p.drawLine(r.right() - e, r.bottom(), r.right(), r.bottom())
+            p.drawLine(r.right(), r.bottom() - e, r.right(), r.bottom())
+            # Edge midpoints (short ticks)
+            mx, my = r.center().x(), r.center().y()
+            hp2 = QPen(QColor(0xff, 0xcc, 0x00, 120)); hp2.setWidth(2); p.setPen(hp2)
+            p.drawLine(mx - e // 2, r.top(),    mx + e // 2, r.top())     # top
+            p.drawLine(mx - e // 2, r.bottom(), mx + e // 2, r.bottom())  # bottom
+            p.drawLine(r.left(),    my - e // 2, r.left(),    my + e // 2) # left
+            p.drawLine(r.right(),   my - e // 2, r.right(),   my + e // 2) # right
+
+        p.end()
+
+
+class LayoutConfigDialog(QDialog):
+    """Dialog for configuring the camera grid layout (drag & resize cameras interactively)."""
+
+    _LAYOUTS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_layouts.json"
+
+    def __init__(self, cam_names: list, parent=None, initial_entries=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Camera Layout")
+        self.resize(680, 500)
+        self._cam_names = list(cam_names)
+
+        lay = QVBoxLayout(self)
+
+        # ── Canvas ──
+        self._canvas = _LayoutCanvasWidget(cam_names=self._cam_names, parent=self)
+        saved = self._load_saved()
+        if saved and "tiles" in saved and len(saved["tiles"]) == len(cam_names):
+            self._canvas._tiles = [list(t) for t in saved["tiles"]]
+            # Restore cam_names order from saved (bring-to-front reorders them)
+            if "cam_order" in saved and len(saved["cam_order"]) == len(cam_names):
+                self._canvas._cam_names = list(saved["cam_order"])
+        elif initial_entries and len(initial_entries) == len(cam_names):
+            # No saved layout — seed from current on-screen camera positions
+            self._canvas._tiles = [[e.x, e.y, e.w, e.h] for e in initial_entries]
+        lay.addWidget(self._canvas, stretch=1)
+
+        hint = QLabel("Drag tile interior to move  ·  Drag any edge or corner to resize")
+        hint.setStyleSheet("color: #888; font-size: 10px;")
+        lay.addWidget(hint)
+
+        # ── Bottom row ──
+        bot = QHBoxLayout()
+        btn_reset = QPushButton("Auto-arrange")
+        btn_reset.setToolTip("Reset all cameras to an evenly-spaced automatic grid")
+        btn_reset.clicked.connect(self._reset_to_default)
+        bot.addWidget(btn_reset)
+        bot.addStretch()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        bot.addWidget(btns)
+        lay.addLayout(bot)
+
+    def _reset_to_default(self):
+        self._canvas._cam_names = list(self._cam_names)
+        self._canvas._reset_tiles()
+        self._canvas._selected = -1
+        self._canvas.update()
+
+    def get_config(self) -> CamLayoutConfig:
+        # Re-map entries back to original camera order
+        name_to_entry = {
+            name: CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3])
+            for name, t in zip(self._canvas._cam_names, self._canvas._tiles)
+        }
+        entries = [name_to_entry.get(n, CamLayoutEntry()) for n in self._cam_names]
+        return CamLayoutConfig(entries=entries)
+
+    # ── Persistence ──────────────────────────────────────────────────────────
+    def _layout_key(self) -> str:
+        return ",".join(sorted(self._cam_names))
+
+    def _load_saved(self) -> dict:
+        try:
+            if self._LAYOUTS_PATH.exists():
+                data = json.loads(self._LAYOUTS_PATH.read_text(encoding="utf-8"))
+                return data.get(self._layout_key(), {})
+        except Exception:
+            pass
+        return {}
+
+    @classmethod
+    def load_config_for_names(cls, cam_names: list) -> "CamLayoutConfig | None":
+        """Return saved CamLayoutConfig for cam_names, or None if nothing saved."""
+        key = ",".join(sorted(cam_names))
+        try:
+            if cls._LAYOUTS_PATH.exists():
+                data = json.loads(cls._LAYOUTS_PATH.read_text(encoding="utf-8"))
+                saved = data.get(key, {})
+                if saved and "tiles" in saved and len(saved["tiles"]) == len(cam_names):
+                    cam_order = saved.get("cam_order", list(cam_names))
+                    if len(cam_order) != len(cam_names):
+                        cam_order = list(cam_names)
+                    name_to_tile = dict(zip(cam_order, saved["tiles"]))
+                    entries = []
+                    for n in cam_names:
+                        t = name_to_tile.get(n)
+                        if t is not None:
+                            entries.append(CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3]))
+                        else:
+                            entries.append(CamLayoutEntry())
+                    return CamLayoutConfig(entries=entries)
+        except Exception:
+            pass
+        return None
+
+    def save_config(self, cfg: CamLayoutConfig):
+        try:
+            self._LAYOUTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data: dict = {}
+            if self._LAYOUTS_PATH.exists():
+                try:
+                    data = json.loads(self._LAYOUTS_PATH.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data[self._layout_key()] = {
+                "tiles":     [list(t) for t in self._canvas._tiles],
+                "cam_order": list(self._canvas._cam_names),
+                "entries":   [_asdict(e) for e in cfg.entries],
+            }
+            self._LAYOUTS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+
 # ---------------- CAMERA PICKER DIALOG ----------------
 # ---------------- CAMERA PICKER DIALOG ----------------
 class _CamLoaderSignals(QObject):
@@ -3037,7 +4074,8 @@ class CameraPickerDialog(QDialog):
 
     def __init__(self, date_obj, hour_from: int, hour_to: int,
                  last_cam_names: list[str], parent=None,
-                 preloaded_cameras: list | None = None):
+                 preloaded_cameras: list | None = None,
+                 multi_grid=None):
         super().__init__(parent)
         self.setWindowTitle("Select cameras")
         self.resize(660, 640)
@@ -3048,6 +4086,7 @@ class CameraPickerDialog(QDialog):
         self._hour_from = hour_from
         self._hour_to = hour_to
         self._presets: dict[str, list[str]] = self._load_presets()
+        self._multi_grid = multi_grid
 
         lay = QVBoxLayout(self)
 
@@ -3111,7 +4150,7 @@ class CameraPickerDialog(QDialog):
         lay.addLayout(top_row, 1)
 
         # ── Selected cameras table ────────────────────────────────────────────
-        sel_lbl = QLabel("Selected (first 4 will be displayed):")
+        sel_lbl = QLabel("Selected cameras:")
         sel_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
         lay.addWidget(sel_lbl)
 
@@ -3128,11 +4167,20 @@ class CameraPickerDialog(QDialog):
         self._sel_table.setMaximumHeight(180)
         lay.addWidget(self._sel_table)
 
+        # ── Layout config button + OK/Cancel ─────────────────────────────────
+        self._layout_config: "CamLayoutConfig | None" = None
+        bottom_row = QHBoxLayout()
+        self._btn_layout = QPushButton("Layout…")
+        self._btn_layout.setToolTip("Configure custom grid layout for the selected cameras")
+        self._btn_layout.clicked.connect(self._on_layout_clicked)
+        bottom_row.addWidget(self._btn_layout)
+        bottom_row.addStretch()
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._on_accept)
         btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
+        bottom_row.addWidget(btns)
+        lay.addLayout(bottom_row)
 
         self._refresh_preset_list()
 
@@ -3330,10 +4378,6 @@ class CameraPickerDialog(QDialog):
             r = self._sel_table.rowCount()
             self._sel_table.insertRow(r)
             item = QTableWidgetItem(name)
-            if i >= 4:
-                # Extra cameras beyond first 4 — shown but won't be loaded
-                item.setForeground(QColor("#999"))
-                item.setToolTip("Will not be shown (only first 4 cameras are loaded)")
             self._sel_table.setItem(r, 0, item)
             btn = QPushButton("✕")
             btn.setFixedSize(24, 24)
@@ -3353,15 +4397,38 @@ class CameraPickerDialog(QDialog):
                     if not q or q in name.lower() or q in num.lower()]
         self._populate_cam_table(filtered)
 
+    def _on_layout_clicked(self):
+        if not self._selected_names:
+            QMessageBox.information(self, "No cameras selected",
+                "Select at least one camera before configuring the layout.")
+            return
+        # Read current on-screen positions as fallback initial tiles
+        initial_entries = None
+        if (self._multi_grid is not None and
+                len(self._selected_names) == len(getattr(self._multi_grid, '_cam_names_list', []))):
+            initial_entries = self._multi_grid.get_current_layout_entries(self._selected_names)
+        dlg = LayoutConfigDialog(self._selected_names, parent=self,
+                                 initial_entries=initial_entries)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            cfg = dlg.get_config()
+            dlg.save_config(cfg)
+            self._layout_config = cfg
+
     def _on_accept(self):
         if not self._selected_names:
             QMessageBox.warning(self, "No camera", "Please select at least one camera.")
             return
+        # If user didn't explicitly configure layout this session, auto-load any saved layout
+        if self._layout_config is None and len(self._selected_names) > 1:
+            self._layout_config = LayoutConfigDialog.load_config_for_names(self._selected_names)
         self.accept()
 
+    @property
+    def layout_config(self) -> "CamLayoutConfig | None":
+        return self._layout_config
+
     def selected_camera_names(self) -> list[str]:
-        # Return up to 4 for display; user can pre-select up to 7 and deselect back to 4
-        return list(self._selected_names)[:4]
+        return list(self._selected_names)
 
     def all_selected_camera_names(self) -> list[str]:
         return list(self._selected_names)
@@ -3451,6 +4518,11 @@ class ImageView(QWidget):
         # When False: bottom space is reserved and labels drawn below the image.
         self.cam_label_use_overlay: bool = True
 
+        # When True: draw a configurable reference grid for PDXM1 cameras.
+        self.show_pdxm1_grid: bool = False
+        self.pdxm1_cam_name: str = ''   # full camera name used to look up per-type grid config
+        self._pdxm1_cfg_override = None  # set by Pdxm1GridConfigDialog for live preview
+
         # Zoom: normalized rect (ln, tn, rn, bn) inside the source image, or None = no zoom
         self._zoom_norm: "tuple[float,float,float,float] | None" = None
         # Right-click rubber-band state
@@ -3515,9 +4587,9 @@ class ImageView(QWidget):
         if self._scaled is None or self._scaled.isNull():
             return None
         lbh = self._label_bar_h()
-        avail_h = self.height() - lbh
-        x0 = (self.width()  - self._scaled.width())  // 2
-        y0 = (avail_h - self._scaled.height()) // 2
+        x0 = (self.width() - self._scaled.width()) // 2
+        # Image starts immediately below the label strip; any leftover space is at the bottom.
+        y0 = lbh
         return QRect(x0, y0, self._scaled.width(), self._scaled.height())
 
     def _handle_radius(self) -> int:
@@ -3564,10 +4636,13 @@ class ImageView(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
+            # Start rubber-band tracking; whether to zoom or open dialog is decided
+            # in mouseReleaseEvent: drag → zoom, single click → grid config dialog.
             ir = self._img_rect()
             if ir is not None and ir.width() > 0 and ir.height() > 0:
                 self._rb_start = event.position().toPoint()
                 self._rb_current = self._rb_start
+                self._rb_dragged = False
                 self.update()
             return
         if event.button() != Qt.MouseButton.LeftButton:
@@ -3621,6 +4696,11 @@ class ImageView(QWidget):
     def mouseMoveEvent(self, event):
         if self._rb_start is not None:
             self._rb_current = event.position().toPoint()
+            if not getattr(self, '_rb_dragged', False):
+                dx = self._rb_current.x() - self._rb_start.x()
+                dy = self._rb_current.y() - self._rb_start.y()
+                if dx * dx + dy * dy > 25:  # >5 px movement = drag
+                    self._rb_dragged = True
             self.update()
             return
         ir = self._img_rect()
@@ -3743,30 +4823,42 @@ class ImageView(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton and self._rb_start is not None:
             end = event.position().toPoint()
-            ir = self._img_rect()
-            if ir is not None and ir.width() > 0 and ir.height() > 0:
-                rb = QRect(self._rb_start, end).normalized()
-                rb = rb.intersected(ir)
-                if rb.width() > 4 and rb.height() > 4:
-                    # Convert rubber-band screen rect to normalized source image coords,
-                    # accounting for existing zoom
-                    ln_new = (rb.left() - ir.left()) / ir.width()
-                    tn_new = (rb.top()  - ir.top())  / ir.height()
-                    rn_new = (rb.right()  - ir.left()) / ir.width()
-                    bn_new = (rb.bottom() - ir.top())  / ir.height()
-                    if self._zoom_norm is not None:
-                        zl, zt, zr, zb = self._zoom_norm
-                        zw, zh = zr - zl, zb - zt
-                        ln_new = zl + ln_new * zw
-                        tn_new = zt + tn_new * zh
-                        rn_new = zl + rn_new * zw
-                        bn_new = zt + bn_new * zh
-                    self.set_zoom((
-                        max(0.0, min(1.0, ln_new)), max(0.0, min(1.0, tn_new)),
-                        max(0.0, min(1.0, rn_new)), max(0.0, min(1.0, bn_new))
-                    ))
+            rb_start_saved = self._rb_start
+            rb_dragged = getattr(self, '_rb_dragged', False)
             self._rb_start = None
             self._rb_current = None
+            self._rb_dragged = False
+
+            if rb_dragged:
+                # Drag: perform rubber-band zoom
+                ir = self._img_rect()
+                if ir is not None and ir.width() > 0 and ir.height() > 0:
+                    rb = QRect(rb_start_saved, end).normalized()
+                    rb = rb.intersected(ir)
+                    if rb.width() > 4 and rb.height() > 4:
+                        ln_new = (rb.left()   - ir.left()) / ir.width()
+                        tn_new = (rb.top()    - ir.top())  / ir.height()
+                        rn_new = (rb.right()  - ir.left()) / ir.width()
+                        bn_new = (rb.bottom() - ir.top())  / ir.height()
+                        if self._zoom_norm is not None:
+                            zl, zt, zr, zb = self._zoom_norm
+                            zw, zh = zr - zl, zb - zt
+                            ln_new = zl + ln_new * zw
+                            tn_new = zt + tn_new * zh
+                            rn_new = zl + rn_new * zw
+                            bn_new = zt + bn_new * zh
+                        self.set_zoom((
+                            max(0.0, min(1.0, ln_new)), max(0.0, min(1.0, tn_new)),
+                            max(0.0, min(1.0, rn_new)), max(0.0, min(1.0, bn_new))
+                        ))
+            else:
+                # Single click: open grid config dialog for any camera
+                cam_name = getattr(self, 'pdxm1_cam_name', '')
+                if cam_name:
+                    dlg = Pdxm1GridConfigDialog(cam_name, img_view=self, parent=self)
+                    if dlg.exec() == QDialog.DialogCode.Accepted:
+                        dlg.save_config()
+
             self.update()
             return
         self._rb_start = None
@@ -3786,9 +4878,8 @@ class ImageView(QWidget):
 
         pm = self._scaled
         lbh = self._label_bar_h()
-        avail_h = self.height() - lbh
-        x0 = (self.width()  - pm.width())  // 2
-        y0 = (avail_h - pm.height()) // 2
+        x0 = (self.width() - pm.width()) // 2
+        y0 = lbh  # image starts immediately below label bar; leftover space at bottom
         p.drawPixmap(x0, y0, pm)
         img_rect = QRect(x0, y0, pm.width(), pm.height())
         # Rámeček kolem obrázku
@@ -3937,6 +5028,59 @@ class ImageView(QWidget):
                 cx = img_rect.left() + int(nx * img_rect.width())
                 cy = img_rect.top()  + int(ny * img_rect.height())
                 p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+
+        # Camera grid overlay (configurable via right-click → Grid Config…)
+        if self.show_pdxm1_grid and img_rect is not None and not self._pix.isNull():
+            from PySide6.QtGui import QFont as _GFont
+            _gcam = getattr(self, 'pdxm1_cam_name', '')
+            if _gcam:
+                _gcfg = (self._pdxm1_cfg_override if self._pdxm1_cfg_override is not None
+                         else get_pdxm1_grid_config(_gcam))
+            else:
+                _gcfg = Pdxm1GridConfig()
+            divs_col  = _gcfg.effective_col_dividers()
+            divs_row  = _gcfg.effective_row_dividers()
+            col_labels = _gcfg.effective_col_labels()
+            row_labels = _gcfg.effective_row_labels()
+            # Border pixel positions
+            _gx = img_rect.left() + int(_gcfg.grid_left   * img_rect.width())
+            _gy = img_rect.top()  + int(_gcfg.grid_top    * img_rect.height())
+            _gw = max(10, int((_gcfg.grid_right  - _gcfg.grid_left)  * img_rect.width()))
+            _gh = max(10, int((_gcfg.grid_bottom - _gcfg.grid_top)   * img_rect.height()))
+            # Inner divider pixel positions (absolute image fractions)
+            col_xs = ([_gx]
+                      + [img_rect.left() + int(d * img_rect.width()) for d in divs_col]
+                      + [_gx + _gw])
+            row_ys = ([_gy]
+                      + [img_rect.top() + int(d * img_rect.height()) for d in divs_row]
+                      + [_gy + _gh])
+            # Grid lines
+            lc = QColor(_gcfg.line_color); lc.setAlpha(_gcfg.line_alpha)
+            grid_pen = QPen(lc); grid_pen.setWidth(max(1, _gcfg.line_width))
+            p.setPen(grid_pen)
+            for x in col_xs:
+                p.drawLine(x, _gy, x, _gy + _gh)
+            for y in row_ys:
+                p.drawLine(_gx, y, _gx + _gw, y)
+            # Labels
+            n_cols = len(col_xs) - 1
+            fsize = _gcfg.font_size if _gcfg.font_size > 0 else max(8, min(18, int(_gw / max(1, n_cols) * 0.45)))
+            gfont = _GFont(); gfont.setPixelSize(fsize); gfont.setBold(True)
+            fc = QColor(_gcfg.font_color); fc.setAlpha(_gcfg.font_alpha)
+            for ci, lbl in enumerate(col_labels):
+                if ci + 1 >= len(col_xs): break
+                cw = col_xs[ci + 1] - col_xs[ci]
+                ch = row_ys[1] - row_ys[0] if len(row_ys) > 1 else _gh
+                _draw_outlined_text(p, QRect(col_xs[ci], _gy, cw, int(ch * 0.4)),
+                                    Qt.AlignmentFlag.AlignCenter, lbl,
+                                    gfont, fc, _gcfg.font_outline)
+            for ri, lbl in enumerate(row_labels):
+                if ri + 1 >= len(row_ys): break
+                rh = row_ys[ri + 1] - row_ys[ri]
+                rw = col_xs[1] - col_xs[0] if len(col_xs) > 1 else _gw
+                _draw_outlined_text(p, QRect(_gx, row_ys[ri], int(rw * 0.4), rh),
+                                    Qt.AlignmentFlag.AlignCenter, lbl,
+                                    gfont, fc, _gcfg.font_outline)
 
         # Zoom rubber-band
         if self._rb_start is not None and self._rb_current is not None:
@@ -4391,8 +5535,40 @@ class CameraView(QWidget):
                 "CameraView { border: 2px solid #555; border-radius: 3px; background: #222; }")
 
     def mousePressEvent(self, event):
+        # Grid config dialog is opened by ImageView.mouseReleaseEvent on single right-click.
         self.clicked.emit(self.cam_index)
         super().mousePressEvent(event)
+
+    def _open_pdxm1_grid_config(self):
+        dlg = Pdxm1GridConfigDialog(self.img_view.pdxm1_cam_name, img_view=self.img_view, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg.save_config()
+            self.img_view.update()
+
+
+class _FreeLayoutContainer(QWidget):
+    """Positions CameraView widgets using absolute geometry from CamLayoutEntry fractions."""
+
+    def __init__(self, entries: list, views: list, parent=None):
+        super().__init__(parent)
+        self._entries = entries
+        self._views   = views
+        for v in views:
+            v.setParent(self)
+            v.show()
+        self._apply()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self):
+        W, H = self.width(), self.height()
+        if W < 1 or H < 1:
+            return
+        for e, v in zip(self._entries, self._views):
+            v.setGeometry(int(e.x * W), int(e.y * H),
+                          max(20, int(e.w * W)), max(20, int(e.h * H)))
 
 
 class MultiCameraGrid(QWidget):
@@ -4415,6 +5591,7 @@ class MultiCameraGrid(QWidget):
         self._grid.setSpacing(4)
         self._reg_container: "QWidget | None" = None  # sub-grid for regular cams in mixed layout
         self._overlay_store: dict[str, dict] = {}  # cam_name → overlay state
+        self._layout_config = None  # CamLayoutConfig or None
 
     @staticmethod
     def _save_iv_overlay(iv: "ImageView") -> dict:
@@ -4442,8 +5619,9 @@ class MultiCameraGrid(QWidget):
         iv.show_square        = state.get("show_square", False)
         iv.square_rect_norm   = state.get("square_rect_norm")
 
-    def setup_cameras(self, cam_names: list[str]):
+    def setup_cameras(self, cam_names: list[str], layout_config=None):
         """Vytvoří/překreslí kamery podle seznamu jmen."""
+        self._layout_config = layout_config  # CamLayoutConfig or None
         # Ulož overlay stav stávajících kamer před zničením
         for cv in self._cam_views:
             self._overlay_store[cv.cam_name] = self._save_iv_overlay(cv.img_view)
@@ -4464,6 +5642,11 @@ class MultiCameraGrid(QWidget):
             # Obnov overlay stav pokud ho máme uložený
             if name in self._overlay_store:
                 self._restore_iv_overlay(cv.img_view, self._overlay_store[name])
+            # Enable grid overlay for all cameras; show flag comes from saved config
+            # (PDXM1 cameras default to visible, all others default to hidden).
+            _cam_cfg = get_pdxm1_grid_config(name)
+            cv.img_view.show_pdxm1_grid = _cam_cfg.show
+            cv.img_view.pdxm1_cam_name  = name
 
         self._selected_idx = 0
         self._selected_set = set()
@@ -4494,6 +5677,33 @@ class MultiCameraGrid(QWidget):
         """True only for M1 portrait cameras (PD[1-4]M1). M2 cameras (PD[1-4]M2) are square — excluded."""
         return bool(re.search(r'PD[1-4]M1(?!M2|\d)', name, re.IGNORECASE))
 
+    def get_current_layout_entries(self, cam_names: list) -> list:
+        """Read current on-screen camera positions as CamLayoutEntry list (ordered by cam_names).
+        Falls back to stored layout config if available, otherwise reads from widget geometry."""
+        if not self._cam_views:
+            return []
+        # If a custom layout is active and matches the cam count, use it
+        if (self._layout_config is not None and
+                len(self._layout_config.entries) == len(cam_names)):
+            names_list = getattr(self, '_cam_names_list', [])
+            name_to_entry = {n: e for n, e in zip(names_list, self._layout_config.entries)}
+            return [name_to_entry.get(n, CamLayoutEntry()) for n in cam_names]
+        # Auto-layout: read actual widget geometry via mapTo so nested parents work
+        W = self.width()
+        H = self.height()
+        if W < 10 or H < 10:
+            return []
+        name_to_entry = {}
+        for cv in self._cam_views:
+            tl = cv.mapTo(self, cv.rect().topLeft())
+            name_to_entry[cv.cam_name] = CamLayoutEntry(
+                x=max(0.0, tl.x() / W),
+                y=max(0.0, tl.y() / H),
+                w=max(0.02, cv.width() / W),
+                h=max(0.02, cv.height() / H),
+            )
+        return [name_to_entry.get(n, CamLayoutEntry()) for n in cam_names]
+
     def _rebuild_grid(self):
         # Remove all cam views and the reg container from the main grid
         for cv in self._cam_views:
@@ -4512,25 +5722,34 @@ class MultiCameraGrid(QWidget):
         if n == 0:
             return
 
+        # ── Custom layout (user-configured, continuous positions) ────────────
+        cfg = self._layout_config
+        if cfg is not None and cfg.entries and len(cfg.entries) >= n:
+            self._grid.setSpacing(0)
+            container = _FreeLayoutContainer(cfg.entries[:n], self._cam_views, parent=self)
+            self._grid.addWidget(container, 0, 0, 1, 1)
+            self._grid.setRowStretch(0, 1)
+            self._grid.setColumnStretch(0, 1)
+            return
+        self._grid.setSpacing(4)
+
+        # ── Auto layout ────────────────────────────────────────────────────────
         # Split cameras into PDxM1 (tall portrait) and regular (square)
         pdxm1_views   = [cv for cv in self._cam_views if self._is_pdxm1_cam(cv.cam_name)]
         regular_views = [cv for cv in self._cam_views if not self._is_pdxm1_cam(cv.cam_name)]
 
         if not pdxm1_views:
-            # 1–3 cameras: single row (1×N). 4 cameras: 2×2 grid.
-            if n <= 3:
-                for i, cv in enumerate(self._cam_views):
-                    self._grid.addWidget(cv, 0, i)
-                    self._grid.setColumnStretch(i, 1)
-                self._grid.setRowStretch(0, 1)
-            else:
-                for i, cv in enumerate(self._cam_views):
-                    r, c = divmod(i, 2)
-                    self._grid.addWidget(cv, r, c)
-                self._grid.setColumnStretch(0, 1)
-                self._grid.setColumnStretch(1, 1)
-                self._grid.setRowStretch(0, 1)
-                self._grid.setRowStretch(1, 1)
+            # Auto-grid: ceil(sqrt(N)) columns, ceil(N/cols) rows
+            import math as _math
+            cols = max(1, _math.ceil(_math.sqrt(n)))
+            for i, cv in enumerate(self._cam_views):
+                r, c = divmod(i, cols)
+                self._grid.addWidget(cv, r, c)
+            rows = _math.ceil(n / cols)
+            for c in range(cols):
+                self._grid.setColumnStretch(c, 1)
+            for r in range(rows):
+                self._grid.setRowStretch(r, 1)
             return
 
         if not regular_views:
@@ -4558,30 +5777,17 @@ class MultiCameraGrid(QWidget):
         reg_grid.setContentsMargins(0, 0, 0, 0)
         reg_grid.setSpacing(4)
 
-        if n_reg == 1:
-            reg_grid.addWidget(regular_views[0], 0, 0)
-            reg_grid.setRowStretch(0, 1)
-            reg_grid.setColumnStretch(0, 1)
-        elif n_reg == 2:
-            for i, cv in enumerate(regular_views):
-                reg_grid.addWidget(cv, i, 0)
-                reg_grid.setRowStretch(i, 1)
-            reg_grid.setColumnStretch(0, 1)
-        elif n_reg == 3:
-            # 3 regular → single row inside sub-grid
-            for i, cv in enumerate(regular_views):
-                reg_grid.addWidget(cv, 0, i)
-                reg_grid.setColumnStretch(i, 1)
-            reg_grid.setRowStretch(0, 1)
-        else:
-            # 4 regular → 2×2 grid
-            for i, cv in enumerate(regular_views):
-                r, c = divmod(i, 2)
-                reg_grid.addWidget(cv, r, c)
-            reg_grid.setColumnStretch(0, 1)
-            reg_grid.setColumnStretch(1, 1)
-            reg_grid.setRowStretch(0, 1)
-            reg_grid.setRowStretch(1, 1)
+        # N regular cameras in sub-grid: ceil(sqrt(N)) columns
+        import math as _math
+        reg_cols = max(1, _math.ceil(_math.sqrt(n_reg)))
+        reg_rows = _math.ceil(n_reg / reg_cols)
+        for i, cv in enumerate(regular_views):
+            r, c = divmod(i, reg_cols)
+            reg_grid.addWidget(cv, r, c)
+        for c in range(reg_cols):
+            reg_grid.setColumnStretch(c, 1)
+        for r in range(reg_rows):
+            reg_grid.setRowStretch(r, 1)
 
         self._reg_container = reg_widget
 
@@ -5264,7 +6470,10 @@ class _DirWatcher(_threading.Thread):
                     "utf-16-le", errors="replace")
                 if action in (_FILE_ACTION_ADDED, _FILE_ACTION_RENAMED):
                     if Path(name).suffix.lower() in self._img_ext:
-                        self._signals.new_file.emit(self._cam_i, name)
+                        try:
+                            self._signals.new_file.emit(self._cam_i, name)
+                        except RuntimeError:
+                            return  # Qt object deleted during shutdown
                 if nxt == 0:
                     break
                 off += nxt
@@ -5848,7 +7057,7 @@ class Viewer(QWidget):
 
         # timestamps (nested under Timeline & Range)
         s_tl.body_layout.addWidget(_group_label("Timestamps"))
-        self.btn_save_ts = QPushButton("Save Timestamp")
+        self.btn_save_ts = QPushButton("📌 Save Timestamp")
         self.btn_save_ts.setToolTip("Save current timestamp for cross-camera lookup. You can save more timestamps.")
         self.btn_save_ts.setEnabled(False)
         self.btn_save_ts.clicked.connect(self._save_current_timestamp)
@@ -5860,11 +7069,15 @@ class Viewer(QWidget):
         self.btn_clear_ts.setToolTip("Clear all saved timestamps")
         self.btn_clear_ts.setEnabled(False)
         self.btn_clear_ts.clicked.connect(self._clear_timestamps)
+        # Row 1: Save Timestamp (full width)
         row_ts1 = QHBoxLayout()
         row_ts1.addWidget(self.btn_save_ts)
-        row_ts1.addWidget(self.btn_goto_ts)
-        row_ts1.addWidget(self.btn_clear_ts)
         s_tl.body_layout.addLayout(row_ts1)
+        # Row 2: Go to Saved + Clear
+        row_ts2 = QHBoxLayout()
+        row_ts2.addWidget(self.btn_goto_ts)
+        row_ts2.addWidget(self.btn_clear_ts)
+        s_tl.body_layout.addLayout(row_ts2)
         self.lbl_ts_status = QLabel("No timestamps saved.")
         self.lbl_ts_status.setWordWrap(True)
         self.lbl_ts_status.setStyleSheet("font-size: 10px; color: #555;")
@@ -6418,7 +7631,6 @@ class Viewer(QWidget):
 
         # Per-camera sliders (hidden until multi-cam mode is active)
         self._per_cam_container = QWidget()
-        self._per_cam_container.setVisible(False)
         _pcl = QVBoxLayout(self._per_cam_container)
         _pcl.setContentsMargins(0, 2, 0, 0)
         _pcl.setSpacing(1)
@@ -6426,7 +7638,16 @@ class Viewer(QWidget):
         self._per_cam_rows: list[_CamSliderRow] = []
         self._per_cam_master_idx: int = 0      # which camera is master
         self._per_cam_scrubbing_cam: int = -1  # which cam is being dragged (-1 = none)
-        rlay.addWidget(self._per_cam_container)
+        # Wrap in a scrollable area so many cameras don't squeeze the image area
+        self._per_cam_scroll = QScrollArea()
+        self._per_cam_scroll.setWidget(self._per_cam_container)
+        self._per_cam_scroll.setWidgetResizable(True)
+        self._per_cam_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._per_cam_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._per_cam_scroll.setMaximumHeight(200)
+        self._per_cam_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._per_cam_scroll.setVisible(False)
+        rlay.addWidget(self._per_cam_scroll)
 
         # Tickbar below sliders — cursor line ends here, at the bottom
         rlay.addWidget(self.tickbar)
@@ -7070,7 +8291,7 @@ class Viewer(QWidget):
         self._multi_grid.setVisible(False)
         if hasattr(self, '_sc_cam_row_widget'):
             self._sc_cam_row_widget.setVisible(False)
-        self._per_cam_container.setVisible(False)
+        self._per_cam_scroll.setVisible(False)
         self.slider.setVisible(True)
         self.tickbar.setVisible(True)
         self.tickbar.set_cursor(None)
@@ -7101,7 +8322,7 @@ class Viewer(QWidget):
             row.set_master(i == 0)
             row.set_enabled(True)
 
-        self._per_cam_container.setVisible(True)
+        self._per_cam_scroll.setVisible(True)
 
         # After layout is computed, align tickbar axis with slider track start
         def _update_tickbar_offset():
@@ -7341,13 +8562,16 @@ class Viewer(QWidget):
 
     def _setup_multi_cam(self, cam_names: list[str], cam_folders: list[Path],
                          reset_items: bool = True,
-                         cam_folder_lists: "list[list[Path]] | None" = None):
+                         cam_folder_lists: "list[list[Path]] | None" = None,
+                         layout_config=None):
         """Inicializuje multi-camera stav."""
         self._cam_names   = cam_names
         self._cam_folders = cam_folders
         self._cam_folder_lists = cam_folder_lists if cam_folder_lists is not None else [[f] for f in cam_folders]
         n = len(cam_names)
         self._cam_last_update_ts = [0.0] * n  # reset refresh dots on camera switch
+        # Scale poll pool for many cameras (2 threads per camera, min 8)
+        self._poll_pool.setMaxThreadCount(max(8, n * 2))
 
         # Inicializuj per-camera struktury (přeskočit pokud data už jsou z předchozího scanu)
         if reset_items:
@@ -7375,7 +8599,7 @@ class Viewer(QWidget):
                     self._on_cam_loaded(cam_i, gen, req, idx, ms, br, gid, bo, img))
             self._cam_signals.append(sig)
 
-        self._multi_grid.setup_cameras(cam_names)
+        self._multi_grid.setup_cameras(cam_names, layout_config=layout_config)
         self._multi_grid.set_label_font_size(self._cam_label_size_sb.value())
         self._switch_to_multi_view()
         self._sc_set_enabled(True)
@@ -7854,6 +9078,9 @@ class Viewer(QWidget):
                                     if other_idx == cam_idx:
                                         continue
                                     self._per_cam_display_one(other_idx, latest_ts)
+                                    if other_idx < len(self._per_cam_rows):
+                                        sv_slave = self._per_cam_ts_to_slider(other_idx, latest_ts)
+                                        self._per_cam_rows[other_idx].set_value(sv_slave)
                             else:
                                 # Scrubbing — show current slider time for all
                                 if self.items and self.current_idx is not None:
@@ -7975,13 +9202,15 @@ class Viewer(QWidget):
             self.last_pick_hour_to,
             self.last_pick_cam_names,
             self,
-            preloaded_cameras=getattr(self, '_preloaded_cameras', None))
+            preloaded_cameras=getattr(self, '_preloaded_cameras', None),
+            multi_grid=self._multi_grid)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
         cam_names = dlg.selected_camera_names()
         if not cam_names:
             return
+        layout_cfg = dlg.layout_config
 
         # Ulož do paměti
         self.last_pick_cam_names = cam_names
@@ -8029,6 +9258,9 @@ class Viewer(QWidget):
             # Pre-load grid_state into img_view so _start_scan saves and restores it
             if grid_state is not None:
                 MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
+            # Enable PDXM1 reference grid for single-cam view
+            self.img_view.show_pdxm1_grid = MultiCameraGrid._is_pdxm1_cam(cam_names[0])
+            self.img_view.pdxm1_cam_name = cam_names[0] if self.img_view.show_pdxm1_grid else ''
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -8040,7 +9272,8 @@ class Viewer(QWidget):
             self._start_multi_cam_scan(
                 cam_names, cam_folder_lists,
                 axis_override=axis_override,
-                online=online)
+                online=online,
+                layout_config=layout_cfg)
 
     def _start_multi_cam_scan(
         self,
@@ -8048,9 +9281,10 @@ class Viewer(QWidget):
         cam_folder_lists: list[list[Path]],
         axis_override,
         online: bool,
+        layout_config=None,
     ):
         """Spustí scan pro více kamer naráz."""
-        self._setup_multi_cam(cam_names, [])
+        self._setup_multi_cam(cam_names, [], layout_config=layout_config)
         self.axis_override = axis_override
         self._gen += 1
         gen = self._gen
@@ -8162,7 +9396,8 @@ class Viewer(QWidget):
 
         self._cam_folders = cam_folders
         self._setup_multi_cam(cam_names, cam_folders, reset_items=False,
-                              cam_folder_lists=cam_folder_lists)
+                              cam_folder_lists=cam_folder_lists,
+                              layout_config=self._multi_grid._layout_config)
 
         # Nastav items ze první kamery pro slider
         self._rebuild_shared_items_from_cams()
@@ -8350,6 +9585,9 @@ class Viewer(QWidget):
             # Pre-load grid_state into img_view so _start_scan saves and restores it
             if grid_state is not None:
                 MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
+            # Enable PDXM1 reference grid for single-cam view
+            self.img_view.show_pdxm1_grid = MultiCameraGrid._is_pdxm1_cam(cam_names[0])
+            self.img_view.pdxm1_cam_name = cam_names[0] if self.img_view.show_pdxm1_grid else ''
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -9697,7 +10935,7 @@ class Viewer(QWidget):
         in_multi = self._is_multi_cam() and bool(self._per_cam_rows)
         self.slider.setVisible(show and not in_multi)
         self.tickbar.setVisible(show)
-        self._per_cam_container.setVisible(show and in_multi)
+        self._per_cam_scroll.setVisible(show and in_multi)
         tab_w = win.findChild(QTabWidget)
         if tab_w is not None:
             tab_w.tabBar().setVisible(show)
@@ -9779,7 +11017,7 @@ class Viewer(QWidget):
         in_multi = self._is_multi_cam() and bool(self._per_cam_rows)
         self.slider.setVisible(show and not in_multi)
         self.tickbar.setVisible(show)           # tickbar vždy viditelný (cursor line)
-        self._per_cam_container.setVisible(show and in_multi)
+        self._per_cam_scroll.setVisible(show and in_multi)
         # Hide/show tab bar and status bar (they live in the main window)
         win = self.window()
         from PySide6.QtWidgets import QTabWidget, QStatusBar

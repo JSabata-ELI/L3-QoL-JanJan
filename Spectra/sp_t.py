@@ -2176,7 +2176,113 @@ class SpectraWidget(QWidget):
                 return
 
         canvas.customContextMenuRequested.connect(_on_context_menu)
+
+        self._install_cursor(canvas, fig, ax, x_is_time=(suffix == "top"))
+
         return w
+
+    def _install_cursor(self, canvas, fig, ax, x_is_time: bool):
+        """Blitted crosshair with Y-axis and X-axis floating annotations inside the graph."""
+        import matplotlib.dates as _mdates
+        from matplotlib.transforms import blended_transform_factory as _btf
+
+        _state = {"bg": None, "pending": False, "last_event": None}
+
+        # Crosshair lines
+        vline = ax.axvline(color="#888", linewidth=0.8, linestyle="--", visible=False)
+        hline = ax.axhline(color="#888", linewidth=0.8, linestyle="--", visible=False)
+
+        # Y-value annotation — floats along left axis edge
+        _y_ann = ax.text(
+            0.0, 0.5, "",
+            transform=_btf(ax.transAxes, ax.transData),
+            ha="right", va="center", fontsize=9,
+            color="#1565C0", zorder=10, visible=False, clip_on=False,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                      ec="#1565C0", alpha=0.88, linewidth=0.7),
+        )
+        # X-value annotation — floats along bottom axis edge
+        _x_ann = ax.text(
+            0.5, 0.0, "",
+            transform=_btf(ax.transData, ax.transAxes),
+            ha="center", va="top", fontsize=9,
+            color="#555", zorder=10, visible=False, clip_on=False,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                      ec="#888", alpha=0.88, linewidth=0.7),
+        )
+
+        def _on_draw(_evt):
+            for a in (_y_ann, _x_ann): a.set_visible(False)
+            vline.set_visible(False); hline.set_visible(False)
+            _state["bg"] = canvas.copy_from_bbox(fig.bbox)
+
+        def _fmt_y(y):
+            abs_y = abs(y)
+            if y == 0 or (1e-3 <= abs_y < 1e6):
+                return f"{y:.5g}"
+            return f"{y:.4e}"
+
+        def _fmt_x(x):
+            if x_is_time:
+                try:
+                    from zoneinfo import ZoneInfo
+                    dt = _mdates.num2date(x, tz=ZoneInfo("Europe/Prague"))
+                    return dt.strftime("%H:%M:%S")
+                except Exception:
+                    return f"{x:.4g}"
+            return f"{x:.4g} nm"
+
+        def _process():
+            _state["pending"] = False
+            evt = _state["last_event"]
+            bg  = _state["bg"]
+
+            if evt is None or evt.inaxes is None:
+                if bg:
+                    canvas.restore_region(bg)
+                    canvas.blit(fig.bbox)
+                return
+
+            x, y = evt.xdata, evt.ydata
+            if x is None or y is None:
+                return
+
+            vline.set_xdata([x, x]); vline.set_visible(True)
+            hline.set_ydata([y, y]); hline.set_visible(True)
+
+            _y_ann.set_position((0.0, y))
+            _y_ann.set_text(f" {_fmt_y(y)} ")
+            _y_ann.set_visible(True)
+
+            _x_ann.set_position((x, 0.0))
+            _x_ann.set_text(f" {_fmt_x(x)} ")
+            _x_ann.set_visible(True)
+
+            if bg:
+                canvas.restore_region(bg)
+                for artist in (vline, hline, _y_ann, _x_ann):
+                    ax.draw_artist(artist)
+                canvas.blit(fig.bbox)
+            else:
+                canvas.draw_idle()
+
+        def _on_motion(evt):
+            _state["last_event"] = evt
+            if not _state["pending"]:
+                _state["pending"] = True
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(16, _process)
+
+        def _on_leave(_evt):
+            for a in (_y_ann, _x_ann): a.set_visible(False)
+            vline.set_visible(False); hline.set_visible(False)
+            if _state["bg"]:
+                canvas.restore_region(_state["bg"])
+                canvas.blit(fig.bbox)
+
+        canvas.mpl_connect("draw_event",          _on_draw)
+        canvas.mpl_connect("motion_notify_event", _on_motion)
+        canvas.mpl_connect("axes_leave_event",    _on_leave)
 
     def _make_region_panel(self) -> QWidget:
         col = QWidget()
@@ -2882,19 +2988,27 @@ class SpectraWidget(QWidget):
             return
         self._set_status(f"Loading {len(pvs)} search PV(s)…")
         self._btn_pick_day.setEnabled(False)
+        self._progress.setRange(0, len(pvs))
+        self._progress.setValue(0)
+        self._progress.setFormat("Loading  %v / %m  PV(s)  (%p%)")
+        self._progress.setVisible(True)
 
         sig = _Sig(self)
         sig.done.connect(self._on_energy_loaded)
         sig.error.connect(self._on_energy_error)
+        sig.progress.connect(self._set_status)
+        sig.progress_n.connect(self._on_analysis_progress)
 
         def _work():
             try:
                 series = []
-                for lbl, ch in pvs:
+                for i, (lbl, ch) in enumerate(pvs):
                     if self._cancel.is_set():
                         break
+                    sig.progress.emit(f"Loading {i+1}/{len(pvs)}: {lbl}…")
                     series.append({"label": lbl, "channel": ch,
                                    "data": _fetch_scalars(ch, start_ns, end_ns)})
+                    sig.progress_n.emit(i + 1, len(pvs))
                 sig.done.emit(series)
             except Exception as e:
                 sig.error.emit(str(e))
@@ -2904,6 +3018,8 @@ class SpectraWidget(QWidget):
 
     def _on_energy_loaded(self, series: list):
         self._btn_pick_day.setEnabled(True)
+        self._progress.setVisible(False)
+        self._progress.setFormat("Analyzing  %v / %m  (%p%)")
         if self._cancel.is_set():
             self._set_status("Load cancelled.")
             return
@@ -2931,6 +3047,8 @@ class SpectraWidget(QWidget):
 
     def _on_energy_error(self, err: str):
         self._btn_pick_day.setEnabled(True)
+        self._progress.setVisible(False)
+        self._progress.setFormat("Analyzing  %v / %m  (%p%)")
         self._set_status(f"Energy error: {err}")
         self._draw_top_empty("Error loading data")
 
