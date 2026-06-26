@@ -793,6 +793,7 @@ class CSSLoggerWidget(QWidget):
         self._samples_by_pv: dict = {}
         self._table_rows:    list = []
         self._pv_order:      list = []
+        self._base_pv_order: list = []
         self._last_pv_search: str = ""
         self._col_full_names: dict = {}
         self._presets:           list = load_presets()
@@ -828,9 +829,8 @@ class CSSLoggerWidget(QWidget):
         self._xy_rect_selector = None
         self._xy_zoom_history: list = []
         self._xy_choice_map: dict = {}
-        # Stacked mode: each PV gets its own vertical band (CS-Studio style) so
-        # traces never overlap. Off = legacy overlaid twin-axes view.
-        self._stacked_mode = bool(self.config.get("stacked_mode", True))
+        # Single banded graph: every PV lives in its own vertical band of one
+        # shared plot (CS-Studio style). A PV with Autoscale on spans full height.
         self._pv_time_canvas = None
         self._pv_time_figure = None
         self._pv_time_df     = None
@@ -853,6 +853,12 @@ class CSSLoggerWidget(QWidget):
         self._countdown_timer.setInterval(50)
         self._countdown_timer.timeout.connect(self._live_countdown_tick)
         self._live_countdown_elapsed_ms = 0
+        # Coalesced cursor-table refresh: the QTableWidget is only rewritten when
+        # the mouse settles, so dragging the crosshair stays smooth (the blit
+        # crosshair itself updates every move).
+        self._cursor_tbl_timer = QTimer(self)
+        self._cursor_tbl_timer.setSingleShot(True)
+        self._cursor_tbl_timer.timeout.connect(self._flush_cursor_table)
         self._ramping_repository = load_ramping_repository()
         self._data_repository: list = []
         self._ref_lines: list      = []
@@ -870,7 +876,7 @@ class CSSLoggerWidget(QWidget):
         self._dt_to   = now
         self._font_size: int = 11
         self._axis_tv_cols = ("show", "pv", "display_name", "color", "cursor_val",
-                               "side", "ymin", "ymax", "auto_scale", "width", "smooth", "grid",
+                               "ymin", "ymax", "auto_scale", "width", "smooth", "grid",
                                "blank")
         self._load_data_repository()
 
@@ -1091,13 +1097,6 @@ class CSSLoggerWidget(QWidget):
         b_cond = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
         b_cpv  = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
 
-        self._chk_stacked = QCheckBox("Stacked")
-        self._chk_stacked.setStyleSheet(_CHK_STYLE)
-        self._chk_stacked.setChecked(self._stacked_mode)
-        self._chk_stacked.setToolTip("One vertical band per PV (CS-Studio style) — traces never overlap.")
-        self._chk_stacked.toggled.connect(self._on_stacked_toggled)
-        ctrl.addWidget(self._chk_stacked)
-
         ctrl.addWidget(QLabel("Font:"))
         self._font_size_spin = QSpinBox()
         self._font_size_spin.setRange(5, 24); self._font_size_spin.setValue(11); self._font_size_spin.setFixedWidth(48)
@@ -1159,14 +1158,14 @@ class CSSLoggerWidget(QWidget):
         _HEADS  = {
             "show":         "Show", "pv": "PV", "display_name": "Display Name",
             "color":        "Color", "cursor_val": "Cursor",
-            "side":         "Side", "ymin": "Y min", "ymax": "Y max",
-            "auto_scale":   "Auto", "width": "Width", "smooth": "Smooth", "grid": "Grid",
+            "ymin": "Y min", "ymax": "Y max",
+            "auto_scale":   "Autoscale", "width": "Width", "smooth": "Smooth", "grid": "Grid",
             "blank":        "",
         }
         _COL_W  = {
             "show":40, "pv":270, "display_name":130, "color":40,
-            "cursor_val":90, "side":45, "ymin":55, "ymax":55,
-            "auto_scale":35, "width":45, "smooth":50, "grid":35,
+            "cursor_val":90, "ymin":55, "ymax":55,
+            "auto_scale":70, "width":45, "smooth":50, "grid":35,
             "blank":0,
         }
 
@@ -1210,9 +1209,11 @@ class CSSLoggerWidget(QWidget):
         ctrl = QHBoxLayout()
         ctrl.addWidget(QLabel("X axis:"))
         self._xy_x_combo = QComboBox(); self._xy_x_combo.setMinimumWidth(200)
+        self._xy_x_combo.currentIndexChanged.connect(self._on_xy_axis_changed)
         ctrl.addWidget(self._xy_x_combo)
         ctrl.addWidget(QLabel("Y axis:"))
         self._xy_y_combo = QComboBox(); self._xy_y_combo.setMinimumWidth(200)
+        self._xy_y_combo.currentIndexChanged.connect(self._on_xy_axis_changed)
         ctrl.addWidget(self._xy_y_combo)
 
         b_plot = QPushButton("Plot XY"); b_plot.setStyleSheet(_BTN_SUCCESS)
@@ -1399,6 +1400,29 @@ class CSSLoggerWidget(QWidget):
 
     # ── Graph plotting ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _band_ylim(idx, n, dmin, dmax, autoscale):
+        """Y-limits that place a PV's data range [dmin, dmax] into its vertical
+        band of the shared plot. Band ``idx`` (0 = top) of ``n`` occupies the
+        fraction [f_bot, f_top] of the axes height; an Autoscale'd PV uses the
+        full height instead so it overlays the banded ones."""
+        if not (dmax > dmin):                      # flat / single value
+            c = dmin
+            pad = abs(c) * 0.1 or 1.0
+            dmin, dmax = c - pad, c + pad
+        if autoscale:
+            f_bot, f_top = 0.02, 0.98
+        else:
+            band_h = 1.0 / max(n, 1)
+            margin = 0.12 * band_h                 # gap so traces don't touch band edges
+            f_top  = 1.0 - idx * band_h - margin
+            f_bot  = 1.0 - (idx + 1) * band_h + margin
+        denom = (f_top - f_bot) or 1.0
+        span  = dmax - dmin
+        lo = dmin - f_bot / denom * span
+        hi = dmax + (1.0 - f_top) / denom * span
+        return lo, hi
+
     def _plot_graph(self):
         """Safe wrapper: a plotting failure must never crash the app or leave a
         stale graph — clear the canvas and show a message instead."""
@@ -1457,71 +1481,35 @@ class CSSLoggerWidget(QWidget):
         except Exception:
             _fsize = 7
 
-        if self._stacked_mode:
-            # ── Stacked: one vertical band per PV, shared X axis (CS-Studio style)
-            # Generous left margin to fit the horizontal Y label + tick numbers.
-            longest = max((len(self._pv_settings.get(pv, {}).get(
-                "display_name", shorten_pv_name(pv))) for pv in pvs_for_axes), default=10)
-            l_margin = min(0.34, max(0.12, (longest * _fsize * 0.78 + 55) / _cw))
-            fig.subplots_adjust(left=l_margin, right=0.98, top=0.97, bottom=0.11,
-                                hspace=0.10)
-            axes = []
-            for i in range(n):
-                if i == 0:
-                    ax = fig.add_subplot(n, 1, i + 1)
-                else:
-                    ax = fig.add_subplot(n, 1, i + 1, sharex=axes[0])
-                axes.append(ax)
-            self._graph_spine_xpos = [(0.0, "left")] * n
-            for i, ax in enumerate(axes):
-                ax.yaxis.set_label_position("left"); ax.yaxis.tick_left()
-                if i < n - 1:                       # only bottom band shows X tick labels
-                    ax.tick_params(axis="x", labelbottom=False)
-            ax_x = axes[-1]
-        else:
-            # ── Overlay: all PVs on one plot, twin Y axes pushed out left/right
-            _fig_w_px  = _cw
-            _axis_px   = _fsize * 1.9 + 17   # +2px so Y labels don't overlap neighbour axis
-            STEP_fig   = max(0.018, _axis_px / _fig_w_px)
+        # ── Single banded graph: ONE plot rectangle, one left Y axis per PV.
+        # Each PV occupies its own vertical band (see _band_ylim); a PV with
+        # Autoscale ticked spans the full graph height instead. Grid / zoom / pan
+        # act on the whole graph at once.
+        _fig_w_px = _cw
+        _axis_px  = _fsize * 1.9 + 25   # room for one left axis column (label + ticks + gap)
+        STEP_fig  = max(0.020, _axis_px / _fig_w_px)
 
-            left_pvs  = [pv for pv in pvs_for_axes
-                         if self._pv_settings.get(pv, {}).get("side", "left") != "right"]
-            right_pvs = [pv for pv in pvs_for_axes
-                         if self._pv_settings.get(pv, {}).get("side", "left") == "right"]
-            n_left    = max(len(left_pvs), 1)
-            n_right   = max(len(right_pvs), 0)
+        BASE_L = 0.04; BASE_R = 0.015
+        left_margin  = min(0.60, BASE_L + (n - 1) * STEP_fig)
+        right_margin = 1.0 - BASE_R
+        fig.subplots_adjust(left=left_margin, right=right_margin, top=0.97, bottom=0.12)
 
-            BASE_L = 0.03; BASE_R = 0.01
-            left_margin  = BASE_L + (n_left - 1) * STEP_fig
-            right_margin = 1.0    - BASE_R - n_right * STEP_fig
-            fig.subplots_adjust(left=left_margin, right=right_margin, top=0.95, bottom=0.12)
+        axes_width = max(0.05, right_margin - left_margin)
+        STEP_ax    = STEP_fig / axes_width
 
-            axes_width = right_margin - left_margin
-            STEP_ax    = STEP_fig / axes_width
+        axes = [fig.add_subplot(111)]
+        for _ in range(1, n):
+            axes.append(axes[0].twinx())
 
-            axes = [fig.add_subplot(111)]
-            for _ in range(1, n):
-                axes.append(axes[0].twinx())
-
-            left_idx = 0; right_idx = 0
-            self._graph_spine_xpos = []
-            for i, (pv, ax) in enumerate(zip(pvs_for_axes, axes)):
-                side = self._pv_settings.get(pv, {}).get("side", "left")
-                if i == 0:
-                    ax.yaxis.set_label_position("left"); ax.yaxis.tick_left()
-                    self._graph_spine_xpos.append((0.0, "left")); left_idx = 1
-                elif side == "right":
-                    ax.yaxis.set_label_position("right"); ax.yaxis.tick_right()
-                    xfrac = 1.0 + right_idx * STEP_ax
-                    if right_idx > 0:
-                        ax.spines["right"].set_position(("axes", xfrac))
-                    self._graph_spine_xpos.append((xfrac, "right")); right_idx += 1
-                else:
-                    ax.yaxis.set_label_position("left"); ax.yaxis.tick_left()
-                    xfrac = -left_idx * STEP_ax
-                    ax.spines["left"].set_position(("axes", xfrac))
-                    self._graph_spine_xpos.append((xfrac, "left")); left_idx += 1
-            ax_x = axes[0]
+        self._graph_spine_xpos = []
+        for i, ax in enumerate(axes):
+            ax.yaxis.set_label_position("left"); ax.yaxis.tick_left()
+            xfrac = -i * STEP_ax
+            if i > 0:
+                ax.spines["left"].set_position(("axes", xfrac))
+                ax.spines["right"].set_visible(False)  # twins must not draw over the plot
+            self._graph_spine_xpos.append((xfrac, "left"))
+        ax_x = axes[0]
         self._graph_x_ax = ax_x
 
         def _moving_avg(vals, w):
@@ -1580,25 +1568,37 @@ class CSSLoggerWidget(QWidget):
                 line.set_visible(visible)
                 self._graph_lines.append([line])
 
-            # Stacked: horizontal Y label + horizontal tick numbers read better in a
-            # short band. Overlay: rotate to save horizontal room for many axes.
-            if self._stacked_mode:
-                ax.set_ylabel(disp_name, color=line_color, fontsize=_fsize,
-                              rotation=0, ha="right", va="center", labelpad=6)
-                ax.tick_params(axis="y", labelcolor=line_color, labelsize=max(5, _fsize - 1), pad=2)
-            else:
-                ax.set_ylabel(disp_name, color=line_color, fontsize=_fsize, rotation=90, labelpad=2)
-                ax.tick_params(axis="y", labelcolor=line_color, labelsize=_fsize, pad=2, labelrotation=90)
-            from matplotlib.ticker import AutoMinorLocator
+            # Rotated (vertical) Y label + tick numbers, one narrow column per PV.
+            ax.set_ylabel(disp_name, color=line_color, fontsize=_fsize, rotation=90, labelpad=1)
+            ax.tick_params(axis="y", labelcolor=line_color, labelsize=max(5, _fsize - 1),
+                           pad=2, labelrotation=90)
+            from matplotlib.ticker import AutoMinorLocator, MaxNLocator
+            ax.yaxis.set_major_locator(MaxNLocator(6))
             ax.yaxis.set_minor_locator(AutoMinorLocator(5))
             ax.tick_params(axis="y", which="minor", length=3, labelsize=0)
-            ax.grid(pv_setting.get("grid", i == 0))
 
+            # Position this PV's data into its vertical band (or full height if
+            # Autoscale is on). Manual Y min/max override the data range that is
+            # mapped into the band.
             ymin_pv = pv_setting.get("ymin"); ymax_pv = pv_setting.get("ymax")
-            if not pv_setting.get("auto_scale", True) and (ymin_pv is not None or ymax_pv is not None):
-                ax.set_ylim(ymin_pv, ymax_pv)
+            vals_clean = [v for v in values if v == v]   # drop NaNs
+            if vals_clean:
+                dmin, dmax = min(vals_clean), max(vals_clean)
+            else:
+                dmin, dmax = 0.0, 1.0
+            autosc  = pv_setting.get("auto_scale", False)
+            if not autosc:
+                if ymin_pv is not None: dmin = ymin_pv
+                if ymax_pv is not None: dmax = ymax_pv
+            lo, hi = self._band_ylim(i, n, dmin, dmax, autosc)
+            ax.set_ylim(lo, hi)
 
-        # X-axis (owned by the bottom band in stacked mode, axes[0] in overlay)
+        # One shared grid for the whole graph (driven by the first visible PV).
+        first_pv = pvs_for_axes[0] if pvs_for_axes else None
+        show_grid = self._pv_settings.get(first_pv, {}).get("grid", True) if first_pv else True
+        axes[0].grid(show_grid)
+
+        # X-axis (the single shared bottom axis, axes[0])
         ax0 = ax_x
         if all_times and len(all_times) > 1:
             t_min, t_max = min(all_times), max(all_times)
@@ -1702,8 +1702,12 @@ class CSSLoggerWidget(QWidget):
         self._x_cursor_ann = None
         from matplotlib.transforms import blended_transform_factory as _btf
         for ax_i, ax in enumerate(axes):
-            vl = ax.axvline(color="#888", linewidth=0.8, linestyle="--", visible=False)
-            hl = ax.axhline(color="#888", linewidth=0.8, linestyle="--", visible=False)
+            # animated=True keeps these out of the normal draw() so the blit
+            # background stays clean — otherwise each redraw bakes in a ghost.
+            vl = ax.axvline(color="#888", linewidth=0.8, linestyle="--",
+                            visible=False, animated=True)
+            hl = ax.axhline(color="#888", linewidth=0.8, linestyle="--",
+                            visible=False, animated=True)
             self._crosshair_vlines.append(vl)
             self._crosshair_hlines.append(hl)
             pv_c  = pvs_for_axes[ax_i] if ax_i < len(pvs_for_axes) else None
@@ -1713,14 +1717,14 @@ class CSSLoggerWidget(QWidget):
             blend = _btf(ax.transAxes, ax.transData)
             ann   = ax.text(sf, 0, "", ha=ha_s, va="center", fontsize=_fsize,
                             color=p_col, zorder=10, visible=False, transform=blend,
-                            clip_on=False,
+                            clip_on=False, animated=True,
                             bbox=dict(boxstyle="round,pad=0.15", fc="white",
                                       ec=p_col, alpha=0.85, linewidth=0.6))
             self._crosshair_texts.append(ann)
 
         self._x_cursor_ann = ax_x.text(
             0, -0.01, "", ha="center", va="top", fontsize=_fsize,
-            color="#333", zorder=10, visible=False,
+            color="#333", zorder=10, visible=False, animated=True,
             transform=ax_x.get_xaxis_transform(), clip_on=False,
             bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#888", alpha=0.9, linewidth=0.6))
 
@@ -1779,8 +1783,17 @@ class CSSLoggerWidget(QWidget):
                 pv_lines[1].set_xdata(times); pv_lines[1].set_ydata(sm)
             elif pv_lines:
                 pv_lines[0].set_xdata(times); pv_lines[0].set_ydata(values)
-            if pv_setting.get("auto_scale", True):
-                ax.relim(); ax.autoscale_view(scalex=False, scaley=True)
+            # Re-apply this PV's band (or full height if Autoscale on).
+            vals_clean = [v for v in values if v == v]
+            if vals_clean:
+                dmin, dmax = min(vals_clean), max(vals_clean)
+                autosc = pv_setting.get("auto_scale", False)
+                if not autosc:
+                    ymin_pv = pv_setting.get("ymin"); ymax_pv = pv_setting.get("ymax")
+                    if ymin_pv is not None: dmin = ymin_pv
+                    if ymax_pv is not None: dmax = ymax_pv
+                lo, hi = self._band_ylim(i, len(self._graph_pvs), dmin, dmax, autosc)
+                ax.set_ylim(lo, hi)
 
         self._graph_raw = new_raw
         if all_times and len(all_times) > 1 and self._graph_axes:
@@ -1807,6 +1820,12 @@ class CSSLoggerWidget(QWidget):
                     now_utc = datetime.now().astimezone(timezone.utc)
                     ax0.set_xlim(now_utc - span, now_utc)
 
+        # Keep the crosshair snap data in sync, and force a fresh blit background
+        # on the next draw so the cursor boxes never ghost over stale pixels.
+        self._graph_raw_np = [
+            (np.asarray(t, dtype=float), np.asarray(v, dtype=float))
+            for t, v in self._graph_raw]
+        self._blit_bg = None
         self._mpl_canvas.draw_idle()
 
     def _on_canvas_draw(self, *_):
@@ -1863,7 +1882,15 @@ class CSSLoggerWidget(QWidget):
             if raw_np and ax_i < len(raw_np):
                 arr, vals = raw_np[ax_i]
                 if len(arr):
-                    idx = int(np.argmin(np.abs(arr - x_f)))
+                    # arr (times) is sorted ascending → binary search the nearest
+                    # sample instead of scanning the whole array each frame.
+                    pos = int(np.searchsorted(arr, x_f))
+                    if pos <= 0:
+                        idx = 0
+                    elif pos >= len(arr):
+                        idx = len(arr) - 1
+                    else:
+                        idx = pos if (arr[pos] - x_f) < (x_f - arr[pos - 1]) else pos - 1
                     snap_val = float(vals[idx])
             if pv and pv in self._pv_settings:
                 self._pv_settings[pv]["cursor_val"] = (
@@ -1899,41 +1926,28 @@ class CSSLoggerWidget(QWidget):
             except Exception:
                 dt_cursor = None
 
-        # Update cursor label with x timestamp + y values for all axes
-        try:
-            dt_cursor = mdates.num2date(x_f, tz=TZ_PRAGUE)
-            y_parts = []
-            raw_np = self._graph_raw_np
-            for ax_i, ax in enumerate(self._graph_axes):
-                pv = self._graph_pvs[ax_i] if ax_i < len(self._graph_pvs) else None
-                if pv and raw_np and ax_i < len(raw_np):
-                    arr, vals = raw_np[ax_i]
-                    if len(arr):
-                        idx = int(np.argmin(np.abs(arr - x_f)))
-                        snap = float(vals[idx])
-                        name = self._pv_settings.get(pv, {}).get(
-                            "display_name", shorten_pv_name(pv))
-                        y_parts.append(f"{name}: {_fmt_cursor_value(snap)}")
-            x_str = dt_cursor.strftime("%Y-%m-%d  %H:%M:%S")
-            y_str = "   |   ".join(y_parts) if y_parts else "—"
-        except Exception:
-            pass
-
         if bg is not None: canvas.blit(self._mpl_figure.bbox)
         else: canvas.draw_idle()
 
-        # Update axis settings cursor column
+        # Push the per-PV cursor values into the axis-settings table only once the
+        # mouse settles (rewriting QTableWidget items every move stutters).
+        self._cursor_tbl_timer.start(120)
+
+    def _flush_cursor_table(self):
+        """Write the latest cursor values (already cached in _pv_settings by the
+        hover handler) into the axis-settings table. Coalesced via a timer."""
         try:
             val_idx = list(self._axis_tv_cols).index("cursor_val")
-            for row in range(self._axis_tv.rowCount()):
-                pv_item = self._axis_tv.item(row, 1)
-                if pv_item:
-                    pv = pv_item.text()
-                    cv = self._pv_settings.get(pv, {}).get("cursor_val", "")
-                    item = self._axis_tv.item(row, val_idx)
-                    if item: item.setText(cv)
-        except Exception:
-            pass
+        except ValueError:
+            return
+        for row in range(self._axis_tv.rowCount()):
+            pv_item = self._axis_tv.item(row, 1)
+            if not pv_item:
+                continue
+            cv = self._pv_settings.get(pv_item.text(), {}).get("cursor_val", "")
+            item = self._axis_tv.item(row, val_idx)
+            if item:
+                item.setText(cv)
 
     def _clear_graph(self):
         if self._mpl_canvas is not None:
@@ -1959,11 +1973,6 @@ class CSSLoggerWidget(QWidget):
         if self._mpl_figure and self._samples_by_pv:
             self._plot_graph()
 
-    def _on_stacked_toggled(self, checked):
-        self._stacked_mode = bool(checked)
-        self.config["stacked_mode"] = self._stacked_mode
-        if self._samples_by_pv:
-            self._plot_graph()
     # ── Span / zoom handlers ────────────────────────────────────────────────
 
     def _on_span_select(self, xmin, xmax):
@@ -2127,6 +2136,7 @@ class CSSLoggerWidget(QWidget):
                                  if start_ns <= ts <= end_ns]
         self._samples_by_pv = graph_samples
         self._pv_order      = pv_order
+        self._base_pv_order = list(pv_order)   # real fetched PVs (no custom channels)
 
         self._numeric_pvs = {
             pv for pv, s in self._samples_by_pv.items()
@@ -2141,11 +2151,7 @@ class CSSLoggerWidget(QWidget):
         rows = self._remove_fake_hour_boundary_rows(rows)
         self._table_rows_unfiltered = rows
 
-        # Custom PVs
-        available_custom = self._get_available_custom_pvs()
-        for cpv in available_custom:
-            if cpv["name"] not in self._pv_order:
-                self._pv_order.append(cpv["name"])
+        # Custom PVs — append the defined channels and compute their values.
         self._rebuild_custom_pvs()
 
         # Master-multiple filter + conditions
@@ -2307,9 +2313,15 @@ class CSSLoggerWidget(QWidget):
             samples_by_pv, pv_order, _, start_ns, end_ns = result
             self._samples_by_pv = samples_by_pv
             self._pv_order      = pv_order
-            self._table_rows    = self._build_table_rows(samples_by_pv, pv_order)
-            self._table_rows_unfiltered = list(self._table_rows)
-            for i, pv in enumerate(pv_order):
+            self._base_pv_order = list(pv_order)
+            self._numeric_pvs = {
+                pv for pv, s in self._samples_by_pv.items()
+                if any(isinstance(v, (int, float)) for _, v, _ in s)
+            }
+            self._table_rows_unfiltered = self._build_table_rows(samples_by_pv, pv_order)
+            self._rebuild_custom_pvs()          # add + compute derived channels
+            self._table_rows = self._apply_conditions_to_rows()
+            for i, pv in enumerate(self._pv_order):
                 if pv not in self._pv_settings:
                     self._pv_settings[pv] = self._get_pv_default_settings(pv, i)
             # Find latest ts for incremental fetch
@@ -2334,6 +2346,13 @@ class CSSLoggerWidget(QWidget):
         if not pvs:
             self._toggle_live_mode(); return
         start_ns = self._live_last_ts if self._live_last_ts else (now_ns() - int(60e9))
+        # Never look back further than the visible window (bounds the query while
+        # the archiver is idle), but always re-query from the last KNOWN sample
+        # forward so ingestion lag doesn't make us skip newly-archived points.
+        if self._live_window_span:
+            min_start = now_ns() - int(self._live_window_span.total_seconds() * 1e9)
+            if start_ns < min_start:
+                start_ns = min_start
         end_ns   = now_ns()
         self._inc_sig = _IncSig()
         sig = self._inc_sig
@@ -2344,6 +2363,7 @@ class CSSLoggerWidget(QWidget):
                 from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value
                 new_samples: dict = {}
                 added_count = 0
+                errors: list = []
                 for pv in pvs:
                     try:
                         raw = cpva_fetch_samples_chunked(pv, start_ns, end_ns)
@@ -2357,21 +2377,33 @@ class CSSLoggerWidget(QWidget):
                         if new_pts:
                             new_samples[pv] = new_pts
                             added_count += len(new_pts)
-                    except Exception:
-                        pass
-                sig.done.emit((new_samples, added_count, end_ns))
-            except Exception:
-                sig.done.emit(({}, 0, end_ns))
+                    except Exception as exc:
+                        errors.append(f"{shorten_pv_name(pv)}: {exc}")
+                sig.done.emit((new_samples, added_count, end_ns, errors))
+            except Exception as exc:
+                sig.done.emit(({}, 0, end_ns, [str(exc)]))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_incremental_finished(self, result):
         if not self._live_mode: return
         try:
-            new_samples, added_count, end_ns = result
-            self._live_last_ts = end_ns
+            # Worker emits a 4-tuple (errors added); tolerate the old 3-tuple too.
+            if len(result) == 4:
+                new_samples, added_count, end_ns, errors = result
+            else:
+                new_samples, added_count, end_ns = result; errors = []
+            self._live_tick_count = getattr(self, "_live_tick_count", 0) + 1
 
             if added_count > 0:
+                # Advance the cursor to the newest sample we actually received —
+                # NOT to wall-clock "now" — so archiver ingestion lag can't make
+                # the next query start ahead of where data exists (which would
+                # silently stall live updates forever).
+                maxrecv = max((pts[-1][0] for pts in new_samples.values() if pts),
+                              default=0)
+                if maxrecv:
+                    self._live_last_ts = max(self._live_last_ts or 0, maxrecv)
                 for pv, pts in new_samples.items():
                     existing = self._samples_by_pv.get(pv, [])
                     existing.extend(pts)
@@ -2383,15 +2415,56 @@ class CSSLoggerWidget(QWidget):
                     else:
                         self._samples_by_pv[pv] = existing
 
-                self._table_rows = self._build_table_rows(
-                    self._samples_by_pv, self._pv_order)
-                self._table_rows_unfiltered = list(self._table_rows)
-                self._apply_conditions_to_rows()
-                self._update_graph_data()
+                self._table_rows_unfiltered = self._build_table_rows(
+                    self._samples_by_pv, self._base_pv_order or self._pv_order)
+                self._rebuild_custom_pvs()          # recompute derived channels live
+                self._table_rows = self._apply_conditions_to_rows()
                 self._populate_table()
                 total_pts = sum(len(v) for v in self._samples_by_pv.values())
                 self._lbl_status.setText(
                     f"Live +{added_count} pts  |  total {total_pts}")
+                if errors:
+                    self._lbl_status.setText(
+                        f"Live +{added_count} pts  |  ⚠ {len(errors)} fetch errors")
+            else:
+                # No new points — show that polling is alive and why nothing moved
+                # so an idle archiver isn't mistaken for a frozen app.
+                last_ns = max((s[-1][0] for s in self._samples_by_pv.values() if s),
+                              default=0)
+                last_str = ns_to_local_str(last_ns)[:19] if last_ns else "—"
+                if errors:
+                    self._lbl_status.setText(f"Live: ⚠ {len(errors)} fetch errors — "
+                                             f"see Log  |  last data {last_str}")
+                else:
+                    self._lbl_status.setText(f"Live: polling… no new data  |  "
+                                             f"last data {last_str}")
+
+            # Log fetch errors and an occasional heartbeat so the Log tab reveals
+            # whether live polling is actually running and reaching the archiver.
+            if errors:
+                self._log("Live fetch errors: " + " | ".join(errors[:4])
+                          + (" …" if len(errors) > 4 else ""))
+            elif self._live_tick_count % 20 == 0:   # ~every 6 s at 300 ms ticks
+                last_ns = max((s[-1][0] for s in self._samples_by_pv.values() if s),
+                              default=0)
+                self._log(f"Live polling (tick {self._live_tick_count}); "
+                          f"last data {ns_to_local_str(last_ns)[:19] if last_ns else '—'}")
+
+            # Always refresh the graph each tick so the live window scrolls to
+            # "now" even when no new points arrived (otherwise it looks frozen).
+            # If the graph has no lines yet or a PV just gained its first numeric
+            # data, the existing artists can't represent it — do a full replot;
+            # otherwise just mutate the existing artists (fast path).
+            numeric_now = {
+                pv for pv in self._pv_order
+                if self._pv_settings.get(pv, {}).get("show", True)
+                and any(isinstance(v, (int, float))
+                        for _, v, _ in self._samples_by_pv.get(pv, []))
+            }
+            if not self._graph_lines or not numeric_now.issubset(set(self._graph_pvs)):
+                self._plot_graph()
+            else:
+                self._update_graph_data()
         except Exception:
             # A failed incremental update must NOT kill the live loop or crash
             # the Qt timer callback — log and keep polling.
@@ -2536,52 +2609,94 @@ class CSSLoggerWidget(QWidget):
 
     # ── Custom PVs ───────────────────────────────────────────────────────────
 
-    def _get_available_custom_pvs(self) -> list:
-        loaded = set(self._pv_order)
-        return [
-            cpv for cpv in self._custom_pvs
-            if set(cpv.get("required_pvs", [])).issubset(loaded)
-        ]
+    @staticmethod
+    def _col_letter(i: int) -> str:
+        """Excel-style column letter for index i (0 -> A, 25 -> Z, 26 -> AA)."""
+        s = ""; i += 1
+        while i > 0:
+            i, r = divmod(i - 1, 26)
+            s = chr(65 + r) + s
+        return s
 
-    def _rebuild_custom_pvs(self):
-        if not self._custom_pvs:
+    def _channel_letters(self) -> list:
+        """Ordered ``[(letter, name, display_name)]`` for every channel currently
+        in ``_pv_order`` (real PVs first, then custom channels). These letters are
+        the variables used in custom-PV expressions (e.g. ``B/D``)."""
+        custom_names = {d.get("name", "") for d in self._custom_pvs}
+        out = []
+        for i, pv in enumerate(self._pv_order):
+            if pv in custom_names:
+                disp = pv
+            else:
+                disp = self._pv_settings.get(pv, {}).get("display_name", shorten_pv_name(pv))
+            out.append((self._col_letter(i), pv, disp))
+        return out
+
+    def _compute_custom_pvs_in_rows(self, rows):
+        """Evaluate every custom PV expression for each row, using the channel
+        letters as variables. Customs are computed in definition order so a later
+        custom can reference an earlier one by its letter."""
+        defs = [(d.get("name", ""), d.get("expr", "")) for d in self._custom_pvs
+                if d.get("name") and d.get("expr")]
+        if not defs:
             return
-        custom_names = {d["name"] for d in self._custom_pvs}
-        self._pv_order = [p for p in self._pv_order if p not in custom_names]
         SAFE = {"__builtins__": {}, "abs": abs, "min": min,
                 "max": max, "round": round, "math": math}
-        for dpv in self._custom_pvs:
-            required = dpv.get("required_pvs", [])
-            if all(p in self._samples_by_pv for p in required):
-                if dpv["name"] not in self._pv_order:
-                    self._pv_order.append(dpv["name"])
-                if dpv["name"] not in self._pv_settings:
-                    self._pv_settings[dpv["name"]] = {"show": True}
-        for _ts_ns, row_dict in self._table_rows_unfiltered:
-            for dpv in self._custom_pvs:
-                aliases = dpv.get("aliases", {})
-                local_vars: dict = {}
-                ok = True
-                for alias, pv_name in aliases.items():
-                    if pv_name not in row_dict:
-                        ok = False; break
-                    val, _ = row_dict[pv_name]
-                    if not isinstance(val, (int, float)):
-                        ok = False; break
-                    local_vars[alias] = val
-                if not ok:
+        letters = self._channel_letters()
+        name_to_letter = {name: letter for letter, name, _ in letters}
+        compiled = {}
+        for name, expr in defs:
+            try:
+                compiled[name] = compile(expr, "<cpv>", "eval")
+            except Exception:
+                compiled[name] = None
+        for _ts_ns, row_dict in rows:
+            ns = {}
+            for letter, name, _ in letters:
+                v = row_dict.get(name, (None,))[0]
+                ns[letter] = v if isinstance(v, (int, float)) else None
+            for name, _expr in defs:
+                code = compiled.get(name)
+                if code is None:
                     continue
                 try:
-                    compiled = dpv.get("_compiled")
-                    if compiled is None:
-                        compiled = compile(dpv["expr"], "<cpv>", "eval")
-                        dpv["_compiled"] = compiled
-                    result = eval(compiled, SAFE, local_vars)
-                    row_dict[dpv["name"]] = (result, "")
+                    result = eval(code, SAFE, ns)
                 except Exception:
-                    pass
-        for dpv in self._custom_pvs:
-            name = dpv["name"]
+                    result = None
+                row_dict[name] = (result, "")
+                lt = name_to_letter.get(name)
+                if lt is not None:
+                    ns[lt] = result if isinstance(result, (int, float)) else None
+
+    def _rebuild_custom_pvs(self):
+        """Refresh the custom channels: re-sync ``_pv_order`` to base PVs + the
+        currently-defined customs, compute their values into the unfiltered rows,
+        and rebuild their derived sample series."""
+        base = getattr(self, "_base_pv_order", None)
+        if base is None:
+            custom_names = {d.get("name", "") for d in self._custom_pvs}
+            base = [p for p in self._pv_order if p not in custom_names]
+            self._base_pv_order = list(base)
+        self._pv_order = list(base)
+        for d in self._custom_pvs:
+            name = d.get("name", "")
+            if name and name not in self._pv_order:
+                self._pv_order.append(name)
+                self._pv_settings.setdefault(name, self._get_pv_default_settings(
+                    name, len(self._pv_order) - 1))
+        # drop derived series for customs that no longer exist
+        cur = {d.get("name", "") for d in self._custom_pvs}
+        for name in [p for p in list(self._samples_by_pv) if p not in self._base_pv_order]:
+            if name not in cur:
+                self._samples_by_pv.pop(name, None)
+                self._numeric_pvs.discard(name)
+
+        self._compute_custom_pvs_in_rows(self._table_rows_unfiltered)
+
+        for d in self._custom_pvs:
+            name = d.get("name", "")
+            if not name:
+                continue
             self._samples_by_pv[name] = [
                 (ts, v, u)
                 for ts, row_dict in self._table_rows_unfiltered
@@ -2589,7 +2704,8 @@ class CSSLoggerWidget(QWidget):
                 for v, u in [row_dict[name]]
                 if isinstance(v, (int, float))
             ]
-            self._numeric_pvs.add(name)
+            if self._samples_by_pv[name]:
+                self._numeric_pvs.add(name)
 
     # ── Save runtime state ────────────────────────────────────────────────────
 
@@ -2797,7 +2913,7 @@ class CSSLoggerWidget(QWidget):
             "side":         "left",
             "ymin":         None,
             "ymax":         None,
-            "auto_scale":   True,
+            "auto_scale":   False,
             "width":        None,
             "smooth":       1,
             "grid":         idx == 0,
@@ -2807,16 +2923,27 @@ class CSSLoggerWidget(QWidget):
 
     def _refresh_xy_choices(self):
         pvs = self._pv_order
-        self._xy_x_combo.clear()
-        self._xy_y_combo.clear()
-        choices = ["Timestamp (numeric)"] + [shorten_pv_name(p) for p in pvs]
-        self._xy_choice_map = {"Timestamp (numeric)": "__ts__"}
+        custom_names = {d.get("name", "") for d in self._custom_pvs}
+        choices = []
+        self._xy_choice_map = {}
         for p in pvs:
-            self._xy_choice_map[shorten_pv_name(p)] = p
-        self._xy_x_combo.addItems(choices)
-        self._xy_y_combo.addItems(choices)
-        if len(choices) > 2:
-            self._xy_y_combo.setCurrentIndex(2)
+            label = p if p in custom_names else shorten_pv_name(p)
+            choices.append(label)
+            self._xy_choice_map[label] = p
+        # Repopulate without firing the auto-replot signal for every added item.
+        for combo in (self._xy_x_combo, self._xy_y_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(choices)
+            combo.blockSignals(False)
+        if len(choices) > 1:
+            self._xy_x_combo.setCurrentIndex(0)
+            self._xy_y_combo.setCurrentIndex(1)
+
+    def _on_xy_axis_changed(self, _idx=0):
+        # Auto-replot when the user picks a different X or Y channel.
+        if self._table_rows:
+            self._plot_xy()
 
     def _plot_xy(self):
         try:
@@ -2840,9 +2967,9 @@ class CSSLoggerWidget(QWidget):
 
         xs, ys = [], []
         for ts, row_dict in self._table_rows:
-            xval = float(ts) / 1e9 if x_pv == "__ts__" else None
+            xval = None
             yval = None
-            if x_pv != "__ts__" and x_pv in row_dict:
+            if x_pv in row_dict:
                 v, _ = row_dict[x_pv]
                 try: xval = float(v)
                 except (TypeError, ValueError): pass
@@ -3127,6 +3254,23 @@ class CSSLoggerWidget(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._dt_from, self._dt_to = dlg._result_from, dlg._result_to
             self._refresh_time_labels()
+            if self._live_mode:
+                # Live mode tracks "now": the chosen window sets the live span
+                # (graph width). Restart the live load so the new span takes
+                # effect and data is re-fetched immediately.
+                self._live_timer.stop()
+                self._countdown_timer.stop()
+                window_diff = (self._dt_to - self._dt_from).total_seconds()
+                self._live_window_span = (timedelta(seconds=window_diff)
+                                          if 60 <= window_diff <= 86400 * 7
+                                          else timedelta(hours=1))
+                self._live_last_ts = None
+                self._zoom_history.clear()
+                self._lbl_status.setText("Live: reloading window…")
+                self._live_initial_load()
+            else:
+                # Not live: load the newly chosen window now.
+                self._on_load_clicked()
 
     # ── Conditions dialog ────────────────────────────────────────────────────
 
@@ -3150,15 +3294,21 @@ class CSSLoggerWidget(QWidget):
     # ── Custom PV dialog ─────────────────────────────────────────────────────
 
     def _open_custom_pv_dialog(self):
-        dlg = _CustomPVDialog(self._custom_pvs, self)
+        dlg = _CustomPVDialog(self._custom_pvs, self._channel_letters(), self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._custom_pvs = dlg.result_pvs
             save_custom_pvs(self._custom_pvs)
             self._compile_custom_pvs()
-            if self._samples_by_pv:
-                self._apply_custom_pvs_to_rows()
+            if self._table_rows_unfiltered:
+                # Recompute customs and re-run the filter pipeline so the new
+                # channels appear with real values everywhere (graph + table).
+                self._rebuild_custom_pvs()
+                rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+                self._table_rows = self._apply_conditions_to_rows(rows)
                 self._plot_graph()
+                self._refresh_axis_settings_tv()
                 self._populate_table()
+                self._refresh_xy_choices()
 
     def _compile_custom_pvs(self):
         self._custom_pv_exprs = {}
@@ -3167,21 +3317,6 @@ class CSSLoggerWidget(QWidget):
             expr = entry.get("expr", "")
             if name and expr:
                 self._custom_pv_exprs[name] = expr
-
-    def _apply_custom_pvs_to_rows(self):
-        for name, expr in self._custom_pv_exprs.items():
-            try:
-                for ts, row_dict in self._table_rows:
-                    ns_val = {shorten_pv_name(p): v for p, (v, _) in row_dict.items()}
-                    try:
-                        result = eval(expr, {"__builtins__": {}}, ns_val)
-                        row_dict[name] = (result, "")
-                    except Exception:
-                        pass
-                if name not in self._pv_order:
-                    self._pv_order.append(name)
-            except Exception as exc:
-                self._log(f"Custom PV '{name}' error: {exc}")
 
     # ── CSV Export ───────────────────────────────────────────────────────────
 
@@ -3414,17 +3549,43 @@ class _RefLinesDialog(QDialog):
 # ── Custom PV Dialog ─────────────────────────────────────────────────────────
 
 class _CustomPVDialog(QDialog):
-    def __init__(self, custom_pvs, parent=None):
+    def __init__(self, custom_pvs, channel_letters=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom PVs (derived channels)")
-        self.resize(550, 350)
+        self.resize(820, 580)
         self._rows: list = []
         self.result_pvs: list = []
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
             "Define new virtual PVs as Python expressions.\n"
-            "Use shortened PV names as variables (e.g. sbw4, ptm1)."))
+            "Use the letters below as variables (e.g. B/D, A*0.749)."))
+
+        # ── Reference table: which letter is which channel ──────────────────
+        channel_letters = channel_letters or []
+        ref_box = QGroupBox("Available channels")
+        ref_lay = QVBoxLayout(ref_box)
+        if channel_letters:
+            ref_tbl = QTableWidget(len(channel_letters), 2)
+            ref_tbl.setHorizontalHeaderLabels(["Var", "Channel"])
+            ref_tbl.verticalHeader().setVisible(False)
+            ref_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            ref_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+            ref_tbl.setMaximumHeight(150)
+            for r, (letter, _name, disp) in enumerate(channel_letters):
+                it_l = QTableWidgetItem(letter)
+                it_l.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ref_tbl.setItem(r, 0, it_l)
+                ref_tbl.setItem(r, 1, QTableWidgetItem(disp))
+            ref_tbl.setColumnWidth(0, 50)
+            ref_tbl.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.ResizeMode.Stretch)
+            ref_lay.addWidget(ref_tbl)
+        else:
+            hint = QLabel("Load data first to see the PV letters.")
+            hint.setStyleSheet("color:#777;")
+            ref_lay.addWidget(hint)
+        lay.addWidget(ref_box)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         inner  = QWidget()
@@ -3452,9 +3613,9 @@ class _CustomPVDialog(QDialog):
         row_w = QWidget()
         rl    = QHBoxLayout(row_w); rl.setContentsMargins(0,0,0,0)
         name_e = QLineEdit(existing.get("name","") if existing else "")
-        name_e.setFixedWidth(110); name_e.setPlaceholderText("Name")
+        name_e.setMinimumWidth(220); name_e.setPlaceholderText("Name")
         expr_e = QLineEdit(existing.get("expr","") if existing else "")
-        expr_e.setPlaceholderText("Expression (Python)")
+        expr_e.setMinimumWidth(260); expr_e.setPlaceholderText("Expression (Python)")
         b_del = QPushButton("✕"); b_del.setFixedWidth(26)
         b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;border-radius:3px;}")
         b_del.clicked.connect(lambda: self._remove_row(row_w, rec))

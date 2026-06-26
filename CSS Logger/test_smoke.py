@@ -205,8 +205,6 @@ def test_every_button_handler():
         ("open_ref_lines",     w._open_ref_lines_dialog),
         ("open_conditions",    w._open_conditions_dialog),
         ("open_custom_pv",     w._open_custom_pv_dialog),
-        ("stacked_on",         lambda: w._on_stacked_toggled(True)),
-        ("stacked_off",        lambda: w._on_stacked_toggled(False)),
         ("font_size",          lambda: (w._font_size_spin.setValue(14), w._apply_font_size())),
         ("apply_axis",         w._apply_axis_settings),
         ("zoom_back",          w._zoom_back),

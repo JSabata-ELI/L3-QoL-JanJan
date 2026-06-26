@@ -2,90 +2,31 @@
   "custom_pvs": [
     {
       "name": "Sum of Green [J]",
-      "expr": "F+H",
-      "aliases": {
-        "F": "L3-PM03-025:Energy",
-        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      },
-      "required_pvs": [
-        "L3-PM03-025:Energy",
-        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      ]
+      "expr": "F+H"
     },
     {
       "name": "Beta/Green [%]",
-      "expr": "A/(F+H)*100",
-      "aliases": {
-        "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-        "F": "L3-PM03-025:Energy",
-        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      },
-      "required_pvs": [
-        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-        "L3-PM03-025:Energy",
-        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      ]
+      "expr": "A/(F+H)*100"
     },
     {
       "name": "PCC1 Eff [%]",
-      "expr": "(F+H)/B*100",
-      "aliases": {
-        "B": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-        "F": "L3-PM03-025:Energy",
-        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      },
-      "required_pvs": [
-        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-        "L3-PM03-025:Energy",
-        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      ]
+      "expr": "(F+H)/B*100"
     },
     {
       "name": "Split Ratio [%]",
-      "expr": "F/(F+H)*100",
-      "aliases": {
-        "F": "L3-PM03-025:Energy",
-        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      },
-      "required_pvs": [
-        "L3-PM03-025:Energy",
-        "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-      ]
+      "expr": "F/(F+H)*100"
     },
     {
       "name": "PTM1/PAP1",
-      "expr": "B/D",
-      "aliases": {
-        "B": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-        "D": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy"
-      },
-      "required_pvs": [
-        "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-        "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy"
-      ]
+      "expr": "B/D"
     },
     {
       "name": "Comp. Beta Output [J]",
-      "expr": "A*0.749",
-      "aliases": {
-        "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
-      },
-      "required_pvs": [
-        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
-      ]
+      "expr": "A*0.749"
     },
     {
       "name": "Back Reflection Ratio [%]",
-      "expr": "E/(0.749*A)*100",
-      "aliases": {
-        "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-        "E": "L3-PM03-023:Energy"
-      },
-      "required_pvs": [
-        "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-        "L3-PM03-023:Energy"
-      ],
-      "show_default": false
+      "expr": "E/(0.749*A)*100"
     }
   ]
 }

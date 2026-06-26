@@ -26,11 +26,39 @@ FLASH_INTERVAL_MS = 300     # flash blink speed
 PV_AVG_COUNT = 25   # number of recent values to average
 PV_POLL_MS   = 500  # how often to read PVs (ms)
 
-# (pv_name, label, lo_orange, lo_red, hi_orange, hi_red, unit)
+# (channel, label, lo_orange, lo_red, hi_orange, hi_red, unit)
+# `channel` is either a PV name (str) or a (minuend, subtrahend) tuple whose
+# difference (minuend - subtrahend) is monitored.
 _PV_MONITORS = [
     ("L3-UTIL-HEB03-001:PressOut_PSI", "Helium volume", 46, 45.5, 57, 60, "PSI"),
     ("HAPLS-VOLT_IN_CGL-SEEDER_ER3_ALPHA1:SeederPZTVoltage", "Alpha voltage", 1.2, 1.1, 1.9, 2.2, "V"),
 ]
+
+# Chiller temperature deviations from setpoint (Temp - TempSP).
+_CHILLER_LABELS = ["Chiller DA1", "Chiller DA2", "Chiller DA3", "Chiller DA4",
+                   "Helium Chiller", "Utility chiller"]
+
+# Absolute-temperature limits (°C) — an "external" condition checked on the raw
+# Temp value, index-aligned with _PV_MONITORS. Outside this range => PURPLE alert
+# (takes priority over the deviation thresholds). None = no absolute check.
+# TODO: per-chiller values to be refined later.
+_PV_ABS_RANGE = [None, None]   # Helium volume, Alpha voltage: no absolute range
+
+for _i, _label in enumerate(_CHILLER_LABELS, start=1):
+    _ch = f"L3-UTIL-CHL03-{_i:03d}"
+    _PV_MONITORS.append(
+        ((f"{_ch}:Temp", f"{_ch}:TempSP"), _label, -0.3, -0.6, 0.3, 0.6, "°C")
+    )
+    # DA1-DA4 + Helium Chiller: 7..17.5 °C ; Utility chiller: 18..22 °C
+    _PV_ABS_RANGE.append((18.0, 22.0) if _i == 6 else (7.0, 17.5))
+
+
+def _pv_key(channel):
+    """Stable string key for a channel spec (str or (minuend, subtrahend) tuple)."""
+    if isinstance(channel, tuple):
+        return f"{channel[0]}-{channel[1]}"
+    return channel
+
 
 _RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry"}
 
@@ -182,8 +210,8 @@ class ScreenTracker(tk.Tk):
 
         pv_saved = self._presets.get("pv_thresholds", {})
         self._pv_thr_vars = []
-        for pv_name, _label, def_lo_o, def_lo_r, def_hi_o, def_hi_r, _unit in _PV_MONITORS:
-            saved = pv_saved.get(pv_name, {})
+        for channel, _label, def_lo_o, def_lo_r, def_hi_o, def_hi_r, _unit in _PV_MONITORS:
+            saved = pv_saved.get(_pv_key(channel), {})
             # backward-compat: old keys were "orange"/"red"
             lo_r_var = tk.DoubleVar(value=saved.get("lo_red",    saved.get("red",    def_lo_r)))
             lo_o_var = tk.DoubleVar(value=saved.get("lo_orange", saved.get("orange", def_lo_o)))
@@ -312,14 +340,19 @@ class ScreenTracker(tk.Tk):
         ttk.Button(self._preset_frame, text="Delete",
                    command=self._delete_preset, width=6).grid(row=0, column=3, padx=(0, 6), pady=6)
 
-        # PV alert panel (row=3) — individual rows shown only when condition breached
+        # PV alert panel (row=3) — individual badges shown only when condition
+        # breached, laid out side by side and wrapping to new lines as needed.
         self._pv_frame = ttk.Frame(self)
         self._pv_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 4))
         self._pv_frame.grid_remove()
+        self._pv_frame.grid_propagate(False)
+        self._pv_last_width = 0
+        self._pv_frame.bind("<Configure>", self._on_pv_frame_configure)
         self.columnconfigure(0, weight=1)
 
         for _pv_name, _label, *_thresholds in _PV_MONITORS:
             row_frame = tk.Frame(self._pv_frame, bg="#cc6600", padx=8, pady=5)
+            row_frame._active = False
             lbl = tk.Label(row_frame, text="", bg="#cc6600", fg="white",
                            font=("Segoe UI", 9, "bold"), anchor="w")
             lbl.pack()
@@ -355,10 +388,10 @@ class ScreenTracker(tk.Tk):
 
     def _save_pv_thresholds(self):
         thr = {}
-        for i, (pv_name, *_rest) in enumerate(_PV_MONITORS):
+        for i, (channel, *_rest) in enumerate(_PV_MONITORS):
             lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
             try:
-                thr[pv_name] = {
+                thr[_pv_key(channel)] = {
                     "lo_red":    lo_r_var.get(),
                     "lo_orange": lo_o_var.get(),
                     "hi_orange": hi_o_var.get(),
@@ -510,23 +543,25 @@ class ScreenTracker(tk.Tk):
             self._sound_combo.current(self._sound_files.index(self.sound_file.get()))
         self._sound_combo.grid(row=3, column=1, padx=(0,6), pady=(0,6))
 
+        # Window position & size
+        win_frame = ttk.LabelFrame(frame, text="Window position & size")
+        win_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(win_frame,
+                  text="Move and resize the Announcer window, then save its position.").grid(
+            row=0, column=0, padx=(6, 4), pady=(4, 4), sticky="w")
+        ttk.Button(win_frame, text="Set location and size of this window",
+                   command=self._start_window_recording).grid(
+            row=0, column=1, padx=(0, 6), pady=(4, 4))
+
         # PV Limits table
         pv_lim_frame = ttk.LabelFrame(frame, text="PV Limits")
-        pv_lim_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-
-        # Zone legend strip
-        legend_fr = tk.Frame(pv_lim_frame)
-        legend_fr.grid(row=0, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 2))
-        for _txt, _bg in [("  RED  ", "#aa1c00"), ("  WARN  ", "#b85a00"),
-                          ("   OK   ", "#2a6030"), ("  WARN  ", "#b85a00"), ("  RED  ", "#aa1c00")]:
-            tk.Label(legend_fr, text=_txt, bg=_bg, fg="white",
-                     font=("Segoe UI", 7, "bold")).pack(side="left", padx=1)
+        pv_lim_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         # Column headers
         ttk.Label(pv_lim_frame, text="Channel",
                   font=("Segoe UI", 8, "bold")).grid(row=1, column=0, padx=(6, 8), pady=(0, 2), sticky="w")
         for _col, (_htxt, _hbg) in enumerate(
-            [("< Red", "#aa1c00"), ("< Warn", "#b85a00"), ("Warn >", "#b85a00"), ("Red >", "#aa1c00")],
+            [("Lolo", "#aa1c00"), ("Lo", "#b85a00"), ("Hi", "#b85a00"), ("HiHi", "#aa1c00")],
             start=1,
         ):
             tk.Label(pv_lim_frame, text=f" {_htxt} ", bg=_hbg, fg="white",
@@ -536,27 +571,17 @@ class ScreenTracker(tk.Tk):
             row=2, column=0, columnspan=5, sticky="ew", padx=4, pady=(0, 2))
 
         # Data rows
-        for i, (_pv_name, label, default_lo_o, _lo_r, _hi_o, _hi_r, unit) in enumerate(_PV_MONITORS):
+        for i, (_channel, label, default_lo_o, _lo_r, _hi_o, _hi_r, unit) in enumerate(_PV_MONITORS):
             lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
-            inc = 0.01 if default_lo_o < 10 else 0.1
-            fmt = "%.2f" if default_lo_o < 10 else "%.1f"
+            inc = 0.01 if abs(default_lo_o) < 10 else 0.1
+            fmt = "%.2f" if abs(default_lo_o) < 10 else "%.1f"
             row_idx = i + 3
             ttk.Label(pv_lim_frame, text=f"{label} ({unit})", anchor="w").grid(
                 row=row_idx, column=0, padx=(6, 8), pady=(2, 4), sticky="w")
             for _col, var in enumerate([lo_r_var, lo_o_var, hi_o_var, hi_r_var], start=1):
-                ttk.Spinbox(pv_lim_frame, from_=0, to=9999, increment=inc,
+                ttk.Spinbox(pv_lim_frame, from_=-9999, to=9999, increment=inc,
                             textvariable=var, width=7, format=fmt).grid(
                     row=row_idx, column=_col, padx=3, pady=(2, 4))
-
-        # Window position & size
-        win_frame = ttk.LabelFrame(frame, text="Window position & size")
-        win_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(win_frame,
-                  text="Move and resize the Announcer window, then save its position.").grid(
-            row=0, column=0, padx=(6, 4), pady=(4, 4), sticky="w")
-        ttk.Button(win_frame, text="Set location and size of this window",
-                   command=self._start_window_recording).grid(
-            row=0, column=1, padx=(0, 6), pady=(4, 4))
 
         # Close when clicking on the main window background (not on popup or its dropdowns)
         self._settings_close_bind = self.bind("<Button-1>", self._on_main_click_close_settings, "+")
@@ -673,7 +698,8 @@ class ScreenTracker(tk.Tk):
             self.after_cancel(self._pv_poll_job)
             self._pv_poll_job = None
         for row in self._pv_alert_rows:
-            row.pack_forget()
+            row._active = False
+            row.place_forget()
         self._pv_frame.grid_remove()
         self.status_var.set("Tracking stopped.")
         self._update_circle()
@@ -926,43 +952,55 @@ class ScreenTracker(tk.Tk):
         _ssl.check_hostname = False
         _ssl.verify_mode    = ssl.CERT_NONE
 
+        def fetch_avg(pv_name):
+            try:
+                params = urllib.parse.urlencode({
+                    "channelName": pv_name,
+                    "start": str(start_ns),
+                    "end":   str(now_ns),
+                })
+                req = urllib.request.Request(
+                    f"{_CPVA}?{params}",
+                    headers={"Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=2.0, context=_ssl) as resp:
+                    data = json.loads(resp.read())
+                vals = []
+                for sample in data:
+                    v = sample.get("value")
+                    if isinstance(v, (int, float)):
+                        vals.append(float(v))
+                    elif isinstance(v, list) and v and isinstance(v[0], (int, float)):
+                        vals.append(float(v[0]))
+                recent = vals[-PV_AVG_COUNT:]
+                return sum(recent) / len(recent) if recent else None
+            except Exception as e:
+                print(f"[PV] {pv_name}: {e}")
+                return None
+
         def worker():
-            now_ns   = int(time.time() * 1e9)
-            start_ns = now_ns - 60 * 1_000_000_000   # last 60 s
-            results  = []
-            for pv_name, _label, *_thresholds in _PV_MONITORS:
-                try:
-                    params = urllib.parse.urlencode({
-                        "channelName": pv_name,
-                        "start": str(start_ns),
-                        "end":   str(now_ns),
-                    })
-                    req = urllib.request.Request(
-                        f"{_CPVA}?{params}",
-                        headers={"Accept": "application/json"},
-                    )
-                    with urllib.request.urlopen(req, timeout=2.0, context=_ssl) as resp:
-                        data = json.loads(resp.read())
-                    vals = []
-                    for sample in data:
-                        v = sample.get("value")
-                        if isinstance(v, (int, float)):
-                            vals.append(float(v))
-                        elif isinstance(v, list) and v and isinstance(v[0], (int, float)):
-                            vals.append(float(v[0]))
-                    recent = vals[-PV_AVG_COUNT:]
-                    avg = sum(recent) / len(recent) if recent else None
-                except Exception as e:
-                    print(f"[PV] {pv_name}: {e}")
-                    avg = None
-                results.append(avg)
+            results = []
+            for channel, _label, *_thresholds in _PV_MONITORS:
+                if isinstance(channel, tuple):
+                    a = fetch_avg(channel[0])
+                    sub = channel[1]
+                    b = sub if isinstance(sub, (int, float)) else fetch_avg(sub)
+                    avg = (a - b) if (a is not None and b is not None) else None
+                    abs_val = a          # raw temperature for the absolute check
+                else:
+                    avg = fetch_avg(channel)
+                    abs_val = avg
+                results.append((avg, abs_val))
             self.after(0, lambda r=results: self._update_pv_display(r))
+
+        now_ns   = int(time.time() * 1e9)
+        start_ns = now_ns - 60 * 1_000_000_000   # last 60 s
 
         threading.Thread(target=worker, daemon=True).start()
         self._pv_poll_job = self.after(PV_POLL_MS, self._poll_pvs)
 
     def _update_pv_display(self, results: list):
-        for i, (avg, (_, label, _lo_o, _lo_r, _hi_o, _hi_r, unit)) in enumerate(zip(results, _PV_MONITORS)):
+        for i, ((avg, abs_val), (_, label, _lo_o, _lo_r, _hi_o, _hi_r, unit)) in enumerate(zip(results, _PV_MONITORS)):
             lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
             lo_r = lo_r_var.get()
             lo_o = lo_o_var.get()
@@ -971,7 +1009,14 @@ class ScreenTracker(tk.Tk):
             row = self._pv_alert_rows[i]
             lbl = self._pv_alert_labels[i]
 
-            if avg is not None and (avg < lo_r or avg > hi_r):
+            # External condition: raw temperature outside its absolute range
+            abs_range = _PV_ABS_RANGE[i]
+            abs_breach = (abs_range is not None and abs_val is not None
+                          and (abs_val < abs_range[0] or abs_val > abs_range[1]))
+
+            if abs_breach:
+                bg = "#7a1fa0"   # purple — out of absolute range
+            elif avg is not None and (avg < lo_r or avg > hi_r):
                 bg = "#cc2200"
             elif avg is not None and (avg < lo_o or avg > hi_o):
                 bg = "#cc6600"
@@ -979,16 +1024,58 @@ class ScreenTracker(tk.Tk):
                 bg = None
 
             if bg is not None:
-                suffix = f" {unit}" if unit else ""
-                fmt = ".2f" if abs(avg) < 10 else ".1f"
-                arrow = " ↑" if avg > hi_o else " ↓"
+                if abs_breach:
+                    fmt = ".2f" if abs(abs_val) < 10 else ".1f"
+                    arrow = " ↑" if abs_val > abs_range[1] else " ↓"
+                    text = f"⛔ {label}: {abs_val:{fmt}} °C{arrow}"
+                else:
+                    suffix = f" {unit}" if unit else ""
+                    fmt = ".2f" if abs(avg) < 10 else ".1f"
+                    arrow = " ↑" if avg > hi_o else " ↓"
+                    text = f"⚠  {label}: {avg:{fmt}}{suffix}{arrow}"
                 row.configure(bg=bg)
-                lbl.configure(bg=bg, text=f"⚠  {label}: {avg:{fmt}}{suffix}{arrow}")
-                if not row.winfo_ismapped():
-                    row.pack(anchor="w", pady=(0, 2))
+                lbl.configure(bg=bg, text=text)
+                row._active = True
             else:
-                if row.winfo_ismapped():
-                    row.pack_forget()
+                row._active = False
+
+        self._relayout_pv_alerts()
+
+    def _on_pv_frame_configure(self, event):
+        # Re-flow only when the available width actually changes (placing
+        # children / setting the frame height fire <Configure> with same width).
+        if event.width != self._pv_last_width:
+            self._pv_last_width = event.width
+            self._relayout_pv_alerts()
+
+    def _relayout_pv_alerts(self):
+        """Lay active alert badges left-to-right, wrapping to a new line so
+        nothing overlaps or gets clipped at the right edge."""
+        for row in self._pv_alert_rows:
+            row.place_forget()
+        active = [r for r in self._pv_alert_rows if getattr(r, "_active", False)]
+        if not active:
+            self._pv_frame.configure(height=1)
+            return
+
+        self.update_idletasks()
+        avail = self._pv_frame.winfo_width()
+        if avail <= 1:
+            avail = max(1, self.winfo_width() - 20)
+
+        gap = 4
+        x = y = line_h = 0
+        for row in active:
+            w = row.winfo_reqwidth()
+            h = row.winfo_reqheight()
+            if x > 0 and x + w > avail:   # wrap to next line
+                x = 0
+                y += line_h + gap
+                line_h = 0
+            row.place(x=x, y=y)
+            x += w + gap
+            line_h = max(line_h, h)
+        self._pv_frame.configure(height=y + line_h)
 
     def _on_close(self):
         self.tracking = False

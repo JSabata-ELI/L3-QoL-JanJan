@@ -628,6 +628,22 @@ def _strip_cam_name(name: str) -> str:
     """Remove -_-IMG (and variants) suffix from camera folder names for display."""
     return re.sub(r"[-_]+IMG$", "", name, flags=re.IGNORECASE).rstrip("-_")
 
+def _cam_short_label(name: str) -> str:
+    """Descriptive camera token for compact display: strip the '-IMG' suffix and
+    the 'C03-032-' container/number prefix. 'C03-032-PAP1DF-IMG' -> 'PAP1DF'."""
+    s = _strip_cam_name(name)
+    m = re.match(r"^C\d{2}-\d{2,3}-(.+)$", s, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return s.split("-")[-1] if "-" in s else s
+
+def _cam_aspect_hint(name: str) -> float:
+    """Rough width/height hint for a camera by name, used to lay out tiles before
+    a real frame is loaded. Portrait diode arrays (PD[1-4]M1xDF) are tall; the
+    rest are treated as square. The real frame is still fit with KeepAspectRatio,
+    so an imperfect hint only costs a little letterbox, never correctness."""
+    return 0.45 if re.search(r"PD[1-4]M1.?DF", name, re.IGNORECASE) else 1.0
+
 def ns_from_dt(dt: datetime) -> int:
     return int(dt.timestamp() * 1_000_000_000)
 
@@ -672,6 +688,11 @@ def folder_hour_from_prague_hour(prague_hour: int, date: datetime | None = None)
 # on every poll is what makes live updates slow down (and keep slowing down) over
 # a long session — so the online poller scans only the newest folders per camera.
 ONLINE_ACTIVE_FOLDER_COUNT = 2  # current hour + previous (grace for late writes at rollover)
+# When a _DirWatcher (ReadDirectoryChangesW) is active for a camera, new frames
+# arrive instantly without enumeration, so the expensive full os.listdir scan only
+# needs to run occasionally — for hour-rollover / new-folder auto-discovery and as a
+# safety net against ReadDirectoryChangesW buffer overflow under burst.
+ONLINE_FULL_POLL_INTERVAL_S = 2.5
 
 
 def _cam_folder_time_key(folder: Path) -> "tuple[int, int, int, int] | None":
@@ -787,6 +808,38 @@ def _read_img_max_value(path: Path) -> float | None:
         pass
     return None
 
+
+# imgMaxValue is the camera's physical full-scale (e.g. 4095) written identically
+# into every frame of a given camera/run — it is NOT the per-frame pixel maximum
+# (that is computed separately as arr_px_max on every decode). It is therefore
+# constant within a source folder, so we cache it per folder to avoid re-opening
+# every PNG a second time with PIL just to read metadata (halves I/O over SMB in
+# the default-gradient live path). Load runs on LoadTask worker threads, so guard
+# the dict with a lock; cap with an LRU so a long session can't grow it unbounded.
+_IMG_MAX_VALUE_CACHE: "OrderedDict[str, float | None]" = OrderedDict()
+_IMG_MAX_VALUE_LOCK = threading.Lock()
+_IMG_MAX_VALUE_CACHE_MAX = 256
+
+
+def _read_img_max_value_cached(path: Path) -> float | None:
+    """Per-folder cached wrapper around _read_img_max_value (see note above)."""
+    if path.suffix.lower() != ".png":
+        return None
+    key = str(path.parent)
+    with _IMG_MAX_VALUE_LOCK:
+        if key in _IMG_MAX_VALUE_CACHE:
+            _IMG_MAX_VALUE_CACHE.move_to_end(key)
+            return _IMG_MAX_VALUE_CACHE[key]
+    # Read outside the lock (PIL open can block on SMB); a rare duplicate read
+    # under contention is harmless.
+    val = _read_img_max_value(path)
+    with _IMG_MAX_VALUE_LOCK:
+        _IMG_MAX_VALUE_CACHE[key] = val
+        _IMG_MAX_VALUE_CACHE.move_to_end(key)
+        while len(_IMG_MAX_VALUE_CACHE) > _IMG_MAX_VALUE_CACHE_MAX:
+            _IMG_MAX_VALUE_CACHE.popitem(last=False)
+    return val
+
 # ---------------- BRIGHTNESS ----------------
 def _autostretch_gray(img: QImage, p_low: float = 0.1, p_high: float = 99.9) -> QImage:
     if img.isNull():
@@ -847,7 +900,7 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
                 ptr.setsize(img.sizeInBytes())
             arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
             arr_f = arr16.astype(np.float32)
-            img_max_val = _read_img_max_value(path)
+            img_max_val = _read_img_max_value_cached(path)
             arr_px_max = float(arr_f.max())
             if img_max_val is not None and arr_px_max > 0:
                 # Matlab: img = imgMaxValue * img / max(img), then imagesc([0, 65535])
@@ -889,7 +942,7 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
                 ptr.setsize(img.sizeInBytes())
             arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
             arr_f = arr16.astype(np.float32)
-            img_max_val = _read_img_max_value(path)
+            img_max_val = _read_img_max_value_cached(path)
             arr_px_max = float(arr_f.max())
             if img_max_val is not None and arr_px_max > 0:
                 arr_f = img_max_val * arr_f / arr_px_max
@@ -2737,6 +2790,7 @@ class DatePickerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Pick date")
         self._camera_mode = False  # set to True by open_folder
+        self._segments: "list[tuple]" = []  # per-day selection: (date, hour_from, hour_to)
 
         init_dt = datetime.now(TZ_PRAGUE)
         init_hour = init_dt.hour
@@ -2829,7 +2883,7 @@ class DatePickerDialog(QDialog):
         self.cb_now.stateChanged.connect(self._on_now_changed)
 
         # ── Multi-day checkbox + To-date calendar ──────────────────────────────
-        self.cb_multiday = QCheckBox("Multi-day (select end date below)")
+        self.cb_multiday = QCheckBox("Multi-day / per-day selection")
         self.cb_multiday.setChecked(False)
         self.cb_multiday.setStyleSheet(_cb_style)
 
@@ -2850,10 +2904,40 @@ class DatePickerDialog(QDialog):
             self.cal_to.setWeekdayTextFormat(day, wf_weekend)
         self.cal_to.setStyleSheet(self.cal.styleSheet())
         self.cal_to.setVisible(False)
-        self._lbl_cal_to = QLabel("End date:")
+        self._lbl_cal_to = QLabel("End date (for 'Add range'):")
         self._lbl_cal_to.setVisible(False)
 
         self.cb_multiday.stateChanged.connect(self._on_multiday_toggled)
+
+        # ── Per-day selection: Add buttons + table ─────────────────────────────
+        self.btn_add_seg = QPushButton("Add to selection")
+        self.btn_add_seg.setToolTip(
+            "Add the selected (start) date with the chosen From/To hours to the list below.")
+        self.btn_add_seg.clicked.connect(self._on_add_segment)
+
+        self.btn_add_range = QPushButton("Add range")
+        self.btn_add_range.setToolTip(
+            "Add every day from start date to end date below, all with the chosen From/To hours.")
+        self.btn_add_range.clicked.connect(self._on_add_range)
+
+        self._lbl_seg = QLabel("Per-day selection:")
+        self._lbl_seg.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
+        self._lbl_seg.setVisible(False)
+
+        self._seg_table = QTableWidget(0, 3)
+        self._seg_table.setHorizontalHeaderLabels(["Date", "Hours", ""])
+        self._seg_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        self._seg_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents)
+        self._seg_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Fixed)
+        self._seg_table.setColumnWidth(2, 28)
+        self._seg_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._seg_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._seg_table.verticalHeader().setVisible(False)
+        self._seg_table.setMaximumHeight(160)
+        self._seg_table.setVisible(False)
 
         btn_now = QPushButton("Now")
         btn_now.setToolTip("Set date and hour to current date and time")
@@ -2879,6 +2963,14 @@ class DatePickerDialog(QDialog):
         self._cam_signals.finished.connect(self._on_cameras_preloaded)
         self._preloaded: list[tuple[str, str]] = []
         self._load_cameras_bg()
+        add_row = QHBoxLayout()
+        add_row.addWidget(self.btn_add_seg)
+        add_row.addWidget(self.btn_add_range)
+        add_row.addStretch(1)
+        self._add_row_widget = QWidget()
+        self._add_row_widget.setLayout(add_row)
+        self._add_row_widget.setVisible(False)
+
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("Select date and hour range"))
         lay.addLayout(top)
@@ -2887,6 +2979,9 @@ class DatePickerDialog(QDialog):
         lay.addWidget(self.cal)
         lay.addWidget(self._lbl_cal_to)
         lay.addWidget(self.cal_to)
+        lay.addWidget(self._add_row_widget)
+        lay.addWidget(self._lbl_seg)
+        lay.addWidget(self._seg_table)
         lay.addWidget(btns)
 
         # Default: online mode on (current hour) when no explicit hours were passed
@@ -2895,18 +2990,27 @@ class DatePickerDialog(QDialog):
 
     @staticmethod
     def selected_folders_static(date, hour_from, hour_to, camera_folder: Path,
-                                 extra_dates: "list | None" = None) -> list[Path]:
+                                 extra_dates: "list | None" = None,
+                                 segments: "list | None" = None) -> list[Path]:
         """
         Return list of archiver folder Paths for a camera over a date+hour range.
-        If extra_dates is given (list of date objects), include all those dates too.
-        Hours are interpreted as Prague lab time (7–21 for multi-day).
+        Precedence:
+          - segments (list of (date, hour_from, hour_to)) → per-day hours, or
+          - extra_dates (list of date objects) → all those days share hour_from..hour_to, or
+          - single date with hour_from..hour_to.
+        Hours are interpreted as Prague lab time.
         """
         cam_name = camera_folder.name
-        all_dates = [date] if extra_dates is None else extra_dates
+        if segments is not None:
+            plan = [(d, hf, ht) for (d, hf, ht) in segments]
+        elif extra_dates is not None:
+            plan = [(d, hour_from, hour_to) for d in extra_dates]
+        else:
+            plan = [(date, hour_from, hour_to)]
         out = []
-        for dt_day in all_dates:
+        for dt_day, hf, ht in plan:
             y, m, day = dt_day.year, dt_day.month, dt_day.day
-            for hh in range(hour_from, hour_to + 1):
+            for hh in range(hf, ht + 1):
                 ref_dt = datetime(y, m, day, hh, 0, 0, tzinfo=TZ_PRAGUE)
                 folder_hh = folder_hour_from_prague_hour(hh, ref_dt)
                 out.append(Path(DEFAULT_OPEN_ROOT) / str(y) / str(m) / str(day) / str(folder_hh) / cam_name)
@@ -2918,9 +3022,13 @@ class DatePickerDialog(QDialog):
     
     def _load_cameras_bg(self):
         import threading as _thr
-        date_obj  = self.selected_date_obj()
-        hour_from = self.hour_from.value()
-        hour_to   = self.hour_to.value()
+        # Cameras are identical across hours/days, so the first segment (if any) suffices.
+        if self._segments:
+            date_obj, hour_from, hour_to = self._segments[0]
+        else:
+            date_obj  = self.selected_date_obj()
+            hour_from = self.hour_from.value()
+            hour_to   = self.hour_to.value()
         signals   = self._cam_signals
 
         def worker():
@@ -2963,18 +3071,70 @@ class DatePickerDialog(QDialog):
         multi = bool(state)
         self.cal_to.setVisible(multi)
         self._lbl_cal_to.setVisible(multi)
+        self._add_row_widget.setVisible(multi)
+        self._lbl_seg.setVisible(multi)
+        self._seg_table.setVisible(multi)
         if multi:
-            # Fix hours to 7–21 lab-time when multi-day is on
-            self.hour_from.setValue(7)
-            self.hour_to.setValue(21)
+            # Online mode is single-day-only; disable while building a per-day list
             self.cb_now.setChecked(False)
             self.cb_now.setEnabled(False)
         else:
             self.cb_now.setEnabled(True)
+            self._segments = []
+            self._refresh_seg_table()
         self.adjustSize()
 
     def is_multiday(self) -> bool:
         return self.cb_multiday.isChecked()
+
+    def _on_add_segment(self):
+        hf, ht = self.selected_hours()
+        if hf > ht:
+            QMessageBox.warning(self, "Chyba", '"From" nesmí být větší než "To".')
+            return
+        self._upsert_segment(self.selected_date_obj(), hf, ht)
+        self._refresh_seg_table()
+        self._load_cameras_bg()
+
+    def _on_add_range(self):
+        hf, ht = self.selected_hours()
+        if hf > ht:
+            QMessageBox.warning(self, "Chyba", '"From" nesmí být větší než "To".')
+            return
+        for d in self.selected_date_range():
+            self._upsert_segment(d, hf, ht)
+        self._refresh_seg_table()
+        self._load_cameras_bg()
+
+    def _upsert_segment(self, d, hf: int, ht: int):
+        """Insert or replace the segment for date d, keeping the list sorted by date."""
+        self._segments = [s for s in self._segments if s[0] != d]
+        self._segments.append((d, int(hf), int(ht)))
+        self._segments.sort(key=lambda s: s[0])
+
+    def _remove_segment(self, d):
+        self._segments = [s for s in self._segments if s[0] != d]
+        self._refresh_seg_table()
+
+    def _refresh_seg_table(self):
+        self._seg_table.setRowCount(0)
+        for d, hf, ht in self._segments:
+            r = self._seg_table.rowCount()
+            self._seg_table.insertRow(r)
+            self._seg_table.setItem(r, 0, QTableWidgetItem(d.strftime("%d.%m.%Y")))
+            hours_txt = f"{hf:02d}h" if hf == ht else f"{hf:02d}–{ht:02d}h"
+            self._seg_table.setItem(r, 1, QTableWidgetItem(hours_txt))
+            btn = QPushButton("✕")
+            btn.setFixedSize(24, 24)
+            btn.setStyleSheet("font-size: 10px; padding: 0;")
+            btn.clicked.connect(lambda checked, dd=d: self._remove_segment(dd))
+            self._seg_table.setCellWidget(r, 2, btn)
+
+    def selected_segments(self):
+        """Return the per-day segment list when in multi/per-day mode, else None."""
+        if self.is_multiday() and self._segments:
+            return list(self._segments)
+        return None
 
     def selected_date_range(self) -> "list[datetime.date]":
         """Return list of date objects from start to end (inclusive), when multiday."""
@@ -2993,18 +3153,18 @@ class DatePickerDialog(QDialog):
         return days
 
     def _on_accept(self):
-        if self.hour_from.value() > self.hour_to.value():
-            QMessageBox.warning(self, "Chyba", '"Od" nesmí být větší než "Do".'); return
         if self.is_multiday():
-            days = self.selected_date_range()
-            if not days:
-                QMessageBox.warning(self, "Chyba", "Vyber alespoň jeden den."); return
-            if len(days) > 14:
+            if not self._segments:
+                QMessageBox.warning(self, "Chyba",
+                    "Přidej alespoň jeden den do výběru ('Add to selection')."); return
+            if len(self._segments) > 14:
                 r = QMessageBox.question(self, "Multi-day",
-                    f"Vybrán rozsah {len(days)} dní. Pokračovat?",
+                    f"Vybráno {len(self._segments)} dní. Pokračovat?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                 if r != QMessageBox.StandardButton.Yes:
                     return
+        elif self.hour_from.value() > self.hour_to.value():
+            QMessageBox.warning(self, "Chyba", '"Od" nesmí být větší než "Do".'); return
         self.accept()
 
     def _go_to_now(self):
@@ -3061,14 +3221,13 @@ class DatePickerDialog(QDialog):
         return out
 
     def selected_axis(self) -> tuple[int, int]:
-        if self.is_multiday():
-            days = self.selected_date_range()
-            h0, h1 = self.selected_hours()
-            d_start = days[0];  d_end = days[-1]
-            start = datetime(d_start.year, d_start.month, d_start.day,
-                             h0, 0, 0, tzinfo=TZ_PRAGUE)
-            end   = datetime(d_end.year,   d_end.month,   d_end.day,
-                             h1 + 1, 0, 0, tzinfo=TZ_PRAGUE)
+        if self.is_multiday() and self._segments:
+            # Bounding box over all per-day segments (gaps are blank on the axis).
+            starts, ends = [], []
+            for d, hf, ht in self._segments:
+                starts.append(ns_from_dt(datetime(d.year, d.month, d.day, hf, 0, 0, tzinfo=TZ_PRAGUE)))
+                ends.append(ns_from_dt(datetime(d.year, d.month, d.day, ht + 1, 0, 0, tzinfo=TZ_PRAGUE)))
+            return min(starts), max(ends)
         else:
             d = self.cal.selectedDate()
             y, m, day = d.year(), d.month(), d.day()
@@ -3498,18 +3657,17 @@ class Pdxm1GridConfigDialog(QDialog):
             img_view._pdxm1_cfg_override = self._cfg
             img_view.update()
         self.setWindowTitle(f"Grid Config — {self._key}")
-        self.resize(520, 1120)
+        self.resize(520, 840)
         self.setStyleSheet("""
             QDialog, QWidget#pdxm1_cfg_root { background-color: #f0f0f0; }
             QLabel      { color: #111111; background: transparent; }
-            QCheckBox   { color: #111111; background: transparent; }
             QSpinBox    { color: #111111; background-color: #ffffff;
                           border: 1px solid #aaaaaa; padding: 1px 3px; }
             QPushButton { color: #111111; background-color: #e0e0e0;
                           border: 1px solid #aaaaaa; padding: 3px 10px; }
             QPushButton:hover   { background-color: #d0d0d0; }
             QPushButton:pressed { background-color: #c0c0c0; }
-        """)
+        """ + _CHECKBOX_STYLE)
         self._build_ui()
 
     def _build_ui(self):
@@ -3723,6 +3881,68 @@ class CamLayoutConfig:
     entries: list = _field(default_factory=list)  # list[CamLayoutEntry]
 
 
+def compute_justified_layout(aspects: list, canvas_w: float, canvas_h: float,
+                             top_px: float = 0.0) -> list:
+    """Pack cameras into justified rows (gallery style) that MAXIMISE total image
+    area for the given canvas. Within a row every tile shares one IMAGE height and
+    gets width ∝ its image aspect, so each image fills its tile's image region with
+    no letterbox. Each tile also reserves top_px of fixed height for the camera's
+    label bar, so when the tile is sized by this function the actual frame fills the
+    window and no grey shows. Tries every row count, keeps the largest realised area.
+
+    aspects   : per-camera image aspect ratio (w / h), in camera order.
+    canvas_w  : container width in pixels.
+    canvas_h  : container height in pixels.
+    top_px    : per-tile non-image overhead in pixels (label bar + margins).
+    Returns   : list[CamLayoutEntry] (fractions of the canvas), camera order.
+    """
+    n = len(aspects)
+    if n == 0:
+        return []
+    W = max(1.0, float(canvas_w))
+    H = max(1.0, float(canvas_h))
+    L = max(0.0, float(top_px))
+    a = [max(0.05, float(x)) for x in aspects]
+    best = None
+    for R in range(1, n + 1):
+        if H - R * L <= 0:
+            continue  # the label bars alone would not fit the canvas height
+        base, extra = divmod(n, R)
+        sizes = [base + 1 if i < extra else base for i in range(R)]
+        rows, idx = [], 0
+        for s in sizes:
+            rows.append(a[idx:idx + s]); idx += s
+        sum_inv = sum(1.0 / sum(r) for r in rows)   # Σ 1/Σaspect over rows
+        if sum_inv <= 0:
+            continue
+        # image_h_r = k·W/Σaspect_r fills row width; Σ image_h + R·L ≤ H
+        k = min(1.0, (H - R * L) / (W * sum_inv))
+        if k <= 0:
+            continue
+        area = (k * W) ** 2 * sum_inv               # Σ Σaspect_r·(kW/Σaspect_r)²
+        if best is None or area > best[0]:
+            best = (area, rows, k)
+    if best is None:
+        # Degenerate (labels taller than the canvas): plain equal horizontal row.
+        tw = 1.0 / n
+        return [CamLayoutEntry(x=i * tw, y=0.0, w=tw, h=1.0) for i in range(n)]
+    _, rows, k = best
+    total_h = sum((k * W / sum(r)) + L for r in rows)
+    voff = max(0.0, (H - total_h) / 2.0)            # centre the block vertically
+    entries, y = [], voff
+    for r in rows:
+        image_h = k * W / sum(r)
+        tile_h = image_h + L
+        row_w = image_h * sum(r)                    # = k·W (all rows equal width)
+        x = max(0.0, (W - row_w) / 2.0)             # centre each row horizontally
+        for ai in r:
+            tile_w = ai * image_h
+            entries.append(CamLayoutEntry(x=x / W, y=y / H, w=tile_w / W, h=tile_h / H))
+            x += tile_w
+        y += tile_h
+    return entries
+
+
 class _LayoutCanvasWidget(QWidget):
     """Continuous free-form drag-resize canvas for camera layout.
 
@@ -3732,6 +3952,10 @@ class _LayoutCanvasWidget(QWidget):
 
     EDGE = 12        # pixel zone for resize handles
     MIN_FRAC = 0.04  # minimum tile size fraction
+    SNAP_FRAC = 0.02         # magnetic snap threshold (fraction of canvas)
+    SHAKE_WINDOW = 8         # number of recent move increments inspected for a shake
+    SHAKE_FLIPS = 4          # direction reversals within the window that free the edge
+    SHAKE_TRAVEL_FRAC = 0.06 # max travel (fraction) during the window to count as a shake
     TILE_COLORS = [
         QColor(0x33, 0x55, 0x88, 210), QColor(0x33, 0x77, 0x55, 210),
         QColor(0x77, 0x33, 0x55, 210), QColor(0x55, 0x33, 0x88, 210),
@@ -3739,10 +3963,19 @@ class _LayoutCanvasWidget(QWidget):
         QColor(0x66, 0x55, 0x22, 210), QColor(0x22, 0x55, 0x44, 210),
     ]
 
-    def __init__(self, cam_names: list, parent=None):
+    def __init__(self, cam_names: list, aspects: "list | None" = None,
+                 label_px: int = 28, parent=None):
         super().__init__(parent)
         self.setMinimumSize(480, 320)
         self._cam_names = list(cam_names)
+        # Per-tile non-image overhead (label bar + margins) in pixels — reserved at
+        # the top of every tile so the previewed image area matches the live grid.
+        self._label_px = max(0, int(label_px))
+        # Per-camera image aspect (w/h), kept aligned with _cam_names through reorders.
+        if aspects and len(aspects) == len(self._cam_names):
+            self._aspects = [float(a) if a and a > 0 else 1.0 for a in aspects]
+        else:
+            self._aspects = [_cam_aspect_hint(n) for n in self._cam_names]
         # tiles: [x, y, w, h] all in [0.0, 1.0] as fractions of canvas
         self._tiles: list = []
         self._reset_tiles()
@@ -3752,22 +3985,33 @@ class _LayoutCanvasWidget(QWidget):
         self._drag_start_pos = None
         self._drag_start_tile = None
         self._selected: int = -1
+        # Magnetic snapping: edges snap to neighbours unless the user "shakes" the
+        # pointer (rapid back-and-forth), which frees the edge for the rest of the drag.
+        self._snap_disabled = False
+        self._move_hist: list = []   # recent (dx_px, dy_px) increments for shake detection
+        self._last_pos = None
+        self._snap_guides: list = [] # [('v', x_frac) | ('h', y_frac)] snapped this move
         self.setMouseTracking(True)
 
     def _reset_tiles(self):
-        import math as _m
         n = len(self._cam_names)
         self._tiles = []
         if n == 0:
             return
-        cols = max(1, _m.ceil(_m.sqrt(n)))
-        rows = _m.ceil(n / cols)
-        tw = 1.0 / cols
-        th = 1.0 / rows
-        for i in range(n):
-            c = i % cols
-            r = i // cols
-            self._tiles.append([c * tw, r * th, tw, th])
+        # Auto-arrange = the image-area-maximising justified layout.
+        W = self.width() if self.width() > 0 else 480
+        H = self.height() if self.height() > 0 else 320
+        entries = compute_justified_layout(self._aspects[:n], W, H, self._label_px)
+        self._tiles = [[e.x, e.y, e.w, e.h] for e in entries]
+        # Auto layout depends on the canvas aspect → recompute it on resize until
+        # the user takes manual control (drag) or a saved/seeded layout is loaded.
+        self._auto_mode = True
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, '_auto_mode', False):
+            self._reset_tiles()
+            self.update()
 
     def get_entries(self) -> list:
         return [CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3]) for t in self._tiles]
@@ -3778,6 +4022,22 @@ class _LayoutCanvasWidget(QWidget):
         W, H = self.width(), self.height()
         return QRect(int(t[0] * W), int(t[1] * H),
                      max(30, int(t[2] * W)), max(20, int(t[3] * H)))
+
+    def _image_rect_in(self, r: QRect, aspect: float) -> QRect:
+        """Sub-rectangle of tile r the camera frame actually fills: below the label
+        bar (self._label_px), then KeepAspectRatio, anchored top, centred
+        horizontally — mirrors the live CameraView (label header + ImageView)."""
+        L = min(self._label_px, max(0, r.height() - 1))
+        rx, ry = r.left(), r.top() + L
+        rw, rh = r.width(), r.height() - L
+        if rw <= 0 or rh <= 0 or aspect <= 0:
+            return QRect(rx, ry, max(1, rw), max(1, rh))
+        if rw / rh > aspect:        # region wider than image → height-limited
+            ih = rh; iw = max(1, int(aspect * rh))
+        else:                       # width-limited
+            iw = rw; ih = max(1, int(rw / aspect))
+        x0 = rx + (rw - iw) // 2
+        return QRect(x0, ry, iw, ih)
 
     def _hit_test(self, pos) -> tuple:
         for i in range(len(self._tiles) - 1, -1, -1):
@@ -3803,6 +4063,99 @@ class _LayoutCanvasWidget(QWidget):
             return i, 'move'
         return -1, ''
 
+    # ── Snapping ───────────────────────────────────────────────────────────────
+    def _is_shaking(self, W: int, H: int) -> bool:
+        """True if recent motion reversed direction many times over a short travel."""
+        if len(self._move_hist) < self.SHAKE_WINDOW:
+            return False
+        def _flips(vals):
+            flips = 0; prev = 0
+            for v in vals:
+                s = (v > 0) - (v < 0)
+                if s != 0 and prev != 0 and s != prev:
+                    flips += 1
+                if s != 0:
+                    prev = s
+            return flips
+        dxs = [d[0] for d in self._move_hist]
+        dys = [d[1] for d in self._move_hist]
+        travel_x = sum(abs(v) for v in dxs)
+        travel_y = sum(abs(v) for v in dys)
+        small = max(8.0, self.SHAKE_TRAVEL_FRAC * max(W, H))
+        return ((_flips(dxs) >= self.SHAKE_FLIPS and travel_x < small) or
+                (_flips(dys) >= self.SHAKE_FLIPS and travel_y < small))
+
+    def _snap_lines(self) -> tuple:
+        """Candidate snap positions (x-fractions, y-fractions) from other tiles
+        and the canvas borders/center, excluding the tile being dragged."""
+        xs = [0.0, 0.5, 1.0]
+        ys = [0.0, 0.5, 1.0]
+        for j, tj in enumerate(self._tiles):
+            if j == self._drag_idx:
+                continue
+            xs.append(tj[0]); xs.append(tj[0] + tj[2])
+            ys.append(tj[1]); ys.append(tj[1] + tj[3])
+        return xs, ys
+
+    def _nearest(self, val: float, candidates: list):
+        """Nearest candidate to val within SNAP_FRAC, else None."""
+        best = None; best_d = self.SNAP_FRAC
+        for c in candidates:
+            d = abs(val - c)
+            if d < best_d:
+                best_d = d; best = c
+        return best
+
+    def _apply_snap(self, mode: str, t: list):
+        """Snap the moved edge(s) of tile t to nearby candidate lines, recording
+        guide lines in self._snap_guides for painting."""
+        xs, ys = self._snap_lines()
+        m = self.MIN_FRAC
+        left, right = t[0], t[0] + t[2]
+        top, bottom = t[1], t[1] + t[3]
+        if mode == 'move':
+            # Snap whichever vertical edge is closest, then translate in x.
+            sl, sr = self._nearest(left, xs), self._nearest(right, xs)
+            cand_x = None
+            if sl is not None and (sr is None or abs(left - sl) <= abs(right - sr)):
+                cand_x = (sl, sl)                 # snap left edge to sl
+            elif sr is not None:
+                cand_x = (sr - t[2], sr)          # snap right edge to sr
+            if cand_x is not None:
+                t[0] = max(0.0, min(1.0 - t[2], cand_x[0]))
+                self._snap_guides.append(('v', cand_x[1]))
+            st_top, sb = self._nearest(top, ys), self._nearest(bottom, ys)
+            cand_y = None
+            if st_top is not None and (sb is None or abs(top - st_top) <= abs(bottom - sb)):
+                cand_y = (st_top, st_top)
+            elif sb is not None:
+                cand_y = (sb - t[3], sb)
+            if cand_y is not None:
+                t[1] = max(0.0, min(1.0 - t[3], cand_y[0]))
+                self._snap_guides.append(('h', cand_y[1]))
+            return
+        # Resize modes — snap the moving edge(s), keep the opposite edge fixed.
+        if 'left' in mode:
+            s = self._nearest(left, xs)
+            if s is not None and s <= right - m:
+                t[2] = right - s; t[0] = s
+                self._snap_guides.append(('v', s))
+        if 'right' in mode:
+            s = self._nearest(right, xs)
+            if s is not None and s >= t[0] + m:
+                t[2] = s - t[0]
+                self._snap_guides.append(('v', s))
+        if 'top' in mode:
+            s = self._nearest(top, ys)
+            if s is not None and s <= bottom - m:
+                t[3] = bottom - s; t[1] = s
+                self._snap_guides.append(('h', s))
+        if 'bottom' in mode:
+            s = self._nearest(bottom, ys)
+            if s is not None and s >= t[1] + m:
+                t[3] = s - t[1]
+                self._snap_guides.append(('h', s))
+
     # ── Mouse ────────────────────────────────────────────────────────────────
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
@@ -3815,9 +4168,18 @@ class _LayoutCanvasWidget(QWidget):
             self._drag_start_pos = pos
             self._drag_start_tile = list(self._tiles[idx])
             self._selected = idx
+            self._auto_mode = False   # user took manual control
+            # New drag — re-arm snapping and reset shake tracking.
+            self._snap_disabled = False
+            self._move_hist = []
+            self._last_pos = pos
+            self._snap_guides = []
             # bring to front
             self._tiles.append(self._tiles.pop(idx))
             self._cam_names.append(self._cam_names.pop(idx))
+            # keep aspects aligned with the reordered tiles/names
+            if self._aspects and idx < len(self._aspects):
+                self._aspects.append(self._aspects.pop(idx))
             self._drag_idx = len(self._tiles) - 1
             self._selected = self._drag_idx
             self.update()
@@ -3880,12 +4242,31 @@ class _LayoutCanvasWidget(QWidget):
             new_x = max(0.0, min(st[0] + st[2] - m, st[0] + dx))
             t[2] = st[2] + (st[0] - new_x); t[0] = new_x
             t[3] = max(m, min(1.0 - st[1], st[3] + dy))
+
+        # Shake-to-free: rapid back-and-forth disables snapping for the rest of the drag.
+        if self._last_pos is not None:
+            self._move_hist.append((pos.x() - self._last_pos.x(),
+                                    pos.y() - self._last_pos.y()))
+            if len(self._move_hist) > self.SHAKE_WINDOW:
+                self._move_hist = self._move_hist[-self.SHAKE_WINDOW:]
+            if not self._snap_disabled and self._is_shaking(W, H):
+                self._snap_disabled = True
+        self._last_pos = pos
+
+        # Magnetic snapping (unless the user shook free).
+        self._snap_guides = []
+        if not self._snap_disabled:
+            self._apply_snap(mode, t)
         self.update()
 
     def mouseReleaseEvent(self, event):
         if self._drag_idx >= 0:
             self._drag_idx = -1
             self._drag_mode = ''
+            self._snap_disabled = False
+            self._move_hist = []
+            self._last_pos = None
+            self._snap_guides = []
             self.update()
 
     # ── Paint ────────────────────────────────────────────────────────────────
@@ -3906,22 +4287,41 @@ class _LayoutCanvasWidget(QWidget):
         p.setPen(QPen(QColor(0x55, 0x55, 0x55)))
         p.drawRect(0, 0, W - 1, H - 1)
 
-        # Tiles
+        # Tiles. Each tile mirrors the live CameraView: a label header bar on top,
+        # the camera frame (coloured) below it, and any leftover window space shown
+        # as grey — exactly the grey letterbox the user sees in the grid. When the
+        # window matches the image aspect, the frame fills it and no grey shows.
         font = p.font()
         for i, tile in enumerate(self._tiles):
             r = self._tile_rect(i)
             color = self.TILE_COLORS[i % len(self.TILE_COLORS)]
-            p.fillRect(r, color)
             sel = (i == self._selected)
+            L = min(self._label_px, max(0, r.height() - 1))
+            # Window background = grey letterbox area (matches the grid's dark bg)
+            p.fillRect(r, QColor(0x22, 0x22, 0x22))
+            # Label header bar with the descriptive camera name
+            if L > 0:
+                hdr = QRect(r.left(), r.top(), r.width(), L)
+                p.fillRect(hdr, QColor(0x44, 0x44, 0x44))
+                font.setPixelSize(max(9, min(L - 6, 15)))
+                p.setFont(font)
+                p.setPen(QColor(0xee, 0xee, 0xee))
+                p.drawText(hdr.adjusted(5, 0, -5, 0),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                           _cam_short_label(self._cam_names[i]))
+            # Image area (the actual frame): fills its region when window matches aspect
+            aspect = self._aspects[i] if i < len(self._aspects) else 1.0
+            img_r = self._image_rect_in(r, aspect)
+            p.fillRect(img_r, color)
+            ip = QPen(QColor(0xcc, 0xdd, 0xff, 220))
+            ip.setStyle(Qt.PenStyle.DotLine); ip.setWidth(1)
+            p.setPen(ip); p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(img_r)
+            # Window (tile) border
             bp = QPen(QColor(0x44, 0xaa, 0xff) if sel else QColor(0x88, 0xbb, 0xff))
             bp.setWidth(2 if sel else 1)
             p.setPen(bp)
             p.drawRect(r)
-            font.setPixelSize(max(9, int(min(r.width(), r.height()) * 0.22)))
-            p.setFont(font)
-            p.setPen(QColor(0xee, 0xee, 0xee))
-            short = self._cam_names[i].split("-")[-1] if "-" in self._cam_names[i] else self._cam_names[i]
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, short)
             # Resize handles — L-shapes at all 4 corners + tick on all 4 edges
             hp = QPen(QColor(0xff, 0xcc, 0x00, 200))
             hp.setWidth(3); p.setPen(hp)
@@ -3946,6 +4346,16 @@ class _LayoutCanvasWidget(QWidget):
             p.drawLine(r.left(),    my - e // 2, r.left(),    my + e // 2) # left
             p.drawLine(r.right(),   my - e // 2, r.right(),   my + e // 2) # right
 
+        # Magnetic snap guide lines (drawn while a snapped edge is active)
+        if self._snap_guides:
+            sp = QPen(QColor(0x44, 0xff, 0x88, 220)); sp.setWidth(1)
+            p.setPen(sp)
+            for kind, frac in self._snap_guides:
+                if kind == 'v':
+                    x = int(frac * W); p.drawLine(x, 0, x, H)
+                else:
+                    y = int(frac * H); p.drawLine(0, y, W, y)
+
         p.end()
 
 
@@ -3954,35 +4364,49 @@ class LayoutConfigDialog(QDialog):
 
     _LAYOUTS_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_layouts.json"
 
-    def __init__(self, cam_names: list, parent=None, initial_entries=None):
+    def __init__(self, cam_names: list, parent=None, initial_entries=None,
+                 cam_aspects=None, label_px: int = 28):
         super().__init__(parent)
         self.setWindowTitle("Configure Camera Layout")
         self.resize(680, 500)
         self._cam_names = list(cam_names)
+        # name → aspect (w/h); used to realign aspects after a saved reorder
+        self._aspect_map = {}
+        if cam_aspects and len(cam_aspects) == len(self._cam_names):
+            self._aspect_map = {n: float(a) for n, a in zip(self._cam_names, cam_aspects)}
+        aspects = [self._aspect_map.get(n, _cam_aspect_hint(n)) for n in self._cam_names]
 
         lay = QVBoxLayout(self)
 
         # ── Canvas ──
-        self._canvas = _LayoutCanvasWidget(cam_names=self._cam_names, parent=self)
+        self._canvas = _LayoutCanvasWidget(cam_names=self._cam_names, aspects=aspects,
+                                           label_px=label_px, parent=self)
         saved = self._load_saved()
         if saved and "tiles" in saved and len(saved["tiles"]) == len(cam_names):
             self._canvas._tiles = [list(t) for t in saved["tiles"]]
+            self._canvas._auto_mode = False   # explicit saved layout — keep as-is
             # Restore cam_names order from saved (bring-to-front reorders them)
             if "cam_order" in saved and len(saved["cam_order"]) == len(cam_names):
                 self._canvas._cam_names = list(saved["cam_order"])
+                # Realign aspects to the restored camera order
+                self._canvas._aspects = [
+                    self._aspect_map.get(n, _cam_aspect_hint(n))
+                    for n in self._canvas._cam_names]
         elif initial_entries and len(initial_entries) == len(cam_names):
             # No saved layout — seed from current on-screen camera positions
             self._canvas._tiles = [[e.x, e.y, e.w, e.h] for e in initial_entries]
+            self._canvas._auto_mode = False
         lay.addWidget(self._canvas, stretch=1)
 
-        hint = QLabel("Drag tile interior to move  ·  Drag any edge or corner to resize")
+        hint = QLabel("Drag interior to move  ·  drag edge/corner to resize  ·  "
+                      "solid = window, dotted = image area  ·  shake an edge to disable snapping")
         hint.setStyleSheet("color: #888; font-size: 10px;")
         lay.addWidget(hint)
 
         # ── Bottom row ──
         bot = QHBoxLayout()
         btn_reset = QPushButton("Auto-arrange")
-        btn_reset.setToolTip("Reset all cameras to an evenly-spaced automatic grid")
+        btn_reset.setToolTip("Auto-arrange cameras to maximise each frame's image area")
         btn_reset.clicked.connect(self._reset_to_default)
         bot.addWidget(btn_reset)
         bot.addStretch()
@@ -3994,6 +4418,9 @@ class LayoutConfigDialog(QDialog):
 
     def _reset_to_default(self):
         self._canvas._cam_names = list(self._cam_names)
+        # Realign aspects to the original camera order before re-arranging.
+        self._canvas._aspects = [
+            self._aspect_map.get(n, _cam_aspect_hint(n)) for n in self._cam_names]
         self._canvas._reset_tiles()
         self._canvas._selected = -1
         self._canvas.update()
@@ -4407,8 +4834,28 @@ class CameraPickerDialog(QDialog):
         if (self._multi_grid is not None and
                 len(self._selected_names) == len(getattr(self._multi_grid, '_cam_names_list', []))):
             initial_entries = self._multi_grid.get_current_layout_entries(self._selected_names)
+        # Build per-camera aspect ratios: prefer the live frame's aspect, else a
+        # name-based hint, so the editor can preview each camera's real image area.
+        live_aspects = {}
+        if self._multi_grid is not None:
+            for cv in getattr(self._multi_grid, '_cam_views', []):
+                pm = getattr(cv.img_view, '_pix', None)
+                if pm is not None and not pm.isNull() and pm.height() > 0:
+                    live_aspects[cv.cam_name] = pm.width() / pm.height()
+        cam_aspects = [live_aspects.get(n, _cam_aspect_hint(n)) for n in self._selected_names]
+        # Label-bar overhead, queried from a live CameraView so the editor reserves
+        # the same header space the grid does (keeps preview matched to reality).
+        label_px = 28
+        if self._multi_grid is not None:
+            for cv in getattr(self._multi_grid, '_cam_views', []):
+                try:
+                    label_px = cv.image_overhead_px()
+                    break
+                except Exception:
+                    pass
         dlg = LayoutConfigDialog(self._selected_names, parent=self,
-                                 initial_entries=initial_entries)
+                                 initial_entries=initial_entries, cam_aspects=cam_aspects,
+                                 label_px=label_px)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             cfg = dlg.get_config()
             dlg.save_config(cfg)
@@ -5486,6 +5933,17 @@ class CameraView(QWidget):
 
         self._update_border()
 
+    def image_overhead_px(self) -> int:
+        """Vertical pixels of a tile NOT used by the image (label header + layout
+        margins + spacing). The justified layout reserves this so the frame fills
+        the window with no grey, and the layout editor previews the same split."""
+        lay = self.layout()
+        m = lay.contentsMargins()
+        overhead = m.top() + m.bottom() + self._name_lbl.sizeHint().height() + lay.spacing()
+        if self._ref_lbl.isVisible():
+            overhead += self._ref_lbl.sizeHint().height() + lay.spacing()
+        return int(overhead)
+
     def set_timestamp(self, text: str):
         self._ts_lbl.setText(text)
 
@@ -5567,6 +6025,48 @@ class _FreeLayoutContainer(QWidget):
         if W < 1 or H < 1:
             return
         for e, v in zip(self._entries, self._views):
+            v.setGeometry(int(e.x * W), int(e.y * H),
+                          max(20, int(e.w * W)), max(20, int(e.h * H)))
+
+
+class _JustifiedRowsContainer(QWidget):
+    """Default auto layout: positions CameraView widgets in image-area-maximising
+    justified rows, recomputed responsively on every resize so each camera's frame
+    stays as large as possible regardless of window proportions (see
+    compute_justified_layout). Per-camera aspect comes from the live frame when
+    available, else a name-based hint."""
+
+    def __init__(self, views: list, parent=None):
+        super().__init__(parent)
+        self._views = views
+        for v in views:
+            v.setParent(self)
+            v.show()
+        self._apply()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply()
+
+    def _aspects(self) -> list:
+        out = []
+        for v in self._views:
+            pm = getattr(v.img_view, '_pix', None)
+            if pm is not None and not pm.isNull() and pm.height() > 0:
+                out.append(pm.width() / pm.height())
+            else:
+                out.append(_cam_aspect_hint(v.cam_name))
+        return out
+
+    def _apply(self):
+        W, H = self.width(), self.height()
+        if W < 1 or H < 1 or not self._views:
+            return
+        top_px = self._views[0].image_overhead_px()
+        entries = compute_justified_layout(self._aspects(), W, H, top_px)
+        if len(entries) != len(self._views):
+            return
+        for e, v in zip(entries, self._views):
             v.setGeometry(int(e.x * W), int(e.y * H),
                           max(20, int(e.w * W)), max(20, int(e.h * H)))
 
@@ -5731,78 +6231,17 @@ class MultiCameraGrid(QWidget):
             self._grid.setRowStretch(0, 1)
             self._grid.setColumnStretch(0, 1)
             return
-        self._grid.setSpacing(4)
+        self._grid.setSpacing(0)
 
-        # ── Auto layout ────────────────────────────────────────────────────────
-        # Split cameras into PDxM1 (tall portrait) and regular (square)
-        pdxm1_views   = [cv for cv in self._cam_views if self._is_pdxm1_cam(cv.cam_name)]
-        regular_views = [cv for cv in self._cam_views if not self._is_pdxm1_cam(cv.cam_name)]
-
-        if not pdxm1_views:
-            # Auto-grid: ceil(sqrt(N)) columns, ceil(N/cols) rows
-            import math as _math
-            cols = max(1, _math.ceil(_math.sqrt(n)))
-            for i, cv in enumerate(self._cam_views):
-                r, c = divmod(i, cols)
-                self._grid.addWidget(cv, r, c)
-            rows = _math.ceil(n / cols)
-            for c in range(cols):
-                self._grid.setColumnStretch(c, 1)
-            for r in range(rows):
-                self._grid.setRowStretch(r, 1)
-            return
-
-        if not regular_views:
-            # All PDxM1 → 1×N row
-            for i, cv in enumerate(pdxm1_views):
-                self._grid.addWidget(cv, 0, i)
-                self._grid.setColumnStretch(i, 1)
-            self._grid.setRowStretch(0, 1)
-            return
-
-        # ── Mixed layout: PDxM1 left, regular cameras right ──────────────────
-        # PDxM1 cameras share the left portion (side by side, full height).
-        # Regular cameras go into a sub-grid on the right:
-        #   1 regular  → fills the right side entirely
-        #   2 regular  → stacked 1×2 (vertical)
-        #   3 regular  → 2×2 grid, top-left + top-right + bottom-left, bottom-right empty
-        #   4 regular  → 2×2 grid fully filled
-        n_pdx = len(pdxm1_views)
-        n_reg = len(regular_views)
-
-        # Build the regular-cameras sub-container
-        reg_widget = QWidget(self)
-        reg_widget.setStyleSheet("background: transparent;")
-        reg_grid = QGridLayout(reg_widget)
-        reg_grid.setContentsMargins(0, 0, 0, 0)
-        reg_grid.setSpacing(4)
-
-        # N regular cameras in sub-grid: ceil(sqrt(N)) columns
-        import math as _math
-        reg_cols = max(1, _math.ceil(_math.sqrt(n_reg)))
-        reg_rows = _math.ceil(n_reg / reg_cols)
-        for i, cv in enumerate(regular_views):
-            r, c = divmod(i, reg_cols)
-            reg_grid.addWidget(cv, r, c)
-        for c in range(reg_cols):
-            reg_grid.setColumnStretch(c, 1)
-        for r in range(reg_rows):
-            reg_grid.setRowStretch(r, 1)
-
-        self._reg_container = reg_widget
-
-        # Place PDxM1 cameras in columns 0..n_pdx-1, spanning full height
-        # Each M1 column gets stretch 2 — narrow but not squished next to a 2-col regular grid
-        for j, cv in enumerate(pdxm1_views):
-            self._grid.addWidget(cv, 0, j, 1, 1)
-            self._grid.setColumnStretch(j, 2)
+        # ── Auto layout = image-area-maximising justified rows ───────────────────
+        # Tile widths follow each camera's aspect so portrait cameras get narrow
+        # tiles and square ones get wider tiles — minimising letterbox and keeping
+        # every frame as large as possible. Responsive: recomputed on resize.
+        container = _JustifiedRowsContainer(self._cam_views, parent=self)
+        self._reg_container = container
+        self._grid.addWidget(container, 0, 0, 1, 1)
         self._grid.setRowStretch(0, 1)
-
-        # Place regular sub-grid in the next column
-        # Regular side stretch: 2 columns × 2 = 4 so each regular cam ~matches one M1 col width
-        reg_col = n_pdx
-        self._grid.addWidget(reg_widget, 0, reg_col, 1, 1)
-        self._grid.setColumnStretch(reg_col, max(4, n_reg * 2))
+        self._grid.setColumnStretch(0, 1)
 
     def _on_cam_clicked(self, idx: int):
         # Toggle selection: klik přidá/odebere kameru z výběru, může být 0 vybraných
@@ -6779,6 +7218,7 @@ class Viewer(QWidget):
         self.last_pick_hour_from: "int | None" = None   # None = first open, default to live mode
         self.last_pick_hour_to:   "int | None" = None
         self.last_pick_axis_override: tuple[int, int] | None = None
+        self._last_pick_segments: "list | None" = None  # per-day (date, hf, ht) list, or None
         self.last_pick_cam_names: list[str] = []   # paměť vybraných kamer
 
         self.pending_slider = None
@@ -8323,6 +8763,9 @@ class Viewer(QWidget):
             row.set_enabled(True)
 
         self._per_cam_scroll.setVisible(True)
+        # Size the scroll area to exactly fit the current number of rows (capped),
+        # so it shrinks back when the camera count decreases.
+        self._resize_per_cam_scroll()
 
         # After layout is computed, align tickbar axis with slider track start
         def _update_tickbar_offset():
@@ -8341,6 +8784,22 @@ class Viewer(QWidget):
                 offset = max(0, self.tickbar.mapFromGlobal(pt).x())
                 self.tickbar.set_left_offset(offset)
         QTimer.singleShot(0, _update_tickbar_offset)
+        QTimer.singleShot(0, self._resize_per_cam_scroll)
+
+    def _resize_per_cam_scroll(self):
+        """Fix the per-camera slider area height to the current row count (capped),
+        so it grows AND shrinks as the number of cameras changes."""
+        MAX_H = 200
+        n = len(self._per_cam_rows)
+        if n == 0:
+            self._per_cam_scroll.setVisible(False)
+            return
+        row_h = self._per_cam_rows[0].sizeHint().height()
+        m = self._per_cam_layout.contentsMargins()
+        total = n * row_h + (n - 1) * self._per_cam_layout.spacing() + m.top() + m.bottom()
+        h = min(MAX_H, max(0, total))
+        self._per_cam_scroll.setMinimumHeight(h)
+        self._per_cam_scroll.setMaximumHeight(h)
 
     def _on_per_cam_master_chosen(self, cam_idx: int):
         """Uživatel klikl na radio tlačítko — přepne master na tuto kameru."""
@@ -8366,6 +8825,13 @@ class Viewer(QWidget):
         self._per_cam_scrubbing_cam = cam_idx
         if self._is_playing:
             self.stop()
+        # Grabbing a slider means the user wants to inspect a moment manually, so
+        # leave live mode: stop auto-follow/online so incoming frames don't fight
+        # the manual scrub. For the master slider the existing value_changed /
+        # released handlers then bind all cameras to the master's time. The user
+        # re-enables Auto-follow when ready to watch live again.
+        if self._online_mode:
+            self._stop_online_mode()
 
     def _on_per_cam_released(self, cam_idx: int):
         self._per_cam_scrubbing_cam = -1
@@ -8560,6 +9026,33 @@ class Viewer(QWidget):
         if self._per_cam_master_idx >= 0:
             self._per_cam_sync_slaves(master, new_ts)
 
+    def _live_advance_cam(self, cam_idx: int, latest_ts: int, was_at_end: bool):
+        """Single source of truth for 'this camera received a fresh live frame'.
+
+        In auto-follow mode each camera shows ITS OWN latest frame independently
+        (decoupled from the master) so a slow/low-rate camera never freezes the
+        others and the master tick no longer fires N simultaneous decodes. The
+        master additionally drives the SHARED widgets (common slider, tickbar
+        cursor, current_idx); per-camera time synchronisation is reserved for
+        manual scrubbing (_per_cam_sync_slaves / _per_cam_step)."""
+        if not (self._auto_follow or was_at_end):
+            return
+        # Always: this camera shows its own latest frame and moves its own row.
+        self._per_cam_display_one(cam_idx, latest_ts)
+        if cam_idx < len(self._per_cam_rows):
+            sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
+            self._per_cam_rows[cam_idx].set_value(sv)
+        # Only the master drives the shared timeline widgets. Info panel + PV
+        # fetch already fire inside _per_cam_display_one (master is _is_info_cam).
+        if cam_idx == self._per_cam_master_idx:
+            self.tickbar.set_cursor(latest_ts)
+            sv_main = self._time_to_slider_value(latest_ts)
+            self.slider.blockSignals(True)
+            self.slider.setValue(sv_main)
+            self.slider.blockSignals(False)
+            if self.items:
+                self.current_idx = len(self.items) - 1
+
     def _setup_multi_cam(self, cam_names: list[str], cam_folders: list[Path],
                          reset_items: bool = True,
                          cam_folder_lists: "list[list[Path]] | None" = None,
@@ -8570,6 +9063,9 @@ class Viewer(QWidget):
         self._cam_folder_lists = cam_folder_lists if cam_folder_lists is not None else [[f] for f in cam_folders]
         n = len(cam_names)
         self._cam_last_update_ts = [0.0] * n  # reset refresh dots on camera switch
+        # Last time the expensive full os.listdir scan ran per camera (throttled
+        # when a dir-watcher is active — see _online_poll_multi).
+        self._cam_last_full_poll_ts = [0.0] * n
         # Scale poll pool for many cameras (2 threads per camera, min 8)
         self._poll_pool.setMaxThreadCount(max(8, n * 2))
 
@@ -8728,22 +9224,9 @@ class Viewer(QWidget):
                 _prev_merged_len > 0 and
                 _prev_current_idx >= _prev_merged_len - 1
             )
-            is_master = (cam_i == self._per_cam_master_idx)
-            if is_master and (self._auto_follow or was_at_end):
-                self._per_cam_display_one(cam_i, latest_ts)
-                if cam_i < len(self._per_cam_rows):
-                    sv = self._per_cam_ts_to_slider(cam_i, latest_ts)
-                    self._per_cam_rows[cam_i].set_value(sv)
-                self.tickbar.set_cursor(latest_ts)
-                sv_main = self._time_to_slider_value(latest_ts)
-                self.slider.blockSignals(True)
-                self.slider.setValue(sv_main)
-                self.slider.blockSignals(False)
-                if self.items:
-                    self.current_idx = len(self.items) - 1
-                for other in range(len(self._cam_ts)):
-                    if other != cam_i:
-                        self._per_cam_display_one(other, latest_ts)
+            # Each camera advances independently to its own latest frame; the
+            # master also drives the shared slider/tickbar (same path as polling).
+            self._live_advance_cam(cam_i, latest_ts, was_at_end)
 
     def _start_online_mode(self):
         self._online_mode = True
@@ -8989,7 +9472,10 @@ class Viewer(QWidget):
             self._cam_poll_running = [False] * n_cams
         if not hasattr(self, '_cam_poll_sigs') or len(self._cam_poll_sigs) != n_cams:
             self._cam_poll_sigs = [None] * n_cams
+        if not hasattr(self, '_cam_last_full_poll_ts') or len(self._cam_last_full_poll_ts) != n_cams:
+            self._cam_last_full_poll_ts = [0.0] * n_cams
         poll_max_ts = getattr(self, '_cam_poll_max_ts', [0] * n_cams)
+        now = time.monotonic()
 
         # Keep dir-watchers only on the folders we still actively scan, so a long
         # session does not leak one open SMB handle + thread per elapsed hour.
@@ -9009,6 +9495,17 @@ class Viewer(QWidget):
             folders  = active_scan_folders(folder_lists[cam_i])
             cutoff   = poll_max_ts[cam_i] if cam_i < len(poll_max_ts) else 0
             cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else ""
+
+            # When a dir-watcher is active on this camera's folders, new frames
+            # already stream in instantly via ReadDirectoryChangesW — so run the
+            # expensive full listdir scan only every ONLINE_FULL_POLL_INTERVAL_S
+            # (for hour-rollover / new-folder discovery + overflow safety net).
+            # Without a watcher, fall back to scanning every tick.
+            has_watcher = _DIRWATCH_AVAILABLE and any(
+                str(f) in self._dir_watchers for f in folders)
+            due = (now - self._cam_last_full_poll_ts[cam_i]) >= ONLINE_FULL_POLL_INTERVAL_S
+            if has_watcher and not due:
+                continue
 
             sig = _CamPollSignals()
             self._cam_poll_sigs[cam_i] = sig  # keep reference so it isn't GC'd
@@ -9058,40 +9555,14 @@ class Viewer(QWidget):
                             _prev_merged_len > 0 and
                             _prev_current_idx >= _prev_merged_len - 1
                         )
-                        is_master = (cam_idx == self._per_cam_master_idx)
-                        if is_master:
-                            # Master camera got new frame — update display for ALL cameras
-                            if self._auto_follow or was_at_end:
-                                self._per_cam_display_one(cam_idx, latest_ts)
-                                if cam_idx < len(self._per_cam_rows):
-                                    sv = self._per_cam_ts_to_slider(cam_idx, latest_ts)
-                                    self._per_cam_rows[cam_idx].set_value(sv)
-                                self.tickbar.set_cursor(latest_ts)
-                                sv_main = self._time_to_slider_value(latest_ts)
-                                self.slider.blockSignals(True)
-                                self.slider.setValue(sv_main)
-                                self.slider.blockSignals(False)
-                                if self.items:
-                                    self.current_idx = len(self.items) - 1
-                                # Update all non-master cameras to the closest frame to master's ts
-                                for other_idx in range(len(self._cam_ts)):
-                                    if other_idx == cam_idx:
-                                        continue
-                                    self._per_cam_display_one(other_idx, latest_ts)
-                                    if other_idx < len(self._per_cam_rows):
-                                        sv_slave = self._per_cam_ts_to_slider(other_idx, latest_ts)
-                                        self._per_cam_rows[other_idx].set_value(sv_slave)
-                            else:
-                                # Scrubbing — show current slider time for all
-                                if self.items and self.current_idx is not None:
-                                    t_ns = self.items[self.current_idx].ts_ns
-                                    for other_idx in range(len(self._cam_ts)):
-                                        self._per_cam_display_one(other_idx, t_ns)
-                        # Non-master: data updated, display driven by master — do nothing
+                        # Each camera advances independently to its own latest frame;
+                        # the master also drives the shared slider/tickbar (see helper).
+                        self._live_advance_cam(cam_idx, latest_ts, was_at_end)
                 return on_cam_found
 
             sig.found.connect(make_callback(cam_i, gen))
             self._cam_poll_running[cam_i] = True
+            self._cam_last_full_poll_ts[cam_i] = now
             self._poll_pool.start(_CamPollTask(cam_i, folders, cutoff, cam_name, sig))
 
     def _rebuild_shared_items_from_cams(self):
@@ -9220,21 +9691,22 @@ class Viewer(QWidget):
         axis_override = self.last_pick_axis_override
         hour_from = self.last_pick_hour_from
         hour_to   = self.last_pick_hour_to
+        segments  = getattr(self, '_last_pick_segments', None)
 
         # Sestav složky
         cam_folder_lists: list[list[Path]] = []
         for cam_name in cam_names:
             folders = DatePickerDialog.selected_folders_static(
                 day_obj, hour_from, hour_to,
-                Path(DEFAULT_OPEN_ROOT) / cam_name)
+                Path(DEFAULT_OPEN_ROOT) / cam_name,
+                segments=segments)
             cam_folders_with_cam = []
             for f in folders:
                 cf = f / cam_name if not f.name == cam_name else f
                 cam_folders_with_cam.append(cf)
             cam_folder_lists.append(cam_folders_with_cam)
 
-        self.lbl_selected_range.setText(
-            f"Range: {hour_from:02d}:00 – {hour_to:02d}:59")
+        self.lbl_selected_range.setText(self._range_label(segments, hour_from, hour_to))
 
         if len(cam_names) == 1:
             self._stop_online_mode()
@@ -9337,18 +9809,11 @@ class Viewer(QWidget):
 
             existing = [f for f in folder_list if f.exists() and f.is_dir()]
             if not existing:
-                day_obj = self.last_pick_date
-                h_from  = self.last_pick_hour_from
-                h_to    = self.last_pick_hour_to
-                for hh in range(h_from, h_to + 1):
-                    ref_dt = datetime(day_obj.year, day_obj.month,
-                                      day_obj.day, hh, 0, 0, tzinfo=TZ_PRAGUE)
-                    folder_h = folder_hour_from_prague_hour(hh, ref_dt)
-                    cf = (Path(DEFAULT_OPEN_ROOT)
-                          / str(day_obj.year) / str(day_obj.month)
-                          / str(day_obj.day) / str(folder_h) / cam_name)
-                    if cf.exists() and cf.is_dir():
-                        existing.append(cf)
+                rebuilt = DatePickerDialog.selected_folders_static(
+                    self.last_pick_date, self.last_pick_hour_from, self.last_pick_hour_to,
+                    Path(DEFAULT_OPEN_ROOT) / cam_name,
+                    segments=getattr(self, '_last_pick_segments', None))
+                existing = [f for f in rebuilt if f.exists() and f.is_dir()]
 
             if not existing:
                 _signals.done.emit(cam_i, [], [])
@@ -9459,6 +9924,20 @@ class Viewer(QWidget):
 
         QTimer.singleShot(0, self._pv_update_overlay)
 
+    @staticmethod
+    def _range_label(segments, hour_from, hour_to) -> str:
+        """Build the 'Range: …' status label for single-day or per-day selections."""
+        def _seg_txt(hf, ht):
+            return f"{hf:02d}h" if hf == ht else f"{hf:02d}–{ht:02d}h"
+        if not segments:
+            return f"Range: {hour_from:02d}:00 – {hour_to:02d}:59"
+        if len(segments) == 1:
+            d, hf, ht = segments[0]
+            return f"Range: {d.strftime('%d.%m')} {_seg_txt(hf, ht)}"
+        parts = [f"{d.strftime('%d.%m')} {_seg_txt(hf, ht)}" for d, hf, ht in segments[:3]]
+        more = "…" if len(segments) > 3 else ""
+        return f"Range: {', '.join(parts)}{more} ({len(segments)} days)"
+
     def open_by_date(self):
         dlg = DatePickerDialog(
             self.last_open_dir,
@@ -9469,28 +9948,29 @@ class Viewer(QWidget):
             return
 
         axis_override = dlg.selected_axis()
-        hour_from, hour_to = dlg.selected_hours()
         online = dlg.is_online_mode()
         multiday = dlg.is_multiday()
         if online:
             self._pending_online_mode = True
 
-        self.last_pick_date          = dlg.selected_date_obj()
+        # Per-day segments (None in plain single-day mode → legacy fast path)
+        segments = dlg.selected_segments()
+        self._last_pick_segments = segments
+        if segments:
+            self.last_pick_date      = segments[0][0]
+            hour_from, hour_to       = segments[0][1], segments[0][2]
+        else:
+            self.last_pick_date      = dlg.selected_date_obj()
+            hour_from, hour_to       = dlg.selected_hours()
         self.last_pick_hour_from     = hour_from
         self.last_pick_hour_to       = hour_to
         self.last_pick_axis_override = axis_override
-        # Multi-day: store all selected dates
-        self._last_pick_extra_dates: "list | None" = dlg.selected_date_range() if multiday else None
+        # Legacy field kept for backward compatibility (segments supersede it)
+        self._last_pick_extra_dates: "list | None" = None
 
-        if multiday:
-            days = dlg.selected_date_range()
-            d0, d1 = days[0], days[-1]
-            self.lbl_selected_range.setText(
-                f"Range: {d0.strftime('%d.%m')}–{d1.strftime('%d.%m')}  {hour_from:02d}–{hour_to:02d}h")
-        else:
-            self.lbl_selected_range.setText(f"Range: {hour_from:02d}:00 – {hour_to:02d}:59")
+        self.lbl_selected_range.setText(self._range_label(segments, hour_from, hour_to))
 
-        # Okamžitě spusť scan kamer na pozadí (ze start date)
+        # Okamžitě spusť scan kamer na pozadí (z prvního dne výběru)
         self._preloaded_cameras: list[tuple[str, str]] = []
         self._cameras_loaded = False
 
@@ -9548,6 +10028,7 @@ class Viewer(QWidget):
         hour_to    = self.last_pick_hour_to
         axis_override = self.last_pick_axis_override
 
+        segments    = getattr(self, '_last_pick_segments', None)
         extra_dates = getattr(self, '_last_pick_extra_dates', None)
 
         cam_folder_lists: list[list[Path]] = []
@@ -9555,18 +10036,12 @@ class Viewer(QWidget):
             folders = DatePickerDialog.selected_folders_static(
                 day_obj, hour_from, hour_to,
                 Path(DEFAULT_OPEN_ROOT) / cam_name,
-                extra_dates=extra_dates)
+                extra_dates=extra_dates, segments=segments)
             cam_folder_lists.append([
                 f / cam_name if not f.name == cam_name else f
                 for f in folders])
 
-        if extra_dates and len(extra_dates) > 1:
-            d0, d1 = extra_dates[0], extra_dates[-1]
-            self.lbl_selected_range.setText(
-                f"Range: {d0.strftime('%d.%m')}–{d1.strftime('%d.%m')}  {hour_from:02d}–{hour_to:02d}h")
-        else:
-            self.lbl_selected_range.setText(
-                f"Range: {hour_from:02d}:00 – {hour_to:02d}:59")
+        self.lbl_selected_range.setText(self._range_label(segments, hour_from, hour_to))
 
         if len(cam_names) == 1:
             self._stop_online_mode()
