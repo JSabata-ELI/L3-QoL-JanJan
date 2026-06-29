@@ -1,12 +1,11 @@
 """
-Low-level CPVA archiver client for PV Monitor.
+Low-level CPVA archiver client for the PV Monitor tab.
 
-These functions are copied verbatim from CSS Logger (cssl.py) so the whole
-toolchain shares one proven implementation. The only addition is
-``cpva_decode_units`` (units pattern lifted from cssl.py:5735).
+These functions are copied verbatim from the standalone PV Monitor app so the
+whole toolchain shares one proven implementation.
 
 CPVA host uses a self-signed cert -> TLS verification is disabled for the
-archiver session only. (The Teams webhook in alerting.py keeps TLS ON.)
+archiver session only. (The notifier clients in alerting.py keep TLS ON.)
 """
 
 from __future__ import annotations
@@ -166,7 +165,7 @@ def cpva_decode_value(sample: dict):
 
 
 def cpva_decode_units(sample: dict) -> str:
-    """Extract the engineering units string from a sample (cssl.py:5735 pattern)."""
+    """Extract the engineering units string from a sample."""
     return (sample.get("metaData") or {}).get("units", "") or ""
 
 

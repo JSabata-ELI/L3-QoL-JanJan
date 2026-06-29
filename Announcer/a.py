@@ -10,6 +10,8 @@ import time
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
+import socket
 import ssl
 from PIL import ImageGrab, ImageTk, ImageChops, ImageStat
 import screeninfo
@@ -58,6 +60,64 @@ def _pv_key(channel):
     if isinstance(channel, tuple):
         return f"{channel[0]}-{channel[1]}"
     return channel
+
+
+# Each entry: HTTP code -> (short label, plain-language explanation)
+_HTTP_MESSAGES = {
+    400: ("Bad request",
+          "We sent the request in a form the archiver didn't accept. Likely a bug in the request, not your network."),
+    401: ("Unauthorized",
+          "The archiver wants credentials we didn't provide."),
+    403: ("Access denied",
+          "The archiver refused the request — you may not be allowed to read this channel."),
+    404: ("Channel not found",
+          "The archiver doesn't know this PV name. It may be misspelled or simply not archived."),
+    500: ("Archiver server error",
+          "The archiver was reached and answered, but crashed internally while handling the request. A server-side problem — usually temporary, not your network."),
+    502: ("Archiver gateway error",
+          "A gateway in front of the archiver got a broken reply from it."),
+    503: ("Archiver unavailable",
+          "The archiver is temporarily down, overloaded, or restarting. Usually clears up on its own."),
+    504: ("Archiver gateway timeout",
+          "A gateway forwarded the request but the archiver behind it never replied in time."),
+}
+
+# detail label -> plain-language explanation for the non-HTTP cases
+_NETWORK_HINTS = {
+    "Connection timed out":
+        "The request left your PC but no reply came back within the time limit. The archiver is reachable in principle but too slow, overloaded, or the network is congested. (Compare: 'failed' = couldn't even start the connection.)",
+    "Archiver unreachable":
+        "We couldn't open a connection to the archiver at all — server is down, the address is wrong, or you're not on the right network/VPN. Nothing was sent.",
+    "Connection failed":
+        "The connection to the archiver was actively refused or dropped mid-way. The server (or a firewall) said 'no' rather than just staying silent.",
+    "Invalid server response":
+        "The archiver answered, but the data wasn't readable (not valid JSON). The server may be returning an error page instead of data.",
+}
+
+
+def _readable_pv_error(pv_name, exc):
+    """Translate a raw fetch exception into (short message, plain explanation)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        label, hint = _HTTP_MESSAGES.get(
+            exc.code, ("Server error", "The archiver returned an unexpected error code."))
+        detail = f"{label} (HTTP {exc.code})"
+    elif isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", exc)
+        detail = "Connection timed out" if isinstance(reason, (socket.timeout, TimeoutError)) else "Archiver unreachable"
+        hint = _NETWORK_HINTS[detail]
+    elif isinstance(exc, (socket.timeout, TimeoutError)):
+        detail = "Connection timed out"
+        hint = _NETWORK_HINTS[detail]
+    elif isinstance(exc, ConnectionError):
+        detail = "Connection failed"
+        hint = _NETWORK_HINTS[detail]
+    elif isinstance(exc, (json.JSONDecodeError, ValueError)):
+        detail = "Invalid server response"
+        hint = _NETWORK_HINTS[detail]
+    else:
+        detail = str(exc) or exc.__class__.__name__
+        hint = "An unexpected error occurred while reading this PV."
+    return f"{pv_name} — {detail}", hint
 
 
 _RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry"}
@@ -201,6 +261,13 @@ class ScreenTracker(tk.Tk):
         self._pv_alert_rows: list[tk.Frame] = []
         self._pv_alert_labels: list[tk.Label] = []
 
+        # Message log state
+        self._log_items: dict[str, tuple[str, int]] = {}   # message -> (item_id, count)
+        self._log_hints: dict[str, str] = {}               # item_id -> plain explanation
+        self._log_tip = None
+        self._log_tip_item = None
+        self._geom_before_hide = None
+
         if getattr(sys, "frozen", False):
             _base = Path(sys.executable).parent
         else:
@@ -225,7 +292,7 @@ class ScreenTracker(tk.Tk):
         self.bind("<Button-1>", self._on_any_click)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         saved_geom = self._presets.get("window_geometry")
-        self.geometry(saved_geom if saved_geom else "350x150")
+        self.geometry(saved_geom if saved_geom else "400x360")
 
     # ------------------------------------------------------------------
     # UI
@@ -264,6 +331,12 @@ class ScreenTracker(tk.Tk):
 
     def _build_ui(self):
         pad = dict(padx=10, pady=5)
+
+        # Theme background color — used as the chroma key for the transparent
+        # (HUD) mode during tracking. Anything painted with this color becomes
+        # fully transparent and click-through; only the circle / PV badges stay.
+        self._chroma = ttk.Style().lookup("TFrame", "background") or self.cget("bg")
+        self.configure(bg=self._chroma)
 
         # Řádek 0: mon_frame vlevo, kolečko samostatně vpravo
         self._top_frame = ttk.Frame(self)
@@ -358,6 +431,33 @@ class ScreenTracker(tk.Tk):
             lbl.pack()
             self._pv_alert_rows.append(row_frame)
             self._pv_alert_labels.append(lbl)
+
+        # Message log (row=4) — shows runtime messages such as PV fetch errors.
+        # Hidden while tracking (see _set_ui_visible).
+        self._log_frame = ttk.LabelFrame(self, text="Message log")
+        self._log_frame.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        self.rowconfigure(4, weight=1)
+        self._log_frame.rowconfigure(0, weight=1)
+        self._log_frame.columnconfigure(0, weight=1)
+
+        cols = ("time", "count", "msg")
+        tv = ttk.Treeview(self._log_frame, columns=cols, show="headings", height=6)
+        tv.heading("time", text="Time")
+        tv.heading("count", text="#")
+        tv.heading("msg", text="Message  (hover for details)")
+        tv.column("time", width=70, anchor="w", stretch=False)
+        tv.column("count", width=40, anchor="center", stretch=False)
+        tv.column("msg", width=250, anchor="w", stretch=True)
+        vsb = ttk.Scrollbar(self._log_frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vsb.set)
+        tv.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(2, 6))
+        vsb.grid(row=0, column=1, sticky="ns", pady=(2, 6), padx=(0, 6))
+        ttk.Button(self._log_frame, text="Clear", width=6,
+                   command=self._clear_log).grid(row=1, column=0, columnspan=2,
+                                                 sticky="e", padx=6, pady=(0, 6))
+        self._log_tree = tv
+        tv.bind("<Motion>", self._on_log_hover)
+        tv.bind("<Leave>", lambda e: self._hide_log_tip())
 
         # Pre-build Settings variables (popup builds widgets on first open)
         self.flash_color = tk.StringVar(value="#ff2222")
@@ -796,11 +896,103 @@ class ScreenTracker(tk.Tk):
             self._settings_btn.pack(side="left", padx=(4, 0))
             self._btn_frame.grid()
             self._preset_frame.grid()
+            self._log_frame.grid()
+            self._set_transparent(False)
         else:
+            self._geom_before_hide = self.geometry()
             self._mon_frame.pack_forget()
             self._settings_btn.pack_forget()
             self._btn_frame.grid_remove()
             self._preset_frame.grid_remove()
+            self._log_frame.grid_remove()
+            self._set_transparent(True)
+
+    def _set_transparent(self, on):
+        """HUD mode: drop window chrome and chroma-key the background so only the
+        circle (and any PV alert badges) remain visible and clickable."""
+        try:
+            if on:
+                self.overrideredirect(True)
+                self.attributes("-transparentcolor", self._chroma)
+                self.attributes("-topmost", True)
+            else:
+                self.attributes("-transparentcolor", "")
+                self.overrideredirect(False)
+                self.attributes("-topmost", True)
+                if self._geom_before_hide:
+                    self.geometry(self._geom_before_hide)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Message log
+    # ------------------------------------------------------------------
+    def _log_message(self, msg, hint=None):
+        """Thread-safe: append/refresh a message in the log table.
+
+        `hint` is an optional plain-language explanation shown as a tooltip when
+        the user hovers the row.
+        """
+        self.after(0, self._do_log, msg, hint)
+
+    def _do_log(self, msg, hint=None):
+        tv = self._log_tree
+        ts = time.strftime("%H:%M:%S")
+        entry = self._log_items.get(msg)
+        if entry and tv.exists(entry[0]):
+            item_id, count = entry[0], entry[1] + 1
+            tv.set(item_id, "time", ts)
+            tv.set(item_id, "count", count)
+            tv.move(item_id, "", "end")
+            self._log_items[msg] = (item_id, count)
+            tv.see(item_id)
+            return
+        item_id = tv.insert("", "end", values=(ts, 1, msg))
+        self._log_items[msg] = (item_id, 1)
+        if hint:
+            self._log_hints[item_id] = hint
+        children = tv.get_children("")
+        if len(children) > 500:
+            oldest = children[0]
+            for m, (iid, _c) in list(self._log_items.items()):
+                if iid == oldest:
+                    del self._log_items[m]
+                    break
+            self._log_hints.pop(oldest, None)
+            tv.delete(oldest)
+        tv.see(item_id)
+
+    def _clear_log(self):
+        self._log_tree.delete(*self._log_tree.get_children(""))
+        self._log_items.clear()
+        self._log_hints.clear()
+        self._hide_log_tip()
+
+    def _on_log_hover(self, event):
+        tv = self._log_tree
+        item = tv.identify_row(event.y)
+        hint = self._log_hints.get(item) if item else None
+        if not hint:
+            self._hide_log_tip()
+            return
+        if item == self._log_tip_item and self._log_tip and self._log_tip.winfo_exists():
+            return
+        self._hide_log_tip()
+        tip = tk.Toplevel(self)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=hint, bg="#ffffe0", fg="#222222", justify="left",
+                 relief="solid", bd=1, font=("Segoe UI", 9),
+                 wraplength=340, padx=6, pady=4).pack()
+        tip.geometry(f"+{event.x_root + 14}+{event.y_root + 16}")
+        self._log_tip = tip
+        self._log_tip_item = item
+
+    def _hide_log_tip(self):
+        if self._log_tip and self._log_tip.winfo_exists():
+            self._log_tip.destroy()
+        self._log_tip = None
+        self._log_tip_item = None
 
     def _pick_flash_color(self):
         from tkinter.colorchooser import askcolor
@@ -975,7 +1167,8 @@ class ScreenTracker(tk.Tk):
                 recent = vals[-PV_AVG_COUNT:]
                 return sum(recent) / len(recent) if recent else None
             except Exception as e:
-                print(f"[PV] {pv_name}: {e}")
+                msg, hint = _readable_pv_error(pv_name, e)
+                self._log_message(msg, hint)
                 return None
 
         def worker():

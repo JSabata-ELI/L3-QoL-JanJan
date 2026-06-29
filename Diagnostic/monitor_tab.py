@@ -1,21 +1,28 @@
 """
-PV Monitor — watch CPVA archiver PVs, alert to Microsoft Teams when out of range.
+PV Monitor tab for the Diagnostic app.
 
-Standalone PySide6 app for ELI Beamlines. Polls a configurable list of EPICS
-PVs from the CPVA archiver, compares each against learned/manual warning + alarm
-limits, sends a Teams message on state changes, and shows the data in a
-colour-coded table + a live graph with threshold lines.
+Watches a user-chosen list of CPVA archiver PVs (temperatures, humidity, …)
+against user-set warning/alarm limits and, on a committed state change, sends
+an alert to every enabled channel (Email, Webex, Teams). Alerts include a PNG
+trend of the offending PV over the last N hours; there is also a manual
+"Send plot now" button.
 
-See cpva_api.py (archiver client) and alerting.py (state machine + Teams client).
+Adapted from the former standalone PV Monitor app: the QMainWindow became this
+embeddable QWidget (toolbar -> button row, no statusbar/geometry), the single
+TeamsClient became a NotificationHub, and a worker-thread plot renderer +
+dispatcher were added so the UI never blocks on network/render.
+
+See cpva_api.py (archiver client) and alerting.py (state machine + notifiers).
 """
 
 from __future__ import annotations
 
 import json
-import sys
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from io import BytesIO
 from typing import Optional
 
 import numpy as np
@@ -23,23 +30,92 @@ from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QObject, QRunnable, Qt, QThreadPool,
     QTimer, Signal,
 )
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter, QTableView,
-    QToolBar, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
+    QPushButton, QScrollArea, QSpinBox, QSplitter, QTableView, QVBoxLayout,
+    QWidget,
 )
 
 import cpva_api as api
 from alerting import (
-    AlertEvaluator, AlertLevel, AlertState, EvalConfig, TeamsClient, Thresholds,
-    build_messagecard, describe_reason,
+    AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
+    NotificationHub, Thresholds, describe_reason,
 )
 
 # ---------------------------------------------------------------------------
-# Design language (from skill_pyside6_app_design)
+# Shared styles (kept local so this module has no import cycle with main.py)
+# ---------------------------------------------------------------------------
+
+BUTTON_STYLE = """
+QPushButton {
+    background: #3a7bd5;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-weight: bold;
+}
+QPushButton:hover { background: #2f6bbf; }
+QPushButton:disabled { background: #555; color: #888; }
+"""
+
+STOP_BUTTON_STYLE = """
+QPushButton {
+    background: #c0392b;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-weight: bold;
+}
+QPushButton:hover { background: #a93226; }
+QPushButton:disabled { background: #555; color: #888; }
+"""
+
+SECONDARY_STYLE = """
+QPushButton {
+    background: #444;
+    color: #ddd;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 5px 12px;
+}
+QPushButton:hover { background: #555; }
+"""
+
+LOG_STYLE = """
+QPlainTextEdit {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-family: Consolas, monospace;
+    font-size: 11px;
+}
+"""
+
+
+def _btn(label, style=BUTTON_STYLE):
+    b = QPushButton(label)
+    b.setStyleSheet(style)
+    return b
+
+
+class LogWidget(QPlainTextEdit):
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+        self.setStyleSheet(LOG_STYLE)
+
+    def append_line(self, text):
+        self.appendPlainText(text)
+        sb = self.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+
+# ---------------------------------------------------------------------------
+# Dialog styles (carried over from the original app for dialog widgets)
 # ---------------------------------------------------------------------------
 
 PRIMARY, PRIMARY_HOVER = "#1565C0", "#0D47A1"
@@ -60,11 +136,6 @@ _BTN_SUCCESS = (
     "padding:7px 10px; border-radius:4px; }"
     "QPushButton:hover { background:#1B5E20; }"
     "QPushButton:disabled { background:#bbb; color:#888; }"
-)
-_BTN_DANGER = (
-    "QPushButton { background:#B71C1C; color:white; font-weight:700; "
-    "padding:7px 10px; border-radius:4px; }"
-    "QPushButton:hover { background:#7F0000; }"
 )
 _CHK_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
@@ -93,10 +164,10 @@ _STATE_BG = {
 # Config
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = api.APP_DIR / "pvmon_config.json"
+CONFIG_FILE = api.APP_DIR / "monitor_config.json"
 
 DEFAULT_SETTINGS = {
-    "teams_webhook_url": "",
+    # monitoring
     "poll_interval_s": 30,
     "avg_last_n": 25,
     "sample_window_s": 60,
@@ -111,11 +182,32 @@ DEFAULT_SETTINGS = {
     "alarm_k_default": 5.0,
     "graph_window_minutes": 60,
     "start_monitoring_on_launch": False,
+    # alert graph
+    "alert_plot_hours": 12,
+    # channels
+    "teams_enabled": True,
+    "email_enabled": False,
+    "webex_enabled": False,
+    # teams
+    "teams_webhook_url": "",
+    # email
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_security": "starttls",     # none | starttls | ssl
+    "smtp_user": "",
+    "smtp_password": "",
+    "email_from": "",
+    "email_recipients": [],
+    # webex
+    "webex_mode": "bot",             # webhook | bot  (bot supports the PNG graph)
+    "webex_webhook_url": "",
+    "webex_bot_token": "",
+    "webex_room_id": "",
 }
 
 
 def load_config() -> dict:
-    data = {"version": 1, "settings": {}, "pvs": [], "window_geometry": None}
+    data = {"version": 1, "settings": {}, "pvs": []}
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -135,7 +227,11 @@ def save_config(data: dict) -> None:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
-        print(f"[config] save failed: {e}")
+        print(f"[monitor config] save failed: {e}")
+
+
+def _parse_recipients(text: str) -> list[str]:
+    return [p.strip() for p in re.split(r"[;,]", text or "") if p.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +320,13 @@ def _avg_recent_numeric(samples: list[dict], avg_n: int):
     return sum(recent) / len(recent), units, last_ts
 
 
+def _safe_emit(sig_fn, value):
+    try:
+        sig_fn(value)
+    except RuntimeError:
+        pass  # signal source deleted (dialog/tab closed while worker ran)
+
+
 class _PollSignals(QObject):
     done = Signal(object)   # {name: (value_or_None, units, last_ts_ns, error_str)}
     log = Signal(str)
@@ -250,10 +353,7 @@ class _PollWorker(QRunnable):
                 out[name] = (val, units, last_ts or end, "")
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
                 out[name] = (None, "", end, str(e))
-        try:
-            self._sig.done.emit(out)
-        except RuntimeError:
-            pass  # window was closed before worker finished
+        _safe_emit(self._sig.done.emit, out)
 
 
 class _ChannelsSignals(QObject):
@@ -270,28 +370,15 @@ class _ChannelsWorker(QRunnable):
     def run(self):
         try:
             channels = api.cpva_fetch_channels(self._timeout)
-            try:
-                self._sig.done.emit(channels)
-            except RuntimeError:
-                pass
+            _safe_emit(self._sig.done.emit, channels)
         except Exception as e:  # noqa: BLE001
-            try:
-                self._sig.error.emit(str(e))
-            except RuntimeError:
-                pass
+            _safe_emit(self._sig.error.emit, str(e))
 
 
 class _LearnSignals(QObject):
     done = Signal(object)   # dict of thresholds + stats
     error = Signal(str)
     log = Signal(str)
-
-
-def _safe_emit(sig_fn, value):
-    try:
-        sig_fn(value)
-    except RuntimeError:
-        pass  # signal source deleted (dialog closed while worker ran)
 
 
 class _LearnWorker(QRunnable):
@@ -463,7 +550,7 @@ class PVTableModel(QAbstractTableModel):
             pv.enabled = (Qt.CheckState(value) == Qt.Checked)
             self.dataChanged.emit(index, index)
             win = self.parent()
-            if isinstance(win, PVMonitorWindow):
+            if isinstance(win, MonitorWidget):
                 win.persist()
             return True
         return False
@@ -570,7 +657,7 @@ class PVBrowserDialog(QDialog):
         self.list.clear()
         for c in capped:
             self.list.addItem(QListWidgetItem(c))
-        extra = "" if len(matches) <= 2000 else f" (showing first 2000)"
+        extra = "" if len(matches) <= 2000 else " (showing first 2000)"
         self.count.setText(f"{len(matches)} match / {len(self._all)} total{extra}")
 
     def _accept(self):
@@ -580,7 +667,7 @@ class PVBrowserDialog(QDialog):
 
 
 class PVEditDialog(QDialog):
-    def __init__(self, parent: "PVMonitorWindow", pv: PVConfig):
+    def __init__(self, parent: "MonitorWidget", pv: PVConfig):
         super().__init__(parent)
         self.setWindowTitle(f"Edit PV — {pv.display_name}")
         self.resize(460, 460)
@@ -705,15 +792,41 @@ class PVEditDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent: "PVMonitorWindow"):
+    def __init__(self, parent: "MonitorWidget"):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(520, 480)
+        self.resize(560, 720)
         self._win = parent
         s = parent.settings
 
-        lay = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
 
+        # --- Channels ------------------------------------------------------
+        ch = QGroupBox("Notification channels")
+        ch.setStyleSheet(_GROUP_STYLE)
+        cl = QFormLayout(ch)
+        self.teams_en = QCheckBox("Teams")
+        self.email_en = QCheckBox("Email")
+        self.webex_en = QCheckBox("Webex")
+        for w, key in ((self.teams_en, "teams_enabled"),
+                       (self.email_en, "email_enabled"),
+                       (self.webex_en, "webex_enabled")):
+            w.setStyleSheet(_CHK_STYLE)
+            w.setChecked(bool(s.get(key)))
+            cl.addRow("", w)
+        self.plot_hours = QSpinBox()
+        self.plot_hours.setRange(0, 168)
+        self.plot_hours.setValue(int(s.get("alert_plot_hours", 12)))
+        cl.addRow("Alert plot window (h, 0=off)", self.plot_hours)
+        lay.addWidget(ch)
+
+        # --- Teams ---------------------------------------------------------
         teams = QGroupBox("Microsoft Teams")
         teams.setStyleSheet(_GROUP_STYLE)
         tl = QVBoxLayout(teams)
@@ -721,15 +834,71 @@ class SettingsDialog(QDialog):
         self.webhook = QLineEdit(s["teams_webhook_url"])
         self.webhook.setPlaceholderText("https://…webhook…")
         tl.addWidget(self.webhook)
-        test = QPushButton("Send test message")
-        test.setStyleSheet(_BTN_PRIMARY)
-        test.clicked.connect(self._test)
-        tl.addWidget(test)
-        self.test_status = QLabel("")
-        self.test_status.setWordWrap(True)
-        tl.addWidget(self.test_status)
+        bt = QPushButton("Send test to Teams")
+        bt.setStyleSheet(_BTN_PRIMARY)
+        bt.clicked.connect(self._test_teams)
+        tl.addWidget(bt)
         lay.addWidget(teams)
 
+        # --- Email ---------------------------------------------------------
+        email = QGroupBox("Email (SMTP)")
+        email.setStyleSheet(_GROUP_STYLE)
+        ef = QFormLayout(email)
+        self.smtp_host = QLineEdit(s.get("smtp_host", ""))
+        ef.addRow("SMTP host", self.smtp_host)
+        self.smtp_port = QSpinBox()
+        self.smtp_port.setRange(1, 65535)
+        self.smtp_port.setValue(int(s.get("smtp_port", 587)))
+        ef.addRow("Port", self.smtp_port)
+        self.smtp_sec = QComboBox()
+        self.smtp_sec.addItems(["none", "starttls", "ssl"])
+        self.smtp_sec.setCurrentText(s.get("smtp_security", "starttls"))
+        ef.addRow("Security", self.smtp_sec)
+        self.smtp_user = QLineEdit(s.get("smtp_user", ""))
+        ef.addRow("Username (optional)", self.smtp_user)
+        self.smtp_pass = QLineEdit(s.get("smtp_password", ""))
+        self.smtp_pass.setEchoMode(QLineEdit.Password)
+        self.smtp_pass.setToolTip("Stored in plaintext in monitor_config.json. "
+                                  "Tip: use ${ENV:NAME} to read from an env var.")
+        ef.addRow("Password", self.smtp_pass)
+        self.email_from = QLineEdit(s.get("email_from", ""))
+        ef.addRow("From address", self.email_from)
+        self.email_to = QLineEdit("; ".join(s.get("email_recipients", [])))
+        self.email_to.setPlaceholderText("comma- or semicolon-separated")
+        ef.addRow("Recipients", self.email_to)
+        be = QPushButton("Send test email")
+        be.setStyleSheet(_BTN_PRIMARY)
+        be.clicked.connect(self._test_email)
+        ef.addRow("", be)
+        lay.addWidget(email)
+
+        # --- Webex ---------------------------------------------------------
+        webex = QGroupBox("Webex")
+        webex.setStyleSheet(_GROUP_STYLE)
+        wf = QFormLayout(webex)
+        self.webex_mode = QComboBox()
+        self.webex_mode.addItems(["webhook", "bot"])
+        self.webex_mode.setCurrentText(s.get("webex_mode", "webhook"))
+        self.webex_mode.currentTextChanged.connect(self._update_webex_fields)
+        wf.addRow("Mode", self.webex_mode)
+        self.webex_url = QLineEdit(s.get("webex_webhook_url", ""))
+        self.webex_url.setPlaceholderText("https://…webex incoming webhook…")
+        wf.addRow("Webhook URL", self.webex_url)
+        self.webex_token = QLineEdit(s.get("webex_bot_token", ""))
+        self.webex_token.setEchoMode(QLineEdit.Password)
+        self.webex_token.setToolTip("Stored in plaintext in monitor_config.json. "
+                                    "Tip: use ${ENV:NAME} to read from an env var.")
+        wf.addRow("Bot token", self.webex_token)
+        self.webex_room = QLineEdit(s.get("webex_room_id", ""))
+        wf.addRow("Room ID", self.webex_room)
+        bw = QPushButton("Send test to Webex")
+        bw.setStyleSheet(_BTN_PRIMARY)
+        bw.clicked.connect(self._test_webex)
+        wf.addRow("", bw)
+        lay.addWidget(webex)
+        self._update_webex_fields(self.webex_mode.currentText())
+
+        # --- Monitoring ----------------------------------------------------
         form_grp = QGroupBox("Monitoring")
         form_grp.setStyleSheet(_GROUP_STYLE)
         form = QFormLayout(form_grp)
@@ -767,26 +936,82 @@ class SettingsDialog(QDialog):
         self.autostart.setChecked(bool(s["start_monitoring_on_launch"]))
         form.addRow("", self.autostart)
         lay.addWidget(form_grp)
+        lay.addStretch(1)
+
+        self.test_status = QLabel("")
+        self.test_status.setWordWrap(True)
+        outer.addWidget(self.test_status)
 
         bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         bb.button(QDialogButtonBox.Save).setStyleSheet(_BTN_SUCCESS)
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+        outer.addWidget(bb)
 
-    def _test(self):
-        client = TeamsClient(self.webhook.text().strip(),
-                             float(self._win.settings["http_timeout_s"]))
-        if client.send_test():
-            self.test_status.setText("✓ Test message sent.")
+    def _update_webex_fields(self, mode: str):
+        is_bot = (mode == "bot")
+        self.webex_url.setEnabled(not is_bot)
+        self.webex_token.setEnabled(is_bot)
+        self.webex_room.setEnabled(is_bot)
+
+    def _show_test(self, ok: bool, name: str, err: str):
+        if ok:
+            self.test_status.setText(f"✓ {name} test sent.")
             self.test_status.setStyleSheet(f"color:{SUCCESS};")
         else:
-            self.test_status.setText(f"✗ Failed: {client.last_error}")
+            self.test_status.setText(f"✗ {name} failed: {err}")
             self.test_status.setStyleSheet(f"color:{DANGER};")
+
+    def _test_teams(self):
+        from alerting import TeamsClient
+        c = TeamsClient(self.webhook.text().strip(),
+                        float(self._win.settings["http_timeout_s"]))
+        self._show_test(c.send_test(), "Teams", c.last_error)
+
+    def _test_email(self):
+        from alerting import EmailNotifier
+        c = EmailNotifier(
+            host=self.smtp_host.text().strip(), port=self.smtp_port.value(),
+            security=self.smtp_sec.currentText(),
+            username=self.smtp_user.text().strip(), password=self.smtp_pass.text(),
+            from_addr=self.email_from.text().strip(),
+            recipients=_parse_recipients(self.email_to.text()),
+            timeout=float(self._win.settings["http_timeout_s"]))
+        self._show_test(c.send_test(), "Email", c.last_error)
+
+    def _test_webex(self):
+        from alerting import WebexNotifier
+        c = WebexNotifier(
+            mode=self.webex_mode.currentText(),
+            webhook_url=self.webex_url.text().strip(),
+            bot_token=self.webex_token.text().strip(),
+            room_id=self.webex_room.text().strip(),
+            timeout=float(self._win.settings["http_timeout_s"]))
+        self._show_test(c.send_test(), "Webex", c.last_error)
 
     def _save(self):
         s = self._win.settings
+        # channels
+        s["teams_enabled"] = self.teams_en.isChecked()
+        s["email_enabled"] = self.email_en.isChecked()
+        s["webex_enabled"] = self.webex_en.isChecked()
+        s["alert_plot_hours"] = self.plot_hours.value()
+        # teams
         s["teams_webhook_url"] = self.webhook.text().strip()
+        # email
+        s["smtp_host"] = self.smtp_host.text().strip()
+        s["smtp_port"] = self.smtp_port.value()
+        s["smtp_security"] = self.smtp_sec.currentText()
+        s["smtp_user"] = self.smtp_user.text().strip()
+        s["smtp_password"] = self.smtp_pass.text()
+        s["email_from"] = self.email_from.text().strip()
+        s["email_recipients"] = _parse_recipients(self.email_to.text())
+        # webex
+        s["webex_mode"] = self.webex_mode.currentText()
+        s["webex_webhook_url"] = self.webex_url.text().strip()
+        s["webex_bot_token"] = self.webex_token.text().strip()
+        s["webex_room_id"] = self.webex_room.text().strip()
+        # monitoring
         s["poll_interval_s"] = self.poll.value()
         s["avg_last_n"] = self.avg_n.value()
         s["sample_window_s"] = self.window_s.value()
@@ -809,14 +1034,60 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import (  # noqa: E402
     FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT as NavToolbar,
 )
+from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 import matplotlib.dates as mdates  # noqa: E402
 
 MAX_GRAPH_POINTS = 3000
 
 
+def render_pv_png(pv_name: str, display_name: str, hours: float,
+                  thr: Thresholds, timeout: float) -> bytes | None:
+    """Fetch the last `hours` h from CPVA and render a value+threshold PNG.
+
+    Worker-thread safe: builds its own Figure and uses the non-Qt Agg canvas,
+    rendering to in-memory PNG bytes (no temp file, no shared matplotlib state).
+    """
+    end = api.now_ns()
+    start = end - int(hours * 3600 * 1e9)
+    samples = api.cpva_fetch_samples_chunked(pv_name, start, end, timeout)
+    xs, ys, units = [], [], ""
+    for s in samples:
+        v = api.cpva_decode_value(s)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        t = s.get("time")
+        if isinstance(t, (int, float)):
+            xs.append(api.ns_to_prague(int(t)))
+            ys.append(float(v))
+            u = api.cpva_decode_units(s)
+            if u:
+                units = u
+    if not xs:
+        return None
+
+    fig = Figure(figsize=(8, 4), dpi=110)
+    ax = fig.add_subplot(111)
+    ax.plot(xs, ys, drawstyle="steps-post", color=PRIMARY, linewidth=1.5)
+    for val, ls, lw in ((thr.warn_low, "--", 1.0), (thr.warn_high, "--", 1.0),
+                        (thr.alarm_low, "-.", 1.5), (thr.alarm_high, "-.", 1.5)):
+        if val is not None:
+            ax.axhline(val, linestyle=ls, linewidth=lw, alpha=0.7,
+                       color=ALARM_COLOR if ls == "-." else WARN_COLOR)
+    ax.set_title(f"{display_name}  (last {hours:g} h)")
+    ax.set_ylabel(units)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=api.TZ_PRAGUE))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    buf = BytesIO()
+    FigureCanvasAgg(fig).print_png(buf)
+    return buf.getvalue()
+
+
 class GraphPanel(QWidget):
-    def __init__(self, win: "PVMonitorWindow"):
+    def __init__(self, win: "MonitorWidget"):
         super().__init__()
         self._win = win
         lay = QVBoxLayout(self)
@@ -876,7 +1147,8 @@ class GraphPanel(QWidget):
             if pv:
                 self._plot_one(pv, PRIMARY, with_thresholds=True)
 
-        self.ax.legend(loc="upper left", fontsize=8) if self.ax.get_legend_handles_labels()[0] else None
+        if self.ax.get_legend_handles_labels()[0]:
+            self.ax.legend(loc="upper left", fontsize=8)
         self.ax.grid(True, alpha=0.3)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=api.TZ_PRAGUE))
 
@@ -895,14 +1167,45 @@ class GraphPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Main window
+# Alert dispatch worker (plot render + fan-out, off the UI thread)
 # ---------------------------------------------------------------------------
 
-class PVMonitorWindow(QMainWindow):
-    def __init__(self):
+class _AlertSignals(QObject):
+    done = Signal(object)   # (tag, {channel: error}, had_png)
+
+
+class _AlertWorker(QRunnable):
+    def __init__(self, sig: _AlertSignals, hub: NotificationHub,
+                 payload: AlertPayload, thr: Thresholds, hours: float,
+                 timeout: float, tag: str):
         super().__init__()
-        self.setWindowTitle("PV Monitor")
-        self.resize(1100, 760)
+        self._sig = sig
+        self._hub = hub
+        self._payload = payload
+        self._thr = thr
+        self._hours = hours
+        self._timeout = timeout
+        self._tag = tag
+
+    def run(self):
+        png = None
+        if self._hours > 0:
+            try:
+                png = render_pv_png(self._payload.pv_name, self._payload.display_name,
+                                    self._hours, self._thr, self._timeout)
+            except Exception:  # noqa: BLE001 - alert must still go out text-only
+                png = None
+        errors = self._hub.dispatch(self._payload, png)
+        _safe_emit(self._sig.done.emit, (self._tag, errors, png is not None))
+
+
+# ---------------------------------------------------------------------------
+# Monitor tab widget
+# ---------------------------------------------------------------------------
+
+class MonitorWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         cfg = load_config()
         self.settings = cfg["settings"]
@@ -913,13 +1216,11 @@ class PVMonitorWindow(QMainWindow):
         self._monitoring = False
         self._sim_timer: Optional[QTimer] = None
 
-        self.teams = TeamsClient(self.settings["teams_webhook_url"],
-                                 float(self.settings["http_timeout_s"]))
+        self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
         self._init_runtime()
 
         self._build_ui()
-        self._restore_geometry(cfg.get("window_geometry"))
         self._prefetch_channels()
 
         if self.settings.get("start_monitoring_on_launch"):
@@ -945,25 +1246,41 @@ class PVMonitorWindow(QMainWindow):
             self.runtime[pv.name] = PVRuntime(history=deque(maxlen=ml))
 
     def _build_ui(self):
-        tb = QToolBar()
-        tb.setMovable(False)
-        self.addToolBar(tb)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
 
-        self.act_monitor = QAction("▶ Start monitoring", self)
-        self.act_monitor.setCheckable(True)
-        self.act_monitor.triggered.connect(self.toggle_monitoring)
-        tb.addAction(self.act_monitor)
-        tb.addSeparator()
-        tb.addAction(QAction("Add PV", self, triggered=self.add_pv))
-        tb.addAction(QAction("Edit", self, triggered=self.edit_pv))
-        tb.addAction(QAction("Remove", self, triggered=self.remove_pv))
-        tb.addAction(QAction("Move ↑", self, triggered=lambda: self.move_pv(-1)))
-        tb.addAction(QAction("Move ↓", self, triggered=lambda: self.move_pv(1)))
-        tb.addSeparator()
-        tb.addAction(QAction("Poll now", self, triggered=self.poll_now))
-        tb.addAction(QAction("Simulate alert", self, triggered=self.simulate_alert))
-        tb.addSeparator()
-        tb.addAction(QAction("Settings", self, triggered=self.open_settings))
+        btn_row = QHBoxLayout()
+        self.btn_monitor = _btn("▶ Start monitoring")
+        self.btn_monitor.setCheckable(True)
+        self.btn_monitor.clicked.connect(self.toggle_monitoring)
+        btn_row.addWidget(self.btn_monitor)
+        btn_row.addSpacing(8)
+
+        for label, slot in (("Add PV", self.add_pv),
+                            ("Edit", self.edit_pv),
+                            ("Remove", self.remove_pv),
+                            ("Move ↑", lambda: self.move_pv(-1)),
+                            ("Move ↓", lambda: self.move_pv(1)),
+                            ("Poll now", self.poll_now),
+                            ("Simulate alert", self.simulate_alert)):
+            b = _btn(label, SECONDARY_STYLE)
+            b.clicked.connect(slot)
+            btn_row.addWidget(b)
+
+        self.btn_sendplot = _btn("Send plot now", SECONDARY_STYLE)
+        self.btn_sendplot.clicked.connect(self.send_plot_now)
+        btn_row.addWidget(self.btn_sendplot)
+
+        self.btn_settings = _btn("Settings", SECONDARY_STYLE)
+        self.btn_settings.clicked.connect(self.open_settings)
+        btn_row.addWidget(self.btn_settings)
+
+        btn_row.addStretch()
+        self._status_lbl = QLabel("")
+        self._status_lbl.setStyleSheet("color:#aaa;")
+        btn_row.addWidget(self._status_lbl)
+        root.addLayout(btn_row)
 
         splitter = QSplitter(Qt.Vertical)
 
@@ -984,55 +1301,50 @@ class PVMonitorWindow(QMainWindow):
         self.graph.refresh_combo()
         splitter.addWidget(self.graph)
         splitter.setSizes([300, 360])
+        root.addWidget(splitter, 1)
 
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(2000)
-        self.log.setFixedHeight(120)
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.Monospace)
-        self.log.setFont(mono)
-
-        central = QWidget()
-        cl = QVBoxLayout(central)
-        cl.setContentsMargins(4, 4, 4, 4)
-        cl.addWidget(splitter, 1)
-        cl.addWidget(self.log)
-        self.setCentralWidget(central)
+        self.log = LogWidget()
+        self.log.setMaximumHeight(140)
+        root.addWidget(self.log)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._start_poll)
 
-        self._update_status_bar()
+        self._update_status()
         self._log(f"Loaded {len(self.pvs)} PV(s). Config: {CONFIG_FILE}")
 
     # --- helpers -------------------------------------------------------
     def _log(self, msg: str):
         ts = datetime.now(api.TZ_PRAGUE).strftime("%H:%M:%S")
-        self.log.appendPlainText(f"[{ts}] {msg}")
+        self.log.append_line(f"[{ts}] {msg}")
 
-    def _update_status_bar(self):
+    def _channel_summary(self) -> str:
+        chans = []
+        if self.hub.teams_enabled and self.hub.teams.is_configured():
+            chans.append("Teams")
+        if self.hub.email_enabled and self.hub.email.is_configured():
+            chans.append("Email")
+        if self.hub.webex_enabled and self.hub.webex.is_configured():
+            chans.append("Webex")
+        return ", ".join(chans) if chans else "no channels"
+
+    def _update_status(self):
         state = "MONITORING" if self._monitoring else "stopped"
-        teams = "Teams ✓" if self.teams.is_configured() else "Teams not set"
-        self.statusBar().showMessage(
+        self._status_lbl.setText(
             f"{state}  ·  {len(self.pvs)} PV(s)  ·  every "
-            f"{self.settings['poll_interval_s']}s  ·  {teams}")
+            f"{self.settings['poll_interval_s']}s  ·  {self._channel_summary()}")
 
     def persist(self):
         save_config({
             "version": 1,
             "settings": self.settings,
             "pvs": [pv.to_dict() for pv in self.pvs],
-            "window_geometry": self.saveGeometry().toBase64().data().decode(),
         })
 
-    def _restore_geometry(self, geo):
-        if geo:
-            try:
-                from PySide6.QtCore import QByteArray
-                self.restoreGeometry(QByteArray.fromBase64(geo.encode()))
-            except Exception:
-                pass
+    def shutdown(self):
+        """Called by the main window on close; state is also saved per-change."""
+        self.timer.stop()
+        self.persist()
 
     def _selected_pv(self) -> Optional[PVConfig]:
         rows = self.table.selectionModel().selectedRows()
@@ -1074,6 +1386,7 @@ class PVMonitorWindow(QMainWindow):
             if added:
                 self.graph.refresh_combo()
                 self.persist()
+                self._update_status()
                 self._log(f"Added {added} PV(s). Edit to set/learn thresholds, "
                           "then tick 'On'.")
 
@@ -1102,6 +1415,7 @@ class PVMonitorWindow(QMainWindow):
         self.model.endResetModel()
         self.graph.refresh_combo()
         self.persist()
+        self._update_status()
         self._log(f"Removed {pv.display_name}.")
 
     def move_pv(self, delta: int):
@@ -1121,8 +1435,7 @@ class PVMonitorWindow(QMainWindow):
     def open_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.Accepted:
-            self.teams = TeamsClient(self.settings["teams_webhook_url"],
-                                     float(self.settings["http_timeout_s"]))
+            self.hub = NotificationHub.from_settings(self.settings)
             self.evaluator = AlertEvaluator(self._eval_config())
             ml = self._history_maxlen()
             for rt in self.runtime.values():
@@ -1131,14 +1444,15 @@ class PVMonitorWindow(QMainWindow):
             if self._monitoring:
                 self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
             self.persist()
-            self._update_status_bar()
+            self._update_status()
             self._log("Settings saved.")
 
     # --- monitoring loop ----------------------------------------------
     def toggle_monitoring(self, on: bool):
         self._monitoring = on
-        self.act_monitor.setChecked(on)
-        self.act_monitor.setText("⏹ Stop monitoring" if on else "▶ Start monitoring")
+        self.btn_monitor.setChecked(on)
+        self.btn_monitor.setText("⏹ Stop monitoring" if on else "▶ Start monitoring")
+        self.btn_monitor.setStyleSheet(STOP_BUTTON_STYLE if on else BUTTON_STYLE)
         if on:
             self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
             self.timer.start()
@@ -1148,7 +1462,7 @@ class PVMonitorWindow(QMainWindow):
             self.timer.stop()
             self._poll_gen += 1            # discard any in-flight result
             self._log("Monitoring stopped.")
-        self._update_status_bar()
+        self._update_status()
 
     def poll_now(self):
         self._log("Manual poll.")
@@ -1190,15 +1504,57 @@ class PVMonitorWindow(QMainWindow):
     def _dispatch_alert(self, pv: PVConfig, rt: PVRuntime, note):
         self._log(f"ALERT {pv.display_name}: {note.prev_level.label}→"
                   f"{note.level.label} ({note.reason})")
-        card = build_messagecard(
-            note.level, note.prev_level, pv.name, pv.display_name,
-            note.value, rt.current_units or pv.units, note.reason,
-            api.ns_to_prague_str(rt.last_update_ns or api.now_ns()), note.kind)
-        ok = self.teams.post(card)
-        if not ok:
-            self._log(f"  Teams send failed: {self.teams.last_error}")
-            self.statusBar().showMessage(
-                f"Teams send failed: {self.teams.last_error}", 8000)
+        payload = AlertPayload(
+            level=note.level, prev_level=note.prev_level,
+            pv_name=pv.name, display_name=pv.display_name,
+            value=note.value, units=rt.current_units or pv.units,
+            reason=note.reason,
+            timestamp_str=api.ns_to_prague_str(rt.last_update_ns or api.now_ns()),
+            kind=note.kind)
+        self._launch_alert_worker(payload, pv.thresholds(), tag="auto")
+
+    def _launch_alert_worker(self, payload: AlertPayload, thr: Thresholds, tag: str):
+        if not self.hub.is_any_configured():
+            self._log("  No notification channel configured (see Settings).")
+            if tag == "manual":
+                self.btn_sendplot.setEnabled(True)
+            return
+        hours = float(self.settings.get("alert_plot_hours", 12))
+        timeout = float(self.settings["http_timeout_s"])
+        sig = _AlertSignals(self)
+        sig.done.connect(self._on_alert_result)
+        self._alert_sig = sig
+        QThreadPool.globalInstance().start(
+            _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag))
+
+    def _on_alert_result(self, result):
+        tag, errors, had_png = result
+        for ch, err in errors.items():
+            self._log(f"  {ch} send failed: {err}")
+        if tag == "manual":
+            self.btn_sendplot.setEnabled(True)
+            if not errors:
+                extra = "" if had_png else " (no data for plot — text only)"
+                self._log(f"Plot sent.{extra}")
+
+    # --- send plot now -------------------------------------------------
+    def send_plot_now(self):
+        pv = self._selected_pv()
+        if not pv:
+            QMessageBox.information(self, "Send plot", "Select a PV first.")
+            return
+        rt = self.runtime.get(pv.name)
+        value = rt.current_value if rt and rt.current_value is not None else 0.0
+        units = (rt.current_units if rt and rt.current_units else pv.units) or ""
+        level = rt.alert.level if rt else AlertLevel.OK
+        payload = AlertPayload(
+            level=level, prev_level=level, pv_name=pv.name,
+            display_name=pv.display_name, value=value, units=units,
+            reason="Manual plot request",
+            timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="manual")
+        self.btn_sendplot.setEnabled(False)
+        self._log(f"Sending plot for {pv.display_name}…")
+        self._launch_alert_worker(payload, pv.thresholds(), tag="manual")
 
     # --- simulate ------------------------------------------------------
     def simulate_alert(self):
@@ -1250,25 +1606,3 @@ class PVMonitorWindow(QMainWindow):
             self._dispatch_alert(pv, rt, note)
         self.model.refresh_all()
         self.graph.redraw()
-
-    # --- close ---------------------------------------------------------
-    def closeEvent(self, event):
-        self.persist()
-        super().closeEvent(event)
-
-
-def main():
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.PVMonitor.1")
-    except Exception:
-        pass
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = PVMonitorWindow()
-    win.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
