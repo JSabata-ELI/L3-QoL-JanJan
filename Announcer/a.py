@@ -120,7 +120,7 @@ def _readable_pv_error(pv_name, exc):
     return f"{pv_name} — {detail}", hint
 
 
-_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry"}
+_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry", "flash_mode", "image_file"}
 
 
 class RegionSelector(tk.Toplevel):
@@ -308,6 +308,8 @@ class ScreenTracker(tk.Tk):
         self._is_flashing = False
         if hasattr(self, "_flash_overlay"):
             self._flash_overlay.place_forget()
+        if self._flash_img_label is not None:
+            self._flash_img_label.place_forget()
         self._set_ui_visible(True)
 
     def _get_icon_path(self):
@@ -328,6 +330,72 @@ class ScreenTracker(tk.Tk):
             for f in sorted(sounds_dir.glob("*.wav")):
                 options.append(f.stem)
         return options
+
+    def _images_dir(self):
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).parent
+        else:
+            base = Path(__file__).parent
+        return base / "images"
+
+    def _load_image_files(self):
+        """List stems of template images in the images/ folder (empty if none)."""
+        images_dir = self._images_dir()
+        options = []
+        if images_dir.exists():
+            for ext in ("*.png", "*.gif", "*.jpg", "*.jpeg"):
+                for f in sorted(images_dir.glob(ext)):
+                    if f.stem not in options:
+                        options.append(f.stem)
+        return options
+
+    def _image_path(self, stem):
+        """Resolve a stem to an existing image file path, or None."""
+        if not stem:
+            return None
+        images_dir = self._images_dir()
+        for ext in (".png", ".gif", ".jpg", ".jpeg"):
+            p = images_dir / f"{stem}{ext}"
+            if p.exists():
+                return p
+        return None
+
+    def _make_flash_photo(self, size, *, fade=None):
+        """Build an ImageTk.PhotoImage of the selected template scaled to `size`.
+
+        The image is composited onto the chroma background so its transparent
+        areas become click-through during the transparent HUD mode. `fade`
+        (0..1) blends the result toward the chroma color to produce a faint
+        "ghost" used for window alignment. Returns None if no image selected /
+        found or the size is degenerate.
+        """
+        from PIL import Image
+        path = self._image_path(self.image_file.get())
+        w, h = size
+        if path is None or w < 1 or h < 1:
+            return None
+        try:
+            chroma_rgb = self._chroma_rgb()
+            src = Image.open(path).convert("RGBA")
+            src = src.resize((int(w), int(h)), resample=Image.LANCZOS)
+            bg = Image.new("RGB", (int(w), int(h)), chroma_rgb)
+            bg.paste(src, (0, 0), src)
+            if fade is not None:
+                ghost = Image.new("RGB", bg.size, chroma_rgb)
+                bg = Image.blend(ghost, bg, max(0.0, min(1.0, fade)))
+            from PIL import ImageTk as _ImageTk
+            return _ImageTk.PhotoImage(bg)
+        except Exception as e:
+            self._log_message(f"Image load failed: {e}")
+            return None
+
+    def _chroma_rgb(self):
+        """Return self._chroma as an (r, g, b) tuple usable by PIL."""
+        try:
+            r, g, b = self.winfo_rgb(self._chroma)
+            return (r // 256, g // 256, b // 256)
+        except Exception:
+            return (240, 240, 240)
 
     def _build_ui(self):
         pad = dict(padx=10, pady=5)
@@ -374,49 +442,45 @@ class ScreenTracker(tk.Tk):
                                         command=self._toggle_settings_popup)
         self._settings_btn.pack(side="left", padx=(4, 0))
 
-        # Action buttons
-        self._btn_frame = ttk.Frame(self)
-        self._btn_frame.grid(row=1, column=0, sticky="w", **pad)
-        btn_frame = self._btn_frame
-
+        # Action buttons — placed on the top row, using the space right of Settings
         self._preview_popup = None
         self._preview_photo = None
-        self.btn_preview = ttk.Button(btn_frame, text="Preview region", width=16)
-        self.btn_preview.grid(row=0, column=0, padx=4)
+        self.btn_preview = ttk.Button(self._top_frame, text="Preview region", width=14)
+        self.btn_preview.pack(side="left", padx=(12, 2))
         self.btn_preview.bind("<Enter>", self._show_preview_popup)
         self.btn_preview.bind("<Leave>", lambda *_: self.after(100, self._check_hide_preview))
         self.btn_preview.bind("<Button-1>", self._toggle_preview_popup)
 
-        self.btn_reference = ttk.Button(btn_frame, text="Set reference",
-                                        command=self._select_region, width=16)
-        self.btn_reference.grid(row=0, column=1, padx=4)
+        self.btn_reference = ttk.Button(self._top_frame, text="Set reference",
+                                        command=self._select_region, width=13)
+        self.btn_reference.pack(side="left", padx=2)
 
-        self.btn_resnap = ttk.Button(btn_frame, text="↺",
+        self.btn_resnap = ttk.Button(self._top_frame, text="↺",
                                      command=self._save_reference,
                                      state="disabled", width=3)
-        self.btn_resnap.grid(row=0, column=2, padx=(0, 4))
+        self.btn_resnap.pack(side="left", padx=(2, 0))
 
-        # Presets panel
+        # Region presets — compact inline row (row 1)
         self._preset_frame = ttk.LabelFrame(self, text="Region presets")
-        self._preset_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 5))
+        self._preset_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
 
         self._preset_var = tk.StringVar()
         self._preset_combo = ttk.Combobox(self._preset_frame, textvariable=self._preset_var,
-                                           state="readonly", width=18)
-        self._preset_combo.grid(row=0, column=0, padx=(6, 4), pady=6)
+                                           state="readonly", width=20)
+        self._preset_combo.grid(row=0, column=0, padx=(6, 4), pady=4)
         self._refresh_preset_combo()
 
         ttk.Button(self._preset_frame, text="Load",
-                   command=self._load_preset, width=6).grid(row=0, column=1, padx=(0, 4), pady=6)
+                   command=self._load_preset, width=6).grid(row=0, column=1, padx=(0, 4), pady=4)
         ttk.Button(self._preset_frame, text="Save region",
-                   command=self._save_preset, width=10).grid(row=0, column=2, padx=(0, 4), pady=6)
+                   command=self._save_preset, width=10).grid(row=0, column=2, padx=(0, 4), pady=4)
         ttk.Button(self._preset_frame, text="Delete",
-                   command=self._delete_preset, width=6).grid(row=0, column=3, padx=(0, 6), pady=6)
+                   command=self._delete_preset, width=6).grid(row=0, column=3, padx=(0, 6), pady=4)
 
-        # PV alert panel (row=3) — individual badges shown only when condition
+        # PV alert panel (row=2) — individual badges shown only when condition
         # breached, laid out side by side and wrapping to new lines as needed.
         self._pv_frame = ttk.Frame(self)
-        self._pv_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 4))
+        self._pv_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
         self._pv_frame.grid_remove()
         self._pv_frame.grid_propagate(False)
         self._pv_last_width = 0
@@ -432,11 +496,11 @@ class ScreenTracker(tk.Tk):
             self._pv_alert_rows.append(row_frame)
             self._pv_alert_labels.append(lbl)
 
-        # Message log (row=4) — shows runtime messages such as PV fetch errors.
+        # Message log (row=3) — shows runtime messages such as PV fetch errors.
         # Hidden while tracking (see _set_ui_visible).
         self._log_frame = ttk.LabelFrame(self, text="Message log")
-        self._log_frame.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 8))
-        self.rowconfigure(4, weight=1)
+        self._log_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        self.rowconfigure(3, weight=1)
         self._log_frame.rowconfigure(0, weight=1)
         self._log_frame.columnconfigure(0, weight=1)
 
@@ -469,6 +533,27 @@ class ScreenTracker(tk.Tk):
         self._sound_files = self._load_sound_files()
         self._flash_color_btn = None  # created in popup
 
+        # Flash-image (template) settings
+        self.flash_mode = tk.StringVar(value="color")   # "color" | "image" | "alternate"
+        self.image_file = tk.StringVar(value="")
+        self._image_files = self._load_image_files()
+        self._flash_photo = None        # cached PhotoImage for the current flash
+        self._flash_img_label = None    # tk.Label showing the template while flashing
+        self._align_photo = None        # ghost PhotoImage during window alignment
+        self._align_label = None
+        self._align_bind = None
+        self._align_last_size = (0, 0)
+
+        # Restore saved flash settings, then persist on change.
+        saved_mode = self._presets.get("flash_mode")
+        if saved_mode in ("color", "image", "alternate"):
+            self.flash_mode.set(saved_mode)
+        saved_img = self._presets.get("image_file")
+        if saved_img in self._image_files:
+            self.image_file.set(saved_img)
+        self.flash_mode.trace_add("write", lambda *_: self._save_flash_settings())
+        self.image_file.trace_add("write", lambda *_: self._save_flash_settings())
+
     # ------------------------------------------------------------------
     # Region presets
     # ------------------------------------------------------------------
@@ -500,6 +585,11 @@ class ScreenTracker(tk.Tk):
             except tk.TclError:
                 pass
         self._presets["pv_thresholds"] = thr
+        self._save_presets_file()
+
+    def _save_flash_settings(self):
+        self._presets["flash_mode"] = self.flash_mode.get()
+        self._presets["image_file"] = self.image_file.get()
         self._save_presets_file()
 
     def _preset_names(self):
@@ -619,6 +709,35 @@ class ScreenTracker(tk.Tk):
         ttk.Spinbox(thr_frame, from_=0, to=60, increment=0.5,
                     textvariable=self.flash_duration,
                     width=6, format="%.1f").grid(row=2, column=1, padx=(0,6), pady=(0,6))
+
+        # Flash mode: full-background color, template image only, or alternating
+        self._FLASH_MODE_LABELS = {
+            "color":     "Background color",
+            "image":     "Image only",
+            "alternate": "Image + background (alternate)",
+        }
+        _mode_to_label = self._FLASH_MODE_LABELS
+        _label_to_mode = {v: k for k, v in _mode_to_label.items()}
+
+        ttk.Label(thr_frame, text="Flash mode:").grid(row=3, column=0, padx=(6,2), pady=(0,6))
+        mode_combo = ttk.Combobox(thr_frame, state="readonly", width=24,
+                                  values=list(_mode_to_label.values()))
+        mode_combo.set(_mode_to_label.get(self.flash_mode.get(), "Background color"))
+        mode_combo.grid(row=3, column=1, sticky="w", padx=(0,6), pady=(0,6))
+        mode_combo.bind("<<ComboboxSelected>>",
+                        lambda e: self.flash_mode.set(_label_to_mode.get(mode_combo.get(), "color")))
+
+        ttk.Label(thr_frame, text="Image:").grid(row=4, column=0, padx=(6,2), pady=(0,6))
+        img_combo = ttk.Combobox(thr_frame, textvariable=self.image_file,
+                                 state="readonly", width=24, values=self._image_files)
+        if self.image_file.get() in self._image_files:
+            img_combo.current(self._image_files.index(self.image_file.get()))
+        img_combo.grid(row=4, column=1, sticky="w", padx=(0,6), pady=(0,6))
+
+        ttk.Label(thr_frame,
+                  text="Align the image via \"Set location and size of this window\" below.",
+                  foreground="gray", wraplength=220, justify="left").grid(
+            row=5, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
 
         # Sound
         sound_frame = ttk.LabelFrame(frame, text="Sound")
@@ -833,22 +952,67 @@ class ScreenTracker(tk.Tk):
         self._is_flashing = True
         d = self.flash_duration.get()
         self._flash_deadline = time.time() + d if d > 0 else float("inf")
+
+        # Decide effective mode: fall back to "color" if image is requested but
+        # no usable template is available.
+        mode = self.flash_mode.get()
+        self._flash_photo = None
+        if mode in ("image", "alternate"):
+            self.update_idletasks()
+            size = (self.winfo_width(), self.winfo_height())
+            self._flash_photo = self._make_flash_photo(size)
+            if self._flash_photo is None:
+                self._log_message("Flash image not set or not found — using background color.")
+                mode = "color"
+        self._flash_active_mode = mode
+
         # Overlay frame covers the whole window — avoids ttk widget bg gaps
         if not hasattr(self, "_flash_overlay"):
             self._flash_overlay = tk.Frame(self)
         self._flash_overlay.place(x=0, y=0, relwidth=1, relheight=1)
         self._flash_overlay.lift()
+
+        if mode in ("image", "alternate"):
+            # Transparent (chroma) backdrop so only the template shows.
+            self._flash_overlay.configure(bg=self._chroma)
+            if self._flash_img_label is None or not self._flash_img_label.winfo_exists():
+                self._flash_img_label = tk.Label(self._flash_overlay, bd=0,
+                                                 highlightthickness=0, bg=self._chroma)
+            self._flash_img_label.configure(image=self._flash_photo, bg=self._chroma)
+            self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
+            self._flash_img_label.lift()
         self._do_flash()
 
     def _do_flash(self):
         if time.time() > self._flash_deadline:
             self._is_flashing = False
             self._flash_overlay.place_forget()
+            if self._flash_img_label is not None:
+                self._flash_img_label.place_forget()
             self._set_ui_visible(True)
             return
         self._flash_state = not self._flash_state
-        color = self.flash_color.get() if self._flash_state else "#440000"
-        self._flash_overlay.configure(bg=color)
+        mode = getattr(self, "_flash_active_mode", "color")
+        if mode == "image":
+            # Only the template blinks; surroundings stay transparent (chroma).
+            self._flash_overlay.configure(bg=self._chroma)
+            if self._flash_state:
+                self._flash_img_label.lift()
+                self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
+            else:
+                self._flash_img_label.place_forget()
+        elif mode == "alternate":
+            # Seesaw: image, then the rest of the surface, never both at once.
+            if self._flash_state:
+                self._flash_overlay.configure(bg=self._chroma)
+                self._flash_img_label.lift()
+                self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
+            else:
+                self._flash_img_label.place_forget()
+                self._flash_overlay.configure(bg=self.flash_color.get())
+        else:
+            color = self.flash_color.get() if self._flash_state else "#440000"
+            self._flash_overlay.configure(bg=color)
         self._flash_job = self.after(FLASH_INTERVAL_MS, self._do_flash)
 
     def _play_sound(self):
@@ -874,6 +1038,8 @@ class ScreenTracker(tk.Tk):
         self._is_flashing = False
         if hasattr(self, "_flash_overlay"):
             self._flash_overlay.place_forget()
+        if self._flash_img_label is not None:
+            self._flash_img_label.place_forget()
         self.changed = False
         self.tracking = False
         self.status_var.set("Ready.")
@@ -894,7 +1060,9 @@ class ScreenTracker(tk.Tk):
         if visible:
             self._mon_frame.pack(side="left", before=self._canvas_circle)
             self._settings_btn.pack(side="left", padx=(4, 0))
-            self._btn_frame.grid()
+            self.btn_preview.pack(side="left", padx=(12, 2))
+            self.btn_reference.pack(side="left", padx=2)
+            self.btn_resnap.pack(side="left", padx=(2, 0))
             self._preset_frame.grid()
             self._log_frame.grid()
             self._set_transparent(False)
@@ -902,7 +1070,9 @@ class ScreenTracker(tk.Tk):
             self._geom_before_hide = self.geometry()
             self._mon_frame.pack_forget()
             self._settings_btn.pack_forget()
-            self._btn_frame.grid_remove()
+            self.btn_preview.pack_forget()
+            self.btn_reference.pack_forget()
+            self.btn_resnap.pack_forget()
             self._preset_frame.grid_remove()
             self._log_frame.grid_remove()
             self._set_transparent(True)
@@ -1030,16 +1200,51 @@ class ScreenTracker(tk.Tk):
             ttk.Label(scope_frame, text="(select a preset to enable preset-only save)",
                       foreground="gray").pack(anchor="w", padx=8, pady=(0, 4))
 
+        # Optional: snap the window to the template's native pixel size so the
+        # flashing image matches the captured object 1:1 on the monitor.
+        img_path = self._image_path(self.image_file.get())
+        if self.flash_mode.get() in ("image", "alternate") and img_path is not None:
+            def fit_native():
+                try:
+                    from PIL import Image
+                    iw, ih = Image.open(img_path).size
+                except Exception as e:
+                    self._log_message(f"Image size read failed: {e}")
+                    return
+                self.geometry(f"{iw}x{ih}")
+                self.update_idletasks()
+                self._refresh_align_ghost()
+            fit_frame = ttk.Frame(rec_win)
+            fit_frame.pack(padx=12, pady=(0, 8), fill="x")
+            ttk.Button(fit_frame, text="Fit window to image (1:1 pixels)",
+                       command=fit_native).pack(fill="x")
+            ttk.Label(fit_frame,
+                      text="Sets the window to the image's captured pixel size, then just drag to position.",
+                      foreground="gray", wraplength=300, justify="left").pack(anchor="w", pady=(2, 0))
+
         btn_frame = ttk.Frame(rec_win)
         btn_frame.pack(pady=(0, 12))
 
+        # Show a faded ghost of the template so the window can be aligned over
+        # the real object on the monitor (only in image / alternate modes).
+        self._start_align_ghost()
+
         def on_done():
-            geom = self.geometry()
+            # Save the CLIENT origin (not the decorated frame origin): during the
+            # actual flash the window is borderless (overrideredirect), so its
+            # client area must land where the ghost was aligned here.
+            geom = f"{self.winfo_width()}x{self.winfo_height()}+{self.winfo_rootx()}+{self.winfo_rooty()}"
+            self._stop_align_ghost()
             self._save_window_geometry(geom, scope_var.get(), current_preset)
             rec_win.destroy()
 
+        def on_cancel():
+            self._stop_align_ghost()
+            rec_win.destroy()
+
         ttk.Button(btn_frame, text="DONE", command=on_done, width=10).pack(side="left", padx=(0, 8))
-        ttk.Button(btn_frame, text="Cancel", command=rec_win.destroy, width=10).pack(side="left")
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side="left")
+        rec_win.protocol("WM_DELETE_WINDOW", on_cancel)
 
         self.update_idletasks()
         rec_win.update_idletasks()
@@ -1047,6 +1252,57 @@ class ScreenTracker(tk.Tk):
         ry = self.winfo_rooty()
         rw = self.winfo_width()
         rec_win.geometry(f"+{rx + rw + 10}+{ry}")
+
+    def _start_align_ghost(self):
+        """During window recording, overlay a faint template ghost that rescales
+        with the window so the user can align it over the monitor object."""
+        if self.flash_mode.get() not in ("image", "alternate"):
+            return
+        if self._image_path(self.image_file.get()) is None:
+            self._log_message("No template image selected to align.")
+            return
+        try:
+            self.attributes("-alpha", 0.5)   # see the desktop through the window
+        except Exception:
+            pass
+        if self._align_label is None or not self._align_label.winfo_exists():
+            self._align_label = tk.Label(self, bd=0, highlightthickness=0, bg=self._chroma)
+        self._align_last_size = (0, 0)
+        self._align_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self._align_label.lift()
+        self._align_bind = self.bind("<Configure>", self._on_align_configure, "+")
+        self.after(50, self._refresh_align_ghost)
+
+    def _on_align_configure(self, event):
+        if event.widget is self:
+            self._refresh_align_ghost()
+
+    def _refresh_align_ghost(self):
+        if self._align_label is None or not self._align_label.winfo_exists():
+            return
+        size = (self.winfo_width(), self.winfo_height())
+        if size == self._align_last_size:
+            return
+        self._align_last_size = size
+        self._align_photo = self._make_flash_photo(size, fade=0.5)
+        if self._align_photo is not None:
+            self._align_label.configure(image=self._align_photo)
+            self._align_label.lift()
+
+    def _stop_align_ghost(self):
+        if self._align_bind is not None:
+            try:
+                self.unbind("<Configure>", self._align_bind)
+            except Exception:
+                pass
+            self._align_bind = None
+        if self._align_label is not None:
+            self._align_label.place_forget()
+        self._align_photo = None
+        try:
+            self.attributes("-alpha", 1.0)
+        except Exception:
+            pass
 
     def _save_window_geometry(self, geom, scope, preset_name):
         if scope == "global":

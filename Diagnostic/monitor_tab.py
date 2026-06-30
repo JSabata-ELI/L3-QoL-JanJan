@@ -51,15 +51,15 @@ from alerting import (
 
 BUTTON_STYLE = """
 QPushButton {
-    background: #3a7bd5;
+    background: #1565C0;
     color: white;
     border: none;
     border-radius: 4px;
     padding: 6px 14px;
     font-weight: bold;
 }
-QPushButton:hover { background: #2f6bbf; }
-QPushButton:disabled { background: #555; color: #888; }
+QPushButton:hover { background: #0D47A1; }
+QPushButton:disabled { background: #bbb; color: #888; }
 """
 
 STOP_BUTTON_STYLE = """
@@ -72,26 +72,27 @@ QPushButton {
     font-weight: bold;
 }
 QPushButton:hover { background: #a93226; }
-QPushButton:disabled { background: #555; color: #888; }
+QPushButton:disabled { background: #bbb; color: #888; }
 """
 
 SECONDARY_STYLE = """
 QPushButton {
-    background: #444;
-    color: #ddd;
-    border: 1px solid #555;
+    background: #e8e8e8;
+    color: #111;
+    border: 1px solid #bbb;
     border-radius: 4px;
     padding: 5px 12px;
 }
-QPushButton:hover { background: #555; }
+QPushButton:hover { background: #d8e8ff; }
 """
 
 LOG_STYLE = """
 QPlainTextEdit {
-    background: #1e1e1e;
-    color: #d4d4d4;
+    background: #ffffff;
+    color: #222;
     font-family: Consolas, monospace;
     font-size: 11px;
+    border: 1px solid #ccc;
 }
 """
 
@@ -203,6 +204,10 @@ DEFAULT_SETTINGS = {
     "webex_webhook_url": "",
     "webex_bot_token": "",
     "webex_room_id": "",
+    # webex two-way commands (bot mode only)
+    "webex_commands_enabled": True,
+    "webex_command_poll_s": 7,
+    "webex_command_allowlist": [],   # sender emails allowed; empty = anyone in room
 }
 
 
@@ -895,6 +900,19 @@ class SettingsDialog(QDialog):
         bw.setStyleSheet(_BTN_PRIMARY)
         bw.clicked.connect(self._test_webex)
         wf.addRow("", bw)
+
+        self.webex_cmds = QCheckBox("Accept commands from Webex (bot mode only)")
+        self.webex_cmds.setStyleSheet(_CHK_STYLE)
+        self.webex_cmds.setChecked(bool(s.get("webex_commands_enabled", True)))
+        wf.addRow("", self.webex_cmds)
+        self.webex_cmd_poll = QSpinBox()
+        self.webex_cmd_poll.setRange(3, 120)
+        self.webex_cmd_poll.setValue(int(s.get("webex_command_poll_s", 7)))
+        wf.addRow("Command poll (s)", self.webex_cmd_poll)
+        self.webex_allow = QLineEdit("; ".join(s.get("webex_command_allowlist", [])))
+        self.webex_allow.setPlaceholderText("allowed sender e-mails, empty = anyone in room")
+        wf.addRow("Command allowlist", self.webex_allow)
+
         lay.addWidget(webex)
         self._update_webex_fields(self.webex_mode.currentText())
 
@@ -1011,6 +1029,9 @@ class SettingsDialog(QDialog):
         s["webex_webhook_url"] = self.webex_url.text().strip()
         s["webex_bot_token"] = self.webex_token.text().strip()
         s["webex_room_id"] = self.webex_room.text().strip()
+        s["webex_commands_enabled"] = self.webex_cmds.isChecked()
+        s["webex_command_poll_s"] = self.webex_cmd_poll.value()
+        s["webex_command_allowlist"] = _parse_recipients(self.webex_allow.text())
         # monitoring
         s["poll_interval_s"] = self.poll.value()
         s["avg_last_n"] = self.avg_n.value()
@@ -1090,6 +1111,7 @@ class GraphPanel(QWidget):
     def __init__(self, win: "MonitorWidget"):
         super().__init__()
         self._win = win
+        self._yaxis: Optional[tuple] = None   # (lo, hi) fixed Y range, or None=auto
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
 
@@ -1105,6 +1127,22 @@ class GraphPanel(QWidget):
         self.canvas = FigureCanvas(self.fig)
         lay.addWidget(NavToolbar(self.canvas, self))
         lay.addWidget(self.canvas, 1)
+
+    def set_yaxis(self, lo, hi):
+        """Fix the Y range (lo, hi), or pass (None, None) to restore autoscale."""
+        self._yaxis = None if lo is None or hi is None else (float(lo), float(hi))
+        self.redraw()
+
+    def select_pv(self, name_or_all: Optional[str]):
+        """Set the combo to a PV name (or None for 'All PVs'). Returns True if found."""
+        if name_or_all is None:
+            self.combo.setCurrentIndex(0)
+            return True
+        idx = self.combo.findData(name_or_all)
+        if idx >= 0:
+            self.combo.setCurrentIndex(idx)
+            return True
+        return False
 
     def refresh_combo(self):
         cur = self.combo.currentText()
@@ -1161,6 +1199,8 @@ class GraphPanel(QWidget):
                 self.ax.set_xlim(xmin, xmax)
             except Exception:
                 pass
+        if self._yaxis is not None:
+            self.ax.set_ylim(*self._yaxis)
         self.fig.autofmt_xdate()
         self.fig.tight_layout()
         self.canvas.draw_idle()
@@ -1200,6 +1240,47 @@ class _AlertWorker(QRunnable):
 
 
 # ---------------------------------------------------------------------------
+# Webex two-way command workers (bot mode only)
+# ---------------------------------------------------------------------------
+
+class _CmdPollSignals(QObject):
+    done = Signal(object)   # (new_items_oldest_first, newest_id_or_None)
+
+
+class _CmdPollWorker(QRunnable):
+    """Fetch room messages and return only those newer than last_id (oldest-first)."""
+
+    def __init__(self, sig: _CmdPollSignals, webex, last_id):
+        super().__init__()
+        self._sig = sig
+        self._webex = webex
+        self._last_id = last_id
+
+    def run(self):
+        items = self._webex.fetch_messages(20)   # newest first
+        newest_id = items[0]["id"] if items else None
+        new = []
+        for it in items:
+            if it.get("id") == self._last_id:
+                break
+            new.append(it)
+        new.reverse()   # oldest-first execution order
+        _safe_emit(self._sig.done.emit, (new, newest_id))
+
+
+class _TextReplyWorker(QRunnable):
+    """Fire-and-forget markdown reply into the Webex room."""
+
+    def __init__(self, webex, markdown: str):
+        super().__init__()
+        self._webex = webex
+        self._markdown = markdown
+
+    def run(self):
+        self._webex.post_text(self._markdown)
+
+
+# ---------------------------------------------------------------------------
 # Monitor tab widget
 # ---------------------------------------------------------------------------
 
@@ -1215,6 +1296,9 @@ class MonitorWidget(QWidget):
         self._poll_gen = 0
         self._monitoring = False
         self._sim_timer: Optional[QTimer] = None
+        self._cmd_timer: Optional[QTimer] = None
+        self._cmd_last_id = None
+        self._cmd_primed = False
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -1222,6 +1306,7 @@ class MonitorWidget(QWidget):
 
         self._build_ui()
         self._prefetch_channels()
+        self._start_cmd_listener()
 
         if self.settings.get("start_monitoring_on_launch"):
             self.toggle_monitoring(True)
@@ -1278,7 +1363,7 @@ class MonitorWidget(QWidget):
 
         btn_row.addStretch()
         self._status_lbl = QLabel("")
-        self._status_lbl.setStyleSheet("color:#aaa;")
+        self._status_lbl.setStyleSheet("color:#555;")
         btn_row.addWidget(self._status_lbl)
         root.addLayout(btn_row)
 
@@ -1344,6 +1429,7 @@ class MonitorWidget(QWidget):
     def shutdown(self):
         """Called by the main window on close; state is also saved per-change."""
         self.timer.stop()
+        self._stop_cmd_listener()
         self.persist()
 
     def _selected_pv(self) -> Optional[PVConfig]:
@@ -1443,6 +1529,7 @@ class MonitorWidget(QWidget):
                     rt.history = deque(rt.history, maxlen=ml)
             if self._monitoring:
                 self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
+            self._start_cmd_listener()
             self.persist()
             self._update_status()
             self._log("Settings saved.")
@@ -1538,11 +1625,7 @@ class MonitorWidget(QWidget):
                 self._log(f"Plot sent.{extra}")
 
     # --- send plot now -------------------------------------------------
-    def send_plot_now(self):
-        pv = self._selected_pv()
-        if not pv:
-            QMessageBox.information(self, "Send plot", "Select a PV first.")
-            return
+    def _send_plot_for(self, pv: PVConfig, tag: str):
         rt = self.runtime.get(pv.name)
         value = rt.current_value if rt and rt.current_value is not None else 0.0
         units = (rt.current_units if rt and rt.current_units else pv.units) or ""
@@ -1552,9 +1635,191 @@ class MonitorWidget(QWidget):
             display_name=pv.display_name, value=value, units=units,
             reason="Manual plot request",
             timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="manual")
+        self._launch_alert_worker(payload, pv.thresholds(), tag=tag)
+
+    def send_plot_now(self):
+        pv = self._selected_pv()
+        if not pv:
+            QMessageBox.information(self, "Send plot", "Select a PV first.")
+            return
         self.btn_sendplot.setEnabled(False)
         self._log(f"Sending plot for {pv.display_name}…")
-        self._launch_alert_worker(payload, pv.thresholds(), tag="manual")
+        self._send_plot_for(pv, tag="manual")
+
+    # --- Webex two-way command listener -------------------------------
+    def _start_cmd_listener(self):
+        self._stop_cmd_listener()
+        if not (self.settings.get("webex_commands_enabled")
+                and self.hub.webex.can_listen()):
+            return
+        self._cmd_primed = False
+        self._cmd_last_id = None
+        poll_s = max(3, int(self.settings.get("webex_command_poll_s", 7)))
+        self._cmd_timer = QTimer(self)
+        self._cmd_timer.timeout.connect(self._poll_commands)
+        self._cmd_timer.setInterval(poll_s * 1000)
+        self._cmd_timer.start()
+        self._poll_commands()
+        self._log(f"Webex command listener on (every {poll_s}s).")
+
+    def _stop_cmd_listener(self):
+        if self._cmd_timer is not None:
+            self._cmd_timer.stop()
+            self._cmd_timer = None
+
+    def _poll_commands(self):
+        if not self.hub.webex.can_listen():
+            return
+        sig = _CmdPollSignals(self)
+        sig.done.connect(self._on_commands)
+        self._cmd_sig = sig
+        QThreadPool.globalInstance().start(
+            _CmdPollWorker(sig, self.hub.webex, self._cmd_last_id))
+
+    def _on_commands(self, result):
+        new_items, newest_id = result
+        if newest_id:
+            self._cmd_last_id = newest_id
+        if not self._cmd_primed:
+            self._cmd_primed = True   # don't replay backlog on the first poll
+            return
+        allow = [e.lower() for e in self.settings.get("webex_command_allowlist", [])]
+        for it in new_items:
+            text = (it.get("text") or "").strip()
+            if "/" not in text:
+                continue
+            if not text.startswith("/"):
+                text = text[text.index("/"):]   # strip a leading @mention
+            email = (it.get("personEmail") or "").lower()
+            if allow and email not in allow:
+                self._reply(f"⛔ Sorry, {email} is not allowed to command me.")
+                continue
+            self._handle_command(text, email)
+
+    def _reply(self, markdown: str):
+        first = markdown.splitlines()[0] if markdown else ""
+        self._log(f"→ Webex: {first}")
+        if self.hub.webex.can_listen():
+            QThreadPool.globalInstance().start(
+                _TextReplyWorker(self.hub.webex, markdown))
+
+    def _find_pv(self, query: str):
+        """Return (pv, '') on a unique match, else (None, reason)."""
+        q = query.strip().lower()
+        if not q:
+            return None, "missing PV name"
+        exact = [p for p in self.pvs
+                 if p.display_name.lower() == q or p.name.lower() == q]
+        if exact:
+            return exact[0], ""
+        matches = [p for p in self.pvs
+                   if q in p.display_name.lower() or q in p.name.lower()]
+        if len(matches) == 1:
+            return matches[0], ""
+        if not matches:
+            return None, f"no PV matches '{query}'"
+        names = ", ".join(p.display_name for p in matches[:8])
+        return None, f"'{query}' is ambiguous: {names}"
+
+    def _handle_command(self, text: str, email: str):
+        parts = text.split()
+        cmd = parts[0].lower()
+        args = parts[1:]
+        self._log(f"Webex cmd from {email}: {text}")
+        try:
+            if cmd in ("/help", "/?"):
+                self._reply(self._cmd_help())
+            elif cmd == "/list":
+                if not self.pvs:
+                    self._reply("No PVs configured.")
+                else:
+                    self._reply("**PVs:**\n" + "\n".join(
+                        f"- {p.display_name}" for p in self.pvs))
+            elif cmd == "/status":
+                self._reply(self._cmd_status())
+            elif cmd == "/start":
+                self.toggle_monitoring(True)
+                self._reply("▶ Monitoring started.")
+            elif cmd == "/stop":
+                self.toggle_monitoring(False)
+                self._reply("⏹ Monitoring stopped.")
+            elif cmd == "/window":
+                mins = int(float(args[0]))
+                self.settings["graph_window_minutes"] = mins
+                self.graph.redraw()
+                self.persist()
+                self._reply(f"Graph window set to {mins} min.")
+            elif cmd == "/yaxis":
+                if args and args[0].lower() == "auto":
+                    self.graph.set_yaxis(None, None)
+                    self._reply("Y axis: autoscale.")
+                else:
+                    lo, hi = float(args[0]), float(args[1])
+                    self.graph.set_yaxis(lo, hi)
+                    self._reply(f"Y axis set to [{lo:g}, {hi:g}].")
+            elif cmd == "/graph":
+                target = " ".join(args).strip()
+                if target.lower() in ("all", ""):
+                    self.graph.select_pv(None)
+                    self._reply("Graph: all PVs.")
+                else:
+                    pv, err = self._find_pv(target)
+                    if not pv:
+                        self._reply(f"⚠ {err}")
+                    else:
+                        self.graph.select_pv(pv.name)
+                        self._reply(f"Graph: {pv.display_name}.")
+            elif cmd == "/plot":
+                pv, err = self._find_pv(" ".join(args))
+                if not pv:
+                    self._reply(f"⚠ {err}")
+                else:
+                    self._send_plot_for(pv, tag="cmd")
+                    self._reply(f"📈 Sending plot for {pv.display_name}…")
+            elif cmd in ("/enable", "/disable"):
+                pv, err = self._find_pv(" ".join(args))
+                if not pv:
+                    self._reply(f"⚠ {err}")
+                else:
+                    pv.enabled = (cmd == "/enable")
+                    self.model.refresh_all()
+                    self.persist()
+                    self._reply(f"{pv.display_name} alerting "
+                                f"{'enabled' if pv.enabled else 'disabled'}.")
+            else:
+                self._reply(f"❓ Unknown command {cmd}. Try /help.")
+        except (IndexError, ValueError):
+            self._reply(f"⚠ Bad arguments for {cmd}. Try /help.")
+
+    def _cmd_help(self) -> str:
+        return (
+            "**PV Monitor commands:**\n"
+            "- `/status` — all PVs + values + state\n"
+            "- `/list` — list configured PVs\n"
+            "- `/plot <pv>` — send current plot of a PV\n"
+            "- `/start` `/stop` — monitoring on/off\n"
+            "- `/enable <pv>` `/disable <pv>` — alerting per PV\n"
+            "- `/graph <pv|all>` — set the live graph\n"
+            "- `/window <minutes>` — graph time window\n"
+            "- `/yaxis <lo> <hi>` | `/yaxis auto` — graph Y range")
+
+    def _cmd_status(self) -> str:
+        if not self.pvs:
+            return "No PVs configured."
+        lines = []
+        for p in self.pvs:
+            rt = self.runtime.get(p.name)
+            val = _fmt(rt.current_value) if rt else "–"
+            units = (rt.current_units if rt and rt.current_units else p.units) or ""
+            if not p.enabled:
+                state = "off"
+            elif rt and rt.display_level() is not None:
+                state = rt.display_level().label.lower()
+            else:
+                state = "no data"
+            lines.append(f"- **{p.display_name}**: {val} {units} [{state}]")
+        mon = "MONITORING" if self._monitoring else "stopped"
+        return f"**Status ({mon}):**\n" + "\n".join(lines)
 
     # --- simulate ------------------------------------------------------
     def simulate_alert(self):

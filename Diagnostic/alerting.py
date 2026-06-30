@@ -452,6 +452,7 @@ class EmailNotifier:
 # ---------------------------------------------------------------------------
 
 WEBEX_MESSAGES_URL = "https://webexapis.com/v1/messages"
+WEBEX_ME_URL = "https://webexapis.com/v1/people/me"
 
 
 class WebexNotifier:
@@ -522,6 +523,74 @@ class WebexNotifier:
             value=0.0, units="", reason="Webex test message",
             timestamp_str="now", kind="manual")
         return self.send(payload)
+
+    # --- two-way (bot mode only): read commands + reply -------------------
+
+    def can_listen(self) -> bool:
+        """Reading messages needs a bot token + room (webhooks can't read)."""
+        return bool(self.mode == "bot" and self.bot_token and self.room_id)
+
+    def _bot_headers(self) -> dict:
+        return {"Authorization": f"Bearer {_resolve_secret(self.bot_token)}"}
+
+    def get_me_id(self) -> Optional[str]:
+        """Return the bot's own personId (to skip its own messages). None on error."""
+        if not self.can_listen():
+            return None
+        try:
+            resp = requests.get(WEBEX_ME_URL, headers=self._bot_headers(),
+                                timeout=self.timeout)
+            if 200 <= resp.status_code < 300:
+                self.last_error = ""
+                return resp.json().get("id")
+            self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:  # noqa: BLE001
+            self.last_error = str(e)
+        return None
+
+    def fetch_messages(self, max_count: int = 20) -> list[dict]:
+        """Return recent messages in the room (newest first). [] on error.
+
+        Direct (1:1) spaces: a bot sees all messages. Group spaces: a bot may
+        only read messages that @mention it, and the API returns 403 unless
+        ``mentionedPeople=me`` is set — so we retry with that filter on a 403.
+        """
+        if not self.can_listen():
+            return []
+        params = {"roomId": self.room_id, "max": max_count}
+        try:
+            resp = requests.get(WEBEX_MESSAGES_URL, headers=self._bot_headers(),
+                                params=params, timeout=self.timeout)
+            if resp.status_code == 403:
+                resp = requests.get(
+                    WEBEX_MESSAGES_URL, headers=self._bot_headers(),
+                    params={**params, "mentionedPeople": "me"}, timeout=self.timeout)
+            if 200 <= resp.status_code < 300:
+                self.last_error = ""
+                return resp.json().get("items", [])
+            self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except Exception as e:  # noqa: BLE001
+            self.last_error = str(e)
+        return []
+
+    def post_text(self, markdown: str) -> bool:
+        """Post a plain markdown reply into the room (bot mode)."""
+        if not self.can_listen():
+            self.last_error = "Webex bot not configured"
+            return False
+        try:
+            resp = requests.post(
+                WEBEX_MESSAGES_URL, headers=self._bot_headers(),
+                json={"roomId": self.room_id, "markdown": markdown},
+                timeout=self.timeout)
+            if 200 <= resp.status_code < 300:
+                self.last_error = ""
+                return True
+            self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return False
+        except Exception as e:  # noqa: BLE001
+            self.last_error = str(e)
+            return False
 
 
 # ---------------------------------------------------------------------------

@@ -841,7 +841,27 @@ def _read_img_max_value_cached(path: Path) -> float | None:
     return val
 
 # ---------------- BRIGHTNESS ----------------
-def _autostretch_gray(img: QImage, p_low: float = 0.1, p_high: float = 99.9) -> QImage:
+def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
+    """Percentile contrast stretch on a full-precision float array → uint8.
+
+    Used for auto-stretch so weak images are stretched from their REAL data range
+    (before any lossy 8-bit conversion). Clipping a small fraction at the top end
+    means a few hot/saturated pixels can't dominate the scale and crush the rest of
+    the frame to black. Falls back to min/max if the percentile window is degenerate,
+    then to a flat black image only if the data is truly uniform.
+    """
+    if arr_f.size == 0:
+        return np.zeros(arr_f.shape, dtype=np.uint8)
+    lo = float(np.percentile(arr_f, p_low))
+    hi = float(np.percentile(arr_f, p_high))
+    if hi <= lo:
+        lo, hi = float(arr_f.min()), float(arr_f.max())
+    if hi <= lo:
+        return np.zeros(arr_f.shape, dtype=np.uint8)
+    return np.clip((arr_f - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+
+def _autostretch_gray(img: QImage, p_low: float = 0.5, p_high: float = 99.5) -> QImage:
     if img.isNull():
         return img
     if img.format() != QImage.Format.Format_Grayscale8:
@@ -855,6 +875,11 @@ def _autostretch_gray(img: QImage, p_low: float = 0.1, p_high: float = 99.9) -> 
     arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, img.bytesPerLine())[:, :w]
     lo, hi = np.quantile(arr, [p_low / 100.0, p_high / 100.0])
     if hi <= lo + 2:
+        # Degenerate percentile window (dim image with sparse bright content):
+        # fall back to the real min/max so we still use the full available range
+        # instead of returning a black image unchanged.
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo:
         return img
     stretched = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
     out = QImage(stretched.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
@@ -890,6 +915,10 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
     if img.isNull():
         return QImage()
 
+    # True once a full-precision percentile stretch has already been applied to 16-bit
+    # data, so the 8-bit _autostretch_gray pass below is skipped (would be redundant).
+    did_autostretch = False
+
     # "Default" = show original colors, skip grayscale conversion.
     # All other palettes convert to grayscale first (needed for LUT mapping).
     if gradient_id == GRADIENT_ID_DEFAULT:
@@ -905,7 +934,14 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             if img_max_val is not None and arr_px_max > 0:
                 # Matlab: img = imgMaxValue * img / max(img), then imagesc([0, 65535])
                 arr_f = img_max_val * arr_f / arr_px_max
-            arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
+                arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
+            elif arr_px_max > 0:
+                # No imgMaxValue metadata: fall back to per-frame max normalization so
+                # dim 16-bit frames still display instead of appearing black. This
+                # matches the metadata path (which also stretches each frame to its max).
+                arr8 = np.clip(arr_f / arr_px_max * 255.0, 0, 255).astype(np.uint8)
+            else:
+                arr8 = np.zeros(arr_f.shape, dtype=np.uint8)
             img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
         # Apply subtraction if requested (requires grayscale)
         if ref_image is not None and img.format() != QImage.Format.Format_Grayscale8:
@@ -942,11 +978,24 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
                 ptr.setsize(img.sizeInBytes())
             arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
             arr_f = arr16.astype(np.float32)
-            img_max_val = _read_img_max_value_cached(path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-            arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
+            if brighten and ref_image is None:
+                # Auto-stretch: percentile-stretch the FULL-PRECISION 16-bit data so weak
+                # frames are revealed and a few hot pixels can't crush the rest to black.
+                # Done here (not on the 8-bit result) because the per-frame-max path below
+                # would otherwise lose the dim content before _autostretch_gray can see it.
+                arr8 = _stretch_arr_f(arr_f)
+                did_autostretch = True
+            else:
+                img_max_val = _read_img_max_value_cached(path)
+                arr_px_max = float(arr_f.max())
+                if img_max_val is not None and arr_px_max > 0:
+                    arr_f = img_max_val * arr_f / arr_px_max
+                    arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
+                elif arr_px_max > 0:
+                    # No imgMaxValue metadata: per-frame max normalization (see DEFAULT branch).
+                    arr8 = np.clip(arr_f / arr_px_max * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    arr8 = np.zeros(arr_f.shape, dtype=np.uint8)
             img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
         else:
             img = img.convertToFormat(QImage.Format.Format_Grayscale8)
@@ -975,7 +1024,7 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
         img = QImage(diff.tobytes(), img.width(), img.height(),
                      img.width(), QImage.Format.Format_Grayscale8)
 
-    if brighten and ref_image is None:
+    if brighten and ref_image is None and not did_autostretch:
         img = _autostretch_gray(img)
 
     if brightness_offset != 0:
@@ -8024,20 +8073,27 @@ class Viewer(QWidget):
         self.lbl_prague_time    = QLabel("Prague Time: —")
         self.lbl_ref_status     = QLabel("")
         self.lbl_scan_progress  = QLabel("")
+        self.lbl_meta_status    = QLabel("")
         for lbl in [self.lbl_index, self.lbl_selected_range, self.lbl_filename,
                     self.lbl_axis_time, self.lbl_prague_time, self.lbl_ref_status,
-                    self.lbl_scan_progress]:
+                    self.lbl_scan_progress, self.lbl_meta_status]:
             lbl.setWordWrap(True)
             lbl.setStyleSheet(info_style)
         from PySide6.QtCore import Qt as _Qt2
         self.lbl_scan_progress.setTextFormat(_Qt2.TextFormat.RichText)
+        # Warning style for the metadata-status note (no imgMaxValue → auto-normalized)
+        self.lbl_meta_status.setStyleSheet("font-size: 10px; color: #b36b00; padding: 1px 0;")
+        self.lbl_meta_status.setToolTip(
+            "This image has no imgMaxValue metadata. It is auto-normalized to its own "
+            "peak pixel for display, so absolute brightness is not comparable between frames.")
 
         # Auto-hide labels when their text is empty so the INFO panel has no blank lines.
         import types as _types
         def _auto_setText(lbl_self, text):
             QLabel.setText(lbl_self, text)
             lbl_self.setVisible(bool(text.strip()))
-        for _lbl in (self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress):
+        for _lbl in (self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress,
+                     self.lbl_meta_status):
             _lbl.setText = _types.MethodType(_auto_setText, _lbl)
 
         self.lbl_ref_status.setStyleSheet("font-size: 10px; color: #666; padding: 1px 0;")
@@ -8170,7 +8226,8 @@ class Viewer(QWidget):
         _idx_range_row.addWidget(self.lbl_index)
         _idx_range_row.addWidget(self.lbl_selected_range, 1)
         ilay.addLayout(_idx_range_row)
-        for lbl in [self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress]:
+        for lbl in [self.lbl_filename, self.lbl_meta_status, self.lbl_ref_status,
+                    self.lbl_scan_progress]:
             lbl.setVisible(bool(lbl.text()))
             ilay.addWidget(lbl)
         ilay.addWidget(self.prog)
@@ -8669,6 +8726,16 @@ class Viewer(QWidget):
     def _is_multi_cam(self) -> bool:
         return len(self._cam_names) > 1
 
+    def _cam_enhance_on(self, cam_i: int) -> bool:
+        """In multi-cam, auto-stretch / brightness-offset apply only to the SELECTED
+        camera(s). If no camera is selected, they apply to all (backward-compatible
+        global behaviour)."""
+        try:
+            sel = self._multi_grid.selected_cam_indices()
+        except Exception:
+            sel = []
+        return (not sel) or (cam_i in sel)
+
     def _on_multicam_selected(self, idx: int):
         """Kamera v gridu byla vybrána kliknutím."""
         if self._focus_mode:
@@ -8708,6 +8775,13 @@ class Viewer(QWidget):
             self.cb_circle.blockSignals(False)
             self.cb_square.blockSignals(False)
             self._refresh_draw_btns()
+
+        # Auto-stretch / brightness apply only to selected camera(s): selection just
+        # changed, so re-render to stretch the newly-selected and un-stretch the rest.
+        if (self.cb_bright.isChecked() or self._brightness_offset != 0) \
+                and self._is_multi_cam() and self.current_idx is not None:
+            self._cam_caches = [PixCache(80) for _ in self._cam_caches]
+            self._display_multicam_index(self.current_idx, update_slider=False)
 
         if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
                 and hasattr(self, '_run_spatial_contrast')):
@@ -8933,14 +9007,17 @@ class Viewer(QWidget):
 
         n_cams = len(self._cam_items)
         max_side = 400 if n_cams >= 3 else (500 if n_cams == 2 else self._scrub_side)
-        brighten    = 1 if self.cb_bright.isChecked() else 0
+        # Auto-stretch / brightness only on the selected camera(s)
+        enh         = self._cam_enhance_on(cam_idx)
+        brighten    = (1 if self.cb_bright.isChecked() else 0) if enh else 0
+        boff        = self._brightness_offset if enh else 0
         gradient_id = self.gradient_cb.currentIndex()
         subtract    = self.cb_subtract.isChecked()
         ref = self._cam_ref_images[cam_idx] if (subtract and cam_idx < len(self._cam_ref_images)) else None
         sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
 
         cache = self._cam_caches[cam_idx]
-        key   = (cam_idx_f, max_side, brighten, gradient_id, self._brightness_offset,
+        key   = (cam_idx_f, max_side, brighten, gradient_id, boff,
                  id(ref) if ref is not None else None, sub_thr)
         cached = cache.get(key)
         if cached is not None and not cached.isNull():
@@ -8956,7 +9033,7 @@ class Viewer(QWidget):
         # this camera isn't already loading one. Intermediate frames are skipped so the
         # display tracks real time instead of replaying a growing backlog.
         self._cam_want[cam_idx] = (cam_idx_f, it.path, max_side, brighten,
-                                   gradient_id, ref, sub_thr)
+                                   gradient_id, ref, sub_thr, boff)
         if not self._cam_busy[cam_idx]:
             self._start_cam_load(cam_idx)
 
@@ -8967,13 +9044,13 @@ class Viewer(QWidget):
             return
         self._cam_want[cam_idx] = None
         self._cam_busy[cam_idx] = True
-        cam_idx_f, path, max_side, brighten, gradient_id, ref, sub_thr = want
+        cam_idx_f, path, max_side, brighten, gradient_id, ref, sub_thr, boff = want
         pool = self._cam_pools[cam_idx]
         sig  = self._cam_signals[cam_idx]
         pool.start(LoadTask(
             self._gen, 0, cam_idx_f,
             path, max_side, brighten, gradient_id,
-            sig, self._brightness_offset, ref, sub_thr))
+            sig, boff, ref, sub_thr))
 
     def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
         """Synchronizuje slave kamery na master_ts_ns.
@@ -10584,9 +10661,17 @@ class Viewer(QWidget):
         if self._is_multi_cam() and self._cam_items:
             self.lbl_filename.setText("")   # scan progress label already shows per-cam counts
             self.lbl_index.setText(f"{idx+1} / {len(self.items)} (merged)")
+            self.lbl_meta_status.setText("")
         else:
             self.lbl_filename.setText(f"File: {it.path.name}")
             self.lbl_index.setText(f"{idx+1} / {len(self.items)}")
+            # Warn when a PNG lacks imgMaxValue metadata: it is still shown (auto-normalized
+            # to its own peak), but absolute brightness is not comparable between frames.
+            # _read_img_max_value_cached caches per folder, so this is cheap.
+            if it.path.suffix.lower() == ".png" and _read_img_max_value_cached(it.path) is None:
+                self.lbl_meta_status.setText("⚠ No imgMaxValue metadata — auto-normalized")
+            else:
+                self.lbl_meta_status.setText("")
         self.lbl_axis_time.setText(f"Axis: {fmt_hhmmss_ms_from_ns(axis_time_ns)}")
         if self._real_ts_list and idx < len(self._real_ts_list):
             real_ts = self._real_ts_list[idx]
@@ -11032,7 +11117,7 @@ class Viewer(QWidget):
         self._pv_trigger_fetch()
 
         t_ns = self.items[idx].ts_ns
-        brighten    = 1 if self.cb_bright.isChecked() else 0
+        brighten_g  = 1 if self.cb_bright.isChecked() else 0
         gradient_id = self.gradient_cb.currentIndex()
         subtract    = self.cb_subtract.isChecked()
         sub_thr     = self.sub_threshold_sb.value() if subtract else 0
@@ -11042,6 +11127,10 @@ class Viewer(QWidget):
             cam_items = self._cam_items[cam_i]
             if not cam_items:
                 continue
+
+            # Auto-stretch / brightness only on the selected camera(s)
+            enh      = self._cam_enhance_on(cam_i)
+            brighten = brighten_g if enh else 0
 
             # Find latest frame in this camera with ts_ns <= t_ns
             cam_ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else None
@@ -11068,7 +11157,7 @@ class Viewer(QWidget):
             else:
                 max_side = self._scrub_side
 
-            boff = self._brightness_offset
+            boff = self._brightness_offset if enh else 0
             cache = self._cam_caches[cam_i]
             key = (cam_idx, max_side, brighten, gradient_id, boff, ref_id, effective_sub_thr)
             cached = cache.get(key)
@@ -12716,7 +12805,13 @@ class Viewer(QWidget):
             arr_px_max = float(arr_f.max())
             if img_max_val is not None and arr_px_max > 0:
                 arr_f = img_max_val * arr_f / arr_px_max
-            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+                arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            elif arr_px_max > 0:
+                # No imgMaxValue metadata: per-frame max normalization so the image
+                # sent to Workshop is not black (see load_image_scaled).
+                arr8 = _np.clip(arr_f / arr_px_max * 255.0, 0, 255).astype(_np.uint8)
+            else:
+                arr8 = _np.zeros(arr_f.shape, dtype=_np.uint8)
 
             ts_str = fmt_prague_full_from_ns(it.ts_ns) if it.ts_ns else ""
             label = f"{cam_name}  {ts_str}".strip()

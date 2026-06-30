@@ -64,6 +64,9 @@ IMAGES_ROOT_OPTIONS = {
     "Office": Path(r"\\users-L3.tier0.lcs.local\cpva-image-2026"),
 }
 
+# Per-user config: persists ROI selection per camera across app restarts
+CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "PulserMonitor" / "rois.json"
+
 # Fixed cameras — display name → CPVA folder name
 CAMERAS = {
     "PD1M1": "C03-015-PD1M1DF-_-IMG",
@@ -323,6 +326,155 @@ def _make_default_rois(cam_key: str, img_w: int, img_h: int) -> list:
             name = f"{col_lbl}{row_lbl}"
             color = _ROI_COLORS[(ri * n_cols + ci) % len(_ROI_COLORS)]
             rois.append(RoiDefinition(name=name, x=x, y=y, w=w, h=h, color=color))
+    return rois
+
+
+def _smooth1d(prof: np.ndarray, k: int) -> np.ndarray:
+    """Simple odd-length moving-average smoothing with edge padding."""
+    if k < 3:
+        return prof
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    padded = np.pad(prof, pad, mode="edge")
+    kernel = np.ones(k, dtype=np.float32) / k
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _detrend(prof: np.ndarray, win: int) -> np.ndarray:
+    """Divide a 1-D profile by its heavily-smoothed baseline to remove a slow
+    illumination gradient, so the dark grid-line dips become comparable in depth
+    across the whole array (the lit pulsers are far brighter on one side)."""
+    baseline = _smooth1d(prof, win)
+    return prof / np.maximum(baseline, 1e-6)
+
+
+def _axis_edges(prof: np.ndarray, n_segments: int) -> list:
+    """Return n_segments+1 boundary positions along one axis by fitting a
+    *regular* grid (constant pitch + offset) — pulser arrays are evenly spaced,
+    so a regular fit aligns every cell at once and avoids the per-boundary drift
+    that leaves some ROIs covering half a pulser or spilling into black.
+
+    The fit searches pitch and offset to minimise the (detrended) brightness
+    sampled at the n_segments+1 predicted grid-line positions, i.e. it slides a
+    rigid comb until its teeth sit on the dark separators."""
+    n = len(prof)
+    if n_segments < 1 or n <= n_segments:
+        return [int(round(n * k / max(1, n_segments))) for k in range(n_segments + 1)]
+
+    lo_v, hi_v = float(prof.min()), float(prof.max())
+    if hi_v <= lo_v:
+        return [int(round(n * k / n_segments)) for k in range(n_segments + 1)]
+    # Inclusive border crop: keep anything above 18% of the lit range
+    thr = lo_v + (hi_v - lo_v) * 0.18
+    lit = np.where(prof >= thr)[0]
+    lo, hi = (int(lit[0]), int(lit[-1]) + 1) if len(lit) >= 2 else (0, n)
+    if hi - lo <= n_segments:
+        lo, hi = 0, n
+
+    nominal = (hi - lo) / n_segments
+    detr = _detrend(prof, max(3, int(nominal * 1.5)))
+
+    def sample(pos: float) -> float:
+        i = int(round(pos))
+        a, b = max(0, i - 1), min(n, i + 2)
+        return float(detr[a:b].min()) if b > a else 1e9
+
+    # Slide a rigid comb of n_segments+1 teeth: vary pitch ±18% and offset (the
+    # left border) ±0.6 cell around the cropped extent; pick the darkest fit.
+    best_cost, best = 1e18, (lo, nominal)
+    p_lo, p_hi = nominal * 0.82, nominal * 1.18
+    n_pitch = 25
+    for pi in range(n_pitch + 1):
+        pitch = p_lo + (p_hi - p_lo) * pi / n_pitch
+        o_start = lo - 0.6 * nominal
+        o_stop = lo + 0.6 * nominal
+        steps = max(8, int((o_stop - o_start)))
+        for si in range(steps + 1):
+            off = o_start + (o_stop - o_start) * si / steps
+            last = off + pitch * n_segments
+            if off < -1 or last > n + 1:
+                continue
+            cost = sum(sample(off + pitch * k) for k in range(n_segments + 1))
+            if cost < best_cost:
+                best_cost, best = cost, (off, pitch)
+
+    off, pitch = best
+    edges = [int(round(min(max(0, off + pitch * k), n))) for k in range(n_segments + 1)]
+    # Guarantee strictly increasing edges
+    for k in range(1, len(edges)):
+        if edges[k] <= edges[k - 1]:
+            edges[k] = min(n, edges[k - 1] + 1)
+    return edges
+
+
+def _bright_edges(detr: np.ndarray, edges: list, frac: float = 0.5) -> list:
+    """For each segment [edges[k], edges[k+1]) of a detrended 1-D profile, return
+    the (start, end) of the bright region using a half-max crossing — i.e. the
+    exact point where brightness rises from / falls to the dark grid line.
+    Because the profile is averaged over the whole opposite axis it is smooth and
+    stable, so every cell in a column (or row) gets the same, correct edge."""
+    spans = []
+    for k in range(len(edges) - 1):
+        a, b = int(edges[k]), int(edges[k + 1])
+        if b - a < 4:
+            spans.append((a, b))
+            continue
+        seg = detr[a:b]
+        lo, hi = float(seg.min()), float(seg.max())
+        if hi <= lo:
+            ins = max(1, int((b - a) * 0.12))
+            spans.append((a + ins, b - ins))
+            continue
+        mask = seg >= lo + (hi - lo) * frac
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            ins = max(1, int((b - a) * 0.12))
+            spans.append((a + ins, b - ins))
+            continue
+        spans.append((a + int(idx[0]), a + int(idx[-1]) + 1))
+    return spans
+
+
+def _detect_grid_rois(arr: np.ndarray, cam_key: str) -> list:
+    """Detect individual pulser ROIs from a reference image.
+
+    1) Fit a regular grid so the dark separators are located consistently.
+    2) Refine each ROI edge to the half-max brightness crossing of the lit area,
+       so the ROI borders sit exactly on the edges of the bright pulser patches.
+    `arr` is a float32 grayscale image (values roughly 0..1)."""
+    cols = CAM_COLS.get(cam_key, ["A", "B", "C", "D", "E"])
+    rows = _ROW_LABELS
+    n_cols, n_rows = len(cols), len(rows)
+    h, w = arr.shape
+    if w < n_cols * 4 or h < n_rows * 4:
+        return _make_default_rois(cam_key, w, h)
+
+    col_prof = _smooth1d(arr.mean(axis=0).astype(np.float32), max(3, w // 120))
+    row_prof = _smooth1d(arr.mean(axis=1).astype(np.float32), max(3, h // 120))
+
+    x_edges = _axis_edges(col_prof, n_cols)
+    y_edges = _axis_edges(row_prof, n_rows)
+
+    # Detrend (illumination-flatten) then locate the bright-patch edges per axis
+    x_detr = _detrend(col_prof, max(3, int((x_edges[-1] - x_edges[0]) / n_cols * 1.5)))
+    y_detr = _detrend(row_prof, max(3, int((y_edges[-1] - y_edges[0]) / n_rows * 1.5)))
+    x_spans = _bright_edges(x_detr, x_edges)
+    y_spans = _bright_edges(y_detr, y_edges)
+
+    rois = []
+    for ri in range(n_rows):
+        sy0, sy1 = y_spans[ri]
+        for ci in range(n_cols):
+            sx0, sx1 = x_spans[ci]
+            if sx1 - sx0 < 4 or sy1 - sy0 < 4:
+                continue
+            name = f"{cols[ci]}{rows[ri]}"
+            color = _ROI_COLORS[(ri * n_cols + ci) % len(_ROI_COLORS)]
+            rois.append(RoiDefinition(name=name, x=sx0, y=sy0,
+                                      w=sx1 - sx0, h=sy1 - sy0, color=color))
+    if not rois:
+        return _make_default_rois(cam_key, w, h)
     return rois
 
 
@@ -936,18 +1088,59 @@ class _ImageCanvas(QWidget):
         self.update()
 
 
+class _RefImageSignals(QObject):
+    ready  = Signal(object, object)  # (Path, np.ndarray)
+    failed = Signal(str)
+
+
+class _RefImageWorker(QRunnable):
+    """Locate the latest reference image on the (possibly network) share and
+    load it — off the UI thread so opening the editor never blocks the GUI."""
+    def __init__(self, sig: _RefImageSignals, images_root: Path, cam_key: str, gen: int):
+        super().__init__()
+        self._sig = sig
+        self._root = images_root
+        self._cam_key = cam_key
+        self._gen = gen
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            ref = _find_ref_image(self._root, self._cam_key)
+            if not ref:
+                self._sig.failed.emit("no-image")
+                return
+            arr = _load_as_float32_gray(ref)
+            if arr is None:
+                self._sig.failed.emit("load-failed")
+                return
+            self._sig.ready.emit(ref, arr)
+        except Exception as exc:
+            self._sig.failed.emit(str(exc))
+
+
 class ROIEditorDialog(QDialog):
     def __init__(self, rois: list, parent=None,
                  cam_key: str = "", images_root: "Path | None" = None):
         super().__init__(parent)
         title = f"ROI Editor — {cam_key}" if cam_key else "ROI Editor"
         self.setWindowTitle(title)
-        self.resize(960, 680)
+        # Resizable + minimise/maximise buttons (QDialog hides them by default)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowMaximizeButtonHint)
+        self.setSizeGripEnabled(True)
+        self.resize(1100, 760)
         import copy
         self._rois: list = copy.deepcopy(rois)
         self._selected_idx: "int | None" = None
         self._cam_key: str = cam_key
         self._images_root: "Path | None" = images_root
+        self._gray_arr: "np.ndarray | None" = None  # last loaded image (float32 gray)
+        self._ref_sig: "_RefImageSignals | None" = None
+        self._ref_gen: int = 0
+        self._ref_loading: bool = False
         self._build_ui()
 
     def _build_ui(self):
@@ -963,7 +1156,7 @@ class ROIEditorDialog(QDialog):
         if self._cam_key and self._images_root:
             btn_auto_img = QPushButton("Auto-load latest")
             btn_auto_img.setStyleSheet(_BTN_SM)
-            btn_auto_img.clicked.connect(self._auto_load_ref)
+            btn_auto_img.clicked.connect(lambda: self._auto_load_ref(initial=False))
             tb.addWidget(btn_auto_img)
         tb.addSpacing(6)
         if self._cam_key:
@@ -1017,27 +1210,52 @@ class ROIEditorDialog(QDialog):
         super().showEvent(event)
         if self._cam_key and self._images_root and self._canvas.img_w == 0:
             from PySide6.QtCore import QTimer
-            QTimer.singleShot(80, self._auto_load_ref)
+            QTimer.singleShot(80, lambda: self._auto_load_ref(initial=True))
 
     def _hint_text(self) -> str:
         return (f"Drag to draw ROIs · Click to select · "
                 f"{len(self._rois)} ROI(s) defined")
 
-    def _auto_load_ref(self):
-        if not (self._cam_key and self._images_root):
+    def _auto_load_ref(self, initial: bool = False):
+        """Find + load the latest reference image on a background thread so the
+        (possibly slow, network) lookup never freezes the editor window.
+        `initial` marks the one-shot lookup fired when the editor opens; its late
+        result is discarded if an image has meanwhile been loaded, so it never
+        overrides what the user is working on."""
+        if not (self._cam_key and self._images_root) or self._ref_loading:
             return
-        self._hint.setText("Searching for reference image…")
-        QApplication.processEvents()
-        ref = _find_ref_image(self._images_root, self._cam_key)
-        if not ref:
-            self._hint.setText(
-                f"No qualifying image found for {self._cam_key} "
-                f"(min {CAM_MIN_BYTES.get(self._cam_key, 0) // 1024} kB). "
-                f"Load manually.")
+        self._ref_loading = True
+        self._ref_gen += 1
+        self._hint.setText("Searching for reference image… (network)")
+        self._ref_sig = _RefImageSignals(self)
+        self._ref_sig.ready.connect(
+            lambda path, arr, g=self._ref_gen, ini=initial: self._on_ref_ready(path, arr, g, ini))
+        self._ref_sig.failed.connect(
+            lambda why, g=self._ref_gen: self._on_ref_failed(why, g))
+        worker = _RefImageWorker(self._ref_sig, self._images_root, self._cam_key, self._ref_gen)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_ref_ready(self, path: Path, arr, gen: int, initial: bool):
+        if gen != self._ref_gen:
             return
-        self._load_image_from_path(ref)
+        self._ref_loading = False
+        # An initial (auto-on-open) load must not clobber an image the user has
+        # already loaded or started working on.
+        if initial and self._canvas.img_w != 0:
+            self._hint.setText(self._hint_text())
+            return
+        self._display_image(path, arr)
         if not self._rois:
             self._auto_grid()
+
+    def _on_ref_failed(self, why: str, gen: int):
+        if gen != self._ref_gen:
+            return
+        self._ref_loading = False
+        self._hint.setText(
+            f"No qualifying image found for {self._cam_key} "
+            f"(min {CAM_MIN_BYTES.get(self._cam_key, 0) // 1024} kB). "
+            f"Load manually.")
 
     def _load_image_manual(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1051,17 +1269,24 @@ class ROIEditorDialog(QDialog):
             arr = _load_as_float32_gray(path)
             if arr is None:
                 raise ValueError("Could not read image")
-            lo, hi = float(arr.min()), float(arr.max())
-            if hi > lo:
-                arr8 = np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
-            else:
-                arr8 = np.zeros(arr.shape, dtype=np.uint8)
-            self._canvas.set_image(arr8)
-            self._hint.setText(
-                f"Loaded: {path.name}  ({arr.shape[1]}×{arr.shape[0]})  —  "
-                f"{self._hint_text()}")
+            self._display_image(path, arr)
         except Exception as exc:
             QMessageBox.warning(self, "Load image", f"Failed:\n{exc}")
+
+    def _display_image(self, path: Path, arr: np.ndarray):
+        # Bump generation so any still-running background auto-load is ignored
+        self._ref_gen += 1
+        self._ref_loading = False
+        self._gray_arr = arr
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi > lo:
+            arr8 = np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+        else:
+            arr8 = np.zeros(arr.shape, dtype=np.uint8)
+        self._canvas.set_image(arr8)
+        self._hint.setText(
+            f"Loaded: {path.name}  ({arr.shape[1]}×{arr.shape[0]})  —  "
+            f"{self._hint_text()}")
 
     def _auto_grid(self):
         w, h = self._canvas.img_w, self._canvas.img_h
@@ -1069,7 +1294,12 @@ class ROIEditorDialog(QDialog):
             QMessageBox.information(self, "Auto-create grid",
                                     "Load a reference image first.")
             return
-        new_rois = _make_default_rois(self._cam_key, w, h)
+        if self._gray_arr is not None and self._gray_arr.shape[:2] == (h, w):
+            new_rois = _detect_grid_rois(self._gray_arr, self._cam_key)
+            mode = "detected from image"
+        else:
+            new_rois = _make_default_rois(self._cam_key, w, h)
+            mode = "even grid"
         self._rois.clear()
         self._rois.extend(new_rois)
         self._selected_idx = None
@@ -1078,7 +1308,7 @@ class ROIEditorDialog(QDialog):
         self._canvas.select(None)
         self._canvas.refresh()
         self._hint.setText(
-            f"Grid created (cols: {' '.join(CAM_COLS.get(self._cam_key, []))}, "
+            f"Grid {mode} (cols: {' '.join(CAM_COLS.get(self._cam_key, []))}, "
             f"rows: 1–{len(_ROW_LABELS)})  —  {self._hint_text()}")
 
     def _on_selected(self, idx: int):
@@ -1551,6 +1781,7 @@ class PulserMonitorWidget(QWidget):
         self._current_scan_cam_key: str = ""
 
         self._build_ui()
+        self._load_rois_config()
 
     def _build_ui(self):
         root_lay = QHBoxLayout(self)
@@ -1750,6 +1981,37 @@ class PulserMonitorWidget(QWidget):
     def _log_msg(self, msg: str):
         self._log.appendPlainText(msg)
 
+    def _save_rois_config(self):
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data = {"version": 1, "cameras": {
+                cam_key: [r.to_dict() for r in rois]
+                for cam_key, rois in self._rois_by_camera.items()
+            }}
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            self._log_msg(f"Could not save ROI config: {exc}")
+
+    def _load_rois_config(self):
+        try:
+            if not CONFIG_PATH.exists():
+                return
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            cams = data.get("cameras", {})
+            loaded = 0
+            for cam_key in CAMERAS:
+                rois = cams.get(cam_key)
+                if isinstance(rois, list):
+                    self._rois_by_camera[cam_key] = [RoiDefinition.from_dict(r) for r in rois]
+                    loaded += len(self._rois_by_camera[cam_key])
+                self._update_roi_lbl(cam_key)
+            if loaded:
+                self._log_msg(f"Loaded saved ROI selection ({loaded} ROIs) from {CONFIG_PATH}")
+        except Exception as exc:
+            self._log_msg(f"Could not load saved ROI config: {exc}")
+
     def _update_roi_lbl(self, cam_key: str):
         n = len(self._rois_by_camera.get(cam_key, []))
         lbl = self._roi_count_lbls.get(cam_key)
@@ -1788,6 +2050,7 @@ class PulserMonitorWidget(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._rois_by_camera[cam_key] = dlg.result_rois()
             self._update_roi_lbl(cam_key)
+            self._save_rois_config()
 
     def _load_rois_json(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1802,6 +2065,7 @@ class PulserMonitorWidget(QWidget):
             if cam_key in self._rois_by_camera:
                 self._rois_by_camera[cam_key] = new_rois
                 self._update_roi_lbl(cam_key)
+                self._save_rois_config()
                 self._log_msg(
                     f"Loaded {len(new_rois)} ROIs for {cam_key} from {Path(path).name}")
             else:
@@ -2059,9 +2323,12 @@ def main():
     status_bar.addPermanentWidget(btn_stop)
 
     try:
-        icon_path = Path(__file__).resolve().parent.parent / "Image Tools" / "icon.ico"
-        if icon_path.exists():
-            win.setWindowIcon(QIcon(str(icon_path)))
+        here = Path(__file__).resolve().parent
+        for icon_name in ("icon.ico", "icon.png", "pulser_monitor.ico"):
+            icon_path = here / icon_name
+            if icon_path.exists():
+                win.setWindowIcon(QIcon(str(icon_path)))
+                break
     except Exception:
         pass
 

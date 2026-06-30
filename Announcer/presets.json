@@ -15,5 +15,7 @@
       "orange": 1.2,
       "red": 1.1
     }
-  }
+  },
+  "flash_mode": "alternate",
+  "image_file": "scorpion"
 }

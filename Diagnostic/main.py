@@ -7,7 +7,6 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QPlainTextEdit,
 )
 from PySide6.QtCore import QThread, Signal
-from PySide6.QtGui import QPalette, QColor
 
 from operation_history_logic import OperationHistoryLogic
 from monitor_tab import MonitorWidget
@@ -22,17 +21,53 @@ APP_DIR = Path(__file__).parent
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+APP_STYLESHEET = """
+    QWidget      { background: #f3f3f3; color: #111; }
+    QLabel       { background: transparent; }
+    QPushButton  { padding: 5px 8px; }
+    QComboBox    { padding: 3px 6px; }
+    QProgressBar { background: #fff; }
+    QTabWidget::pane { border: 1px solid #ccc; }
+    QTabBar::tab {
+        background: #e8e8e8; color: #444;
+        padding: 6px 18px; border: 1px solid #ccc;
+        border-bottom: none; border-radius: 3px 3px 0 0;
+        margin-right: 2px;
+    }
+    QTabBar::tab:selected { background: #f3f3f3; color: #111; font-weight: 600; }
+    QTabBar::tab:hover    { background: #d8e8ff; }
+    QTableView { background: #ffffff; gridline-color: #ddd; }
+    QHeaderView::section {
+        background: #e8e8e8; color: #333;
+        padding: 4px; border: 1px solid #ccc;
+    }
+    QLineEdit, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QListWidget {
+        background: #ffffff; color: #111; border: 1px solid #bbb;
+    }
+    QTableView::indicator, QCheckBox::indicator {
+        width: 16px; height: 16px;
+        border: 1px solid #888; border-radius: 3px; background: #fff;
+    }
+    QTableView::indicator:checked, QCheckBox::indicator:checked {
+        background: #1565C0; border-color: #1565C0;
+    }
+    QToolTip {
+        background: #ffffcc; color: #111;
+        border: 1px solid #aaa; padding: 4px;
+    }
+"""
+
 BUTTON_STYLE = """
 QPushButton {
-    background: #3a7bd5;
+    background: #1565C0;
     color: white;
     border: none;
     border-radius: 4px;
     padding: 6px 14px;
     font-weight: bold;
 }
-QPushButton:hover { background: #2f6bbf; }
-QPushButton:disabled { background: #555; color: #888; }
+QPushButton:hover { background: #0D47A1; }
+QPushButton:disabled { background: #bbb; color: #888; }
 """
 
 STOP_BUTTON_STYLE = """
@@ -45,26 +80,27 @@ QPushButton {
     font-weight: bold;
 }
 QPushButton:hover { background: #a93226; }
-QPushButton:disabled { background: #555; color: #888; }
+QPushButton:disabled { background: #bbb; color: #888; }
 """
 
 SECONDARY_STYLE = """
 QPushButton {
-    background: #444;
-    color: #ddd;
-    border: 1px solid #555;
+    background: #e8e8e8;
+    color: #111;
+    border: 1px solid #bbb;
     border-radius: 4px;
     padding: 5px 12px;
 }
-QPushButton:hover { background: #555; }
+QPushButton:hover { background: #d8e8ff; }
 """
 
 LOG_STYLE = """
 QPlainTextEdit {
-    background: #1e1e1e;
-    color: #d4d4d4;
+    background: #ffffff;
+    color: #222;
     font-family: Consolas, monospace;
     font-size: 11px;
+    border: 1px solid #ccc;
 }
 """
 
@@ -193,18 +229,6 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.setTabPosition(QTabWidget.North)
-        tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #444; }
-            QTabBar::tab {
-                background: #2a2a2a;
-                color: #ccc;
-                padding: 8px 18px;
-                border: 1px solid #444;
-                border-bottom: none;
-            }
-            QTabBar::tab:selected { background: #3a3a3a; color: white; }
-            QTabBar::tab:hover { background: #333; }
-        """)
 
         self._monitor_tab = MonitorWidget()
         tabs.addTab(self._monitor_tab, "PV Monitor")
@@ -227,18 +251,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(40, 40, 40))
-    palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
-    palette.setColor(QPalette.Base, QColor(30, 30, 30))
-    palette.setColor(QPalette.AlternateBase, QColor(45, 45, 45))
-    palette.setColor(QPalette.Text, QColor(220, 220, 220))
-    palette.setColor(QPalette.Button, QColor(55, 55, 55))
-    palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
-    palette.setColor(QPalette.Highlight, QColor(58, 123, 213))
-    palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
-    app.setPalette(palette)
+    app.setStyleSheet(APP_STYLESHEET)
 
     window = MainWindow()
     window.show()
