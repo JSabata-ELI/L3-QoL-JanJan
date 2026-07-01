@@ -360,14 +360,24 @@ class ScreenTracker(tk.Tk):
                 return p
         return None
 
-    def _make_flash_photo(self, size, *, fade=None):
+    def _make_flash_photo(self, size, *, fade=None, invert=False, key=None):
         """Build an ImageTk.PhotoImage of the selected template scaled to `size`.
 
-        The image is composited onto the chroma background so its transparent
-        areas become click-through during the transparent HUD mode. `fade`
-        (0..1) blends the result toward the chroma color to produce a faint
-        "ghost" used for window alignment. Returns None if no image selected /
-        found or the size is degenerate.
+        The template's alpha is used as a stencil and the result is a *chroma-keyed*
+        RGB image: pixels painted with the chroma colour (the window theme colour)
+        become transparent / click-through via the window's ``-transparentcolor``,
+        while flash-coloured pixels stay opaque and clickable.
+
+          * ``invert=False`` (fill): the silhouette is the flash colour and the
+            surrounding area is chroma → only the scorpion shows, surroundings are
+            see-through.
+          * ``invert=True``: the surrounding area is the flash colour and the
+            silhouette is chroma → the surroundings blink and the scorpion is a
+            see-through hole.
+
+        ``fade`` (0..1) blends the (non-inverted) fill toward chroma to produce a
+        faint "ghost" used for window alignment. Returns None if no image is
+        selected / found or the size is degenerate.
         """
         from PIL import Image
         path = self._image_path(self.image_file.get())
@@ -375,27 +385,37 @@ class ScreenTracker(tk.Tk):
         if path is None or w < 1 or h < 1:
             return None
         try:
-            chroma_rgb = self._chroma_rgb()
             src = Image.open(path).convert("RGBA")
             src = src.resize((int(w), int(h)), resample=Image.LANCZOS)
-            bg = Image.new("RGB", (int(w), int(h)), chroma_rgb)
-            bg.paste(src, (0, 0), src)
-            if fade is not None:
-                ghost = Image.new("RGB", bg.size, chroma_rgb)
-                bg = Image.blend(ghost, bg, max(0.0, min(1.0, fade)))
+            alpha = src.split()[3]
+            chroma = self._color_rgb(key or self._chroma)
+            flash = self._color_rgb(self.flash_color.get())
+            if invert:
+                # flash-coloured field with the scorpion punched out to chroma
+                base = Image.new("RGB", src.size, flash)
+                hole = Image.new("RGB", src.size, chroma)
+                out = Image.composite(hole, base, alpha)
+            else:
+                # flash-coloured scorpion on a chroma (transparent) background
+                base = Image.new("RGB", src.size, chroma)
+                fill = Image.new("RGB", src.size, flash)
+                out = Image.composite(fill, base, alpha)
+                if fade is not None:
+                    ghost = Image.new("RGB", src.size, chroma)
+                    out = Image.blend(ghost, out, max(0.0, min(1.0, fade)))
             from PIL import ImageTk as _ImageTk
-            return _ImageTk.PhotoImage(bg)
+            return _ImageTk.PhotoImage(out)
         except Exception as e:
             self._log_message(f"Image load failed: {e}")
             return None
 
-    def _chroma_rgb(self):
-        """Return self._chroma as an (r, g, b) tuple usable by PIL."""
+    def _color_rgb(self, color):
+        """Return a Tk colour string as an (r, g, b) 0-255 tuple usable by PIL."""
         try:
-            r, g, b = self.winfo_rgb(self._chroma)
+            r, g, b = self.winfo_rgb(color)
             return (r // 256, g // 256, b // 256)
         except Exception:
-            return (240, 240, 240)
+            return (255, 34, 34)
 
     def _build_ui(self):
         pad = dict(padx=10, pady=5)
@@ -405,6 +425,12 @@ class ScreenTracker(tk.Tk):
         # fully transparent and click-through; only the circle / PV badges stay.
         self._chroma = ttk.Style().lookup("TFrame", "background") or self.cget("bg")
         self.configure(bg=self._chroma)
+
+        # Dedicated chroma key for the flash images. The theme colour keys fine for
+        # native widgets, but PIL-painted pixels must match the -transparentcolor
+        # value EXACTLY, which a named/system theme colour can't guarantee. A unique
+        # magenta we both paint and key on is reliably transparent / click-through.
+        self._flash_key = "#ff00ff"
 
         # Řádek 0: mon_frame vlevo, kolečko samostatně vpravo
         self._top_frame = ttk.Frame(self)
@@ -538,6 +564,7 @@ class ScreenTracker(tk.Tk):
         self.image_file = tk.StringVar(value="")
         self._image_files = self._load_image_files()
         self._flash_photo = None        # cached PhotoImage for the current flash
+        self._flash_photo_inv = None    # inverse (surround-on) variant for "alternate"
         self._flash_img_label = None    # tk.Label showing the template while flashing
         self._align_photo = None        # ghost PhotoImage during window alignment
         self._align_label = None
@@ -939,6 +966,14 @@ class ScreenTracker(tk.Tk):
     def _on_change_detected(self, diff):
         self.tracking = False
         self.changed = True
+        # Tracking is over — stop polling PVs as well (no point fetching once
+        # we're no longer watching; otherwise stray archiver errors keep logging).
+        if self._poll_job:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+        if self._pv_poll_job:
+            self.after_cancel(self._pv_poll_job)
+            self._pv_poll_job = None
         self.status_var.set(f"CHANGE DETECTED  (diff={diff:.1f})")
         self._start_flash()
         if self.sound_enabled.get():
@@ -957,30 +992,51 @@ class ScreenTracker(tk.Tk):
         # no usable template is available.
         mode = self.flash_mode.get()
         self._flash_photo = None
+        self._flash_photo_inv = None
         if mode in ("image", "alternate"):
             self.update_idletasks()
             size = (self.winfo_width(), self.winfo_height())
-            self._flash_photo = self._make_flash_photo(size)
+            self._flash_photo = self._make_flash_photo(size, key=self._flash_key)
+            if mode == "alternate":
+                self._flash_photo_inv = self._make_flash_photo(size, invert=True, key=self._flash_key)
             if self._flash_photo is None:
                 self._log_message("Flash image not set or not found — using background color.")
                 mode = "color"
         self._flash_active_mode = mode
 
+        # Keep chroma-key transparency on for the whole trip: keyed areas stay
+        # see-through (per user choice — transparency over clickability). A dedicated
+        # magenta key is used so PIL-painted pixels reliably become transparent. The
+        # alarm is dismissed by clicking an opaque (flash-coloured) area or Esc.
+        try:
+            self.attributes("-transparentcolor", self._flash_key)
+        except Exception:
+            pass
+
         # Overlay frame covers the whole window — avoids ttk widget bg gaps
         if not hasattr(self, "_flash_overlay"):
             self._flash_overlay = tk.Frame(self)
+        self._flash_overlay.configure(bg=self._flash_key)
         self._flash_overlay.place(x=0, y=0, relwidth=1, relheight=1)
         self._flash_overlay.lift()
+        self._flash_overlay.bind("<Button-1>", self._on_any_click)
 
         if mode in ("image", "alternate"):
-            # Transparent (chroma) backdrop so only the template shows.
-            self._flash_overlay.configure(bg=self._chroma)
             if self._flash_img_label is None or not self._flash_img_label.winfo_exists():
                 self._flash_img_label = tk.Label(self._flash_overlay, bd=0,
-                                                 highlightthickness=0, bg=self._chroma)
-            self._flash_img_label.configure(image=self._flash_photo, bg=self._chroma)
+                                                 highlightthickness=0)
+            self._flash_img_label.configure(image=self._flash_photo, bg=self._flash_key)
+            self._flash_img_label.bind("<Button-1>", self._on_any_click)
             self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
             self._flash_img_label.lift()
+
+        # Esc as a reliable dismiss (clicks only land on opaque areas). Needs focus
+        # because the flashing window is borderless (overrideredirect).
+        try:
+            self.focus_force()
+        except Exception:
+            pass
+        self.bind("<Escape>", self._on_any_click)
         self._do_flash()
 
     def _do_flash(self):
@@ -993,25 +1049,31 @@ class ScreenTracker(tk.Tk):
             return
         self._flash_state = not self._flash_state
         mode = getattr(self, "_flash_active_mode", "color")
+        flash_col = self.flash_color.get()
+        chroma = self._flash_key   # keyed areas are see-through via -transparentcolor
         if mode == "image":
-            # Only the template blinks; surroundings stay transparent (chroma).
-            self._flash_overlay.configure(bg=self._chroma)
+            # Surroundings always transparent; only the colour-tinted silhouette
+            # blinks on/off.
+            self._flash_overlay.configure(bg=chroma)
+            self._flash_img_label.configure(bg=chroma)
             if self._flash_state:
+                self._flash_img_label.configure(image=self._flash_photo)
                 self._flash_img_label.lift()
                 self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
             else:
                 self._flash_img_label.place_forget()
         elif mode == "alternate":
-            # Seesaw: image, then the rest of the surface, never both at once.
-            if self._flash_state:
-                self._flash_overlay.configure(bg=self._chroma)
-                self._flash_img_label.lift()
-                self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
-            else:
-                self._flash_img_label.place_forget()
-                self._flash_overlay.configure(bg=self.flash_color.get())
+            # Inverse seesaw — the scorpion stays visible as a shape the whole time:
+            #   state on  -> coloured scorpion, transparent surround
+            #   state off -> coloured surround, scorpion is a see-through hole
+            self._flash_overlay.configure(bg=chroma)
+            self._flash_img_label.configure(
+                image=self._flash_photo if self._flash_state else self._flash_photo_inv,
+                bg=chroma)
+            self._flash_img_label.lift()
+            self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
         else:
-            color = self.flash_color.get() if self._flash_state else "#440000"
+            color = flash_col if self._flash_state else "#440000"
             self._flash_overlay.configure(bg=color)
         self._flash_job = self.after(FLASH_INTERVAL_MS, self._do_flash)
 

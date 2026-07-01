@@ -206,7 +206,7 @@ DEFAULT_SETTINGS = {
     "webex_room_id": "",
     # webex two-way commands (bot mode only)
     "webex_commands_enabled": True,
-    "webex_command_poll_s": 7,
+    "webex_command_poll_s": 1,
     "webex_command_allowlist": [],   # sender emails allowed; empty = anyone in room
 }
 
@@ -906,8 +906,8 @@ class SettingsDialog(QDialog):
         self.webex_cmds.setChecked(bool(s.get("webex_commands_enabled", True)))
         wf.addRow("", self.webex_cmds)
         self.webex_cmd_poll = QSpinBox()
-        self.webex_cmd_poll.setRange(3, 120)
-        self.webex_cmd_poll.setValue(int(s.get("webex_command_poll_s", 7)))
+        self.webex_cmd_poll.setRange(1, 120)
+        self.webex_cmd_poll.setValue(int(s.get("webex_command_poll_s", 1)))
         wf.addRow("Command poll (s)", self.webex_cmd_poll)
         self.webex_allow = QLineEdit("; ".join(s.get("webex_command_allowlist", [])))
         self.webex_allow.setPlaceholderText("allowed sender e-mails, empty = anyone in room")
@@ -1299,6 +1299,7 @@ class MonitorWidget(QWidget):
         self._cmd_timer: Optional[QTimer] = None
         self._cmd_last_id = None
         self._cmd_primed = False
+        self._cmd_last_logged_error = ""
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -1388,9 +1389,11 @@ class MonitorWidget(QWidget):
         splitter.setSizes([300, 360])
         root.addWidget(splitter, 1)
 
+        # The message log lives in its own top-level "Log" tab (added in
+        # main.py). It is still owned/written by this widget via _log(); we
+        # just don't place it in the monitor layout. Qt reparents it when
+        # main.py adds it to the tab bar.
         self.log = LogWidget()
-        self.log.setMaximumHeight(140)
-        root.addWidget(self.log)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._start_poll)
@@ -1654,7 +1657,7 @@ class MonitorWidget(QWidget):
             return
         self._cmd_primed = False
         self._cmd_last_id = None
-        poll_s = max(3, int(self.settings.get("webex_command_poll_s", 7)))
+        poll_s = max(1, int(self.settings.get("webex_command_poll_s", 1)))
         self._cmd_timer = QTimer(self)
         self._cmd_timer.timeout.connect(self._poll_commands)
         self._cmd_timer.setInterval(poll_s * 1000)
@@ -1678,6 +1681,15 @@ class MonitorWidget(QWidget):
 
     def _on_commands(self, result):
         new_items, newest_id = result
+        # Surface poll failures (bad token, bot not in room, network, 403…)
+        # in the Log tab — but only when the error changes, to avoid spamming
+        # one line every poll interval.
+        err = self.hub.webex.last_error
+        if err and err != self._cmd_last_logged_error:
+            self._log(f"⚠ Webex command poll failed: {err}")
+            self._cmd_last_logged_error = err
+        elif not err:
+            self._cmd_last_logged_error = ""
         if newest_id:
             self._cmd_last_id = newest_id
         if not self._cmd_primed:
@@ -1686,10 +1698,18 @@ class MonitorWidget(QWidget):
         allow = [e.lower() for e in self.settings.get("webex_command_allowlist", [])]
         for it in new_items:
             text = (it.get("text") or "").strip()
-            if "/" not in text:
-                continue
-            if not text.startswith("/"):
-                text = text[text.index("/"):]   # strip a leading @mention
+            if "/" in text:
+                if not text.startswith("/"):
+                    text = text[text.index("/"):]   # strip a leading @mention
+            else:
+                # Be forgiving: a bare "help"/"?"/"commands" (no slash) is
+                # treated as /help. Anything else without a slash is ignored
+                # so the bot stays quiet during normal conversation.
+                low = text.lower()
+                if low in ("help", "?", "commands") or low.endswith(" help"):
+                    text = "/help"
+                else:
+                    continue
             email = (it.get("personEmail") or "").lower()
             if allow and email not in allow:
                 self._reply(f"⛔ Sorry, {email} is not allowed to command me.")

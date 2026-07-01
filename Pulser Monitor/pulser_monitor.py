@@ -100,6 +100,20 @@ _ROI_COLORS = [
     "#9C27B0", "#00BCD4", "#FF5722", "#FFEB3B",
 ]
 
+# ── Per-pulser grid-detection tunables ─────────────────────────────────────────
+# The pulser array is detected cell-by-cell: a regular comb locates each cell, then
+# the actual bright tile is cut out in 2-D inside that cell's window, so a camera
+# where every diode differs in size/position/brightness still aligns tightly.
+_WINDOW_FRAC     = 0.6   # half-window for the outermost cells, in units of pitch
+_CELL_BLUR_FRAC  = 0.9   # box-blur baseline size (× pitch) for per-cell illumination flatten
+_CELL_THR_LO_PCT = 25    # dark (separator) level percentile inside a cell window
+_CELL_THR_HI_PCT = 92    # bright (tile) level percentile inside a cell window
+_CELL_THR_FRAC   = 0.45  # tile threshold placed this far from dark toward bright
+_CELL_TRIM_PCT   = 4     # trim this %% of lit pixels off each side of the bbox
+                         # (discards the thin diagonal reflection and stray specks)
+_CELL_MIN_BRIGHT = 0.05  # min lit-pixel fraction for a cell to count as a live pulser
+_ROI_INSET_FRAC  = 0.02  # small margin pulled inward from the detected tile edge
+
 _BTN = (
     f"QPushButton {{background:{PRIMARY};color:#fff;border:none;"
     f"border-radius:4px;padding:5px 10px;}}"
@@ -408,40 +422,103 @@ def _axis_edges(prof: np.ndarray, n_segments: int) -> list:
     return edges
 
 
-def _bright_edges(detr: np.ndarray, edges: list, frac: float = 0.5) -> list:
-    """For each segment [edges[k], edges[k+1]) of a detrended 1-D profile, return
-    the (start, end) of the bright region using a half-max crossing — i.e. the
-    exact point where brightness rises from / falls to the dark grid line.
-    Because the profile is averaged over the whole opposite axis it is smooth and
-    stable, so every cell in a column (or row) gets the same, correct edge."""
-    spans = []
-    for k in range(len(edges) - 1):
-        a, b = int(edges[k]), int(edges[k + 1])
-        if b - a < 4:
-            spans.append((a, b))
-            continue
-        seg = detr[a:b]
-        lo, hi = float(seg.min()), float(seg.max())
-        if hi <= lo:
-            ins = max(1, int((b - a) * 0.12))
-            spans.append((a + ins, b - ins))
-            continue
-        mask = seg >= lo + (hi - lo) * frac
-        idx = np.where(mask)[0]
-        if len(idx) == 0:
-            ins = max(1, int((b - a) * 0.12))
-            spans.append((a + ins, b - ins))
-            continue
-        spans.append((a + int(idx[0]), a + int(idx[-1]) + 1))
-    return spans
+def _box_blur2d(a: np.ndarray, k: int) -> np.ndarray:
+    """Fast separable box blur via an integral image (edge-padded). Builds a
+    per-cell illumination baseline so thresholding is immune to the lighting
+    gradient across a tile."""
+    if k < 3:
+        return a
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    ap = np.pad(a, pad, mode="edge")
+    cs = np.cumsum(np.cumsum(ap, 0), 1)
+    cs = np.pad(cs, ((1, 0), (1, 0)), mode="constant")
+    H, W = a.shape
+    y0 = np.arange(H)[:, None]; x0 = np.arange(W)[None, :]
+    y1 = y0 + k; x1 = x0 + k
+    tot = cs[y1, x1] - cs[y0, x1] - cs[y1, x0] + cs[y0, x0]
+    return (tot / (k * k)).astype(np.float32)
+
+
+def _cell_centers(edges: list) -> list:
+    """Midpoints of consecutive comb edges — the coarse centre of each cell."""
+    return [(edges[k] + edges[k + 1]) * 0.5 for k in range(len(edges) - 1)]
+
+
+def _neighbor_clamps(centers: list, pitch: float, n: int) -> list:
+    """For every cell return (lo, hi): the boundary halfway to its neighbours
+    (and ±_WINDOW_FRAC·pitch for the two outermost cells), clamped to [0, n].
+
+    These bounds serve double duty — they are both the local search window for
+    the cell *and* the hard limit its box may not cross, so a cell can physically
+    never read or claim pixels past the midpoint to a neighbour."""
+    m = len(centers)
+    clamps = []
+    for k in range(m):
+        lo = (centers[k - 1] + centers[k]) * 0.5 if k > 0 else centers[k] - _WINDOW_FRAC * pitch
+        hi = (centers[k] + centers[k + 1]) * 0.5 if k < m - 1 else centers[k] + _WINDOW_FRAC * pitch
+        clamps.append((int(max(0, round(lo))), int(min(n, round(hi)))))
+    return clamps
+
+
+def _cell_bbox(block: np.ndarray, pitch: float) -> "tuple | None":
+    """Find the actual bright pulser patch inside one cell window in 2-D and
+    return its (x0, y0, x1, y1) in the block's local coords, or None if the
+    window holds no clear patch (a dark/off pulser).
+
+    The block is flattened for illumination (divided by a heavy box blur) so the
+    lit tile stands out from the dark separators regardless of the lighting
+    gradient; a threshold placed between the dark and bright levels gives the tile
+    mask. The bounding box is taken from the inner percentile of the lit
+    coordinates, which trims off the thin diagonal reflection and stray specks
+    rather than letting them stretch the box out to the window edge."""
+    bh, bw = block.shape
+    if bh < 4 or bw < 4:
+        return None
+    base = _box_blur2d(block, max(5, int(pitch * _CELL_BLUR_FRAC)))
+    norm = block / np.maximum(base, 1e-6)
+    lo = float(np.percentile(norm, _CELL_THR_LO_PCT))
+    hi = float(np.percentile(norm, _CELL_THR_HI_PCT))
+    if hi <= lo:
+        return None
+    mask = norm > lo + (hi - lo) * _CELL_THR_FRAC
+    ys, xs = np.where(mask)
+    if len(xs) < bh * bw * _CELL_MIN_BRIGHT:
+        return None
+    x0, x1 = np.percentile(xs, [_CELL_TRIM_PCT, 100 - _CELL_TRIM_PCT])
+    y0, y1 = np.percentile(ys, [_CELL_TRIM_PCT, 100 - _CELL_TRIM_PCT])
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def _sane_span(a: float, b: float, center: float, pitch: float,
+               lo: float, hi: float) -> "tuple[int, int]":
+    """Keep a detected 1-D span sane: never thinner than half the pitch and
+    centred within 30 % of the pitch of the comb centre, clamped to [lo, hi].
+    A safety net so a stray detection can't collapse or drift a box."""
+    width = min(max(b - a, pitch * 0.5), hi - lo)
+    c = (a + b) * 0.5
+    c = min(max(c, center - pitch * 0.30), center + pitch * 0.30)
+    a, b = c - width / 2, c + width / 2
+    if a < lo:
+        a, b = lo, lo + width
+    if b > hi:
+        a, b = hi - width, hi
+    return int(round(max(lo, a))), int(round(min(hi, b)))
 
 
 def _detect_grid_rois(arr: np.ndarray, cam_key: str) -> list:
     """Detect individual pulser ROIs from a reference image.
 
-    1) Fit a regular grid so the dark separators are located consistently.
-    2) Refine each ROI edge to the half-max brightness crossing of the lit area,
-       so the ROI borders sit exactly on the edges of the bright pulser patches.
+    1) Fit a regular comb over the global row/column profiles to locate the cell
+       centres + pitch consistently, robust even when several pulsers are dark
+       (the skeleton).
+    2) For EACH cell, search a local window clamped to the midpoints with its
+       neighbours and cut the box to the actual bright tile in 2-D (`_cell_bbox`).
+       Every diode gets its own size/position, the box fills the tile up to the
+       dark separators, and it can never reach into a neighbour.
+    3) A cell with no clear patch (a dark/off pulser) falls back to the regular
+       comb cell, so it still gets a full-size, correctly-placed ROI to nudge.
     `arr` is a float32 grayscale image (values roughly 0..1)."""
     cols = CAM_COLS.get(cam_key, ["A", "B", "C", "D", "E"])
     rows = _ROW_LABELS
@@ -450,29 +527,50 @@ def _detect_grid_rois(arr: np.ndarray, cam_key: str) -> list:
     if w < n_cols * 4 or h < n_rows * 4:
         return _make_default_rois(cam_key, w, h)
 
+    # ── Skeleton: regular comb over the global profiles ────────────────────────
     col_prof = _smooth1d(arr.mean(axis=0).astype(np.float32), max(3, w // 120))
     row_prof = _smooth1d(arr.mean(axis=1).astype(np.float32), max(3, h // 120))
-
     x_edges = _axis_edges(col_prof, n_cols)
     y_edges = _axis_edges(row_prof, n_rows)
 
-    # Detrend (illumination-flatten) then locate the bright-patch edges per axis
-    x_detr = _detrend(col_prof, max(3, int((x_edges[-1] - x_edges[0]) / n_cols * 1.5)))
-    y_detr = _detrend(row_prof, max(3, int((y_edges[-1] - y_edges[0]) / n_rows * 1.5)))
-    x_spans = _bright_edges(x_detr, x_edges)
-    y_spans = _bright_edges(y_detr, y_edges)
+    x_centers = _cell_centers(x_edges)
+    y_centers = _cell_centers(y_edges)
+    x_pitch = (x_centers[-1] - x_centers[0]) / max(1, n_cols - 1) if n_cols > 1 else float(w)
+    y_pitch = (y_centers[-1] - y_centers[0]) / max(1, n_rows - 1) if n_rows > 1 else float(h)
+    x_clamps = _neighbor_clamps(x_centers, x_pitch, w)
+    y_clamps = _neighbor_clamps(y_centers, y_pitch, h)
+    pitch = min(x_pitch, y_pitch)
 
     rois = []
     for ri in range(n_rows):
-        sy0, sy1 = y_spans[ri]
+        cy = y_centers[ri]
+        wy0, wy1 = y_clamps[ri]
         for ci in range(n_cols):
-            sx0, sx1 = x_spans[ci]
-            if sx1 - sx0 < 4 or sy1 - sy0 < 4:
-                continue
+            cx = x_centers[ci]
+            wx0, wx1 = x_clamps[ci]
             name = f"{cols[ci]}{rows[ri]}"
             color = _ROI_COLORS[(ri * n_cols + ci) % len(_ROI_COLORS)]
-            rois.append(RoiDefinition(name=name, x=sx0, y=sy0,
-                                      w=sx1 - sx0, h=sy1 - sy0, color=color))
+
+            bbox = _cell_bbox(arr[wy0:wy1, wx0:wx1], pitch)
+            if bbox is not None:
+                ix0, iy0 = wx0 + bbox[0], wy0 + bbox[1]
+                ix1, iy1 = wx0 + bbox[2], wy0 + bbox[3]
+                # Safety net: keep the box a sane cell, never crossing a neighbour.
+                ix0, ix1 = _sane_span(ix0, ix1, cx, x_pitch, wx0, wx1)
+                iy0, iy1 = _sane_span(iy0, iy1, cy, y_pitch, wy0, wy1)
+            else:
+                # No clear patch (dark/off pulser) → full comb cell to nudge.
+                ix0, ix1, iy0, iy1 = wx0, wx1, wy0, wy1
+
+            in_x = max(1, int((ix1 - ix0) * _ROI_INSET_FRAC))
+            in_y = max(1, int((iy1 - iy0) * _ROI_INSET_FRAC))
+            x0, y0, x1, y1 = ix0 + in_x, iy0 + in_y, ix1 - in_x, iy1 - in_y
+            x0, y0 = max(0, x0), max(0, y0)
+            x1, y1 = min(w, x1), min(h, y1)
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                continue
+            rois.append(RoiDefinition(name=name, x=x0, y=y0,
+                                      w=x1 - x0, h=y1 - y0, color=color))
     if not rois:
         return _make_default_rois(cam_key, w, h)
     return rois

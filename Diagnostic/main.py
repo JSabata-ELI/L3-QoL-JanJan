@@ -234,6 +234,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._monitor_tab, "PV Monitor")
         tabs.addTab(HistoryTab(), "History")
 
+        # Log stays the last tab — add any new tabs above this line.
+        tabs.addTab(self._monitor_tab.log, "Log")
+
         self.setCentralWidget(tabs)
 
     def closeEvent(self, event):
