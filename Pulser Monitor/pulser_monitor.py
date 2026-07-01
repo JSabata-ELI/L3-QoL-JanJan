@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,6 +31,7 @@ import matplotlib.dates as mdates
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 
 from PySide6.QtCore import (
     Qt, QDate, QObject, Signal, QEvent, QPoint, QRect,
@@ -46,8 +47,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
-    QSizePolicy, QSpinBox, QStatusBar, QStyledItemDelegate, QTabWidget,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QStatusBar, QStyledItemDelegate,
+    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 # ── CONSTANTS ──────────────────────────────────────────────────────────────────
@@ -58,6 +59,7 @@ SUCCESS     = "#2E7D32"
 SUCCESS_HOV = "#1B5E20"
 DANGER      = "#B71C1C"
 DANGER_HOV  = "#7F0000"
+NODATA_CLR  = "#9E9E9E"   # gray — frame had no real array data
 
 IMAGES_ROOT_OPTIONS = {
     "Lab":    Path(r"//users-L3.tier0.lcs.local/cpva-image-2026"),
@@ -196,6 +198,217 @@ class SamplePoint:
     roi_means: list
     roi_norms: list
     roi_alive: list
+    frame_mean: float = 1.0   # mean brightness of the whole frame (for no-data detection)
+
+
+# ── STATE MODEL & ANALYSIS ──────────────────────────────────────────────────────
+# Per-pulser, per-frame state:
+STATE_OFF    = 0    # array present but this pulser is dark  → counts toward dropouts
+STATE_ON     = 1    # pulser lit
+STATE_NODATA = -1   # whole frame is dark / no real array data → a gap, never a dropout
+
+
+@dataclass
+class DropoutEvent:
+    start_ns: int                    # ts of the first OFF frame of this dropout
+    recovery_ns: "int | None" = None  # ts of the first ON frame after it (None = still down)
+    dark_frames: int = 0             # number of OFF frames in the dropout
+    nodata_frames: int = 0           # number of no-data frames spanned by the dropout
+
+    def duration_ns(self, end_fallback_ns: int) -> int:
+        end = self.recovery_ns if self.recovery_ns is not None else end_fallback_ns
+        return max(0, end - self.start_ns)
+
+
+@dataclass
+class PulserStats:
+    name: str
+    dropouts: int = 0
+    longest_run_ns: int = 0          # longest run without a dropout (wall-clock, incl. no-data)
+    longest_run_active_ns: int = 0   # same run but with no-data gaps subtracted
+    uptime_pct: float = 0.0          # ON / (ON+OFF) frames
+    total_down_ns: int = 0
+    frames: int = 0
+    on_frames: int = 0
+    off_frames: int = 0
+    nodata_frames: int = 0
+    first_drop_ns: "int | None" = None
+    last_drop_ns: "int | None" = None
+    span_ns: int = 0                 # ts[last] - ts[first]
+    current_state: int = STATE_NODATA
+    events: list = field(default_factory=list)
+
+    @property
+    def mtbf_ns(self) -> "int | None":
+        """Mean time between dropouts (observed span / number of dropouts)."""
+        if self.dropouts <= 0:
+            return None
+        return int(self.span_ns / self.dropouts)
+
+
+@dataclass
+class CameraAnalysis:
+    stats: list                       # PulserStats per ROI, aligned to the rois order
+    state_matrix: "np.ndarray"        # shape (n_rois, n_frames): STATE_ON/OFF/NODATA
+    frame_nodata: list                # bool per frame
+    times_ns: list                    # ts_ns per frame
+
+
+def _fmt_dur(ns: "int | None") -> str:
+    """Human-readable duration from nanoseconds, e.g. '3d 4h', '5h 12m', '45m', '30s'."""
+    if ns is None:
+        return "—"
+    s = int(ns // 1_000_000_000)
+    if s < 0:
+        s = 0
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+def _compute_pulser_stats(name: str, st: list, times: list) -> PulserStats:
+    """Compute per-pulser statistics from a cleaned per-frame state sequence `st`."""
+    n = len(st)
+    ps = PulserStats(name=name)
+    if n == 0:
+        return ps
+    ps.frames = n
+    ps.on_frames = sum(1 for s in st if s == STATE_ON)
+    ps.off_frames = sum(1 for s in st if s == STATE_OFF)
+    ps.nodata_frames = sum(1 for s in st if s == STATE_NODATA)
+    data_frames = ps.on_frames + ps.off_frames
+    ps.uptime_pct = 100.0 * ps.on_frames / data_frames if data_frames else 0.0
+    ps.span_ns = times[-1] - times[0]
+
+    # Prefix sum of no-data interval time so a run can subtract the gaps inside it.
+    nd_cum = [0] * n
+    acc = 0
+    for i in range(n - 1):
+        dt = times[i + 1] - times[i]
+        if st[i] == STATE_NODATA:
+            acc += dt
+        nd_cum[i + 1] = acc
+
+    def nd_between(i0: int, i1: int) -> int:
+        return nd_cum[i1] - nd_cum[i0]
+
+    longest = longest_active = 0
+    dropouts = 0
+    events: list = []
+    first_drop = last_drop = None
+    in_dropout = False
+    run_start = None
+    last_data_state = STATE_NODATA
+
+    for i, s in enumerate(st):
+        if s == STATE_ON:
+            last_data_state = STATE_ON
+            if run_start is None:
+                run_start = i
+            if in_dropout:
+                in_dropout = False
+                events[-1].recovery_ns = times[i]
+                run_start = i
+        elif s == STATE_OFF:
+            last_data_state = STATE_OFF
+            if not in_dropout:
+                if run_start is not None:
+                    wall = times[i] - times[run_start]
+                    active = wall - nd_between(run_start, i)
+                    longest = max(longest, wall)
+                    longest_active = max(longest_active, active)
+                in_dropout = True
+                dropouts += 1
+                events.append(DropoutEvent(start_ns=times[i]))
+                if first_drop is None:
+                    first_drop = times[i]
+                last_drop = times[i]
+            events[-1].dark_frames += 1
+        else:  # STATE_NODATA
+            if in_dropout:
+                events[-1].nodata_frames += 1
+
+    if not in_dropout and run_start is not None:
+        wall = times[-1] - times[run_start]
+        active = wall - nd_between(run_start, n - 1)
+        longest = max(longest, wall)
+        longest_active = max(longest_active, active)
+
+    total_down = sum(ev.duration_ns(times[-1]) for ev in events)
+
+    ps.dropouts = dropouts
+    ps.longest_run_ns = longest
+    ps.longest_run_active_ns = longest_active
+    ps.total_down_ns = total_down
+    ps.events = events
+    ps.first_drop_ns = first_drop
+    ps.last_drop_ns = last_drop
+    ps.current_state = last_data_state if st[-1] == STATE_NODATA else st[-1]
+    return ps
+
+
+def analyze_camera(rois: list, sample_points: list, thr_high: float,
+                   thr_low: float, nodata_floor: float, debounce: int) -> CameraAnalysis:
+    """Turn raw brightness samples into stabilised ON/OFF/NODATA states and per-pulser stats.
+
+    - A frame whose whole-frame brightness < nodata_floor is NODATA for every pulser.
+    - Otherwise a pulser is ON when norm >= thr_high, OFF when norm <= thr_low, and holds
+      its previous state in between (hysteresis) — this kills flicker near the threshold.
+    - OFF runs shorter than `debounce` consecutive data frames are treated as ON (noise).
+    """
+    n_rois = len(rois)
+    n = len(sample_points)
+    times = [sp.ts_ns for sp in sample_points]
+    frame_nodata = [float(getattr(sp, "frame_mean", 1.0)) < nodata_floor for sp in sample_points]
+    state_matrix = np.full((n_rois, n), STATE_NODATA, dtype=int)
+    stats: list = []
+
+    for r in range(n_rois):
+        raw = [STATE_NODATA] * n
+        prev = STATE_ON
+        for i, sp in enumerate(sample_points):
+            if frame_nodata[i]:
+                raw[i] = STATE_NODATA
+                continue
+            norm = sp.roi_norms[r] if r < len(sp.roi_norms) else 0.0
+            if norm >= thr_high:
+                s = STATE_ON
+            elif norm <= thr_low:
+                s = STATE_OFF
+            else:
+                s = prev
+            raw[i] = s
+            prev = s
+
+        # Debounce: flip too-short OFF runs (among data frames) back to ON.
+        if debounce > 1:
+            data_idx = [i for i in range(n) if raw[i] != STATE_NODATA]
+            k, m = 0, len(data_idx)
+            while k < m:
+                if raw[data_idx[k]] == STATE_OFF:
+                    j = k
+                    while j < m and raw[data_idx[j]] == STATE_OFF:
+                        j += 1
+                    if (j - k) < debounce:
+                        for t in range(k, j):
+                            raw[data_idx[t]] = STATE_ON
+                    k = j
+                else:
+                    k += 1
+
+        for i in range(n):
+            state_matrix[r, i] = raw[i]
+        stats.append(_compute_pulser_stats(rois[r].name, raw, times))
+
+    return CameraAnalysis(stats=stats, state_matrix=state_matrix,
+                          frame_nodata=frame_nodata, times_ns=times)
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -927,7 +1140,9 @@ class _ScanWorker(QRunnable):
                         roi_means.append(float(arr[y0:y1, x0:x1].mean()))
                 roi_norms = _normalize(roi_means, self._norm_mode, self._rois)
                 roi_alive = [n >= self._threshold for n in roi_norms]
-                self._sig.sample.emit(SamplePoint(ts_ns, path, roi_means, roi_norms, roi_alive))
+                frame_mean = float(arr.mean())
+                self._sig.sample.emit(
+                    SamplePoint(ts_ns, path, roi_means, roi_norms, roi_alive, frame_mean))
                 self._sig.progress.emit(idx + 1, total)
             if self._gen_box[0] == self._my_gen:
                 self._sig.finished.emit()
@@ -1543,298 +1758,526 @@ class ROIEditorDialog(QDialog):
 
 # ── RESULT TABS ───────────────────────────────────────────────────────────────
 
-class _TimelineTab(QWidget):
-    sample_selected = Signal(int)
+def _state_str(s: int) -> str:
+    return {STATE_ON: "ON", STATE_OFF: "OFF", STATE_NODATA: "no-data"}.get(s, "—")
+
+
+def _grid_layout_for(cam_key: str, rois: list):
+    """Return (rows, cols, cell_index) mapping the physical 5x8 grid onto ROI indices.
+
+    rows = ordered list of row labels, cols = ordered list of column labels,
+    cell_index[(ri, ci)] = index into `rois` (missing pairs are simply absent).
+    Falls back to a compact left-to-right / top-to-bottom grid if names don't parse.
+    """
+    name_to_idx = {r.name: i for i, r in enumerate(rois)}
+    parsed = {}      # name -> (col_letters, row_number)
+    row_nums, col_letters = set(), []
+    ok = True
+    for r in rois:
+        m = re.match(r"^([A-Za-z]+)(\d+)$", r.name)
+        if not m:
+            ok = False
+            break
+        col, num = m.group(1), int(m.group(2))
+        parsed[r.name] = (col, num)
+        row_nums.add(num)
+        if col not in col_letters:
+            col_letters.append(col)
+    if ok and parsed:
+        cols = [c for c in CAM_COLS.get(cam_key, []) if c in col_letters]
+        for c in col_letters:              # append any extra columns not in CAM_COLS
+            if c not in cols:
+                cols.append(c)
+        rows = [str(n) for n in sorted(row_nums)]
+        cell_index = {}
+        for ri, rlbl in enumerate(rows):
+            for ci, clbl in enumerate(cols):
+                name = f"{clbl}{rlbl}"
+                if name in name_to_idx:
+                    cell_index[(ri, ci)] = name_to_idx[name]
+        return rows, cols, cell_index
+    # Fallback: pack sequentially into a grid sized from CAM_COLS.
+    cols = CAM_COLS.get(cam_key, ["A", "B", "C", "D", "E"])
+    n_cols = max(1, len(cols))
+    n_rows = (len(rois) + n_cols - 1) // n_cols
+    rows = [str(i + 1) for i in range(n_rows)]
+    cell_index = {(i // n_cols, i % n_cols): i for i in range(len(rois))}
+    return rows, cols, cell_index
+
+
+class _MapTab(QWidget):
+    """Interactive pulser map (heatmap of dropout counts) + dropout table + timeline."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._fig = Figure(figsize=(10, 4))
-        self._canvas = FigureCanvasQTAgg(self._fig)
-        self._toolbar = NavigationToolbar2QT(self._canvas, self)
-        self._ax = self._fig.add_subplot(111)
-        self._times_num = []
-        self._sample_points = []
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(4, 4, 4, 4)
-        lay.addWidget(self._toolbar)
-        lay.addWidget(self._canvas, 1)
-        self._canvas.mpl_connect("button_press_event", self._on_click)
+        self._cam_key = ""
+        self._rois: list = []
+        self._stats: list = []          # PulserStats aligned to rois
+        self._rows_lbl: list = []
+        self._cols_lbl: list = []
+        self._cell_index: dict = {}
+        self._sel_roi: "int | None" = None
+        self._events: list = []         # events of the selected pulser
+        self._sel_event = 0
+        self._start_ns: "int | None" = None
+        self._end_ns: "int | None" = None
+        self._annot = None
+        self._build_ui()
 
-    def update_data(self, sample_points: list, rois: list, threshold: float):
-        self._sample_points = sample_points
-        self._ax.clear()
-        if not sample_points or not rois:
-            self._ax.text(0.5, 0.5, "No scan data yet",
-                         transform=self._ax.transAxes,
-                         ha="center", va="center", color="#888", fontsize=12)
-            self._canvas.draw()
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+
+        # LEFT — map + colorbar
+        left_w = QWidget()
+        left = QVBoxLayout(left_w)
+        left.setContentsMargins(0, 0, 0, 0)
+        self._map_fig = Figure(figsize=(5, 4))
+        self._map_canvas = FigureCanvasQTAgg(self._map_fig)
+        self._map_ax = self._map_fig.add_subplot(111)
+        self._map_canvas.mpl_connect("motion_notify_event", self._on_hover)
+        self._map_canvas.mpl_connect("button_press_event", self._on_click)
+        left.addWidget(self._map_canvas, 1)
+        map_btns = QHBoxLayout()
+        btn_map = QPushButton("Export map (PNG)…")
+        btn_map.setStyleSheet(_BTN)
+        btn_map.clicked.connect(self._export_map)
+        map_btns.addWidget(btn_map)
+        map_btns.addStretch(1)
+        left.addLayout(map_btns)
+
+        # RIGHT — dropout table + timeline
+        right_w = QWidget()
+        right = QVBoxLayout(right_w)
+        right.setContentsMargins(0, 0, 0, 0)
+        self._sel_lbl = QLabel("Click a pulser in the map")
+        self._sel_lbl.setStyleSheet("font-weight:bold;color:#111;")
+        right.addWidget(self._sel_lbl)
+        self._tbl = QTableWidget(0, 4)
+        self._tbl.setHorizontalHeaderLabels(["#", "Dropout start", "Recovery", "Duration"])
+        self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._tbl.setAlternatingRowColors(True)
+        self._tbl.setStyleSheet(
+            "QTableWidget{background:#fff;gridline-color:#e0e0e0;}"
+            "QTableWidget::item{background:#fff;color:#111;padding:2px 4px;}"
+            "QTableWidget::item:alternate{background:#e8f0fe;color:#111;}"
+            "QTableWidget::item:selected{background:#1565C0;color:#fff;}"
+        )
+        self._tbl.itemSelectionChanged.connect(self._on_table_sel)
+        right.addWidget(self._tbl, 1)
+
+        self._tl_fig = Figure(figsize=(5, 1.4))
+        self._tl_canvas = FigureCanvasQTAgg(self._tl_fig)
+        self._tl_ax = self._tl_fig.add_subplot(111)
+        right.addWidget(self._tl_canvas)
+
+        nav = QHBoxLayout()
+        btn_prev = QPushButton("◀")
+        btn_prev.setFixedWidth(36)
+        btn_prev.clicked.connect(lambda: self._step_event(-1))
+        btn_next = QPushButton("▶")
+        btn_next.setFixedWidth(36)
+        btn_next.clicked.connect(lambda: self._step_event(1))
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setEnabled(False)
+        self._slider.valueChanged.connect(self._on_slider)
+        self._ev_lbl = QLabel("—")
+        self._ev_lbl.setStyleSheet("font-size:10px;color:#555;")
+        nav.addWidget(btn_prev)
+        nav.addWidget(self._slider, 1)
+        nav.addWidget(btn_next)
+        nav.addWidget(self._ev_lbl)
+        right.addLayout(nav)
+
+        btn_csv = QPushButton("Export dropouts (CSV)…")
+        btn_csv.setStyleSheet(_BTN)
+        btn_csv.clicked.connect(self._export_csv)
+        right.addWidget(btn_csv)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(left_w)
+        split.addWidget(right_w)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        root.addWidget(split)
+
+    # ── data / drawing ──────────────────────────────────────────────────────
+    def update_data(self, cam_key: str, rois: list, analysis: "CameraAnalysis | None",
+                    start_ns: "int | None", end_ns: "int | None"):
+        self._cam_key = cam_key
+        self._rois = rois
+        self._stats = analysis.stats if analysis else []
+        self._start_ns = start_ns
+        self._end_ns = end_ns
+        self._sel_roi = None
+        self._events = []
+        self._sel_event = 0
+        self._draw_map()
+        self._clear_selection()
+
+    def _draw_map(self):
+        self._map_ax.clear()
+        self._map_fig.clf()
+        self._map_ax = self._map_fig.add_subplot(111)
+        if not self._rois or not self._stats:
+            self._map_ax.text(0.5, 0.5, "No scan data yet", transform=self._map_ax.transAxes,
+                              ha="center", va="center", color="#888", fontsize=12)
+            self._map_canvas.draw()
             return
-        n_rois = len(rois)
-        n_times = len(sample_points)
-        alive_matrix = np.full((n_rois, n_times), np.nan)
-        self._times_num = []
-        for t_idx, sp in enumerate(sample_points):
-            dt = _ns_to_dt(sp.ts_ns)
-            self._times_num.append(mdates.date2num(dt))
-            for r_idx in range(n_rois):
-                if r_idx < len(sp.roi_alive):
-                    alive_matrix[r_idx, t_idx] = 1.0 if sp.roi_alive[r_idx] else 0.0
-        cmap = ListedColormap([DANGER, SUCCESS])
-        cmap.set_bad("lightgray")
-        masked = np.ma.masked_invalid(alive_matrix)
-        if len(self._times_num) > 1:
-            dt_half = (self._times_num[1] - self._times_num[0]) * 0.5
-            t0 = self._times_num[0] - dt_half
-            t1 = self._times_num[-1] + dt_half
-        else:
-            t0 = self._times_num[0] - 0.001
-            t1 = self._times_num[0] + 0.001
-        self._ax.imshow(masked, aspect="auto", cmap=cmap, vmin=0, vmax=1,
-                        interpolation="nearest",
-                        extent=[t0, t1, n_rois - 0.5, -0.5])
-        self._ax.set_yticks(range(n_rois))
-        self._ax.set_yticklabels([r.name for r in rois], fontsize=9)
-        self._ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
-        self._ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-        self._fig.autofmt_xdate(rotation=30)
-        self._ax.set_title("Pulser alive (green) / dead (red)  —  click to inspect")
-        self._ax.set_xlabel("Prague time")
-        self._fig.tight_layout()
-        self._canvas.draw()
+        rows, cols, cell_index = _grid_layout_for(self._cam_key, self._rois)
+        self._rows_lbl, self._cols_lbl, self._cell_index = rows, cols, cell_index
+        n_rows, n_cols = len(rows), len(cols)
+        mat = np.full((n_rows, n_cols), np.nan)
+        for (ri, ci), idx in cell_index.items():
+            if idx < len(self._stats):
+                mat[ri, ci] = self._stats[idx].dropouts
+        cmap = matplotlib.colormaps["YlOrRd"].copy()
+        cmap.set_bad("#dddddd")
+        vmax = np.nanmax(mat) if np.isfinite(np.nanmax(mat)) else 1
+        im = self._map_ax.imshow(np.ma.masked_invalid(mat), cmap=cmap, aspect="auto",
+                                 vmin=0, vmax=max(1, vmax), interpolation="nearest",
+                                 extent=[-0.5, n_cols - 0.5, n_rows - 0.5, -0.5])
+        self._map_ax.set_xticks(range(n_cols))
+        self._map_ax.set_xticklabels(cols)
+        self._map_ax.set_yticks(range(n_rows))
+        self._map_ax.set_yticklabels(rows)
+        self._map_ax.set_title(f"{self._cam_key} — dropouts per pulser  (click a cell)")
+        for (ri, ci), idx in cell_index.items():
+            self._map_ax.text(ci, ri, self._rois[idx].name, ha="center", va="center",
+                              fontsize=7, color="#222")
+        cbar = self._map_fig.colorbar(im, ax=self._map_ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Dropouts")
+        self._annot = self._map_ax.annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="#ffffe0", ec="#888", alpha=0.95),
+            fontsize=8, zorder=20)
+        self._annot.set_visible(False)
+        self._map_fig.tight_layout()
+        self._map_canvas.draw()
+
+    def _cell_at(self, event):
+        if event.inaxes != self._map_ax or event.xdata is None or event.ydata is None:
+            return None
+        ci = int(round(event.xdata))
+        ri = int(round(event.ydata))
+        return self._cell_index.get((ri, ci))
+
+    def _tooltip_text(self, idx: int) -> str:
+        st = self._stats[idx]
+        last_drop = (_ns_to_dt(st.last_drop_ns).strftime("%Y-%m-%d %H:%M")
+                     if st.last_drop_ns else "—")
+        return "\n".join([
+            f"{st.name}",
+            f"Dropouts: {st.dropouts}",
+            f"Longest run: {_fmt_dur(st.longest_run_ns)}",
+            f"Longest run (no gaps): {_fmt_dur(st.longest_run_active_ns)}",
+            f"Uptime: {st.uptime_pct:.1f}%",
+            f"State: {_state_str(st.current_state)}",
+            f"Last dropout: {last_drop}",
+            f"Total downtime: {_fmt_dur(st.total_down_ns)}",
+            f"MTBF: {_fmt_dur(st.mtbf_ns)}",
+            f"Frames: {st.frames}",
+        ])
+
+    def _on_hover(self, event):
+        if self._annot is None:
+            return
+        idx = self._cell_at(event)
+        if idx is None:
+            if self._annot.get_visible():
+                self._annot.set_visible(False)
+                self._map_canvas.draw_idle()
+            return
+        self._annot.xy = (event.xdata, event.ydata)
+        self._annot.set_text(self._tooltip_text(idx))
+        self._annot.set_visible(True)
+        self._map_canvas.draw_idle()
 
     def _on_click(self, event):
-        if event.inaxes != self._ax or not self._times_num:
+        idx = self._cell_at(event)
+        if idx is None:
             return
-        x = event.xdata
-        if x is None:
+        self._select_pulser(idx)
+
+    def _select_pulser(self, idx: int):
+        self._sel_roi = idx
+        st = self._stats[idx]
+        self._events = list(st.events)
+        self._sel_event = 0
+        self._sel_lbl.setText(
+            f"{st.name} — {st.dropouts} dropout(s), uptime {st.uptime_pct:.1f}%")
+        # fill table
+        self._tbl.blockSignals(True)
+        self._tbl.setRowCount(0)
+        for i, ev in enumerate(self._events):
+            r = self._tbl.rowCount()
+            self._tbl.insertRow(r)
+            start_s = _ns_to_dt(ev.start_ns).strftime("%Y-%m-%d %H:%M:%S")
+            rec_s = (_ns_to_dt(ev.recovery_ns).strftime("%Y-%m-%d %H:%M:%S")
+                     if ev.recovery_ns else "— (still down)")
+            dur_s = _fmt_dur(ev.duration_ns(self._end_ns or ev.start_ns))
+            for c, txt in enumerate([str(i + 1), start_s, rec_s, dur_s]):
+                it = QTableWidgetItem(txt)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._tbl.setItem(r, c, it)
+        self._tbl.blockSignals(False)
+        # slider
+        self._slider.blockSignals(True)
+        self._slider.setEnabled(bool(self._events))
+        self._slider.setRange(0, max(0, len(self._events) - 1))
+        self._slider.setValue(0)
+        self._slider.blockSignals(False)
+        self._draw_timeline()
+        if self._events:
+            self._set_event(0)
+
+    def _clear_selection(self):
+        self._tbl.setRowCount(0)
+        self._sel_lbl.setText("Click a pulser in the map")
+        self._ev_lbl.setText("—")
+        self._slider.setEnabled(False)
+        self._draw_timeline()
+
+    def _draw_timeline(self):
+        self._tl_ax.clear()
+        if not self._events or self._start_ns is None or self._end_ns is None:
+            self._tl_ax.set_yticks([])
+            self._tl_ax.text(0.5, 0.5, "No dropouts", transform=self._tl_ax.transAxes,
+                             ha="center", va="center", color="#aaa", fontsize=9)
+            self._tl_fig.tight_layout()
+            self._tl_canvas.draw()
             return
-        idx = int(np.argmin([abs(x - t) for t in self._times_num]))
-        self.sample_selected.emit(idx)
+        t0 = mdates.date2num(_ns_to_dt(self._start_ns))
+        t1 = mdates.date2num(_ns_to_dt(self._end_ns))
+        self._tl_ax.set_xlim(t0, t1)
+        self._tl_ax.set_ylim(0, 1)
+        self._tl_ax.set_yticks([])
+        for i, ev in enumerate(self._events):
+            x = mdates.date2num(_ns_to_dt(ev.start_ns))
+            is_sel = (i == self._sel_event)
+            self._tl_ax.axvline(x, color=PRIMARY if is_sel else DANGER,
+                                linewidth=2.5 if is_sel else 1.2,
+                                alpha=1.0 if is_sel else 0.7)
+        # adaptive ticks
+        span_days = max(1e-6, t1 - t0)
+        loc = mdates.AutoDateLocator()
+        self._tl_ax.xaxis.set_major_locator(loc)
+        if span_days <= 1.5:
+            fmt = "%H:%M"
+        elif span_days <= 8:
+            fmt = "%m-%d %Hh"
+        else:
+            fmt = "%m-%d"
+        self._tl_ax.xaxis.set_major_formatter(mdates.DateFormatter(fmt))
+        self._tl_ax.tick_params(labelsize=8)
+        for lbl in self._tl_ax.get_xticklabels():
+            lbl.set_rotation(20)
+        self._tl_fig.tight_layout()
+        self._tl_canvas.draw()
 
-
-class _OverlayCanvas(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._pm: "QPixmap | None" = None
-        self._rois: list = []
-        self._roi_norms: list = []
-        self._roi_alive: list = []
-        self._show_overlay = True
-        self._show_labels = True
-        self.setMinimumSize(200, 150)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        pal = self.palette()
-        pal.setColor(self.backgroundRole(), QColor(40, 40, 40))
-        self.setAutoFillBackground(True)
-        self.setPalette(pal)
-
-    def set_image(self, pm: "QPixmap | None"):
-        self._pm = pm
-        self.update()
-
-    def set_overlay(self, rois: list, roi_norms: list, roi_alive: list):
-        self._rois = rois
-        self._roi_norms = roi_norms
-        self._roi_alive = roi_alive
-        self.update()
-
-    def set_show_overlay(self, v: bool):
-        self._show_overlay = v
-        self.update()
-
-    def set_show_labels(self, v: bool):
-        self._show_labels = v
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.fillRect(self.rect(), QColor(40, 40, 40))
-        if self._pm is None or self._pm.isNull():
-            p.setPen(QColor(180, 180, 180))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                       "Click a timeline cell to load image preview")
-            p.end()
+    def _set_event(self, idx: int):
+        if not self._events:
             return
-        pm_w, pm_h = self._pm.width(), self._pm.height()
-        cw, ch = self.width(), self.height()
-        scale = min(cw / pm_w, ch / pm_h)
-        dw, dh = int(pm_w * scale), int(pm_h * scale)
-        ox, oy = (cw - dw) // 2, (ch - dh) // 2
-        p.drawPixmap(ox, oy, dw, dh, self._pm)
-        if self._show_overlay:
-            for i, roi in enumerate(self._rois):
-                alive = self._roi_alive[i] if i < len(self._roi_alive) else True
-                c = QColor(SUCCESS if alive else DANGER)
-                p.setPen(QPen(c, 2))
-                p.setBrush(QBrush(QColor(c.red(), c.green(), c.blue(), 40)))
-                rx = int(roi.x * scale + ox)
-                ry = int(roi.y * scale + oy)
-                rw = int(roi.w * scale)
-                rh = int(roi.h * scale)
-                p.drawRect(QRect(rx, ry, rw, rh))
-                if self._show_labels and rh > 16:
-                    norm_s = f"{self._roi_norms[i]:.2f}" if i < len(self._roi_norms) else ""
-                    p.setPen(QColor(255, 255, 255))
-                    f = QFont(); f.setPointSize(8); p.setFont(f)
-                    p.drawText(QRect(rx + 2, ry + 2, rw - 2, rh - 2),
-                               Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
-                               f"{roi.name}\n{norm_s}")
-        p.end()
+        self._sel_event = max(0, min(len(self._events) - 1, idx))
+        ev = self._events[self._sel_event]
+        self._ev_lbl.setText(f"{self._sel_event + 1}/{len(self._events)}  "
+                             f"{_ns_to_dt(ev.start_ns).strftime('%m-%d %H:%M')}")
+        self._slider.blockSignals(True)
+        self._slider.setValue(self._sel_event)
+        self._slider.blockSignals(False)
+        self._tbl.blockSignals(True)
+        self._tbl.selectRow(self._sel_event)
+        self._tbl.blockSignals(False)
+        self._draw_timeline()
+
+    def _step_event(self, delta: int):
+        self._set_event(self._sel_event + delta)
+
+    def _on_slider(self, v: int):
+        self._set_event(v)
+
+    def _on_table_sel(self):
+        r = self._tbl.currentRow()
+        if r >= 0:
+            self._set_event(r)
+
+    # ── exports ─────────────────────────────────────────────────────────────
+    def _export_map(self):
+        if not self._rois or not self._stats:
+            QMessageBox.information(self, "Export", "No data to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export map", f"pulser_map_{self._cam_key}.png",
+            "PNG (*.png);;All files (*)")
+        if not path:
+            return
+        try:
+            self._map_fig.savefig(path, dpi=150, bbox_inches="tight")
+            QMessageBox.information(self, "Export", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export", f"Failed:\n{exc}")
+
+    def _export_csv(self):
+        if self._sel_roi is None:
+            QMessageBox.information(self, "Export", "Click a pulser first.")
+            return
+        st = self._stats[self._sel_roi]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export dropouts", f"dropouts_{self._cam_key}_{st.name}.csv",
+            "CSV (*.csv);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["#", "dropout_start", "recovery", "duration",
+                            "dark_frames", "nodata_frames"])
+                for i, ev in enumerate(st.events):
+                    rec = (_ns_to_dt(ev.recovery_ns).strftime("%Y-%m-%d %H:%M:%S")
+                           if ev.recovery_ns else "")
+                    w.writerow([
+                        i + 1,
+                        _ns_to_dt(ev.start_ns).strftime("%Y-%m-%d %H:%M:%S"),
+                        rec, _fmt_dur(ev.duration_ns(self._end_ns or ev.start_ns)),
+                        ev.dark_frames, ev.nodata_frames])
+            QMessageBox.information(self, "Export", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export", f"Failed:\n{exc}")
 
 
-class _PreviewLoadSig(QObject):
-    ready = Signal(object, int)
+class _RunGraphTab(QWidget):
+    """Per-pulser run over time: ON/OFF/NODATA state bands, or brightness lines."""
 
-
-class _PreviewTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._sample_points: list = []
         self._rois: list = []
-        self._current_idx: "int | None" = None
-        self._prev_gen = 0
-        self._load_sig = _PreviewLoadSig()
-        self._load_sig.ready.connect(self._on_ready)
-        self._build_ui()
-
-    def _build_ui(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(4, 4, 4, 4)
-        tb = QHBoxLayout()
-        self._path_lbl = QLabel("—")
-        self._path_lbl.setStyleSheet("font-size:10px;color:#555;")
-        btn_prev = QPushButton("◀")
-        btn_prev.setFixedWidth(32)
-        btn_prev.clicked.connect(lambda: self._step(-1))
-        btn_next = QPushButton("▶")
-        btn_next.setFixedWidth(32)
-        btn_next.clicked.connect(lambda: self._step(1))
-        chk_ov = QCheckBox("Overlays")
-        chk_ov.setChecked(True)
-        chk_ov.setStyleSheet(_CHECKBOX_STYLE)
-        chk_ov.stateChanged.connect(lambda s: self._canvas.set_show_overlay(s > 0))
-        chk_lb = QCheckBox("Labels")
-        chk_lb.setChecked(True)
-        chk_lb.setStyleSheet(_CHECKBOX_STYLE)
-        chk_lb.stateChanged.connect(lambda s: self._canvas.set_show_labels(s > 0))
-        tb.addWidget(self._path_lbl, 1)
-        tb.addWidget(btn_prev)
-        tb.addWidget(btn_next)
-        tb.addSpacing(8)
-        tb.addWidget(chk_ov)
-        tb.addWidget(chk_lb)
-        self._canvas = _OverlayCanvas(self)
-        lay.addLayout(tb)
-        lay.addWidget(self._canvas, 1)
-
-    def set_data(self, sample_points: list, rois: list):
-        self._sample_points = sample_points
-        self._rois = rois
-        if sample_points:
-            self._current_idx = 0
-            self._load()
-
-    def select_sample(self, idx: int):
-        if not self._sample_points:
-            return
-        self._current_idx = max(0, min(len(self._sample_points) - 1, idx))
-        self._load()
-
-    def _step(self, delta: int):
-        if self._current_idx is None or not self._sample_points:
-            return
-        self._current_idx = max(0, min(len(self._sample_points) - 1,
-                                       self._current_idx + delta))
-        self._load()
-
-    def _load(self):
-        if self._current_idx is None:
-            return
-        sp = self._sample_points[self._current_idx]
-        self._path_lbl.setText(
-            f"[{self._current_idx + 1}/{len(self._sample_points)}]  {sp.path.name}")
-        self._canvas.set_overlay(self._rois, sp.roi_norms, sp.roi_alive)
-        self._prev_gen += 1
-        gen = self._prev_gen
-        sig = self._load_sig
-        path = sp.path
-
-        class _Ldr(QRunnable):
-            def run(self_ldr):
-                try:
-                    arr = _load_as_float32_gray(path)
-                    if arr is None:
-                        sig.ready.emit(None, gen)
-                        return
-                    arr8 = np.clip(arr * 255, 0, 255).astype(np.uint8)
-                    h, w = arr8.shape
-                    qimg = QImage(bytes(arr8.data), w, h, w, QImage.Format.Format_Grayscale8)
-                    sig.ready.emit(QPixmap.fromImage(qimg.copy()), gen)
-                except Exception:
-                    sig.ready.emit(None, gen)
-
-        ldr = _Ldr()
-        ldr.setAutoDelete(True)
-        QThreadPool.globalInstance().start(ldr)
-
-    def _on_ready(self, pm, gen: int):
-        if gen != self._prev_gen:
-            return
-        self._canvas.set_image(pm)
-
-
-class _BrightnessTab(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+        self._analysis: "CameraAnalysis | None" = None
+        self._threshold = 0.5
         self._fig = Figure(figsize=(10, 4))
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._toolbar = NavigationToolbar2QT(self._canvas, self)
         self._ax = self._fig.add_subplot(111)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
+        top = QHBoxLayout()
+        self._chk_bright = QCheckBox("Show brightness lines")
+        self._chk_bright.setStyleSheet(_CHECKBOX_STYLE)
+        self._chk_bright.stateChanged.connect(lambda _s: self._redraw())
+        top.addWidget(self._chk_bright)
+        top.addStretch(1)
+        btn_png = QPushButton("Export graph (PNG)…")
+        btn_png.setStyleSheet(_BTN)
+        btn_png.clicked.connect(self._export_png)
+        top.addWidget(btn_png)
+        lay.addLayout(top)
         lay.addWidget(self._toolbar)
         lay.addWidget(self._canvas, 1)
 
-    def update_data(self, sample_points: list, rois: list, threshold: float):
+    def update_data(self, sample_points: list, rois: list,
+                    analysis: "CameraAnalysis | None", threshold: float):
+        self._sample_points = sample_points
+        self._rois = rois
+        self._analysis = analysis
+        self._threshold = threshold
+        self._redraw()
+
+    def _redraw(self):
         self._ax.clear()
-        if not sample_points or not rois:
-            self._ax.text(0.5, 0.5, "No scan data yet",
-                         transform=self._ax.transAxes,
-                         ha="center", va="center", color="#888", fontsize=12)
+        if not self._sample_points or not self._rois:
+            self._ax.text(0.5, 0.5, "No scan data yet", transform=self._ax.transAxes,
+                          ha="center", va="center", color="#888", fontsize=12)
             self._canvas.draw()
             return
-        times = [mdates.date2num(_ns_to_dt(sp.ts_ns)) for sp in sample_points]
-        for i, roi in enumerate(rois):
+        if self._chk_bright.isChecked():
+            self._draw_brightness()
+        else:
+            self._draw_states()
+        self._fig.tight_layout()
+        self._canvas.draw()
+
+    def _draw_brightness(self):
+        times = [mdates.date2num(_ns_to_dt(sp.ts_ns)) for sp in self._sample_points]
+        for i, roi in enumerate(self._rois):
             norms = [sp.roi_norms[i] if i < len(sp.roi_norms) else 0.0
-                     for sp in sample_points]
-            self._ax.plot(times, norms,
-                         color=_ROI_COLORS[i % len(_ROI_COLORS)],
-                         label=roi.name, linewidth=1, alpha=0.85)
-        self._ax.axhline(threshold, color="orange", linestyle="--",
-                        linewidth=1.5, label=f"Threshold ({threshold:.2f})")
+                     for sp in self._sample_points]
+            self._ax.plot(times, norms, color=_ROI_COLORS[i % len(_ROI_COLORS)],
+                          label=roi.name, linewidth=1, alpha=0.85)
+        self._ax.axhline(self._threshold, color="orange", linestyle="--",
+                         linewidth=1.5, label=f"Threshold ({self._threshold:.2f})")
         self._ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         self._ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         self._fig.autofmt_xdate(rotation=30)
         self._ax.set_ylabel("Normalized brightness")
         self._ax.set_title("Brightness per pulser over time")
-        ncol = max(1, min(len(rois), 6))
+        ncol = max(1, min(len(self._rois), 6))
         self._ax.legend(fontsize=8, ncol=ncol, loc="upper right")
-        self._fig.tight_layout()
-        self._canvas.draw()
+
+    def _draw_states(self):
+        if self._analysis is None:
+            self._ax.text(0.5, 0.5, "No analysis", transform=self._ax.transAxes,
+                          ha="center", va="center", color="#888", fontsize=12)
+            return
+        sm = self._analysis.state_matrix
+        n_rois, n_times = sm.shape
+        # OFF=0→0, ON=1→1, NODATA=-1→2
+        disp = np.where(sm == STATE_NODATA, 2, sm)
+        times_num = [mdates.date2num(_ns_to_dt(t)) for t in self._analysis.times_ns]
+        if len(times_num) > 1:
+            dt_half = (times_num[1] - times_num[0]) * 0.5
+            t0, t1 = times_num[0] - dt_half, times_num[-1] + dt_half
+        else:
+            t0, t1 = times_num[0] - 0.001, times_num[0] + 0.001
+        cmap = ListedColormap([DANGER, SUCCESS, NODATA_CLR])
+        self._ax.imshow(disp, aspect="auto", cmap=cmap, vmin=0, vmax=2,
+                        interpolation="nearest", extent=[t0, t1, n_rois - 0.5, -0.5])
+        self._ax.set_yticks(range(n_rois))
+        self._ax.set_yticklabels([r.name for r in self._rois], fontsize=8)
+        self._ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+        self._ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        self._fig.autofmt_xdate(rotation=30)
+        self._ax.set_title("Pulser state over time")
+        self._ax.set_xlabel("Prague time")
+        self._ax.legend(handles=[
+            Patch(color=SUCCESS, label="ON"),
+            Patch(color=DANGER, label="OFF"),
+            Patch(color=NODATA_CLR, label="no-data"),
+        ], fontsize=8, ncol=3, loc="upper right")
+
+    def _export_png(self):
+        if not self._sample_points:
+            QMessageBox.information(self, "Export", "No data to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export graph", "pulser_run_graph.png", "PNG (*.png);;All files (*)")
+        if not path:
+            return
+        try:
+            self._fig.savefig(path, dpi=150, bbox_inches="tight")
+            QMessageBox.information(self, "Export", f"Saved:\n{path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export", f"Failed:\n{exc}")
 
 
-class _SummaryTab(QWidget):
+class _AllDataTab(QWidget):
+    """One exportable table with per-pulser stats across all scanned arrays."""
+
+    COLS = ["Array", "Pulser", "Dropouts", "Longest run", "Longest run (no gaps)",
+            "Uptime %", "First dropout", "Last dropout", "State"]
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._rows: list = []
+        self._data: list = []          # list of dicts, one per pulser
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
-        self._table = QTableWidget(0, 6)
-        self._table.setHorizontalHeaderLabels(
-            ["ROI", "Uptime %", "Dead intervals", "First dropout", "Last dropout", "Last recovery"])
+        self._table = QTableWidget(0, len(self.COLS))
+        self._table.setHorizontalHeaderLabels(self.COLS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
+        self._table.setSortingEnabled(True)
         self._table.setStyleSheet(
             "QTableWidget{background:#fff;gridline-color:#e0e0e0;}"
             "QTableWidget::item{background:#fff;color:#111;padding:2px 4px;}"
@@ -1842,82 +2285,83 @@ class _SummaryTab(QWidget):
             "QTableWidget::item:selected{background:#1565C0;color:#fff;}"
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        btn_exp = QPushButton("Export summary CSV…")
+        btn_exp = QPushButton("Export all data CSV…")
         btn_exp.setStyleSheet(_BTN)
         btn_exp.clicked.connect(self._export)
         lay.addWidget(self._table, 1)
         lay.addWidget(btn_exp)
 
-    def update_data(self, sample_points: list, rois: list):
-        self._rows = []
+    def update_data(self, analysis_by_camera: dict):
+        self._data = []
+        for cam_key, analysis in analysis_by_camera.items():
+            if not analysis:
+                continue
+            for st in analysis.stats:
+                self._data.append({
+                    "array": cam_key, "name": st.name, "dropouts": st.dropouts,
+                    "longest": st.longest_run_ns, "longest_active": st.longest_run_active_ns,
+                    "uptime": st.uptime_pct,
+                    "first": st.first_drop_ns, "last": st.last_drop_ns,
+                    "state": st.current_state,
+                })
+        self._rebuild()
+
+    def _rebuild(self):
+        self._table.setSortingEnabled(False)
         self._table.setRowCount(0)
-        if not sample_points or not rois:
-            return
-        for r_idx, roi in enumerate(rois):
-            seq = [sp.roi_alive[r_idx] if r_idx < len(sp.roi_alive) else True
-                   for sp in sample_points]
-            total = len(seq)
-            alive_n = sum(seq)
-            uptime = 100.0 * alive_n / total if total else 0.0
-            dead_intervals = 0
-            first_drop = last_drop = last_rec = None
-            in_dead = False
-            for i, alive in enumerate(seq):
-                ts = sample_points[i].ts_ns
-                dt_s = _ns_to_dt(ts).strftime("%Y-%m-%d %H:%M")
-                if not alive and not in_dead:
-                    in_dead = True
-                    dead_intervals += 1
-                    if first_drop is None:
-                        first_drop = dt_s
-                    last_drop = dt_s
-                elif alive and in_dead:
-                    in_dead = False
-                    last_rec = dt_s
-            row = {
-                "name": roi.name, "uptime": uptime,
-                "dead": dead_intervals,
-                "first_drop": first_drop or "—",
-                "last_drop": last_drop or "—",
-                "last_rec": last_rec or "—",
-            }
-            self._rows.append(row)
+        for d in self._data:
             r = self._table.rowCount()
             self._table.insertRow(r)
-
-            def _item(txt, left=False):
-                it = QTableWidgetItem(str(txt))
-                it.setTextAlignment(
-                    (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                    if left else Qt.AlignmentFlag.AlignCenter)
-                return it
-
-            self._table.setItem(r, 0, _item(roi.name, left=True))
-            self._table.setItem(r, 1, _item(f"{uptime:.1f}%"))
-            self._table.setItem(r, 2, _item(str(dead_intervals)))
-            self._table.setItem(r, 3, _item(row["first_drop"]))
-            self._table.setItem(r, 4, _item(row["last_drop"]))
-            self._table.setItem(r, 5, _item(row["last_rec"]))
+            first_s = (_ns_to_dt(d["first"]).strftime("%Y-%m-%d %H:%M") if d["first"] else "—")
+            last_s = (_ns_to_dt(d["last"]).strftime("%Y-%m-%d %H:%M") if d["last"] else "—")
+            cells = [
+                (d["array"], None), (d["name"], None),
+                (str(d["dropouts"]), d["dropouts"]),
+                (_fmt_dur(d["longest"]), d["longest"]),
+                (_fmt_dur(d["longest_active"]), d["longest_active"]),
+                (f"{d['uptime']:.1f}%", d["uptime"]),
+                (first_s, d["first"] or 0), (last_s, d["last"] or 0),
+                (_state_str(d["state"]), None),
+            ]
+            for c, (txt, sortval) in enumerate(cells):
+                it = QTableWidgetItem()
+                it.setText(txt)
+                if sortval is not None:
+                    it.setData(Qt.ItemDataRole.EditRole, sortval)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._table.setItem(r, c, it)
+        self._table.setSortingEnabled(True)
 
     def _export(self):
-        if not self._rows:
+        if not self._data:
             QMessageBox.information(self, "Export", "No data to export.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export summary", "pulser_summary.csv", "CSV (*.csv);;All files (*)")
+            self, "Export all data", "pulser_all_data.csv", "CSV (*.csv);;All files (*)")
         if not path:
             return
         try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["ROI", "Uptime %", "Dead intervals",
-                            "First dropout", "Last dropout", "Last recovery"])
-                for r in self._rows:
-                    w.writerow([r["name"], f"{r['uptime']:.1f}", r["dead"],
-                               r["first_drop"], r["last_drop"], r["last_rec"]])
+            self.export_to(path)
             QMessageBox.information(self, "Export", f"Saved:\n{path}")
         except Exception as exc:
             QMessageBox.warning(self, "Export", f"Failed:\n{exc}")
+
+    def export_to(self, path: str):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Array", "Pulser", "Dropouts", "Longest run", "Longest run",
+                        "Longest run (no gaps)", "Longest run (no gaps)",
+                        "Uptime %", "First dropout", "Last dropout", "State"])
+            w.writerow(["", "", "", "human", "seconds", "human", "seconds",
+                        "", "", "", ""])
+            for d in self._data:
+                first_s = (_ns_to_dt(d["first"]).strftime("%Y-%m-%d %H:%M") if d["first"] else "")
+                last_s = (_ns_to_dt(d["last"]).strftime("%Y-%m-%d %H:%M") if d["last"] else "")
+                w.writerow([
+                    d["array"], d["name"], d["dropouts"],
+                    _fmt_dur(d["longest"]), int(d["longest"] // 1_000_000_000),
+                    _fmt_dur(d["longest_active"]), int(d["longest_active"] // 1_000_000_000),
+                    f"{d['uptime']:.1f}", first_s, last_s, _state_str(d["state"])])
 
 
 # ── MAIN WIDGET ───────────────────────────────────────────────────────────────
@@ -1935,6 +2379,8 @@ class PulserMonitorWidget(QWidget):
         self._rois_by_camera: dict = {cam: [] for cam in CAMERAS}
         # Per-camera scan results
         self._results_by_camera: dict = {}
+        # Per-camera analysis (states + stats), computed after each scan
+        self._analysis_by_camera: dict = {}
         # Currently displayed results and ROIs (set when viewing a camera)
         self._results: list = []
         self._rois: list = []
@@ -2047,6 +2493,18 @@ class PulserMonitorWidget(QWidget):
         thr_row.addWidget(self._thr_sb)
         thr_row.addStretch(1)
         lv.addLayout(thr_row)
+        # Hysteresis lower threshold: stays alive until it drops below this.
+        thr_lo_row = QHBoxLayout()
+        thr_lo_row.addWidget(QLabel("Off threshold:"))
+        self._thr_low_sb = QDoubleSpinBox()
+        self._thr_low_sb.setRange(0.0, 5.0)
+        self._thr_low_sb.setSingleStep(0.05)
+        self._thr_low_sb.setDecimals(2)
+        self._thr_low_sb.setValue(0.30)
+        self._thr_low_sb.setFixedWidth(75)
+        thr_lo_row.addWidget(self._thr_low_sb)
+        thr_lo_row.addStretch(1)
+        lv.addLayout(thr_lo_row)
         lv.addWidget(QLabel("Normalization:"))
         self._norm_group = QButtonGroup(self)
         for label, val in [("Median of ROIs  (recommended)", "median"),
@@ -2067,6 +2525,28 @@ class PulserMonitorWidget(QWidget):
         bd_row.addWidget(QLabel("bit"))
         bd_row.addStretch(1)
         lv.addLayout(bd_row)
+        # No-data floor: whole-frame brightness below this = frame has no array data.
+        nd_row = QHBoxLayout()
+        nd_row.addWidget(QLabel("No-data floor:"))
+        self._nodata_sb = QDoubleSpinBox()
+        self._nodata_sb.setRange(0.0, 1.0)
+        self._nodata_sb.setSingleStep(0.01)
+        self._nodata_sb.setDecimals(3)
+        self._nodata_sb.setValue(0.020)
+        self._nodata_sb.setFixedWidth(75)
+        nd_row.addWidget(self._nodata_sb)
+        nd_row.addStretch(1)
+        lv.addLayout(nd_row)
+        # Debounce: OFF must persist this many data frames to count as a dropout.
+        db_row = QHBoxLayout()
+        db_row.addWidget(QLabel("Debounce (frames):"))
+        self._debounce_sb = QSpinBox()
+        self._debounce_sb.setRange(1, 20)
+        self._debounce_sb.setValue(2)
+        self._debounce_sb.setFixedWidth(55)
+        db_row.addWidget(self._debounce_sb)
+        db_row.addStretch(1)
+        lv.addLayout(db_row)
 
         # Scan buttons
         lv.addWidget(_hsep())
@@ -2095,6 +2575,11 @@ class PulserMonitorWidget(QWidget):
         self._btn_csv.clicked.connect(self._export_csv)
         self._btn_csv.setEnabled(False)
         lv.addWidget(self._btn_csv)
+        self._btn_export_all = QPushButton("Export all (folder)…")
+        self._btn_export_all.setStyleSheet(_BTN)
+        self._btn_export_all.clicked.connect(self._export_all)
+        self._btn_export_all.setEnabled(False)
+        lv.addWidget(self._btn_export_all)
 
         # Log
         lv.addWidget(_hsep())
@@ -2123,15 +2608,12 @@ class PulserMonitorWidget(QWidget):
         right_lay.addLayout(cam_view_row)
 
         self._tabs = QTabWidget()
-        self._tab_tl = _TimelineTab()
-        self._tab_pv = _PreviewTab()
-        self._tab_br = _BrightnessTab()
-        self._tab_sm = _SummaryTab()
-        self._tabs.addTab(self._tab_tl, "Timeline")
-        self._tabs.addTab(self._tab_pv, "Image Preview")
-        self._tabs.addTab(self._tab_br, "Brightness Plot")
-        self._tabs.addTab(self._tab_sm, "Summary")
-        self._tab_tl.sample_selected.connect(self._on_tl_click)
+        self._tab_map = _MapTab()
+        self._tab_all = _AllDataTab()
+        self._tab_run = _RunGraphTab()
+        self._tabs.addTab(self._tab_map, "Pulser Map")
+        self._tabs.addTab(self._tab_all, "All Data")
+        self._tabs.addTab(self._tab_run, "Run Graph")
         right_lay.addWidget(self._tabs, 1)
 
         root_lay.addWidget(left_scroll)
@@ -2241,10 +2723,6 @@ class PulserMonitorWidget(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Load ROIs", f"Failed:\n{exc}")
 
-    def _on_tl_click(self, idx: int):
-        self._tab_pv.select_sample(idx)
-        self._tabs.setCurrentIndex(1)
-
     # ── SCAN ──────────────────────────────────────────────────────────────────
 
     def _start_scan(self):
@@ -2268,11 +2746,13 @@ class PulserMonitorWidget(QWidget):
 
         self._results.clear()
         self._results_by_camera.clear()
+        self._analysis_by_camera.clear()
         self._scan_queue = list(cam_keys)
         self._gen_box[0] += 1
         self._btn_scan.setEnabled(False)
         self._btn_stop.setEnabled(True)
         self._btn_csv.setEnabled(False)
+        self._btn_export_all.setEnabled(False)
         self._prog.setValue(0)
         self._prog.setVisible(True)
         self._log_msg(
@@ -2371,13 +2851,29 @@ class PulserMonitorWidget(QWidget):
             self._result_cam_combo.addItem(cam_key)
         self._result_cam_combo.setEnabled(n_cameras > 1)
         self._result_cam_combo.blockSignals(False)
+        # Analyse every scanned camera (states + per-pulser stats).
+        self._analysis_by_camera = {}
+        for cam_key, results in self._results_by_camera.items():
+            rois = self._rois_by_camera.get(cam_key, [])
+            if results and rois:
+                self._analysis_by_camera[cam_key] = analyze_camera(
+                    rois, results, *self._analysis_params())
+            else:
+                self._analysis_by_camera[cam_key] = None
+        self._tab_all.update_data(self._analysis_by_camera)
         if self._results_by_camera:
             self._btn_csv.setEnabled(True)
+            self._btn_export_all.setEnabled(True)
             first_cam = next(iter(self._results_by_camera))
             self._result_cam_combo.setCurrentText(first_cam)
             self._results = list(self._results_by_camera[first_cam])
             self._rois = list(self._rois_by_camera.get(first_cam, []))
             self._render_all_tabs()
+
+    def _analysis_params(self) -> tuple:
+        """(thr_high, thr_low, nodata_floor, debounce) from the Detection panel."""
+        return (self._thr_sb.value(), self._thr_low_sb.value(),
+                self._nodata_sb.value(), self._debounce_sb.value())
 
     def _on_scan_error(self, msg: str):
         cam_key = self._current_scan_cam_key
@@ -2406,12 +2902,33 @@ class PulserMonitorWidget(QWidget):
 
     def _render_all_tabs(self):
         t = self._thr_sb.value()
-        self._tab_tl.update_data(self._results, self._rois, t)
-        self._tab_pv.set_data(self._results, self._rois)
-        self._tab_br.update_data(self._results, self._rois, t)
-        self._tab_sm.update_data(self._results, self._rois)
+        cam_key = self._result_cam_combo.currentText()
+        analysis = self._analysis_by_camera.get(cam_key)
+        start_ns = self._results[0].ts_ns if self._results else None
+        end_ns = self._results[-1].ts_ns if self._results else None
+        self._tab_map.update_data(cam_key, self._rois, analysis, start_ns, end_ns)
+        self._tab_run.update_data(self._results, self._rois, analysis, t)
 
     # ── CSV EXPORT ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _write_full_csv(path: str, cam_key: str, rois: list, results: list):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            header = ["camera", "timestamp_ns", "datetime_prague", "frame_mean"]
+            for roi in rois:
+                header += [f"{roi.name}_brightness", f"{roi.name}_norm", f"{roi.name}_alive"]
+            w.writerow(header)
+            for sp in results:
+                dt = _ns_to_dt(sp.ts_ns)
+                row = [cam_key, sp.ts_ns, dt.strftime("%Y-%m-%d %H:%M:%S"),
+                       f"{getattr(sp, 'frame_mean', 1.0):.6f}"]
+                for i in range(len(rois)):
+                    mean_v = sp.roi_means[i] if i < len(sp.roi_means) else 0.0
+                    norm_v = sp.roi_norms[i] if i < len(sp.roi_norms) else 0.0
+                    alive_v = 1 if (i < len(sp.roi_alive) and sp.roi_alive[i]) else 0
+                    row += [f"{mean_v:.6f}", f"{norm_v:.6f}", str(alive_v)]
+                w.writerow(row)
 
     def _export_csv(self):
         if not self._results:
@@ -2422,24 +2939,66 @@ class PulserMonitorWidget(QWidget):
         if not path:
             return
         try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                header = ["camera", "timestamp_ns", "datetime_prague"]
-                for roi in self._rois:
-                    header += [f"{roi.name}_brightness", f"{roi.name}_norm", f"{roi.name}_alive"]
-                w.writerow(header)
-                for sp in self._results:
-                    dt = _ns_to_dt(sp.ts_ns)
-                    row = [cam_key, sp.ts_ns, dt.strftime("%Y-%m-%d %H:%M:%S")]
-                    for i in range(len(self._rois)):
-                        mean_v = sp.roi_means[i] if i < len(sp.roi_means) else 0.0
-                        norm_v = sp.roi_norms[i] if i < len(sp.roi_norms) else 0.0
-                        alive_v = 1 if (i < len(sp.roi_alive) and sp.roi_alive[i]) else 0
-                        row += [f"{mean_v:.6f}", f"{norm_v:.6f}", str(alive_v)]
-                    w.writerow(row)
+            self._write_full_csv(path, cam_key, self._rois, self._results)
             QMessageBox.information(self, "Export", f"Saved:\n{path}")
         except Exception as exc:
             QMessageBox.warning(self, "Export", f"Failed:\n{exc}")
+
+    def _export_all(self):
+        if not self._results_by_camera:
+            QMessageBox.information(self, "Export all", "Nothing to export — run a scan first.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Export all — choose folder")
+        if not folder:
+            return
+        folder_p = Path(folder)
+        written = []
+        errors = []
+        # 1) All-data summary (across every camera)
+        try:
+            p = folder_p / "pulser_all_data.csv"
+            self._tab_all.export_to(str(p))
+            written.append(p.name)
+        except Exception as exc:
+            errors.append(f"all_data: {exc}")
+        # 2) Per-camera: full CSV + map PNG + run-graph PNG
+        keep_cam = self._result_cam_combo.currentText()
+        for cam_key, results in self._results_by_camera.items():
+            rois = self._rois_by_camera.get(cam_key, [])
+            if not results or not rois:
+                continue
+            try:
+                p = folder_p / f"pulser_{cam_key}.csv"
+                self._write_full_csv(str(p), cam_key, rois, results)
+                written.append(p.name)
+            except Exception as exc:
+                errors.append(f"{cam_key} csv: {exc}")
+            # Render this camera into the tabs, then save the figures.
+            self._result_cam_combo.blockSignals(True)
+            self._result_cam_combo.setCurrentText(cam_key)
+            self._result_cam_combo.blockSignals(False)
+            self._results = list(results)
+            self._rois = list(rois)
+            self._render_all_tabs()
+            try:
+                p = folder_p / f"pulser_map_{cam_key}.png"
+                self._tab_map._map_fig.savefig(str(p), dpi=150, bbox_inches="tight")
+                written.append(p.name)
+            except Exception as exc:
+                errors.append(f"{cam_key} map: {exc}")
+            try:
+                p = folder_p / f"pulser_run_{cam_key}.png"
+                self._tab_run._fig.savefig(str(p), dpi=150, bbox_inches="tight")
+                written.append(p.name)
+            except Exception as exc:
+                errors.append(f"{cam_key} run: {exc}")
+        # Restore the previously viewed camera.
+        if keep_cam:
+            self._result_cam_combo.setCurrentText(keep_cam)
+        msg = f"Saved {len(written)} file(s) to:\n{folder}"
+        if errors:
+            msg += "\n\nProblems:\n" + "\n".join(errors)
+        QMessageBox.information(self, "Export all", msg)
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
