@@ -271,14 +271,14 @@ class AlertPayload:
 
 
 def _resolve_secret(value: str) -> str:
-    """Resolve a ``${ENV:NAME}`` indirection to os.environ at send time.
+    """Resolve a stored secret to usable plaintext at send time.
 
-    Lets the user keep secrets out of monitor_config.json by storing a
-    reference instead of the literal password/token.
+    Delegates to ``secrets_util`` which understands ``${ENV:NAME}`` references
+    and ``dpapi:`` (Windows DPAPI) encrypted blobs, so secrets need not be kept
+    as literal plaintext in monitor_config.json.
     """
-    if isinstance(value, str) and value.startswith("${ENV:") and value.endswith("}"):
-        return os.environ.get(value[6:-1], "")
-    return value or ""
+    from secrets_util import resolve_secret
+    return resolve_secret(value)
 
 
 # ---------------------------------------------------------------------------

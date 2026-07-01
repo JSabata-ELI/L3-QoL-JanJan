@@ -8736,6 +8736,21 @@ class Viewer(QWidget):
             sel = []
         return (not sel) or (cam_i in sel)
 
+    def _redraw_all_cams_in_place(self):
+        """Re-render every camera at the frame it is CURRENTLY showing (its own per-cam
+        slider position), WITHOUT re-syncing them to the shared timeline. Used when a
+        display setting changes (auto-stretch, brightness, gradient) so the shown frames
+        don't jump — unlike _display_multicam_index, which snaps all cams to one time."""
+        if not self._is_multi_cam() or not self._cam_items:
+            return
+        for cam_i in range(len(self._cam_items)):
+            cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+            if not cam_ts:
+                continue
+            cur = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else 0
+            cur = max(0, min(cur, len(cam_ts) - 1))
+            self._per_cam_display_one(cam_i, cam_ts[cur])
+
     def _on_multicam_selected(self, idx: int):
         """Kamera v gridu byla vybrána kliknutím."""
         if self._focus_mode:
@@ -8778,10 +8793,11 @@ class Viewer(QWidget):
 
         # Auto-stretch / brightness apply only to selected camera(s): selection just
         # changed, so re-render to stretch the newly-selected and un-stretch the rest.
+        # Redraw each cam at its own current frame (don't snap all to the shared time).
         if (self.cb_bright.isChecked() or self._brightness_offset != 0) \
                 and self._is_multi_cam() and self.current_idx is not None:
             self._cam_caches = [PixCache(80) for _ in self._cam_caches]
-            self._display_multicam_index(self.current_idx, update_slider=False)
+            self._redraw_all_cams_in_place()
 
         if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
                 and hasattr(self, '_run_spatial_contrast')):
@@ -10474,7 +10490,7 @@ class Viewer(QWidget):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
             self._cam_caches = [PixCache(80) for _ in self._cam_caches]
-            self._display_multicam_index(self.current_idx, update_slider=False)
+            self._redraw_all_cams_in_place()
             return
         idx = self.current_idx
         self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
@@ -10572,7 +10588,7 @@ class Viewer(QWidget):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
             self._cam_caches = [PixCache(80) for _ in self._cam_caches]
-            self._display_multicam_index(self.current_idx, update_slider=False)
+            self._redraw_all_cams_in_place()
             return
         self.cache = PixCache(CACHE_SIZE)
         self._inflight.clear(); self._want_display_req.clear()
@@ -10583,7 +10599,7 @@ class Viewer(QWidget):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
             self._cam_caches = [PixCache(80) for _ in self._cam_caches]
-            self._display_multicam_index(self.current_idx, update_slider=False)
+            self._redraw_all_cams_in_place()
             return
         self.cache = PixCache(CACHE_SIZE)
         self._inflight.clear(); self._want_display_req.clear()

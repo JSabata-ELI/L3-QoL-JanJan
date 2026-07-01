@@ -112,6 +112,9 @@ _CELL_THR_FRAC   = 0.45  # tile threshold placed this far from dark toward brigh
 _CELL_TRIM_PCT   = 4     # trim this %% of lit pixels off each side of the bbox
                          # (discards the thin diagonal reflection and stray specks)
 _CELL_MIN_BRIGHT = 0.05  # min lit-pixel fraction for a cell to count as a live pulser
+_CELL_ABS_FLOOR_FRAC = 0.16  # raw-intensity floor (× global lit range) a pixel must
+                             # clear to count as tile — kills the black image border
+                             # that the illumination flatten would otherwise pass as lit
 _ROI_INSET_FRAC  = 0.02  # small margin pulled inward from the detected tile edge
 
 _BTN = (
@@ -462,7 +465,7 @@ def _neighbor_clamps(centers: list, pitch: float, n: int) -> list:
     return clamps
 
 
-def _cell_bbox(block: np.ndarray, pitch: float) -> "tuple | None":
+def _cell_bbox(block: np.ndarray, pitch: float, abs_floor: float = 0.0) -> "tuple | None":
     """Find the actual bright pulser patch inside one cell window in 2-D and
     return its (x0, y0, x1, y1) in the block's local coords, or None if the
     window holds no clear patch (a dark/off pulser).
@@ -472,7 +475,11 @@ def _cell_bbox(block: np.ndarray, pitch: float) -> "tuple | None":
     gradient; a threshold placed between the dark and bright levels gives the tile
     mask. The bounding box is taken from the inner percentile of the lit
     coordinates, which trims off the thin diagonal reflection and stray specks
-    rather than letting them stretch the box out to the window edge."""
+    rather than letting them stretch the box out to the window edge.
+
+    `abs_floor` is a raw-intensity gate: near-black pixels (e.g. the image border
+    that the leftmost/top cells reach into) become ~1.0 after the flatten and would
+    pass the relative threshold, so they must also clear this floor to count."""
     bh, bw = block.shape
     if bh < 4 or bw < 4:
         return None
@@ -482,13 +489,42 @@ def _cell_bbox(block: np.ndarray, pitch: float) -> "tuple | None":
     hi = float(np.percentile(norm, _CELL_THR_HI_PCT))
     if hi <= lo:
         return None
-    mask = norm > lo + (hi - lo) * _CELL_THR_FRAC
+    mask = (norm > lo + (hi - lo) * _CELL_THR_FRAC) & (block > abs_floor)
     ys, xs = np.where(mask)
     if len(xs) < bh * bw * _CELL_MIN_BRIGHT:
         return None
     x0, x1 = np.percentile(xs, [_CELL_TRIM_PCT, 100 - _CELL_TRIM_PCT])
     y0, y1 = np.percentile(ys, [_CELL_TRIM_PCT, 100 - _CELL_TRIM_PCT])
     return int(x0), int(y0), int(x1), int(y1)
+
+
+def _consensus_spans(spans: list, detected: list,
+                     lo_w: float = 0.65, hi_w: float = 1.4,
+                     tol_c: float = 0.4) -> list:
+    """Snap outlier 1-D spans along a grid line to the line's median span.
+
+    Pulsers in a column share one horizontal extent and pulsers in a row share
+    one vertical extent, so a cell whose detected span is much wider/narrower or
+    badly off-centre — e.g. an edge cell that grabbed the dim image border instead
+    of the (smaller) edge tile, or a dark/off pulser with no detection — is replaced
+    by the robust median box of its well-detected neighbours. Lines with fewer than
+    two detected cells are left untouched (no consensus to trust)."""
+    idx = [i for i, d in enumerate(detected) if d]
+    if len(idx) < 2:
+        return list(spans)
+    widths = sorted(spans[i][1] - spans[i][0] for i in idx)
+    centers = sorted((spans[i][0] + spans[i][1]) * 0.5 for i in idx)
+    med_w = widths[len(widths) // 2]
+    med_c = centers[len(centers) // 2]
+    if med_w <= 0:
+        return list(spans)
+    out = []
+    for i, (a, b) in enumerate(spans):
+        w, c = b - a, (a + b) * 0.5
+        ok = (detected[i] and lo_w * med_w <= w <= hi_w * med_w
+              and abs(c - med_c) <= tol_c * med_w)
+        out.append((a, b) if ok else (med_c - med_w / 2, med_c + med_w / 2))
+    return out
 
 
 def _sane_span(a: float, b: float, center: float, pitch: float,
@@ -541,32 +577,63 @@ def _detect_grid_rois(arr: np.ndarray, cam_key: str) -> list:
     y_clamps = _neighbor_clamps(y_centers, y_pitch, h)
     pitch = min(x_pitch, y_pitch)
 
-    rois = []
+    # Raw-intensity floor separating the black image border from lit tiles, so the
+    # outermost cells (col A / row 1) can't grab the dark border as part of a tile.
+    g_lo = float(np.percentile(arr, 5))
+    g_hi = float(np.percentile(arr, 95))
+    abs_floor = g_lo + (g_hi - g_lo) * _CELL_ABS_FLOOR_FRAC
+
+    # ── Pass 1: detect each cell's tile box independently ──────────────────────
+    xspan = [[None] * n_cols for _ in range(n_rows)]
+    yspan = [[None] * n_cols for _ in range(n_rows)]
+    detected = [[False] * n_cols for _ in range(n_rows)]
     for ri in range(n_rows):
         cy = y_centers[ri]
         wy0, wy1 = y_clamps[ri]
         for ci in range(n_cols):
             cx = x_centers[ci]
             wx0, wx1 = x_clamps[ci]
-            name = f"{cols[ci]}{rows[ri]}"
-            color = _ROI_COLORS[(ri * n_cols + ci) % len(_ROI_COLORS)]
-
-            bbox = _cell_bbox(arr[wy0:wy1, wx0:wx1], pitch)
+            bbox = _cell_bbox(arr[wy0:wy1, wx0:wx1], pitch, abs_floor)
             if bbox is not None:
-                ix0, iy0 = wx0 + bbox[0], wy0 + bbox[1]
-                ix1, iy1 = wx0 + bbox[2], wy0 + bbox[3]
+                ix0, ix1 = wx0 + bbox[0], wx0 + bbox[2]
+                iy0, iy1 = wy0 + bbox[1], wy0 + bbox[3]
                 # Safety net: keep the box a sane cell, never crossing a neighbour.
                 ix0, ix1 = _sane_span(ix0, ix1, cx, x_pitch, wx0, wx1)
                 iy0, iy1 = _sane_span(iy0, iy1, cy, y_pitch, wy0, wy1)
+                detected[ri][ci] = True
             else:
-                # No clear patch (dark/off pulser) → full comb cell to nudge.
+                # No clear patch (dark/off pulser) → full comb cell as a placeholder;
+                # consensus below pulls it onto the column/row's real tile box.
                 ix0, ix1, iy0, iy1 = wx0, wx1, wy0, wy1
+            xspan[ri][ci] = (ix0, ix1)
+            yspan[ri][ci] = (iy0, iy1)
 
+    # ── Pass 2: consensus — a column shares one x-extent, a row shares one y ────
+    # Repairs edge cells that grabbed the dim border and off pulsers with no patch.
+    for ci in range(n_cols):
+        col_x = _consensus_spans([xspan[ri][ci] for ri in range(n_rows)],
+                                 [detected[ri][ci] for ri in range(n_rows)])
+        for ri in range(n_rows):
+            xspan[ri][ci] = col_x[ri]
+    for ri in range(n_rows):
+        row_y = _consensus_spans([yspan[ri][ci] for ci in range(n_cols)],
+                                 [detected[ri][ci] for ci in range(n_cols)])
+        for ci in range(n_cols):
+            yspan[ri][ci] = row_y[ci]
+
+    # ── Emit ───────────────────────────────────────────────────────────────────
+    rois = []
+    for ri in range(n_rows):
+        for ci in range(n_cols):
+            name = f"{cols[ci]}{rows[ri]}"
+            color = _ROI_COLORS[(ri * n_cols + ci) % len(_ROI_COLORS)]
+            ix0, ix1 = xspan[ri][ci]
+            iy0, iy1 = yspan[ri][ci]
             in_x = max(1, int((ix1 - ix0) * _ROI_INSET_FRAC))
             in_y = max(1, int((iy1 - iy0) * _ROI_INSET_FRAC))
             x0, y0, x1, y1 = ix0 + in_x, iy0 + in_y, ix1 - in_x, iy1 - in_y
-            x0, y0 = max(0, x0), max(0, y0)
-            x1, y1 = min(w, x1), min(h, y1)
+            x0, y0 = max(0, int(round(x0))), max(0, int(round(y0)))
+            x1, y1 = min(w, int(round(x1))), min(h, int(round(y1)))
             if x1 - x0 < 4 or y1 - y0 < 4:
                 continue
             rois.append(RoiDefinition(name=name, x=x0, y=y0,

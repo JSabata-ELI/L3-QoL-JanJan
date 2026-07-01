@@ -388,6 +388,12 @@ class ScreenTracker(tk.Tk):
             src = Image.open(path).convert("RGBA")
             src = src.resize((int(w), int(h)), resample=Image.LANCZOS)
             alpha = src.split()[3]
+            # Binarize alpha: LANCZOS anti-aliases the edges into partial-alpha
+            # pixels; compositing those blends flash<->chroma into intermediate
+            # colours that the exact-match -transparentcolor can't key out (the
+            # magenta fringe / non-transparent silhouette). A hard threshold keeps
+            # every pixel either pure flash or pure chroma, so the key is clean.
+            alpha = alpha.point(lambda a: 255 if a >= 128 else 0)
             chroma = self._color_rgb(key or self._chroma)
             flash = self._color_rgb(self.flash_color.get())
             if invert:

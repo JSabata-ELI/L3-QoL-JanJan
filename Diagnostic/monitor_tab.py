@@ -44,6 +44,7 @@ from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
     NotificationHub, Thresholds, describe_reason,
 )
+from secrets_util import encrypt_secret
 
 # ---------------------------------------------------------------------------
 # Shared styles (kept local so this module has no import cycle with main.py)
@@ -863,13 +864,19 @@ class SettingsDialog(QDialog):
         ef.addRow("Username (optional)", self.smtp_user)
         self.smtp_pass = QLineEdit(s.get("smtp_password", ""))
         self.smtp_pass.setEchoMode(QLineEdit.Password)
-        self.smtp_pass.setToolTip("Stored in plaintext in monitor_config.json. "
-                                  "Tip: use ${ENV:NAME} to read from an env var.")
+        self.smtp_pass.setToolTip(
+            "Encrypted at rest (Windows DPAPI) for your Windows account only — "
+            "the saved value is unreadable to others / on other PCs. "
+            "Tip: use ${ENV:NAME} to read from an env var instead.")
         ef.addRow("Password", self.smtp_pass)
         self.email_from = QLineEdit(s.get("email_from", ""))
         ef.addRow("From address", self.email_from)
         self.email_to = QLineEdit("; ".join(s.get("email_recipients", [])))
-        self.email_to.setPlaceholderText("comma- or semicolon-separated")
+        self.email_to.setPlaceholderText(
+            "one or more, comma- or semicolon-separated: a@x.eu; b@y.eu")
+        self.email_to.setToolTip(
+            "Add as many recipients as you like, separated by ; or , — "
+            "every address gets the alert.")
         ef.addRow("Recipients", self.email_to)
         be = QPushButton("Send test email")
         be.setStyleSheet(_BTN_PRIMARY)
@@ -891,8 +898,10 @@ class SettingsDialog(QDialog):
         wf.addRow("Webhook URL", self.webex_url)
         self.webex_token = QLineEdit(s.get("webex_bot_token", ""))
         self.webex_token.setEchoMode(QLineEdit.Password)
-        self.webex_token.setToolTip("Stored in plaintext in monitor_config.json. "
-                                    "Tip: use ${ENV:NAME} to read from an env var.")
+        self.webex_token.setToolTip(
+            "Encrypted at rest (Windows DPAPI) for your Windows account only — "
+            "the saved value is unreadable to others / on other PCs. "
+            "Tip: use ${ENV:NAME} to read from an env var instead.")
         wf.addRow("Bot token", self.webex_token)
         self.webex_room = QLineEdit(s.get("webex_room_id", ""))
         wf.addRow("Room ID", self.webex_room)
@@ -1021,13 +1030,13 @@ class SettingsDialog(QDialog):
         s["smtp_port"] = self.smtp_port.value()
         s["smtp_security"] = self.smtp_sec.currentText()
         s["smtp_user"] = self.smtp_user.text().strip()
-        s["smtp_password"] = self.smtp_pass.text()
+        s["smtp_password"] = encrypt_secret(self.smtp_pass.text())
         s["email_from"] = self.email_from.text().strip()
         s["email_recipients"] = _parse_recipients(self.email_to.text())
         # webex
         s["webex_mode"] = self.webex_mode.currentText()
         s["webex_webhook_url"] = self.webex_url.text().strip()
-        s["webex_bot_token"] = self.webex_token.text().strip()
+        s["webex_bot_token"] = encrypt_secret(self.webex_token.text().strip())
         s["webex_room_id"] = self.webex_room.text().strip()
         s["webex_commands_enabled"] = self.webex_cmds.isChecked()
         s["webex_command_poll_s"] = self.webex_cmd_poll.value()

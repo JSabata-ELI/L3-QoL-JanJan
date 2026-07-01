@@ -32,7 +32,7 @@
     "webex_bot_token": "ZDQ1YWU2M2YtZjkzYS00ZjYxLTgwZDUtNzAyZGVlYTg3MTI1NjJiYjQ4MDUtOTMy_PE93_3a866221-438c-4819-82f6-12a2870c2618",
     "webex_room_id": "Y2lzY29zcGFyazovL3VybjpURUFNOmV1LWNlbnRyYWwtMV9rL1JPT00vMTRjMmIyODAtNzNhOC0xMWYxLTk4ZDgtNTllZjlkYWNhOTZi",
     "webex_commands_enabled": true,
-    "webex_command_poll_s": 7,
+    "webex_command_poll_s": 1,
     "webex_command_allowlist": []
   },
   "pvs": []

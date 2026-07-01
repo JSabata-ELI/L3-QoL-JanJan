@@ -18,6 +18,7 @@ except Exception:
     _PIL_OK = False
 import tkinter.font as tkfont
 import time
+from statistics import median
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
@@ -582,6 +583,44 @@ def list_monitors_rects() -> list[tuple[int, int, int, int]]:
     cb = MONITORENUMPROC(_cb)
     user32.EnumDisplayMonitors(0, 0, cb, 0)
     return monitors
+
+
+def _cluster_1d(values: list[int], tol: float) -> dict[int, int]:
+    """Greedy 1-D banding anchored on each band's start (prevents tolerance creep).
+    Returns {value: rank} with rank 0 = smallest."""
+    uniq = sorted(set(values))
+    if not uniq:
+        return {}
+    bands = {uniq[0]: 0}
+    rank = 0
+    anchor = uniq[0]
+    for v in uniq[1:]:
+        if v - anchor > tol:
+            rank += 1
+            anchor = v
+        bands[v] = rank
+    return bands
+
+
+def geometric_monitor_grid(rects: list[tuple[int, int, int, int]]) -> dict[tuple[int, int], int]:
+    """Cluster monitor rects into a physical (row, col) grid.
+    Returns {(row, col): os_index}. row 0 = topmost, col 0 = leftmost.
+
+    Positions never change, so this mapping is stable even when Windows renumbers
+    the monitors (the OS enumeration index / EnumDisplayMonitors order changes)."""
+    if not rects:
+        return {}
+    med_h = median(b - t for l, t, r, b in rects)
+    med_w = median(r - l for l, t, r, b in rects)
+    rows = _cluster_1d([t for l, t, r, b in rects], 0.5 * med_h)
+    cols = _cluster_1d([l for l, t, r, b in rects], 0.5 * med_w)
+    cell_to_osidx: dict[tuple[int, int], int] = {}
+    for i, (l, t, r, b) in enumerate(rects):
+        cell = (rows[t], cols[l])
+        while cell in cell_to_osidx:  # collision → push right, never hide a monitor
+            cell = (cell[0], cell[1] + 1)
+        cell_to_osidx[cell] = i
+    return cell_to_osidx
 
 
 def monitor_index_for_hwnd(hwnd: int) -> int | None:
@@ -2398,11 +2437,44 @@ class App(tk.Tk):
         self._prog_label_widget.pack_forget()
         self._progress_label_var.set("")
 
+    def _sync_monitor_vars_len(self, n: int):
+        """Grow monitor_vars to at least n entries. Never shrink (avoids dangling
+        preset/manual refs into monitor_vars)."""
+        while len(self.monitor_vars) < n:
+            self.monitor_vars.append(tk.BooleanVar(value=False))
+
     def _render_monitor_layout(self, layout_name: str):
         if not self._layout_grid:
             return
         for w in self._layout_grid.winfo_children():
             w.destroy()
+
+        rects = list_monitors_rects()[:8]
+
+        # CZOW single-monitor sim box: keep the old MONITOR_LAYOUTS preview (disabled cells)
+        # so the Layout combobox still previews the wall shapes.
+        if self._station_id == "CZOW-NB2DLRL24" and len(rects) <= 1:
+            self._render_layout_placeholder(layout_name)
+            return
+
+        # Real multi-monitor wall: build the grid from live pixel geometry.
+        # Monitor positions never change, so clicking a physical cell always toggles the
+        # correct OS monitor regardless of how Windows renumbers the displays.
+        self._monitors = rects
+        self._sync_monitor_vars_len(len(rects))
+        for (r, c), idx in sorted(geometric_monitor_grid(rects).items()):
+            if idx >= len(self.monitor_vars):
+                continue
+            ttk.Checkbutton(
+                self._layout_grid, text=f"M{idx + 1}",  # matches on_identify_monitors
+                variable=self.monitor_vars[idx],
+                command=lambda i=idx: self._on_specific_monitor_toggle(i),
+                width=3
+            ).grid(row=r, column=c, padx=2, pady=2, sticky="nsew")
+
+    def _render_layout_placeholder(self, layout_name: str):
+        """Static MONITOR_LAYOUTS preview (disabled cells). Used only on the CZOW dev box,
+        which has a single physical monitor but emulates a wall via the Layout combobox."""
         layout = MONITOR_LAYOUTS.get(layout_name, {})
         for mon, (r, c) in layout.items():
             idx = int(mon) - 1
