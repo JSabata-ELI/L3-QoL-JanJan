@@ -126,19 +126,49 @@ EXTRA_COL_MATCH_TOL_S = 30.0
 IMG_MATCH_TOL_NS = 30_000_000_000
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
-CPVA_BASE_URL     = "https://10.78.0.57:8443/api/1.0/cpva"
+def _import_cpva_client():
+    """Load the shared CPVA client (sibling cpva_client.py). Reuses an
+    already-loaded instance so every tool (and re-exec'd module copy) shares
+    one connection pool and one day cache."""
+    import importlib.util as _ilu
+    mod = _sys.modules.get("cpva_client")
+    if mod is not None:
+        return mod
+    p = Path(__file__).resolve().parent / "cpva_client.py"
+    spec = _ilu.spec_from_file_location("cpva_client", p)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules["cpva_client"] = mod   # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+cpva = _import_cpva_client()
+
+CPVA_BASE_URL     = cpva.CPVA_BASE_URL
 CPVA_HTTP_TIMEOUT = 15.0   # seconds per channel request
 
 # Maps PV column name → CPVA archiver channel name.
-CPVA_CHANNEL_MAP: dict[str, str] = {
-    "ptm1":      "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-    "pcm2":      "HAPLS-ENER_IN_PCM2_LT6_DIAG2:Energy",
-    "pcm4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
-    "pap1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
-    "sbw4":      "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-    "Back_Ref":  "L3-PM03-023:Energy",
-    "waveplate": "L3-PFWP6-MTR03-1:RawPos",
-}
+CPVA_CHANNEL_MAP: dict[str, str] = cpva.CHANNEL_MAP
+
+_SLIDER_MOD = None
+
+
+def _get_slider_module():
+    """Borrow helpers (GRADIENTS, _copy_metadata_into_png, …) from the Image
+    Slider module WITHOUT re-executing 13k lines of is_t.py on every use —
+    prefer the instance main.py already loaded, else load once and cache."""
+    global _SLIDER_MOD
+    mod = _sys.modules.get("image_slider")
+    if mod is not None:
+        return mod
+    if _SLIDER_MOD is None:
+        import importlib.util as _ilu
+        p = Path(__file__).resolve().parent / "is_t.py"
+        spec = _ilu.spec_from_file_location("is_t_helpers", p)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SLIDER_MOD = mod
+    return _SLIDER_MOD
 
 PV_COLUMNS: dict[str, str] = {
     "sbw4":      "SBW4 [J]",
@@ -186,46 +216,18 @@ def _read_img_max_value(path: Path) -> "float | None":
     return None
 
 
-def _cpva_ssl_ctx() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
 def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
                         timeout: float = CPVA_HTTP_TIMEOUT) -> "tuple[list[dict], str]":
-    """Fetch archiver samples. Returns (samples_list, url_used)."""
-    params = urllib.parse.urlencode({
-        "channelName": channel,
-        "start": str(start_ns),
-        "end":   str(end_ns),
-    })
-    url = f"{CPVA_BASE_URL}/samples?{params}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout, context=_cpva_ssl_ctx()) as resp:
-        return json.loads(resp.read().decode("utf-8")), url
+    """Fetch archiver samples via the shared pooled client (keep-alive, retry).
+    Returns (samples_list, url_used). Raises cpva.CpvaError."""
+    url = f"{CPVA_BASE_URL}/samples?channelName={urllib.parse.quote(channel)}"
+    return cpva.fetch_samples(channel, start_ns, end_ns, timeout=timeout), url
 
 
 def _cpva_fetch_channels(pattern: str = "**",
                          timeout: float = CPVA_HTTP_TIMEOUT) -> "list[str]":
     """Return all archiver channel names matching `pattern` (default: all)."""
-    params = urllib.parse.urlencode({"pattern": pattern})
-    url = f"{CPVA_BASE_URL}/channels-by-pattern?{params}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout, context=_cpva_ssl_ctx()) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    # Endpoint may return a bare list of names or a list of dicts.
-    out: list[str] = []
-    if isinstance(data, list):
-        for d in data:
-            if isinstance(d, str):
-                out.append(d)
-            elif isinstance(d, dict):
-                name = d.get("channelName") or d.get("name") or d.get("channel")
-                if name:
-                    out.append(str(name))
-    return out
+    return cpva.fetch_channels(pattern, timeout=timeout)
 
 
 def _load_csv_for_day(day: date, cols: "list[str]",
@@ -325,39 +327,24 @@ def _load_api_for_day(day: date, cols: "list[str]",
         channel = CPVA_CHANNEL_MAP.get(col, col)
         col_rows: list[dict] = []
         if channel:
-            channels_to_try = [channel]
-            if not channel.endswith(".value"):
-                channels_to_try.append(channel + ".value")
-            for ch_try in channels_to_try:
-                try:
-                    samples, _url = _cpva_fetch_samples(ch_try, start_ns, end_ns)
-                    if not isinstance(samples, list):
-                        _log(f"  API {col}: unexpected response type {type(samples).__name__}: {str(samples)[:120]}")
-                        continue
-                    parsed = 0
-                    for s in samples:
-                        t_ns = s.get("time")
-                        if t_ns is None:
-                            continue
-                        val = s.get("value")
-                        if isinstance(val, list):
-                            val = val[0] if val else None
-                        if val is None:
-                            continue
-                        t_ns = int(t_ns)
-                        if PRAGUE is not None:
-                            dt_local = datetime.fromtimestamp(
-                                t_ns / 1e9, tz=timezone.utc).astimezone(PRAGUE).replace(tzinfo=None)
-                        else:
-                            dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
-                        col_rows.append({"_dt": dt_local, "_ns": t_ns, col: str(val)})
-                        parsed += 1
-                    col_rows.sort(key=lambda r: r["_dt"])
-                    _log(f"  API {col} ({ch_try}): {len(samples)} raw → {parsed} parsed")
-                    if parsed > 0:
-                        break
-                except Exception as exc:
-                    _log(f"  API {col} ({ch_try}) ERROR: {type(exc).__name__}: {exc}")
+            date_key = day.strftime("%Y-%m-%d")
+            # Shared day cache: repeat searches over the same days are served
+            # from memory; the ".value" channel-suffix retry happens inside.
+            res = cpva.get_day(channel, date_key, timeout=CPVA_HTTP_TIMEOUT)
+            if res.status == "error":
+                _log(f"  API {col} ({channel}) FETCH FAILED (will retry) — falling back to CSV")
+            elif res.status == "stale":
+                _log(f"  API {col} ({channel}): fetch failed, using "
+                     f"{len(res.samples)} samples from {res.age_s:.0f}s ago")
+            for t_ns, v in res.samples:
+                if PRAGUE is not None:
+                    dt_local = datetime.fromtimestamp(
+                        t_ns / 1e9, tz=timezone.utc).astimezone(PRAGUE).replace(tzinfo=None)
+                else:
+                    dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
+                col_rows.append({"_dt": dt_local, "_ns": t_ns, col: str(v)})
+            if col_rows:
+                _log(f"  API {col} ({channel}): {len(col_rows)} samples")
         else:
             _log(f"  {col}: no CPVA channel mapping, trying CSV only")
         if not col_rows:
@@ -1628,35 +1615,40 @@ class ShotFinderWidget(QWidget):
         cam = self._active_cam
         if not cam or dr.hour_folder is None:
             return
-        cam_folder = dr.hour_folder / cam
-        if not cam_folder.exists():
-            try:
-                for sub in dr.hour_folder.iterdir():
-                    if sub.is_dir() and sub.name.lower() == cam.lower():
-                        cam_folder = sub
-                        break
-            except Exception:
-                return
         dt_obj = dr.best_row.get("_dt")
         if dt_obj is None:
             return
         ts_ns_direct = dr.best_row.get("_ns")
-        img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
-        if img is None:
-            self._preview_widget.set_pixmap(None)
-            self._log(f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s in "
-                      f"{cam_folder} for {dt_obj}")
-            return
-
-        energy_text = self._build_energy_text(dr, dr.best_row, ts_ns_direct)
-
-        self._current_preview_path = img
         self._preview_gen += 1
         gen = self._preview_gen
         gradient_name = self._gradient_cb.currentText()
-        threading.Thread(
-            target=lambda: self._load_and_show_preview(img, energy_text, gen, gradient_name),
-            daemon=True).start()
+
+        def _resolve_and_load():
+            # Folder probing + _find_image_for_ts (os.scandir over SMB) used to
+            # run on the UI thread — a row click froze the GUI on a slow share.
+            cam_folder = dr.hour_folder / cam
+            if not cam_folder.exists():
+                try:
+                    for sub in dr.hour_folder.iterdir():
+                        if sub.is_dir() and sub.name.lower() == cam.lower():
+                            cam_folder = sub
+                            break
+                except Exception:
+                    return
+            img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
+            if gen != self._preview_gen:
+                return
+            if img is None:
+                self._preview_sig.log_msg.emit(
+                    f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s in "
+                    f"{cam_folder} for {dt_obj}")
+                self._preview_sig.show.emit(None, "", gen)
+                return
+            energy_text = self._build_energy_text(dr, dr.best_row, ts_ns_direct)
+            self._current_preview_path = img
+            self._load_and_show_preview(img, energy_text, gen, gradient_name)
+
+        threading.Thread(target=_resolve_and_load, daemon=True).start()
 
     def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int, gradient_name: str = ""):
         """Background thread: load and process image into QImage; QPixmap conversion on main thread."""
@@ -1939,10 +1931,21 @@ class ShotFinderWidget(QWidget):
         _emit_log = self._sig.log_msg.emit
 
         def worker():
+            all_cols = list(search_cols) + [
+                c for c in extra_cols if c not in search_cols]
+            # Pre-warm the shared day cache: all (channel × day) fetches run in
+            # parallel through the connection pool, so the sequential per-day
+            # loop below is served from memory instead of days × cols × RTT.
+            try:
+                _chans = [CPVA_CHANNEL_MAP.get(c, c) for c in all_cols]
+                _dkeys = [d.strftime("%Y-%m-%d") for d in days]
+                if _chans and _dkeys:
+                    _emit_log(f"Pre-warming {len(_chans)}×{len(_dkeys)} channel-days…")
+                    cpva.warm_days(_chans, _dkeys, timeout=CPVA_HTTP_TIMEOUT)
+            except Exception:
+                pass
             for i, day in enumerate(days):
                 try:
-                    all_cols = list(search_cols) + [
-                        c for c in extra_cols if c not in search_cols]
                     _emit_log(f"{day}: querying API+CSV for cols={all_cols}")
                     rows, per_col = _load_api_for_day(day, all_cols, log=_emit_log,
                                                       csv_root=csv_root)
@@ -2866,10 +2869,7 @@ class ShotFinderWidget(QWidget):
                 combined.paste(bar2, (0, pil_img.height))
                 combined.save(dst)
                 try:
-                    import importlib.util as _ilu_sf, pathlib as _pl_sf
-                    _ist_sf = _ilu_sf.spec_from_file_location("is_t", _pl_sf.Path(__file__).parent / "is_t.py")
-                    _m_sf = _ilu_sf.module_from_spec(_ist_sf); _ist_sf.loader.exec_module(_m_sf)
-                    _m_sf._copy_metadata_into_png(img, dst, save_txt=False)
+                    _get_slider_module()._copy_metadata_into_png(img, dst, save_txt=False)
                 except Exception:
                     pass
                 copied += 1

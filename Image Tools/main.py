@@ -69,14 +69,17 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
             raise ImportError(f"{filename} failed to load:\n{_tb.format_exc()}") from _e
         return mod
 
-    try:
-        _if = _load_module("image_finder", "if_t.py")
-    except Exception as e:
-        raise RuntimeError(f"if_t.py error: {e}") from e
+    # Load the slider FIRST: if_t/sf_t borrow its helpers (GRADIENTS, PNG
+    # metadata copy) via sys.modules["image_slider"] — loading it first means
+    # they reuse this instance instead of exec'ing is_t.py a second time.
     try:
         _is = _load_module("image_slider", "is_t.py")
     except Exception as e:
         raise RuntimeError(f"is_t.py error: {e}") from e
+    try:
+        _if = _load_module("image_finder", "if_t.py")
+    except Exception as e:
+        raise RuntimeError(f"if_t.py error: {e}") from e
     try:
         _sf = _load_module("shot_finder", "sf_t.py")
     except Exception as e:

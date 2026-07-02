@@ -89,20 +89,27 @@ PV_UNITS: dict[str, str] = {
 }
 
 
-def _pv_ssl_ctx() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    return ctx
+def _import_cpva_client():
+    """Load the shared CPVA client (sibling cpva_client.py). Reuses an
+    already-loaded instance so every tool (and re-exec'd module copy) shares
+    one connection pool and one day cache."""
+    import sys as _sys
+    import importlib.util as _ilu
+    mod = _sys.modules.get("cpva_client")
+    if mod is not None:
+        return mod
+    p = Path(__file__).resolve().parent / "cpva_client.py"
+    spec = _ilu.spec_from_file_location("cpva_client", p)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules["cpva_client"] = mod   # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-# Cache: (channel, date_str) → sorted list of (t_ns, float)
-# date_str = "YYYY-MM-DD" in Prague time
-_pv_day_cache: dict[tuple[str, str], list] = {}
-_pv_day_cache_lock = threading.Lock()
+cpva = _import_cpva_client()
+
 # Today's cache expires after this many seconds (live mode gets fresh data periodically)
 _PV_TODAY_CACHE_TTL = 3.0
-_pv_today_cache_time: dict[tuple[str, str], float] = {}  # cache_key → time.monotonic() of last fetch
 
 
 def _pv_date_key(ts_ns: int) -> str:
@@ -112,62 +119,16 @@ def _pv_date_key(ts_ns: int) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+def _pv_load_day_res(channel: str, date_key: str) -> "cpva.DayResult":
+    """Samples + status for channel on date_key via the shared day cache.
+    status: "ok" | "empty" | "stale" (fetch failed, older data shown) | "error"."""
+    return cpva.get_day(channel, date_key, today_ttl=_PV_TODAY_CACHE_TTL,
+                        timeout=CPVA_HTTP_TIMEOUT)
+
+
 def _pv_load_day(channel: str, date_key: str) -> "list[tuple[int, float]]":
     """Fetch (or return cached) sorted (t_ns, value) list for channel on date_key."""
-    cache_key = (channel, date_key)
-    today_key = datetime.now(TZ_PRAGUE).strftime("%Y-%m-%d")
-    is_today  = (date_key == today_key)
-
-    with _pv_day_cache_lock:
-        if cache_key in _pv_day_cache:
-            if not is_today:
-                return _pv_day_cache[cache_key]
-            # Today: honour TTL so live data refreshes periodically
-            age = time.monotonic() - _pv_today_cache_time.get(cache_key, 0.0)
-            if age < _PV_TODAY_CACHE_TTL:
-                return _pv_day_cache[cache_key]
-
-    # Parse date_key → day boundaries in Prague time
-    y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
-    day_start = datetime(y, m, d, 0, 0, 0, tzinfo=TZ_PRAGUE)
-    day_end   = datetime(y, m, d, 23, 59, 59, 999999, tzinfo=TZ_PRAGUE)
-    start_ns  = int(day_start.timestamp() * 1e9)
-    end_ns    = int(day_end.timestamp()   * 1e9)
-
-    params = urllib.parse.urlencode({
-        "channelName": channel,
-        "start": str(start_ns),
-        "end":   str(end_ns),
-    })
-    url = f"{CPVA_BASE_URL}/samples?{params}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=CPVA_HTTP_TIMEOUT, context=_pv_ssl_ctx()) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-        result: list[tuple[int, float]] = []
-        for s in raw if isinstance(raw, list) else []:
-            t = s.get("time")
-            val = s.get("value")
-            if isinstance(val, list):
-                val = val[0] if val else None
-            try:
-                result.append((int(t), float(val)))
-            except (TypeError, ValueError):
-                continue
-        result.sort(key=lambda x: x[0])
-    except Exception:
-        # On failure keep whatever was in cache (avoids showing "—" when server hiccups)
-        with _pv_day_cache_lock:
-            return _pv_day_cache.get(cache_key, [])
-
-    with _pv_day_cache_lock:
-        _pv_day_cache[cache_key] = result
-        if is_today:
-            _pv_today_cache_time[cache_key] = time.monotonic()
-        if len(_pv_day_cache) > 32:
-            oldest = next(iter(_pv_day_cache))
-            del _pv_day_cache[oldest]
-    return result
+    return _pv_load_day_res(channel, date_key).samples
 
 
 def _pv_prev_date_key(date_key: str) -> str:
@@ -186,29 +147,10 @@ def _pv_next_date_key(date_key: str) -> str:
 
 def _pv_query_range(channel: str, start_ns: int, end_ns: int) -> "list[tuple[int, float]]":
     """One archiver query for samples in [start_ns, end_ns], sorted by time.
-    Unlike _pv_load_day this is not day-aligned/cached — used for wide look-backs."""
-    params = urllib.parse.urlencode({
-        "channelName": channel, "start": str(int(start_ns)), "end": str(int(end_ns)),
-    })
-    url = f"{CPVA_BASE_URL}/samples?{params}"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=CPVA_HTTP_TIMEOUT, context=_pv_ssl_ctx()) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return []
-    result: list[tuple[int, float]] = []
-    for s in raw if isinstance(raw, list) else []:
-        t = s.get("time")
-        val = s.get("value")
-        if isinstance(val, list):
-            val = val[0] if val else None
-        try:
-            result.append((int(t), float(val)))
-        except (TypeError, ValueError):
-            continue
-    result.sort(key=lambda x: x[0])
-    return result
+    Unlike _pv_load_day this is not day-aligned/cached — used for wide look-backs.
+    Raises cpva.CpvaError on fetch failure (so callers can avoid caching None)."""
+    return cpva.fetch_values(channel, int(start_ns), int(end_ns),
+                             timeout=CPVA_HTTP_TIMEOUT, try_value_suffix=False)
 
 
 # Cache of "last value at or before this day" per (channel, date_key) — so a whole
@@ -237,11 +179,16 @@ def _pv_value_at_or_before(channel: str, ts_ns: int) -> "float | None":
         if ck in _pv_before_cache:
             return _pv_before_cache[ck]
     val: "float | None" = None
-    for d in _PV_LOOKBACK_WINDOWS_DAYS:
-        samples = _pv_query_range(channel, ts_ns - d * _DAY_NS, ts_ns)
-        if samples:
-            val = samples[-1][1]   # query end is ts_ns → all samples are ≤ ts_ns
-            break
+    try:
+        for d in _PV_LOOKBACK_WINDOWS_DAYS:
+            samples = _pv_query_range(channel, ts_ns - d * _DAY_NS, ts_ns)
+            if samples:
+                val = samples[-1][1]   # query end is ts_ns → all samples are ≤ ts_ns
+                break
+    except cpva.CpvaError:
+        # Fetch failed — do NOT cache: a transient outage must not poison this
+        # (channel, day) with None until restart. Next call retries.
+        return None
     with _pv_before_lock:
         _pv_before_cache[ck] = val
         if len(_pv_before_cache) > 256:
@@ -249,8 +196,13 @@ def _pv_value_at_or_before(channel: str, ts_ns: int) -> "float | None":
     return val
 
 
-def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
-    """Return nearest sample to ts_ns within ±_PV_WINDOW_NS (30 s).
+def _pv_last_known_ex(channel: str, ts_ns: int) -> "tuple[float | None, str]":
+    """Return (nearest sample to ts_ns within ±_PV_WINDOW_NS, fetch status).
+
+    Status is the worst across the consulted days: "ok"/"empty" → data reliable,
+    "stale" → shown from an older successful fetch (this fetch failed),
+    "error" → fetch failed and nothing cached (caller should show a retry hint,
+    not a permanent "—").
 
     Strategy differs by channel type:
     - Forward channels (waveplate): prefer the FIRST sample at or AFTER ts_ns
@@ -265,40 +217,34 @@ def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
     date_key = _pv_date_key(ts_ns)
     # Collect candidates from same day + adjacent days (handles midnight boundary)
     candidates: list[tuple[int, float]] = []
+    status = "ok"
     for dk in (_pv_prev_date_key(date_key), date_key, _pv_next_date_key(date_key)):
-        day = _pv_load_day(channel, dk)
-        if day:
-            candidates.extend(day)
+        res = _pv_load_day_res(channel, dk)
+        if res.samples:
+            candidates.extend(res.samples)
+        if res.status == "error":
+            status = "error"
+        elif res.status == "stale" and status != "error":
+            status = "stale"
     if not candidates:
         if channel in _PV_FORWARD_CHANNELS:
-            return _pv_value_at_or_before(channel, ts_ns)
-        return None
+            return _pv_value_at_or_before(channel, ts_ns), status
+        return None, status
 
     candidates.sort(key=lambda x: x[0])
-    ts_list = [s[0] for s in candidates]
-
-    if channel in _PV_FORWARD_CHANNELS:
-        # Primary: first sample >= ts_ns within window
-        idx_f = bisect.bisect_left(ts_list, ts_ns)
-        if idx_f < len(candidates) and (candidates[idx_f][0] - ts_ns) <= _PV_WINDOW_NS:
-            return candidates[idx_f][1]
-        # Secondary: last sample < ts_ns within window (small backward offset)
-        idx_b = bisect.bisect_right(ts_list, ts_ns) - 1
-        if idx_b >= 0 and (ts_ns - candidates[idx_b][0]) <= _PV_WINDOW_NS:
-            return candidates[idx_b][1]
+    prefer = "after" if channel in _PV_FORWARD_CHANNELS else "before"
+    val = cpva.nearest_sample(candidates, ts_ns, window_ns=_PV_WINDOW_NS, prefer=prefer)
+    if val is None and channel in _PV_FORWARD_CHANNELS:
         # Fallback: last-known backward (waveplate position may be set days ago)
-        return _pv_value_at_or_before(channel, ts_ns)
-    else:
-        # Primary: last sample <= ts_ns within window
-        idx_b = bisect.bisect_right(ts_list, ts_ns) - 1
-        if idx_b >= 0 and (ts_ns - candidates[idx_b][0]) <= _PV_WINDOW_NS:
-            return candidates[idx_b][1]
-        # Secondary: first sample > ts_ns within window (image slightly ahead of PV)
-        idx_f = bisect.bisect_left(ts_list, ts_ns)
-        if idx_f < len(candidates) and (candidates[idx_f][0] - ts_ns) <= _PV_WINDOW_NS:
-            return candidates[idx_f][1]
-        # No sample within 30 s — don't show a stale value from hours/days ago
-        return None
+        return _pv_value_at_or_before(channel, ts_ns), status
+    # Energy channels: no sample within 30 s stays None — don't show a stale
+    # value from hours/days ago
+    return val, status
+
+
+def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
+    """Compat shim — value only (see _pv_last_known_ex for fetch status)."""
+    return _pv_last_known_ex(channel, ts_ns)[0]
 
 
 def _format_pv_value(channel: str, val: float) -> str:
@@ -342,15 +288,8 @@ def pv_warm_days(channels: "list[str]", ts_values: "list[int]", lookback_days: i
     for _ in range(max(0, lookback_days)):
         k = _pv_prev_date_key(k)
         date_keys.add(k)
-    jobs = [(ch, dk) for ch in channels for dk in date_keys]
-    if not jobs:
-        return
-    from concurrent.futures import ThreadPoolExecutor
-    try:
-        with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
-            list(ex.map(lambda j: _pv_load_day(j[0], j[1]), jobs))
-    except Exception:
-        pass
+    cpva.warm_days(channels, date_keys, today_ttl=_PV_TODAY_CACHE_TTL,
+                   timeout=CPVA_HTTP_TIMEOUT)
 
 
 def _pv_bar_font(size: int):
@@ -562,7 +501,7 @@ DEFAULT_OPEN_ROOT = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
 DEFAULT_SAVE_DIR  = r"\\hapls-share.lcs.local\scratch"
 
 _CHECKBOX_STYLE = """
-QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
+QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; background: transparent; }
 QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #4a4a4a;
     border-radius: 3px; background: #fff; }
 QCheckBox::indicator:hover { border: 2px solid #2d7dff; background: #f4f8ff; }
@@ -688,11 +627,19 @@ def folder_hour_from_prague_hour(prague_hour: int, date: datetime | None = None)
 # on every poll is what makes live updates slow down (and keep slowing down) over
 # a long session — so the online poller scans only the newest folders per camera.
 ONLINE_ACTIVE_FOLDER_COUNT = 2  # current hour + previous (grace for late writes at rollover)
-# When a _DirWatcher (ReadDirectoryChangesW) is active for a camera, new frames
-# arrive instantly without enumeration, so the expensive full os.listdir scan only
-# needs to run occasionally — for hour-rollover / new-folder auto-discovery and as a
-# safety net against ReadDirectoryChangesW buffer overflow under burst.
-ONLINE_FULL_POLL_INTERVAL_S = 2.5
+# Adaptive per-camera full-poll pacing (multi-cam live). A camera with a HEALTHY
+# dir-watcher gets frames pushed instantly, so its listdir poll is only a
+# rollover/overflow safety net and can be slow. Without a watcher (RDCW silently
+# fails on many SMB/UNC setups), polling IS the data source: start fast, back
+# off while idle, snap back to fast on the first new frame. With 12 cameras this
+# is the difference between hundreds of SMB roundtrips/s and a handful.
+ONLINE_POLL_MIN_INTERVAL_S     = 1.0
+ONLINE_POLL_MAX_INTERVAL_S     = 5.0
+ONLINE_POLL_BACKOFF            = 1.5
+ONLINE_WATCHER_POLL_INTERVAL_S = 10.0
+# Minutes after the UTC hour rollover during which the previous hour folder may
+# still receive late writes and must stay in the scan set.
+ONLINE_ROLLOVER_GRACE_MIN      = 5
 
 
 def _cam_folder_time_key(folder: Path) -> "tuple[int, int, int, int] | None":
@@ -710,10 +657,13 @@ def _cam_folder_time_key(folder: Path) -> "tuple[int, int, int, int] | None":
     return (yy, mm, dd, hh)
 
 
-def active_scan_folders(all_folders: "list[Path]") -> "list[Path]":
+def active_scan_folders(all_folders: "list[Path]", count: "int | None" = None) -> "list[Path]":
     """Return only the folders worth scanning for new images in live mode: the
-    newest ONLINE_ACTIVE_FOLDER_COUNT hour folders. Folders whose path can't be
-    parsed are always kept (defensive — never silently skip an unexpected layout)."""
+    newest `count` (default ONLINE_ACTIVE_FOLDER_COUNT) hour folders. Folders
+    whose path can't be parsed are always kept (defensive — never silently skip
+    an unexpected layout)."""
+    if count is None:
+        count = ONLINE_ACTIVE_FOLDER_COUNT
     keyed: "list[tuple[tuple, Path]]" = []
     keyless: "list[Path]" = []
     for f in all_folders:
@@ -723,8 +673,67 @@ def active_scan_folders(all_folders: "list[Path]") -> "list[Path]":
         else:
             keyed.append((k, f))
     keyed.sort(key=lambda x: x[0])
-    active = [f for _, f in keyed[-ONLINE_ACTIVE_FOLDER_COUNT:]]
+    active = [f for _, f in keyed[-count:]]
     return active + keyless
+
+
+def poll_scan_folders(all_folders: "list[Path]") -> "list[Path]":
+    """Folders to LISTDIR-poll right now: outside the rollover grace window only
+    the newest hour folder can still receive frames, so scanning the previous
+    one is wasted SMB traffic."""
+    in_grace = time.gmtime().tm_min < ONLINE_ROLLOVER_GRACE_MIN
+    return active_scan_folders(all_folders, ONLINE_ACTIVE_FOLDER_COUNT if in_grace else 1)
+
+
+def _is_dir_quiet(p: "Path") -> bool:
+    """One-stat directory check (is_dir implies exists) that never raises."""
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
+# Negative-probe cache for hour-folder discovery. Probing candidate folders that
+# don't exist yet costs one SMB stat per camera per poll — cache the misses.
+_NEG_PROBE_TTL_S = 20.0
+_neg_probe_cache: "dict[str, float]" = {}
+_neg_probe_lock = threading.Lock()
+
+
+def _probe_hour_folder(candidate: "Path") -> bool:
+    """is_dir() probe for a future hour-folder candidate, with:
+    - wall-clock gate: an hour-H (UTC) folder cannot exist before hour H, so
+      future hours are rejected without touching the share at all;
+    - negative TTL cache: a folder that was missing moments ago is not
+      re-stat'ed on every poll (12 cams × every tick = a stat storm over SMB)."""
+    k = _cam_folder_time_key(candidate)
+    is_current_hour = False
+    if k is not None:
+        g = time.gmtime()
+        now_key = (g.tm_year, g.tm_mon, g.tm_mday, g.tm_hour)
+        if k > now_key:
+            return False
+        # The CURRENT hour's folder appears at any moment after rollover —
+        # never negative-cache it, or discovery lags by the TTL on top of the
+        # poll interval and the camera shows no frames for ~30 s each hour.
+        is_current_hour = (k == now_key)
+    key = str(candidate)
+    now = time.monotonic()
+    if not is_current_hour:
+        with _neg_probe_lock:
+            t = _neg_probe_cache.get(key)
+            if t is not None and (now - t) < _NEG_PROBE_TTL_S:
+                return False
+    try:
+        ok = candidate.is_dir()
+    except OSError:
+        ok = False
+    if not ok and not is_current_hour:
+        with _neg_probe_lock:
+            if len(_neg_probe_cache) > 512:
+                _neg_probe_cache.clear()
+            _neg_probe_cache[key] = now
+    return ok
 
 
 # ---------------- IMAGE SCALE READER ----------------
@@ -6914,6 +6923,11 @@ class _DirWatcher(_threading.Thread):
         self._img_ext = img_ext
         self._stop    = _threading.Event()
         self._handle  = None
+        # True once ReadDirectoryChangesW is actually armed. RDCW can silently
+        # fail on UNC/SMB paths — the thread then exits and is_alive() goes
+        # False, so health = (ok and is_alive()). A dead watcher must NOT be
+        # treated as coverage, or the poll fallback never takes over.
+        self.ok = False
 
     def stop(self):
         self._stop.set()
@@ -6939,6 +6953,7 @@ class _DirWatcher(_threading.Thread):
         if h == _INVALID_HANDLE:
             return
         self._handle = h
+        self.ok = True
         buf = _ct.create_string_buffer(65536)
         br  = _wt.DWORD(0)
         while not self._stop.is_set():
@@ -6989,7 +7004,10 @@ class _CamPollTask(QRunnable):
             try:
                 folder_path = Path(folder)
                 for name in os.listdir(folder):
-                    if Path(name).suffix.lower() not in IMG_EXT:
+                    # String-level extension check — avoids a Path object per
+                    # file in a loop that runs over thousands of entries.
+                    dot = name.rfind(".")
+                    if dot < 0 or name[dot:].lower() not in IMG_EXT:
                         continue
                     p = folder_path / name
                     ts_ns = parse_unix_ns_from_name(p)
@@ -7034,13 +7052,14 @@ class _CamPollTask(QRunnable):
                             candidate = day_dir / str(next_h) / self._cam_name
                         if candidate in known or candidate in new_folders:
                             break
-                        if candidate.exists() and candidate.is_dir():
+                        if _probe_hour_folder(candidate):
                             new_folders.append(candidate)
                             known.add(candidate)
                             try:
                                 cand_path = Path(candidate)
                                 for name in os.listdir(candidate):
-                                    if Path(name).suffix.lower() not in IMG_EXT:
+                                    dot = name.rfind(".")
+                                    if dot < 0 or name[dot:].lower() not in IMG_EXT:
                                         continue
                                     p = cand_path / name
                                     ts_ns = parse_unix_ns_from_name(p)
@@ -7304,7 +7323,9 @@ class Viewer(QWidget):
         self.scan_pool = QThreadPool(self); self.scan_pool.setMaxThreadCount(4)
         # Separate pool for online polling — one thread per camera so they run in parallel
         self._poll_pool = QThreadPool(self); self._poll_pool.setMaxThreadCount(8)
-        self.load_pool = QThreadPool(self); self.load_pool.setMaxThreadCount(3)
+        # Image decode is I/O-bound over SMB (read latency dominates decode CPU)
+        # — more threads keep scrubbing/prefetch responsive on a slow share.
+        self.load_pool = QThreadPool(self); self.load_pool.setMaxThreadCount(8)
         self.analysis_pool = QThreadPool(self); self.analysis_pool.setMaxThreadCount(1)
 
         self.load_signals = LoaderSignals()
@@ -8493,6 +8514,22 @@ class Viewer(QWidget):
             self._pv_table.setRowHeight(i, row_h)
 
     def _pv_trigger_fetch(self):
+        """Throttled entry: coalesce rapid frame changes (live mode ~3 Hz,
+        scrubbing) into one fetch at most every ~400 ms. Trailing-edge — the
+        timestamp is resolved when the timer fires, so the newest frame wins."""
+        if not self._pv_enabled:
+            return
+        t = getattr(self, "_pv_debounce_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.setInterval(400)
+            t.timeout.connect(self._pv_trigger_fetch_now)
+            self._pv_debounce_timer = t
+        if not t.isActive():
+            t.start()
+
+    def _pv_trigger_fetch_now(self):
         """Start a background fetch for the current displayed timestamp."""
         if not self._pv_enabled:
             return
@@ -8541,12 +8578,15 @@ class Viewer(QWidget):
             channel = PV_CHANNEL_MAP.get(name)
             if not channel:
                 return name, "—"
-            val = _pv_last_known(channel, ts_ns)
+            val, status = _pv_last_known_ex(channel, ts_ns)
             if val is None:
-                return name, "—"
-            if "RawPos" in channel:
-                return name, f"{val:.0f}"
-            return name, f"{val:.3f}"
+                # "error" = fetch failed (not cached → next trigger retries);
+                # distinguish it from a genuine "no data near this timestamp".
+                return name, ("⟳" if status == "error" else "—")
+            txt = f"{val:.0f}" if "RawPos" in channel else f"{val:.3f}"
+            if status == "stale":
+                txt += " (old)"
+            return name, txt
 
         def _fetch():
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8576,11 +8616,8 @@ class Viewer(QWidget):
             ts_ns = self.items[self.current_idx].ts_ns
         if ts_ns is not None:
             date_key = _pv_date_key(ts_ns)
-            prev_key = _pv_prev_date_key(date_key)
-            with _pv_day_cache_lock:
-                for key in list(_pv_day_cache.keys()):
-                    if key[1] in (date_key, prev_key):
-                        del _pv_day_cache[key]
+            cpva.invalidate(date_key=date_key)
+            cpva.invalidate(date_key=_pv_prev_date_key(date_key))
         self._pv_trigger_fetch()
 
     def _pv_on_result(self, gen: int, results: dict):
@@ -8607,7 +8644,7 @@ class Viewer(QWidget):
         for name in self._pv_enabled:
             val = self._pv_values.get(name, "…")
             units = PV_UNITS.get(name, "")
-            if val not in ("…", "—") and units:
+            if val not in ("…", "—", "⟳") and units:
                 val = f"{val} {units}"
             rows.append((name, val))
 
@@ -8796,7 +8833,7 @@ class Viewer(QWidget):
         # Redraw each cam at its own current frame (don't snap all to the shared time).
         if (self.cb_bright.isChecked() or self._brightness_offset != 0) \
                 and self._is_multi_cam() and self.current_idx is not None:
-            self._cam_caches = [PixCache(80) for _ in self._cam_caches]
+            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
             self._redraw_all_cams_in_place()
 
         if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
@@ -8876,18 +8913,25 @@ class Viewer(QWidget):
         QTimer.singleShot(0, _update_tickbar_offset)
         QTimer.singleShot(0, self._resize_per_cam_scroll)
 
+    # Show at most this many camera-slider rows at once; with more cameras
+    # selected, the rest scroll into view via the scroll area's side scrollbar.
+    MAX_VISIBLE_CAM_ROWS = 4
+
     def _resize_per_cam_scroll(self):
-        """Fix the per-camera slider area height to the current row count (capped),
-        so it grows AND shrinks as the number of cameras changes."""
-        MAX_H = 200
+        """Fix the per-camera slider area height to the current row count
+        (capped at MAX_VISIBLE_CAM_ROWS), so it grows AND shrinks as the
+        number of cameras changes, and never shows more than the cap."""
         n = len(self._per_cam_rows)
         if n == 0:
             self._per_cam_scroll.setVisible(False)
             return
         row_h = self._per_cam_rows[0].sizeHint().height()
+        spacing = self._per_cam_layout.spacing()
         m = self._per_cam_layout.contentsMargins()
-        total = n * row_h + (n - 1) * self._per_cam_layout.spacing() + m.top() + m.bottom()
-        h = min(MAX_H, max(0, total))
+        visible_rows = min(n, self.MAX_VISIBLE_CAM_ROWS)
+        total = n * row_h + (n - 1) * spacing + m.top() + m.bottom()
+        max_h = visible_rows * row_h + max(0, visible_rows - 1) * spacing + m.top() + m.bottom()
+        h = min(max_h, max(0, total))
         self._per_cam_scroll.setMinimumHeight(h)
         self._per_cam_scroll.setMaximumHeight(h)
 
@@ -9167,7 +9211,7 @@ class Viewer(QWidget):
             self._cam_items       = [[] for _ in range(n)]
             self._cam_ts          = [[] for _ in range(n)]
             self._cam_poll_max_ts = [0] * n   # highest ts_ns seen per camera (for fast incremental poll)
-        self._cam_caches       = [PixCache(80) for _ in range(n)]
+        self._cam_caches       = [PixCache(self._cam_cache_size(n)) for _ in range(n)]
         self._cam_ref_images   = [None] * n
         self._cam_current_idx  = [0] * n   # per-camera frame index currently displayed
         # Per-camera load coalescing: at most ONE image load in flight per camera so
@@ -9230,6 +9274,12 @@ class Viewer(QWidget):
                     self.tickbar.set_cursor(self._cam_ts[master][-1])
             else:
                 self._display_exact_index(last_idx, self.items[last_idx].ts_ns, update_slider=True)
+
+    @staticmethod
+    def _cam_cache_size(n_cams: int) -> int:
+        """Per-camera pixmap cache size, scaled by camera count so total memory
+        stays bounded (12 cams × 80 pixmaps ≈ 0.5 GB was too much)."""
+        return max(20, 160 // max(1, n_cams))
 
     def _ensure_dir_watcher(self, cam_i: int, folder: "Path"):
         """Start a _DirWatcher for folder if not already running."""
@@ -9401,9 +9451,9 @@ class Viewer(QWidget):
     def _online_poll_single_bg(self):
         """Spustí background scan pro single-camera — neblokuje UI."""
         self._online_poll_running = True
-        # Only the newest hour folders can still receive frames — scanning the whole
-        # accumulated list every tick is what made live mode lag grow over time.
-        folders = active_scan_folders(self.opened_folders)
+        # Only the newest hour folder(s) can still receive frames — scanning the
+        # whole accumulated list every tick is what made live mode lag grow over time.
+        folders = poll_scan_folders(self.opened_folders)
         gen = self._gen
         # Use ts_ns cutoff instead of path set — much faster O(n) single pass
         cutoff_ns = self.ts_list[-1] if self.ts_list else 0
@@ -9485,7 +9535,8 @@ class Viewer(QWidget):
                     try:
                         folder_path = Path(folder)
                         for name in os.listdir(folder):
-                            if Path(name).suffix.lower() not in IMG_EXT:
+                            dot = name.rfind(".")
+                            if dot < 0 or name[dot:].lower() not in IMG_EXT:
                                 continue
                             p = folder_path / name
                             ts_ns = parse_unix_ns_from_name(p)
@@ -9527,13 +9578,14 @@ class Viewer(QWidget):
                                 candidate = day_dir / str(next_h) / cam_name
                             if candidate in known or candidate in new_folders:
                                 break
-                            if candidate.exists() and candidate.is_dir():
+                            if _probe_hour_folder(candidate):
                                 new_folders.append(candidate)
                                 known.add(candidate)
                                 try:
                                     cand_path = Path(candidate)
                                     for name in os.listdir(candidate):
-                                        if Path(name).suffix.lower() not in IMG_EXT:
+                                        dot = name.rfind(".")
+                                        if dot < 0 or name[dot:].lower() not in IMG_EXT:
                                             continue
                                         p = cand_path / name
                                         ts_ns = parse_unix_ns_from_name(p)
@@ -9565,10 +9617,16 @@ class Viewer(QWidget):
             self._cam_poll_running = [False] * n_cams
         if not hasattr(self, '_cam_poll_sigs') or len(self._cam_poll_sigs) != n_cams:
             self._cam_poll_sigs = [None] * n_cams
-        if not hasattr(self, '_cam_last_full_poll_ts') or len(self._cam_last_full_poll_ts) != n_cams:
-            self._cam_last_full_poll_ts = [0.0] * n_cams
         poll_max_ts = getattr(self, '_cam_poll_max_ts', [0] * n_cams)
         now = time.monotonic()
+        if not hasattr(self, '_cam_last_full_poll_ts') or len(self._cam_last_full_poll_ts) != n_cams:
+            # Stagger the first polls so N cameras don't all hit the SMB share
+            # in the same tick — spread them across one min-interval.
+            step = ONLINE_POLL_MIN_INTERVAL_S / max(1, n_cams)
+            self._cam_last_full_poll_ts = [
+                now - ONLINE_POLL_MIN_INTERVAL_S + i * step for i in range(n_cams)]
+        if not hasattr(self, '_cam_poll_interval') or len(self._cam_poll_interval) != n_cams:
+            self._cam_poll_interval = [ONLINE_POLL_MIN_INTERVAL_S] * n_cams
 
         # Keep dir-watchers only on the folders we still actively scan, so a long
         # session does not leak one open SMB handle + thread per elapsed hour.
@@ -9582,22 +9640,28 @@ class Viewer(QWidget):
             if self._cam_poll_running[cam_i]:
                 continue  # this camera's previous task still running — skip tick
 
-            # Only the newest hour folders can still receive frames — scanning the
-            # whole accumulated list every 200 ms is what made live mode lag worse
-            # the longer it ran.
-            folders  = active_scan_folders(folder_lists[cam_i])
+            # Only the newest hour folder(s) can still receive frames — scanning
+            # the whole accumulated list every tick is what made live mode lag
+            # worse the longer it ran.
+            folders  = poll_scan_folders(folder_lists[cam_i])
             cutoff   = poll_max_ts[cam_i] if cam_i < len(poll_max_ts) else 0
             cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else ""
 
-            # When a dir-watcher is active on this camera's folders, new frames
-            # already stream in instantly via ReadDirectoryChangesW — so run the
-            # expensive full listdir scan only every ONLINE_FULL_POLL_INTERVAL_S
-            # (for hour-rollover / new-folder discovery + overflow safety net).
-            # Without a watcher, fall back to scanning every tick.
-            has_watcher = _DIRWATCH_AVAILABLE and any(
-                str(f) in self._dir_watchers for f in folders)
-            due = (now - self._cam_last_full_poll_ts[cam_i]) >= ONLINE_FULL_POLL_INTERVAL_S
-            if has_watcher and not due:
+            # A watcher only counts as coverage while it is HEALTHY: RDCW can
+            # silently fail on UNC/SMB paths (thread exits, entry stays in the
+            # dict). With a healthy watcher frames stream in instantly and the
+            # listdir poll is just a rollover/overflow safety net; without one,
+            # polling is the data source and runs at the adaptive interval.
+            has_watcher = False
+            if _DIRWATCH_AVAILABLE:
+                for f in folders:
+                    w = self._dir_watchers.get(str(f))
+                    if w is not None and w.ok and w.is_alive():
+                        has_watcher = True
+                        break
+            interval = (ONLINE_WATCHER_POLL_INTERVAL_S if has_watcher
+                        else self._cam_poll_interval[cam_i])
+            if (now - self._cam_last_full_poll_ts[cam_i]) < interval:
                 continue
 
             sig = _CamPollSignals()
@@ -9608,6 +9672,15 @@ class Viewer(QWidget):
                     self._cam_poll_running[cam_idx] = False
                     if g != self._gen:
                         return
+                    # Adaptive pacing: an active camera polls fast again, an
+                    # idle one backs off (bounded) to spare the SMB share.
+                    if hasattr(self, '_cam_poll_interval') and cam_idx < len(self._cam_poll_interval):
+                        if new_items:
+                            self._cam_poll_interval[cam_idx] = ONLINE_POLL_MIN_INTERVAL_S
+                        else:
+                            self._cam_poll_interval[cam_idx] = min(
+                                ONLINE_POLL_MAX_INTERVAL_S,
+                                self._cam_poll_interval[cam_idx] * ONLINE_POLL_BACKOFF)
                     # Heartbeat: update refresh dot even if no new frames arrived
                     while len(self._cam_last_update_ts) <= cam_idx:
                         self._cam_last_update_ts.append(0.0)
@@ -9704,9 +9777,11 @@ class Viewer(QWidget):
         current_max_ts = self.ts_list[-1]
         new_items = []
         seen_ts: set[int] = set()
-        for cam_items in self._cam_items:
-            # Only look at the tail that is newer than current_max_ts
-            ts_arr = [it.ts_ns for it in cam_items]
+        for ci, cam_items in enumerate(self._cam_items):
+            # Only look at the tail that is newer than current_max_ts.
+            # self._cam_ts is kept in sync with _cam_items — rebuilding the
+            # array here would be O(total frames) on the UI thread per event.
+            ts_arr = self._cam_ts[ci] if ci < len(self._cam_ts) else [it.ts_ns for it in cam_items]
             start = bisect.bisect_right(ts_arr, current_max_ts)
             for it in cam_items[start:]:
                 if it.ts_ns not in seen_ts:
@@ -9812,7 +9887,7 @@ class Viewer(QWidget):
             self._switch_to_single_view()
             self._cam_names = [cam_names[0]]
             folders = cam_folder_lists[0]
-            existing = [f for f in folders if f.exists() and f.is_dir()]
+            existing = [f for f in folders if _is_dir_quiet(f)]
             if not existing:
                 QMessageBox.warning(self, "Folder not found",
                     f"Camera folder '{cam_names[0]}' not found.")
@@ -9897,40 +9972,48 @@ class Viewer(QWidget):
 
         _signals.done.connect(on_cam_scan_done)
 
+        _pick_args = (self.last_pick_date, self.last_pick_hour_from, self.last_pick_hour_to,
+                      getattr(self, '_last_pick_segments', None))
+
         for cam_i, (cam_name, folder_list) in enumerate(
                 zip(cam_names, cam_folder_lists)):
 
-            existing = [f for f in folder_list if f.exists() and f.is_dir()]
-            if not existing:
-                rebuilt = DatePickerDialog.selected_folders_static(
-                    self.last_pick_date, self.last_pick_hour_from, self.last_pick_hour_to,
-                    Path(DEFAULT_OPEN_ROOT) / cam_name,
-                    segments=getattr(self, '_last_pick_segments', None))
-                existing = [f for f in rebuilt if f.exists() and f.is_dir()]
-
-            if not existing:
-                _signals.done.emit(cam_i, [], [])
-                continue
-
             # Každá kamera jako samostatný QRunnable — správně přes Qt thread pool
             class _CamScanTask(QRunnable):
-                def __init__(self, ci, folders, sig):
+                def __init__(self, ci, cname, folders, pick_args, sig):
                     super().__init__()
                     self._ci = ci
+                    self._cname = cname
                     self._folders = folders
+                    self._pick = pick_args
                     self._sig = sig
 
                 def run(self):
+                    # Existence filtering runs HERE, off the UI thread — one
+                    # stat per folder per camera over SMB froze the open with
+                    # many cameras on a slow link.
+                    existing = [f for f in self._folders if _is_dir_quiet(f)]
+                    if not existing:
+                        try:
+                            pd, hf, ht, segs = self._pick
+                            rebuilt = DatePickerDialog.selected_folders_static(
+                                pd, hf, ht, Path(DEFAULT_OPEN_ROOT) / self._cname,
+                                segments=segs)
+                            existing = [f for f in rebuilt if _is_dir_quiet(f)]
+                        except Exception:
+                            existing = []
                     items: list[Item] = []
-                    for folder in self._folders:
+                    for folder in existing:
                         try:
                             with os.scandir(folder) as it:
                                 for e in it:
                                     if not e.is_file():
                                         continue
-                                    p = Path(e.path)
-                                    if p.suffix.lower() not in IMG_EXT:
+                                    name = e.name
+                                    dot = name.rfind(".")
+                                    if dot < 0 or name[dot:].lower() not in IMG_EXT:
                                         continue
+                                    p = Path(e.path)
                                     ts_ns = parse_unix_ns_from_name(p)
                                     if ts_ns is None:
                                         continue
@@ -9938,9 +10021,9 @@ class Viewer(QWidget):
                         except Exception:
                             pass
                     items.sort(key=lambda x: x.ts_ns)
-                    self._sig.done.emit(self._ci, items, self._folders)
+                    self._sig.done.emit(self._ci, items, existing)
 
-            task = _CamScanTask(cam_i, existing, _signals)
+            task = _CamScanTask(cam_i, cam_name, list(folder_list), _pick_args, _signals)
             self.scan_pool.start(task)
 
     def _on_multi_scan_all_done(
@@ -10144,7 +10227,7 @@ class Viewer(QWidget):
                 grid_state = MultiCameraGrid._save_iv_overlay(self.img_view)
             self._switch_to_single_view()
             self._cam_names = [cam_names[0]]
-            existing = [f for f in cam_folder_lists[0] if f.exists() and f.is_dir()]
+            existing = [f for f in cam_folder_lists[0] if _is_dir_quiet(f)]
             if not existing:
                 QMessageBox.warning(self, "Folder not found",
                     f"Camera folder '{cam_names[0]}' not found.")
@@ -10489,7 +10572,7 @@ class Viewer(QWidget):
     def _apply_brightness_debounced(self):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(80) for _ in self._cam_caches]
+            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
             self._redraw_all_cams_in_place()
             return
         idx = self.current_idx
@@ -10543,7 +10626,7 @@ class Viewer(QWidget):
                     self._cam_ref_images[cam_i] = arr
                     ts_str = fmt_prague_full_from_ns(it.ts_ns)
                     self._multi_grid.set_cam_ref_status(cam_i, f"Ref: {ts_str}")
-                    self._cam_caches[cam_i] = PixCache(80)
+                    self._cam_caches[cam_i] = PixCache(self._cam_cache_size(len(self._cam_caches)))
                     cam_name = self._cam_names[cam_i] if cam_i < len(self._cam_names) else f"cam {cam_i}"
                     set_names.append(cam_name)
                 except Exception:
@@ -10573,7 +10656,7 @@ class Viewer(QWidget):
 
     def _on_subtract_changed(self):
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(80) for _ in self._cam_caches]
+            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
             if self.current_idx is not None:
                 self._display_multicam_index(self.current_idx, update_slider=False)
             return
@@ -10587,7 +10670,7 @@ class Viewer(QWidget):
     def _on_brightness_changed(self):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(80) for _ in self._cam_caches]
+            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
             self._redraw_all_cams_in_place()
             return
         self.cache = PixCache(CACHE_SIZE)
@@ -10598,7 +10681,7 @@ class Viewer(QWidget):
     def _on_gradient_changed(self):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(80) for _ in self._cam_caches]
+            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
             self._redraw_all_cams_in_place()
             return
         self.cache = PixCache(CACHE_SIZE)
@@ -11211,15 +11294,16 @@ class Viewer(QWidget):
         ref_id = id(ref) if ref is not None else None
         sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
         key = (idx, max_side, brighten, gradient_id, brightness_offset, ref_id, sub_thr)
+        pix = QPixmap.fromImage(img)
         if cam_i < len(self._cam_caches):
-            self._cam_caches[cam_i].put(key, QPixmap.fromImage(img))
+            self._cam_caches[cam_i].put(key, pix)
         # Don't paint a frame that is already older than the latest target — avoids the
         # view flashing backwards while it catches up to live.
         cur = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else idx
         if idx >= cur:
             iv = self._multi_grid.get_img_view(cam_i)
             if iv:
-                iv.set_pixmap(QPixmap.fromImage(img))
+                iv.set_pixmap(pix)
             if (cam_i < len(self._cam_items) and idx < len(self._cam_items[cam_i])):
                 ts = self._cam_items[cam_i][idx].ts_ns
                 self._multi_grid.set_cam_timestamp(cam_i, fmt_hhmmss_ms_from_ns(ts))

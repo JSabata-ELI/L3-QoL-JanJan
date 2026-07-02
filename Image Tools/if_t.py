@@ -120,6 +120,10 @@ ENERGY_COLUMNS_DISPLAY: dict[str, str] = {
 # "—". The energies (SBW4/PTM1/…) change slowly, so the nearest sample within a
 # couple of minutes is a faithful value for the image's shot.
 ENERGY_MATCH_TOL_S = 120.0
+# API (archiver) data is per-shot, not the sparse ~20 s CSV log — with a 120 s
+# window a dark frame could inherit the PREVIOUS shot's energy. Revert to 120.0
+# if operators prefer the old behaviour.
+ENERGY_MATCH_TOL_API_S = 30.0
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
 CPVA_BASE_URL     = "https://10.78.0.57:8443/api/1.0/cpva"
@@ -129,64 +133,53 @@ CPVA_HTTP_TIMEOUT = 10.0   # seconds per request
 CPVA_SHOT_CHANNEL = "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy"
 CPVA_SBW4_CHANNEL = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
 
+def _import_cpva_client():
+    """Load the shared CPVA client (sibling cpva_client.py). Reuses an
+    already-loaded instance so every tool (and re-exec'd module copy) shares
+    one connection pool and one day cache."""
+    import importlib.util as _ilu
+    mod = sys.modules.get("cpva_client")
+    if mod is not None:
+        return mod
+    p = Path(__file__).resolve().parent / "cpva_client.py"
+    spec = _ilu.spec_from_file_location("cpva_client", p)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules["cpva_client"] = mod   # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+cpva = _import_cpva_client()
+
 # Maps energy CSV column name → CPVA archiver channel name for API lookup
-CPVA_CHANNEL_MAP: dict[str, str] = {
-    "ptm1":      "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-    "pcm2":      "HAPLS-ENER_IN_PCM2_LT6_DIAG2:Energy",
-    "pcm4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
-    "pap1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
-    "sbw4":      "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-    "Back_Ref":  "L3-PM03-023:Energy",
-    "waveplate": "L3-PFWP6-MTR03-1:RawPos",
-}
+CPVA_CHANNEL_MAP: dict[str, str] = cpva.CHANNEL_MAP
+
+_SLIDER_MOD = None
 
 
-def _cpva_ssl_ctx() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode    = ssl.CERT_NONE
-    return ctx
-
-
-import http.client as _http_client
-
-_cpva_conn_lock = threading.Lock()   # serialises all CPVA requests (conn is not thread-safe)
-_cpva_conn: "_http_client.HTTPSConnection | None" = None
-_CPVA_HOST = CPVA_BASE_URL.split("://", 1)[1].split("/")[0]   # "10.78.0.57:8443"
+def _get_slider_module():
+    """Borrow helpers (GRADIENTS, _copy_metadata_into_png, …) from the Image
+    Slider module WITHOUT re-executing 13k lines of is_t.py on every use —
+    prefer the instance main.py already loaded, else load once and cache."""
+    global _SLIDER_MOD
+    mod = sys.modules.get("image_slider")
+    if mod is not None:
+        return mod
+    if _SLIDER_MOD is None:
+        import importlib.util as _ilu
+        p = Path(__file__).resolve().parent / "is_t.py"
+        spec = _ilu.spec_from_file_location("is_t_helpers", p)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SLIDER_MOD = mod
+    return _SLIDER_MOD
 
 
 def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
                         timeout: float = CPVA_HTTP_TIMEOUT) -> list[dict]:
-    """Fetch archiver samples, reusing a persistent HTTPS connection."""
-    global _cpva_conn
-    params = urllib.parse.urlencode({
-        "channelName": channel,
-        "start": str(start_ns),
-        "end":   str(end_ns),
-    })
-    path = f"/api/1.0/cpva/samples?{params}"
-    with _cpva_conn_lock:
-        for attempt in range(2):
-            try:
-                if _cpva_conn is None:
-                    _cpva_conn = _http_client.HTTPSConnection(
-                        _CPVA_HOST, timeout=timeout, context=_cpva_ssl_ctx())
-                else:
-                    # Update timeout on existing connection for this request
-                    _cpva_conn.timeout = timeout
-                _cpva_conn.request("GET", path, headers={"Accept": "application/json"})
-                resp = _cpva_conn.getresponse()
-                body = resp.read()
-                return json.loads(body.decode("utf-8"))
-            except Exception:
-                # Drop broken connection and retry once with a fresh one.
-                try:
-                    _cpva_conn.close()
-                except Exception:
-                    pass
-                _cpva_conn = None
-                if attempt == 1:
-                    raise
+    """Fetch archiver samples via the shared pooled client (kept as a thin
+    wrapper so existing call sites stay unchanged). Raises cpva.CpvaError."""
+    return cpva.fetch_samples(channel, start_ns, end_ns, timeout=timeout)
 
 
 def _cpva_best_shot_ns(start_ns: int, end_ns: int,
@@ -904,75 +897,58 @@ def _energy_api_for_day(
     cols: list[str],
     csv_root: "str | None" = None,
     log=None,
-) -> "tuple[list[_EnergyRow], dict[str, list[_EnergyRow]]]":
+) -> "tuple[list[_EnergyRow], dict, bool]":
     """
-    Query CPVA archiver for the given day and return (_EnergyRow list, per_col dict).
-    Falls back column-by-column to CSV when API returns nothing.
+    Query CPVA archiver for the given day and return (_EnergyRow list, per_col dict,
+    had_error). Falls back column-by-column to CSV when API returns nothing.
     dt should be a naive Prague-local datetime (used only for the date).
 
     Returns:
       - merged: list[_EnergyRow] sorted by timestamp (merged across all channels)
       - per_col: dict[str, list[_EnergyRow]] mapping each column to sorted rows that
-                 have a value for that column (used for per-column closest-timestamp lookup)
+                 have a value for that column (used for per-column closest-timestamp
+                 lookup). Also carries precomputed "_ns:<col>" → list[int] arrays so
+                 the per-file lookup is a pure bisect instead of O(rows) rebuilds.
+      - had_error: True if any column's API fetch FAILED (as opposed to genuinely
+                   having no data) and CSV had nothing either — the caller must NOT
+                   cache such a day, so the next lookup retries.
     """
-    from datetime import date as _date
-    day = _date(dt.year, dt.month, dt.day)
+    date_key = dt.strftime("%Y-%m-%d")
 
     def _log(msg):
         if log is not None:
             log(msg)
 
-    if PRAGUE is None:
-        day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc)
-    else:
-        day_start = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=PRAGUE)
-        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=PRAGUE)
-
-    start_ns = int(day_start.timestamp() * 1_000_000_000)
-    end_ns   = int(day_end.timestamp()   * 1_000_000_000)
-
     # Collect per-column rows: {t_ns: {col: value, ...}}
     by_ts: dict[int, dict] = {}
     # Per-column row lists: col -> list of (t_ns, dt_local, val)
     per_col_raw: dict[str, list[tuple[int, datetime, str]]] = {}
+    err_flags: dict[str, bool] = {}
+    src_flags: dict[str, str] = {}   # col → "api" | "csv"
 
-    def _fetch_one_col(col: str) -> tuple[str, list[tuple[int, datetime, str]]]:
+    def _fetch_one_col(col: str) -> "tuple[str, list[tuple[int, datetime, str]], bool, str]":
         channel = CPVA_CHANNEL_MAP.get(col)
         col_rows: list[tuple[int, datetime, str]] = []
+        had_error = False
+        src = "api"
 
         if channel is not None:
-            channels_to_try = [channel]
-            if not channel.endswith(".value"):
-                channels_to_try.append(channel + ".value")
-            for ch_try in channels_to_try:
-                try:
-                    samples = _cpva_fetch_samples(ch_try, start_ns, end_ns)
-                    if not isinstance(samples, list):
-                        continue
-                    parsed = 0
-                    for s in samples:
-                        t_ns = s.get("time")
-                        if t_ns is None:
-                            continue
-                        val = s.get("value")
-                        if isinstance(val, list):
-                            val = val[0] if val else None
-                        if val is None:
-                            continue
-                        t_ns = int(t_ns)
-                        if PRAGUE is not None:
-                            dt_local = datetime.fromtimestamp(
-                                t_ns / 1e9, tz=timezone.utc).astimezone(PRAGUE).replace(tzinfo=None)
-                        else:
-                            dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
-                        col_rows.append((t_ns, dt_local, str(val)))
-                        parsed += 1
-                    _log(f"  API {col} ({ch_try}): {len(samples)} raw → {parsed} parsed")
-                    if parsed > 0:
-                        break
-                except Exception as exc:
-                    _log(f"  API {col} ({ch_try}) ERROR: {type(exc).__name__}: {exc}")
+            res = cpva.get_day(channel, date_key, timeout=CPVA_HTTP_TIMEOUT)
+            if res.status == "error":
+                had_error = True
+                _log(f"  API {col} ({channel}) FETCH FAILED — will retry on next lookup")
+            elif res.status == "stale":
+                _log(f"  API {col} ({channel}): fetch failed, showing "
+                     f"{len(res.samples)} samples from {res.age_s:.0f}s ago")
+            for t_ns, v in res.samples:
+                if PRAGUE is not None:
+                    dt_local = datetime.fromtimestamp(
+                        t_ns / 1e9, tz=timezone.utc).astimezone(PRAGUE).replace(tzinfo=None)
+                else:
+                    dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
+                col_rows.append((t_ns, dt_local, str(v)))
+            if res.samples:
+                _log(f"  API {col} ({channel}): {len(res.samples)} samples")
         else:
             _log(f"  {col}: no CPVA channel mapping, trying CSV only")
 
@@ -990,15 +966,19 @@ def _energy_api_for_day(
                         t_ns = int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000)
                     col_rows.append((t_ns, r.ts_dt, r.values[col]))
             if col_rows:
+                had_error = False   # CSV covered the outage
+                src = "csv"
                 _log(f"  CSV fallback {col}: {len(col_rows)} rows")
 
-        return col, col_rows
+        return col, col_rows, had_error, src
 
     with ThreadPoolExecutor(max_workers=max(1, len(cols))) as _aex:
         _col_futs = {_aex.submit(_fetch_one_col, c): c for c in cols}
         for _fut in as_completed(_col_futs):
             try:
-                _col, _col_rows = _fut.result()
+                _col, _col_rows, _col_err, _col_src = _fut.result()
+                err_flags[_col] = _col_err
+                src_flags[_col] = _col_src
                 if _col_rows:
                     per_col_raw[_col] = _col_rows
                 for t_ns, dt_local, val in _col_rows:
@@ -1007,6 +987,7 @@ def _energy_api_for_day(
                     by_ts[t_ns].setdefault("_dt", dt_local)
                     by_ts[t_ns][_col] = val
             except Exception as exc:
+                err_flags[_col_futs[_fut]] = True
                 _log(f"  col fetch ERROR: {type(exc).__name__}: {exc}")
 
     # Convert to _EnergyRow objects sorted by timestamp
@@ -1017,16 +998,20 @@ def _energy_api_for_day(
         values = {k: v for k, v in entry.items() if k != "_dt"}
         result.append(_EnergyRow(dt_local, values))
 
-    # Build per_col: col -> sorted list of _EnergyRow that have only that col's value
-    per_col: dict[str, list[_EnergyRow]] = {}
+    # Build per_col: col -> sorted list of _EnergyRow that have only that col's
+    # value, plus parallel "_ns:<col>" sorted int arrays for direct bisect and
+    # "_src:<col>" data-source markers (API rows use a tighter match tolerance).
+    per_col: dict = {}
     for col, rows_raw in per_col_raw.items():
         rows_raw_sorted = sorted(rows_raw, key=lambda x: x[0])
         per_col[col] = [
             _EnergyRow(dt_local, {col: val})
             for t_ns, dt_local, val in rows_raw_sorted
         ]
+        per_col[f"_ns:{col}"] = [t_ns for t_ns, _dt, _v in rows_raw_sorted]
+        per_col[f"_src:{col}"] = src_flags.get(col, "csv")
 
-    return result, per_col
+    return result, per_col, any(err_flags.values())
 
 
 def _find_energy_match(
@@ -1074,14 +1059,20 @@ def _find_closest_per_col_value(
     rows = per_col.get(col)
     if not rows:
         return "—"
-    # Build ns list for binary search
-    ns_list = []
-    for r in rows:
-        if PRAGUE is not None:
-            r_ns = int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
-        else:
-            r_ns = int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000)
-        ns_list.append(r_ns)
+    # Use the precomputed ns array when present ("_ns:<col>" sidecar built by
+    # _energy_api_for_day / _build_per_col_from_rows) — rebuilding it here made
+    # the lookup O(files × cols × rows).
+    ns_list = per_col.get(f"_ns:{col}")
+    if ns_list is None or len(ns_list) != len(rows):
+        # Fallback for dicts built elsewhere — compute locally, do NOT write
+        # back into per_col (it is shared across worker threads via the cache).
+        ns_list = []
+        for r in rows:
+            if PRAGUE is not None:
+                r_ns = int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
+            else:
+                r_ns = int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000)
+            ns_list.append(r_ns)
     idx = bisect.bisect_left(ns_list, target_ns)
     best_val = None
     best_diff = float("inf")
@@ -1107,13 +1098,24 @@ def _build_per_col_from_rows(
     chronological order of `rows` (which _load_energy_csv already sorts by ts),
     so _find_closest_per_col_value can binary-search it directly.
     """
-    per_col: dict[str, list[_EnergyRow]] = {}
+    per_col: dict = {}
     for r in rows:
         for col, val in r.values.items():
             if col == "Timestamp":
                 continue
             if val is not None and str(val).strip() not in ("", "—"):
                 per_col.setdefault(col, []).append(r)
+    # Same "_ns:<col>"/"_src:<col>" sidecars as _energy_api_for_day builds, so
+    # _find_closest_per_col_value never needs its O(rows) rebuild fallback.
+    for col in [c for c in per_col if not c.startswith("_")]:
+        ns_list = []
+        for r in per_col[col]:
+            if PRAGUE is not None:
+                ns_list.append(int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000))
+            else:
+                ns_list.append(int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000))
+        per_col[f"_ns:{col}"] = ns_list
+        per_col[f"_src:{col}"] = "csv"
     return per_col
 
 
@@ -2894,20 +2896,46 @@ class ImageFinderWidget(QWidget):
         Also populates self._energy_per_col_cache for per-column closest-timestamp lookups.
         """
         day_key = dt.strftime("%Y-%m-%d")
-        if day_key in self._energy_cache:
-            return self._energy_cache[day_key]
+        today_key = datetime.now(PRAGUE).strftime("%Y-%m-%d") if PRAGUE else \
+            datetime.utcnow().strftime("%Y-%m-%d")
+        if not hasattr(self, "_energy_cache_time"):
+            self._energy_cache_time = {}     # day_key → time.monotonic() of fetch
+        if not hasattr(self, "_energy_error_days"):
+            self._energy_error_days = set()  # day_keys whose last fetch had a failure
+        if day_key in self._energy_cache and day_key not in self._energy_error_days:
+            # Past days are immutable; TODAY keeps filling in — refetch after a
+            # short TTL (cheap: the shared client's day cache does the real work,
+            # only today's channels are actually re-hit).
+            if day_key != today_key:
+                return self._energy_cache[day_key]
+            age = time.monotonic() - self._energy_cache_time.get(day_key, 0.0)
+            if age < 30.0:
+                return self._energy_cache[day_key]
         cols = self._energy_selected_cols
         if cols:
-            rows, per_col = _energy_api_for_day(dt, cols, log=self._log_safe)
+            rows, per_col, had_error = _energy_api_for_day(dt, cols, log=self._log_safe)
+            if had_error:
+                # A fetch FAILED (≠ "day has no data"). Show what we got, but mark
+                # the day for retry — caching the gap silently meant one outage
+                # showed "—" for the whole session. Retry only re-hits the failed
+                # channel (successful ones are served from the shared day cache).
+                self._energy_error_days.add(day_key)
+                self._log_safe(f"ENERGY: API fetch FAILED for {day_key} — will retry on next lookup")
+            else:
+                self._energy_error_days.discard(day_key)
             if rows:
                 self._log_safe(f"ENERGY: {len(rows)} rows via API for {day_key}")
                 self._energy_cache[day_key] = rows
                 self._energy_per_col_cache[day_key] = per_col
+                self._energy_cache_time[day_key] = time.monotonic()
                 return rows
+            if had_error:
+                return self._energy_cache.get(day_key, [])
         # CSV fallback
         csv_path = _energy_csv_path(dt)
         rows = _load_energy_csv(csv_path)
         self._energy_cache[day_key] = rows
+        self._energy_cache_time[day_key] = time.monotonic()
         # Build the per-column closest-timestamp lookup from the CSV rows so that
         # _find_closest_per_col_value works identically for CSV and API data.
         self._energy_per_col_cache[day_key] = _build_per_col_from_rows(rows)
@@ -2971,8 +2999,11 @@ class ImageFinderWidget(QWidget):
         img_ns   = extract_ns_from_stem(path.stem) or 0
         parts: list[str] = []
         for col in self._energy_selected_cols:
+            # API rows are per-shot → tight window; sparse CSV keeps the wide one.
+            tol = (ENERGY_MATCH_TOL_API_S if per_col.get(f"_src:{col}") == "api"
+                   else ENERGY_MATCH_TOL_S)
             raw_val = _find_closest_per_col_value(
-                per_col, col, img_ns, tol_s=ENERGY_MATCH_TOL_S)
+                per_col, col, img_ns, tol_s=tol)
             if (not raw_val or raw_val == "—") and match is not None:
                 raw_val = match.values.get(col, "—")
             val   = _format_energy_value(col, raw_val)
@@ -4501,15 +4532,17 @@ class ImageFinderWidget(QWidget):
                 self._view_temp_dir = None
         except: pass
 
-    def _apply_gradient_to_image(self, img: PilImage.Image, src_path: "Path | None" = None) -> PilImage.Image:
-        """Apply currently selected gradient LUT."""
-        name = self._gradient_cb.currentText()
+    def _apply_gradient_to_image(self, img: PilImage.Image, src_path: "Path | None" = None,
+                                 grad_name: "str | None" = None) -> PilImage.Image:
+        """Apply the selected gradient LUT. Pass grad_name when calling from a
+        worker thread (reading the combo box off the main thread is unsafe)."""
+        name = grad_name if grad_name is not None else self._gradient_cb.currentText()
         lut  = GRADIENTS.get(name)
         if lut is None: return img
         arr = np.array(img)
         if arr.ndim == 3: arr = arr.mean(axis=2)
         arr = arr.astype(np.float32)
-        self._log(f"IMG range: min={arr.min():.0f} max={arr.max():.0f} dtype={img.mode} shape={arr.shape}")
+        self._log_safe(f"IMG range: min={arr.min():.0f} max={arr.max():.0f} dtype={img.mode} shape={arr.shape}")
         img_max_val = _read_img_max_value(src_path) if src_path is not None else None
         arr_px_max = float(arr.max())
         if img_max_val is not None and arr_px_max > 0:
@@ -4905,100 +4938,124 @@ class ImageFinderWidget(QWidget):
             if not dest: return
             self._last_save_dir = Path(dest)
             dest_path = Path(dest)
-            copied = 0; skipped_already = 0; skipped_nomatch = 0; annotated = 0
 
-            # Build energy lookup map if annotation is requested
-            annotate = self._cb_annotate.isChecked()
-            energy_map: dict[str, tuple] = {}   # path.name -> (match, before, after)
-            if annotate:
-                # Always do a fresh lookup — results may be stale or from different files
-                for entry in self._lookup_energy_for_files(files):
-                    path, match, before, after = entry[0], entry[1], entry[2], entry[3]
-                    energy_map[str(path)] = (match, before, after)
+            # Snapshot UI state on the main thread; the energy lookup + copy /
+            # annotate loop runs in a worker — network I/O, PNG encode and SMB
+            # copies used to freeze the whole UI here.
+            annotate  = self._cb_annotate.isChecked()
+            grad_name = self._gradient_cb.currentText()
+            sel_cols  = list(self._energy_selected_cols)
 
-            try:
-                import importlib.util as _ilu_meta, pathlib as _pl_meta
-                _ist_spec = _ilu_meta.spec_from_file_location("is_t", _pl_meta.Path(__file__).parent / "is_t.py")
-                _ist_meta = _ilu_meta.module_from_spec(_ist_spec); _ist_spec.loader.exec_module(_ist_meta)
-                _copy_meta_fn = _ist_meta._copy_metadata_into_png
-            except Exception:
-                _copy_meta_fn = None
+            self._save_as_sig = _CollectSignals()
+            _sig = self._save_as_sig  # local ref — prevents GC if called again
 
-            for src in files:
+            def on_save_done(payload: list):
+                QMessageBox.information(self, "Done", payload[0] if payload else "Done")
+
+            _sig.done.connect(on_save_done)
+            self._log(f"SAVE AS: saving {len(files)} files to {dest_path} in background…")
+
+            def worker():
+                copied = 0; skipped_already = 0; skipped_nomatch = 0; annotated = 0
+                energy_map: dict[str, tuple] = {}   # path -> (match, before, after)
+                if annotate:
+                    # Pre-warm the shared day cache in parallel so the fresh
+                    # per-file lookup below is pure in-memory bisects.
+                    try:
+                        chans = [CPVA_CHANNEL_MAP[c] for c in sel_cols if c in CPVA_CHANNEL_MAP]
+                        dkeys = {cpva.date_key_for_ns(ns) for ns in
+                                 (extract_ns_from_stem(p.stem) for p in files) if ns}
+                        if chans and dkeys:
+                            cpva.warm_days(chans, dkeys, timeout=CPVA_HTTP_TIMEOUT)
+                    except Exception:
+                        pass
+                    # Always do a fresh lookup — results may be stale or from different files
+                    for entry in self._lookup_energy_for_files(files):
+                        path, match, before, after = entry[0], entry[1], entry[2], entry[3]
+                        energy_map[str(path)] = (match, before, after)
+
                 try:
-                    if not src.exists() or not is_valid_image_file(src.name): continue
-                    new_stem, reason = build_new_name(src.stem, use_prague_time=True)
-                    if new_stem is None and reason == "already_converted":
-                        new_stem = src.stem.replace("-_-","_").replace("_-_","_")
-                        skipped_already += 1
-                    if new_stem is None and reason == "no_trailing_number":
-                        new_stem = src.stem; skipped_nomatch += 1
-                    if new_stem is None: new_stem = src.stem
+                    _copy_meta_fn = _get_slider_module()._copy_metadata_into_png
+                except Exception:
+                    _copy_meta_fn = None
 
-                    # Annotated saves always go to PNG (bar is drawn)
-                    if annotate:
-                        dst = dest_path / f"{new_stem}.png"
-                    else:
-                        dst = dest_path / f"{new_stem}{src.suffix}"
+                for src in files:
+                    try:
+                        if not src.exists() or not is_valid_image_file(src.name): continue
+                        new_stem, reason = build_new_name(src.stem, use_prague_time=True)
+                        if new_stem is None and reason == "already_converted":
+                            new_stem = src.stem.replace("-_-","_").replace("_-_","_")
+                            skipped_already += 1
+                        if new_stem is None and reason == "no_trailing_number":
+                            new_stem = src.stem; skipped_nomatch += 1
+                        if new_stem is None: new_stem = src.stem
 
-                    if dst.exists():
-                        base = Path(dst).stem; ext = dst.suffix; i = 1
-                        while True:
-                            cand = dest_path / f"{base}_dup{i}{ext}"
-                            if not cand.exists(): dst = cand; break
-                            i += 1
+                        # Annotated saves always go to PNG (bar is drawn)
+                        if annotate:
+                            dst = dest_path / f"{new_stem}.png"
+                        else:
+                            dst = dest_path / f"{new_stem}{src.suffix}"
 
-                    grad_name = self._gradient_cb.currentText()
+                        if dst.exists():
+                            base = Path(dst).stem; ext = dst.suffix; i = 1
+                            while True:
+                                cand = dest_path / f"{base}_dup{i}{ext}"
+                                if not cand.exists(): dst = cand; break
+                                i += 1
 
-                    if annotate:
-                        # Apply gradient first to a temp file if needed, then annotate
-                        match, before, after = energy_map.get(str(src), (None, None, None))
-                        ns = extract_ns_from_stem(src.stem)
-                        img_ts_ns = ns if ns is not None else 0
-                        if grad_name != "Grayscale":
-                            # Save gradient-applied version to temp, then annotate from temp
-                            import tempfile as _tf
-                            with _tf.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                                tmp_path = Path(tmp.name)
-                            try:
-                                self._apply_gradient_to_image(PilImage.open(src)).save(tmp_path)
+                        if annotate:
+                            # Apply gradient first to a temp file if needed, then annotate
+                            match, before, after = energy_map.get(str(src), (None, None, None))
+                            ns = extract_ns_from_stem(src.stem)
+                            img_ts_ns = ns if ns is not None else 0
+                            if grad_name != "Grayscale":
+                                # Save gradient-applied version to temp, then annotate from temp
+                                import tempfile as _tf
+                                with _tf.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                                    tmp_path = Path(tmp.name)
+                                try:
+                                    self._apply_gradient_to_image(
+                                        PilImage.open(src), grad_name=grad_name).save(tmp_path)
+                                    _annotate_image_with_energy(
+                                        tmp_path, dst, match, before, after,
+                                        img_ts_ns, sel_cols)
+                                finally:
+                                    try: tmp_path.unlink()
+                                    except: pass
+                            else:
                                 _annotate_image_with_energy(
-                                    tmp_path, dst, match, before, after,
-                                    img_ts_ns, self._energy_selected_cols)
-                            finally:
-                                try: tmp_path.unlink()
-                                except: pass
+                                    src, dst, match, before, after,
+                                    img_ts_ns, sel_cols)
+                            if _copy_meta_fn is not None:
+                                try: _copy_meta_fn(src, dst, save_txt=False)
+                                except Exception: pass
+                            annotated += 1
                         else:
-                            _annotate_image_with_energy(
-                                src, dst, match, before, after,
-                                img_ts_ns, self._energy_selected_cols)
-                        if _copy_meta_fn is not None:
-                            try: _copy_meta_fn(src, dst, save_txt=False)
-                            except Exception: pass
-                        annotated += 1
-                    else:
-                        if grad_name != "Grayscale":
-                            try:
-                                self._apply_gradient_to_image(PilImage.open(src), src).save(dst)
-                                if _copy_meta_fn is not None:
-                                    try: _copy_meta_fn(src, dst, save_txt=False)
-                                    except Exception: pass
-                            except: shutil.copy2(src, dst)
-                        else:
-                            shutil.copy2(src, dst)
+                            if grad_name != "Grayscale":
+                                try:
+                                    self._apply_gradient_to_image(
+                                        PilImage.open(src), src, grad_name=grad_name).save(dst)
+                                    if _copy_meta_fn is not None:
+                                        try: _copy_meta_fn(src, dst, save_txt=False)
+                                        except Exception: pass
+                                except: shutil.copy2(src, dst)
+                            else:
+                                shutil.copy2(src, dst)
 
-                    copied += 1
-                except Exception as e:
-                    self._log(f"SAVE ERROR: {src} -> {type(e).__name__}: {e}")
+                        copied += 1
+                    except Exception as e:
+                        self._log_safe(f"SAVE ERROR: {src} -> {type(e).__name__}: {e}")
 
-            msg = f"Copied {copied} files to:\n{dest_path}"
-            if annotated:
-                msg += f"\n- {annotated} files annotated with energy data"
-            if skipped_already:
-                msg += f"\n- {skipped_already} files already in final format (kept name)"
-            if skipped_nomatch:
-                msg += f"\n- {skipped_nomatch} files had no trailing ns timestamp (kept name)"
-            QMessageBox.information(self, "Done", msg)
+                msg = f"Copied {copied} files to:\n{dest_path}"
+                if annotated:
+                    msg += f"\n- {annotated} files annotated with energy data"
+                if skipped_already:
+                    msg += f"\n- {skipped_already} files already in final format (kept name)"
+                if skipped_nomatch:
+                    msg += f"\n- {skipped_nomatch} files had no trailing ns timestamp (kept name)"
+                _sig.done.emit([msg])
+
+            threading.Thread(target=worker, daemon=True).start()
         self._collect_primary_files_async(after_collect)
 
 
@@ -5619,12 +5676,7 @@ class MultiDayPreviewWindow(QWidget):
 
     # re-use LUT table from is_t (sibling file) if available
     try:
-        import importlib.util as _ilu, pathlib as _pl
-        _ist_path = _pl.Path(__file__).parent / "is_t.py"
-        _spec = _ilu.spec_from_file_location("is_t", _ist_path)
-        _ist_mod = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_ist_mod)
-        _GRADIENTS: dict = _ist_mod.GRADIENTS
+        _GRADIENTS: dict = _get_slider_module().GRADIENTS
     except Exception:
         _GRADIENTS: dict = {"Grayscale": None}
 
