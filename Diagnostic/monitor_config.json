@@ -1,7 +1,7 @@
 {
   "version": 1,
   "settings": {
-    "poll_interval_s": 27,
+    "poll_interval_s": 10,
     "avg_last_n": 25,
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
@@ -20,19 +20,38 @@
     "email_enabled": false,
     "webex_enabled": true,
     "teams_webhook_url": "",
-    "smtp_host": "",
-    "smtp_port": 594,
-    "smtp_security": "ssl",
-    "smtp_user": "",
-    "smtp_password": "",
-    "email_from": "",
-    "email_recipients": [],
+    "smtp_host": "smtp.seznam.cz",
+    "smtp_port": 587,
+    "smtp_security": "starttls",
+    "smtp_user": "minsck@seznam.cz",
+    "smtp_password": "dpapi:AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAubpLwLv8OEGuPG1vbvmjFgAAAAACAAAAAAAQZgAAAAEAACAAAAAnftLb83tnT5c3/Mv5lbYOH3VlgQVOVdVcJWmtHd6a2AAAAAAOgAAAAAIAACAAAABtmEe4fL4bgS0T9KUJsqOgQckWb6FlTxsxTB8newpq1xAAAACVqhRNimDpMgIEsWpaqX0QQAAAAPZ0GR7P++kDhJPIuHH0uW2cSb0LmjuPz3q55i7aJzQs++dthTlngiGhlQY1FCTWsnNJ55b3A286Tb6gcEpi2fk=",
+    "email_from": "minsck@seznam.cz",
+    "email_contacts": [
+      {
+        "address": "jan.moucka@eli-laser.eu",
+        "description": "Jan Moučka",
+        "enabled": true
+      }
+    ],
     "webex_mode": "bot",
     "webex_webhook_url": "",
-    "webex_bot_token": "ZDQ1YWU2M2YtZjkzYS00ZjYxLTgwZDUtNzAyZGVlYTg3MTI1NjJiYjQ4MDUtOTMy_PE93_3a866221-438c-4819-82f6-12a2870c2618",
-    "webex_room_id": "Y2lzY29zcGFyazovL3VybjpURUFNOmV1LWNlbnRyYWwtMV9rL1JPT00vMTRjMmIyODAtNzNhOC0xMWYxLTk4ZDgtNTllZjlkYWNhOTZi",
+    "webex_bot_token": "dpapi:AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAubpLwLv8OEGuPG1vbvmjFgAAAAACAAAAAAAQZgAAAAEAACAAAAC6ZI8UZxDFO2gRf7qA7aNP+GkSZlbANmxLFMmHgWd66AAAAAAOgAAAAAIAACAAAACmMEEXevlIUYL88aTZg0siM75UFHe4dfMrijjVaPiH83AAAAD7hx5C6xgiiiAR6KCu9dfUajLhnNt7wpLCcokvP42jgEz/QbrcQEk8IBUUhaT3e72soX+S3xHQhKSz1z6zIi5oTqgHDEnMLd+t3hxpt6HaxZnTvf8xQoAM1x0fAfG+j+j6iIxOQNG/VF5upVWc5YmcQAAAADVD9nrVIbLrT93KZJGc25n72QrleapMxnvFyiC3M7lrR9d1VI9Wy195VP0cMgMqSOD/9mGH6QrB6QrtVVoLSdg=",
+    "webex_rooms": [
+      {
+        "name": "TEST",
+        "room_id": "Y2lzY29zcGFyazovL3VybjpURUFNOmV1LWNlbnRyYWwtMV9rL1JPT00vMTRjMmIyODAtNzNhOC0xMWYxLTk4ZDgtNTllZjlkYWNhOTZi",
+        "enabled": true,
+        "listen": true
+      },
+      {
+        "name": "Main",
+        "room_id": "Y2lzY29zcGFyazovL3VybjpURUFNOmV1LWNlbnRyYWwtMV9rL1JPT00vN2EyZjdhMTAtNzZjNi0xMWYxLWFiMDEtOTkzNTBhZTExNjdi",
+        "enabled": true,
+        "listen": false
+      }
+    ],
     "webex_commands_enabled": true,
-    "webex_command_poll_s": 1,
+    "webex_command_poll_s": 2,
     "webex_command_allowlist": []
   },
   "pvs": []

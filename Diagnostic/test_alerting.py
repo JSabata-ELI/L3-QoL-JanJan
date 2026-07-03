@@ -187,12 +187,42 @@ def test_webex_webhook_posts_markdown():
 
 
 def test_webex_bot_uploads_file_when_png():
-    n = WebexNotifier(mode="bot", bot_token="tok", room_id="room")
+    n = WebexNotifier(mode="bot", bot_token="tok", room_ids=["room"])
     resp = mock.MagicMock(status_code=200)
     with mock.patch("alerting.requests.post", return_value=resp) as post:
         assert n.send(_payload(), png_bytes=b"\x89PNG") is True
     _, kwargs = post.call_args
     assert "files" in kwargs and "files" in kwargs["files"]
+
+
+def test_webex_bot_broadcasts_to_multiple_rooms():
+    n = WebexNotifier(mode="bot", bot_token="tok", room_ids=["room1", "room2"])
+    resp = mock.MagicMock(status_code=200)
+    with mock.patch("alerting.requests.post", return_value=resp) as post:
+        assert n.send(_payload()) is True
+    assert post.call_count == 2
+    posted_rooms = {c.kwargs["json"]["roomId"] for c in post.call_args_list}
+    assert posted_rooms == {"room1", "room2"}
+
+
+def test_webex_bot_partial_room_failure_reported():
+    n = WebexNotifier(mode="bot", bot_token="tok", room_ids=["ok", "bad"])
+    ok_resp = mock.MagicMock(status_code=200)
+    bad_resp = mock.MagicMock(status_code=404, text="not found")
+    with mock.patch("alerting.requests.post", side_effect=[ok_resp, bad_resp]):
+        assert n.send(_payload()) is False
+    assert "bad" in n.last_error
+
+
+def test_webex_tracks_own_message_ids_to_block_feedback_loop():
+    n = WebexNotifier(mode="bot", bot_token="tok", room_ids=["room"],
+                      listen_room_id="room")
+    resp = mock.MagicMock(status_code=200)
+    resp.json.return_value = {"id": "msg123"}
+    with mock.patch("alerting.requests.post", return_value=resp):
+        assert n.post_text("hello") is True
+    assert n.is_own_message("msg123") is True
+    assert n.is_own_message("someone-elses-msg") is False
 
 
 def test_webex_not_configured():
@@ -214,6 +244,32 @@ def test_hub_dispatch_only_enabled_and_configured():
         errors = hub.dispatch(_payload(), png_bytes=b"x")
     assert errors == {}
     assert t.called and e.called and not w.called
+
+
+def test_hub_email_uses_only_enabled_contacts():
+    s = {
+        "email_enabled": True, "smtp_host": "smtp", "email_from": "a@b.c",
+        "smtp_security": "none",
+        "email_contacts": [
+            {"name": "A", "address": "a@x.eu", "enabled": True},
+            {"name": "B", "address": "b@x.eu", "enabled": False},
+        ],
+    }
+    hub = NotificationHub.from_settings(s)
+    assert hub.email.recipients == ["a@x.eu"]
+
+
+def test_hub_webex_broadcasts_to_enabled_rooms_only():
+    s = {
+        "webex_enabled": True, "webex_mode": "bot", "webex_bot_token": "tok",
+        "webex_rooms": [
+            {"name": "Main", "room_id": "r1", "enabled": True, "listen": True},
+            {"name": "Testing", "room_id": "r2", "enabled": False},
+        ],
+    }
+    hub = NotificationHub.from_settings(s)
+    assert hub.webex.room_ids == ["r1"]
+    assert hub.webex.listen_room_id == "r1"
 
 
 def test_hub_collects_errors():

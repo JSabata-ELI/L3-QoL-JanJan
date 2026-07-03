@@ -125,6 +125,90 @@ last_processed_day  YYYY-MM-DD — builder resumes from the next day
 
 ---
 
+### Notifikace — přidání druhé Webex roomky a e-mail (Seznam / Outlook)
+
+Aplikace už umí posílat alerty do **více Webex roomek zároveň** (jeden bot vysílá do N roomek) — žádná úprava kódu není potřeba, jen doplnit nastavení v GUI.
+
+#### Přidání druhé Webex roomky
+
+1. **PV Monitor** tab → **Settings** → **Notification channels** → zaškrtnout **Webex**, dole v sekci **Webex** nastavit **Mode = bot**.
+2. Do políčka **Bot token** vyplnit token bota (stejný pro všechny roomky — jeden bot vysílá do všech).
+3. V tabulce **Rooms** kliknout **Add**, vyplnit:
+   - **Name** — libovolný popisek
+   - **Room ID** — ID dané roomky (viz níže, jak ho získat)
+   - **On** — zaškrtnout, aby do ní chodily alerty
+   - **Listen for commands** — max. jedna roomka smí mít zaškrtnuto (bot čte obousměrné příkazy jen z jedné roomky)
+4. **Save**.
+
+#### Jak získat Room ID (ty "kódy")
+
+Webex API vrací jen roomky, jejichž je bot **členem** — ne všechny roomky obecně. Postup:
+
+1. **Přidat bota do cílové roomky jako běžného účastníka**
+   - Otevřít Webex (aplikace nebo web) → danou roomku → ikona lidí **People** → **Add People**
+   - Zadat e-mail bota (formát `neco@webex.bot`) a potvrdit
+   - E-mail bota (i jeho access token, stejný jako `webex_bot_token`) najdeš na https://developer.webex.com/my-apps → kliknout na daného bota
+
+2. **Zavolat API, které vypíše všechny roomky bota** — nejjednodušší přímo v prohlížeči, bez curl/PowerShell:
+   - Jít na https://developer.webex.com/docs/api/v1/rooms/list-rooms
+   - Vpravo v panelu **Try It** vložit bot token do pole Authorization
+   - Kliknout **Run** — vrátí se JSON se všemi roomkami, kde je bot členem
+
+   Alternativa přes PowerShell:
+   ```powershell
+   $resp = Invoke-RestMethod -Uri "https://webexapis.com/v1/rooms" -Headers @{Authorization="Bearer <bot_token>"}
+   $resp.items | Select-Object title, id
+   ```
+   nebo v bashi:
+   ```bash
+   curl -H "Authorization: Bearer <bot_token>" https://webexapis.com/v1/rooms
+   ```
+
+3. **Najít správnou roomku a zkopírovat `id`** — výstup vypadá takto (zkráceně):
+   ```json
+   {
+     "items": [
+       { "id": "Y2lzY29zcGFyazovL3VybjpURUFN...", "title": "Diagnostika – druhá roomka", "type": "group" },
+       { "id": "Y2lzY29zcGFyazovL3VybjpURUFN...", "title": "Main", "type": "group" }
+     ]
+   }
+   ```
+   Podle `title` (názvu roomky, jak ji vidíš ve Webexu) najdi tu správnou a zkopíruj hodnotu jejího `id` — to je přesně to, co se vloží do sloupce **Room ID** v tabulce Rooms v Settings.
+
+   Poznámka: pokud bota do roomky teprve přidáváš, projeví se v seznamu roomek až po přidání — ne dřív.
+
+#### E-mail (SMTP) — Seznam.cz a Outlook.com
+
+Settings → Notification channels → zaškrtnout **Email**, pak v sekci **Email (SMTP)**:
+
+| Provider | SMTP host | Port | Security | Poznámka |
+|---|---|---|---|---|
+| Seznam.cz | `smtp.seznam.cz` | 587 | starttls | Běžné heslo ke schránce funguje, pokud není zapnuté 2FA |
+| Outlook.com / Microsoft 365 | `smtp-mail.outlook.com` (nebo `smtp.office365.com` pro firemní M365) | 587 | starttls | Při zapnutém 2FA je nutné aplikační heslo, běžné heslo bude odmítnuto |
+
+**Username** = celá e-mailová adresa, **From address** = odesílací adresa (může být stejná), **Recipients** = tabulka příjemců alertů (zaškrtnout **On** u každého, kdo má dostávat e-maily).
+
+Kde najít/vytvořit aplikační heslo:
+- **Seznam.cz**: přihlásit se na email.seznam.cz → Nastavení → Zabezpečení → "Hesla pro aplikace" → vytvořit nové, vložit do pole **Password**.
+- **Outlook.com / Microsoft 365**: https://account.microsoft.com/security → Security → Advanced security options → App passwords (dostupné jen když je zapnuté dvoufázové ověření).
+
+Heslo/token se při **Save** automaticky zašifruje (Windows DPAPI, jen pro aktuální Windows účet) — viz `secrets_util.py`. Do gitu se nikdy neukládá čitelné heslo; alternativa je zapsat `${ENV:NAME}` a heslo držet v proměnné prostředí.
+
+#### Microsoft Teams
+
+Aplikace posílá alerty přes klasický **Incoming Webhook** konektor (formát "MessageCard") — ne přes novější Power Automate Workflows.
+
+1. V Teams otevřít cílový kanál → **...** (More options) → **Connectors** (nebo Manage channel → Connectors).
+2. Najít **Incoming Webhook** → **Configure** (případně Add).
+3. Zadat jméno (např. "PV Monitor alerts"), volitelně nahrát ikonu → **Create**.
+4. Zkopírovat vygenerovanou URL webhooku.
+5. V aplikaci: Settings → Notification channels → zaškrtnout **Teams** → do pole **Incoming Webhook URL** vložit zkopírovanou URL → **Save**.
+6. Otestovat tlačítkem **Send test to Teams**.
+
+**Poznámka:** Microsoft postupně ruší staré "Office 365 Connectors" (klasické Incoming Webhooks) ve prospěch Workflows. Pokud v daném týmu/kanálu možnost **Connectors** chybí, znamená to, že tenant už byl migrován — pak je nutné použít šablonu Workflows "Post to a channel when a webhook request is received". Ta ale očekává jiný formát payloadu (Adaptive Card, ne MessageCard), takže by vyžadovala úpravu kódu v `alerting.py` (`build_messagecard`), aby zprávy vypadaly správně.
+
+---
+
 ### Dependencies
 
 ```

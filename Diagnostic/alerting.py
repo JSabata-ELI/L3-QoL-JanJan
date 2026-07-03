@@ -19,7 +19,8 @@ Design:
 Notification channels (all are safe to call from a worker thread, never raise):
   - TeamsClient      -> Microsoft Teams Incoming Webhook (text card, no image)
   - EmailNotifier    -> SMTP, supports a PNG attachment
-  - WebexNotifier    -> Webex incoming webhook (text) or bot API (text + file)
+  - WebexNotifier    -> Webex incoming webhook (text) or bot API (text + file,
+                        broadcast to any number of rooms)
   - NotificationHub  -> fans a single alert out to all enabled+configured ones
 """
 
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import os
 import smtplib
+from collections import deque
 from dataclasses import dataclass
 from email.message import EmailMessage
 from enum import IntEnum
@@ -460,23 +462,60 @@ class WebexNotifier:
 
     mode == "webhook": POST {"markdown": ...} to an incoming webhook URL.
                        Webex incoming webhooks do NOT support file uploads.
-    mode == "bot":     POST to the Messages API with a bot token + roomId.
-                       A PNG is attached as multipart/form-data when given.
+    mode == "bot":     POST to the Messages API with a bot token, once per
+                       room in `room_ids` (one bot broadcasting to many
+                       rooms). A PNG is attached as multipart/form-data
+                       when given. Two-way commands are only read from
+                       `listen_room_id` (a bot can only usefully answer
+                       commands in one place).
     """
 
     def __init__(self, mode: str = "webhook", webhook_url: str = "",
-                 bot_token: str = "", room_id: str = "", timeout: float = 10.0):
+                 bot_token: str = "", room_ids: Optional[list[str]] = None,
+                 listen_room_id: str = "", timeout: float = 10.0):
         self.mode = (mode or "webhook").lower()
         self.webhook_url = webhook_url
         self.bot_token = bot_token
-        self.room_id = room_id
+        self.room_ids = list(room_ids or [])
+        self.listen_room_id = listen_room_id or (self.room_ids[0] if self.room_ids else "")
         self.timeout = timeout
         self.last_error: str = ""
+        # IDs of messages this bot itself posted — a hard backstop against the
+        # bot reading back and "replying to" its own messages (personId
+        # filtering in the caller can fail transiently; this cannot, since it
+        # never depends on a second API call).
+        self._own_message_ids: deque = deque(maxlen=200)
+
+    def _remember_own_message(self, resp) -> None:
+        try:
+            mid = resp.json().get("id")
+        except Exception:  # noqa: BLE001 - best effort only
+            mid = None
+        if mid:
+            self._own_message_ids.append(mid)
+
+    def is_own_message(self, message_id: Optional[str]) -> bool:
+        return bool(message_id) and message_id in self._own_message_ids
 
     def is_configured(self) -> bool:
         if self.mode == "bot":
-            return bool(self.bot_token and self.room_id)
+            return bool(self.bot_token and self.room_ids)
         return bool(self.webhook_url and self.webhook_url.lower().startswith("http"))
+
+    def _post_to_room(self, headers: dict, room_id: str,
+                      payload: "AlertPayload", png_bytes: bytes | None):
+        if png_bytes:
+            files = {
+                "roomId": (None, room_id),
+                "markdown": (None, payload.markdown_body()),
+                "files": ("plot.png", png_bytes, "image/png"),
+            }
+            return requests.post(WEBEX_MESSAGES_URL, headers=headers,
+                                 files=files, timeout=self.timeout)
+        return requests.post(
+            WEBEX_MESSAGES_URL, headers=headers,
+            json={"roomId": room_id, "markdown": payload.markdown_body()},
+            timeout=self.timeout)
 
     def send(self, payload: "AlertPayload", png_bytes: bytes | None = None) -> bool:
         if not self.is_configured():
@@ -486,19 +525,19 @@ class WebexNotifier:
             if self.mode == "bot":
                 token = _resolve_secret(self.bot_token)
                 headers = {"Authorization": f"Bearer {token}"}
-                if png_bytes:
-                    files = {
-                        "roomId": (None, self.room_id),
-                        "markdown": (None, payload.markdown_body()),
-                        "files": ("plot.png", png_bytes, "image/png"),
-                    }
-                    resp = requests.post(WEBEX_MESSAGES_URL, headers=headers,
-                                         files=files, timeout=self.timeout)
-                else:
-                    resp = requests.post(
-                        WEBEX_MESSAGES_URL, headers=headers,
-                        json={"roomId": self.room_id, "markdown": payload.markdown_body()},
-                        timeout=self.timeout)
+                errors = []
+                for room_id in self.room_ids:
+                    resp = self._post_to_room(headers, room_id, payload, png_bytes)
+                    if 200 <= resp.status_code < 300:
+                        self._remember_own_message(resp)
+                    else:
+                        errors.append(f"{room_id}: HTTP {resp.status_code} "
+                                     f"{resp.text[:120]}")
+                if errors:
+                    self.last_error = "; ".join(errors)
+                    return False
+                self.last_error = ""
+                return True
             else:
                 # Incoming webhook: text/markdown only; note the graph is in e-mail.
                 md = payload.markdown_body()
@@ -506,12 +545,11 @@ class WebexNotifier:
                     md += "\n\n_(graph attached in the e-mail alert)_"
                 resp = requests.post(self.webhook_url, json={"markdown": md},
                                      timeout=self.timeout, verify=True)
-
-            if 200 <= resp.status_code < 300:
-                self.last_error = ""
-                return True
-            self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            return False
+                if 200 <= resp.status_code < 300:
+                    self.last_error = ""
+                    return True
+                self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                return False
         except Exception as e:  # noqa: BLE001 - must never propagate to UI thread
             self.last_error = str(e)
             return False
@@ -527,8 +565,8 @@ class WebexNotifier:
     # --- two-way (bot mode only): read commands + reply -------------------
 
     def can_listen(self) -> bool:
-        """Reading messages needs a bot token + room (webhooks can't read)."""
-        return bool(self.mode == "bot" and self.bot_token and self.room_id)
+        """Reading messages needs a bot token + a designated room (webhooks can't read)."""
+        return bool(self.mode == "bot" and self.bot_token and self.listen_room_id)
 
     def _bot_headers(self) -> dict:
         return {"Authorization": f"Bearer {_resolve_secret(self.bot_token)}"}
@@ -557,7 +595,7 @@ class WebexNotifier:
         """
         if not self.can_listen():
             return []
-        params = {"roomId": self.room_id, "max": max_count}
+        params = {"roomId": self.listen_room_id, "max": max_count}
         try:
             resp = requests.get(WEBEX_MESSAGES_URL, headers=self._bot_headers(),
                                 params=params, timeout=self.timeout)
@@ -581,10 +619,11 @@ class WebexNotifier:
         try:
             resp = requests.post(
                 WEBEX_MESSAGES_URL, headers=self._bot_headers(),
-                json={"roomId": self.room_id, "markdown": markdown},
+                json={"roomId": self.listen_room_id, "markdown": markdown},
                 timeout=self.timeout)
             if 200 <= resp.status_code < 300:
                 self.last_error = ""
+                self._remember_own_message(resp)
                 return True
             self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
             return False
@@ -612,17 +651,29 @@ class NotificationHub:
     def from_settings(cls, s: dict) -> "NotificationHub":
         timeout = float(s.get("http_timeout_s", 10.0))
         teams = TeamsClient(s.get("teams_webhook_url", ""), timeout)
+
+        contacts = s.get("email_contacts", [])
+        recipients = (s.get("email_recipients")
+                     or [c["address"] for c in contacts
+                         if c.get("enabled") and c.get("address")])
         email = EmailNotifier(
             host=s.get("smtp_host", ""), port=int(s.get("smtp_port", 587)),
             security=s.get("smtp_security", "starttls"),
             username=s.get("smtp_user", ""), password=s.get("smtp_password", ""),
             from_addr=s.get("email_from", ""),
-            recipients=s.get("email_recipients", []), timeout=timeout)
+            recipients=recipients, timeout=timeout)
+
+        rooms = s.get("webex_rooms", [])
+        room_ids = [r["room_id"] for r in rooms
+                   if r.get("enabled") and r.get("room_id")]
+        listen_room_id = next(
+            (r["room_id"] for r in rooms if r.get("listen") and r.get("room_id")), "")
         webex = WebexNotifier(
             mode=s.get("webex_mode", "webhook"),
             webhook_url=s.get("webex_webhook_url", ""),
             bot_token=s.get("webex_bot_token", ""),
-            room_id=s.get("webex_room_id", ""), timeout=timeout)
+            room_ids=room_ids, listen_room_id=listen_room_id, timeout=timeout)
+
         return cls(teams, email, webex,
                    teams_enabled=bool(s.get("teams_enabled", True)),
                    email_enabled=bool(s.get("email_enabled", False)),

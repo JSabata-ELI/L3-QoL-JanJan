@@ -35,8 +35,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QSpinBox, QSplitter, QTableView, QVBoxLayout,
-    QWidget,
+    QPushButton, QScrollArea, QSpinBox, QSplitter, QTableView, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import cpva_api as api
@@ -199,12 +199,12 @@ DEFAULT_SETTINGS = {
     "smtp_user": "",
     "smtp_password": "",
     "email_from": "",
-    "email_recipients": [],
+    "email_contacts": [],   # [{"address":..., "description":..., "enabled":...}, ...]
     # webex
     "webex_mode": "bot",             # webhook | bot  (bot supports the PNG graph)
     "webex_webhook_url": "",
     "webex_bot_token": "",
-    "webex_room_id": "",
+    "webex_rooms": [],      # [{"name":..., "room_id":..., "enabled":..., "listen":...}, ...]
     # webex two-way commands (bot mode only)
     "webex_commands_enabled": True,
     "webex_command_poll_s": 1,
@@ -223,9 +223,27 @@ def load_config() -> dict:
             pass
     settings = dict(DEFAULT_SETTINGS)
     settings.update(data.get("settings") or {})
+    _migrate_settings(settings)
     data["settings"] = settings
     data.setdefault("pvs", [])
     return data
+
+
+def _migrate_settings(settings: dict) -> None:
+    """One-time upgrade from the old single-email/single-room schema."""
+    if not settings.get("email_contacts") and settings.get("email_recipients"):
+        settings["email_contacts"] = [
+            {"address": addr, "description": "", "enabled": True}
+            for addr in settings["email_recipients"]
+        ]
+    settings.pop("email_recipients", None)
+
+    if not settings.get("webex_rooms") and settings.get("webex_room_id"):
+        settings["webex_rooms"] = [{
+            "name": "Main", "room_id": settings["webex_room_id"],
+            "enabled": True, "listen": True,
+        }]
+    settings.pop("webex_room_id", None)
 
 
 def save_config(data: dict) -> None:
@@ -797,11 +815,218 @@ class PVEditDialog(QDialog):
         self.accept()
 
 
+class EmailContactsWidget(QWidget):
+    """Editable On/Email/Description table — one row per email recipient.
+
+    Only the address is required; Description is a free-text note (e.g. the
+    recipient's real name) so the list stays readable.
+    """
+
+    COLS = ["On", "Email address", "Description"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 32)  # just wide enough for the checkbox
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(110)
+        lay.addWidget(self.table)
+
+        row = QHBoxLayout()
+        add = QPushButton("Add")
+        add.setStyleSheet(SECONDARY_STYLE)
+        add.clicked.connect(lambda: self._add_row(start_edit=True))
+        rm = QPushButton("Remove selected")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.clicked.connect(self._remove_selected)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _add_row(self, address: str = "", description: str = "",
+                enabled: bool = True, start_edit: bool = False):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        chk = QCheckBox()
+        chk.setChecked(enabled)
+        cell = QWidget()
+        cl = QHBoxLayout(cell)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setAlignment(Qt.AlignCenter)
+        cl.addWidget(chk)
+        self.table.setCellWidget(r, 0, cell)
+        addr_item = QTableWidgetItem(address)
+        self.table.setItem(r, 1, addr_item)
+        self.table.setItem(r, 2, QTableWidgetItem(description))
+        if start_edit:
+            # A freshly-added row is otherwise two blank cells with no visual
+            # cue that they're editable — jump straight into typing the address.
+            self.table.setCurrentItem(addr_item)
+            self.table.editItem(addr_item)
+
+    def _remove_selected(self):
+        for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
+            self.table.removeRow(r)
+
+    def set_rows(self, contacts: list[dict]):
+        self.table.setRowCount(0)
+        for c in contacts:
+            self._add_row(c.get("address", ""), c.get("description", ""),
+                          bool(c.get("enabled", True)))
+
+    def rows(self) -> list[dict]:
+        out = []
+        for r in range(self.table.rowCount()):
+            cell = self.table.cellWidget(r, 0)
+            chk = cell.findChild(QCheckBox) if cell else None
+            addr_item = self.table.item(r, 1)
+            address = addr_item.text().strip() if addr_item else ""
+            if not address:
+                continue
+            desc_item = self.table.item(r, 2)
+            description = desc_item.text().strip() if desc_item else ""
+            out.append({"address": address, "description": description,
+                       "enabled": chk.isChecked() if chk else True})
+        return out
+
+    def enabled_addresses(self) -> list[str]:
+        return [c["address"] for c in self.rows() if c["enabled"]]
+
+
+class WebexRoomsWidget(QWidget):
+    """Editable On/Name/Room ID/Listen table — one bot broadcasting to N rooms.
+
+    Only one row may have "Listen" checked (two-way commands are read from a
+    single designated room); checking one unchecks the others.
+    """
+
+    COLS = ["On", "Name", "Room ID", "Listen for commands"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 32)   # just wide enough for the checkbox
+        hh.setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.setColumnWidth(1, 149)  # ~75% of the old stretched width
+        hh.setSectionResizeMode(2, QHeaderView.Interactive)
+        self.table.setColumnWidth(2, 99)   # ~50% of the old stretched width
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)  # takes the freed-up space, so the full label fits
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(110)
+        lay.addWidget(self.table)
+
+        row = QHBoxLayout()
+        add = QPushButton("Add")
+        add.setStyleSheet(SECONDARY_STYLE)
+        add.clicked.connect(lambda: self._add_row(start_edit=True))
+        rm = QPushButton("Remove selected")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.clicked.connect(self._remove_selected)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _add_row(self, name: str = "", room_id: str = "", enabled: bool = True,
+                listen: bool = False, start_edit: bool = False):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+
+        on_chk = QCheckBox()
+        on_chk.setChecked(enabled)
+        on_cell = QWidget()
+        ol = QHBoxLayout(on_cell)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setAlignment(Qt.AlignCenter)
+        ol.addWidget(on_chk)
+        self.table.setCellWidget(r, 0, on_cell)
+
+        name_item = QTableWidgetItem(name)
+        self.table.setItem(r, 1, name_item)
+        self.table.setItem(r, 2, QTableWidgetItem(room_id))
+        if start_edit:
+            # A freshly-added row is otherwise blank cells with no visible
+            # cue that they're editable — jump straight into typing the name.
+            self.table.setCurrentItem(name_item)
+            self.table.editItem(name_item)
+
+        listen_chk = QCheckBox()
+        listen_chk.setChecked(listen)
+        listen_chk.toggled.connect(
+            lambda checked, cb=listen_chk: self._on_listen_toggled(cb, checked))
+        listen_cell = QWidget()
+        ll = QHBoxLayout(listen_cell)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setAlignment(Qt.AlignCenter)
+        ll.addWidget(listen_chk)
+        self.table.setCellWidget(r, 3, listen_cell)
+
+    def _on_listen_toggled(self, cb: QCheckBox, checked: bool):
+        if not checked:
+            return
+        for r in range(self.table.rowCount()):
+            cell = self.table.cellWidget(r, 3)
+            other = cell.findChild(QCheckBox) if cell else None
+            if other is not None and other is not cb and other.isChecked():
+                other.setChecked(False)
+
+    def _remove_selected(self):
+        for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
+            self.table.removeRow(r)
+
+    def set_rows(self, rooms: list[dict]):
+        self.table.setRowCount(0)
+        for r in rooms:
+            self._add_row(r.get("name", ""), r.get("room_id", ""),
+                          bool(r.get("enabled", True)), bool(r.get("listen", False)))
+
+    def rows(self) -> list[dict]:
+        out = []
+        for r in range(self.table.rowCount()):
+            on_cell = self.table.cellWidget(r, 0)
+            on_chk = on_cell.findChild(QCheckBox) if on_cell else None
+            id_item = self.table.item(r, 2)
+            room_id = id_item.text().strip() if id_item else ""
+            if not room_id:
+                continue
+            name_item = self.table.item(r, 1)
+            name = (name_item.text().strip() if name_item else "") or room_id
+            listen_cell = self.table.cellWidget(r, 3)
+            listen_chk = listen_cell.findChild(QCheckBox) if listen_cell else None
+            out.append({
+                "name": name, "room_id": room_id,
+                "enabled": on_chk.isChecked() if on_chk else True,
+                "listen": listen_chk.isChecked() if listen_chk else False,
+            })
+        return out
+
+    def enabled_room_ids(self) -> list[str]:
+        return [r["room_id"] for r in self.rows() if r["enabled"]]
+
+    def listen_room_id(self) -> str:
+        return next((r["room_id"] for r in self.rows() if r["listen"]), "")
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: "MonitorWidget"):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(560, 720)
+        self.resize(620, 860)
         self._win = parent
         s = parent.settings
 
@@ -871,13 +1096,12 @@ class SettingsDialog(QDialog):
         ef.addRow("Password", self.smtp_pass)
         self.email_from = QLineEdit(s.get("email_from", ""))
         ef.addRow("From address", self.email_from)
-        self.email_to = QLineEdit("; ".join(s.get("email_recipients", [])))
-        self.email_to.setPlaceholderText(
-            "one or more, comma- or semicolon-separated: a@x.eu; b@y.eu")
-        self.email_to.setToolTip(
-            "Add as many recipients as you like, separated by ; or , — "
-            "every address gets the alert.")
-        ef.addRow("Recipients", self.email_to)
+        recip_lbl = QLabel("Recipients")
+        recip_lbl.setToolTip("Tick 'On' for everyone who should get alert e-mails.")
+        ef.addRow(recip_lbl)
+        self.email_contacts = EmailContactsWidget()
+        self.email_contacts.set_rows(s.get("email_contacts", []))
+        ef.addRow(self.email_contacts)
         be = QPushButton("Send test email")
         be.setStyleSheet(_BTN_PRIMARY)
         be.clicked.connect(self._test_email)
@@ -903,8 +1127,14 @@ class SettingsDialog(QDialog):
             "the saved value is unreadable to others / on other PCs. "
             "Tip: use ${ENV:NAME} to read from an env var instead.")
         wf.addRow("Bot token", self.webex_token)
-        self.webex_room = QLineEdit(s.get("webex_room_id", ""))
-        wf.addRow("Room ID", self.webex_room)
+        rooms_lbl = QLabel("Rooms")
+        rooms_lbl.setToolTip(
+            "Tick 'On' for every room the bot should broadcast alerts to. "
+            "Exactly one room can be 'Listen for commands' (two-way chat).")
+        wf.addRow(rooms_lbl)
+        self.webex_rooms = WebexRoomsWidget()
+        self.webex_rooms.set_rows(s.get("webex_rooms", []))
+        wf.addRow(self.webex_rooms)
         bw = QPushButton("Send test to Webex")
         bw.setStyleSheet(_BTN_PRIMARY)
         bw.clicked.connect(self._test_webex)
@@ -979,7 +1209,7 @@ class SettingsDialog(QDialog):
         is_bot = (mode == "bot")
         self.webex_url.setEnabled(not is_bot)
         self.webex_token.setEnabled(is_bot)
-        self.webex_room.setEnabled(is_bot)
+        self.webex_rooms.setEnabled(is_bot)
 
     def _show_test(self, ok: bool, name: str, err: str):
         if ok:
@@ -1002,7 +1232,7 @@ class SettingsDialog(QDialog):
             security=self.smtp_sec.currentText(),
             username=self.smtp_user.text().strip(), password=self.smtp_pass.text(),
             from_addr=self.email_from.text().strip(),
-            recipients=_parse_recipients(self.email_to.text()),
+            recipients=self.email_contacts.enabled_addresses(),
             timeout=float(self._win.settings["http_timeout_s"]))
         self._show_test(c.send_test(), "Email", c.last_error)
 
@@ -1012,7 +1242,8 @@ class SettingsDialog(QDialog):
             mode=self.webex_mode.currentText(),
             webhook_url=self.webex_url.text().strip(),
             bot_token=self.webex_token.text().strip(),
-            room_id=self.webex_room.text().strip(),
+            room_ids=self.webex_rooms.enabled_room_ids(),
+            listen_room_id=self.webex_rooms.listen_room_id(),
             timeout=float(self._win.settings["http_timeout_s"]))
         self._show_test(c.send_test(), "Webex", c.last_error)
 
@@ -1032,12 +1263,12 @@ class SettingsDialog(QDialog):
         s["smtp_user"] = self.smtp_user.text().strip()
         s["smtp_password"] = encrypt_secret(self.smtp_pass.text())
         s["email_from"] = self.email_from.text().strip()
-        s["email_recipients"] = _parse_recipients(self.email_to.text())
+        s["email_contacts"] = self.email_contacts.rows()
         # webex
         s["webex_mode"] = self.webex_mode.currentText()
         s["webex_webhook_url"] = self.webex_url.text().strip()
         s["webex_bot_token"] = encrypt_secret(self.webex_token.text().strip())
-        s["webex_room_id"] = self.webex_room.text().strip()
+        s["webex_rooms"] = self.webex_rooms.rows()
         s["webex_commands_enabled"] = self.webex_cmds.isChecked()
         s["webex_command_poll_s"] = self.webex_cmd_poll.value()
         s["webex_command_allowlist"] = _parse_recipients(self.webex_allow.text())
@@ -1252,6 +1483,23 @@ class _AlertWorker(QRunnable):
 # Webex two-way command workers (bot mode only)
 # ---------------------------------------------------------------------------
 
+class _MeIdSignals(QObject):
+    done = Signal(object)   # bot_person_id_or_None
+
+
+class _MeIdWorker(QRunnable):
+    """Resolve the bot's own personId (blocking HTTP call) off the UI thread."""
+
+    def __init__(self, sig: _MeIdSignals, webex):
+        super().__init__()
+        self._sig = sig
+        self._webex = webex
+
+    def run(self):
+        bot_id = self._webex.get_me_id()
+        _safe_emit(self._sig.done.emit, bot_id)
+
+
 class _CmdPollSignals(QObject):
     done = Signal(object)   # (new_items_oldest_first, newest_id_or_None)
 
@@ -1309,6 +1557,10 @@ class MonitorWidget(QWidget):
         self._cmd_last_id = None
         self._cmd_primed = False
         self._cmd_last_logged_error = ""
+        self._cmd_bot_id = None
+        self._cmd_poll_inflight = False
+        self._cmd_bot_id_inflight = False
+        self._cmd_gen = 0
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -1666,6 +1918,9 @@ class MonitorWidget(QWidget):
             return
         self._cmd_primed = False
         self._cmd_last_id = None
+        self._cmd_bot_id = None
+        self._cmd_poll_inflight = False
+        self._resolve_bot_id()
         poll_s = max(1, int(self.settings.get("webex_command_poll_s", 1)))
         self._cmd_timer = QTimer(self)
         self._cmd_timer.timeout.connect(self._poll_commands)
@@ -1678,17 +1933,54 @@ class MonitorWidget(QWidget):
         if self._cmd_timer is not None:
             self._cmd_timer.stop()
             self._cmd_timer = None
+        self._cmd_bot_id = None
+        self._cmd_poll_inflight = False
+        self._cmd_bot_id_inflight = False
+        # Bump so any response from a poll/resolve dispatched before this
+        # stop (still in flight in the thread pool, uncancellable) is
+        # recognized as stale and discarded instead of being processed as
+        # a fresh command — see _on_commands / _on_bot_id.
+        self._cmd_gen += 1
+
+    def _resolve_bot_id(self):
+        """Fetch the bot's own personId off the UI thread (blocking HTTP call)."""
+        if self._cmd_bot_id_inflight:
+            return
+        self._cmd_bot_id_inflight = True
+        gen = self._cmd_gen
+        sig = _MeIdSignals(self)
+        sig.done.connect(lambda bot_id, g=gen: self._on_bot_id(bot_id, g))
+        self._me_id_sig = sig
+        QThreadPool.globalInstance().start(_MeIdWorker(sig, self.hub.webex))
+
+    def _on_bot_id(self, bot_id, gen):
+        if gen != self._cmd_gen:
+            return   # listener was restarted/stopped since this request was sent
+        self._cmd_bot_id_inflight = False
+        self._cmd_bot_id = bot_id
+        if not bot_id:
+            self._log("⚠ Failed to get bot's personId; will retry on next poll. "
+                      "(Own-message IDs are still filtered as a backstop.)")
 
     def _poll_commands(self):
         if not self.hub.webex.can_listen():
             return
+        if self._cmd_poll_inflight:
+            return   # previous poll hasn't returned yet — never overlap requests
+        if not self._cmd_bot_id:
+            self._resolve_bot_id()   # keep retrying until it resolves, off the UI thread
+        self._cmd_poll_inflight = True
+        gen = self._cmd_gen
         sig = _CmdPollSignals(self)
-        sig.done.connect(self._on_commands)
+        sig.done.connect(lambda result, g=gen: self._on_commands(result, g))
         self._cmd_sig = sig
         QThreadPool.globalInstance().start(
             _CmdPollWorker(sig, self.hub.webex, self._cmd_last_id))
 
-    def _on_commands(self, result):
+    def _on_commands(self, result, gen):
+        if gen != self._cmd_gen:
+            return   # listener was restarted/stopped since this poll was sent — discard
+        self._cmd_poll_inflight = False
         new_items, newest_id = result
         # Surface poll failures (bad token, bot not in room, network, 403…)
         # in the Log tab — but only when the error changes, to avoid spamming
@@ -1706,6 +1998,10 @@ class MonitorWidget(QWidget):
             return
         allow = [e.lower() for e in self.settings.get("webex_command_allowlist", [])]
         for it in new_items:
+            if self._cmd_bot_id and it.get("personId") == self._cmd_bot_id:
+                continue
+            if self.hub.webex.is_own_message(it.get("id")):
+                continue
             text = (it.get("text") or "").strip()
             if "/" in text:
                 if not text.startswith("/"):
