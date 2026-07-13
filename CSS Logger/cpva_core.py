@@ -296,6 +296,42 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
     return results
 
 
+# Cumulative look-back horizons (seconds) for hunting the most recent sample
+# before a time. We scan the NEW slice at each step (near → far) and stop at the
+# first hit, so PVs with recent data cost one chunk and only truly-stale PVs pay
+# for the deeper scan. The archiver is unreliable for windows > 1 h, so every
+# slice is fetched via cpva_fetch_samples_chunked (1-hour chunks) — a single
+# multi-hour request would silently return nothing.
+_LAST_BEFORE_STEPS_S = (3600, 6 * 3600, 24 * 3600,
+                        3 * 24 * 3600, 7 * 24 * 3600, 30 * 24 * 3600)
+
+
+def cpva_fetch_last_before(channel: str, before_ns: int,
+                           timeout: float = CPVA_HTTP_TIMEOUT):
+    """Return the most recent sample dict strictly before `before_ns`, or None.
+
+    Scans expanding 1-hour-chunked rings back to ~30 days and stops at the first
+    ring that holds data, so a PV whose last update predates the requested
+    window can still be carried forward instead of leaving a gap in the plot.
+    """
+    hi = before_ns
+    for step_s in _LAST_BEFORE_STEPS_S:
+        lo = max(0, before_ns - int(step_s * 1e9))
+        if lo >= hi:
+            break
+        try:
+            raw = cpva_fetch_samples_chunked(channel, lo, hi, timeout)
+        except Exception:
+            raw = None
+        if raw:
+            # Chunked results are time-ordered ascending → last is nearest `hi`.
+            return raw[-1]
+        hi = lo
+        if lo == 0:
+            break
+    return None
+
+
 def cpva_decode_value(sample: dict):
     val = sample.get("value")
 

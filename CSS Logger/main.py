@@ -822,6 +822,8 @@ class CSSLoggerWidget(QWidget):
         self._blit_bg          = None
         self._mouse_pending    = False
         self._mouse_last_event = None
+        self._cursor_active    = False
+        self._in_cursor_redraw = False
         self._xy_canvas = None
         self._xy_figure = None
         self._xy_rows   = []
@@ -863,6 +865,7 @@ class CSSLoggerWidget(QWidget):
         self._data_repository: list = []
         self._ref_lines: list      = []
         self._pre_window_vals: dict = {}  # pv → (ts_ns, value, units) before window start
+        self._plot_window_ns = None       # explicit carry-forward window (live mode)
         self._conditions: list = copy(self.config.get("conditions", []))
         self._table_rows_unfiltered: list = []
         self._numeric_pvs: set = set()
@@ -994,6 +997,8 @@ class CSSLoggerWidget(QWidget):
         bar.addWidget(h3)
 
         self._pv_list = QListWidget()
+        self._pv_list.setStyleSheet(
+            "QListWidget{background:#ffffff;border:1px solid #b0b0b0;border-radius:3px;}")
         self._pv_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._pv_list.setMinimumHeight(120)
         self._pv_list.setMaximumHeight(220)
@@ -1108,8 +1113,14 @@ class CSSLoggerWidget(QWidget):
         self._lbl_graph_info.setStyleSheet("color:#777;")
         ctrl.addWidget(self._lbl_graph_info)
 
-        # Vertical splitter: graph canvas (top) + axis settings (bottom)
+        # Vertical splitter: graph canvas (top) + axis settings (bottom).
+        # A wide, clearly-shaded handle tells the user where to grab to resize.
         self._graph_v_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._graph_v_splitter.setHandleWidth(8)
+        self._graph_v_splitter.setStyleSheet(
+            "QSplitter::handle{background:#c8c8c8;"
+            "border-top:1px solid #8a8a8a;border-bottom:1px solid #8a8a8a;}"
+            "QSplitter::handle:hover{background:#1565C0;}")
         lay.addWidget(self._graph_v_splitter, stretch=1)
 
         # Top pane: canvas container + stats strip
@@ -1118,8 +1129,10 @@ class CSSLoggerWidget(QWidget):
         top_lay.setContentsMargins(0, 0, 0, 0)
         top_lay.setSpacing(0)
 
+        # Visible border around the graph area so its extent is obvious.
         self._graph_container = QWidget()
-        self._graph_container.setStyleSheet("background:#f5f5f5;")
+        self._graph_container.setStyleSheet(
+            "background:#ffffff;border:1px solid #9e9e9e;")
         gc_lay = QVBoxLayout(self._graph_container)
         gc_lay.setContentsMargins(0, 0, 0, 0)
         top_lay.addWidget(self._graph_container, stretch=1)
@@ -1135,7 +1148,11 @@ class CSSLoggerWidget(QWidget):
         axis_pane = QWidget()
         self._build_axis_settings_panel(axis_pane)
         self._graph_v_splitter.addWidget(axis_pane)
-        self._graph_v_splitter.setSizes([600, 150])
+        # Give all spare vertical space to the graph; keep the table compact and
+        # docked right beneath it (no dead gap between graph and table).
+        self._graph_v_splitter.setStretchFactor(0, 1)
+        self._graph_v_splitter.setStretchFactor(1, 0)
+        self._graph_v_splitter.setSizes([900, 190])
 
     # ── Axis settings panel ────────────────────────────────────────────────
 
@@ -1175,7 +1192,12 @@ class CSSLoggerWidget(QWidget):
         self._axis_tv.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._axis_tv.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked |
                                        QAbstractItemView.EditTrigger.SelectedClicked)
-        self._axis_tv.setMaximumHeight(160)
+        # White background (incl. the empty area beneath the rows) and let the
+        # table fill the pane so no dead gap opens between the heading and it.
+        self._axis_tv.setStyleSheet(
+            "QTableWidget{background:#ffffff;}"
+            "QTableWidget QTableCornerButton::section{background:#ffffff;}")
+        self._axis_tv.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         hdr = self._axis_tv.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         # PV + Display Name auto-fit their content so the full text is always visible.
@@ -1446,11 +1468,30 @@ class CSSLoggerWidget(QWidget):
             self._lbl_graph_info.setText("Load data first.")
             return
 
-        # PVs with actual numeric samples
+        # Carry-forward window bounds (ns) — used to draw the last known value
+        # across any gaps at the window edges (see per-PV pairs building below).
+        # Live mode supplies an explicit window via _plot_window_ns so it need
+        # not clobber the user's chosen From/To.
+        _win_override = getattr(self, "_plot_window_ns", None)
+        if _win_override:
+            _win_start_ns, _win_end_ns = _win_override
+            _use_window = _win_end_ns > _win_start_ns
+        else:
+            _win_start_ns = dt_to_ns(self._dt_from)
+            _win_end_ns   = dt_to_ns(self._dt_to)
+            _use_window   = self._dt_to > self._dt_from
+
+        def _pre_numeric(pv):
+            p = self._pre_window_vals.get(pv)
+            return p is not None and isinstance(p[1], (int, float))
+
+        # PVs with actual numeric samples (or a numeric last-known value before
+        # the window, so a fully-empty window still shows the held line).
         numeric_pvs = [
             pv for pv in self._pv_order
             if self._pv_settings.get(pv, {}).get("show", True)
-            and any(isinstance(v, (int, float)) for _, v, _ in self._samples_by_pv.get(pv, []))
+            and (any(isinstance(v, (int, float)) for _, v, _ in self._samples_by_pv.get(pv, []))
+                 or _pre_numeric(pv))
         ]
 
         # All visible PVs (for axis layout — includes PVs with no data yet)
@@ -1501,12 +1542,15 @@ class CSSLoggerWidget(QWidget):
         for _ in range(1, n):
             axes.append(axes[0].twinx())
 
+        # Order the Y-axis columns left → right in PV order (first PV = leftmost
+        # column, last PV nearest the plot) so reading the axes left-to-right
+        # matches the top-to-bottom order of the traces and the table.
         self._graph_spine_xpos = []
         for i, ax in enumerate(axes):
             ax.yaxis.set_label_position("left"); ax.yaxis.tick_left()
-            xfrac = -i * STEP_ax
+            xfrac = -(n - 1 - i) * STEP_ax
+            ax.spines["left"].set_position(("axes", xfrac))
             if i > 0:
-                ax.spines["left"].set_position(("axes", xfrac))
                 ax.spines["right"].set_visible(False)  # twins must not draw over the plot
             self._graph_spine_xpos.append((xfrac, "left"))
         ax_x = axes[0]
@@ -1532,6 +1576,22 @@ class CSSLoggerWidget(QWidget):
             if len(pairs) > MAX_PTS:
                 step = max(1, len(pairs) // MAX_PTS)
                 pairs = pairs[::step]
+
+            # Carry-forward / hold (like CS Studio): fill gaps at the window
+            # edges so the trace spans the whole window instead of breaking off.
+            # • Prepend the last value seen BEFORE the window at the start edge.
+            # • Extend the last in-window value flat out to the window end.
+            if _use_window:
+                pre = self._pre_window_vals.get(pv)
+                pre_val = pre[1] if (pre and isinstance(pre[1], (int, float))) else None
+                if not pairs:
+                    if pre_val is not None:
+                        pairs = [(_win_start_ns, pre_val), (_win_end_ns, pre_val)]
+                else:
+                    if pre_val is not None and pairs[0][0] > _win_start_ns:
+                        pairs.insert(0, (_win_start_ns, pre_val))
+                    if pairs[-1][0] < _win_end_ns:
+                        pairs.append((_win_end_ns, pairs[-1][1]))
 
             times  = [datetime.fromtimestamp(ts / 1e9, tz=timezone.utc) for ts, v in pairs]
             values = [float("nan") if v is None else v for ts, v in pairs]
@@ -1576,6 +1636,11 @@ class CSSLoggerWidget(QWidget):
             ax.yaxis.set_major_locator(MaxNLocator(6))
             ax.yaxis.set_minor_locator(AutoMinorLocator(5))
             ax.tick_params(axis="y", which="minor", length=3, labelsize=0)
+            # No floating "1e6" multiplier — show plain tick numbers instead.
+            try:
+                ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+            except Exception:
+                pass
 
             # Position this PV's data into its vertical band (or full height if
             # Autoscale is on). Manual Y min/max override the data range that is
@@ -1670,27 +1735,14 @@ class CSSLoggerWidget(QWidget):
             ax0.axhline(y=rl["y"], color=rl["color"], linewidth=1.2, linestyle="--",
                         label=rl.get("label") or f"y={rl['y']}")
 
-        # ── Last-known-value lines (PVs with no data in window) ─────────────
-        for i, (pv, ax) in enumerate(zip(pvs_for_axes, axes)):
-            if pv in self._pre_window_vals and not self._samples_by_pv.get(pv):
-                _ts_pre, val_pre, _ = self._pre_window_vals[pv]
-                if isinstance(val_pre, (int, float)):
-                    line_color = self._pv_settings.get(pv, {}).get(
-                        "color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
-                    ax.axhline(y=val_pre, color=line_color, linewidth=1.0,
-                               linestyle=":", alpha=0.6,
-                               label=f"{shorten_pv_name(pv)} (last known: {_fmt_cursor_value(val_pre)})")
-                    ax.annotate(
-                        f"last: {_fmt_cursor_value(val_pre)}",
-                        xy=(0.01, val_pre), xycoords=("axes fraction", "data"),
-                        fontsize=max(7, _fsize - 2), color=line_color, alpha=0.8,
-                        va="bottom",
-                        bbox=dict(boxstyle="round,pad=0.1", fc="white", ec=line_color,
-                                  alpha=0.7, linewidth=0.5),
-                    )
+        # (Carry-forward is now drawn as a solid held line in the per-PV loop
+        # above, so no separate dotted "last known value" overlay is needed.)
 
-        # Embed canvas
+        # Embed canvas — force it to expand and fill the container so the graph
+        # border hugs the plot (no white padding band inside the border).
         canvas = FigureCanvasQTAgg(fig)
+        canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        canvas.setMinimumSize(0, 0)
         layout = self._graph_container.layout()
         layout.addWidget(canvas)
         self._mpl_canvas = canvas
@@ -1836,6 +1888,18 @@ class CSSLoggerWidget(QWidget):
             if ann is not None: ann.set_visible(False)
         if self._x_cursor_ann is not None: self._x_cursor_ann.set_visible(False)
         self._blit_bg = self._mpl_canvas.copy_from_bbox(self._mpl_figure.bbox)
+        # A stray full redraw (matplotlib schedules one when artists go stale,
+        # e.g. while the mouse sits still) repaints without the animated
+        # crosshair and would make it vanish after a second or two. If the
+        # cursor is still parked over the plot, re-assert the overlay now.
+        if (getattr(self, "_cursor_active", False)
+                and self._mouse_last_event is not None
+                and not getattr(self, "_in_cursor_redraw", False)):
+            self._in_cursor_redraw = True
+            try:
+                self._process_mouse_move()
+            finally:
+                self._in_cursor_redraw = False
 
     def _on_graph_mouse_move(self, event):
         self._mouse_last_event = event
@@ -1852,6 +1916,7 @@ class CSSLoggerWidget(QWidget):
         bg     = self._blit_bg
 
         if event.inaxes is None:
+            self._cursor_active = False
             if bg is not None:
                 canvas.restore_region(bg); canvas.blit(self._mpl_figure.bbox)
             else:
@@ -1905,11 +1970,15 @@ class CSSLoggerWidget(QWidget):
                     val_str = _fmt_cursor_value(y_mouse)
                     txt = f" {val_str}" if side == "right" else f"{val_str} "
                     y_ann = y_mouse
+                    # Stagger every other axis label onto a second row, with
+                    # enough vertical padding that the two rows' boxes clear
+                    # each other (box height ≈ font size + bbox padding).
                     if ax_i % 2 == 1:
                         try:
                             ylo, yhi = ax.get_ylim()
                             h_px = ax.get_window_extent().height
-                            if h_px > 0: y_ann += (yhi - ylo) / h_px * 15
+                            pad_px = ann.get_fontsize() + 16
+                            if h_px > 0: y_ann += (yhi - ylo) / h_px * pad_px
                         except Exception:
                             pass
                     ann.set_position((xfrac, y_ann)); ann.set_text(txt); ann.set_visible(True)
@@ -1926,6 +1995,7 @@ class CSSLoggerWidget(QWidget):
             except Exception:
                 dt_cursor = None
 
+        self._cursor_active = True
         if bg is not None: canvas.blit(self._mpl_figure.bbox)
         else: canvas.draw_idle()
 
@@ -2043,7 +2113,8 @@ class CSSLoggerWidget(QWidget):
 
         def _worker():
             try:
-                from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value, cpva_fetch_samples
+                from cpva_core import (cpva_fetch_samples_chunked, cpva_decode_value,
+                                       cpva_fetch_samples, cpva_fetch_last_before)
                 samples_by_pv   = {}
                 pv_order        = []
                 errors          = []
@@ -2065,19 +2136,20 @@ class CSSLoggerWidget(QWidget):
                         samples_by_pv[pv] = samples
                         pv_order.append(pv)
                         print(f"[CSS Logger]   → {len(samples)} samples")
-                        if not samples:
-                            look_back_ns = max(0, start_ns - int(30 * 24 * 3600 * 1e9))
-                            try:
-                                pre_raw = cpva_fetch_samples(pv, look_back_ns, start_ns)
-                                if pre_raw:
-                                    last_s = pre_raw[-1]
-                                    last_ts = last_s.get("time")
-                                    last_val = cpva_decode_value(last_s)
-                                    last_units = (last_s.get("metaData") or {}).get("units", "") or ""
-                                    if last_ts:
-                                        pre_window_vals[pv] = (int(last_ts), last_val, last_units)
-                            except Exception:
-                                pass
+                        # Look back for the last sample BEFORE the window start
+                        # whenever the window either has no data, or its first
+                        # sample sits after start_ns. This lets the graph carry
+                        # that value forward so the trace begins at the window
+                        # start instead of jumping in at the first in-window point.
+                        first_ts = min((t for t, _, _ in samples), default=None)
+                        if first_ts is None or first_ts > start_ns:
+                            last_s = cpva_fetch_last_before(pv, start_ns)
+                            if last_s:
+                                last_ts = last_s.get("time")
+                                if last_ts:
+                                    pre_window_vals[pv] = (
+                                        int(last_ts), cpva_decode_value(last_s),
+                                        (last_s.get("metaData") or {}).get("units", "") or "")
                     except Exception as exc:
                         errors.append(f"{pv}: {exc}")
                         print(f"[CSS Logger]   → ERROR: {exc}")
@@ -2122,6 +2194,7 @@ class CSSLoggerWidget(QWidget):
             samples_by_pv, pv_order, errors, start_ns, end_ns = result
             pre_window_vals = {}
         self._pre_window_vals = pre_window_vals
+        self._plot_window_ns = None   # regular load uses the user's From/To
         self._btn_load.setEnabled(True)
         self._progress_bar.hide()
 
@@ -2233,6 +2306,12 @@ class CSSLoggerWidget(QWidget):
             self._countdown_timer.stop()
             self._btn_live.setText("⏵ Live")
             self._btn_live.setStyleSheet("")
+            # Stopping live must immediately free the LOAD DATA button, even if
+            # the initial live fetch is still running (its callback bails out
+            # once _live_mode is False and would otherwise leave LOAD disabled).
+            self._btn_load.setEnabled(True)
+            self._progress_bar.hide()
+            self._plot_window_ns = None
             self._refresh_time_labels()
             self._lbl_status.setText("Live mode stopped.")
         else:
@@ -2269,9 +2348,11 @@ class CSSLoggerWidget(QWidget):
 
         def _worker():
             try:
-                from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value
+                from cpva_core import (cpva_fetch_samples_chunked, cpva_decode_value,
+                                       cpva_fetch_last_before)
                 samples_by_pv = {}
                 pv_order = []
+                pre_window_vals = {}
                 total = len(pvs)
                 for idx, pv in enumerate(pvs, 1):
                     sig.progress.emit(f"Live init {idx}/{total}: {shorten_pv_name(pv)}")
@@ -2286,9 +2367,19 @@ class CSSLoggerWidget(QWidget):
                             samples.append((int(t_ns), value, units))
                         samples_by_pv[pv] = samples
                         pv_order.append(pv)
+                        # Carry-forward: also in live mode, hold the last known
+                        # value so a PV without a fresh sample still draws a line
+                        # instead of leaving the graph empty.
+                        first_ts = min((t for t, _, _ in samples), default=None)
+                        if first_ts is None or first_ts > start_ns:
+                            last_s = cpva_fetch_last_before(pv, start_ns)
+                            if last_s and last_s.get("time"):
+                                pre_window_vals[pv] = (
+                                    int(last_s["time"]), cpva_decode_value(last_s),
+                                    (last_s.get("metaData") or {}).get("units", "") or "")
                     except Exception:
                         pass
-                sig.done.emit((samples_by_pv, pv_order, [], start_ns, end_ns))
+                sig.done.emit((samples_by_pv, pv_order, [], start_ns, end_ns, pre_window_vals))
             except Exception as exc:
                 sig.error.emit(str(exc))
 
@@ -2310,7 +2401,15 @@ class CSSLoggerWidget(QWidget):
         if not self._live_mode: return
         self._btn_load.setEnabled(True)
         try:
-            samples_by_pv, pv_order, _, start_ns, end_ns = result
+            if len(result) == 6:
+                samples_by_pv, pv_order, _, start_ns, end_ns, pre_window_vals = result
+            else:
+                samples_by_pv, pv_order, _, start_ns, end_ns = result
+                pre_window_vals = {}
+            self._pre_window_vals = pre_window_vals
+            # Anchor the carry-forward window to the live window (without
+            # clobbering the user's chosen From/To) so the held line spans it.
+            self._plot_window_ns = (start_ns, end_ns)
             self._samples_by_pv = samples_by_pv
             self._pv_order      = pv_order
             self._base_pv_order = list(pv_order)

@@ -2313,6 +2313,12 @@ class _MapTab(QWidget):
         left_w = QWidget()
         left = QVBoxLayout(left_w)
         left.setContentsMargins(0, 0, 0, 0)
+        # One-line overview of the whole camera, always visible above the map so the
+        # important totals (dead pulsers, array trips) are seen without opening Run Graph.
+        self._map_summary = QLabel("No scan data yet")
+        self._map_summary.setStyleSheet("font-weight:bold;color:#111;")
+        self._map_summary.setWordWrap(True)
+        left.addWidget(self._map_summary)
         self._map_fig = Figure(figsize=(5, 4))
         self._map_canvas = FigureCanvasQTAgg(self._map_fig)
         self._map_ax = self._map_fig.add_subplot(111)
@@ -2322,8 +2328,11 @@ class _MapTab(QWidget):
         metric_row = QHBoxLayout()
         metric_row.addWidget(QLabel("Heatmap:"))
         self._metric_combo = _NoScrollComboBox()
-        for label in ("Dropouts", "Trip dropouts", "Total dropouts", "Status", "Uptime %"):
+        for label in ("Status", "Dropouts", "Trip dropouts", "Total dropouts", "Uptime %"):
             self._metric_combo.addItem(label)
+        # Default to Status: it shows dead/alive at a glance. The dropout metrics look
+        # empty when every outage was a whole-array trip (per-pulser dropouts are 0 then).
+        self._metric_combo.setCurrentText("Status")
         self._metric_combo.currentTextChanged.connect(lambda _t: self._draw_map())
         metric_row.addWidget(self._metric_combo, 1)
         left.addLayout(metric_row)
@@ -2426,15 +2435,42 @@ class _MapTab(QWidget):
             return 0.0
         return float(st.dropouts)
 
+    def _update_summary(self):
+        """One-line camera overview shown above the map: dead pulsers, array trips
+        and per-pulser dropouts, so the key totals are visible without Run Graph."""
+        stats = self._stats
+        n_dead0 = sum(1 for s in stats if s.dead_from_start)
+        n_dead = sum(1 for s in stats if s.is_dead and not s.dead_from_start)
+        n_alive = sum(1 for s in stats if not s.is_dead)
+        n_drop = sum(s.dropouts for s in stats)
+        n_trip_drop = sum(s.trip_dropouts for s in stats)
+        n_trips = len(self._analysis.trips) if self._analysis else 0
+        dead_names = [s.name for s in stats if s.is_dead]
+        parts = [
+            f"{self._cam_key}:",
+            f"{n_alive} alive",
+            f"{n_dead} dead",
+            f"{n_dead0} dead-from-start",
+            f"{n_trips} array trips",
+            f"{n_drop} dropouts",
+            f"{n_trip_drop} trip-dropouts",
+        ]
+        text = "   ·   ".join(parts)
+        if dead_names:
+            text += f"\nDead: {', '.join(dead_names)}"
+        self._map_summary.setText(text)
+
     def _draw_map(self):
         self._map_ax.clear()
         self._map_fig.clf()
         self._map_ax = self._map_fig.add_subplot(111)
         if not self._rois or not self._stats:
+            self._map_summary.setText("No scan data yet")
             self._map_ax.text(0.5, 0.5, "No scan data yet", transform=self._map_ax.transAxes,
                               ha="center", va="center", color="#888", fontsize=12)
             self._map_canvas.draw()
             return
+        self._update_summary()
         rows, cols, cell_index = _grid_layout_for(self._cam_key, self._rois)
         self._rows_lbl, self._cols_lbl, self._cell_index = rows, cols, cell_index
         n_rows, n_cols = len(rows), len(cols)
@@ -2765,6 +2801,14 @@ class _RunGraphTab(QWidget):
                           ha="center", va="center", color="#888", fontsize=12)
             return
         times = [mdates.date2num(_ns_to_dt(t)) for t in a.times_ns]
+        # Shade every array trip so the whole-array outages are visible here too, not
+        # only in the state view. Labelled once so the legend stays clean.
+        trips = getattr(a, "trips", [])
+        for j, trip in enumerate(trips):
+            self._ax.axvspan(mdates.date2num(_ns_to_dt(trip.start_ns)),
+                             mdates.date2num(_ns_to_dt(trip.end_ns)),
+                             color=NODATA_CLR, alpha=0.25, linewidth=0,
+                             label="array trip" if j == 0 else None, zorder=0)
         sig = a.signal_matrix
         for i, roi in enumerate(self._rois):
             if i >= sig.shape[1]:
@@ -2782,7 +2826,7 @@ class _RunGraphTab(QWidget):
         self._ax.xaxis.set_major_locator(_date_loc())
         self._fig.autofmt_xdate(rotation=30)
         self._ax.set_ylabel("Score (× own alive level)")
-        self._ax.set_title("Pulser score over time (Prague time)")
+        self._ax.set_title(f"Pulser score over time  ({len(trips)} array trip(s), Prague time)")
         ncol = max(1, min(len(self._rois), 6))
         self._ax.legend(fontsize=8, ncol=ncol, loc="upper right")
 
@@ -3061,7 +3105,18 @@ class _StatsTab(QWidget):
     """Per-array statistics: category counts, dropouts over time, inter-dropout
     distribution, and the array-trip log."""
 
-    TRIP_COLS = ["Trip start", "Duration", "Recovered", "Died", "Died pulsers"]
+    TRIP_COLS = ["Trip start", "Duration", "Recovered (#)", "Died (#)", "Died pulsers"]
+    TRIP_COL_TIPS = [
+        "When the whole array went down (started producing no data).",
+        "How long the array stayed down before data resumed.",
+        "How many pulsers that were alive before this trip were alive again after it.",
+        "How many pulsers were alive before this trip and never came back after it.\n"
+        "0 = the array fully recovered from this trip.",
+        "Names of the pulsers counted in 'Died (#)'. '—' when none died at this trip.\n"
+        "Note: a pulser that was already dead (or dead from the start) before the trip\n"
+        "is not counted here — that is why the Recovered count can be one short of the\n"
+        "total pulser count.",
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3088,6 +3143,10 @@ class _StatsTab(QWidget):
         lay.addWidget(QLabel("Array trips"))
         self._tbl = QTableWidget(0, len(self.TRIP_COLS))
         self._tbl.setHorizontalHeaderLabels(self.TRIP_COLS)
+        for c, tip in enumerate(self.TRIP_COL_TIPS):
+            hdr_item = self._tbl.horizontalHeaderItem(c)
+            if hdr_item is not None:
+                hdr_item.setToolTip(tip)
         self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._tbl.setAlternatingRowColors(True)
@@ -3277,6 +3336,9 @@ class PulserMonitorWidget(QWidget):
             chk = QCheckBox(cam_key)
             chk.setChecked(True)
             chk.setStyleSheet(_CHECKBOX_STYLE)
+            chk.setToolTip(
+                f"Include camera {cam_key} in the scan.\n"
+                "Unticked cameras are skipped entirely (not read, not analysed).")
             chk.stateChanged.connect(
                 lambda state, k=cam_key: self._set_roi_row_visible(k, state > 0))
             self._cam_checks[cam_key] = chk
@@ -3291,6 +3353,9 @@ class PulserMonitorWidget(QWidget):
         lv.addWidget(_group_label("Time window"))
         btn_tw = QPushButton("Set time window…")
         btn_tw.setStyleSheet(_BTN)
+        btn_tw.setToolTip(
+            "Pick the start and end date/hour of the period to scan.\n"
+            "Only images whose timestamp falls inside this window are analysed.")
         btn_tw.clicked.connect(self._open_tw)
         lv.addWidget(btn_tw)
         self._tw_lbl = QLabel(self._tw_text())
@@ -3309,6 +3374,10 @@ class PulserMonitorWidget(QWidget):
             btn = QPushButton(f"Edit {cam_key}…")
             btn.setStyleSheet(_BTN_SM)
             btn.setFixedWidth(110)
+            btn.setToolTip(
+                f"Open the ROI editor for camera {cam_key}: draw/move the boxes marking\n"
+                "each pulser tile and set the all-alive reference (Auto-create grid).\n"
+                "The scan measures brightness inside these boxes.")
             btn.clicked.connect(lambda checked=False, k=cam_key: self._open_roi_editor(k))
             lbl = QLabel("0 ROIs")
             lbl.setStyleSheet("font-size:10px;color:#555;")
@@ -3322,6 +3391,9 @@ class PulserMonitorWidget(QWidget):
         roi_json_row = QHBoxLayout()
         btn_load_all = QPushButton("Load configuration…")
         btn_load_all.setFixedWidth(130)
+        btn_load_all.setToolTip(
+            "Load a saved ROI configuration (box positions + reference levels) for all\n"
+            "cameras from a JSON file, replacing the current ROIs.")
         btn_load_all.clicked.connect(self._load_rois_json)
         roi_json_row.addWidget(btn_load_all)
         roi_json_row.addStretch(1)
@@ -3337,28 +3409,46 @@ class PulserMonitorWidget(QWidget):
         # Adaptive per-pulser scoring: each pulser is judged against its OWN learnt
         # "alive" brightness (score = mean / alive-level), so dark corner pulsers are
         # not mistaken for dead. ON when score ≥ alive score, OFF when ≤ off score.
+        _tip_alive = (
+            "ON threshold (hysteresis upper bound).\n"
+            "Each pulser is scored against its own learnt bright level:\n"
+            "score = current brightness / that pulser's alive brightness.\n"
+            "When the score rises to at least this value the pulser is marked ON.\n"
+            "Higher = stricter (a pulser must be nearly full brightness to count as ON);\n"
+            "lower = more forgiving. Must stay above 'Off score'. Default 0.60.")
         thr_row = QHBoxLayout()
-        thr_row.addWidget(QLabel("Alive score:"))
+        _lbl_alive = QLabel("Alive score:")
+        _lbl_alive.setToolTip(_tip_alive)
+        thr_row.addWidget(_lbl_alive)
         self._thr_sb = QDoubleSpinBox()
         self._thr_sb.setRange(0.05, 2.0)
         self._thr_sb.setSingleStep(0.05)
         self._thr_sb.setDecimals(2)
         self._thr_sb.setValue(0.60)
         self._thr_sb.setFixedWidth(75)
-        self._thr_sb.setToolTip("Fraction of the pulser's own alive brightness to count as ON")
+        self._thr_sb.setToolTip(_tip_alive)
         thr_row.addWidget(self._thr_sb)
         thr_row.addStretch(1)
         lv.addLayout(thr_row)
         # Hysteresis lower threshold: stays alive until it drops below this.
+        _tip_off = (
+            "OFF threshold (hysteresis lower bound).\n"
+            "When a pulser's score drops to at most this fraction of its own alive\n"
+            "brightness it is marked OFF (a candidate dropout).\n"
+            "Between 'Off score' and 'Alive score' the previous state is held, so\n"
+            "brightness flicker around the boundary does not toggle the state.\n"
+            "Must stay below 'Alive score'. Default 0.40.")
         thr_lo_row = QHBoxLayout()
-        thr_lo_row.addWidget(QLabel("Off score:"))
+        _lbl_off = QLabel("Off score:")
+        _lbl_off.setToolTip(_tip_off)
+        thr_lo_row.addWidget(_lbl_off)
         self._thr_low_sb = QDoubleSpinBox()
         self._thr_low_sb.setRange(0.0, 2.0)
         self._thr_low_sb.setSingleStep(0.05)
         self._thr_low_sb.setDecimals(2)
         self._thr_low_sb.setValue(0.40)
         self._thr_low_sb.setFixedWidth(75)
-        self._thr_low_sb.setToolTip("Below this fraction of its alive level, the pulser is OFF")
+        self._thr_low_sb.setToolTip(_tip_off)
         thr_lo_row.addWidget(self._thr_low_sb)
         thr_lo_row.addStretch(1)
         lv.addLayout(thr_lo_row)
@@ -3368,51 +3458,90 @@ class PulserMonitorWidget(QWidget):
         self._use_ref_chk.setChecked(True)
         self._use_ref_chk.setToolTip(
             "Blend each pulser's brightness in the all-alive reference image into its\n"
-            "alive level. Needed to flag a pulser that stayed dead the whole window.\n"
+            "alive level. Needed to flag a pulser that stayed dead the whole window\n"
+            "(with no reference, a pulser dark the entire time looks like its own\n"
+            "normal level and cannot be told apart from a live-but-dim one).\n"
             "Set the reference in the ROI editor via 'Auto-create grid'.")
         lv.addWidget(self._use_ref_chk)
         # Gap factor: a jump in time > this × the median cadence = a trip (no images).
+        _tip_gap = (
+            "Trip detection from gaps in the image stream.\n"
+            "The app measures the median spacing (cadence) between consecutive frames.\n"
+            "If the time jump to the next image exceeds this many times that cadence,\n"
+            "the array is assumed to have stopped acquiring (an array trip / no-data),\n"
+            "not that every pulser dropped out. Lower = more sensitive to short gaps;\n"
+            "higher = only long outages count as trips. Default 4.0.")
         gap_row = QHBoxLayout()
-        gap_row.addWidget(QLabel("Gap factor:"))
+        _lbl_gap = QLabel("Gap factor:")
+        _lbl_gap.setToolTip(_tip_gap)
+        gap_row.addWidget(_lbl_gap)
         self._gap_sb = QDoubleSpinBox()
         self._gap_sb.setRange(1.5, 50.0)
         self._gap_sb.setSingleStep(0.5)
         self._gap_sb.setDecimals(1)
         self._gap_sb.setValue(4.0)
         self._gap_sb.setFixedWidth(75)
-        self._gap_sb.setToolTip("A time gap larger than this × the median frame spacing = a trip")
+        self._gap_sb.setToolTip(_tip_gap)
         gap_row.addWidget(self._gap_sb)
         gap_row.addStretch(1)
         lv.addLayout(gap_row)
+        _tip_bd = (
+            "Bit depth used to scale pixel values to 0..1 when an image carries no\n"
+            "maximum-sample metadata of its own. E.g. 12 bit assumes a full-scale\n"
+            "value of 4095. Only used as a fallback; images that record their own\n"
+            "max value ignore this. Set it to match the camera's real bit depth.\n"
+            "Default 12.")
         bd_row = QHBoxLayout()
-        bd_row.addWidget(QLabel("Bit depth fallback:"))
+        _lbl_bd = QLabel("Bit depth fallback:")
+        _lbl_bd.setToolTip(_tip_bd)
+        bd_row.addWidget(_lbl_bd)
         self._bd_sb = QSpinBox()
         self._bd_sb.setRange(8, 16)
         self._bd_sb.setValue(12)
         self._bd_sb.setFixedWidth(55)
+        self._bd_sb.setToolTip(_tip_bd)
         bd_row.addWidget(self._bd_sb)
         bd_row.addWidget(QLabel("bit"))
         bd_row.addStretch(1)
         lv.addLayout(bd_row)
         # No-data floor: whole-frame brightness below this = frame has no array data.
+        _tip_nd = (
+            "Blank-frame threshold (fraction of full scale, 0..1).\n"
+            "If the mean brightness of a whole frame falls below this, the frame is\n"
+            "treated as no-data / array-down rather than as every pulser being OFF.\n"
+            "Distinguishes a real trip (black image) from genuine dropouts.\n"
+            "Raise it if dim-but-valid frames are wrongly kept; lower it if faint\n"
+            "trips slip through as data. Default 0.020.")
         nd_row = QHBoxLayout()
-        nd_row.addWidget(QLabel("No-data floor:"))
+        _lbl_nd = QLabel("No-data floor:")
+        _lbl_nd.setToolTip(_tip_nd)
+        nd_row.addWidget(_lbl_nd)
         self._nodata_sb = QDoubleSpinBox()
         self._nodata_sb.setRange(0.0, 1.0)
         self._nodata_sb.setSingleStep(0.01)
         self._nodata_sb.setDecimals(3)
         self._nodata_sb.setValue(0.020)
         self._nodata_sb.setFixedWidth(75)
+        self._nodata_sb.setToolTip(_tip_nd)
         nd_row.addWidget(self._nodata_sb)
         nd_row.addStretch(1)
         lv.addLayout(nd_row)
         # Debounce: OFF must persist this many data frames to count as a dropout.
+        _tip_db = (
+            "Minimum length (in data frames) of an OFF run before it counts as a\n"
+            "real dropout. Shorter OFF blips are treated as noise and flipped back\n"
+            "to ON, so a single dim frame does not register as a dropout.\n"
+            "1 = no debouncing (every OFF frame counts); higher = only sustained\n"
+            "outages are reported. Default 2.")
         db_row = QHBoxLayout()
-        db_row.addWidget(QLabel("Debounce (frames):"))
+        _lbl_db = QLabel("Debounce (frames):")
+        _lbl_db.setToolTip(_tip_db)
+        db_row.addWidget(_lbl_db)
         self._debounce_sb = QSpinBox()
         self._debounce_sb.setRange(1, 20)
         self._debounce_sb.setValue(2)
         self._debounce_sb.setFixedWidth(55)
+        self._debounce_sb.setToolTip(_tip_db)
         db_row.addWidget(self._debounce_sb)
         db_row.addStretch(1)
         lv.addLayout(db_row)
