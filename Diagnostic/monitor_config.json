@@ -1,11 +1,11 @@
 {
   "version": 1,
   "settings": {
-    "poll_interval_s": 10,
-    "avg_last_n": 25,
+    "poll_interval_s": 15,
+    "avg_last_n": 20,
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
-    "renotify_cooldown_minutes": 30,
+    "renotify_cooldown_minutes": 10,
     "recovery_notify": true,
     "debounce_count": 2,
     "hysteresis_frac": 0.05,
@@ -13,16 +13,18 @@
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
-    "graph_window_minutes": 60,
-    "start_monitoring_on_launch": false,
-    "alert_plot_hours": 12,
+    "valid_min_default": 5.0,
+    "valid_max_default": 80.0,
+    "graph_window_minutes": 360,
+    "start_monitoring_on_launch": true,
+    "alert_plot_hours": 1,
     "teams_enabled": false,
     "email_enabled": false,
     "webex_enabled": true,
     "teams_webhook_url": "",
     "smtp_host": "smtp.seznam.cz",
     "smtp_port": 587,
-    "smtp_security": "starttls",
+    "smtp_security": "ssl",
     "smtp_user": "minsck@seznam.cz",
     "smtp_password": "dpapi:AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAubpLwLv8OEGuPG1vbvmjFgAAAAACAAAAAAAQZgAAAAEAACAAAAAnftLb83tnT5c3/Mv5lbYOH3VlgQVOVdVcJWmtHd6a2AAAAAAOgAAAAAIAACAAAABtmEe4fL4bgS0T9KUJsqOgQckWb6FlTxsxTB8newpq1xAAAACVqhRNimDpMgIEsWpaqX0QQAAAAPZ0GR7P++kDhJPIuHH0uW2cSb0LmjuPz3q55i7aJzQs++dthTlngiGhlQY1FCTWsnNJ55b3A286Tb6gcEpi2fk=",
     "email_from": "minsck@seznam.cz",
@@ -54,5 +56,290 @@
     "webex_command_poll_s": 2,
     "webex_command_allowlist": []
   },
-  "pvs": []
+  "pvs": [
+    {
+      "name": "L3-UTIL-CHL03-001:Temp",
+      "display_name": "DA1 Chiller",
+      "units": "DegC",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": 16.0,
+      "warn_high": 21.0,
+      "alarm_low": 14.0,
+      "alarm_high": 23.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "0,2 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 16.2,
+          "warn_high": 16.8,
+          "alarm_low": 16.0,
+          "alarm_high": 17.0
+        },
+        {
+          "label": "3,3 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 13.8,
+          "warn_high": 14.4,
+          "alarm_low": 13.5,
+          "alarm_high": 14.7
+        }
+      ],
+      "valid_min": 0.0,
+      "valid_max": 50.0,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-CHL03-002:Temp",
+      "display_name": "DA2 Chiller",
+      "units": "DegC",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": 16.0,
+      "warn_high": 21.0,
+      "alarm_low": 14.0,
+      "alarm_high": 23.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "0,2 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 16.2,
+          "warn_high": 16.8,
+          "alarm_low": 16.0,
+          "alarm_high": 17.0
+        },
+        {
+          "label": "3,3 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 13.8,
+          "warn_high": 14.4,
+          "alarm_low": 13.5,
+          "alarm_high": 14.7
+        }
+      ],
+      "valid_min": 0.0,
+      "valid_max": 50.0,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-CHL03-003:Temp",
+      "display_name": "DA3 Chiller",
+      "units": "DegC",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": 16.0,
+      "warn_high": 21.0,
+      "alarm_low": 14.0,
+      "alarm_high": 23.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "0,2 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 16.2,
+          "warn_high": 16.8,
+          "alarm_low": 16.0,
+          "alarm_high": 17.0
+        },
+        {
+          "label": "3,3 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 13.8,
+          "warn_high": 14.4,
+          "alarm_low": 13.5,
+          "alarm_high": 14.7
+        }
+      ],
+      "valid_min": 0.0,
+      "valid_max": 50.0,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-CHL03-004:Temp",
+      "display_name": "DA4 Chiller",
+      "units": "DegC",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": 16.0,
+      "warn_high": 21.0,
+      "alarm_low": 14.0,
+      "alarm_high": 23.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "0,2 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 16.2,
+          "warn_high": 16.8,
+          "alarm_low": 16.0,
+          "alarm_high": 17.0
+        },
+        {
+          "label": "3,3 Hz",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 13.8,
+          "warn_high": 14.4,
+          "alarm_low": 13.5,
+          "alarm_high": 14.7
+        }
+      ],
+      "valid_min": 0.0,
+      "valid_max": 50.0,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-CHL03-005:Temp",
+      "display_name": "He Chiller",
+      "units": "DegC",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": 16.0907,
+      "warn_high": 20.7,
+      "alarm_low": 10.0,
+      "alarm_high": 21.1563,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": -5.0,
+      "valid_max": 40.0,
+      "learned_at": "2026-07-13T11:01:59+02:00",
+      "learn_stats": {
+        "center": 17.779215,
+        "spread": 1.68853,
+        "method": "mean_std",
+        "n": 1256476,
+        "rejected": 4,
+        "days": 30,
+        "window_start": "2026-06-13T10:53:52+02:00",
+        "window_end": "2026-07-13T10:53:52+02:00"
+      }
+    },
+    {
+      "name": "L3-UTIL-CHL03-006:Temp",
+      "display_name": "Utility Chiller",
+      "units": "DegC",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": 19.5,
+      "warn_high": 20.5,
+      "alarm_low": 19.0,
+      "alarm_high": 21.0,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": "2026-07-13T09:17:52+02:00",
+      "learn_stats": {
+        "center": 20.551235,
+        "spread": 0.544598,
+        "method": "mean_std",
+        "n": 1263869,
+        "days": 30
+      }
+    },
+    {
+      "name": "L3-UTIL-DAQ-TE902:Temp",
+      "display_name": "L3-UTIL-DAQ-TE902 - Temp",
+      "units": "",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-TE903:Temp",
+      "display_name": "L3-UTIL-DAQ-TE903 - Temp",
+      "units": "",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-TE904:Temp",
+      "display_name": "L3-UTIL-DAQ-TE904 - Temp",
+      "units": "",
+      "group": "Temperatures",
+      "enabled": true,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    }
+  ]
 }

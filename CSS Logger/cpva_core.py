@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
     "conditions": [],
     "master_pv": MASTER_RAMP_PV,
     "master_multiple": "",
+    "avg_target_points": 2000,
 }
 
 
@@ -224,12 +225,28 @@ def _http_get_json(url: str, timeout: float = CPVA_HTTP_TIMEOUT):
 
 
 def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
-                       timeout: float = CPVA_HTTP_TIMEOUT) -> list[dict]:
-    params = urllib.parse.urlencode({
+                       timeout: float = CPVA_HTTP_TIMEOUT,
+                       count: int | None = None) -> list[dict]:
+    """Fetch samples for a channel in [start_ns, end_ns].
+
+    When ``count`` is given, it is passed to the archiver as the desired number
+    of samples. The Cassandra PV Archiver then returns server-side *decimated*
+    samples from the decimation level whose density is closest to ``count``
+    (see the JSON archive-access protocol, Appendix B.3), instead of every raw
+    sample — the same mechanism CS Studio uses as "Optimized Archived Data".
+    Decimated points arrive as ``type: "minMaxDouble"`` with a mean ``value``
+    plus ``minimum``/``maximum``; ``quality`` is ``"Interpolated"`` for them and
+    ``"Original"`` for raw ones. If no decimation level is configured on the
+    server, raw samples are returned regardless of ``count``.
+    """
+    query = {
         "channelName": channel,
         "start": str(start_ns),
         "end":   str(end_ns),
-    })
+    }
+    if count is not None and count > 0:
+        query["count"] = str(int(count))
+    params = urllib.parse.urlencode(query)
     url  = f"{CPVA_BASE_URL}{CPVA_SAMPLES_ENDPOINT}?{params}"
     data = _http_get_json(url, timeout=timeout)
     if not isinstance(data, list):
@@ -294,6 +311,110 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
         results.extend(results_map[idx])
 
     return results
+
+
+def cpva_fetch_many_chunked(channels: list[str], start_ns: int, end_ns: int,
+                            timeout: float = CPVA_HTTP_TIMEOUT,
+                            max_workers: int = 16,
+                            progress_fn=None):
+    """Fetch several channels over [start_ns, end_ns) using ONE shared thread pool.
+
+    All (channel, 1-hour-chunk) requests compete for the same pool, so the load
+    is limited by a single ``max_workers`` cap instead of running channels
+    sequentially. Returns ``(results, errors)`` where ``results`` maps each
+    channel to its time-ordered sample list and ``errors`` maps a channel to the
+    first error string encountered (that channel's data may be partial/empty).
+
+    ``progress_fn(done, total)`` is called from worker threads as chunks finish.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    tasks = []                       # (channel, chunk_idx, cs, ce)
+    for ch in channels:
+        cs = start_ns
+        i = 0
+        while cs < end_ns:
+            ce = min(cs + CHUNK_SIZE_NS, end_ns)
+            if not _chunk_is_night(cs, ce):
+                tasks.append((ch, i, cs, ce))
+            i += 1
+            cs = ce
+
+    results_map = {ch: {} for ch in channels}
+    errors: dict[str, str] = {}
+    total = len(tasks)
+    if progress_fn:
+        progress_fn(0, total)
+    if total == 0:
+        return {ch: [] for ch in channels}, errors
+
+    done = 0
+    workers = min(max_workers, total)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(cpva_fetch_samples, ch, cs, ce, timeout): (ch, idx)
+            for ch, idx, cs, ce in tasks
+        }
+        for fut in as_completed(futures):
+            ch, idx = futures[fut]
+            try:
+                results_map[ch][idx] = fut.result()
+            except Exception as exc:            # keep other channels/chunks alive
+                errors.setdefault(ch, str(exc))
+            done += 1
+            if progress_fn:
+                progress_fn(done, total)
+
+    out = {}
+    for ch in channels:
+        merged = []
+        for idx in sorted(results_map[ch]):
+            merged.extend(results_map[ch][idx])
+        out[ch] = merged
+    return out, errors
+
+
+def cpva_fetch_many_optimized(channels: list[str], start_ns: int, end_ns: int,
+                              count: int,
+                              timeout: float = CPVA_HTTP_TIMEOUT,
+                              max_workers: int = 16,
+                              progress_fn=None):
+    """Fetch several channels using server-side decimation (one request each).
+
+    Each channel is fetched with a single request over the whole window, passing
+    ``count`` so the archiver returns decimated samples instead of every raw
+    sample (see cpva_fetch_samples). This needs no 1-hour chunking — the archiver
+    serves the full range at once from a decimation level. Returns
+    ``(results, errors)`` like cpva_fetch_many_chunked. ``progress_fn(done,
+    total)`` is called as channels finish (total = number of channels).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = {ch: [] for ch in channels}
+    errors: dict[str, str] = {}
+    total = len(channels)
+    if progress_fn:
+        progress_fn(0, total)
+    if total == 0:
+        return results, errors
+
+    done = 0
+    workers = min(max_workers, total)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(cpva_fetch_samples, ch, start_ns, end_ns, timeout, count): ch
+            for ch in channels
+        }
+        for fut in as_completed(futures):
+            ch = futures[fut]
+            try:
+                results[ch] = fut.result()
+            except Exception as exc:
+                errors.setdefault(ch, str(exc))
+            done += 1
+            if progress_fn:
+                progress_fn(done, total)
+    return results, errors
 
 
 # Cumulative look-back horizons (seconds) for hunting the most recent sample

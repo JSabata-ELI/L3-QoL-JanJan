@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QPlainTextEdit,
+    QLabel, QPushButton, QPlainTextEdit, QProxyStyle, QStyle,
 )
 from PySide6.QtCore import QThread, Signal
 
@@ -111,6 +111,15 @@ def _btn(label, style=BUTTON_STYLE):
     return b
 
 
+class ToolTipDelayStyle(QProxyStyle):
+    """Show tooltips after a 0.5 s hover (Qt's default is ~0.7 s)."""
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.SH_ToolTip_WakeUpDelay:
+            return 500
+        return super().styleHint(hint, option, widget, returnData)
+
+
 class WorkerThread(QThread):
     log = Signal(str)
     finished = Signal()
@@ -165,9 +174,20 @@ class HistoryTab(QWidget):
 
         top = QHBoxLayout()
         self._btn_run = _btn("▶  Run History Analysis")
+        self._btn_run.setToolTip(
+            "Reads MasterOperations.parquet and compares each waveplate's recent "
+            "operations against its 30-day baseline. Flags any that drift more "
+            "than 3 % and writes a PNG plot per flagged waveplate into "
+            "HistoryPlots. Runs in the background — watch the log below.")
         self._btn_stop = _btn("■  Stop", STOP_BUTTON_STYLE)
         self._btn_stop.setEnabled(False)
+        self._btn_stop.setToolTip(
+            "Ask the running analysis to stop after its current step. "
+            "Enabled only while an analysis is in progress.")
         self._btn_open = _btn("Open HistoryPlots", SECONDARY_STYLE)
+        self._btn_open.setToolTip(
+            "Open the HistoryPlots folder in Explorer to view the PNG plots "
+            "produced by the last analysis run.")
         for b in [self._btn_run, self._btn_stop, self._btn_open]:
             top.addWidget(b)
         top.addStretch()
@@ -253,7 +273,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    app.setStyle(ToolTipDelayStyle("Fusion"))
     app.setStyleSheet(APP_STYLESHEET)
 
     window = MainWindow()

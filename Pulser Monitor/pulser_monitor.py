@@ -2428,11 +2428,10 @@ class _MapTab(QWidget):
         if metric == "Uptime %":
             return float(st.uptime_pct)
         if metric == "Status":
-            if st.dead_from_start:
-                return 2.0
-            if st.is_dead:
-                return 1.0
-            return 0.0
+            # A dead pulser is a broken pulser regardless of whether it died during the
+            # window or was never lit — both are the same severity (one red). The
+            # "from start" nuance is kept only as info (cell tooltip + summary line).
+            return 1.0 if st.is_dead else 0.0
         return float(st.dropouts)
 
     def _update_summary(self):
@@ -2482,11 +2481,11 @@ class _MapTab(QWidget):
 
         status_mode = (metric == "Status")
         if status_mode:
-            # 0=alive (green), 1=dead (red), 2=dead-from-start (dark red)
-            cmap = ListedColormap([SUCCESS, DANGER, DANGER_HOV])
+            # 0 = alive (green), 1 = dead (red) — dead-from-start is the same red.
+            cmap = ListedColormap([SUCCESS, DANGER])
             cmap.set_bad("#dddddd")
             im = self._map_ax.imshow(np.ma.masked_invalid(mat), cmap=cmap, aspect="auto",
-                                     vmin=-0.5, vmax=2.5, interpolation="nearest",
+                                     vmin=-0.5, vmax=1.5, interpolation="nearest",
                                      extent=[-0.5, n_cols - 0.5, n_rows - 0.5, -0.5])
         else:
             cmap = matplotlib.colormaps[
@@ -2516,9 +2515,8 @@ class _MapTab(QWidget):
         if status_mode:
             self._map_ax.legend(handles=[
                 Patch(color=SUCCESS, label="alive"),
-                Patch(color=DANGER, label="dead"),
-                Patch(color=DANGER_HOV, label="dead from start"),
-            ], fontsize=7, ncol=3, loc="upper center",
+                Patch(color=DANGER, label="dead (broken)"),
+            ], fontsize=7, ncol=2, loc="upper center",
                 bbox_to_anchor=(0.5, -0.06))
         else:
             cbar = self._map_fig.colorbar(im, ax=self._map_ax, fraction=0.046, pad=0.04)

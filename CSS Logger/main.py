@@ -460,6 +460,11 @@ class DatePickerDialog(QDialog):
 
 # ── Time window dialog ─────────────────────────────────────────────────────
 
+# Max span (seconds) accepted for a live rolling window. Longer windows than
+# this fall back to 1 hour. 366 days keeps year-long relative windows working.
+_LIVE_MAX_SPAN_S = 86400 * 366
+
+
 class TimeWindowDialog(QDialog):
     """CS-Studio-style Start/End time picker.
 
@@ -485,11 +490,18 @@ class TimeWindowDialog(QDialog):
         row = QHBoxLayout(); lay.addLayout(row, stretch=1)
 
         # Default relative span: Start = window length before now, End = now.
-        span = dt_to - dt_from
-        rel_from_hours = max(0, int(round(span.total_seconds() / 3600))) or 1
+        # Decompose into days/hours/minutes/seconds so the user's units survive a
+        # round-trip (17 days must reopen as 17 days, not 408 hours).
+        total_s = max(1, int(round((dt_to - dt_from).total_seconds())))
+        rel_from = {
+            "Days":    total_s // 86400,
+            "Hours":  (total_s % 86400) // 3600,
+            "Minutes": (total_s % 3600) // 60,
+            "Secs":    total_s % 60,
+        }
 
-        row.addWidget(self._build_side("from", dt_from, rel_from_hours, is_start=True))
-        row.addWidget(self._build_side("to",   dt_to,   0,             is_start=False))
+        row.addWidget(self._build_side("from", dt_from, rel_from, is_start=True))
+        row.addWidget(self._build_side("to",   dt_to,   {},       is_start=False))
 
         # Status strip
         st_row = QHBoxLayout()
@@ -512,7 +524,7 @@ class TimeWindowDialog(QDialog):
         self._sides["from"]["tabs"].setCurrentIndex(1)
         self._sides["to"]["tabs"].setCurrentIndex(1)
 
-    def _build_side(self, which, init_dt, rel_hours, is_start):
+    def _build_side(self, which, init_dt, rel_values, is_start):
         tabs = QTabWidget()
         abs_lbl = "Absolute Start" if is_start else "Absolute End"
         rel_lbl = "Relative Start" if is_start else "Relative End"
@@ -563,7 +575,9 @@ class TimeWindowDialog(QDialog):
             grid.addWidget(QLabel(name + ":"), r, c)
             grid.addWidget(sp, r, c + 1)
             rel_spins[name] = sp
-        rel_spins["Hours"].setValue(rel_hours)
+        for name, val in (rel_values or {}).items():
+            if name in rel_spins:
+                rel_spins[name].setValue(val)
         rel_lay.addLayout(grid)
 
         qr = QHBoxLayout()
@@ -1108,6 +1122,25 @@ class CSSLoggerWidget(QWidget):
         self._font_size_spin.valueChanged.connect(self._apply_font_size)
         ctrl.addWidget(self._font_size_spin)
         ctrl.addWidget(QLabel("pt"))
+
+        # Averaging / downsampling: bin each trace to at most N points per PV so
+        # long windows stay responsive. 0 = off (plot raw, capped only by a
+        # safety limit). Kept client-side until a server-side option exists.
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QLabel("Avg to:"))
+        self._avg_target_spin = QSpinBox()
+        self._avg_target_spin.setRange(0, 200000)
+        self._avg_target_spin.setValue(int(self.config.get("avg_target_points", 2000)))
+        self._avg_target_spin.setSingleStep(500)
+        self._avg_target_spin.setFixedWidth(78)
+        self._avg_target_spin.setToolTip(
+            "Target points per PV. >0 fetches server-side DECIMATED data "
+            "(fast, ~this many points, like CS Studio 'Optimized'); the trace is "
+            "then trimmed to exactly this many by time-binned mean. "
+            "0 = fetch RAW samples (slow for long windows). Applies on next Load.")
+        self._avg_target_spin.valueChanged.connect(self._on_avg_target_changed)
+        ctrl.addWidget(self._avg_target_spin)
+        ctrl.addWidget(QLabel("pts"))
         ctrl.addStretch()
         self._lbl_graph_info = QLabel("")
         self._lbl_graph_info.setStyleSheet("color:#777;")
@@ -1572,10 +1605,16 @@ class CSSLoggerWidget(QWidget):
                 if isinstance(value, (int, float)):
                     pairs.append((ts_ns, value))
 
-            MAX_PTS = 25000
-            if len(pairs) > MAX_PTS:
-                step = max(1, len(pairs) // MAX_PTS)
-                pairs = pairs[::step]
+            # Downsample: time-binned mean to the user's target (keeps the trace
+            # shape while cutting point count). 0 = off → only a hard safety cap.
+            avg_target = self._avg_target_points()
+            if avg_target > 0:
+                pairs = self._downsample_pairs_mean(pairs, avg_target)
+            else:
+                MAX_PTS = 25000
+                if len(pairs) > MAX_PTS:
+                    step = max(1, len(pairs) // MAX_PTS)
+                    pairs = pairs[::step]
 
             # Carry-forward / hold (like CS Studio): fill gaps at the window
             # edges so the trace spans the whole window instead of breaking off.
@@ -1700,11 +1739,27 @@ class CSSLoggerWidget(QWidget):
                 dt_tick = epoch + timedelta(seconds=cur_s)
                 if dt_tick >= t_hi - timedelta(seconds=step_s * 0.25): break
                 ticks_dt.append(dt_tick); cur_s += step_s
-            return ([mdates.date2num(t_lo)]
-                    + [mdates.date2num(d) for d in ticks_dt]
-                    + [mdates.date2num(t_hi)])
+            majors = ([mdates.date2num(t_lo)]
+                      + [mdates.date2num(d) for d in ticks_dt]
+                      + [mdates.date2num(t_hi)])
+            # Minor ticks: subdivide the regular major step by 5. Built here as a
+            # fixed list so matplotlib never infers spacing from the irregular
+            # endpoint ticks (which would blow past Locator.MAXTICKS).
+            minor_step = step_s / 5.0
+            minors = []
+            m_s = first_s - step_s
+            while True:
+                dt_m = epoch + timedelta(seconds=m_s)
+                if dt_m > t_hi: break
+                if dt_m >= t_lo: minors.append(mdates.date2num(dt_m))
+                m_s += minor_step
+            return majors, minors
 
-        _ticks = _make_x_ticks(t_min.astimezone(TZ_PRAGUE), t_max.astimezone(TZ_PRAGUE)) if total_seconds > 0 else []
+        if total_seconds > 0:
+            _ticks, _minor_ticks = _make_x_ticks(
+                t_min.astimezone(TZ_PRAGUE), t_max.astimezone(TZ_PRAGUE))
+        else:
+            _ticks, _minor_ticks = [], []
         if _ticks:
             ax0.xaxis.set_major_locator(FixedLocator(_ticks))
         else:
@@ -1719,7 +1774,10 @@ class CSSLoggerWidget(QWidget):
             return dt.strftime("%m-%d\n00:00") if (dt.hour == 0 and dt.minute == 0) else dt.strftime("%H:%M:%S")
 
         ax0.xaxis.set_major_formatter(FuncFormatter(_fmt_x))
-        ax0.xaxis.set_minor_locator(AutoMinorLocator(5))
+        if _minor_ticks:
+            ax0.xaxis.set_minor_locator(FixedLocator(_minor_ticks))
+        else:
+            ax0.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax0.set_xlabel(
             f"Time (Prague)  {t_min_local.strftime('%Y-%m-%d')}" if same_day else "Time (Prague)",
             fontsize=_fsize)
@@ -1881,7 +1939,7 @@ class CSSLoggerWidget(QWidget):
         self._mpl_canvas.draw_idle()
 
     def _on_canvas_draw(self, *_):
-        if self._mpl_canvas is None: return
+        if self._mpl_canvas is None or self._mpl_figure is None: return
         for vl in self._crosshair_vlines: vl.set_visible(False)
         for hl in self._crosshair_hlines: hl.set_visible(False)
         for ann in self._crosshair_texts:
@@ -1892,12 +1950,19 @@ class CSSLoggerWidget(QWidget):
         # e.g. while the mouse sits still) repaints without the animated
         # crosshair and would make it vanish after a second or two. If the
         # cursor is still parked over the plot, re-assert the overlay now.
+        # Guard against a stale event left over from a previous figure (a
+        # replot fires draw_event while _mouse_last_event still points at the
+        # old canvas — redrawing then hits detached artists → dpi/None crash).
+        ev = self._mouse_last_event
         if (getattr(self, "_cursor_active", False)
-                and self._mouse_last_event is not None
+                and ev is not None
+                and getattr(ev, "canvas", None) is self._mpl_canvas
                 and not getattr(self, "_in_cursor_redraw", False)):
             self._in_cursor_redraw = True
             try:
                 self._process_mouse_move()
+            except Exception:
+                pass
             finally:
                 self._in_cursor_redraw = False
 
@@ -1908,6 +1973,16 @@ class CSSLoggerWidget(QWidget):
             QTimer.singleShot(16, self._process_mouse_move)
 
     def _process_mouse_move(self):
+        # Never let a hover-frame render escape as an exception: a replot/resize
+        # can tear the figure down between the queued move and this call,
+        # leaving detached artists (matplotlib then raises 'NoneType has no
+        # attribute dpi' while drawing a Text). It's harmless — just swallow it.
+        try:
+            self._process_mouse_move_impl()
+        except Exception:
+            self._mouse_pending = False
+
+    def _process_mouse_move_impl(self):
         self._mouse_pending = False
         event = self._mouse_last_event
         if event is None or self._mpl_canvas is None: return
@@ -2038,6 +2113,7 @@ class CSSLoggerWidget(QWidget):
         self._crosshair_texts  = []
         self._x_cursor_ann = None
         self._blit_bg      = None
+        self._cursor_active = False   # no crosshair to re-assert on next draw
 
     def _apply_font_size(self):
         if self._mpl_figure and self._samples_by_pv:
@@ -2091,6 +2167,58 @@ class CSSLoggerWidget(QWidget):
         self._clear_graph()
         self._lbl_graph_info.setText("")
 
+    # ── Downsampling / averaging ──────────────────────────────────────────────
+
+    def _avg_target_points(self) -> int:
+        spin = getattr(self, "_avg_target_spin", None)
+        if spin is not None:
+            return int(spin.value())
+        return int(self.config.get("avg_target_points", 2000))
+
+    def _on_avg_target_changed(self, _val):
+        self.config["avg_target_points"] = self._avg_target_points()
+        if self._samples_by_pv:
+            self._plot_graph()
+
+    @staticmethod
+    def _downsample_pairs_mean(pairs, target):
+        """Bin (ts_ns, value) pairs into ~`target` equal-time bins and average.
+
+        Values are assumed numeric (callers pre-filter). One linear pass; empty
+        bins are simply skipped, so the result may hold fewer than `target`
+        points. Returns pairs unchanged when already at/under target.
+        """
+        n = len(pairs)
+        if target <= 0 or n <= target:
+            return pairs
+        t0 = pairs[0][0]
+        t1 = pairs[-1][0]
+        span = t1 - t0
+        if span <= 0:
+            return pairs
+        bin_w = span / target
+        last_bin = target - 1
+        out = []
+        cur_bin = -1
+        acc_t = 0.0
+        acc_v = 0.0
+        cnt = 0
+        for ts, v in pairs:
+            b = min(last_bin, int((ts - t0) / bin_w))
+            if b != cur_bin:
+                if cnt:
+                    out.append((int(acc_t / cnt), acc_v / cnt))
+                acc_t = 0.0
+                acc_v = 0.0
+                cnt = 0
+                cur_bin = b
+            acc_t += ts
+            acc_v += v
+            cnt += 1
+        if cnt:
+            out.append((int(acc_t / cnt), acc_v / cnt))
+        return out
+
     # ── Load data ───────────────────────────────────────────────────────────
 
     def _on_load_clicked(self):
@@ -2103,7 +2231,11 @@ class CSSLoggerWidget(QWidget):
         self._progress_bar.show()
         start_ns = dt_to_ns(self._dt_from)
         end_ns   = dt_to_ns(self._dt_to)
-        print(f"[CSS Logger] Load clicked: {len(pvs)} PVs, window {start_ns} → {end_ns}")
+        # Read the target-points value on the UI thread (Qt widgets are not
+        # thread-safe). >0 → server-side decimated fetch; 0 → raw chunked fetch.
+        avg_target = self._avg_target_points()
+        print(f"[CSS Logger] Load clicked: {len(pvs)} PVs, window {start_ns} → {end_ns}, "
+              f"avg_target={avg_target}")
         self._load_sig = _LoadSig()          # keep alive until done
         sig = self._load_sig
         sig.done.connect(self._on_load_finished)
@@ -2113,46 +2245,70 @@ class CSSLoggerWidget(QWidget):
 
         def _worker():
             try:
-                from cpva_core import (cpva_fetch_samples_chunked, cpva_decode_value,
-                                       cpva_fetch_samples, cpva_fetch_last_before)
+                from cpva_core import (cpva_fetch_many_chunked,
+                                       cpva_fetch_many_optimized, cpva_decode_value,
+                                       cpva_fetch_last_before)
                 samples_by_pv   = {}
                 pv_order        = []
                 errors          = []
                 pre_window_vals = {}
-                total = len(pvs)
-                for idx, pv in enumerate(pvs, 1):
-                    print(f"[CSS Logger] Fetching {idx}/{total}: {pv}")
-                    sig.progress.emit(f"Fetching {idx}/{total}: {shorten_pv_name(pv)}")
-                    sig.pct.emit(int((idx - 1) / total * 100))
-                    try:
-                        raw = cpva_fetch_samples_chunked(pv, start_ns, end_ns)
-                        samples = []
-                        for s in raw:
-                            t_ns = s.get("time")
-                            if t_ns is None: continue
-                            value = cpva_decode_value(s)
-                            units = (s.get("metaData") or {}).get("units", "") or ""
-                            samples.append((int(t_ns), value, units))
-                        samples_by_pv[pv] = samples
-                        pv_order.append(pv)
-                        print(f"[CSS Logger]   → {len(samples)} samples")
-                        # Look back for the last sample BEFORE the window start
-                        # whenever the window either has no data, or its first
-                        # sample sits after start_ns. This lets the graph carry
-                        # that value forward so the trace begins at the window
-                        # start instead of jumping in at the first in-window point.
-                        first_ts = min((t for t, _, _ in samples), default=None)
-                        if first_ts is None or first_ts > start_ns:
-                            last_s = cpva_fetch_last_before(pv, start_ns)
-                            if last_s:
-                                last_ts = last_s.get("time")
-                                if last_ts:
-                                    pre_window_vals[pv] = (
-                                        int(last_ts), cpva_decode_value(last_s),
-                                        (last_s.get("metaData") or {}).get("units", "") or "")
-                    except Exception as exc:
-                        errors.append(f"{pv}: {exc}")
-                        print(f"[CSS Logger]   → ERROR: {exc}")
+
+                if avg_target > 0:
+                    # Server-side decimation: one request per PV over the whole
+                    # window (no 1-hour chunking). Fast for long windows.
+                    def _report(done, total_pvs):
+                        if total_pvs:
+                            sig.pct.emit(int(done / total_pvs * 100))
+                            sig.progress.emit(
+                                f"Fetching {total_pvs} PVs (optimized): {done}/{total_pvs}")
+
+                    sig.progress.emit(f"Fetching {len(pvs)} PVs (optimized, ≤{avg_target} pts)…")
+                    raw_by_pv, chunk_errors = cpva_fetch_many_optimized(
+                        pvs, start_ns, end_ns, avg_target, progress_fn=_report)
+                else:
+                    # Raw: fetch every PV's 1-hour chunks in one shared pool so
+                    # the PVs load concurrently instead of one after another.
+                    def _report(done, total_chunks):
+                        if total_chunks:
+                            sig.pct.emit(int(done / total_chunks * 100))
+                            sig.progress.emit(
+                                f"Fetching {len(pvs)} PVs: {done}/{total_chunks} chunks")
+
+                    sig.progress.emit(f"Fetching {len(pvs)} PVs (raw)…")
+                    raw_by_pv, chunk_errors = cpva_fetch_many_chunked(
+                        pvs, start_ns, end_ns, progress_fn=_report)
+
+                for pv in pvs:
+                    if pv in chunk_errors:
+                        errors.append(f"{pv}: {chunk_errors[pv]}")
+                        print(f"[CSS Logger]   → ERROR {pv}: {chunk_errors[pv]}")
+                    raw = raw_by_pv.get(pv, [])
+                    samples = []
+                    for s in raw:
+                        t_ns = s.get("time")
+                        if t_ns is None: continue
+                        value = cpva_decode_value(s)
+                        units = (s.get("metaData") or {}).get("units", "") or ""
+                        samples.append((int(t_ns), value, units))
+                    samples_by_pv[pv] = samples
+                    pv_order.append(pv)
+                    print(f"[CSS Logger]   {pv} → {len(samples)} samples")
+
+                # Look back for the last sample BEFORE the window start whenever a
+                # PV has no data or its first sample sits after start_ns, so the
+                # trace can start at the window edge instead of jumping in later.
+                sig.progress.emit("Filling gaps at window start…")
+                for pv in pvs:
+                    samples = samples_by_pv.get(pv, [])
+                    first_ts = min((t for t, _, _ in samples), default=None)
+                    if first_ts is None or first_ts > start_ns:
+                        last_s = cpva_fetch_last_before(pv, start_ns)
+                        if last_s:
+                            last_ts = last_s.get("time")
+                            if last_ts:
+                                pre_window_vals[pv] = (
+                                    int(last_ts), cpva_decode_value(last_s),
+                                    (last_s.get("metaData") or {}).get("units", "") or "")
                 sig.pct.emit(100)
                 print(f"[CSS Logger] Emitting done: {len(pv_order)} PVs, errors={errors}")
                 sig.done.emit((samples_by_pv, pv_order, errors, start_ns, end_ns, pre_window_vals))
@@ -2321,7 +2477,7 @@ class CSSLoggerWidget(QWidget):
             self._live_mode = True
             # Use the user's time window if it makes sense, else last hour
             window_diff = (self._dt_to - self._dt_from).total_seconds()
-            if 60 <= window_diff <= 86400 * 7:
+            if 60 <= window_diff <= _LIVE_MAX_SPAN_S:
                 self._live_window_span = timedelta(seconds=window_diff)
             else:
                 self._live_window_span = timedelta(hours=1)
@@ -2340,45 +2496,75 @@ class CSSLoggerWidget(QWidget):
         start_ns = dt_to_ns(t_from)
         end_ns   = dt_to_ns(now_utc)
         pvs      = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        avg_target = self._avg_target_points()   # read on UI thread
         self._live_init_sig = _LoadSig()
         sig = self._live_init_sig
         sig.done.connect(self._after_live_initial_load)
         sig.error.connect(self._on_live_init_error)
         sig.progress.connect(lambda m: self._lbl_status.setText(m))
+        sig.pct.connect(self._progress_bar.setValue)
+        self._progress_bar.setValue(0)
+        self._progress_bar.show()
 
         def _worker():
             try:
-                from cpva_core import (cpva_fetch_samples_chunked, cpva_decode_value,
+                from cpva_core import (cpva_fetch_many_chunked,
+                                       cpva_fetch_many_optimized, cpva_decode_value,
                                        cpva_fetch_last_before)
                 samples_by_pv = {}
                 pv_order = []
                 pre_window_vals = {}
-                total = len(pvs)
-                for idx, pv in enumerate(pvs, 1):
-                    sig.progress.emit(f"Live init {idx}/{total}: {shorten_pv_name(pv)}")
-                    try:
-                        raw = cpva_fetch_samples_chunked(pv, start_ns, end_ns)
-                        samples = []
-                        for s in raw:
-                            t_ns = s.get("time")
-                            if t_ns is None: continue
-                            value = cpva_decode_value(s)
-                            units = (s.get("metaData") or {}).get("units", "") or ""
-                            samples.append((int(t_ns), value, units))
-                        samples_by_pv[pv] = samples
-                        pv_order.append(pv)
-                        # Carry-forward: also in live mode, hold the last known
-                        # value so a PV without a fresh sample still draws a line
-                        # instead of leaving the graph empty.
-                        first_ts = min((t for t, _, _ in samples), default=None)
-                        if first_ts is None or first_ts > start_ns:
+
+                if avg_target > 0:
+                    # Server-side decimation: one request per PV over the window.
+                    def _report(done, total_pvs):
+                        if total_pvs:
+                            sig.pct.emit(int(done / total_pvs * 100))
+                            sig.progress.emit(
+                                f"Live init (optimized): {done}/{total_pvs} PVs")
+
+                    sig.progress.emit(f"Live init: fetching {len(pvs)} PVs (optimized)…")
+                    raw_by_pv, _errs = cpva_fetch_many_optimized(
+                        pvs, start_ns, end_ns, avg_target, progress_fn=_report)
+                else:
+                    # Raw: all PVs' 1-hour chunks in one shared pool.
+                    def _report(done, total_chunks):
+                        if total_chunks:
+                            sig.pct.emit(int(done / total_chunks * 100))
+                            sig.progress.emit(
+                                f"Live init: {done}/{total_chunks} chunks")
+
+                    sig.progress.emit(f"Live init: fetching {len(pvs)} PVs (raw)…")
+                    raw_by_pv, _errs = cpva_fetch_many_chunked(
+                        pvs, start_ns, end_ns, progress_fn=_report)
+
+                for pv in pvs:
+                    samples = []
+                    for s in raw_by_pv.get(pv, []):
+                        t_ns = s.get("time")
+                        if t_ns is None: continue
+                        value = cpva_decode_value(s)
+                        units = (s.get("metaData") or {}).get("units", "") or ""
+                        samples.append((int(t_ns), value, units))
+                    samples_by_pv[pv] = samples
+                    pv_order.append(pv)
+
+                # Carry-forward: hold the last known value so a PV without a fresh
+                # sample still draws a line instead of leaving the graph empty.
+                sig.progress.emit("Live init: filling gaps…")
+                for pv in pvs:
+                    samples = samples_by_pv.get(pv, [])
+                    first_ts = min((t for t, _, _ in samples), default=None)
+                    if first_ts is None or first_ts > start_ns:
+                        try:
                             last_s = cpva_fetch_last_before(pv, start_ns)
-                            if last_s and last_s.get("time"):
-                                pre_window_vals[pv] = (
-                                    int(last_s["time"]), cpva_decode_value(last_s),
-                                    (last_s.get("metaData") or {}).get("units", "") or "")
-                    except Exception:
-                        pass
+                        except Exception:
+                            last_s = None
+                        if last_s and last_s.get("time"):
+                            pre_window_vals[pv] = (
+                                int(last_s["time"]), cpva_decode_value(last_s),
+                                (last_s.get("metaData") or {}).get("units", "") or "")
+                sig.pct.emit(100)
                 sig.done.emit((samples_by_pv, pv_order, [], start_ns, end_ns, pre_window_vals))
             except Exception as exc:
                 sig.error.emit(str(exc))
@@ -2394,12 +2580,15 @@ class CSSLoggerWidget(QWidget):
         self._btn_live.setText("⏵ Live")
         self._btn_live.setStyleSheet("")
         self._btn_load.setEnabled(True)
+        self._progress_bar.hide()
         self._refresh_time_labels()
         self._lbl_status.setText("Live init failed — see Log tab.")
 
     def _after_live_initial_load(self, result):
-        if not self._live_mode: return
+        if not self._live_mode:
+            self._progress_bar.hide(); return
         self._btn_load.setEnabled(True)
+        self._progress_bar.hide()
         try:
             if len(result) == 6:
                 samples_by_pv, pv_order, _, start_ns, end_ns, pre_window_vals = result
@@ -2816,6 +3005,7 @@ class CSSLoggerWidget(QWidget):
         self.config["conditions"]      = copy(self._conditions)
         self.config["master_pv"]       = self._get_master_pv()
         self.config["master_multiple"] = self._get_master_multiple()
+        self.config["avg_target_points"] = self._avg_target_points()
         self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
         self.config["time_to"]   = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
         save_config(self.config)
@@ -3361,7 +3551,7 @@ class CSSLoggerWidget(QWidget):
                 self._countdown_timer.stop()
                 window_diff = (self._dt_to - self._dt_from).total_seconds()
                 self._live_window_span = (timedelta(seconds=window_diff)
-                                          if 60 <= window_diff <= 86400 * 7
+                                          if 60 <= window_diff <= _LIVE_MAX_SPAN_S
                                           else timedelta(hours=1))
                 self._live_last_ts = None
                 self._zoom_history.clear()

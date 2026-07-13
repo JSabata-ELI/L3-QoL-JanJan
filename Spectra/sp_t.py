@@ -1619,6 +1619,8 @@ class SpectraWidget(QWidget):
         self._span:             SpanSelector | None      = None
         self._top_user_xlim:    tuple | None             = None   # (xmin,xmax) when user zoomed
         self._top_user_ylim:    tuple | None             = None
+        self._top_extra_axes:   list                     = []     # twinx axes (multi Y-axis)
+        self._top_cursor_series: list                    = []     # per-trace cursor readout state
         self._bot_user_xlim:    tuple | None             = None
         self._bot_user_ylim:    tuple | None             = None
         self._live              = False
@@ -2177,7 +2179,12 @@ class SpectraWidget(QWidget):
 
         canvas.customContextMenuRequested.connect(_on_context_menu)
 
-        self._install_cursor(canvas, fig, ax, x_is_time=(suffix == "top"))
+        if suffix == "top":
+            # Top plot has multiple Y-axes (one per PV); it needs a cursor that
+            # reads each trace's real value on its own axis.
+            self._install_top_cursor(canvas, fig, ax)
+        else:
+            self._install_cursor(canvas, fig, ax, x_is_time=False)
 
         return w
 
@@ -2276,6 +2283,142 @@ class SpectraWidget(QWidget):
         def _on_leave(_evt):
             for a in (_y_ann, _x_ann): a.set_visible(False)
             vline.set_visible(False); hline.set_visible(False)
+            if _state["bg"]:
+                canvas.restore_region(_state["bg"])
+                canvas.blit(fig.bbox)
+
+        canvas.mpl_connect("draw_event",          _on_draw)
+        canvas.mpl_connect("motion_notify_event", _on_motion)
+        canvas.mpl_connect("axes_leave_event",    _on_leave)
+
+    def _install_top_cursor_artists(self):
+        """(Re)create the crosshair + per-trace value labels for the energy plot.
+
+        Called at the end of every _draw_energy, after the twin axes exist, since
+        ax.clear() wipes the old artists. Each trace gets a coloured dot and a
+        value label anchored on its own Y-axis edge (left or right)."""
+        from matplotlib.transforms import blended_transform_factory as _btf
+        ax = self._ax_top
+        vline = ax.axvline(color="#888", linewidth=0.8, linestyle="--",
+                           visible=False, zorder=9)
+        x_ann = ax.text(
+            0.5, 0.0, "", transform=_btf(ax.transData, ax.transAxes),
+            ha="center", va="top", fontsize=9, color="#333", zorder=12,
+            visible=False, clip_on=False,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#888",
+                      alpha=0.9, linewidth=0.7),
+        )
+        for cs in self._top_cursor_series:
+            a = cs["axis"]
+            dot, = a.plot([], [], "o", ms=6, color=cs["color"],
+                          visible=False, zorder=11)
+            on_left = cs["side"] == "left"
+            xpos = 0.0 if on_left else 1.0
+            ha   = "right" if on_left else "left"
+            lbl = a.text(
+                xpos, 0.5, "", transform=_btf(a.transAxes, a.transData),
+                ha=ha, va="center", fontsize=9, color="white", zorder=12,
+                visible=False, clip_on=False,
+                bbox=dict(boxstyle="round,pad=0.2", fc=cs["color"],
+                          ec=cs["color"], alpha=0.95, linewidth=0.7),
+            )
+            cs["dot"] = dot
+            cs["value_label"] = lbl
+        self._top_cursor_artists = {"vline": vline, "x_ann": x_ann}
+
+    def _install_top_cursor(self, canvas, fig, ax):
+        """Blitted crosshair for the energy plot: one vertical line + a time label
+        at the bottom, plus each trace's value read off its own Y-axis at the
+        cursor's X (zero-order hold, matching the steps-post lines)."""
+        import matplotlib.dates as _mdates
+        _state = {"bg": None, "pending": False, "last_event": None}
+
+        def _artists():
+            arts = []
+            ca = getattr(self, "_top_cursor_artists", None)
+            if ca:
+                arts += [ca["vline"], ca["x_ann"]]
+            for cs in self._top_cursor_series:
+                if "dot" in cs:
+                    arts += [cs["dot"], cs["value_label"]]
+            return arts
+
+        def _hide_all():
+            for a in _artists():
+                a.set_visible(False)
+
+        def _on_draw(_evt):
+            _hide_all()
+            _state["bg"] = canvas.copy_from_bbox(fig.bbox)
+
+        def _fmt_v(v):
+            av = abs(v)
+            if v == 0 or (1e-3 <= av < 1e6):
+                return f"{v:.5g}"
+            return f"{v:.4e}"
+
+        def _fmt_time(x):
+            try:
+                from zoneinfo import ZoneInfo
+                return _mdates.num2date(x, tz=ZoneInfo("Europe/Prague")).strftime("%H:%M:%S")
+            except Exception:
+                return f"{x:.4g}"
+
+        def _value_at(cs, x):
+            times, vals = cs["times"], cs["vals"]
+            if len(times) == 0:
+                return None
+            idx = int(np.searchsorted(times, x, side="right")) - 1
+            if idx < 0:
+                return None
+            return float(vals[idx])
+
+        def _process():
+            _state["pending"] = False
+            evt = _state["last_event"]
+            bg  = _state["bg"]
+            if evt is None or evt.inaxes is None:
+                if bg:
+                    canvas.restore_region(bg)
+                    canvas.blit(fig.bbox)
+                return
+            x = evt.xdata
+            ca = getattr(self, "_top_cursor_artists", None)
+            if x is None or not ca:
+                return
+            ca["vline"].set_xdata([x, x]); ca["vline"].set_visible(True)
+            ca["x_ann"].set_position((x, 0.0))
+            ca["x_ann"].set_text(f" {_fmt_time(x)} ")
+            ca["x_ann"].set_visible(True)
+            for cs in self._top_cursor_series:
+                v = _value_at(cs, x)
+                if v is None:
+                    cs["dot"].set_visible(False)
+                    cs["value_label"].set_visible(False)
+                    continue
+                cs["dot"].set_data([x], [v]); cs["dot"].set_visible(True)
+                xpos = 0.0 if cs["side"] == "left" else 1.0
+                cs["value_label"].set_position((xpos, v))
+                cs["value_label"].set_text(f" {_fmt_v(v)} ")
+                cs["value_label"].set_visible(True)
+            if bg:
+                canvas.restore_region(bg)
+                for a in _artists():
+                    if a.get_visible():
+                        a.axes.draw_artist(a)
+                canvas.blit(fig.bbox)
+            else:
+                canvas.draw_idle()
+
+        def _on_motion(evt):
+            _state["last_event"] = evt
+            if not _state["pending"]:
+                _state["pending"] = True
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(16, _process)
+
+        def _on_leave(_evt):
+            _hide_all()
             if _state["bg"]:
                 canvas.restore_region(_state["bg"])
                 canvas.blit(fig.bbox)
@@ -3079,33 +3222,69 @@ class SpectraWidget(QWidget):
             self._top_user_xlim = None
             self._top_user_ylim = None
         self._top_redrawing = True
+        # Drop the twin axes from a previous draw before clearing the base one,
+        # otherwise old Y-axes pile up on every redraw.
+        for extra in self._top_extra_axes:
+            try:
+                extra.remove()
+            except Exception:
+                pass
+        self._top_extra_axes = []
+        self._top_cursor_series = []
         ax.clear()
         series = [s for s in self._energy_data if s.get("data")]
         if not series:
             self._top_redrawing = False
             return
-        # With more than one PV the units differ wildly (J vs fs² vs …), so each
-        # trace is min–max normalized to 0–1 for visibility; the real range is
-        # shown in the legend. A single PV keeps its real values.
-        normalize = len(series) > 1
+        # Each PV keeps its REAL values on its own Y-axis (units differ wildly:
+        # J vs fs² vs …). Axes are split between the two sides so the labels stay
+        # readable: 1→L, 2→L+R, 3→2×L+R, 4→2×L+2×R (left fills first).
         active_ch = self._active_search_channel()
-        for s in series:
-            data = sorted(s["data"], key=lambda tv: tv[0])
-            times = [mdates.date2num(_ns_to_dt(t)) for t, _ in data]
+        n = len(series)
+        n_left = (n + 1) // 2
+        sides = ["left"] * n_left + ["right"] * (n - n_left)
+
+        axes_for_series = []
+        left_i = right_i = 0
+        for side in sides:
+            if side == "left":
+                if left_i == 0:
+                    a = ax                      # base axis owns the primary left spine
+                else:
+                    a = ax.twinx()
+                    a.yaxis.set_label_position("left")
+                    a.yaxis.set_ticks_position("left")
+                    a.spines["left"].set_position(("outward", 55 * left_i))
+                    a.spines["right"].set_visible(False)
+                    self._top_extra_axes.append(a)
+                left_i += 1
+            else:
+                a = ax.twinx()
+                if right_i > 0:
+                    a.spines["right"].set_position(("outward", 55 * right_i))
+                self._top_extra_axes.append(a)
+                right_i += 1
+            axes_for_series.append((a, side))
+
+        for s, (a, side) in zip(series, axes_for_series):
+            data  = sorted(s["data"], key=lambda tv: tv[0])
+            times = np.array([mdates.date2num(_ns_to_dt(t)) for t, _ in data])
             vals  = np.array([v for _, v in data], dtype=float)
-            disp, lab = vals, s["label"]
-            if normalize:
-                vmin, vmax = float(vals.min()), float(vals.max())
-                rng = vmax - vmin
-                disp = (vals - vmin) / rng if rng > 0 else np.full_like(vals, 0.5)
-                lab = f"{s['label']}  [{vmin:.3g}…{vmax:.3g}]"
             is_active = (s["channel"] == active_ch)
             # Archived values hold until the next sample (zero-order hold), so a
             # step-after line reflects the real signal — no false linear ramps.
-            ax.plot(times, disp, "-", drawstyle="steps-post",
-                    lw=2.0 if is_active else 1.0,
-                    color=s["color"], alpha=0.9, marker=".", ms=3,
-                    label=lab, zorder=5 if is_active else 3)
+            a.plot(times, vals, "-", drawstyle="steps-post",
+                   lw=2.0 if is_active else 1.0,
+                   color=s["color"], alpha=0.9, marker=".", ms=3,
+                   label=s["label"], zorder=5 if is_active else 3)
+            a.set_ylabel(s["label"], color=s["color"])
+            a.tick_params(axis="y", colors=s["color"])
+            spine = "left" if side == "left" else "right"
+            a.spines[spine].set_color(s["color"])
+            self._top_cursor_series.append({
+                "label": s["label"], "color": s["color"], "axis": a,
+                "side": side, "times": times, "vals": vals,
+            })
 
         days = self._selected_days or ([self._selected_day] if self._selected_day else [])
         multi = len(days) > 1
@@ -3123,12 +3302,10 @@ class SpectraWidget(QWidget):
             ax.set_xlabel(f"Time   —   {date_str}")
         else:
             ax.set_xlabel("Time")
-        ax.set_ylabel("Signals (each normalized 0–1)" if normalize else series[0]["label"])
         ax.set_title("Drag to select time region(s), then click Analyze")
         ax.grid(True, alpha=0.25)
-        if len(series) > 1:
-            ax.legend(fontsize=8, loc="best")
         self._paint_region_spans(ax)
+        self._install_top_cursor_artists()
         self._top_redrawing = False
         if self._top_user_xlim is not None:
             ax.set_xlim(self._top_user_xlim)

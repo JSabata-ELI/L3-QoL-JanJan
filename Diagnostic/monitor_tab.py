@@ -17,6 +17,7 @@ See cpva_api.py (archiver client) and alerting.py (state machine + notifiers).
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections import deque
@@ -27,16 +28,16 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, QObject, QRunnable, Qt, QThreadPool,
-    QTimer, Signal,
+    QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QObject, QRunnable,
+    Qt, QThreadPool, QTimer, Signal,
 )
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QSpinBox, QSplitter, QTableView, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit,
+    QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QTableView, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 import cpva_api as api
@@ -117,6 +118,39 @@ class LogWidget(QPlainTextEdit):
 
 
 # ---------------------------------------------------------------------------
+# Wheel-safe inputs
+# ---------------------------------------------------------------------------
+# Spin boxes and combo boxes change their value on mouse-wheel by default,
+# which silently edits fields while you scroll a dialog. These variants only
+# react to the wheel once the field has keyboard focus (click or Tab into it);
+# otherwise the wheel scrolls the surrounding form as expected.
+
+class _NoWheelMixin:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Drop WheelFocus so scrolling over the widget doesn't focus it.
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()   # let the scroll area handle it instead
+
+
+class _NoWheelSpinBox(_NoWheelMixin, QSpinBox):
+    pass
+
+
+class _NoWheelDoubleSpinBox(_NoWheelMixin, QDoubleSpinBox):
+    pass
+
+
+class _NoWheelComboBox(_NoWheelMixin, QComboBox):
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Dialog styles (carried over from the original app for dialog widgets)
 # ---------------------------------------------------------------------------
 
@@ -126,6 +160,7 @@ DANGER = "#B71C1C"
 WARN_COLOR = "#cc6600"
 ALARM_COLOR = "#cc2200"
 NODATA_COLOR = "#9e9e9e"
+BADDATA_COLOR = "#8e24aa"  # out-of-range sensor error (distinct from grey no-data)
 
 _BTN_PRIMARY = (
     "QPushButton { background:#1565C0; color:white; font-weight:700; "
@@ -182,6 +217,11 @@ DEFAULT_SETTINGS = {
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
+    # Sensor-error sanity range applied to every PV unless it overrides:
+    # readings outside [valid_min_default, valid_max_default] are discarded.
+    # None = no bound on that side.
+    "valid_min_default": None,
+    "valid_max_default": 80.0,
     "graph_window_minutes": 60,
     "start_monitoring_on_launch": False,
     # alert graph
@@ -267,11 +307,31 @@ class PVConfig:
     name: str
     display_name: str = ""
     units: str = ""
+    group: str = ""
     enabled: bool = False
+    # Default thresholds — used when no conditional profile below matches (the
+    # ordinary single-profile case, and the fallback for the gated case).
     warn_low: Optional[float] = None
     warn_high: Optional[float] = None
     alarm_low: Optional[float] = None
     alarm_high: Optional[float] = None
+    # Optional state gating on up to two "dependency" PVs (e.g. hall state +
+    # sys-rate). ``gate_pvs`` holds their names (0, 1 or 2). ``profiles`` is an
+    # ordered list of conditional rules; the first whose conditions all match
+    # the current dependency-PV values (and whose thresholds are set) wins,
+    # otherwise the default thresholds above apply. Each profile is a dict:
+    #   {"label": str,
+    #    "conds": [[min, max], ...],   # one [min, max] per entry in gate_pvs
+    #    "warn_low", "warn_high", "alarm_low", "alarm_high"}
+    # A None edge in a cond means "unbounded on that side"; a [None, None] cond
+    # (or a missing one) means "any value" for that dependency.
+    gate_pvs: list = field(default_factory=list)
+    profiles: list = field(default_factory=list)
+    # Sanity range: readings outside [valid_min, valid_max] are treated as
+    # sensor errors and dropped (not plotted, not alarmed, excluded from Learn).
+    # None on a side = fall back to the global valid_*_default setting.
+    valid_min: Optional[float] = None
+    valid_max: Optional[float] = None
     learned_at: Optional[str] = None
     learn_stats: Optional[dict] = None
 
@@ -280,27 +340,89 @@ class PVConfig:
             self.display_name = api.shorten_pv_name(self.name)
 
     def thresholds(self) -> Thresholds:
+        """Default thresholds (used when no conditional profile matches)."""
         return Thresholds(self.warn_low, self.warn_high,
                           self.alarm_low, self.alarm_high)
+
+    @staticmethod
+    def profile_thresholds(prof: dict) -> Thresholds:
+        """Thresholds carried by a conditional profile."""
+        return Thresholds(prof.get("warn_low"), prof.get("warn_high"),
+                          prof.get("alarm_low"), prof.get("alarm_high"))
+
+    @staticmethod
+    def _profile_matches(prof: dict, gate_values: list) -> bool:
+        """True if every dependency condition in ``prof`` holds for the current
+        dependency-PV values. A [None, None] (or missing) cond is 'any'; a cond
+        with a real edge against an unknown (None) value never matches."""
+        conds = prof.get("conds") or []
+        for i, cond in enumerate(conds):
+            lo, hi = (cond + [None, None])[:2] if cond else (None, None)
+            if lo is None and hi is None:
+                continue                       # 'any value' for this dependency
+            gv = gate_values[i] if i < len(gate_values) else None
+            if gv is None:
+                return False                   # condition set but value unknown
+            if lo is not None and gv < lo:
+                return False
+            if hi is not None and gv > hi:
+                return False
+        return True
+
+    def match_profile(self, gate_values: list) -> Optional[dict]:
+        """First conditional profile whose conditions match and whose thresholds
+        are set, else None (caller falls back to the default thresholds)."""
+        for prof in self.profiles:
+            if (self._profile_matches(prof, gate_values)
+                    and self.profile_thresholds(prof).is_active()):
+                return prof
+        return None
 
     def to_dict(self) -> dict:
         return {
             "name": self.name, "display_name": self.display_name,
-            "units": self.units, "enabled": self.enabled,
+            "units": self.units, "group": self.group, "enabled": self.enabled,
             "warn_low": self.warn_low, "warn_high": self.warn_high,
             "alarm_low": self.alarm_low, "alarm_high": self.alarm_high,
+            "gate_pvs": list(self.gate_pvs),
+            "profiles": [dict(p) for p in self.profiles],
+            "valid_min": self.valid_min, "valid_max": self.valid_max,
             "learned_at": self.learned_at, "learn_stats": self.learn_stats,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "PVConfig":
+        gate_pvs, profiles = cls._read_gating(d)
         return cls(
             name=d["name"], display_name=d.get("display_name", ""),
-            units=d.get("units", ""), enabled=bool(d.get("enabled", False)),
+            units=d.get("units", ""), group=d.get("group", ""),
+            enabled=bool(d.get("enabled", False)),
             warn_low=d.get("warn_low"), warn_high=d.get("warn_high"),
             alarm_low=d.get("alarm_low"), alarm_high=d.get("alarm_high"),
+            gate_pvs=gate_pvs, profiles=profiles,
+            valid_min=d.get("valid_min"), valid_max=d.get("valid_max"),
             learned_at=d.get("learned_at"), learn_stats=d.get("learn_stats"),
         )
+
+    @staticmethod
+    def _read_gating(d: dict) -> tuple:
+        """Return (gate_pvs, profiles), migrating the old single-gate schema
+        (gate_pv + gate_run_* + run_* thresholds) into one profile."""
+        if d.get("gate_pvs") is not None or d.get("profiles") is not None:
+            return list(d.get("gate_pvs") or []), [dict(p) for p in
+                                                   (d.get("profiles") or [])]
+        old_gate = d.get("gate_pv") or None
+        if not old_gate:
+            return [], []
+        run_thr = {
+            "warn_low": d.get("run_warn_low"), "warn_high": d.get("run_warn_high"),
+            "alarm_low": d.get("run_alarm_low"), "alarm_high": d.get("run_alarm_high"),
+        }
+        if not any(v is not None for v in run_thr.values()):
+            return [old_gate], []          # gate existed but had no run limits
+        prof = {"label": "running",
+                "conds": [[d.get("gate_run_min"), d.get("gate_run_max")]], **run_thr}
+        return [old_gate], [prof]
 
 
 @dataclass
@@ -311,6 +433,10 @@ class PVRuntime:
     alert: AlertState = field(default_factory=AlertState)
     history: deque = field(default_factory=lambda: deque(maxlen=2000))
     last_error: str = ""
+    rejected_count: int = 0
+    bad_data: bool = False   # last poll returned samples but all out of range
+    # Conditional profile in force at the last poll (None = default thresholds).
+    active_profile: Optional[dict] = None
 
     def display_level(self):
         """AlertLevel for colouring, or None for NODATA."""
@@ -323,25 +449,40 @@ class PVRuntime:
 # Workers (QThreadPool + QRunnable)
 # ---------------------------------------------------------------------------
 
-def _avg_recent_numeric(samples: list[dict], avg_n: int):
-    """Return (avg_value_or_None, units, last_ts_ns) from raw CPVA samples."""
-    vals, units, last_ts = [], "", 0
+def _out_of_range(v: float, vmin, vmax) -> bool:
+    return (vmin is not None and v < vmin) or (vmax is not None and v > vmax)
+
+
+def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
+    """Return (avg_or_None, units, last_ts_ns, n_rejected) from raw CPVA samples.
+
+    Readings outside [vmin, vmax] are treated as sensor errors and dropped;
+    n_rejected counts how many were discarded this pass.
+    """
+    vals, units, last_ts, rejected = [], "", 0, 0
     for s in samples:
         v = api.cpva_decode_value(s)
         if isinstance(v, bool):
             continue
         if isinstance(v, (int, float)):
-            vals.append(float(v))
+            fv = float(v)
             u = api.cpva_decode_units(s)
             if u:
                 units = u
             t = s.get("time")
-            if isinstance(t, (int, float)):
-                last_ts = max(last_ts, int(t))
+            ts = int(t) if isinstance(t, (int, float)) else 0
+            if _out_of_range(fv, vmin, vmax):
+                rejected += 1
+                if ts:
+                    last_ts = max(last_ts, ts)  # note freshness even if bad
+                continue
+            vals.append(fv)
+            if ts:
+                last_ts = max(last_ts, ts)
     if not vals:
-        return None, units, last_ts
+        return None, units, last_ts, rejected
     recent = vals[-max(1, avg_n):]
-    return sum(recent) / len(recent), units, last_ts
+    return sum(recent) / len(recent), units, last_ts, rejected
 
 
 def _safe_emit(sig_fn, value):
@@ -352,16 +493,18 @@ def _safe_emit(sig_fn, value):
 
 
 class _PollSignals(QObject):
-    done = Signal(object)   # {name: (value_or_None, units, last_ts_ns, error_str)}
+    done = Signal(object)   # {name: (val_or_None, units, last_ts_ns, err, n_rejected)}
     log = Signal(str)
 
 
 class _PollWorker(QRunnable):
-    def __init__(self, sig: _PollSignals, names: list[str], settings: dict):
+    def __init__(self, sig: _PollSignals, names: list[str], settings: dict,
+                 ranges: Optional[dict] = None):
         super().__init__()
         self._sig = sig
         self._names = names
         self._s = settings
+        self._ranges = ranges or {}
 
     def run(self):
         window_ns = int(self._s["sample_window_s"] * 1e9)
@@ -371,12 +514,19 @@ class _PollWorker(QRunnable):
         start = end - window_ns
         out = {}
         for name in self._names:
+            lo, hi = self._ranges.get(name, (None, None))
             try:
                 samples = api.cpva_fetch_samples(name, start, end, timeout)
-                val, units, last_ts = _avg_recent_numeric(samples, avg_n)
-                out[name] = (val, units, last_ts or end, "")
+                val, units, last_ts, rejected = _avg_recent_numeric(
+                    samples, avg_n, lo, hi)
+                if rejected:
+                    err = (f"dropped {rejected} out-of-range reading(s) "
+                           f"[{_fmt(lo)}..{_fmt(hi)}]")
+                else:
+                    err = ""
+                out[name] = (val, units, last_ts or end, err, rejected)
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
-                out[name] = (None, "", end, str(e))
+                out[name] = (None, "", end, str(e), 0)
         _safe_emit(self._sig.done.emit, out)
 
 
@@ -403,11 +553,13 @@ class _LearnSignals(QObject):
     done = Signal(object)   # dict of thresholds + stats
     error = Signal(str)
     log = Signal(str)
+    progress = Signal(object)   # (done_chunks, total_chunks)
 
 
 class _LearnWorker(QRunnable):
     def __init__(self, sig: _LearnSignals, name: str, days: int,
-                 warn_k: float, alarm_k: float, timeout: float):
+                 warn_k: float, alarm_k: float, timeout: float,
+                 valid_min=None, valid_max=None):
         super().__init__()
         self._sig = sig
         self._name = name
@@ -415,6 +567,8 @@ class _LearnWorker(QRunnable):
         self._warn_k = warn_k
         self._alarm_k = alarm_k
         self._timeout = timeout
+        self._vmin = valid_min
+        self._vmax = valid_max
 
     def run(self):
         try:
@@ -424,27 +578,44 @@ class _LearnWorker(QRunnable):
                        f"Fetching {self._days} d of history for {self._name}…")
             samples = api.cpva_fetch_samples_chunked(
                 self._name, start, end, self._timeout,
-                log_fn=lambda m: _safe_emit(self._sig.log.emit, m))
+                log_fn=lambda m: _safe_emit(self._sig.log.emit, m),
+                progress_fn=lambda d, t: _safe_emit(
+                    self._sig.progress.emit, (d, t)))
             vals = []
             units = ""
+            rejected = 0
             for s in samples:
                 v = api.cpva_decode_value(s)
                 if isinstance(v, bool):
                     continue
                 if isinstance(v, (int, float)) and np.isfinite(v):
-                    vals.append(float(v))
+                    fv = float(v)
+                    if _out_of_range(fv, self._vmin, self._vmax):
+                        rejected += 1
+                        continue
+                    vals.append(fv)
                     u = api.cpva_decode_units(s)
                     if u:
                         units = u
+            if rejected:
+                _safe_emit(self._sig.log.emit,
+                           f"Dropped {rejected} out-of-range point(s) "
+                           f"[{_fmt(self._vmin)}..{_fmt(self._vmax)}].")
             if len(vals) < 30:
                 _safe_emit(self._sig.error.emit,
-                           f"Insufficient history ({len(vals)} numeric points). "
+                           f"Insufficient history ({len(vals)} in-range points). "
                            "Limits left unchanged.")
                 return
             result = compute_baseline(np.asarray(vals), self._warn_k, self._alarm_k)
             result["units"] = units
             result["n"] = len(vals)
+            result["rejected"] = rejected
             result["days"] = self._days
+            # Record exactly where the data came from, so it survives Save.
+            result["window_start"] = api.ns_to_prague(start).isoformat(
+                timespec="seconds")
+            result["window_end"] = api.ns_to_prague(end).isoformat(
+                timespec="seconds")
             _safe_emit(self._sig.done.emit, result)
         except Exception as e:  # noqa: BLE001
             _safe_emit(self._sig.error.emit, str(e))
@@ -479,25 +650,111 @@ def compute_baseline(v: np.ndarray, warn_k: float, alarm_k: float) -> dict:
     }
 
 
+_STAT_KEYS = ("center", "spread", "method", "n", "rejected", "days",
+              "window_start", "window_end")
+
+
+def _stats_from_result(r: dict) -> dict:
+    """Pull the provenance/stats subset of a Learn result for storage on a PV."""
+    return {k: r[k] for k in _STAT_KEYS if k in r}
+
+
+def _apply_result_to_pv(pv: "PVConfig", r: dict) -> None:
+    """Write learned limits + provenance onto a PV (used by batch Learn)."""
+    pv.warn_low = r["warn_low"]
+    pv.warn_high = r["warn_high"]
+    pv.alarm_low = r["alarm_low"]
+    pv.alarm_high = r["alarm_high"]
+    if r.get("units") and not pv.units:
+        pv.units = r["units"]
+    pv.learned_at = datetime.now(api.TZ_PRAGUE).isoformat(timespec="seconds")
+    pv.learn_stats = _stats_from_result(r)
+
+
 # ---------------------------------------------------------------------------
 # Table model
 # ---------------------------------------------------------------------------
 
-COLS = ["On", "PV", "Value", "Units", "State", "Warn lo/hi", "Alarm lo/hi", "Updated"]
+COLS = ["On", "Display name", "PV name", "Value", "Units", "State",
+        "Warn lo/hi", "Alarm lo/hi", "Updated"]
+
+PV_MIME = "application/x-pv-monitor-row"
+GROUP_HEADER_BG = QColor("#d7e3f4")
+GROUP_HEADER_FG = QColor("#0D47A1")
+UNGROUPED_LABEL = "Ungrouped"
 
 
 def _fmt(x) -> str:
     return "–" if x is None else f"{x:g}"
 
 
+def _fmt_range(cond) -> str:
+    lo, hi = (list(cond) + [None, None])[:2] if cond else (None, None)
+    if lo is None and hi is None:
+        return "any"
+    if lo is not None and hi is not None:
+        return f"{_fmt(lo)}..{_fmt(hi)}"
+    return f"≥{_fmt(lo)}" if hi is None else f"≤{_fmt(hi)}"
+
+
+def _describe_profile(pv: "PVConfig", prof: dict) -> str:
+    """One-line human summary of a conditional profile, e.g.
+    'sys-rate: HALL=1  RATE=10 → warn 20/24 alarm 18/26'."""
+    conds = prof.get("conds") or []
+    parts = []
+    for i, name in enumerate(pv.gate_pvs):
+        cond = conds[i] if i < len(conds) else None
+        parts.append(f"{api.shorten_pv_name(name)} {_fmt_range(cond)}")
+    thr = pv.profile_thresholds(prof)
+    when = "  ".join(parts) if parts else "always"
+    label = prof.get("label") or "rule"
+    return (f"{label}: {when} → "
+            f"warn {_fmt(thr.warn_low)}/{_fmt(thr.warn_high)} "
+            f"alarm {_fmt(thr.alarm_low)}/{_fmt(thr.alarm_high)}")
+
+
 class PVTableModel(QAbstractTableModel):
+    """Flat PV list rendered with per-group header rows.
+
+    ``self.pvs`` is the single source of truth (kept group-contiguous by the
+    widget). ``self._display`` is the derived view: a list of ("header", group)
+    and ("pv", PVConfig) entries. Header rows appear only when at least one PV
+    has a non-empty group, so an ungrouped setup looks exactly as before.
+    """
+
     def __init__(self, pvs: list[PVConfig], runtime: dict[str, PVRuntime], parent=None):
         super().__init__(parent)
         self.pvs = pvs
         self.runtime = runtime
+        self._display: list[tuple] = []
+        self._rebuild()
+
+    def _rebuild(self):
+        show_headers = any(p.group for p in self.pvs)
+        disp: list[tuple] = []
+        last = object()   # sentinel so the first PV always opens a header
+        for pv in self.pvs:
+            if show_headers and pv.group != last:
+                disp.append(("header", pv.group))
+                last = pv.group
+            disp.append(("pv", pv))
+        self._display = disp
+
+    def reset(self):
+        """Structural refresh: rebuild the display rows and repaint everything."""
+        self.beginResetModel()
+        self._rebuild()
+        self.endResetModel()
+
+    def pv_at_row(self, row: int) -> Optional[PVConfig]:
+        if 0 <= row < len(self._display):
+            kind, ref = self._display[row]
+            if kind == "pv":
+                return ref
+        return None
 
     def rowCount(self, parent=QModelIndex()):
-        return len(self.pvs)
+        return len(self._display)
 
     def columnCount(self, parent=QModelIndex()):
         return len(COLS)
@@ -508,39 +765,114 @@ class PVTableModel(QAbstractTableModel):
         return None
 
     def flags(self, index):
-        base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        if not index.isValid():
+            return Qt.ItemIsDropEnabled
+        kind, _ = self._display[index.row()]
+        if kind == "header":
+            return Qt.ItemIsEnabled | Qt.ItemIsDropEnabled
+        base = (Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
         if index.column() == 0:
-            return base | Qt.ItemIsUserCheckable
+            base |= Qt.ItemIsUserCheckable
         return base
+
+    # --- drag & drop reordering ---------------------------------------
+    def supportedDropActions(self):
+        return Qt.MoveAction
+
+    def supportedDragActions(self):
+        return Qt.MoveAction
+
+    def mimeTypes(self):
+        return [PV_MIME]
+
+    def mimeData(self, indexes):
+        names = []
+        for r in sorted({i.row() for i in indexes}):
+            pv = self.pv_at_row(r)
+            if pv is not None:
+                names.append(pv.name)
+        md = QMimeData()
+        md.setData(PV_MIME, QByteArray("\n".join(names).encode("utf-8")))
+        return md
+
+    def canDropMimeData(self, data, action, row, column, parent):
+        return data.hasFormat(PV_MIME)
+
+    def dropMimeData(self, data, action, row, column, parent):
+        if action != Qt.MoveAction or not data.hasFormat(PV_MIME):
+            return False
+        names = [n for n in bytes(data.data(PV_MIME)).decode("utf-8").split("\n") if n]
+        if not names:
+            return False
+        if row != -1:
+            target = row
+        elif parent.isValid():
+            target = parent.row()
+        else:
+            target = len(self._display)
+        win = self.parent()
+        if isinstance(win, MonitorWidget):
+            win.drop_pvs(names, target)
+        # The move is done in-place above; returning True lets the view call the
+        # (unimplemented, no-op) removeRows without touching our data.
+        return True
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
-        pv = self.pvs[index.row()]
-        rt = self.runtime.get(pv.name)
+        kind, ref = self._display[index.row()]
         col = index.column()
+
+        if kind == "header":
+            if role == Qt.DisplayRole and col == 0:
+                return ref or UNGROUPED_LABEL
+            if role == Qt.BackgroundRole:
+                return GROUP_HEADER_BG
+            if role == Qt.ForegroundRole:
+                return GROUP_HEADER_FG
+            if role == Qt.FontRole:
+                f = QFont()
+                f.setBold(True)
+                return f
+            if role == Qt.TextAlignmentRole:
+                return int(Qt.AlignVCenter | Qt.AlignLeft)
+            return None
+
+        pv = ref
+        rt = self.runtime.get(pv.name)
 
         if role == Qt.CheckStateRole and col == 0:
             return Qt.Checked if pv.enabled else Qt.Unchecked
 
         if role == Qt.ToolTipRole:
             tip = pv.name
+            if pv.gate_pvs:
+                tip += "\nDepends on: " + ", ".join(pv.gate_pvs)
+                for prof in pv.profiles:
+                    tip += "\n  • " + _describe_profile(pv, prof)
+                active = rt.active_profile if rt else None
+                label = (active.get("label") or "conditional") if active else "default"
+                tip += f"\nActive limits: {label}"
             if rt and rt.last_error:
                 tip += f"\nLast error: {rt.last_error}"
             return tip
 
         level = rt.display_level() if rt else None
+        bad = bool(rt and rt.bad_data and level is None and pv.enabled)
 
-        if role == Qt.BackgroundRole and col == 4:
+        if role == Qt.BackgroundRole and col == 5:
+            if bad:
+                return QColor(BADDATA_COLOR)
             if level is None:
                 return QColor(NODATA_COLOR)
             return _STATE_BG[level]
-        if role == Qt.ForegroundRole and col == 4:
+        if role == Qt.ForegroundRole and col == 5:
             if level in (AlertLevel.WARNING, AlertLevel.ALARM) or level is None:
                 return QColor("white")
             return QColor(SUCCESS)
 
-        if role == Qt.TextAlignmentRole and col in (2, 3, 4, 5, 6):
+        if role == Qt.TextAlignmentRole and col in (3, 4, 5, 6, 7):
             return int(Qt.AlignCenter)
 
         if role == Qt.DisplayRole:
@@ -549,20 +881,33 @@ class PVTableModel(QAbstractTableModel):
             if col == 1:
                 return pv.display_name
             if col == 2:
-                return _fmt(rt.current_value) if rt else "–"
+                return pv.name
             if col == 3:
-                return (rt.current_units if rt and rt.current_units else pv.units) or ""
+                return _fmt(rt.current_value) if rt else "–"
             if col == 4:
+                return (rt.current_units if rt and rt.current_units else pv.units) or ""
+            if col == 5:
                 if not pv.enabled:
                     return "off"
+                if bad:
+                    return "bad data"
                 if level is None:
                     return "no data"
                 return level.label.lower()
-            if col == 5:
-                return f"{_fmt(pv.warn_low)} / {_fmt(pv.warn_high)}"
+            # Threshold columns show whichever profile is currently in force:
+            # the matched conditional profile, else the default set.
+            active = rt.active_profile if rt else None
+            if active is not None:
+                thr = pv.profile_thresholds(active)
+                mark = f" ({active.get('label') or 'cond'})"
+            else:
+                thr = pv.thresholds()
+                mark = ""
             if col == 6:
-                return f"{_fmt(pv.alarm_low)} / {_fmt(pv.alarm_high)}"
+                return f"{_fmt(thr.warn_low)} / {_fmt(thr.warn_high)}{mark}"
             if col == 7:
+                return f"{_fmt(thr.alarm_low)} / {_fmt(thr.alarm_high)}{mark}"
+            if col == 8:
                 if rt and rt.last_update_ns:
                     return api.ns_to_prague(rt.last_update_ns).strftime("%H:%M:%S")
                 return "–"
@@ -570,7 +915,9 @@ class PVTableModel(QAbstractTableModel):
 
     def setData(self, index, value, role=Qt.EditRole):
         if index.column() == 0 and role == Qt.CheckStateRole:
-            pv = self.pvs[index.row()]
+            pv = self.pv_at_row(index.row())
+            if pv is None:
+                return False
             pv.enabled = (Qt.CheckState(value) == Qt.Checked)
             self.dataChanged.emit(index, index)
             win = self.parent()
@@ -579,15 +926,10 @@ class PVTableModel(QAbstractTableModel):
             return True
         return False
 
-    def refresh_row(self, row: int):
-        if 0 <= row < len(self.pvs):
-            self.dataChanged.emit(self.index(row, 0),
-                                  self.index(row, len(COLS) - 1))
-
     def refresh_all(self):
-        if self.pvs:
+        if self._display:
             self.dataChanged.emit(self.index(0, 0),
-                                  self.index(len(self.pvs) - 1, len(COLS) - 1))
+                                  self.index(len(self._display) - 1, len(COLS) - 1))
 
 
 # ---------------------------------------------------------------------------
@@ -599,15 +941,28 @@ class OptionalDoubleField(QWidget):
         super().__init__(parent)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
         self.chk = QCheckBox(label)
         self.chk.setStyleSheet(_CHK_STYLE)
-        self.spin = QDoubleSpinBox()
+        self.spin = _NoWheelDoubleSpinBox()
         self.spin.setRange(-1e12, 1e12)
         self.spin.setDecimals(4)
         self.spin.setEnabled(False)
+        # Keep the spinbox only as wide as it needs to be; a trailing stretch
+        # left-aligns it so it doesn't balloon across the row.
+        self.spin.setMaximumWidth(96)
         self.chk.toggled.connect(self.spin.setEnabled)
         lay.addWidget(self.chk)
-        lay.addWidget(self.spin, 1)
+        lay.addWidget(self.spin)
+        lay.addStretch(1)
+
+    def setToolTip(self, text: str):
+        # Qt shows a child's own tooltip, not the parent's, so a tooltip on this
+        # container alone would never appear over the checkbox/spinbox. Push it
+        # onto both children (and keep it on self for completeness).
+        super().setToolTip(text)
+        self.chk.setToolTip(text)
+        self.spin.setToolTip(text)
 
     def value(self) -> Optional[float]:
         return self.spin.value() if self.chk.isChecked() else None
@@ -618,6 +973,107 @@ class OptionalDoubleField(QWidget):
         else:
             self.chk.setChecked(True)
             self.spin.setValue(v)
+
+
+# ---------------------------------------------------------------------------
+# Conditional-threshold rule row (used inside PVEditDialog)
+# ---------------------------------------------------------------------------
+
+class _ProfileRow(QGroupBox):
+    """One conditional-threshold rule: dependency conditions + its limits.
+
+    Both dependency slots are always shown; the caption for each reflects the
+    dependency PV chosen above (or marks it unused). On save the dialog keeps
+    only the conditions for the dependency slots that actually have a PV.
+    """
+
+    def __init__(self, on_remove):
+        super().__init__()
+        self.setStyleSheet(_GROUP_STYLE)
+        v = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Label"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("e.g. sys-rate 10")
+        self.name_edit.setToolTip(
+            "A short name for this rule, shown in the table and tooltips when "
+            "the rule is active (e.g. 'sys-rate 10').")
+        top.addWidget(self.name_edit, 1)
+        rm = QPushButton("✕ Remove rule")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.clicked.connect(lambda: on_remove(self))
+        top.addWidget(rm)
+        v.addLayout(top)
+
+        self.dep_caption: list[QLabel] = []
+        self.c_min: list[OptionalDoubleField] = []
+        self.c_max: list[OptionalDoubleField] = []
+        for _ in range(2):
+            cap = QLabel()
+            cap.setStyleSheet("color:#444; font-weight:600;")
+            v.addWidget(cap)
+            row = QHBoxLayout()
+            cmin = OptionalDoubleField("value ≥")
+            cmin.setToolTip(
+                "Lower edge of this dependency's range for this rule. For an "
+                "exact value, tick both ≥ and ≤ with the same number (or a "
+                "narrow window). Unticked = no lower limit.")
+            cmax = OptionalDoubleField("value ≤")
+            cmax.setToolTip(
+                "Upper edge of this dependency's range for this rule. "
+                "Unticked = no upper limit.")
+            row.addWidget(cmin)
+            row.addWidget(cmax)
+            row.addStretch(1)
+            v.addLayout(row)
+            self.dep_caption.append(cap)
+            self.c_min.append(cmin)
+            self.c_max.append(cmax)
+
+        self.warn_low = OptionalDoubleField("Warn low ≤")
+        self.warn_high = OptionalDoubleField("Warn high ≥")
+        self.alarm_low = OptionalDoubleField("Alarm low ≤")
+        self.alarm_high = OptionalDoubleField("Alarm high ≥")
+        for a, b in ((self.warn_low, self.warn_high),
+                     (self.alarm_low, self.alarm_high)):
+            row = QHBoxLayout()
+            row.addWidget(a)
+            row.addWidget(b)
+            row.addStretch(1)
+            v.addLayout(row)
+
+    def set_dep_labels(self, names: list[str]):
+        for i, cap in enumerate(self.dep_caption):
+            name = names[i] if i < len(names) else ""
+            if name:
+                cap.setText(f"When {api.shorten_pv_name(name)} is in range:")
+            else:
+                cap.setText(f"Dependency {i + 1} — set a dependency PV above to use")
+
+    def load(self, prof: dict):
+        self.name_edit.setText(prof.get("label", ""))
+        conds = prof.get("conds") or []
+        for i in range(2):
+            cond = conds[i] if i < len(conds) else None
+            lo, hi = (list(cond) + [None, None])[:2] if cond else (None, None)
+            self.c_min[i].set_value(lo)
+            self.c_max[i].set_value(hi)
+        self.warn_low.set_value(prof.get("warn_low"))
+        self.warn_high.set_value(prof.get("warn_high"))
+        self.alarm_low.set_value(prof.get("alarm_low"))
+        self.alarm_high.set_value(prof.get("alarm_high"))
+
+    def cond(self, slot: int) -> list:
+        return [self.c_min[slot].value(), self.c_max[slot].value()]
+
+    def is_empty(self) -> bool:
+        vals = (self.c_min[0].value(), self.c_max[0].value(),
+                self.c_min[1].value(), self.c_max[1].value(),
+                self.warn_low.value(), self.warn_high.value(),
+                self.alarm_low.value(), self.alarm_high.value())
+        return not (self.name_edit.text().strip()
+                    or any(v is not None for v in vals))
 
 
 # ---------------------------------------------------------------------------
@@ -638,10 +1094,18 @@ class PVBrowserDialog(QDialog):
         lay = QVBoxLayout(self)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter (space = AND, * = wildcard)…")
+        self.search.setToolTip(
+            "Type to filter the full CPVA channel list below. Space-separated "
+            "words must all match (AND); * matches any run of characters. "
+            "Example: 'temp * L3' shows channels containing both 'temp' and 'L3'.")
         self.search.textChanged.connect(self._apply_filter)
         lay.addWidget(self.search)
 
         self.list = QListWidget()
+        self.list.setToolTip(
+            "All archiver channels matching the filter (capped at 2000 shown). "
+            "Select one or more (Ctrl/Shift-click) and click 'Add selected', or "
+            "double-click a single channel to add it and close.")
         self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list.itemDoubleClicked.connect(lambda *_: self._accept())
         lay.addWidget(self.list, 1)
@@ -652,6 +1116,8 @@ class PVBrowserDialog(QDialog):
         bb = QDialogButtonBox()
         add = bb.addButton("Add selected", QDialogButtonBox.AcceptRole)
         add.setStyleSheet(_BTN_PRIMARY)
+        add.setToolTip("Add every highlighted channel to the monitor list and "
+                       "close this browser.")
         bb.addButton("Close", QDialogButtonBox.RejectRole)
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
@@ -694,11 +1160,17 @@ class PVEditDialog(QDialog):
     def __init__(self, parent: "MonitorWidget", pv: PVConfig):
         super().__init__(parent)
         self.setWindowTitle(f"Edit PV — {pv.display_name}")
-        self.resize(460, 460)
+        self.resize(560, 660)
         self._win = parent
         self.pv = pv
 
-        lay = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
 
         info = QLabel(pv.name)
         info.setStyleSheet("color:#555;")
@@ -707,20 +1179,64 @@ class PVEditDialog(QDialog):
 
         form = QFormLayout()
         self.name_edit = QLineEdit(pv.display_name)
+        self.name_edit.setToolTip(
+            "Friendly label shown in the monitor table, graph and alert "
+            "messages instead of the raw PV name. Does not change the PV itself.")
         form.addRow("Display name", self.name_edit)
+        self.units_combo = _NoWheelComboBox()
+        self.units_combo.setEditable(True)
+        self.units_combo.lineEdit().setPlaceholderText(
+            "e.g. DegC — overrides the archiver's units")
+        self.units_combo.setToolTip(
+            "Unit shown next to values and on plot axes (e.g. DegC, %, mbar). "
+            "Pick a unit already used by another PV, or type a new one. "
+            "Overrides whatever the archiver reports. Leave blank to use the "
+            "archiver's own units.")
+        self.units_combo.addItem("")
+        for u in sorted({p.units for p in parent.pvs if p.units}):
+            self.units_combo.addItem(u)
+        self.units_combo.setCurrentText(pv.units)
+        form.addRow("Units", self.units_combo)
+        self.group_combo = _NoWheelComboBox()
+        self.group_combo.setEditable(True)
+        self.group_combo.setToolTip(
+            "PVs sharing a group name are shown together under a group header. "
+            "Leave blank for ungrouped.")
+        self.group_combo.addItem("")
+        for g in sorted({p.group for p in parent.pvs if p.group}):
+            self.group_combo.addItem(g)
+        self.group_combo.setCurrentText(pv.group)
+        form.addRow("Group", self.group_combo)
         self.enabled_chk = QCheckBox("Enable alerting for this PV")
         self.enabled_chk.setStyleSheet(_CHK_STYLE)
+        self.enabled_chk.setToolTip(
+            "When on, this PV is evaluated against its thresholds and can raise "
+            "Warning/Alarm alerts. When off, it is still polled and plotted but "
+            "never triggers a notification.")
         self.enabled_chk.setChecked(pv.enabled)
         form.addRow("", self.enabled_chk)
         lay.addLayout(form)
 
-        grp = QGroupBox("Thresholds  (unchecked = that side not checked)")
+        grp = QGroupBox("Default thresholds  (laser off / no gate — "
+                        "unchecked = that side not checked)")
         grp.setStyleSheet(_GROUP_STYLE)
         gl = QVBoxLayout(grp)
         self.f_warn_low = OptionalDoubleField("Warning low ≤")
+        self.f_warn_low.setToolTip(
+            "Tick and set a value: a Warning is raised when the reading falls to "
+            "or below it. Leave unticked to not watch the low side for warnings.")
         self.f_warn_high = OptionalDoubleField("Warning high ≥")
+        self.f_warn_high.setToolTip(
+            "Tick and set a value: a Warning is raised when the reading rises to "
+            "or above it. Leave unticked to not watch the high side for warnings.")
         self.f_alarm_low = OptionalDoubleField("Alarm low ≤")
+        self.f_alarm_low.setToolTip(
+            "Tick and set a value: an Alarm (more severe than Warning) is raised "
+            "when the reading falls to or below it. Usually set below Warning low.")
         self.f_alarm_high = OptionalDoubleField("Alarm high ≥")
+        self.f_alarm_high.setToolTip(
+            "Tick and set a value: an Alarm (more severe than Warning) is raised "
+            "when the reading rises to or above it. Usually set above Warning high.")
         for f in (self.f_warn_low, self.f_warn_high,
                   self.f_alarm_low, self.f_alarm_high):
             gl.addWidget(f)
@@ -730,31 +1246,132 @@ class PVEditDialog(QDialog):
         self.f_alarm_high.set_value(pv.alarm_high)
         lay.addWidget(grp)
 
+        # --- Conditional thresholds (dependency PVs) -----------------------
+        gate = QGroupBox("Conditional thresholds  (depend on up to 2 other PVs)")
+        gate.setStyleSheet(_GROUP_STYLE)
+        gvl = QVBoxLayout(gate)
+
+        self.dep_edits: list[QLineEdit] = []
+        for i in range(2):
+            grow = QHBoxLayout()
+            grow.addWidget(QLabel(f"Dependency PV {i + 1}"))
+            edit = QLineEdit(pv.gate_pvs[i] if i < len(pv.gate_pvs) else "")
+            edit.setPlaceholderText("blank = not used")
+            edit.setToolTip(
+                "A PV this one depends on (e.g. hall state, sys-rate). Each rule "
+                "below can require this PV to sit in a given range. Leave blank "
+                "to use fewer dependencies.")
+            edit.textChanged.connect(self._refresh_dep_labels)
+            grow.addWidget(edit, 1)
+            br = QPushButton("Browse…")
+            br.setStyleSheet(SECONDARY_STYLE)
+            br.setToolTip("Pick this dependency PV from the CPVA channel list.")
+            br.clicked.connect(lambda _=False, e=edit: self._browse_into(e))
+            grow.addWidget(br)
+            self.dep_edits.append(edit)
+            gvl.addLayout(grow)
+
+        self._profiles_host = QVBoxLayout()
+        gvl.addLayout(self._profiles_host)
+        self._profile_rows: list[_ProfileRow] = []
+
+        add_rule = QPushButton("+ Add rule")
+        add_rule.setStyleSheet(SECONDARY_STYLE)
+        add_rule.setToolTip(
+            "Add a conditional rule. The first rule whose dependency conditions "
+            "all match — and that has at least one limit set — decides the active "
+            "limits. If no rule matches, the default thresholds above apply.")
+        add_rule.clicked.connect(lambda: self._add_profile_row())
+        gvl.addWidget(add_rule)
+
+        ghint = QLabel(
+            "Rules are checked top to bottom; the first match wins. A rule with "
+            "no limits set is ignored. Example: 3 rules on sys-rate (0.2 / 3.3 / "
+            "10) give each rate its own limits; leave a dependency's range empty "
+            "to mean 'any value'.")
+        ghint.setWordWrap(True)
+        ghint.setStyleSheet("color:#777; font-size:11px;")
+        gvl.addWidget(ghint)
+        lay.addWidget(gate)
+
+        for prof in pv.profiles:
+            self._add_profile_row(prof)
+        self._refresh_dep_labels()
+
+        vrg = QGroupBox("Valid range  (sensor-error filter)")
+        vrg.setStyleSheet(_GROUP_STYLE)
+        vrl = QVBoxLayout(vrg)
+        self.f_valid_min = OptionalDoubleField("Drop readings below <")
+        self.f_valid_min.setToolTip(
+            "Sensor-error guard: readings below this value are treated as bad and "
+            "discarded everywhere (plot, alarms, Learn). Overrides the global "
+            "default for this PV. Unticked = use the global default.")
+        self.f_valid_max = OptionalDoubleField("Drop readings above >")
+        self.f_valid_max.setToolTip(
+            "Sensor-error guard: readings above this value are treated as bad and "
+            "discarded everywhere (plot, alarms, Learn). Overrides the global "
+            "default for this PV. Unticked = use the global default.")
+        vrl.addWidget(self.f_valid_min)
+        vrl.addWidget(self.f_valid_max)
+        self.f_valid_min.set_value(pv.valid_min)
+        self.f_valid_max.set_value(pv.valid_max)
+        gmin = parent.settings.get("valid_min_default")
+        gmax = parent.settings.get("valid_max_default")
+        hint = QLabel(f"Unchecked = use global default "
+                      f"[{_fmt(gmin)} .. {_fmt(gmax)}]. "
+                      "Out-of-range readings are dropped everywhere "
+                      "(plot, alarms, Learn).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#777; font-size:11px;")
+        vrl.addWidget(hint)
+        lay.addWidget(vrg)
+
         learn = QGroupBox("Learn from history")
         learn.setStyleSheet(_GROUP_STYLE)
         ll = QHBoxLayout(learn)
         ll.addWidget(QLabel("Days"))
-        self.days = QSpinBox()
+        self.days = _NoWheelSpinBox()
         self.days.setRange(1, 90)
+        self.days.setToolTip(
+            "How many days of archiver history to sample when learning "
+            "thresholds. More days = a more stable baseline but slower to fetch. "
+            "Range 1–90.")
         self.days.setValue(int(parent.settings["learn_days_default"]))
         ll.addWidget(self.days)
         ll.addWidget(QLabel("warn k"))
-        self.warn_k = QDoubleSpinBox()
+        self.warn_k = _NoWheelDoubleSpinBox()
         self.warn_k.setRange(0.5, 20)
         self.warn_k.setSingleStep(0.5)
+        self.warn_k.setToolTip(
+            "Warning band width, in spreads (≈ standard deviations) around the "
+            "learned centre. Warning thresholds are set at centre ± k×spread. "
+            "Smaller k = tighter, more sensitive warnings.")
         self.warn_k.setValue(float(parent.settings["warn_k_default"]))
         ll.addWidget(self.warn_k)
         ll.addWidget(QLabel("alarm k"))
-        self.alarm_k = QDoubleSpinBox()
+        self.alarm_k = _NoWheelDoubleSpinBox()
         self.alarm_k.setRange(0.5, 30)
         self.alarm_k.setSingleStep(0.5)
+        self.alarm_k.setToolTip(
+            "Alarm band width, in spreads around the learned centre "
+            "(centre ± k×spread). Set larger than 'warn k' so alarms sit outside "
+            "the warning band.")
         self.alarm_k.setValue(float(parent.settings["alarm_k_default"]))
         ll.addWidget(self.alarm_k)
         self.learn_btn = QPushButton("Learn")
         self.learn_btn.setStyleSheet(_BTN_PRIMARY)
+        self.learn_btn.setToolTip(
+            "Fetch this PV's history for the chosen number of days and compute "
+            "Warning/Alarm thresholds from its centre and spread. Results fill "
+            "the fields above for review — nothing is saved until you click Save.")
         self.learn_btn.clicked.connect(self._learn)
         ll.addWidget(self.learn_btn)
         lay.addWidget(learn)
+
+        self.learn_prog = QProgressBar()
+        self.learn_prog.setVisible(False)
+        self.learn_prog.setFormat("%v / %m chunks")
+        lay.addWidget(self.learn_prog)
 
         self.learn_status = QLabel("")
         self.learn_status.setWordWrap(True)
@@ -766,53 +1383,267 @@ class PVEditDialog(QDialog):
         bb.button(QDialogButtonBox.Save).setStyleSheet(_BTN_SUCCESS)
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
+        outer.addWidget(bb)
 
     def _learn(self):
         self.learn_btn.setEnabled(False)
         self.learn_status.setText("Learning…")
+        self.learn_prog.setRange(0, 0)   # busy until first chunk completes
+        self.learn_prog.setVisible(True)
         sig = _LearnSignals(self)
         sig.done.connect(self._on_learned)
         sig.error.connect(self._on_learn_error)
         sig.log.connect(self.learn_status.setText)
+        sig.progress.connect(self._on_progress)
         self._learn_sig = sig
+        # Learn honours the same valid range that would be saved for this PV,
+        # using the checkbox values live (falling back to the global default).
+        vmin = self.f_valid_min.value()
+        if vmin is None:
+            vmin = self._win.settings.get("valid_min_default")
+        vmax = self.f_valid_max.value()
+        if vmax is None:
+            vmax = self._win.settings.get("valid_max_default")
         worker = _LearnWorker(
             sig, self.pv.name, self.days.value(),
             self.warn_k.value(), self.alarm_k.value(),
-            float(self._win.settings["http_timeout_s"]))
+            float(self._win.settings["http_timeout_s"]), vmin, vmax)
         QThreadPool.globalInstance().start(worker)
+
+    def _on_progress(self, dt):
+        done, total = dt
+        if total:
+            self.learn_prog.setRange(0, total)
+            self.learn_prog.setValue(done)
 
     def _on_learned(self, r: dict):
         self.learn_btn.setEnabled(True)
+        self.learn_prog.setVisible(False)
         self.f_warn_low.set_value(r["warn_low"])
         self.f_warn_high.set_value(r["warn_high"])
         self.f_alarm_low.set_value(r["alarm_low"])
         self.f_alarm_high.set_value(r["alarm_high"])
-        if r.get("units") and not self.pv.units:
-            self.pv.units = r["units"]
-        self._pending_stats = {k: r[k] for k in
-                               ("center", "spread", "method", "n", "days")}
+        if r.get("units") and not self.units_combo.currentText().strip():
+            self.units_combo.setCurrentText(r["units"])
+        self._pending_stats = _stats_from_result(r)
+        dropped = f", {r['rejected']} dropped" if r.get("rejected") else ""
+        window = ""
+        if r.get("window_start") and r.get("window_end"):
+            window = f"\nData: {r['window_start']} → {r['window_end']}"
         self.learn_status.setText(
-            f"Learned from {r['n']} pts / {r['days']} d "
+            f"Learned from {r['n']} in-range pts / {r['days']} d{dropped} "
             f"({r['method']}, center={r['center']:g}, spread={r['spread']:g}). "
-            "Review and Save.")
+            f"Review and Save.{window}")
 
     def _on_learn_error(self, msg: str):
         self.learn_btn.setEnabled(True)
+        self.learn_prog.setVisible(False)
         self.learn_status.setText(f"⚠ {msg}")
+
+    def _browse_into(self, edit: QLineEdit):
+        dlg = PVBrowserDialog(self._win, self._win._all_channels,
+                              float(self._win.settings["http_timeout_s"]))
+        if not self._win._all_channels and dlg._all:
+            self._win._all_channels = dlg._all
+        if dlg.exec() == QDialog.Accepted and dlg.selected:
+            edit.setText(dlg.selected[0])
+
+    def _add_profile_row(self, prof: Optional[dict] = None) -> _ProfileRow:
+        row = _ProfileRow(self._remove_profile_row)
+        if prof:
+            row.load(prof)
+        self._profile_rows.append(row)
+        self._profiles_host.addWidget(row)
+        self._refresh_dep_labels()
+        return row
+
+    def _remove_profile_row(self, row: _ProfileRow):
+        if row in self._profile_rows:
+            self._profile_rows.remove(row)
+            row.setParent(None)
+            row.deleteLater()
+
+    def _refresh_dep_labels(self):
+        names = [e.text().strip() for e in self.dep_edits]
+        for row in self._profile_rows:
+            row.set_dep_labels(names)
+
+    def _collect_gating(self) -> tuple:
+        """Build (gate_pvs, profiles) from the dependency fields and rule rows.
+
+        Only dependency slots with a PV name are kept; each rule's conditions
+        are aligned to those kept slots. Empty rules are dropped."""
+        kept = [(name, slot) for slot, name in
+                enumerate(e.text().strip() for e in self.dep_edits) if name]
+        gate_pvs = [name for name, _ in kept]
+        profiles = []
+        for row in self._profile_rows:
+            if row.is_empty():
+                continue
+            profiles.append({
+                "label": row.name_edit.text().strip(),
+                "conds": [row.cond(slot) for _, slot in kept],
+                "warn_low": row.warn_low.value(), "warn_high": row.warn_high.value(),
+                "alarm_low": row.alarm_low.value(), "alarm_high": row.alarm_high.value(),
+            })
+        return gate_pvs, profiles
 
     def _save(self):
         pv = self.pv
         pv.display_name = self.name_edit.text().strip() or pv.display_name
+        pv.units = self.units_combo.currentText().strip()
+        pv.group = self.group_combo.currentText().strip()
         pv.enabled = self.enabled_chk.isChecked()
         pv.warn_low = self.f_warn_low.value()
         pv.warn_high = self.f_warn_high.value()
         pv.alarm_low = self.f_alarm_low.value()
         pv.alarm_high = self.f_alarm_high.value()
+        pv.gate_pvs, pv.profiles = self._collect_gating()
+        pv.valid_min = self.f_valid_min.value()
+        pv.valid_max = self.f_valid_max.value()
         if hasattr(self, "_pending_stats"):
             pv.learned_at = datetime.now(api.TZ_PRAGUE).isoformat(timespec="seconds")
             pv.learn_stats = self._pending_stats
         self.accept()
+
+
+class _LearnParamsDialog(QDialog):
+    """Ask once for Days / warn k / alarm k before a batch Learn."""
+
+    def __init__(self, parent: "MonitorWidget", n_pvs: int):
+        super().__init__(parent)
+        self.setWindowTitle("Learn selected")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"Learn thresholds for {n_pvs} selected PV(s) "
+                             "from archiver history."))
+        form = QFormLayout()
+        self.days = _NoWheelSpinBox()
+        self.days.setRange(1, 90)
+        self.days.setToolTip(
+            "Days of archiver history to sample for every selected PV. "
+            "More days = steadier baseline but slower. Range 1–90.")
+        self.days.setValue(int(parent.settings["learn_days_default"]))
+        form.addRow("Days", self.days)
+        self.warn_k = _NoWheelDoubleSpinBox()
+        self.warn_k.setRange(0.5, 20)
+        self.warn_k.setSingleStep(0.5)
+        self.warn_k.setToolTip(
+            "Warning band width in spreads (≈ std-devs): thresholds are set at "
+            "centre ± k×spread. Smaller k = more sensitive warnings.")
+        self.warn_k.setValue(float(parent.settings["warn_k_default"]))
+        form.addRow("warn k", self.warn_k)
+        self.alarm_k = _NoWheelDoubleSpinBox()
+        self.alarm_k.setRange(0.5, 30)
+        self.alarm_k.setSingleStep(0.5)
+        self.alarm_k.setToolTip(
+            "Alarm band width in spreads: centre ± k×spread. Set larger than "
+            "'warn k' so alarms sit outside the warning band.")
+        self.alarm_k.setValue(float(parent.settings["alarm_k_default"]))
+        form.addRow("alarm k", self.alarm_k)
+        lay.addLayout(form)
+        lay.addWidget(QLabel("Results are written straight to each PV and saved."))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def values(self):
+        return self.days.value(), self.warn_k.value(), self.alarm_k.value()
+
+
+class _BatchLearnController(QObject):
+    """Runs Learn over several PVs one at a time behind a progress dialog."""
+
+    def __init__(self, win: "MonitorWidget", pvs: list, days: int,
+                 warn_k: float, alarm_k: float):
+        super().__init__(win)
+        self._win = win
+        self._pvs = list(pvs)
+        self._days = days
+        self._warn_k = warn_k
+        self._alarm_k = alarm_k
+        self._i = 0
+        self._ok = 0
+        self._fail: list[tuple[str, str]] = []
+        self._cancelled = False
+        self._sig = None
+        self._dlg = QProgressDialog("Learning…", "Cancel", 0, len(self._pvs), win)
+        self._dlg.setWindowTitle("Learn selected")
+        self._dlg.setWindowModality(Qt.WindowModal)
+        self._dlg.setMinimumDuration(0)
+        self._dlg.setAutoClose(False)
+        self._dlg.setAutoReset(False)
+        self._dlg.canceled.connect(self._cancel)
+
+    def start(self):
+        if not self._pvs:
+            return
+        self._dlg.show()
+        self._next()
+
+    def _cancel(self):
+        self._cancelled = True
+
+    def _next(self):
+        if self._cancelled or self._i >= len(self._pvs):
+            self._finish()
+            return
+        pv = self._pvs[self._i]
+        self._dlg.setValue(self._i)
+        self._dlg.setLabelText(
+            f"PV {self._i + 1}/{len(self._pvs)}: {pv.display_name}")
+        vmin, vmax = self._win._valid_range(pv)
+        sig = _LearnSignals(self)
+        sig.done.connect(self._on_done)
+        sig.error.connect(self._on_error)
+        sig.progress.connect(self._on_progress)
+        self._sig = sig
+        worker = _LearnWorker(
+            sig, pv.name, self._days, self._warn_k, self._alarm_k,
+            float(self._win.settings["http_timeout_s"]), vmin, vmax)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_progress(self, dt):
+        done, total = dt
+        if total:
+            pv = self._pvs[self._i]
+            self._dlg.setLabelText(
+                f"PV {self._i + 1}/{len(self._pvs)}: {pv.display_name} "
+                f"— chunk {done}/{total}")
+
+    def _on_done(self, r: dict):
+        pv = self._pvs[self._i]
+        _apply_result_to_pv(pv, r)
+        self._ok += 1
+        self._win._log(
+            f"Learned {pv.display_name}: {r['n']} pts / {r['days']} d, "
+            f"warn {_fmt(r['warn_low'])}/{_fmt(r['warn_high'])}, "
+            f"alarm {_fmt(r['alarm_low'])}/{_fmt(r['alarm_high'])}.")
+        self._i += 1
+        self._next()
+
+    def _on_error(self, msg: str):
+        pv = self._pvs[self._i]
+        self._fail.append((pv.display_name, msg))
+        self._win._log(f"Learn failed for {pv.display_name}: {msg}")
+        self._i += 1
+        self._next()
+
+    def _finish(self):
+        self._dlg.close()
+        if self._ok:
+            self._win.model.refresh_all()
+            self._win.graph.refresh_combo()
+            self._win.persist()
+        summary = f"Learned {self._ok} PV(s)."
+        if self._fail:
+            summary += (f" Failed {len(self._fail)}: "
+                        + ", ".join(n for n, _ in self._fail))
+        if self._cancelled:
+            summary = "Cancelled. " + summary
+        self._win._log(summary)
+        QMessageBox.information(self._win, "Learn selected", summary)
+        self._win._batch = None   # release
 
 
 class EmailContactsWidget(QWidget):
@@ -843,9 +1674,13 @@ class EmailContactsWidget(QWidget):
         row = QHBoxLayout()
         add = QPushButton("Add")
         add.setStyleSheet(SECONDARY_STYLE)
+        add.setToolTip("Add a new, empty recipient row and start typing the "
+                       "e-mail address.")
         add.clicked.connect(lambda: self._add_row(start_edit=True))
         rm = QPushButton("Remove selected")
         rm.setStyleSheet(SECONDARY_STYLE)
+        rm.setToolTip("Delete the currently selected recipient row(s) from the "
+                      "list.")
         rm.clicked.connect(self._remove_selected)
         row.addWidget(add)
         row.addWidget(rm)
@@ -933,9 +1768,11 @@ class WebexRoomsWidget(QWidget):
         row = QHBoxLayout()
         add = QPushButton("Add")
         add.setStyleSheet(SECONDARY_STYLE)
+        add.setToolTip("Add a new, empty room row and start typing its name.")
         add.clicked.connect(lambda: self._add_row(start_edit=True))
         rm = QPushButton("Remove selected")
         rm.setStyleSheet(SECONDARY_STYLE)
+        rm.setToolTip("Delete the currently selected room row(s) from the list.")
         rm.clicked.connect(self._remove_selected)
         row.addWidget(add)
         row.addWidget(rm)
@@ -1043,16 +1880,29 @@ class SettingsDialog(QDialog):
         ch.setStyleSheet(_GROUP_STYLE)
         cl = QFormLayout(ch)
         self.teams_en = QCheckBox("Teams")
+        self.teams_en.setToolTip(
+            "Master switch for Microsoft Teams alerts. Must be on AND the Teams "
+            "webhook below configured for alerts to reach Teams.")
         self.email_en = QCheckBox("Email")
+        self.email_en.setToolTip(
+            "Master switch for e-mail alerts. Must be on AND the SMTP section "
+            "below configured with at least one enabled recipient.")
         self.webex_en = QCheckBox("Webex")
+        self.webex_en.setToolTip(
+            "Master switch for Webex alerts. Must be on AND the Webex section "
+            "below configured (webhook URL or bot token + rooms).")
         for w, key in ((self.teams_en, "teams_enabled"),
                        (self.email_en, "email_enabled"),
                        (self.webex_en, "webex_enabled")):
             w.setStyleSheet(_CHK_STYLE)
             w.setChecked(bool(s.get(key)))
             cl.addRow("", w)
-        self.plot_hours = QSpinBox()
+        self.plot_hours = _NoWheelSpinBox()
         self.plot_hours.setRange(0, 168)
+        self.plot_hours.setToolTip(
+            "Hours of trend history rendered into the PNG attached to each alert "
+            "(e.g. 12 = last 12 h). 0 = send text-only alerts with no plot. "
+            "Range 0–168 h (one week).")
         self.plot_hours.setValue(int(s.get("alert_plot_hours", 12)))
         cl.addRow("Alert plot window (h, 0=off)", self.plot_hours)
         lay.addWidget(ch)
@@ -1064,9 +1914,15 @@ class SettingsDialog(QDialog):
         tl.addWidget(QLabel("Incoming Webhook URL"))
         self.webhook = QLineEdit(s["teams_webhook_url"])
         self.webhook.setPlaceholderText("https://…webhook…")
+        self.webhook.setToolTip(
+            "Incoming Webhook URL of the Teams channel that should receive "
+            "alerts. Create it in the channel's Connectors → Incoming Webhook, "
+            "then paste the full https:// URL here.")
         tl.addWidget(self.webhook)
         bt = QPushButton("Send test to Teams")
         bt.setStyleSheet(_BTN_PRIMARY)
+        bt.setToolTip("Post a test message to the webhook above right now, to "
+                      "confirm the URL works. Does not save the settings.")
         bt.clicked.connect(self._test_teams)
         tl.addWidget(bt)
         lay.addWidget(teams)
@@ -1076,16 +1932,29 @@ class SettingsDialog(QDialog):
         email.setStyleSheet(_GROUP_STYLE)
         ef = QFormLayout(email)
         self.smtp_host = QLineEdit(s.get("smtp_host", ""))
+        self.smtp_host.setToolTip(
+            "Hostname of the outgoing mail (SMTP) server, e.g. "
+            "smtp.office365.com or your site's relay.")
         ef.addRow("SMTP host", self.smtp_host)
-        self.smtp_port = QSpinBox()
+        self.smtp_port = _NoWheelSpinBox()
         self.smtp_port.setRange(1, 65535)
+        self.smtp_port.setToolTip(
+            "SMTP server port. Typical values: 587 for STARTTLS, 465 for SSL, "
+            "25 for an unencrypted relay. Match this to the Security setting.")
         self.smtp_port.setValue(int(s.get("smtp_port", 587)))
         ef.addRow("Port", self.smtp_port)
-        self.smtp_sec = QComboBox()
+        self.smtp_sec = _NoWheelComboBox()
         self.smtp_sec.addItems(["none", "starttls", "ssl"])
+        self.smtp_sec.setToolTip(
+            "Connection encryption: 'starttls' (upgrade on port 587, most "
+            "common), 'ssl' (implicit TLS on port 465), or 'none' (unencrypted, "
+            "internal relays only).")
         self.smtp_sec.setCurrentText(s.get("smtp_security", "starttls"))
         ef.addRow("Security", self.smtp_sec)
         self.smtp_user = QLineEdit(s.get("smtp_user", ""))
+        self.smtp_user.setToolTip(
+            "Login name for the SMTP server, if it requires authentication. "
+            "Leave blank for an open internal relay that needs no login.")
         ef.addRow("Username (optional)", self.smtp_user)
         self.smtp_pass = QLineEdit(s.get("smtp_password", ""))
         self.smtp_pass.setEchoMode(QLineEdit.Password)
@@ -1095,6 +1964,9 @@ class SettingsDialog(QDialog):
             "Tip: use ${ENV:NAME} to read from an env var instead.")
         ef.addRow("Password", self.smtp_pass)
         self.email_from = QLineEdit(s.get("email_from", ""))
+        self.email_from.setToolTip(
+            "Address that alert e-mails are sent from (the 'From' header). "
+            "Many servers require this to match the authenticated username.")
         ef.addRow("From address", self.email_from)
         recip_lbl = QLabel("Recipients")
         recip_lbl.setToolTip("Tick 'On' for everyone who should get alert e-mails.")
@@ -1104,6 +1976,9 @@ class SettingsDialog(QDialog):
         ef.addRow(self.email_contacts)
         be = QPushButton("Send test email")
         be.setStyleSheet(_BTN_PRIMARY)
+        be.setToolTip("Send a test message now using the SMTP settings above to "
+                      "every enabled recipient, to confirm delivery works. "
+                      "Does not save the settings.")
         be.clicked.connect(self._test_email)
         ef.addRow("", be)
         lay.addWidget(email)
@@ -1112,13 +1987,21 @@ class SettingsDialog(QDialog):
         webex = QGroupBox("Webex")
         webex.setStyleSheet(_GROUP_STYLE)
         wf = QFormLayout(webex)
-        self.webex_mode = QComboBox()
+        self.webex_mode = _NoWheelComboBox()
         self.webex_mode.addItems(["webhook", "bot"])
+        self.webex_mode.setToolTip(
+            "'webhook' = one-way alerts to a single space via an Incoming "
+            "Webhook URL (simplest). 'bot' = a Webex bot that can broadcast to "
+            "several rooms and, optionally, accept two-way commands. Switching "
+            "mode enables the relevant fields below.")
         self.webex_mode.setCurrentText(s.get("webex_mode", "webhook"))
         self.webex_mode.currentTextChanged.connect(self._update_webex_fields)
         wf.addRow("Mode", self.webex_mode)
         self.webex_url = QLineEdit(s.get("webex_webhook_url", ""))
         self.webex_url.setPlaceholderText("https://…webex incoming webhook…")
+        self.webex_url.setToolTip(
+            "Webex Incoming Webhook URL for the target space (webhook mode "
+            "only). Create it via the Webex 'Incoming Webhooks' integration.")
         wf.addRow("Webhook URL", self.webex_url)
         self.webex_token = QLineEdit(s.get("webex_bot_token", ""))
         self.webex_token.setEchoMode(QLineEdit.Password)
@@ -1137,19 +2020,34 @@ class SettingsDialog(QDialog):
         wf.addRow(self.webex_rooms)
         bw = QPushButton("Send test to Webex")
         bw.setStyleSheet(_BTN_PRIMARY)
+        bw.setToolTip("Send a test message now using the Webex settings above "
+                      "(webhook URL, or bot token to every enabled room), to "
+                      "confirm it works. Does not save the settings.")
         bw.clicked.connect(self._test_webex)
         wf.addRow("", bw)
 
         self.webex_cmds = QCheckBox("Accept commands from Webex (bot mode only)")
         self.webex_cmds.setStyleSheet(_CHK_STYLE)
+        self.webex_cmds.setToolTip(
+            "When on (bot mode only), the bot reads the 'Listen for commands' "
+            "room and responds to chat commands such as status/stop. When off, "
+            "the bot only sends alerts and never reads messages.")
         self.webex_cmds.setChecked(bool(s.get("webex_commands_enabled", True)))
         wf.addRow("", self.webex_cmds)
-        self.webex_cmd_poll = QSpinBox()
+        self.webex_cmd_poll = _NoWheelSpinBox()
         self.webex_cmd_poll.setRange(1, 120)
+        self.webex_cmd_poll.setToolTip(
+            "How often (seconds) the bot checks the listen room for new "
+            "commands. Lower = snappier replies but more API calls. Range "
+            "1–120 s.")
         self.webex_cmd_poll.setValue(int(s.get("webex_command_poll_s", 1)))
         wf.addRow("Command poll (s)", self.webex_cmd_poll)
         self.webex_allow = QLineEdit("; ".join(s.get("webex_command_allowlist", [])))
         self.webex_allow.setPlaceholderText("allowed sender e-mails, empty = anyone in room")
+        self.webex_allow.setToolTip(
+            "Semicolon-separated list of e-mail addresses allowed to issue "
+            "commands to the bot. Leave empty to accept commands from anyone in "
+            "the listen room.")
         wf.addRow("Command allowlist", self.webex_allow)
 
         lay.addWidget(webex)
@@ -1159,37 +2057,88 @@ class SettingsDialog(QDialog):
         form_grp = QGroupBox("Monitoring")
         form_grp.setStyleSheet(_GROUP_STYLE)
         form = QFormLayout(form_grp)
-        self.poll = QSpinBox(); self.poll.setRange(5, 3600)
+        self.poll = _NoWheelSpinBox(); self.poll.setRange(5, 3600)
+        self.poll.setToolTip(
+            "How often (seconds) every PV is read from the archiver while "
+            "monitoring. Lower = faster detection but more load. Range "
+            "5–3600 s.")
         self.poll.setValue(int(s["poll_interval_s"]))
         form.addRow("Poll interval (s)", self.poll)
-        self.avg_n = QSpinBox(); self.avg_n.setRange(1, 500)
+        self.avg_n = _NoWheelSpinBox(); self.avg_n.setRange(1, 500)
+        self.avg_n.setToolTip(
+            "Each poll averages up to this many recent samples before comparing "
+            "to thresholds, smoothing out noise. 1 = use the latest raw sample. "
+            "Range 1–500.")
         self.avg_n.setValue(int(s["avg_last_n"]))
         form.addRow("Average last N samples", self.avg_n)
-        self.window_s = QSpinBox(); self.window_s.setRange(5, 3600)
+        self.window_s = _NoWheelSpinBox(); self.window_s.setRange(5, 3600)
+        self.window_s.setToolTip(
+            "Time span (seconds) of archiver data fetched each poll to draw the "
+            "'last N samples' from. Should comfortably cover N samples at the "
+            "PV's update rate. Range 5–3600 s.")
         self.window_s.setValue(int(s["sample_window_s"]))
         form.addRow("Sample window (s)", self.window_s)
-        self.debounce = QSpinBox(); self.debounce.setRange(1, 20)
+        self.debounce = _NoWheelSpinBox(); self.debounce.setRange(1, 20)
+        self.debounce.setToolTip(
+            "A new state (Warning/Alarm/OK) must persist this many consecutive "
+            "polls before an alert is committed, suppressing brief spikes. "
+            "1 = alert immediately. Range 1–20 polls.")
         self.debounce.setValue(int(s["debounce_count"]))
         form.addRow("Debounce (polls)", self.debounce)
-        self.hyst = QDoubleSpinBox(); self.hyst.setRange(0, 0.5)
+        self.hyst = _NoWheelDoubleSpinBox(); self.hyst.setRange(0, 0.5)
         self.hyst.setSingleStep(0.01); self.hyst.setDecimals(3)
+        self.hyst.setToolTip(
+            "Dead-band around each threshold, as a fraction of it, that the "
+            "reading must clear before the state resets — stops flapping when a "
+            "value hovers on a limit. E.g. 0.05 = 5 %. Range 0–0.5.")
         self.hyst.setValue(float(s["hysteresis_frac"]))
         form.addRow("Hysteresis (fraction)", self.hyst)
-        self.cooldown = QSpinBox(); self.cooldown.setRange(0, 1440)
+        self.cooldown = _NoWheelSpinBox(); self.cooldown.setRange(0, 1440)
+        self.cooldown.setToolTip(
+            "Minimum minutes between repeat notifications for a PV that stays in "
+            "the same alert state, to avoid spam. 0 = notify only on state "
+            "change (no repeats). Range 0–1440 min.")
         self.cooldown.setValue(int(s["renotify_cooldown_minutes"]))
         form.addRow("Re-notify cooldown (min, 0=off)", self.cooldown)
         self.recovery = QCheckBox("Notify on recovery to OK")
         self.recovery.setStyleSheet(_CHK_STYLE)
+        self.recovery.setToolTip(
+            "When on, send an 'all clear' notification once a PV returns to OK "
+            "after a Warning/Alarm. When off, recoveries are silent.")
         self.recovery.setChecked(bool(s["recovery_notify"]))
         form.addRow("", self.recovery)
-        self.hist = QSpinBox(); self.hist.setRange(10, 10080)
+        self.hist = _NoWheelSpinBox(); self.hist.setRange(10, 10080)
+        self.hist.setToolTip(
+            "How many minutes of polled samples are kept in memory per PV for "
+            "the live graph. Larger = longer graph history but more memory. "
+            "Range 10–10080 min (one week).")
         self.hist.setValue(int(s["history_minutes"]))
         form.addRow("History kept (min)", self.hist)
-        self.graph_win = QSpinBox(); self.graph_win.setRange(1, 10080)
+        self.graph_win = _NoWheelSpinBox(); self.graph_win.setRange(1, 10080)
+        self.graph_win.setToolTip(
+            "Default visible time span (minutes) on the live graph's X axis. "
+            "Can't show more than 'History kept' holds. Range 1–10080 min.")
         self.graph_win.setValue(int(s["graph_window_minutes"]))
         form.addRow("Graph window (min)", self.graph_win)
+        self.valid_min = OptionalDoubleField("enable")
+        self.valid_min.setToolTip(
+            "Default sensor-error floor for every PV: readings below this are "
+            "discarded as bad. Individual PVs can override it. Unticked = no "
+            "lower bound by default.")
+        self.valid_min.set_value(s.get("valid_min_default"))
+        form.addRow("Global reject below <", self.valid_min)
+        self.valid_max = OptionalDoubleField("enable")
+        self.valid_max.setToolTip(
+            "Default sensor-error ceiling for every PV: readings above this are "
+            "discarded as bad. Individual PVs can override it. Unticked = no "
+            "upper bound by default.")
+        self.valid_max.set_value(s.get("valid_max_default"))
+        form.addRow("Global reject above >", self.valid_max)
         self.autostart = QCheckBox("Start monitoring on launch")
         self.autostart.setStyleSheet(_CHK_STYLE)
+        self.autostart.setToolTip(
+            "When on, the app begins polling and evaluating alerts automatically "
+            "as soon as it opens, without clicking 'Start monitoring'.")
         self.autostart.setChecked(bool(s["start_monitoring_on_launch"]))
         form.addRow("", self.autostart)
         lay.addWidget(form_grp)
@@ -1282,6 +2231,8 @@ class SettingsDialog(QDialog):
         s["recovery_notify"] = self.recovery.isChecked()
         s["history_minutes"] = self.hist.value()
         s["graph_window_minutes"] = self.graph_win.value()
+        s["valid_min_default"] = self.valid_min.value()
+        s["valid_max_default"] = self.valid_max.value()
         s["start_monitoring_on_launch"] = self.autostart.isChecked()
         self.accept()
 
@@ -1303,11 +2254,13 @@ MAX_GRAPH_POINTS = 3000
 
 
 def render_pv_png(pv_name: str, display_name: str, hours: float,
-                  thr: Thresholds, timeout: float) -> bytes | None:
+                  thr: Thresholds, timeout: float,
+                  vmin=None, vmax=None) -> bytes | None:
     """Fetch the last `hours` h from CPVA and render a value+threshold PNG.
 
     Worker-thread safe: builds its own Figure and uses the non-Qt Agg canvas,
     rendering to in-memory PNG bytes (no temp file, no shared matplotlib state).
+    Readings outside [vmin, vmax] are dropped as sensor errors.
     """
     end = api.now_ns()
     start = end - int(hours * 3600 * 1e9)
@@ -1317,10 +2270,13 @@ def render_pv_png(pv_name: str, display_name: str, hours: float,
         v = api.cpva_decode_value(s)
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             continue
+        fv = float(v)
+        if _out_of_range(fv, vmin, vmax):
+            continue
         t = s.get("time")
         if isinstance(t, (int, float)):
             xs.append(api.ns_to_prague(int(t)))
-            ys.append(float(v))
+            ys.append(fv)
             u = api.cpva_decode_units(s)
             if u:
                 units = u
@@ -1357,7 +2313,11 @@ class GraphPanel(QWidget):
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Show:"))
-        self.combo = QComboBox()
+        self.combo = _NoWheelComboBox()
+        self.combo.setToolTip(
+            "Choose what the graph below plots: 'All PVs' overlays every PV "
+            "(no threshold lines), or pick a single PV to see it alone with its "
+            "Warning/Alarm threshold lines drawn in.")
         self.combo.currentIndexChanged.connect(lambda *_: self.redraw())
         top.addWidget(self.combo, 1)
         lay.addLayout(top)
@@ -1457,7 +2417,7 @@ class _AlertSignals(QObject):
 class _AlertWorker(QRunnable):
     def __init__(self, sig: _AlertSignals, hub: NotificationHub,
                  payload: AlertPayload, thr: Thresholds, hours: float,
-                 timeout: float, tag: str):
+                 timeout: float, tag: str, vmin=None, vmax=None):
         super().__init__()
         self._sig = sig
         self._hub = hub
@@ -1466,13 +2426,16 @@ class _AlertWorker(QRunnable):
         self._hours = hours
         self._timeout = timeout
         self._tag = tag
+        self._vmin = vmin
+        self._vmax = vmax
 
     def run(self):
         png = None
         if self._hours > 0:
             try:
                 png = render_pv_png(self._payload.pv_name, self._payload.display_name,
-                                    self._hours, self._thr, self._timeout)
+                                    self._hours, self._thr, self._timeout,
+                                    self._vmin, self._vmax)
             except Exception:  # noqa: BLE001 - alert must still go out text-only
                 png = None
         errors = self._hub.dispatch(self._payload, png)
@@ -1550,12 +2513,21 @@ class MonitorWidget(QWidget):
         self.pvs: list[PVConfig] = [PVConfig.from_dict(d) for d in cfg["pvs"]]
         self.runtime: dict[str, PVRuntime] = {}
         self._all_channels: list[str] = []
+        # Clipboard for the right-click "Copy settings / Paste settings" feature.
+        self._copied_settings: Optional[dict] = None
+        self._copied_from: str = ""
+        # Latest value of every gate PV that isn't itself a monitored PV,
+        # refreshed each poll so state-dependent thresholds can switch.
+        self._gate_values: dict[str, Optional[float]] = {}
         self._poll_gen = 0
         self._monitoring = False
         self._sim_timer: Optional[QTimer] = None
+        self._resume_timer: Optional[QTimer] = None   # auto-resume after /stop <h>
+        self._resume_at_ns = 0
         self._cmd_timer: Optional[QTimer] = None
         self._cmd_last_id = None
         self._cmd_primed = False
+        self._cmd_handled_ids: deque = deque(maxlen=500)  # answered msg ids
         self._cmd_last_logged_error = ""
         self._cmd_bot_id = None
         self._cmd_poll_inflight = False
@@ -1600,26 +2572,52 @@ class MonitorWidget(QWidget):
         btn_row = QHBoxLayout()
         self.btn_monitor = _btn("▶ Start monitoring")
         self.btn_monitor.setCheckable(True)
+        self.btn_monitor.setToolTip(
+            "Start/stop the monitoring loop. While running, every PV is polled "
+            "at the configured interval, evaluated against its thresholds, and "
+            "alerts are sent on committed state changes.")
         self.btn_monitor.clicked.connect(self.toggle_monitoring)
         btn_row.addWidget(self.btn_monitor)
         btn_row.addSpacing(8)
 
+        tips = {
+            "Add PV": "Browse the CPVA archiver channel list and add one or "
+                      "more channels to monitor.",
+            "Edit": "Open the selected PV to edit its name, units, group, "
+                    "thresholds and valid range (same as double-clicking it).",
+            "Learn selected": "Auto-compute Warning/Alarm thresholds for the "
+                              "selected PV(s) from archiver history.",
+            "Remove": "Delete the selected PV(s) from the monitor list. Does "
+                      "not affect the archiver.",
+            "Poll now": "Read every PV once immediately, without waiting for the "
+                        "next scheduled poll. Works even while stopped.",
+            "Simulate alert": "Inject a fake alarm for the selected PV to test "
+                              "that notification channels are wired up "
+                              "correctly. No real data is changed.",
+        }
         for label, slot in (("Add PV", self.add_pv),
                             ("Edit", self.edit_pv),
+                            ("Learn selected", self.learn_selected),
                             ("Remove", self.remove_pv),
-                            ("Move ↑", lambda: self.move_pv(-1)),
-                            ("Move ↓", lambda: self.move_pv(1)),
                             ("Poll now", self.poll_now),
                             ("Simulate alert", self.simulate_alert)):
             b = _btn(label, SECONDARY_STYLE)
+            b.setToolTip(tips[label])
             b.clicked.connect(slot)
             btn_row.addWidget(b)
 
         self.btn_sendplot = _btn("Send plot now", SECONDARY_STYLE)
+        self.btn_sendplot.setToolTip(
+            "Render a trend plot of the selected PV (or all PVs) right now and "
+            "push it to the enabled notification channels, independently of any "
+            "alert.")
         self.btn_sendplot.clicked.connect(self.send_plot_now)
         btn_row.addWidget(self.btn_sendplot)
 
         self.btn_settings = _btn("Settings", SECONDARY_STYLE)
+        self.btn_settings.setToolTip(
+            "Open Settings: notification channels (Teams/Email/Webex), polling "
+            "and alert timing, and global valid-range defaults.")
         self.btn_settings.clicked.connect(self.open_settings)
         btn_row.addWidget(self.btn_settings)
 
@@ -1635,13 +2633,26 @@ class MonitorWidget(QWidget):
         self.table = QTableView()
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.doubleClicked.connect(lambda *_: self.edit_pv())
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.verticalHeader().setVisible(False)
+        # Drag a row to reorder; the drop indicator's top edge decides where it
+        # lands (drop into another group's block reassigns that group).
+        self.table.setDragEnabled(True)
+        self.table.setAcceptDrops(True)
+        self.table.setDragDropMode(QAbstractItemView.InternalMove)
+        self.table.setDefaultDropAction(Qt.MoveAction)
+        self.table.setDragDropOverwriteMode(False)
+        self.table.setDropIndicatorShown(True)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        for c in (0, 2, 3, 4, 5, 6, 7):
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)   # Display name
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)   # PV name
+        for c in (0, 3, 4, 5, 6, 7, 8):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.model.modelReset.connect(self._apply_group_spans)
+        self._apply_group_spans()
         splitter.addWidget(self.table)
 
         self.graph = GraphPanel(self)
@@ -1696,11 +2707,77 @@ class MonitorWidget(QWidget):
         self._stop_cmd_listener()
         self.persist()
 
+    def _apply_group_spans(self):
+        """Make each group-header row span the full width of the table."""
+        self.table.clearSpans()
+        for r, (kind, _ref) in enumerate(self.model._display):
+            if kind == "header":
+                self.table.setSpan(r, 0, 1, len(COLS))
+
     def _selected_pv(self) -> Optional[PVConfig]:
         rows = self.table.selectionModel().selectedRows()
-        if not rows:
+        for idx in rows:
+            pv = self.model.pv_at_row(idx.row())
+            if pv is not None:
+                return pv
+        return None
+
+    def _selected_pvs(self) -> list[PVConfig]:
+        rows = sorted(self.table.selectionModel().selectedRows(),
+                      key=lambda x: x.row())
+        out = [self.model.pv_at_row(i.row()) for i in rows]
+        return [pv for pv in out if pv is not None]
+
+    def _valid_range(self, pv: PVConfig):
+        """Effective (min, max) sanity range: per-PV override else global default."""
+        lo = pv.valid_min if pv.valid_min is not None \
+            else self.settings.get("valid_min_default")
+        hi = pv.valid_max if pv.valid_max is not None \
+            else self.settings.get("valid_max_default")
+        return lo, hi
+
+    def _gate_pv_names(self) -> set[str]:
+        """Every dependency PV referenced by a monitored PV (may or may not
+        itself be in the monitored list)."""
+        names: set[str] = set()
+        for pv in self.pvs:
+            names.update(g for g in pv.gate_pvs if g)
+        return names
+
+    def _gate_value(self, name: str) -> Optional[float]:
+        """Current value of a gate PV, whether it's monitored or fetched
+        alongside the poll."""
+        rt = self.runtime.get(name)
+        if rt is not None and rt.current_value is not None:
+            return rt.current_value
+        return self._gate_values.get(name)
+
+    def _match_profile(self, pv: PVConfig) -> Optional[dict]:
+        """The conditional profile in force for this PV right now, or None if
+        no rule matches (caller uses the default thresholds)."""
+        if not pv.gate_pvs or not pv.profiles:
             return None
-        return self.pvs[rows[0].row()]
+        return pv.match_profile([self._gate_value(g) for g in pv.gate_pvs])
+
+    def _active_thresholds(self, pv: PVConfig) -> Thresholds:
+        """The threshold set in force for this PV right now: the first matching
+        conditional profile's set, else the default set."""
+        prof = self._match_profile(pv)
+        return pv.profile_thresholds(prof) if prof is not None else pv.thresholds()
+
+    def learn_selected(self):
+        pvs = self._selected_pvs()
+        if not pvs:
+            QMessageBox.information(self, "Learn selected",
+                                    "Select one or more PVs first.")
+            return
+        params = _LearnParamsDialog(self, len(pvs))
+        if params.exec() != QDialog.Accepted:
+            return
+        days, warn_k, alarm_k = params.values()
+        self._log(f"Batch learn: {len(pvs)} PV(s), {days} d.")
+        self._batch = _BatchLearnController(self, pvs, days, warn_k, alarm_k)
+        self._batch.start()
 
     def _prefetch_channels(self):
         sig = _ChannelsSignals(self)
@@ -1724,7 +2801,6 @@ class MonitorWidget(QWidget):
             existing = {p.name for p in self.pvs}
             added = 0
             ml = self._history_maxlen()
-            self.model.beginResetModel()
             for name in dlg.selected:
                 if name in existing:
                     continue
@@ -1732,8 +2808,9 @@ class MonitorWidget(QWidget):
                 self.pvs.append(pv)
                 self.runtime[pv.name] = PVRuntime(history=deque(maxlen=ml))
                 added += 1
-            self.model.endResetModel()
             if added:
+                self._recluster()
+                self.model.reset()
                 self.graph.refresh_combo()
                 self.persist()
                 self._update_status()
@@ -1747,10 +2824,83 @@ class MonitorWidget(QWidget):
             return
         dlg = PVEditDialog(self, pv)
         if dlg.exec() == QDialog.Accepted:
-            self.model.refresh_all()
+            self._recluster()
+            self.model.reset()
             self.graph.refresh_combo()
             self.persist()
             self._log(f"Updated {pv.display_name}.")
+
+    # --- copy / paste settings ----------------------------------------
+    # Fields carried by copy/paste: limits, dependency gating and valid range.
+    # Identity (name/display_name/group), the enabled flag and learned-history
+    # stats stay with each target PV.
+    _COPY_KEYS = ("units", "warn_low", "warn_high", "alarm_low", "alarm_high",
+                  "gate_pvs", "profiles", "valid_min", "valid_max")
+
+    def _show_context_menu(self, pos):
+        idx = self.table.indexAt(pos)
+        pv = self.model.pv_at_row(idx.row()) if idx.isValid() else None
+        targets = self._selected_pvs()
+        menu = QMenu(self)
+
+        act_edit = menu.addAction("Edit…")
+        act_edit.setEnabled(pv is not None)
+        menu.addSeparator()
+        act_copy = menu.addAction("Copy settings")
+        act_copy.setEnabled(pv is not None)
+        paste_label = "Paste settings"
+        if self._copied_settings is not None:
+            paste_label += f" from {self._copied_from} → {len(targets)} PV(s)"
+        act_paste = menu.addAction(paste_label)
+        act_paste.setEnabled(self._copied_settings is not None and bool(targets))
+        menu.addSeparator()
+        act_remove = menu.addAction("Remove")
+        act_remove.setEnabled(bool(targets))
+
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_edit and pv is not None:
+            dlg = PVEditDialog(self, pv)
+            if dlg.exec() == QDialog.Accepted:
+                self._recluster()
+                self.model.reset()
+                self.graph.refresh_combo()
+                self.persist()
+                self._log(f"Updated {pv.display_name}.")
+        elif chosen == act_copy and pv is not None:
+            self._copy_pv_settings(pv)
+        elif chosen == act_paste:
+            self._paste_pv_settings(targets)
+        elif chosen == act_remove:
+            self.remove_pv()
+
+    def _copy_pv_settings(self, pv: PVConfig):
+        d = pv.to_dict()
+        self._copied_settings = {k: copy.deepcopy(d[k]) for k in self._COPY_KEYS}
+        self._copied_from = pv.display_name
+        self._log(f"Copied settings from {pv.display_name} "
+                  "(limits, dependencies, valid range).")
+
+    def _paste_pv_settings(self, targets: list[PVConfig]):
+        if not self._copied_settings or not targets:
+            return
+        names = ", ".join(pv.display_name for pv in targets)
+        if QMessageBox.question(
+                self, "Paste settings",
+                f"Overwrite limits, dependencies and valid range of "
+                f"{len(targets)} PV(s) with the settings copied from "
+                f"{self._copied_from}?\n\n{names}") != QMessageBox.Yes:
+            return
+        for pv in targets:
+            for k in self._COPY_KEYS:
+                setattr(pv, k, copy.deepcopy(self._copied_settings[k]))
+        self._recluster()
+        self.model.reset()
+        self.graph.refresh_combo()
+        self.persist()
+        self._log(f"Pasted settings from {self._copied_from} onto "
+                  f"{len(targets)} PV(s).")
 
     def remove_pv(self):
         pv = self._selected_pv()
@@ -1759,30 +2909,91 @@ class MonitorWidget(QWidget):
         if QMessageBox.question(self, "Remove PV",
                                 f"Remove {pv.display_name}?") != QMessageBox.Yes:
             return
-        self.model.beginResetModel()
         self.pvs.remove(pv)
         self.runtime.pop(pv.name, None)
-        self.model.endResetModel()
+        self.model.reset()
         self.graph.refresh_combo()
         self.persist()
         self._update_status()
         self._log(f"Removed {pv.display_name}.")
 
-    def move_pv(self, delta: int):
-        pv = self._selected_pv()
-        if not pv:
+    def _recluster(self):
+        """Reorder self.pvs so each group's PVs are contiguous.
+
+        Group order follows first appearance; within-group order is preserved.
+        This keeps the group-header view coherent after edits and drops.
+        """
+        buckets: dict[str, list] = {}
+        order: list[str] = []
+        for pv in self.pvs:
+            if pv.group not in buckets:
+                buckets[pv.group] = []
+                order.append(pv.group)
+            buckets[pv.group].append(pv)
+        self.pvs[:] = [pv for g in order for pv in buckets[g]]
+
+    def drop_pvs(self, names: list[str], target_disp: int):
+        """Move dragged PVs (by name) to a display row; adopt that spot's group.
+
+        target_disp is an index into the model's display rows (the drop
+        indicator sits *above* that row). Landing on/above a group header puts
+        the PVs at that group's top; landing just below a group's last row keeps
+        them in that group.
+        """
+        moving_names = set(names)
+        moving = [p for p in self.pvs if p.name in moving_names]  # original order
+        if not moving:
             return
-        i = self.pvs.index(pv)
-        j = i + delta
-        if 0 <= j < len(self.pvs):
-            self.model.beginResetModel()
-            self.pvs[i], self.pvs[j] = self.pvs[j], self.pvs[i]
-            self.model.endResetModel()
-            self.table.selectRow(j)
-            self.graph.refresh_combo()
-            self.persist()
+        disp = self.model._display
+        n = len(disp)
+        cur = disp[target_disp] if 0 <= target_disp < n else None
+
+        anchor = None          # insert immediately before this PV
+        after = None           # ...or immediately after this PV
+        if cur is None:                                   # dropped past the end
+            group = self.pvs[-1].group if self.pvs else ""
+        elif cur[0] == "pv":                              # before a PV row
+            anchor = cur[1]
+            group = anchor.group
+        else:                                             # on a group header
+            prev = disp[target_disp - 1] if target_disp - 1 >= 0 else None
+            if prev is None:                              # top of the first group
+                group = cur[1]
+                nxt = disp[target_disp + 1] if target_disp + 1 < n else None
+                anchor = nxt[1] if nxt and nxt[0] == "pv" else None
+            else:                                         # end of the prior group
+                after = prev[1]
+                group = after.group
+
+        reduced = [p for p in self.pvs if p.name not in moving_names]
+        for p in moving:
+            p.group = group
+
+        if anchor is not None and anchor.name not in moving_names:
+            idx = reduced.index(anchor)
+        elif after is not None and after.name not in moving_names:
+            idx = reduced.index(after) + 1
+        else:                                             # end of the target group
+            idxs = [i for i, p in enumerate(reduced) if p.group == group]
+            idx = (idxs[-1] + 1) if idxs else len(reduced)
+
+        reduced[idx:idx] = moving
+        self.pvs[:] = reduced
+        self._recluster()
+        self.model.reset()
+        self.graph.refresh_combo()
+        self.persist()
+
+    _CMD_KEYS = ("webex_enabled", "webex_mode", "webex_bot_token", "webex_rooms",
+                 "webex_commands_enabled", "webex_command_poll_s",
+                 "webex_command_allowlist")
+
+    def _cmd_settings_snapshot(self) -> str:
+        return json.dumps({k: self.settings.get(k) for k in self._CMD_KEYS},
+                          sort_keys=True, default=str)
 
     def open_settings(self):
+        before = self._cmd_settings_snapshot()
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.Accepted:
             self.hub = NotificationHub.from_settings(self.settings)
@@ -1793,13 +3004,19 @@ class MonitorWidget(QWidget):
                     rt.history = deque(rt.history, maxlen=ml)
             if self._monitoring:
                 self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
-            self._start_cmd_listener()
+            # Only restart the Webex command listener when its own settings
+            # changed (or it isn't running) — a needless restart re-primes and
+            # briefly drops commands for no reason.
+            if self._cmd_settings_snapshot() != before or self._cmd_timer is None:
+                self._start_cmd_listener()
             self.persist()
             self._update_status()
             self._log("Settings saved.")
 
     # --- monitoring loop ----------------------------------------------
     def toggle_monitoring(self, on: bool):
+        # Any explicit start/stop cancels a pending timed auto-resume.
+        self._cancel_resume()
         self._monitoring = on
         self.btn_monitor.setChecked(on)
         self.btn_monitor.setText("⏹ Stop monitoring" if on else "▶ Start monitoring")
@@ -1815,38 +3032,86 @@ class MonitorWidget(QWidget):
             self._log("Monitoring stopped.")
         self._update_status()
 
+    def _cancel_resume(self):
+        if self._resume_timer is not None:
+            self._resume_timer.stop()
+            self._resume_timer = None
+        self._resume_at_ns = 0
+
+    def pause_monitoring(self, hours: float):
+        """Stop monitoring and auto-resume after `hours` (used by /stop <h>)."""
+        self.toggle_monitoring(False)     # this clears any previous resume timer
+        ms = max(1, int(hours * 3600 * 1000))
+        self._resume_at_ns = api.now_ns() + int(hours * 3600 * 1e9)
+        self._resume_timer = QTimer(self)
+        self._resume_timer.setSingleShot(True)
+        self._resume_timer.timeout.connect(self._auto_resume)
+        self._resume_timer.start(ms)
+        until = api.ns_to_prague(self._resume_at_ns).strftime("%Y-%m-%d %H:%M")
+        self._log(f"Monitoring paused for {hours:g} h (auto-resume {until}).")
+
+    def _auto_resume(self):
+        self._resume_timer = None
+        self._resume_at_ns = 0
+        self._log("Auto-resume timer fired.")
+        self.toggle_monitoring(True)
+        if self.hub.webex.can_listen():
+            self._reply("▶ Monitoring auto-resumed (scheduled /stop elapsed).")
+
     def poll_now(self):
         self._log("Manual poll.")
         self._start_poll()
 
     def _start_poll(self):
+        monitored = {pv.name for pv in self.pvs}
         names = [pv.name for pv in self.pvs]
         if not names:
             return
+        # Also fetch any gate PV that isn't already monitored, so its value is
+        # available this pass to switch state-dependent thresholds.
+        names += [g for g in sorted(self._gate_pv_names()) if g not in monitored]
+        ranges = {pv.name: self._valid_range(pv) for pv in self.pvs}
         self._poll_gen += 1
         gen = self._poll_gen
         sig = _PollSignals(self)
         sig.done.connect(lambda res, g=gen: self._on_poll(res)
                          if g == self._poll_gen else None)
         self._poll_sig = sig
-        QThreadPool.globalInstance().start(_PollWorker(sig, names, dict(self.settings)))
+        QThreadPool.globalInstance().start(
+            _PollWorker(sig, names, dict(self.settings), ranges))
 
     def _on_poll(self, results: dict):
         now = api.now_ns()
+        # Refresh gate-PV values first so threshold switching below sees this
+        # pass's data (a gate PV may not itself be in the monitored list).
+        for g in self._gate_pv_names():
+            res = results.get(g)
+            if res is not None:
+                self._gate_values[g] = res[0]
         for pv in self.pvs:
             res = results.get(pv.name)
             if res is None:
                 continue
-            val, units, last_ts, err = res
+            val, units, last_ts, err, rejected = res
             rt = self.runtime[pv.name]
+            prev_rej = rt.rejected_count
             rt.current_value = val
             rt.current_units = units or rt.current_units
             rt.last_update_ns = last_ts or now
             rt.last_error = err
+            rt.rejected_count = rejected
+            rt.bad_data = (val is None and rejected > 0)
+            if rejected and not prev_rej:
+                self._log(f"{pv.display_name}: {err} — treating as sensor error.")
+            elif prev_rej and not rejected:
+                self._log(f"{pv.display_name}: readings back within valid range.")
             if val is not None:
                 rt.history.append((rt.last_update_ns, val))
-            if pv.enabled and pv.thresholds().is_active():
-                note = self.evaluator.evaluate(rt.alert, val, pv.thresholds(), now)
+            rt.active_profile = self._match_profile(pv)
+            thr = (pv.profile_thresholds(rt.active_profile)
+                   if rt.active_profile is not None else pv.thresholds())
+            if pv.enabled and thr.is_active():
+                note = self.evaluator.evaluate(rt.alert, val, thr, now)
                 if note is not None:
                     self._dispatch_alert(pv, rt, note)
         self.model.refresh_all()
@@ -1862,9 +3127,11 @@ class MonitorWidget(QWidget):
             reason=note.reason,
             timestamp_str=api.ns_to_prague_str(rt.last_update_ns or api.now_ns()),
             kind=note.kind)
-        self._launch_alert_worker(payload, pv.thresholds(), tag="auto")
+        self._launch_alert_worker(payload, self._active_thresholds(pv), tag="auto",
+                                  valid_range=self._valid_range(pv))
 
-    def _launch_alert_worker(self, payload: AlertPayload, thr: Thresholds, tag: str):
+    def _launch_alert_worker(self, payload: AlertPayload, thr: Thresholds, tag: str,
+                             valid_range=(None, None)):
         if not self.hub.is_any_configured():
             self._log("  No notification channel configured (see Settings).")
             if tag == "manual":
@@ -1872,11 +3139,13 @@ class MonitorWidget(QWidget):
             return
         hours = float(self.settings.get("alert_plot_hours", 12))
         timeout = float(self.settings["http_timeout_s"])
+        vmin, vmax = valid_range
         sig = _AlertSignals(self)
         sig.done.connect(self._on_alert_result)
         self._alert_sig = sig
         QThreadPool.globalInstance().start(
-            _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag))
+            _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag,
+                         vmin, vmax))
 
     def _on_alert_result(self, result):
         tag, errors, had_png = result
@@ -1899,7 +3168,8 @@ class MonitorWidget(QWidget):
             display_name=pv.display_name, value=value, units=units,
             reason="Manual plot request",
             timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="manual")
-        self._launch_alert_worker(payload, pv.thresholds(), tag=tag)
+        self._launch_alert_worker(payload, self._active_thresholds(pv), tag=tag,
+                                  valid_range=self._valid_range(pv))
 
     def send_plot_now(self):
         pv = self._selected_pv()
@@ -1991,13 +3261,29 @@ class MonitorWidget(QWidget):
             self._cmd_last_logged_error = err
         elif not err:
             self._cmd_last_logged_error = ""
+        if not self._cmd_primed:
+            # Establish a baseline WITHOUT processing backlog. Only prime on a
+            # *successful* poll: priming on a failed one (newest_id=None) would
+            # leave last_id=None, so the next poll would treat the whole fetched
+            # backlog as "new" and re-answer every old command — this is what
+            # produced the duplicate command-list messages after a restart.
+            if err:
+                return   # retry priming on the next poll; no baseline yet
+            self._cmd_last_id = newest_id
+            self._cmd_primed = True
+            return
         if newest_id:
             self._cmd_last_id = newest_id
-        if not self._cmd_primed:
-            self._cmd_primed = True   # don't replay backlog on the first poll
-            return
         allow = [e.lower() for e in self.settings.get("webex_command_allowlist", [])]
         for it in new_items:
+            mid = it.get("id")
+            # Belt-and-braces: never act on a message id twice, even if a
+            # listener restart (e.g. after a Settings save, which rebuilds the
+            # hub and clears its own-message dedup) makes it reappear.
+            if mid:
+                if mid in self._cmd_handled_ids:
+                    continue
+                self._cmd_handled_ids.append(mid)
             if self._cmd_bot_id and it.get("personId") == self._cmd_bot_id:
                 continue
             if self.hub.webex.is_own_message(it.get("id")):
@@ -2066,8 +3352,18 @@ class MonitorWidget(QWidget):
                 self.toggle_monitoring(True)
                 self._reply("▶ Monitoring started.")
             elif cmd == "/stop":
-                self.toggle_monitoring(False)
-                self._reply("⏹ Monitoring stopped.")
+                if args:
+                    hours = float(args[0])
+                    if hours <= 0:
+                        raise ValueError("hours must be > 0")
+                    self.pause_monitoring(hours)
+                    until = api.ns_to_prague(self._resume_at_ns).strftime(
+                        "%Y-%m-%d %H:%M")
+                    self._reply(f"⏸ Monitoring paused for {hours:g} h — "
+                                f"auto-resume at {until}. Send /start to resume now.")
+                else:
+                    self.toggle_monitoring(False)
+                    self._reply("⏹ Monitoring stopped (no auto-resume).")
             elif cmd == "/window":
                 mins = int(float(args[0]))
                 self.settings["graph_window_minutes"] = mins
@@ -2122,7 +3418,9 @@ class MonitorWidget(QWidget):
             "- `/status` — all PVs + values + state\n"
             "- `/list` — list configured PVs\n"
             "- `/plot <pv>` — send current plot of a PV\n"
-            "- `/start` `/stop` — monitoring on/off\n"
+            "- `/start` — monitoring on\n"
+            "- `/stop [hours]` — monitoring off; with hours, auto-resume later "
+            "(e.g. `/stop 10`)\n"
             "- `/enable <pv>` `/disable <pv>` — alerting per PV\n"
             "- `/graph <pv|all>` — set the live graph\n"
             "- `/window <minutes>` — graph time window\n"
@@ -2152,12 +3450,12 @@ class MonitorWidget(QWidget):
         if not pv:
             QMessageBox.information(self, "Simulate", "Select a PV first.")
             return
-        if not pv.thresholds().is_active():
+        if not self._active_thresholds(pv).is_active():
             QMessageBox.information(
                 self, "Simulate",
                 "This PV has no thresholds set. Edit/learn limits first.")
             return
-        thr = pv.thresholds()
+        thr = self._active_thresholds(pv)
         # Build a synthetic OK -> ALARM -> OK sequence from the thresholds.
         hi = thr.alarm_high if thr.alarm_high is not None else None
         lo = thr.alarm_low if thr.alarm_low is not None else None
@@ -2188,7 +3486,7 @@ class MonitorWidget(QWidget):
         rt.current_value = v
         rt.last_update_ns = api.now_ns()
         rt.history.append((rt.last_update_ns, v))
-        note = self.evaluator.evaluate(self._sim_state, v, pv.thresholds(),
+        note = self.evaluator.evaluate(self._sim_state, v, self._active_thresholds(pv),
                                        rt.last_update_ns)
         # Reflect simulated level in the table without touching the real alert state.
         rt.alert.level = self._sim_state.level

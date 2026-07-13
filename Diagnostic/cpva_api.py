@@ -97,7 +97,13 @@ def _chunk_is_night(chunk_start_ns: int, chunk_end_ns: int) -> bool:
 def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
                                timeout: float = CPVA_HTTP_TIMEOUT,
                                log_fn=None,
-                               max_workers: int = 12) -> list[dict]:
+                               max_workers: int = 12,
+                               progress_fn=None) -> list[dict]:
+    """Fetch a channel's samples in parallel time-chunks.
+
+    progress_fn, if given, is called as progress_fn(done, total) after each
+    chunk completes so callers can drive a progress bar.
+    """
     chunks = []
     cs = start_ns
     i = 0
@@ -110,15 +116,21 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
         cs = ce
 
     if not chunks:
+        if progress_fn:
+            progress_fn(0, 0)
         return []
 
     if len(chunks) == 1:
-        return cpva_fetch_samples(channel, chunks[0][1], chunks[0][2], timeout)
+        out = cpva_fetch_samples(channel, chunks[0][1], chunks[0][2], timeout)
+        if progress_fn:
+            progress_fn(1, 1)
+        return out
 
     if log_fn:
         log_fn(f"      {channel}: {len(chunks)} chunks")
 
-    workers = min(max_workers, len(chunks))
+    total = len(chunks)
+    workers = min(max_workers, total)
     results_map = {}
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -126,9 +138,13 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
             ex.submit(cpva_fetch_samples, channel, cs, ce, timeout): idx
             for idx, cs, ce in chunks
         }
+        done = 0
         for fut in as_completed(futures):
             idx = futures[fut]
             results_map[idx] = fut.result()
+            done += 1
+            if progress_fn:
+                progress_fn(done, total)
 
     results = []
     for idx in sorted(results_map):
