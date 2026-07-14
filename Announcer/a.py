@@ -6,6 +6,7 @@ Monitors a specific region on screen and alerts on change.
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import json
+import re
 import time
 import threading
 import urllib.parse
@@ -53,6 +54,40 @@ for _i, _label in enumerate(_CHILLER_LABELS, start=1):
     )
     # DA1-DA4 + Helium Chiller: 7..17.5 °C ; Utility chiller: 18..22 °C
     _PV_ABS_RANGE.append((18.0, 22.0) if _i == 6 else (7.0, 17.5))
+
+
+def set_app_icon(win, ico_path, app_id=None):
+    """Apply icon.ico to the title bar AND the Windows taskbar button.
+
+    tkinter's iconbitmap only sets the title bar icon; the Windows 11 taskbar
+    reads the small icon slots + window-class icon, which Tk leaves as its
+    default feather. We force every slot from icon.ico via Win32.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
+        for which, h in ((1, big), (0, sm), (2, sm)):
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)
+        if sm:
+            set_cls(hwnd, -34, sm)
+    except Exception:
+        pass
 
 
 def _pv_key(channel):
@@ -120,7 +155,7 @@ def _readable_pv_error(pv_name, exc):
     return f"{pv_name} — {detail}", hint
 
 
-_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry", "flash_mode", "image_file"}
+_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry", "image_geometry", "flash_mode", "image_file"}
 
 
 class RegionSelector(tk.Toplevel):
@@ -224,11 +259,7 @@ class ScreenTracker(tk.Tk):
             pass
         super().__init__()
         self.title("Announcer")
-
-        try:
-            self.iconbitmap(self._get_icon_path())
-        except Exception:
-            pass
+        set_app_icon(self, self._get_icon_path())
 
         self.resizable(True, True)
         self.attributes("-topmost", True)
@@ -268,6 +299,11 @@ class ScreenTracker(tk.Tk):
         self._log_tip_item = None
         self._geom_before_hide = None
 
+        # Separate image (flash) window — decoupled from the control window.
+        self._image_win = None
+        self._image_geometry = None
+        self._flash_overlay = None
+
         if getattr(sys, "frozen", False):
             _base = Path(sys.executable).parent
         else:
@@ -292,7 +328,8 @@ class ScreenTracker(tk.Tk):
         self.bind("<Button-1>", self._on_any_click)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         saved_geom = self._presets.get("window_geometry")
-        self.geometry(saved_geom if saved_geom else "400x360")
+        self.geometry(self._clamp_geometry(saved_geom) if saved_geom else "400x360")
+        self._image_geometry = self._presets.get("image_geometry")
 
     # ------------------------------------------------------------------
     # UI
@@ -306,10 +343,7 @@ class ScreenTracker(tk.Tk):
             self._flash_job = None
 
         self._is_flashing = False
-        if hasattr(self, "_flash_overlay"):
-            self._flash_overlay.place_forget()
-        if self._flash_img_label is not None:
-            self._flash_img_label.place_forget()
+        self._hide_image_win()
         self._set_ui_visible(True)
 
     def _get_icon_path(self):
@@ -671,9 +705,11 @@ class ScreenTracker(tk.Tk):
         if isinstance(data, list):
             coords = data
             preset_geom = None
+            preset_img_geom = None
         elif isinstance(data, dict):
             coords = data.get("region") or []
             preset_geom = data.get("window_geometry")
+            preset_img_geom = data.get("image_geometry")
         else:
             return
         if not coords:
@@ -682,7 +718,9 @@ class ScreenTracker(tk.Tk):
         self._set_ui_visible(True)
         geom = preset_geom or self._presets.get("window_geometry")
         if geom:
-            self.geometry(geom)
+            self.geometry(self._clamp_geometry(geom))
+        self._image_geometry = (preset_img_geom or self._presets.get("image_geometry")
+                                or self._image_geometry)
 
     def _delete_preset(self):
         name = self._preset_var.get()
@@ -768,7 +806,7 @@ class ScreenTracker(tk.Tk):
         img_combo.grid(row=4, column=1, sticky="w", padx=(0,6), pady=(0,6))
 
         ttk.Label(thr_frame,
-                  text="Align the image via \"Set location and size of this window\" below.",
+                  text="Align the image via \"Set image window\" below.",
                   foreground="gray", wraplength=220, justify="left").grid(
             row=5, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
 
@@ -795,15 +833,22 @@ class ScreenTracker(tk.Tk):
             self._sound_combo.current(self._sound_files.index(self.sound_file.get()))
         self._sound_combo.grid(row=3, column=1, padx=(0,6), pady=(0,6))
 
-        # Window position & size
+        # Window position & size — two independent windows
         win_frame = ttk.LabelFrame(frame, text="Window position & size")
         win_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        win_frame.columnconfigure(0, weight=1)
         ttk.Label(win_frame,
-                  text="Move and resize the Announcer window, then save its position.").grid(
-            row=0, column=0, padx=(6, 4), pady=(4, 4), sticky="w")
-        ttk.Button(win_frame, text="Set location and size of this window",
-                   command=self._start_window_recording).grid(
-            row=0, column=1, padx=(0, 6), pady=(4, 4))
+                  text="Control panel (circle, presets, alerts):").grid(
+            row=0, column=0, padx=(6, 4), pady=(4, 2), sticky="w")
+        ttk.Button(win_frame, text="Set control window",
+                   command=self._start_control_window_recording).grid(
+            row=0, column=1, padx=(0, 6), pady=(4, 2))
+        ttk.Label(win_frame,
+                  text="Image window (where the alarm image flashes):").grid(
+            row=1, column=0, padx=(6, 4), pady=(2, 4), sticky="w")
+        ttk.Button(win_frame, text="Set image window",
+                   command=self._start_image_window_recording).grid(
+            row=1, column=1, padx=(0, 6), pady=(2, 4))
 
         # PV Limits table
         pv_lim_frame = ttk.LabelFrame(frame, text="PV Limits")
@@ -943,6 +988,11 @@ class ScreenTracker(tk.Tk):
 
     def _stop_tracking(self):
         self.tracking = False
+        if self._flash_job:
+            self.after_cancel(self._flash_job)
+            self._flash_job = None
+        self._is_flashing = False
+        self._hide_image_win()
         if self._poll_job:
             self.after_cancel(self._poll_job)
             self._poll_job = None
@@ -987,6 +1037,88 @@ class ScreenTracker(tk.Tk):
         self._update_circle()
 
     # ------------------------------------------------------------------
+    # Image (flash) window
+    # ------------------------------------------------------------------
+    def _ensure_image_win(self):
+        """Create (once) the borderless, chroma-keyed window used for the flash.
+
+        It is a separate Toplevel from the control window so the alarm image can
+        be positioned and sized independently. Kept withdrawn until a flash."""
+        if self._image_win is not None and self._image_win.winfo_exists():
+            return self._image_win
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=self._flash_key)
+        try:
+            win.attributes("-transparentcolor", self._flash_key)
+        except Exception:
+            pass
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        win.withdraw()
+        self._image_win = win
+        self._flash_overlay = tk.Frame(win, bg=self._flash_key)
+        self._flash_img_label = tk.Label(self._flash_overlay, bd=0,
+                                         highlightthickness=0, bg=self._flash_key)
+        self._align_label = tk.Label(win, bd=0, highlightthickness=0, bg=self._chroma)
+        return win
+
+    def _clamp_geometry(self, geom):
+        """Keep a saved Tk geometry string on a visible monitor.
+
+        Saved geometries store absolute ``+x+y`` coordinates, which may point
+        at a monitor that does not exist on another machine (e.g. a second
+        screen at x=2729). In that case the window would open off-screen, so
+        reposition it onto the primary monitor. Size-only or unparseable
+        strings are returned unchanged (OS decides placement)."""
+        if not geom:
+            return geom
+        m = re.match(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)$", geom)
+        if not m:
+            return geom
+        gw, gh, x, y = m.groups()
+        x, y = int(x), int(y)
+        try:
+            monitors = self._monitors or screeninfo.get_monitors()
+        except Exception:
+            return geom
+        if not monitors:
+            return geom
+        w = int(gw) if gw else 400
+        h = int(gh) if gh else 360
+
+        def _on_monitor(px, py):
+            return any(mon.x <= px < mon.x + mon.width and
+                       mon.y <= py < mon.y + mon.height for mon in monitors)
+
+        # Visible if the title-bar area (top-left corner) sits on a monitor.
+        if _on_monitor(x, y) and _on_monitor(x + min(w, 60), y + min(h, 20)):
+            return geom
+
+        prim = next((mon for mon in monitors
+                     if getattr(mon, "is_primary", False)), monitors[0])
+        nx = max(prim.x, min(x, prim.x + prim.width  - w))
+        ny = max(prim.y, min(y, prim.y + prim.height - h))
+        prefix = f"{gw}x{gh}" if gw else ""
+        return f"{prefix}+{nx}+{ny}"
+
+    def _resolve_image_geometry(self):
+        """Geometry string for the image window; fall back to the control
+        window's current geometry so behaviour matches the old single-window
+        setup until the user sets a dedicated image window."""
+        return (self._image_geometry
+                or self._presets.get("image_geometry")
+                or self.geometry())
+
+    def _hide_image_win(self):
+        if self._flash_overlay is not None:
+            self._flash_overlay.place_forget()
+        if self._flash_img_label is not None:
+            self._flash_img_label.place_forget()
+        if self._image_win is not None and self._image_win.winfo_exists():
+            self._image_win.withdraw()
+
+    # ------------------------------------------------------------------
     # Flash and sound
     # ------------------------------------------------------------------
     def _start_flash(self):
@@ -994,14 +1126,26 @@ class ScreenTracker(tk.Tk):
         d = self.flash_duration.get()
         self._flash_deadline = time.time() + d if d > 0 else float("inf")
 
+        # Position/show the dedicated image window at its own geometry.
+        win = self._ensure_image_win()
+        win.overrideredirect(True)
+        try:
+            win.attributes("-transparentcolor", self._flash_key)
+        except Exception:
+            pass
+        win.geometry(self._clamp_geometry(self._resolve_image_geometry()))
+        win.deiconify()
+        win.lift()
+        win.attributes("-topmost", True)
+        win.update_idletasks()
+
         # Decide effective mode: fall back to "color" if image is requested but
         # no usable template is available.
         mode = self.flash_mode.get()
         self._flash_photo = None
         self._flash_photo_inv = None
         if mode in ("image", "alternate"):
-            self.update_idletasks()
-            size = (self.winfo_width(), self.winfo_height())
+            size = (win.winfo_width(), win.winfo_height())
             self._flash_photo = self._make_flash_photo(size, key=self._flash_key)
             if mode == "alternate":
                 self._flash_photo_inv = self._make_flash_photo(size, invert=True, key=self._flash_key)
@@ -1010,27 +1154,13 @@ class ScreenTracker(tk.Tk):
                 mode = "color"
         self._flash_active_mode = mode
 
-        # Keep chroma-key transparency on for the whole trip: keyed areas stay
-        # see-through (per user choice — transparency over clickability). A dedicated
-        # magenta key is used so PIL-painted pixels reliably become transparent. The
-        # alarm is dismissed by clicking an opaque (flash-coloured) area or Esc.
-        try:
-            self.attributes("-transparentcolor", self._flash_key)
-        except Exception:
-            pass
-
-        # Overlay frame covers the whole window — avoids ttk widget bg gaps
-        if not hasattr(self, "_flash_overlay"):
-            self._flash_overlay = tk.Frame(self)
+        # Overlay frame covers the whole image window — avoids widget bg gaps.
         self._flash_overlay.configure(bg=self._flash_key)
         self._flash_overlay.place(x=0, y=0, relwidth=1, relheight=1)
         self._flash_overlay.lift()
         self._flash_overlay.bind("<Button-1>", self._on_any_click)
 
         if mode in ("image", "alternate"):
-            if self._flash_img_label is None or not self._flash_img_label.winfo_exists():
-                self._flash_img_label = tk.Label(self._flash_overlay, bd=0,
-                                                 highlightthickness=0)
             self._flash_img_label.configure(image=self._flash_photo, bg=self._flash_key)
             self._flash_img_label.bind("<Button-1>", self._on_any_click)
             self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
@@ -1039,18 +1169,17 @@ class ScreenTracker(tk.Tk):
         # Esc as a reliable dismiss (clicks only land on opaque areas). Needs focus
         # because the flashing window is borderless (overrideredirect).
         try:
-            self.focus_force()
+            win.focus_force()
         except Exception:
             pass
+        win.bind("<Escape>", self._on_any_click)
         self.bind("<Escape>", self._on_any_click)
         self._do_flash()
 
     def _do_flash(self):
         if time.time() > self._flash_deadline:
             self._is_flashing = False
-            self._flash_overlay.place_forget()
-            if self._flash_img_label is not None:
-                self._flash_img_label.place_forget()
+            self._hide_image_win()
             self._set_ui_visible(True)
             return
         self._flash_state = not self._flash_state
@@ -1104,10 +1233,7 @@ class ScreenTracker(tk.Tk):
             self.after_cancel(self._flash_job)
             self._flash_job = None
         self._is_flashing = False
-        if hasattr(self, "_flash_overlay"):
-            self._flash_overlay.place_forget()
-        if self._flash_img_label is not None:
-            self._flash_img_label.place_forget()
+        self._hide_image_win()
         self.changed = False
         self.tracking = False
         self.status_var.set("Ready.")
@@ -1239,19 +1365,26 @@ class ScreenTracker(tk.Tk):
             self.flash_color.set(color[1])
             self._flash_color_btn.config(bg=color[1])
 
-    def _start_window_recording(self):
+    # ------------------------------------------------------------------
+    # Window position & size recorders (control window + image window)
+    # ------------------------------------------------------------------
+    def _open_geometry_recorder(self, *, key, prep, teardown, fetch_geom,
+                                fit_action, title, instr):
+        """Shared recorder dialog: scope radios + DONE/Cancel. `prep`/`teardown`
+        show and restore the target window, `fetch_geom` returns the geometry to
+        persist under `key` (global or per-preset)."""
         if self._settings_popup and self._settings_popup.winfo_exists():
             self._settings_popup.destroy()
             self._settings_popup = None
 
+        prep()
+
         rec_win = tk.Toplevel(self)
-        rec_win.title("Set window position & size")
+        rec_win.title(title)
         rec_win.attributes("-topmost", True)
         rec_win.resizable(False, False)
 
-        ttk.Label(rec_win,
-                  text="Move and resize the Announcer window\nto the desired position, then click DONE.",
-                  justify="center").pack(padx=16, pady=(12, 8))
+        ttk.Label(rec_win, text=instr, justify="center").pack(padx=16, pady=(12, 8))
 
         scope_var = tk.StringVar(value="global")
         scope_frame = ttk.LabelFrame(rec_win, text="Save for")
@@ -1268,24 +1401,11 @@ class ScreenTracker(tk.Tk):
             ttk.Label(scope_frame, text="(select a preset to enable preset-only save)",
                       foreground="gray").pack(anchor="w", padx=8, pady=(0, 4))
 
-        # Optional: snap the window to the template's native pixel size so the
-        # flashing image matches the captured object 1:1 on the monitor.
-        img_path = self._image_path(self.image_file.get())
-        if self.flash_mode.get() in ("image", "alternate") and img_path is not None:
-            def fit_native():
-                try:
-                    from PIL import Image
-                    iw, ih = Image.open(img_path).size
-                except Exception as e:
-                    self._log_message(f"Image size read failed: {e}")
-                    return
-                self.geometry(f"{iw}x{ih}")
-                self.update_idletasks()
-                self._refresh_align_ghost()
+        if fit_action is not None:
             fit_frame = ttk.Frame(rec_win)
             fit_frame.pack(padx=12, pady=(0, 8), fill="x")
             ttk.Button(fit_frame, text="Fit window to image (1:1 pixels)",
-                       command=fit_native).pack(fill="x")
+                       command=fit_action).pack(fill="x")
             ttk.Label(fit_frame,
                       text="Sets the window to the image's captured pixel size, then just drag to position.",
                       foreground="gray", wraplength=300, justify="left").pack(anchor="w", pady=(2, 0))
@@ -1293,21 +1413,14 @@ class ScreenTracker(tk.Tk):
         btn_frame = ttk.Frame(rec_win)
         btn_frame.pack(pady=(0, 12))
 
-        # Show a faded ghost of the template so the window can be aligned over
-        # the real object on the monitor (only in image / alternate modes).
-        self._start_align_ghost()
-
         def on_done():
-            # Save the CLIENT origin (not the decorated frame origin): during the
-            # actual flash the window is borderless (overrideredirect), so its
-            # client area must land where the ghost was aligned here.
-            geom = f"{self.winfo_width()}x{self.winfo_height()}+{self.winfo_rootx()}+{self.winfo_rooty()}"
-            self._stop_align_ghost()
-            self._save_window_geometry(geom, scope_var.get(), current_preset)
+            geom = fetch_geom()
+            teardown()
+            self._save_geometry(geom, scope_var.get(), current_preset, key)
             rec_win.destroy()
 
         def on_cancel():
-            self._stop_align_ghost()
+            teardown()
             rec_win.destroy()
 
         ttk.Button(btn_frame, text="DONE", command=on_done, width=10).pack(side="left", padx=(0, 8))
@@ -1321,34 +1434,118 @@ class ScreenTracker(tk.Tk):
         rw = self.winfo_width()
         rec_win.geometry(f"+{rx + rw + 10}+{ry}")
 
+    def _start_control_window_recording(self):
+        """Record position/size of the control window (this window)."""
+        self._open_geometry_recorder(
+            key="window_geometry",
+            prep=lambda: (self.lift(), self.attributes("-topmost", True)),
+            teardown=lambda: None,
+            fetch_geom=lambda: (f"{self.winfo_width()}x{self.winfo_height()}"
+                                f"+{self.winfo_rootx()}+{self.winfo_rooty()}"),
+            fit_action=None,
+            title="Set control window position & size",
+            instr=("Move and resize the CONTROL window (circle, presets, alerts)\n"
+                   "to the desired position, then click DONE."))
+
+    def _start_image_window_recording(self):
+        """Record position/size of the separate image (flash) window."""
+        win = self._ensure_image_win()
+        geom = self._clamp_geometry(
+            self._resolve_image_geometry()
+            or f"400x300+{self.winfo_rootx() + 40}+{self.winfo_rooty() + 40}")
+        has_image = (self.flash_mode.get() in ("image", "alternate")
+                     and self._image_path(self.image_file.get()) is not None)
+
+        def prep():
+            # Decorated + semi-transparent so the borderless window can be dragged
+            # and the desktop shows through for alignment.
+            win.overrideredirect(False)
+            win.title("Image window — drag to position, then DONE")
+            try: win.attributes("-transparentcolor", "")
+            except Exception: pass
+            try: win.attributes("-alpha", 0.6)
+            except Exception: pass
+            win.configure(bg=self._chroma)
+            win.geometry(geom)
+            win.deiconify()
+            win.lift()
+            win.attributes("-topmost", True)
+            if has_image:
+                self._start_align_ghost()
+            else:
+                # No template: show a solid flash-colour rectangle so the bounds
+                # are visible while positioning.
+                self._flash_overlay.configure(bg=self.flash_color.get())
+                self._flash_overlay.place(x=0, y=0, relwidth=1, relheight=1)
+
+        def teardown():
+            self._stop_align_ghost()
+            if self._flash_overlay is not None:
+                self._flash_overlay.place_forget()
+            try: win.attributes("-alpha", 1.0)
+            except Exception: pass
+            win.configure(bg=self._flash_key)
+            win.overrideredirect(True)
+            try: win.attributes("-transparentcolor", self._flash_key)
+            except Exception: pass
+            win.withdraw()
+
+        def fetch_geom():
+            g = (f"{win.winfo_width()}x{win.winfo_height()}"
+                 f"+{win.winfo_rootx()}+{win.winfo_rooty()}")
+            self._image_geometry = g
+            return g
+
+        def fit_action():
+            p = self._image_path(self.image_file.get())
+            if p is None:
+                return
+            try:
+                from PIL import Image
+                iw, ih = Image.open(p).size
+            except Exception as e:
+                self._log_message(f"Image size read failed: {e}")
+                return
+            win.geometry(f"{iw}x{ih}")
+            win.update_idletasks()
+            self._align_last_size = (0, 0)
+            self._refresh_align_ghost()
+
+        self._open_geometry_recorder(
+            key="image_geometry",
+            prep=prep, teardown=teardown, fetch_geom=fetch_geom,
+            fit_action=fit_action if has_image else None,
+            title="Set image window position & size",
+            instr=("Move and resize the IMAGE window (where the alarm flashes)\n"
+                   "to the desired position, then click DONE."))
+
     def _start_align_ghost(self):
-        """During window recording, overlay a faint template ghost that rescales
-        with the window so the user can align it over the monitor object."""
+        """During image-window recording, overlay a faint template ghost that
+        rescales with the window so the user can align it over the monitor
+        object. Operates on the dedicated image window."""
         if self.flash_mode.get() not in ("image", "alternate"):
             return
         if self._image_path(self.image_file.get()) is None:
             self._log_message("No template image selected to align.")
             return
-        try:
-            self.attributes("-alpha", 0.5)   # see the desktop through the window
-        except Exception:
-            pass
-        if self._align_label is None or not self._align_label.winfo_exists():
-            self._align_label = tk.Label(self, bd=0, highlightthickness=0, bg=self._chroma)
+        win = self._image_win
+        if win is None or self._align_label is None or not self._align_label.winfo_exists():
+            return
         self._align_last_size = (0, 0)
         self._align_label.place(x=0, y=0, relwidth=1, relheight=1)
         self._align_label.lift()
-        self._align_bind = self.bind("<Configure>", self._on_align_configure, "+")
+        self._align_bind = win.bind("<Configure>", self._on_align_configure, "+")
         self.after(50, self._refresh_align_ghost)
 
     def _on_align_configure(self, event):
-        if event.widget is self:
+        if event.widget is self._image_win:
             self._refresh_align_ghost()
 
     def _refresh_align_ghost(self):
-        if self._align_label is None or not self._align_label.winfo_exists():
+        win = self._image_win
+        if win is None or self._align_label is None or not self._align_label.winfo_exists():
             return
-        size = (self.winfo_width(), self.winfo_height())
+        size = (win.winfo_width(), win.winfo_height())
         if size == self._align_last_size:
             return
         self._align_last_size = size
@@ -1358,29 +1555,26 @@ class ScreenTracker(tk.Tk):
             self._align_label.lift()
 
     def _stop_align_ghost(self):
-        if self._align_bind is not None:
+        win = self._image_win
+        if self._align_bind is not None and win is not None:
             try:
-                self.unbind("<Configure>", self._align_bind)
+                win.unbind("<Configure>", self._align_bind)
             except Exception:
                 pass
             self._align_bind = None
         if self._align_label is not None:
             self._align_label.place_forget()
         self._align_photo = None
-        try:
-            self.attributes("-alpha", 1.0)
-        except Exception:
-            pass
 
-    def _save_window_geometry(self, geom, scope, preset_name):
+    def _save_geometry(self, geom, scope, preset_name, key):
         if scope == "global":
-            self._presets["window_geometry"] = geom
+            self._presets[key] = geom
         elif scope == "preset" and preset_name and preset_name in self._presets:
             data = self._presets[preset_name]
             if isinstance(data, list):
-                self._presets[preset_name] = {"region": data, "window_geometry": geom}
+                self._presets[preset_name] = {"region": data, key: geom}
             elif isinstance(data, dict):
-                data["window_geometry"] = geom
+                data[key] = geom
         self._save_presets_file()
 
     # ------------------------------------------------------------------

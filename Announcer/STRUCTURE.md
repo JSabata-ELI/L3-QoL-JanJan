@@ -52,9 +52,13 @@ Hlavní okno aplikace.
 | `_start_flash()` | Animované blikání overlay framu přes celé okno |
 | `_play_sound()` | `winsound.Beep` nebo WAV ze složky `sounds/` v background vlákně |
 
-**Presets:** region uložen jako JSON do `presets.json` (vedle exe)
+**Presets:** region uložen jako JSON do `presets.json` (vedle exe). Geometrie oken: `window_geometry` (ovládací okno) a `image_geometry` (obrázkové okno) — každá globálně (top-level klíč) nebo per-preset (uvnitř dictu presetu).
 
-**Settings popup:** práh detekce, barva flashe, trvání flashe, zvuk (freq / duration / WAV soubor)
+**Dvě nezávislá okna:**
+- *Ovládací okno* (`ScreenTracker` sám) — kolečko, presety, PV alerty, log. Za trackingu HUD (borderless + chroma-key). Geometrie `window_geometry`.
+- *Obrázkové okno* (`_image_win`, samostatný `Toplevel`) — sem blikne alarm obrázek/barva. Vlastní geometrie `image_geometry`, jinak fallback na geometrii ovládacího okna. Za tripu jsou obě okna viditelná zároveň. Vytvořeno v `_ensure_image_win()`.
+
+**Settings popup:** práh detekce, barva flashe, trvání flashe, flash mode, obrázek, zvuk (freq / duration / WAV soubor), dva recordery geometrie ("Set control window" / "Set image window" → `_start_control_window_recording` / `_start_image_window_recording`, sdílejí `_open_geometry_recorder`)
 
 **Preview popup:** hover nebo klik na "Preview region" — miniatura aktuálního screenshotu oblasti
 

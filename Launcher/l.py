@@ -622,6 +622,40 @@ def prompt_restore_swap_state(parent: tk.Tk, stuck: list[tuple[str, Path, Path]]
         )
 
 # ---------------- APP ----------------
+def set_app_icon(win, ico_path, app_id=None):
+    """Apply icon.ico to the title bar AND the Windows taskbar button.
+
+    tkinter's iconbitmap only sets the title bar icon; the Windows 11 taskbar
+    reads the small icon slots + window-class icon, which Tk leaves as its
+    default feather. We force every slot from icon.ico via Win32.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
+        for which, h in ((1, big), (0, sm), (2, sm)):
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)
+        if sm:
+            set_cls(hwnd, -34, sm)
+    except Exception:
+        pass
+
+
 class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -685,18 +719,12 @@ class Launcher(tk.Tk):
         self.style.configure("Info.TButton", padding=(5, 2), font=("Segoe UI", 8))
         self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         self.style.configure("TLabel", font=("Segoe UI", 10))
+        self.title("Software Launcher")
         if getattr(sys, "frozen", False):
-            self.title(Path(sys.executable).stem)
+            _base = Path(sys.executable).resolve().parent
         else:
-            self.title("Software Launcher")
-        try:
-            if getattr(sys, "frozen", False):
-                _base = Path(sys.executable).resolve().parent
-            else:
-                _base = Path(__file__).resolve().parent
-            self.iconbitmap(str(_base / "icon.ico"))
-        except Exception:
-            pass
+            _base = Path(__file__).resolve().parent
+        set_app_icon(self, str(_base / "icon.ico"), "ELI.Launcher")
         self.geometry("600x510")
         self.minsize(550, 430)
 

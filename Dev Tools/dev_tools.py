@@ -13,24 +13,48 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
+    """Give the window (title bar) AND the Windows taskbar button our icon.
+
+    tkinter's iconbitmap only fixes the title bar / WM_BIG icon; the Windows 11
+    taskbar reads the *small* icon slots (ICON_SMALL/SMALL2) and the window-class
+    icon (GCLP_HICONSM), which Tk otherwise leaves as its default feather logo.
+    We force every slot from icon.ico via Win32 before the window is first shown.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)  # LR_LOADFROMFILE|LR_DEFAULTSIZE
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)       # LR_LOADFROMFILE
+        for which, h in ((1, big), (0, sm), (2, sm)):            # ICON_BIG, ICON_SMALL, ICON_SMALL2
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)           # WM_SETICON
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)   # GCLP_HICON
+        if sm:
+            set_cls(hwnd, -34, sm)    # GCLP_HICONSM
+    except Exception:
+        pass
+
+
 def main():
     from b_t import BuilderUI
     from cm_t import DeployGUI
 
-    try:
-        import ctypes as _ct
-        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.DevTools")
-    except Exception:
-        pass
     root = tk.Tk()
-    if getattr(sys, "frozen", False):
-        root.title(Path(sys.executable).stem)
-    else:
-        root.title("Dev Tools")
-    try:
-        root.iconbitmap(str(_app_dir() / "icon.ico"))
-    except Exception:
-        pass
+    root.title("Dev Tools")
+    set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.DevTools")
     root.geometry("950x780")
     root.minsize(900, 600)
 

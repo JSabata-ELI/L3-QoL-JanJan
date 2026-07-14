@@ -4168,9 +4168,24 @@ class CPVASuiteWindow(QMainWindow):
         try:
             cfg = load_config()
             geom = cfg.get("suite_geometry")
-            if geom:
-                x, y, w, h = geom
-                self.setGeometry(x, y, w, h)
+            if not geom:
+                return
+            x, y, w, h = geom
+            # A saved position from a different monitor layout can point at a
+            # screen that no longer exists, opening the window off-screen.
+            # If the title-bar area isn't on any current screen, recentre it
+            # on the primary monitor.
+            on_screen = any(
+                s.availableGeometry().contains(QPoint(int(x) + 40, int(y) + 20))
+                for s in QApplication.screens()
+            )
+            if not on_screen:
+                avail = QApplication.primaryScreen().availableGeometry()
+                w = min(w, avail.width())
+                h = min(h, avail.height())
+                x = avail.x() + (avail.width()  - w) // 2
+                y = avail.y() + (avail.height() - h) // 2
+            self.setGeometry(int(x), int(y), int(w), int(h))
         except Exception:
             pass
 

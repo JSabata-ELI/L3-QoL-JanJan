@@ -2136,6 +2136,40 @@ class PreviewWindow(tk.Toplevel):
             self._popup = None
 
 # ---------------- App ----------------
+def set_app_icon(win, ico_path, app_id=None):
+    """Apply icon.ico to the title bar AND the Windows taskbar button.
+
+    tkinter's iconbitmap only sets the title bar icon; the Windows 11 taskbar
+    reads the small icon slots + window-class icon, which Tk leaves as its
+    default feather. We force every slot from icon.ico via Win32.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
+        for which, h in ((1, big), (0, sm), (2, sm)):
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)
+        if sm:
+            set_cls(hwnd, -34, sm)
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self):
         try:
@@ -2144,14 +2178,8 @@ class App(tk.Tk):
         except Exception:
             pass
         super().__init__()
-        if getattr(sys, "frozen", False):
-            self.title(Path(sys.executable).stem)
-        else:
-            self.title("Screenshots")
-        try:
-            self.iconbitmap(str(get_app_dir() / "icon.ico"))
-        except Exception:
-            pass
+        self.title("Screenshots")
+        set_app_icon(self, str(get_app_dir() / "icon.ico"))
         self.geometry("1440x800")
         self.minsize(800, 450)
 

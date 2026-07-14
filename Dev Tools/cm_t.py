@@ -147,6 +147,40 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
+    """Apply icon.ico to the title bar AND the Windows taskbar button.
+
+    tkinter's iconbitmap only sets the title bar icon; the Windows 11 taskbar
+    reads the small icon slots + window-class icon, which Tk leaves as its
+    default feather. We force every slot from icon.ico via Win32.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
+        for which, h in ((1, big), (0, sm), (2, sm)):
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)
+        if sm:
+            set_cls(hwnd, -34, sm)
+    except Exception:
+        pass
+
+
 def _state_path() -> Path:
     return _app_dir() / STATE_FILE_NAME
 
@@ -1858,10 +1892,7 @@ class DeployGUI(ttk.Frame):
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Copy Manager")
-    try:
-        root.iconbitmap(str(_app_dir() / "icon.ico"))
-    except Exception:
-        pass
+    set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.CopyManager")
     root.geometry("980x650")
     root.minsize(900, 560)
     app = DeployGUI(root)

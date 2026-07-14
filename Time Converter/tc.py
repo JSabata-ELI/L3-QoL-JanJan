@@ -416,32 +416,51 @@ def copy_one(args):
         return (old_name, None, False, str(e))
 
 
+def set_app_icon(win, ico_path, app_id=None):
+    """Apply icon.ico to the title bar AND the Windows taskbar button.
+
+    tkinter's iconbitmap only sets the title bar icon; the Windows 11 taskbar
+    reads the small icon slots + window-class icon, which Tk leaves as its
+    default feather. We force every slot from icon.ico via Win32.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)
+        for which, h in ((1, big), (0, sm), (2, sm)):
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)
+        if sm:
+            set_cls(hwnd, -34, sm)
+    except Exception:
+        pass
+
+
 # --------- main ----------
 def main():
-    try:
-        import ctypes as _ct
-        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.TimeConverter")
-    except Exception:
-        pass
     root = Tk()
     root.withdraw()
-    try:
-        import sys as _sys
-        if getattr(_sys, "frozen", False):
-            root.title(Path(_sys.executable).stem)
-        else:
-            root.title("Time Converter")
-    except Exception:
-        pass
-    try:
-        import sys as _sys
-        if getattr(_sys, "frozen", False):
-            _base = Path(_sys.executable).resolve().parent
-        else:
-            _base = Path(__file__).resolve().parent
-        root.iconbitmap(str(_base / "icon.ico"))
-    except Exception:
-        pass
+    root.title("Time Converter")
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        _base = Path(_sys.executable).resolve().parent
+    else:
+        _base = Path(__file__).resolve().parent
+    set_app_icon(root, str(_base / "icon.ico"), "ELI.TimeConverter")
 
     while True:
         opts = show_intro_and_get_options(root)

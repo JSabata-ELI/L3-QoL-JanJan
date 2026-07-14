@@ -5,7 +5,7 @@
     3288,
     349
   ],
-  "window_geometry": "604x301+2900+504",
+  "window_geometry": "790x323+2729+428",
   "pv_thresholds": {
     "L3-UTIL-HEB03-001:PressOut_PSI": {
       "orange": 46.0,
@@ -17,5 +17,6 @@
     }
   },
   "flash_mode": "alternate",
-  "image_file": "scorpion_oval_placeholder"
+  "image_file": "scorpion_orig",
+  "image_geometry": "176x143+2683+119"
 }
