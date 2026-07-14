@@ -1,7 +1,7 @@
 {
   "version": 1,
   "settings": {
-    "poll_interval_s": 15,
+    "poll_interval_s": 5,
     "avg_last_n": 20,
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
@@ -17,7 +17,7 @@
     "valid_max_default": 80.0,
     "graph_window_minutes": 360,
     "start_monitoring_on_launch": true,
-    "alert_plot_hours": 1,
+    "alert_plot_hours": 4,
     "teams_enabled": false,
     "email_enabled": false,
     "webex_enabled": true,
@@ -48,7 +48,7 @@
       {
         "name": "Main",
         "room_id": "Y2lzY29zcGFyazovL3VybjpURUFNOmV1LWNlbnRyYWwtMV9rL1JPT00vN2EyZjdhMTAtNzZjNi0xMWYxLWFiMDEtOTkzNTBhZTExNjdi",
-        "enabled": true,
+        "enabled": false,
         "listen": false
       }
     ],
@@ -125,10 +125,10 @@
               1.0
             ]
           ],
-          "warn_low": 16.2,
-          "warn_high": 16.8,
-          "alarm_low": 16.0,
-          "alarm_high": 17.0
+          "warn_low": 14.6,
+          "warn_high": 15.2,
+          "alarm_low": 14.3,
+          "alarm_high": 15.5
         },
         {
           "label": "3,3 Hz",
@@ -138,14 +138,14 @@
               1.0
             ]
           ],
-          "warn_low": 13.8,
-          "warn_high": 14.4,
-          "alarm_low": 13.5,
-          "alarm_high": 14.7
+          "warn_low": 12.1,
+          "warn_high": 12.7,
+          "alarm_low": 11.8,
+          "alarm_high": 13.0
         }
       ],
-      "valid_min": 0.0,
-      "valid_max": 50.0,
+      "valid_min": null,
+      "valid_max": null,
       "learned_at": null,
       "learn_stats": null
     },
@@ -171,10 +171,10 @@
               1.0
             ]
           ],
-          "warn_low": 16.2,
-          "warn_high": 16.8,
-          "alarm_low": 16.0,
-          "alarm_high": 17.0
+          "warn_low": 11.4,
+          "warn_high": 12.0,
+          "alarm_low": 11.1,
+          "alarm_high": 12.3
         },
         {
           "label": "3,3 Hz",
@@ -184,14 +184,14 @@
               1.0
             ]
           ],
-          "warn_low": 13.8,
-          "warn_high": 14.4,
-          "alarm_low": 13.5,
-          "alarm_high": 14.7
+          "warn_low": 8.6,
+          "warn_high": 9.2,
+          "alarm_low": 8.3,
+          "alarm_high": 9.2
         }
       ],
-      "valid_min": 0.0,
-      "valid_max": 50.0,
+      "valid_min": null,
+      "valid_max": null,
       "learned_at": null,
       "learn_stats": null
     },
@@ -217,10 +217,10 @@
               1.0
             ]
           ],
-          "warn_low": 16.2,
-          "warn_high": 16.8,
-          "alarm_low": 16.0,
-          "alarm_high": 17.0
+          "warn_low": 11.1,
+          "warn_high": 11.7,
+          "alarm_low": 10.8,
+          "alarm_high": 12.0
         },
         {
           "label": "3,3 Hz",
@@ -230,10 +230,10 @@
               1.0
             ]
           ],
-          "warn_low": 13.8,
-          "warn_high": 14.4,
-          "alarm_low": 13.5,
-          "alarm_high": 14.7
+          "warn_low": 8.2,
+          "warn_high": 8.8,
+          "alarm_low": 7.9,
+          "alarm_high": 9.1
         }
       ],
       "valid_min": 0.0,
@@ -247,14 +247,30 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 16.0907,
-      "warn_high": 20.7,
-      "alarm_low": 10.0,
-      "alarm_high": 21.1563,
-      "gate_pvs": [],
-      "profiles": [],
-      "valid_min": -5.0,
-      "valid_max": 40.0,
+      "warn_low": 17.0,
+      "warn_high": 23.0,
+      "alarm_low": 15.0,
+      "alarm_high": 25.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 16.0,
+          "warn_high": 16.8,
+          "alarm_low": 15.5,
+          "alarm_high": 17.3
+        }
+      ],
+      "valid_min": null,
+      "valid_max": null,
       "learned_at": "2026-07-13T11:01:59+02:00",
       "learn_stats": {
         "center": 17.779215,
@@ -277,8 +293,24 @@
       "warn_high": 20.5,
       "alarm_low": 19.0,
       "alarm_high": 21.0,
-      "gate_pvs": [],
-      "profiles": [],
+      "gate_pvs": [
+        "L3-SIS-KEY:LowPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "",
+          "conds": [
+            [
+              0.0,
+              1.0
+            ]
+          ],
+          "warn_low": 19.7,
+          "warn_high": 20.3,
+          "alarm_low": 19.4,
+          "alarm_high": 20.6
+        }
+      ],
       "valid_min": null,
       "valid_max": null,
       "learned_at": "2026-07-13T09:17:52+02:00",

@@ -437,6 +437,10 @@ class PVRuntime:
     bad_data: bool = False   # last poll returned samples but all out of range
     # Conditional profile in force at the last poll (None = default thresholds).
     active_profile: Optional[dict] = None
+    # Delivery state of the current non-OK episode's alert, for the "Alarm status"
+    # column: "" (nothing to send / OK), "sending", "sent", "failed".
+    notify_status: str = ""
+    notify_error: str = ""
 
     def display_level(self):
         """AlertLevel for colouring, or None for NODATA."""
@@ -676,7 +680,7 @@ def _apply_result_to_pv(pv: "PVConfig", r: dict) -> None:
 # ---------------------------------------------------------------------------
 
 COLS = ["On", "Display name", "PV name", "Value", "Units", "State",
-        "Warn lo/hi", "Alarm lo/hi", "Updated"]
+        "Alarm status", "Warn lo/hi", "Alarm lo/hi", "Updated"]
 
 PV_MIME = "application/x-pv-monitor-row"
 GROUP_HEADER_BG = QColor("#d7e3f4")
@@ -711,6 +715,49 @@ def _describe_profile(pv: "PVConfig", prof: dict) -> str:
     return (f"{label}: {when} → "
             f"warn {_fmt(thr.warn_low)}/{_fmt(thr.warn_high)} "
             f"alarm {_fmt(thr.alarm_low)}/{_fmt(thr.alarm_high)}")
+
+
+def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
+    """One-cell summary of alert delivery for the 'Alarm status' column.
+
+    Blank while OK/off; once a PV is in Warning/Alarm it reports when its first
+    alert of the current episode went out ("sent HH:MM:SS"), that it is still
+    in flight ("sending…"), that delivery failed ("⚠ not sent"), or that a
+    committed alert has nothing to send yet ("pending")."""
+    if rt is None or not pv.enabled:
+        return ""
+    if rt.alert.level == AlertLevel.OK:
+        return ""
+    if rt.notify_status == "failed":
+        return "⚠ not sent"
+    if rt.notify_status == "sending":
+        return "sending…"
+    if rt.alert.first_notified_ns:
+        return "sent " + api.ns_to_prague(
+            rt.alert.first_notified_ns).strftime("%H:%M:%S")
+    return "pending"
+
+
+def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
+    if rt is None or not pv.enabled:
+        return "Alerting off for this PV."
+    if rt.alert.level == AlertLevel.OK:
+        return "No active alert."
+    lines = [f"State: {rt.alert.level.label}"]
+    if rt.alert.first_notified_ns:
+        lines.append("First alert sent: " + api.ns_to_prague(
+            rt.alert.first_notified_ns).strftime("%Y-%m-%d %H:%M:%S"))
+    if rt.alert.last_notified_ns:
+        lines.append("Last notified: " + api.ns_to_prague(
+            rt.alert.last_notified_ns).strftime("%Y-%m-%d %H:%M:%S"))
+    if rt.notify_status == "failed":
+        lines.append("Delivery FAILED — alert not sent:")
+        lines.append("  " + (rt.notify_error or "unknown error"))
+    elif rt.notify_status == "sending":
+        lines.append("Delivery in progress…")
+    elif rt.notify_status == "sent":
+        lines.append("Delivered to all enabled channels.")
+    return "\n".join(lines)
 
 
 class PVTableModel(QAbstractTableModel):
@@ -846,6 +893,8 @@ class PVTableModel(QAbstractTableModel):
             return Qt.Checked if pv.enabled else Qt.Unchecked
 
         if role == Qt.ToolTipRole:
+            if col == 6:
+                return _alarm_status_tooltip(pv, rt)
             tip = pv.name
             if pv.gate_pvs:
                 tip += "\nDepends on: " + ", ".join(pv.gate_pvs)
@@ -872,7 +921,15 @@ class PVTableModel(QAbstractTableModel):
                 return QColor("white")
             return QColor(SUCCESS)
 
-        if role == Qt.TextAlignmentRole and col in (3, 4, 5, 6, 7):
+        # Alarm-status cell: paint red only when a send failed, so a lost alert
+        # stands out; other states use plain text.
+        if col == 6 and rt is not None:
+            if role == Qt.BackgroundRole and rt.notify_status == "failed":
+                return QColor(ALARM_COLOR)
+            if role == Qt.ForegroundRole and rt.notify_status == "failed":
+                return QColor("white")
+
+        if role == Qt.TextAlignmentRole and col in (3, 4, 5, 6, 7, 8):
             return int(Qt.AlignCenter)
 
         if role == Qt.DisplayRole:
@@ -894,6 +951,8 @@ class PVTableModel(QAbstractTableModel):
                 if level is None:
                     return "no data"
                 return level.label.lower()
+            if col == 6:
+                return _alarm_status_text(pv, rt)
             # Threshold columns show whichever profile is currently in force:
             # the matched conditional profile, else the default set.
             active = rt.active_profile if rt else None
@@ -903,11 +962,11 @@ class PVTableModel(QAbstractTableModel):
             else:
                 thr = pv.thresholds()
                 mark = ""
-            if col == 6:
-                return f"{_fmt(thr.warn_low)} / {_fmt(thr.warn_high)}{mark}"
             if col == 7:
-                return f"{_fmt(thr.alarm_low)} / {_fmt(thr.alarm_high)}{mark}"
+                return f"{_fmt(thr.warn_low)} / {_fmt(thr.warn_high)}{mark}"
             if col == 8:
+                return f"{_fmt(thr.alarm_low)} / {_fmt(thr.alarm_high)}{mark}"
+            if col == 9:
                 if rt and rt.last_update_ns:
                     return api.ns_to_prague(rt.last_update_ns).strftime("%H:%M:%S")
                 return "–"
@@ -2649,7 +2708,7 @@ class MonitorWidget(QWidget):
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(1, QHeaderView.Stretch)   # Display name
         hh.setSectionResizeMode(2, QHeaderView.Stretch)   # PV name
-        for c in (0, 3, 4, 5, 6, 7, 8):
+        for c in (0, 3, 4, 5, 6, 7, 8, 9):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.model.modelReset.connect(self._apply_group_spans)
         self._apply_group_spans()
@@ -3114,6 +3173,9 @@ class MonitorWidget(QWidget):
                 note = self.evaluator.evaluate(rt.alert, val, thr, now)
                 if note is not None:
                     self._dispatch_alert(pv, rt, note)
+            if rt.alert.level == AlertLevel.OK:
+                rt.notify_status = ""      # episode over — clear the status cell
+                rt.notify_error = ""
         self.model.refresh_all()
         self.graph.redraw()
 
@@ -3127,25 +3189,40 @@ class MonitorWidget(QWidget):
             reason=note.reason,
             timestamp_str=api.ns_to_prague_str(rt.last_update_ns or api.now_ns()),
             kind=note.kind)
-        self._launch_alert_worker(payload, self._active_thresholds(pv), tag="auto",
-                                  valid_range=self._valid_range(pv))
+        # Tag the worker with the PV name so its result updates this PV's
+        # "Alarm status" cell (recoveries to OK aren't tracked there).
+        if note.level != AlertLevel.OK:
+            rt.notify_status = "sending"
+            rt.notify_error = ""
+        started = self._launch_alert_worker(
+            payload, self._active_thresholds(pv), tag=pv.name,
+            valid_range=self._valid_range(pv))
+        if not started and note.level != AlertLevel.OK:
+            rt.notify_status = "failed"
+            rt.notify_error = "no notification channel configured"
 
     def _launch_alert_worker(self, payload: AlertPayload, thr: Thresholds, tag: str,
-                             valid_range=(None, None)):
+                             valid_range=(None, None)) -> bool:
+        """Start the render+dispatch worker. Returns True if a worker was
+        launched, False if there is nothing to send it to."""
         if not self.hub.is_any_configured():
             self._log("  No notification channel configured (see Settings).")
             if tag == "manual":
                 self.btn_sendplot.setEnabled(True)
-            return
+            return False
         hours = float(self.settings.get("alert_plot_hours", 12))
         timeout = float(self.settings["http_timeout_s"])
         vmin, vmax = valid_range
         sig = _AlertSignals(self)
         sig.done.connect(self._on_alert_result)
+        # Each dispatch keeps its own signals object alive via the worker, so
+        # concurrent alerts (several PVs tripping at once) don't clobber one
+        # another; this attribute is just a convenience handle to the latest.
         self._alert_sig = sig
         QThreadPool.globalInstance().start(
             _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag,
                          vmin, vmax))
+        return True
 
     def _on_alert_result(self, result):
         tag, errors, had_png = result
@@ -3156,6 +3233,17 @@ class MonitorWidget(QWidget):
             if not errors:
                 extra = "" if had_png else " (no data for plot — text only)"
                 self._log(f"Plot sent.{extra}")
+            return
+        # Auto alert: tag is the PV name — update its "Alarm status" cell.
+        rt = self.runtime.get(tag)
+        if rt is not None and rt.alert.level != AlertLevel.OK:
+            if errors:
+                rt.notify_status = "failed"
+                rt.notify_error = "; ".join(f"{c}: {e}" for c, e in errors.items())
+            else:
+                rt.notify_status = "sent"
+                rt.notify_error = ""
+            self.model.refresh_all()
 
     # --- send plot now -------------------------------------------------
     def _send_plot_for(self, pv: PVConfig, tag: str):
@@ -3172,13 +3260,17 @@ class MonitorWidget(QWidget):
                                   valid_range=self._valid_range(pv))
 
     def send_plot_now(self):
-        pv = self._selected_pv()
-        if not pv:
+        pvs = self._selected_pvs()
+        if not pvs:
             QMessageBox.information(self, "Send plot", "Select a PV first.")
             return
         self.btn_sendplot.setEnabled(False)
-        self._log(f"Sending plot for {pv.display_name}…")
-        self._send_plot_for(pv, tag="manual")
+        names = ", ".join(pv.display_name for pv in pvs)
+        self._log(f"Sending plot for {names}…")
+        # One worker per selected PV so every selection is sent (not just the
+        # first). The button re-enables when the first worker reports back.
+        for pv in pvs:
+            self._send_plot_for(pv, tag="manual")
 
     # --- Webex two-way command listener -------------------------------
     def _start_cmd_listener(self):
@@ -3490,6 +3582,7 @@ class MonitorWidget(QWidget):
                                        rt.last_update_ns)
         # Reflect simulated level in the table without touching the real alert state.
         rt.alert.level = self._sim_state.level
+        rt.alert.first_notified_ns = self._sim_state.first_notified_ns
         if note is not None:
             self._dispatch_alert(pv, rt, note)
         self.model.refresh_all()

@@ -41,7 +41,7 @@ import numpy as np
 
 # ── PySide6 ────────────────────────────────────────────────────────────────
 from PySide6.QtCore import (
-    Qt, QObject, QTimer, Signal, QDate, QLocale,
+    Qt, QObject, QTimer, Signal, QDate, QLocale, QRect, QSize, QPoint,
 )
 from PySide6.QtGui import (
     QColor, QIcon, QPalette, QPainter, QPen,
@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QFileDialog, QMessageBox, QSizePolicy,
     QDoubleSpinBox, QSpinBox, QToolButton, QMenu, QColorDialog,
     QCalendarWidget, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QTextEdit, QProgressBar,
+    QTextEdit, QProgressBar, QLayout,
 )
 
 # ── matplotlib ─────────────────────────────────────────────────────────────
@@ -779,6 +779,75 @@ class PVBrowserDialog(QDialog):
         self.selected_pvs = [it.text() for it in items]
         self.accept()
 
+# ── Flow layout (wraps children to the next row, never overflows) ───────────
+
+class _FlowLayout(QLayout):
+    """A left-to-right layout that wraps onto a new row when it runs out of
+    width — so stat cards line up side by side and nothing spills past the
+    right edge of the panel."""
+
+    def __init__(self, parent=None, margin=0, spacing=6):
+        super().__init__(parent)
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+        self._items: list = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        x, y = rect.x(), rect.y()
+        line_height = 0
+        spacing = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + spacing
+            if next_x - spacing > rect.right() and line_height > 0:
+                x = rect.x()
+                y = y + line_height + spacing
+                next_x = x + hint.width() + spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y()
+
+
 # ── CSSLoggerWidget ────────────────────────────────────────────────────────
 
 class CSSLoggerWidget(QWidget):
@@ -1170,10 +1239,27 @@ class CSSLoggerWidget(QWidget):
         gc_lay.setContentsMargins(0, 0, 0, 0)
         top_lay.addWidget(self._graph_container, stretch=1)
 
-        self._stats_label = QLabel("")
-        self._stats_label.setStyleSheet("font-size:10px;padding:2px 6px;")
-        self._stats_label.setWordWrap(True)
-        top_lay.addWidget(self._stats_label)
+        # Selection statistics strip: appears under the graph when the user
+        # drags out a region (left-drag) on the plot. One compact card per PV,
+        # laid out side by side and wrapping onto new rows so nothing spills
+        # past the panel edge; the whole strip scrolls if it gets too tall.
+        self._stats_title = QLabel("")
+        self._stats_title.setStyleSheet(
+            "font-size:10px;font-weight:700;color:#1565C0;padding:2px 6px 0 6px;")
+        self._stats_title.hide()
+        top_lay.addWidget(self._stats_title)
+
+        self._stats_scroll = QScrollArea()
+        self._stats_scroll.setWidgetResizable(True)
+        self._stats_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._stats_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._stats_scroll.setMaximumHeight(150)
+        self._stats_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self._stats_container = QWidget()
+        self._stats_flow = _FlowLayout(self._stats_container, margin=4, spacing=6)
+        self._stats_scroll.setWidget(self._stats_container)
+        self._stats_scroll.hide()
+        top_lay.addWidget(self._stats_scroll)
 
         self._graph_v_splitter.addWidget(top_pane)
 
@@ -2114,6 +2200,7 @@ class CSSLoggerWidget(QWidget):
         self._x_cursor_ann = None
         self._blit_bg      = None
         self._cursor_active = False   # no crosshair to re-assert on next draw
+        self._clear_stats()
 
     def _apply_font_size(self):
         if self._mpl_figure and self._samples_by_pv:
@@ -2121,8 +2208,124 @@ class CSSLoggerWidget(QWidget):
 
     # ── Span / zoom handlers ────────────────────────────────────────────────
 
+    def _clear_stats(self):
+        """Empty the selection-statistics strip and hide it."""
+        flow = getattr(self, "_stats_flow", None)
+        if flow is not None:
+            while flow.count():
+                item = flow.takeAt(0)
+                w = item.widget() if item else None
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+        if getattr(self, "_stats_scroll", None) is not None:
+            self._stats_scroll.hide()
+        if getattr(self, "_stats_title", None) is not None:
+            self._stats_title.hide()
+
+    def _make_stat_card(self, disp_name, color, stats):
+        """Build one compact per-PV statistics card for the selection strip."""
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:#ffffff;border:1px solid #cfcfcf;"
+            f"border-top:3px solid {color};border-radius:4px;}}")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(7, 4, 7, 5)
+        cl.setSpacing(1)
+
+        title = QLabel(disp_name)
+        title.setStyleSheet(
+            f"border:none;color:{color};font-weight:700;font-size:11px;")
+        title.setToolTip(disp_name)
+        title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cl.addWidget(title)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(0)
+        rows = [
+            ("N",   stats["n"],   "Number of samples inside the selected region."),
+            ("Avg", stats["avg"], "Average (arithmetic mean) of the selected values."),
+            ("Std", stats["std"], "Standard deviation — how much the values scatter "
+                                  "around the average (population σ)."),
+            ("Min", stats["min"], "Smallest value in the selection."),
+            ("Max", stats["max"], "Largest value in the selection."),
+            ("P-P", stats["ptp"], "Peak-to-peak = Max − Min (total spread of the values)."),
+        ]
+        for r, (lbl, val, tip) in enumerate(rows):
+            k = QLabel(lbl + ":")
+            k.setStyleSheet("border:none;color:#666;font-size:10px;")
+            k.setToolTip(tip)
+            v = QLabel(val)
+            v.setStyleSheet("border:none;color:#111;font-size:10px;font-weight:600;")
+            v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            v.setToolTip(tip)
+            # Selectable so the number can be copied with the mouse (Ctrl+C).
+            v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            v.setCursor(Qt.CursorShape.IBeamCursor)
+            grid.addWidget(k, r, 0)
+            grid.addWidget(v, r, 1)
+        cl.addLayout(grid)
+
+        # A "Copy" action on right-click / button copies the whole card as a
+        # tab-separated block that pastes cleanly into Excel / a spreadsheet.
+        tsv = (disp_name + "\n"
+               + "\n".join(f"{lbl}\t{val}" for lbl, val, _ in rows))
+        card.setToolTip("Right-click to copy these statistics")
+        card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        card.customContextMenuRequested.connect(
+            lambda _pos, t=tsv: self._copy_stats_text(t))
+        return card
+
+    def _copy_stats_text(self, text):
+        QApplication.clipboard().setText(text)
+        self._lbl_status.setText("Statistics copied to clipboard.")
+
     def _on_span_select(self, xmin, xmax):
-        pass  # just visual selection feedback
+        # Left-drag selection over the plot → per-PV statistics for the region.
+        if xmax - xmin < 1e-9 or not self._graph_pvs:
+            self._clear_stats()
+            return
+
+        self._clear_stats()
+        any_card = False
+        for i, pv in enumerate(self._graph_pvs):
+            if i >= len(self._graph_raw_np):
+                continue
+            t_arr, v_arr = self._graph_raw_np[i]
+            if t_arr.size == 0:
+                continue
+            mask = (t_arr >= xmin) & (t_arr <= xmax) & np.isfinite(v_arr)
+            sel = v_arr[mask]
+            if sel.size == 0:
+                continue
+            stats = {
+                "n":   f"{sel.size:,}",
+                "avg": _fmt_cursor_value(float(np.mean(sel))),
+                "std": _fmt_cursor_value(float(np.std(sel))),
+                "min": _fmt_cursor_value(float(np.min(sel))),
+                "max": _fmt_cursor_value(float(np.max(sel))),
+                "ptp": _fmt_cursor_value(float(np.max(sel) - np.min(sel))),
+            }
+            pv_setting = self._pv_settings.get(pv, {})
+            disp_name = pv_setting.get("display_name", shorten_pv_name(pv))
+            color     = pv_setting.get("color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
+            self._stats_flow.addWidget(self._make_stat_card(disp_name, color, stats))
+            any_card = True
+
+        if not any_card:
+            self._clear_stats()
+            return
+
+        t0 = mdates.num2date(xmin, tz=TZ_PRAGUE)
+        t1 = mdates.num2date(xmax, tz=TZ_PRAGUE)
+        span_s = (t1 - t0).total_seconds()
+        self._stats_title.setText(
+            f"Selection statistics  ·  {t0.strftime('%Y-%m-%d %H:%M:%S')} → "
+            f"{t1.strftime('%H:%M:%S')}  ({span_s:,.1f} s)")
+        self._stats_title.show()
+        self._stats_scroll.show()
 
     def _on_zoom_select(self, xmin, xmax):
         if xmax - xmin < 1e-6: return

@@ -67,6 +67,9 @@ class AlertState:
     level: AlertLevel = AlertLevel.OK
     since_ns: int = 0
     last_notified_ns: int = 0
+    # When the first alert of the *current* non-OK episode was sent (0 when OK).
+    # Reset to 0 on recovery so each episode reports its own first-alert time.
+    first_notified_ns: int = 0
     pending_level: Optional[AlertLevel] = None
     pending_count: int = 0
 
@@ -128,6 +131,13 @@ def _tightened(thr: Thresholds, deadband: float) -> Thresholds:
     )
 
 
+def fmt_value(x: float) -> str:
+    """Format a measured value for messages: always at least one decimal
+    (tenths), e.g. 20 -> '20.0', 20.013 -> '20.0'. Kept consistent across all
+    channels so a reading never shows as a bare integer."""
+    return f"{x:.1f}"
+
+
 def describe_reason(level: AlertLevel, value: float, thr: Thresholds) -> str:
     if level == AlertLevel.OK:
         return "Back to normal range"
@@ -135,10 +145,10 @@ def describe_reason(level: AlertLevel, value: float, thr: Thresholds) -> str:
     hi = thr.alarm_high if level == AlertLevel.ALARM else thr.warn_high
     name = level.label
     if lo is not None and value <= lo:
-        return f"{name} low: {value:g} ≤ {lo:g}"
+        return f"{name} low: {fmt_value(value)} ≤ {lo:g}"
     if hi is not None and value >= hi:
-        return f"{name} high: {value:g} ≥ {hi:g}"
-    return f"{name}: {value:g}"
+        return f"{name} high: {fmt_value(value)} ≥ {hi:g}"
+    return f"{name}: {fmt_value(value)}"
 
 
 # ---------------------------------------------------------------------------
@@ -210,10 +220,14 @@ class AlertEvaluator:
         state.since_ns = now_ns
         state.pending_level = None
         state.pending_count = 0
+        if target == AlertLevel.OK:
+            state.first_notified_ns = 0        # episode ended — arm for the next
 
         notify = self._should_notify(prev, target)
         if notify:
             state.last_notified_ns = now_ns
+            if target != AlertLevel.OK and state.first_notified_ns == 0:
+                state.first_notified_ns = now_ns
             return Notification(
                 level=target, prev_level=prev, value=value,
                 reason=describe_reason(target, value, thr), kind="transition",
@@ -245,7 +259,7 @@ class AlertPayload:
     kind: str                 # "transition" | "reminder" | "manual"
 
     def _val_str(self) -> str:
-        return f"{self.value:g} {self.units}".strip()
+        return f"{fmt_value(self.value)} {self.units}".strip()
 
     def subject(self) -> str:
         if self.kind == "manual":
@@ -299,7 +313,7 @@ def build_messagecard(level: AlertLevel, prev_level: AlertLevel,
                       value: float, units: str, reason: str,
                       timestamp_str: str, kind: str = "transition") -> dict:
     """Build a classic Teams MessageCard payload (renders on Incoming Webhooks)."""
-    val_str = f"{value:g} {units}".strip()
+    val_str = f"{fmt_value(value)} {units}".strip()
     if kind == "reminder":
         title = f"{level.label} ongoing — {display_name}"
     elif level == AlertLevel.OK:
