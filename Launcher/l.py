@@ -225,7 +225,6 @@ SCRIPTS = {
     "Image Tools",
     "Screenshots",
     "Time Converter",
-    "Dev Tools",
     "Announcer",
     "CSS Logger",
     "Chiller log",
@@ -250,6 +249,8 @@ PERSONAL = {
     "Copy Manager",
     "Builder",
     "Internal Builder",
+    "Dev Tools",
+    "Git Work",
 }
 
 GROUP_ORDER = [

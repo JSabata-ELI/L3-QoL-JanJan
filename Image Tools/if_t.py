@@ -467,6 +467,47 @@ def _read_img_max_value(path: Path) -> "float | None":
     return None
 
 
+# Frames whose physical max pixel value is below this are considered "empty"
+# (dark frame, no beam). Camera dark noise is typically tens of counts on the
+# 12/16-bit sensors here; real shots reach thousands. Tune if a camera differs.
+EMPTY_IMG_MAX_THRESHOLD = 100.0
+# Pixel-fallback: minimum (max − median) contrast in raw counts to call a
+# downscaled decode non-empty.
+EMPTY_IMG_CONTRAST_MIN = 50.0
+
+
+def _image_is_nonempty(path: Path, log=None) -> bool:
+    """True when the image plausibly contains a beam (not a dark frame).
+
+    imgMaxValue PNG metadata first (no decode); pixel fallback decodes a
+    downscaled copy and checks max−median contrast. Validation failures count
+    as EMPTY so the caller moves on to the next candidate."""
+    try:
+        mv = _read_img_max_value(path)
+        if mv is not None:
+            ok = mv > EMPTY_IMG_MAX_THRESHOLD
+            if log and not ok:
+                log(f"  {path.name}: imgMaxValue={mv:.0f} ≤ {EMPTY_IMG_MAX_THRESHOLD:.0f} → empty")
+            return ok
+        import numpy as _np
+        with PilImage.open(str(path)) as pil:
+            pil.draft("L", (256, 256))
+            if pil.mode in ("I", "I;16"):
+                arr = _np.asarray(pil, dtype=_np.float32)
+            else:
+                arr = _np.asarray(pil.convert("L"), dtype=_np.float32)
+        contrast = float(arr.max()) - float(_np.median(arr))
+        ok = contrast > EMPTY_IMG_CONTRAST_MIN
+        if log and not ok:
+            log(f"  {path.name}: pixel contrast {contrast:.0f} ≤ "
+                f"{EMPTY_IMG_CONTRAST_MIN:.0f} → empty")
+        return ok
+    except Exception as e:
+        if log:
+            log(f"  {path.name}: validation failed ({type(e).__name__}) → treated as empty")
+        return False
+
+
 # ── CALENDAR WEEKEND DELEGATE ─────────────────────────────────────────────────
 
 class _WeekendDelegate(QStyledItemDelegate):
@@ -1188,21 +1229,10 @@ def _annotate_image_with_energy(
             parts.append(f"{label}: {val}")
         text = "   |   ".join(parts) if parts else "(no columns selected)"
     else:
-        img_dt_local = datetime.fromtimestamp(img_ts_ns / 1_000_000_000, tz=timezone.utc)
-        if PRAGUE:
-            img_dt_local = img_dt_local.astimezone(PRAGUE).replace(tzinfo=None)
-        else:
-            img_dt_local = img_dt_local.replace(tzinfo=None)
-        msg_parts = ["No CSV match"]
-        if no_match_before is not None:
-            diff = _format_energy_diff_s(abs((img_dt_local - no_match_before.ts_dt).total_seconds()))
-            ts_str = no_match_before.ts_dt.strftime("%H:%M:%S.%f")[:-3]
-            msg_parts.append(f"before: {ts_str} (−{diff})")
-        if no_match_after is not None:
-            diff = _format_energy_diff_s(abs((no_match_after.ts_dt - img_dt_local).total_seconds()))
-            ts_str = no_match_after.ts_dt.strftime("%H:%M:%S.%f")[:-3]
-            msg_parts.append(f"after: {ts_str} (+{diff})")
-        text = "   |   ".join(msg_parts)
+        # PV values only — no timestamps or extra info in the bar
+        parts = [f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: n/a"
+                 for col in selected_cols]
+        text = "   |   ".join(parts) if parts else "n/a"
 
     # Create bar — dynamický počet řádků, font a výška se přizpůsobí obsahu
     w, h = img.size
@@ -1381,6 +1411,8 @@ class _ThumbView(QWidget):
     hovered_in   = Signal()
     hovered_out  = Signal()
     right_clicked = Signal()          # right-click (context menu)
+    overlay_changing = Signal()       # overlay mutated during a drag (live mirror)
+    overlay_edited   = Signal()       # overlay edit finished (mouse release)
 
     _HANDLE_R = 7
 
@@ -1389,6 +1421,10 @@ class _ThumbView(QWidget):
         self._pix:    "QPixmap | None" = None
         self._scaled: "QPixmap | None" = None
         self._is_selected: bool = False
+        # identity + native (full-res) image size, set by _make_thumb_cell —
+        # used for center-preserving overlay mirroring across selected thumbs
+        self.key: "tuple | None" = None
+        self.native_size: "tuple[int, int] | None" = None
 
         # overlay state — normalised [0,1] relative to the displayed image rect
         self.show_circle = False
@@ -1504,7 +1540,9 @@ class _ThumbView(QWidget):
             self.cross_pos_norm = QPointF(
                 max(0.0, min(1.0, (pos.x() - ir.left()) / ir.width())),
                 max(0.0, min(1.0, (pos.y() - ir.top())  / ir.height())))
-            self.update(); return
+            self.update()
+            self.overlay_edited.emit()
+            return
 
         if self._draw_mode == "circle":
             if self.circle_center_norm is not None and self.circle_rx_norm is not None:
@@ -1579,6 +1617,7 @@ class _ThumbView(QWidget):
                 if shift: self.circle_rx_norm = ry_n
                 self.circle_ry_norm = ry_n
             self.update()
+            self.overlay_changing.emit()
 
         elif self._draw_mode == "square":
             if self._drag_handle == "new":
@@ -1612,6 +1651,7 @@ class _ThumbView(QWidget):
                     elif h_ == "sw": side = max(rn-ln, bn-tn); ln = rn-side; bn = tn+side
                 self.square_rect_norm = (clamp(ln), clamp(tn), clamp(rn), clamp(bn))
             self.update()
+            self.overlay_changing.emit()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self._did_drag \
@@ -1619,6 +1659,9 @@ class _ThumbView(QWidget):
             self.clicked.emit()
         elif event.button() == Qt.MouseButton.RightButton:
             self.right_clicked.emit()
+        if event.button() == Qt.MouseButton.LeftButton and self._did_drag \
+                and self._draw_mode in ("circle", "square"):
+            self.overlay_edited.emit()
         self._drag_handle = ""; self._drag_start = None
         super().mouseReleaseEvent(event)
 
@@ -1907,6 +1950,12 @@ class _LogSignals(QObject):
 
 class _PreviewSignals(QObject):
     ready = Signal(object, int)   # (QPixmap, gen)
+
+
+class _TryAgainSignals(QObject):
+    progress  = Signal(str, str)                        # main label, hour label
+    cell_done = Signal(str, object, int, object, str)   # cam, date, hour, path|None, log line
+    finished  = Signal(list)                            # summary lines
 
 
 # ── MAIN WIDGET ───────────────────────────────────────────────────────────────
@@ -2982,31 +3031,87 @@ class ImageFinderWidget(QWidget):
                 except ValueError:
                     pass
 
+            # Warm the slow-PV look-back cache HERE (background thread) so the
+            # UI-thread display path (allow_network=False) gets cache hits for
+            # waveplate-like channels whose last sample is hours/days old.
+            try:
+                self._pv_values_for_ns(ns, self._energy_selected_cols, per_col,
+                                       match=match, allow_network=True)
+            except Exception:
+                pass
+
             results.append((path, match, before, after, rows, match_idx, per_col))
         return results
+
+    def _pv_values_for_ns(self, img_ns: int, cols: "list[str]",
+                          per_col: dict, match=None,
+                          allow_network: bool = False
+                          ) -> "list[tuple[str, str, str]]":
+        """
+        THE single matching implementation: resolve each column's value at the
+        image timestamp. Returns [(col, raw, state)] with state:
+          "ok"        — per-column sample within tolerance (or merged-row /
+                        slow-PV look-back hit); raw is a valid value string
+          "error"     — archiver fetch failed (display "ERR")
+          "not_found" — data loaded fine, nothing matches (display "n/a")
+
+        Per-column nearest match first (30 s API / 120 s CSV window), then the
+        merged row, then — for slow PVs only (waveplate: archived on-change, so
+        the last sample can be days old) — the archiver's last-at-or-before
+        look-back. allow_network=False (UI thread) still serves look-back
+        cache hits.
+        """
+        out: "list[tuple[str, str, str]]" = []
+        for col in cols:
+            # API rows are per-shot → tight window; sparse CSV keeps the wide one.
+            tol = (ENERGY_MATCH_TOL_API_S if per_col.get(f"_src:{col}") == "api"
+                   else ENERGY_MATCH_TOL_S)
+            raw_val = _find_closest_per_col_value(per_col, col, img_ns, tol_s=tol)
+            if raw_val and raw_val != "—":
+                out.append((col, raw_val, "ok"))
+                continue
+            if match is not None:
+                mv = match.values.get(col, "")
+                if mv and mv != "—":
+                    out.append((col, mv, "ok"))
+                    continue
+            channel = CPVA_CHANNEL_MAP.get(col)
+            if channel and channel in cpva.FORWARD_CHANNELS:
+                res = cpva.value_at_or_before(channel, int(img_ns),
+                                              timeout=CPVA_HTTP_TIMEOUT,
+                                              network_ok=allow_network)
+                if res.value is not None:
+                    out.append((col, str(res.value), "ok"))
+                    continue
+                if res.status == "error":
+                    out.append((col, "", "error"))
+                    continue
+            out.append((col, "", "not_found"))
+        return out
+
+    @staticmethod
+    def _format_pv_state(col: str, raw: str, state: str) -> str:
+        """Tri-state display: real value (incl. genuine 0) / "ERR" / "n/a"."""
+        if state == "error":
+            return cpva.PV_TEXT_ERROR
+        if state != "ok" or raw == "":
+            return cpva.PV_TEXT_NOT_FOUND
+        return _format_energy_value(col, raw)
 
     def _energy_parts_for_path(self, path: Path, entry: tuple) -> list[str]:
         """
         Return ['<label>=<value>', ...] for the selected PV columns of one image.
-
-        For each selected column it takes the nearest CSV/API sample within
-        ENERGY_MATCH_TOL_S (via _find_closest_per_col_value), falling back to the
-        matched row's raw value when no per-column sample is in tolerance.
-        Single source of truth for the info panel, the preview overlay and saves.
+        Delegates to _pv_values_for_ns — single source of truth for the info
+        panel, the preview overlay and saves.
         """
         match    = entry[1] if len(entry) > 1 else None
         per_col  = entry[6] if len(entry) > 6 else {}
         img_ns   = extract_ns_from_stem(path.stem) or 0
         parts: list[str] = []
-        for col in self._energy_selected_cols:
-            # API rows are per-shot → tight window; sparse CSV keeps the wide one.
-            tol = (ENERGY_MATCH_TOL_API_S if per_col.get(f"_src:{col}") == "api"
-                   else ENERGY_MATCH_TOL_S)
-            raw_val = _find_closest_per_col_value(
-                per_col, col, img_ns, tol_s=tol)
-            if (not raw_val or raw_val == "—") and match is not None:
-                raw_val = match.values.get(col, "—")
-            val   = _format_energy_value(col, raw_val)
+        for col, raw, state in self._pv_values_for_ns(
+                img_ns, self._energy_selected_cols, per_col, match=match,
+                allow_network=False):
+            val   = self._format_pv_state(col, raw, state)
             label = ENERGY_COLUMNS_DISPLAY.get(col, col)
             parts.append(f"{label}={val}")
         return parts
@@ -5448,7 +5553,7 @@ class _MultiDaySetupDialog(QDialog):
         self._wd_checks: list[QCheckBox] = []
         for i, label in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
             cb = QCheckBox(label)
-            cb.setChecked(i == 2)  # Wednesday default
+            cb.setChecked(i < 5)  # Mon–Fri default
             cb.setStyleSheet(_CHECKBOX_STYLE)
             cb.stateChanged.connect(self._refresh_highlight)
             self._wd_checks.append(cb)
@@ -6107,6 +6212,64 @@ class MultiDayPreviewWindow(QWidget):
                 tv.cross_pos_norm = None
                 tv.update()
 
+    def _mirror_overlay_from(self, src_tv):
+        """Live-mirror src_tv's overlay onto every SELECTED thumbnail.
+
+        Coordinates are center-preserving across differing native image sizes:
+        norm' = 0.5 + (norm − 0.5) · (src_dim / dst_dim) per axis, radii scaled
+        the same way — the drawn shape keeps its physical offset from the image
+        center. Same-size images copy 1:1. Editing an unselected thumb mirrors
+        nothing."""
+        key = getattr(src_tv, "key", None)
+        if key is None or key not in self._selected or len(self._selected) < 2:
+            # Still sync the sibling views (day tab / cam tab) of the same key
+            targets = [(key, tv) for tv in self._thumb_views_all.get(key, [])
+                       if tv is not src_tv] if key is not None else []
+        else:
+            targets = [(k, tv) for k in self._selected
+                       for tv in self._thumb_views_all.get(k, [])
+                       if tv is not src_tv]
+        if not targets:
+            return
+        src_nat = src_tv.native_size
+        for _k, tv in targets:
+            dst_nat = tv.native_size
+            if (src_nat and dst_nat and src_nat[0] > 0 and src_nat[1] > 0
+                    and dst_nat[0] > 0 and dst_nat[1] > 0):
+                fx = src_nat[0] / dst_nat[0]
+                fy = src_nat[1] / dst_nat[1]
+            else:
+                fx = fy = 1.0
+
+            def _mx(nx): return max(0.0, min(1.0, 0.5 + (nx - 0.5) * fx))
+            def _my(ny): return max(0.0, min(1.0, 0.5 + (ny - 0.5) * fy))
+
+            if src_tv.circle_center_norm is not None:
+                tv.circle_center_norm = QPointF(
+                    _mx(src_tv.circle_center_norm.x()),
+                    _my(src_tv.circle_center_norm.y()))
+                tv.circle_rx_norm = min(1.0, (src_tv.circle_rx_norm or 0.0) * fx)
+                tv.circle_ry_norm = min(1.0, (src_tv.circle_ry_norm or 0.0) * fy)
+            else:
+                tv.circle_center_norm = None
+                tv.circle_rx_norm = None
+                tv.circle_ry_norm = None
+
+            if src_tv.square_rect_norm is not None:
+                ln, tn, rn, bn = src_tv.square_rect_norm
+                tv.square_rect_norm = (_mx(ln), _my(tn), _mx(rn), _my(bn))
+            else:
+                tv.square_rect_norm = None
+
+            if src_tv.cross_pos_norm is not None:
+                tv.cross_pos_norm = QPointF(
+                    _mx(src_tv.cross_pos_norm.x()),
+                    _my(src_tv.cross_pos_norm.y()))
+            else:
+                tv.cross_pos_norm = None
+
+            tv.update()
+
     # ── Undo ──────────────────────────────────────────────────────────────────
     def _tv_overlay_state(self) -> dict:
         """Snapshot overlay state of every _ThumbView for undo."""
@@ -6276,6 +6439,19 @@ class MultiDayPreviewWindow(QWidget):
                 tv.show_square = self._draw_square
                 tv.show_cross  = self._draw_cross
 
+    def _native_size_for(self, path: "Path | None") -> "tuple[int, int] | None":
+        """(w, h) of the full-res image in DISPLAY orientation (rotation applied).
+        Served from the raw-array cache — no extra decode after _render_thumb."""
+        if path is None:
+            return None
+        arr = self._raw_cache.get(path)
+        if arr is None:
+            return None
+        nh, nw = arr.shape[:2]
+        if getattr(self, '_rotation', 0) % 180:
+            nw, nh = nh, nw
+        return (nw, nh)
+
     def _refresh_all_thumbs(self):
         """Re-render pixmaps (palette/brightness/rotation applied) and sync draw modes."""
         sz = self._thumb_size()
@@ -6288,9 +6464,11 @@ class MultiDayPreviewWindow(QWidget):
             if key not in rendered:
                 rendered[key] = self._render_thumb(path, sz, cn)
             pm = rendered[key]
+            nat = self._native_size_for(path)
             for tv in tvs:
                 tv.setFixedSize(sz, sz)
                 tv.set_pixmap(pm)
+                tv.native_size = nat
         self._update_all_draw_modes()
 
     # ── Thumb cells ───────────────────────────────────────────────────────────
@@ -6321,6 +6499,8 @@ class MultiDayPreviewWindow(QWidget):
             tv.set_selected(key in self._selected)   # restore selection state if key already known
             pm = self._render_thumb(path, sz, cam_name)
             tv.set_pixmap(pm)
+            tv.key = key
+            tv.native_size = self._native_size_for(path)   # raw cache is warm now
             vl.addWidget(tv, 0, Qt.AlignmentFlag.AlignHCenter)
 
             # Track this view
@@ -6377,6 +6557,9 @@ class MultiDayPreviewWindow(QWidget):
             tv.clicked.connect(_on_click)
             tv.dbl_clicked.connect(_on_dbl)
             tv.right_clicked.connect(_on_right_click)
+            # Live overlay mirroring to all selected thumbs (item: apply to all)
+            tv.overlay_changing.connect(lambda _tv=tv: self._mirror_overlay_from(_tv))
+            tv.overlay_edited.connect(lambda _tv=tv: self._mirror_overlay_from(_tv))
         else:
             # No image — placeholder same size as real thumbs
             placeholder = QLabel()
@@ -6403,24 +6586,28 @@ class MultiDayPreviewWindow(QWidget):
             placeholder.customContextMenuRequested.connect(lambda _pos, fn=_ph_ctx: fn())
             vl.addWidget(placeholder, 0, Qt.AlignmentFlag.AlignHCenter)
 
-        # ── Label: camera name + date + timestamp ─────────────────────────────
+        # ── Label: PV values ONLY when PV annotation is active; otherwise the
+        #    camera/date/time identity line ────────────────────────────────────
         date_str = date.strftime("%d.%m.%Y")
         lines: list[str] = []
-        if extra_label:
-            lines.append(extra_label)
-        if path is not None:
-            ns = extract_ns_from_stem(path.stem)
-            if ns is not None:
-                dt_utc = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
-                dt_disp = dt_utc.astimezone(PRAGUE) if (not self._use_lab and PRAGUE) else dt_utc
-                ts_str = dt_disp.strftime("%H:%M:%S.") + f"{dt_disp.microsecond // 1000:03d}"
-                lines.append(f"{date_str}  {ts_str}")
-            else:
-                lines.append(f"{date_str}  {hour:02d}:00" if hour is not None else date_str)
-        else:
-            lines.append(date_str)
         if pv_text:
+            if extra_label:
+                lines.append(extra_label)
             lines.append(pv_text)
+        else:
+            if extra_label:
+                lines.append(extra_label)
+            if path is not None:
+                ns = extract_ns_from_stem(path.stem)
+                if ns is not None:
+                    dt_utc = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+                    dt_disp = dt_utc.astimezone(PRAGUE) if (not self._use_lab and PRAGUE) else dt_utc
+                    ts_str = dt_disp.strftime("%H:%M:%S.") + f"{dt_disp.microsecond // 1000:03d}"
+                    lines.append(f"{date_str}  {ts_str}")
+                else:
+                    lines.append(f"{date_str}  {hour:02d}:00" if hour is not None else date_str)
+            else:
+                lines.append(date_str)
 
         lbl_txt = QLabel("\n".join(lines))
         lbl_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -6594,13 +6781,16 @@ class MultiDayPreviewWindow(QWidget):
             else:
                 dt = dt.replace(tzinfo=None)
             rows = finder._get_energy_rows_for_dt(dt)
+            # Per-column lookup — the old merged-row path returned "—" for every
+            # column except the one that happened to share the row's exact ns.
+            day_key = dt.strftime("%Y-%m-%d")
+            per_col = finder._energy_per_col_cache.get(day_key, {})
             match, _, _ = _find_energy_match(rows, ns)
-            if match is None:
-                return ""
             parts = []
-            for col in cols:
-                raw = match.values.get(col, "")
-                parts.append(f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: {_format_energy_value(col, raw)}")
+            for col, raw, state in finder._pv_values_for_ns(
+                    ns, cols, per_col, match=match, allow_network=False):
+                parts.append(f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: "
+                             f"{finder._format_pv_state(col, raw, state)}")
             return "  ".join(parts)
         except Exception:
             return ""
@@ -6823,16 +7013,11 @@ class MultiDayPreviewWindow(QWidget):
                 if not annotate:
                     shutil.copy2(str(src), str(cam_dir / (clean_stem + src.suffix)))
                 else:
-                    # ── Build annotation text ─────────────────────────────────
+                    # ── Build annotation text — PV values ONLY ────────────────
+                    # (camera identity lives in the subfolder + filename; no
+                    # timestamps / palette / extra info in the baked bar)
                     ns = extract_ns_from_stem(src.stem)
-                    ts_str = ""
-                    if ns is not None:
-                        dt_utc = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
-                        if PRAGUE:
-                            ts_str = dt_utc.astimezone(PRAGUE).strftime("%Y-%m-%d %H:%M:%S")
-                        else:
-                            ts_str = dt_utc.strftime("%Y-%m-%d %H:%M:%S")
-                    ann_parts = [cam_name, ts_str, f"Palette: {self._palette}"]
+                    ann_parts: list[str] = []
                     if finder is not None and ns is not None:
                         try:
                             cols = getattr(finder, "_energy_selected_cols", [])
@@ -6843,13 +7028,17 @@ class MultiDayPreviewWindow(QWidget):
                                 else:
                                     dt_csv = dt_csv.replace(tzinfo=None)
                                 rows = finder._get_energy_rows_for_dt(dt_csv)
+                                day_key = dt_csv.strftime("%Y-%m-%d")
+                                per_col = finder._energy_per_col_cache.get(day_key, {})
                                 match, _, _ = _find_energy_match(rows, ns)
-                                if match is not None:
-                                    for col in cols:
-                                        raw = match.values.get(col, "")
-                                        ann_parts.append(
-                                            f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: "
-                                            f"{_format_energy_value(col, raw)}")
+                                # Saving may hit the network (progress dialog is
+                                # up) — resolves slow PVs via look-back too.
+                                for col, raw, state in finder._pv_values_for_ns(
+                                        ns, cols, per_col, match=match,
+                                        allow_network=True):
+                                    ann_parts.append(
+                                        f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: "
+                                        f"{finder._format_pv_state(col, raw, state)}")
                         except Exception:
                             pass
                     ann_text = "   |   ".join(p for p in ann_parts if p)
@@ -6892,10 +7081,6 @@ class MultiDayPreviewWindow(QWidget):
     def _try_again_selected(self):
         if not self._selected:
             QMessageBox.information(self, "Search again", "Select thumbnails first."); return
-        parent_finder = self.parent()
-        if parent_finder is None:
-            return
-
         keys = list(self._selected)
 
         # Determine current/last-tried hours for summary
@@ -6920,69 +7105,10 @@ class MultiDayPreviewWindow(QWidget):
             default_h, 0, 23)
         if not ok:
             return
-
-        total = len(keys)
-        prog = QDialog(self)
-        prog.setWindowTitle("Searching…")
-        prog.setMinimumWidth(360)
-        prog.setWindowFlags(prog.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
-        pv = QVBoxLayout(prog)
-        plbl = QLabel("Searching…")
-        plbl.setWordWrap(True)
-        hour_lbl = QLabel()
-        hour_lbl.setStyleSheet("font-size:10px; color:#555;")
-        pbar = QProgressBar()
-        pbar.setRange(0, total)
-        pbar.setValue(0)
-        pv.addWidget(plbl)
-        pv.addWidget(hour_lbl)
-        pv.addWidget(pbar)
-        prog.show()
-        QApplication.processEvents()
-
-        updated = []
-        need_rebuild = False
-        for idx, (cam_name, date) in enumerate(keys):
-            plbl.setText(f"{cam_name}  {date.strftime('%d.%m.%Y')}")
-            pbar.setValue(idx)
-            QApplication.processEvents()
-
-            found = False
-            for real_h in range(chosen_hour, 24):
-                hour_lbl.setText(f"Scanning hour {real_h:02d}:00" + (f"  (next: {real_h+1:02d}:00)" if real_h < 23 else ""))
-                QApplication.processEvents()
-                if PRAGUE is not None:
-                    dt_p = datetime(date.year, date.month, date.day, real_h, tzinfo=PRAGUE)
-                    folder_h = real_h - int(dt_p.utcoffset().total_seconds() / 3600)
-                else:
-                    folder_h = real_h
-                dt_eff = datetime(date.year, date.month, date.day, folder_h)
-                hour_path = parent_finder._build_target_path(dt_eff)
-                cam_folder = hour_path / cam_name
-                if not cam_folder.exists():
-                    continue
-                chosen = parent_finder.select_images_from_folder(cam_folder, 1)
-                if chosen:
-                    self._try_hour[(cam_name, date)] = real_h
-                    if self._update_thumb_result(cam_name, date, (cam_name, date), real_h, chosen[0]):
-                        need_rebuild = True
-                    updated.append(f"{cam_name} {date.strftime('%d.%m')}: found {real_h:02d}:00")
-                    found = True
-                    break
-            if not found:
-                updated.append(f"{cam_name} {date.strftime('%d.%m')}: no image from {chosen_hour:02d}:00")
-
-        prog.accept()
-        if need_rebuild:
-            self._rebuild_grids()
-        if updated:
-            QMessageBox.information(self, "Search again", "\n".join(updated))
+        self._try_again_run(keys, chosen_hour)
 
     def _try_again_single(self, cam_name: str, date):
         """Search again for a single (cam_name, date) cell — user picks the starting hour."""
-        parent_finder = self.parent()
-        if parent_finder is None:
-            return
         key = (cam_name, date)
         current_hour = None
         for d, h, _p, _m, _s in self._results.get(cam_name, []):
@@ -7001,30 +7127,171 @@ class MultiDayPreviewWindow(QWidget):
             default_h, 0, 23)
         if not ok:
             return
+        self._try_again_run([key], chosen_hour)
 
-        for real_h in range(chosen_hour, 24):
-            if PRAGUE is not None:
-                dt_p = datetime(date.year, date.month, date.day, real_h, tzinfo=PRAGUE)
-                folder_h = real_h - int(dt_p.utcoffset().total_seconds() / 3600)
-            else:
-                folder_h = real_h
-            dt_eff     = datetime(date.year, date.month, date.day, folder_h)
-            hour_path  = parent_finder._build_target_path(dt_eff)
-            cam_folder = hour_path / cam_name
+    def _try_again_candidates(self, parent_finder, cam_name: str, date,
+                              real_h: int, exclude: "set[str]", log):
+        """Ranked candidate paths for one (cam, date, Prague hour) cell.
+
+        Energy-anchored first (SBW4/PTM1 best shot → nearest files, the same
+        picker the initial search uses), then the file-size heuristic as a
+        fallback. Candidates in `exclude` (already shown / already rejected)
+        are skipped."""
+        if PRAGUE is not None:
+            # Prague hour → UTC folder datetime. astimezone handles day/year
+            # boundaries too (the old `hour - offset` arithmetic produced hour
+            # -1/-2 for early-morning Prague hours and crashed datetime()).
+            dt_p = datetime(date.year, date.month, date.day, real_h, tzinfo=PRAGUE)
+            dt_eff = dt_p.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            dt_eff = datetime(date.year, date.month, date.day, real_h)
+        hour_path = parent_finder._build_target_path(dt_eff)
+        cam_folder = hour_path / cam_name
+        try:
             if not cam_folder.exists():
-                continue
-            chosen = parent_finder.select_images_from_folder(cam_folder, 1)
-            if chosen:
-                self._try_hour[key] = real_h
-                if self._update_thumb_result(cam_name, date, key, real_h, chosen[0]):
-                    self._rebuild_grids()
-                QMessageBox.information(
-                    self, "Search again",
-                    f"{cam_name}  {date.strftime('%d.%m.%Y')}: found {real_h:02d}:00\n{chosen[0].name}")
-                return
-        QMessageBox.information(
-            self, "Search again",
-            f"{cam_name}  {date.strftime('%d.%m.%Y')}: no image found from {chosen_hour:02d}:00.")
+                return []
+        except Exception:
+            return []
+
+        out: list = []
+        seen: set = set(exclude)
+
+        def _add(paths):
+            for p in paths or []:
+                sp = str(p)
+                if sp not in seen:
+                    seen.add(sp)
+                    out.append(p)
+
+        # Energy anchor: the UTC hour window of this folder
+        try:
+            start_dt = datetime(dt_eff.year, dt_eff.month, dt_eff.day, dt_eff.hour,
+                                tzinfo=timezone.utc)
+            start_ns = int(start_dt.timestamp() * 1_000_000_000)
+            end_ns = start_ns + 3_600_000_000_000 - 1
+            tp_channel = _cam_totalpower_channel(cam_name)
+            _add(parent_finder._select_by_totalpower(
+                cam_folder, 3, tp_channel, log, start_ns, end_ns))
+        except Exception as e:
+            log(f"  energy anchor failed ({type(e).__name__}: {e}) — size fallback")
+
+        # Size-heuristic fallback candidates
+        try:
+            _add(parent_finder.select_images_from_folder(cam_folder, 3))
+        except Exception:
+            pass
+        return out
+
+    def _try_again_run(self, keys: list, chosen_hour: int):
+        """Background try-again over `keys`: energy-anchored candidates, each
+        validated as non-empty (imgMaxValue first, pixel fallback) before it is
+        accepted. UI stays responsive; Cancel aborts between candidates."""
+        parent_finder = self.parent()
+        if parent_finder is None:
+            return
+
+        total = len(keys)
+        prog = QDialog(self)
+        prog.setWindowTitle("Searching…")
+        prog.setMinimumWidth(400)
+        pv = QVBoxLayout(prog)
+        plbl = QLabel("Searching…")
+        plbl.setWordWrap(True)
+        hour_lbl = QLabel()
+        hour_lbl.setStyleSheet("font-size:10px; color:#555;")
+        pbar = QProgressBar()
+        pbar.setRange(0, total)
+        pbar.setValue(0)
+        btn_cancel = QPushButton("Cancel")
+        pv.addWidget(plbl)
+        pv.addWidget(hour_lbl)
+        pv.addWidget(pbar)
+        pv.addWidget(btn_cancel, 0, Qt.AlignmentFlag.AlignRight)
+
+        cancel_ev = threading.Event()
+        btn_cancel.clicked.connect(cancel_ev.set)
+
+        self._try_sig = _TryAgainSignals()
+        sig = self._try_sig
+        state = {"done": 0, "need_rebuild": False}
+
+        sig.progress.connect(plbl.setText)
+        sig.progress.connect(lambda _m, h: hour_lbl.setText(h))
+
+        def _on_cell(cam_name, date, real_h, path, line):
+            state["done"] += 1
+            pbar.setValue(state["done"])
+            if path is not None:
+                self._try_hour[(cam_name, date)] = real_h
+                if self._update_thumb_result(cam_name, date, (cam_name, date),
+                                             real_h, Path(path)):
+                    state["need_rebuild"] = True
+
+        def _on_finished(summary):
+            try:
+                prog.accept()
+            except Exception:
+                pass
+            if state["need_rebuild"]:
+                self._rebuild_grids()
+            if summary:
+                QMessageBox.information(self, "Search again", "\n".join(summary))
+
+        sig.cell_done.connect(_on_cell)
+        sig.finished.connect(_on_finished)
+        prog.rejected.connect(cancel_ev.set)   # closing the dialog cancels too
+
+        results_snapshot = {k: str(p) for k, p in self._thumb_paths.items()}
+
+        def worker():
+            summary: list[str] = []
+            for cam_name, date in keys:
+                if cancel_ev.is_set():
+                    summary.append("(cancelled)")
+                    break
+                sig.progress.emit(f"{cam_name}  {date.strftime('%d.%m.%Y')}", "")
+                exclude: set = set()
+                cur = results_snapshot.get((cam_name, date))
+                if cur:
+                    exclude.add(cur)
+                logs: list[str] = []
+                found_path = None
+                found_h = None
+                tried = 0
+                empt = 0
+                for real_h in range(chosen_hour, 24):
+                    if cancel_ev.is_set():
+                        break
+                    sig.progress.emit(f"{cam_name}  {date.strftime('%d.%m.%Y')}",
+                                      f"Scanning hour {real_h:02d}:00")
+                    cands = self._try_again_candidates(
+                        parent_finder, cam_name, date, real_h, exclude,
+                        logs.append)
+                    for cand in cands:
+                        if cancel_ev.is_set():
+                            break
+                        tried += 1
+                        exclude.add(str(cand))
+                        if _image_is_nonempty(cand, log=logs.append):
+                            found_path = cand
+                            found_h = real_h
+                            break
+                        empt += 1
+                    if found_path is not None:
+                        break
+                if found_path is not None:
+                    line = (f"{cam_name} {date.strftime('%d.%m')}: found "
+                            f"{found_h:02d}:00 ({tried} candidate(s), {empt} empty)")
+                    sig.cell_done.emit(cam_name, date, found_h, str(found_path), line)
+                else:
+                    line = (f"{cam_name} {date.strftime('%d.%m')}: no non-empty image "
+                            f"from {chosen_hour:02d}:00 ({tried} candidate(s), {empt} empty)")
+                    sig.cell_done.emit(cam_name, date, chosen_hour, None, line)
+                summary.append(line)
+            sig.finished.emit(summary)
+
+        threading.Thread(target=worker, daemon=True).start()
+        prog.exec()
 
     def _pick_image_single(self, cam_name: str, date):
         """Let user browse and pick any image file for a single cell."""
@@ -7041,10 +7308,9 @@ class MultiDayPreviewWindow(QWidget):
             for real_h in range(0, 24):
                 if PRAGUE is not None:
                     dt_p = datetime(date.year, date.month, date.day, real_h, tzinfo=PRAGUE)
-                    folder_h = real_h - int(dt_p.utcoffset().total_seconds() / 3600)
+                    dt_eff = dt_p.astimezone(timezone.utc).replace(tzinfo=None)
                 else:
-                    folder_h = real_h
-                dt_eff     = datetime(date.year, date.month, date.day, folder_h)
+                    dt_eff = datetime(date.year, date.month, date.day, real_h)
                 cam_folder = parent_finder._build_target_path(dt_eff) / cam_name
                 if cam_folder.exists():
                     start_dir = str(cam_folder); break

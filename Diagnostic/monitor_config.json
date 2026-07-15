@@ -75,7 +75,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -88,7 +88,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -121,7 +121,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -134,7 +134,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -167,7 +167,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -180,7 +180,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -213,7 +213,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -226,7 +226,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -247,9 +247,9 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 17.0,
+      "warn_low": 15.8,
       "warn_high": 23.0,
-      "alarm_low": 15.0,
+      "alarm_low": 15.5,
       "alarm_high": 25.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
@@ -259,14 +259,14 @@
           "label": "",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
-          "warn_low": 16.0,
-          "warn_high": 16.8,
+          "warn_low": 15.8,
+          "warn_high": 16.6,
           "alarm_low": 15.5,
-          "alarm_high": 17.3
+          "alarm_high": 16.9
         }
       ],
       "valid_min": null,
@@ -301,7 +301,7 @@
           "label": "",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],

@@ -21,6 +21,7 @@ import copy
 import json
 import re
 from collections import deque
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
@@ -31,7 +32,7 @@ from PySide6.QtCore import (
     QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QObject, QRunnable,
     Qt, QThreadPool, QTimer, Signal,
 )
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
@@ -437,6 +438,10 @@ class PVRuntime:
     bad_data: bool = False   # last poll returned samples but all out of range
     # Conditional profile in force at the last poll (None = default thresholds).
     active_profile: Optional[dict] = None
+    # Which threshold set the user pinned in the 'Depends on' dropdown:
+    # None = Auto (follow the first matching rule), -1 = Default forced,
+    # i >= 0 = pin profiles[i] (in force only while its conditions hold).
+    dep_view: Optional[int] = None
     # Delivery state of the current non-OK episode's alert, for the "Alarm status"
     # column: "" (nothing to send / OK), "sending", "sent", "failed".
     notify_status: str = ""
@@ -680,12 +685,15 @@ def _apply_result_to_pv(pv: "PVConfig", r: dict) -> None:
 # ---------------------------------------------------------------------------
 
 COLS = ["On", "Display name", "PV name", "Value", "Units", "State",
-        "Alarm status", "Depends on", "Warn ≤", "Warn ≥", "Alarm ≤",
+        "Alarm status", "Depends on", "Alarm ≤", "Warn ≤", "Warn ≥",
         "Alarm ≥", "Updated"]
 
 # Threshold columns (double-click opens the limits popup); kept as one place so
 # data(), flags() and the double-click handler stay in sync.
 THR_COLS = (8, 9, 10, 11)
+
+# "Depends on" column — hosts the per-row rule dropdown for gated PVs.
+DEP_COL = 7
 
 PV_MIME = "application/x-pv-monitor-row"
 GROUP_HEADER_BG = QColor("#d7e3f4")
@@ -906,10 +914,11 @@ class PVTableModel(QAbstractTableModel):
                 for prof in pv.profiles:
                     tip += "\n  • " + _describe_profile(pv, prof)
                 active = rt.active_profile if rt else None
-                label = (active.get("label") or "conditional") if active else "default"
-                tip += f"\nActive limits: {label}"
+                label = (active.get("label") or "conditional") if active else "Global"
+                pinned = rt is not None and rt.dep_view is not None
+                tip += f"\nActive limits: {label}" + (" (pinned)" if pinned else "")
             if col in THR_COLS:
-                tip += "\nDouble-click to edit limits (default + rules)."
+                tip += "\nDouble-click to edit limits (Global + rules)."
             if rt and rt.last_error:
                 tip += f"\nLast error: {rt.last_error}"
             return tip
@@ -961,6 +970,8 @@ class PVTableModel(QAbstractTableModel):
             if col == 6:
                 return _alarm_status_text(pv, rt)
             if col == 7:
+                if pv.gate_pvs and pv.profiles:
+                    return None      # cell is covered by the rule dropdown
                 return _cond_summary(pv)
             # Threshold columns show whichever set is currently in force: the
             # matched conditional profile, else the default set. (Which one is
@@ -969,11 +980,11 @@ class PVTableModel(QAbstractTableModel):
             thr = pv.profile_thresholds(active) if active is not None \
                 else pv.thresholds()
             if col == 8:
-                return _fmt(thr.warn_low)
-            if col == 9:
-                return _fmt(thr.warn_high)
-            if col == 10:
                 return _fmt(thr.alarm_low)
+            if col == 9:
+                return _fmt(thr.warn_low)
+            if col == 10:
+                return _fmt(thr.warn_high)
             if col == 11:
                 return _fmt(thr.alarm_high)
             if col == 12:
@@ -1103,6 +1114,33 @@ def _fmt_cond(cond) -> str:
     return f"≥{_fmt_num(lo)}" if hi is None else f"≤{_fmt_num(hi)}"
 
 
+def _profile_rule_text(pv: "PVConfig", prof: dict) -> str:
+    """Compact condition summary of one rule, e.g. 'HighPowerStatus=1' or
+    'HALL=1 & RATE≥5'. Empty when the rule has no real conditions."""
+    conds = prof.get("conds") or []
+    parts = []
+    for i, name in enumerate(pv.gate_pvs):
+        cond = conds[i] if i < len(conds) else None
+        lo, hi = (list(cond) + [None, None])[:2] if cond else (None, None)
+        if lo is None and hi is None:
+            continue
+        short = api.shorten_pv_name(name)
+        if lo is not None and hi is not None and lo == hi:
+            parts.append(f"{short}={_fmt_num(lo)}")
+        else:
+            parts.append(f"{short}{_fmt_cond(cond)}")
+    return " & ".join(parts)
+
+
+def _profile_item_text(pv: "PVConfig", i: int, prof: dict) -> str:
+    """Dropdown item text for one rule: its label plus the condition summary."""
+    rule = _profile_rule_text(pv, prof)
+    label = (prof.get("label") or "").strip()
+    if label and rule:
+        return f"{label}  ({rule})"
+    return label or rule or f"Rule {i + 1}"
+
+
 def _cond_summary(pv: "PVConfig") -> str:
     """One-line, read-only summary of a PV's dependency rules for the table.
 
@@ -1112,19 +1150,8 @@ def _cond_summary(pv: "PVConfig") -> str:
         return ", ".join(api.shorten_pv_name(g) for g in pv.gate_pvs)
     rules = []
     for prof in pv.profiles:
-        conds = prof.get("conds") or []
-        parts = []
-        for i, name in enumerate(pv.gate_pvs):
-            cond = conds[i] if i < len(conds) else None
-            lo, hi = (list(cond) + [None, None])[:2] if cond else (None, None)
-            if lo is None and hi is None:
-                continue
-            short = api.shorten_pv_name(name)
-            if lo is not None and hi is not None and lo == hi:
-                parts.append(f"{short}={_fmt_num(lo)}")
-            else:
-                parts.append(f"{short}{_fmt_cond(cond)}")
-        rules.append(" & ".join(parts) if parts else (prof.get("label") or "any"))
+        rule = _profile_rule_text(pv, prof)
+        rules.append(rule if rule else (prof.get("label") or "any"))
     return " / ".join(r for r in rules if r)
 
 
@@ -1135,14 +1162,18 @@ def _cond_summary(pv: "PVConfig") -> str:
 class ThresholdsEditor(QWidget):
     """One compact table editing a PV's alert limits.
 
-    The pinned first row ('Default') holds the limits used when no rule matches.
+    The pinned first row ('Global') holds the limits used when no rule matches.
     Each further row is a conditional rule. Within a row every dependency
     condition must hold (AND); rules are checked top to bottom and the first
     match wins, so separate rows act as OR. An empty limit cell means that side
     is not checked; an empty dependency cell means 'any value'.
     """
 
-    HDR = ["Rule", "Dep 1", "Dep 2", "Warn ≤", "Warn ≥", "Alarm ≤", "Alarm ≥"]
+    HDR = ["Rule", "Dep 1", "Dep 2", "Alarm ≤", "Warn ≤", "Warn ≥", "Alarm ≥"]
+    # Threshold cells sit in columns 3..6, ordered along the number line:
+    #   col 3 = alarm_low, col 4 = warn_low, col 5 = warn_high, col 6 = alarm_high.
+    # This tuple maps each of those columns to its (wl, wh, al, ah)-tuple index.
+    _THR_COL_TO_IDX = (2, 0, 1, 3)   # alarm_low, warn_low, warn_high, alarm_high
 
     def __init__(self, win, pv: "PVConfig", parent=None):
         super().__init__(parent)
@@ -1179,14 +1210,15 @@ class ThresholdsEditor(QWidget):
         self.table.setHorizontalHeaderLabels(self.HDR)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setMinimumSectionSize(70)
         for c in range(1, len(self.HDR)):
             hh.setSectionResizeMode(c, QHeaderView.Interactive)
-            self.table.setColumnWidth(c, 78)
+            self.table.setColumnWidth(c, 95)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setMinimumHeight(150)
+        self.table.setMinimumHeight(200)
         self.table.setToolTip(
-            "Row 'Default' = limits used when no rule matches.\n"
+            "Row 'Global' = limits used when no rule matches.\n"
             "Add rules that depend on the PVs above. Within a row all "
             "conditions must hold (AND); the first matching rule wins, so "
             "rules act as OR.\n\n"
@@ -1202,7 +1234,7 @@ class ThresholdsEditor(QWidget):
         add.clicked.connect(lambda: self._add_rule())
         rm = QPushButton("Remove rule")
         rm.setStyleSheet(SECONDARY_STYLE)
-        rm.setToolTip("Delete the selected rule row(s). The Default row stays.")
+        rm.setToolTip("Delete the selected rule row(s). The Global row stays.")
         rm.clicked.connect(self._remove_selected)
         btns.addWidget(add)
         btns.addWidget(rm)
@@ -1266,8 +1298,10 @@ class ThresholdsEditor(QWidget):
         for i in range(2):
             cond = conds[i] if i < len(conds) else None
             self.table.setItem(r, 1 + i, QTableWidgetItem(_fmt_cond(cond)))
-        for j in range(4):
-            self.table.setItem(r, 3 + j, QTableWidgetItem(_fmt_num(thr[j])))
+        # thr is (warn_low, warn_high, alarm_low, alarm_high); place each into
+        # its number-line column (Alarm ≤, Warn ≤, Warn ≥, Alarm ≥).
+        for k, idx in enumerate(self._THR_COL_TO_IDX):
+            self.table.setItem(r, 3 + k, QTableWidgetItem(_fmt_num(thr[idx])))
         return r
 
     def _add_rule(self, prof: Optional[dict] = None):
@@ -1291,16 +1325,17 @@ class ThresholdsEditor(QWidget):
             self.dep_edits[i].setText(
                 pv.gate_pvs[i] if i < len(pv.gate_pvs) else "")
         self.table.setRowCount(0)
-        self._new_row("Default", True, [None, None],
+        self._new_row("Global", True, [None, None],
                       [pv.warn_low, pv.warn_high, pv.alarm_low, pv.alarm_high])
         for prof in pv.profiles:
             self._add_rule(prof)
         self._refresh_dep_headers()
 
     def set_default_thresholds(self, wl, wh, al, ah):
-        """Fill the Default row (used by Learn)."""
-        for j, v in enumerate((wl, wh, al, ah)):
-            self.table.setItem(0, 3 + j, QTableWidgetItem(_fmt_num(v)))
+        """Fill the Global row (used by Learn)."""
+        thr = (wl, wh, al, ah)
+        for k, idx in enumerate(self._THR_COL_TO_IDX):
+            self.table.setItem(0, 3 + k, QTableWidgetItem(_fmt_num(thr[idx])))
 
     def _cell(self, r: int, c: int) -> str:
         item = self.table.item(r, c)
@@ -1308,9 +1343,17 @@ class ThresholdsEditor(QWidget):
 
     def apply_to(self, pv: "PVConfig"):
         """Write edited default limits, dependency PVs and rules back into pv."""
-        pv.warn_low = _to_float(self._cell(0, 3))
-        pv.warn_high = _to_float(self._cell(0, 4))
-        pv.alarm_low = _to_float(self._cell(0, 5))
+        # If a cell is still in edit mode (Save clicked without first leaving
+        # the cell), commit that pending edit before reading — otherwise
+        # item.text() returns the OLD value and the typed one is silently
+        # dropped. This is the likely reason a hand-set '1' condition reverted
+        # to its previous [0, 1].
+        if self.table.state() == QAbstractItemView.EditingState:
+            self.table.setFocus()
+        # Columns 3..6 are Alarm ≤, Warn ≤, Warn ≥, Alarm ≥ (number-line order).
+        pv.alarm_low = _to_float(self._cell(0, 3))
+        pv.warn_low = _to_float(self._cell(0, 4))
+        pv.warn_high = _to_float(self._cell(0, 5))
         pv.alarm_high = _to_float(self._cell(0, 6))
         kept = [(name, slot) for slot, name in
                 enumerate(e.text().strip() for e in self.dep_edits) if name]
@@ -1320,16 +1363,20 @@ class ThresholdsEditor(QWidget):
             label = self._cell(r, 0)
             conds_full = [_parse_cond(self._cell(r, 1)),
                           _parse_cond(self._cell(r, 2))]
-            thr = [_to_float(self._cell(r, 3)), _to_float(self._cell(r, 4)),
-                   _to_float(self._cell(r, 5)), _to_float(self._cell(r, 6))]
+            # Columns 3..6 are Alarm ≤, Warn ≤, Warn ≥, Alarm ≥.
+            alarm_low = _to_float(self._cell(r, 3))
+            warn_low = _to_float(self._cell(r, 4))
+            warn_high = _to_float(self._cell(r, 5))
+            alarm_high = _to_float(self._cell(r, 6))
+            thr = (warn_low, warn_high, alarm_low, alarm_high)
             cond_set = any(conds_full[slot] != [None, None] for _, slot in kept)
             if not (label or cond_set or any(v is not None for v in thr)):
                 continue
             profiles.append({
                 "label": label,
                 "conds": [conds_full[slot] for _, slot in kept],
-                "warn_low": thr[0], "warn_high": thr[1],
-                "alarm_low": thr[2], "alarm_high": thr[3],
+                "warn_low": warn_low, "warn_high": warn_high,
+                "alarm_low": alarm_low, "alarm_high": alarm_high,
             })
         pv.profiles = profiles
 
@@ -1342,7 +1389,8 @@ class ThresholdsPopup(QDialog):
     def __init__(self, win, pv: "PVConfig"):
         super().__init__(win)
         self.setWindowTitle(f"Limits — {pv.display_name}")
-        self.resize(620, 460)
+        self.resize(900, 600)
+        self.setMinimumSize(760, 500)
         self.pv = pv
         lay = QVBoxLayout(self)
         info = QLabel(pv.name)
@@ -1446,7 +1494,8 @@ class PVEditDialog(QDialog):
     def __init__(self, parent: "MonitorWidget", pv: PVConfig):
         super().__init__(parent)
         self.setWindowTitle(f"Edit PV — {pv.display_name}")
-        self.resize(560, 660)
+        self.resize(840, 720)
+        self.setMinimumSize(720, 600)
         self._win = parent
         self.pv = pv
 
@@ -1503,7 +1552,7 @@ class PVEditDialog(QDialog):
         form.addRow("", self.enabled_chk)
         lay.addLayout(form)
 
-        thr_box = QGroupBox("Alert limits  (Default row + conditional rules)")
+        thr_box = QGroupBox("Alert limits  (Global row + conditional rules)")
         thr_box.setStyleSheet(_GROUP_STYLE)
         tbl = QVBoxLayout(thr_box)
         self.thr_editor = ThresholdsEditor(parent, pv)
@@ -2411,6 +2460,32 @@ import matplotlib.dates as mdates  # noqa: E402
 MAX_GRAPH_POINTS = 3000
 
 
+class _LightNavToolbar(NavToolbar):
+    """Matplotlib nav toolbar with a light background and forced near-black
+    icons. The stock toolbar recolors its glyphs from the Qt palette, so with
+    Windows in dark mode they come out white — invisible on this app's light
+    UI. Recoloring here makes the buttons legible regardless of the OS theme."""
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(canvas, parent)
+        self.setStyleSheet(
+            "QToolBar { background: #f2f2f2; border: 1px solid #ccc; }"
+            "QToolButton { background: transparent; color: #111; }"
+            "QToolButton:hover { background: #d8e8ff; }"
+            "QToolButton:checked { background: #cfe0f7; }"
+            "QLabel { color: #111; }")
+
+    def _icon(self, name):
+        p = Path(matplotlib.get_data_path()) / "images" / name
+        large = p.with_name(p.name.replace(".png", "_large.png"))
+        pm = QPixmap(str(large if large.exists() else p))
+        pm.setDevicePixelRatio(self.devicePixelRatioF() or 1)
+        mask = pm.createMaskFromColor(QColor("black"), Qt.MaskOutColor)
+        pm.fill(QColor("#111111"))
+        pm.setMask(mask)
+        return QIcon(pm)
+
+
 def render_pv_png(pv_name: str, display_name: str, hours: float,
                   thr: Thresholds, timeout: float,
                   vmin=None, vmax=None) -> bytes | None:
@@ -2483,8 +2558,22 @@ class GraphPanel(QWidget):
         self.fig = Figure(figsize=(6, 3), dpi=96)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
-        lay.addWidget(NavToolbar(self.canvas, self))
+        lay.addWidget(_LightNavToolbar(self.canvas, self))
         lay.addWidget(self.canvas, 1)
+
+        # Crosshair cursor: artists are recreated on every redraw (ax.clear()
+        # drops them); animated=True keeps them out of the blit background so
+        # moving the mouse never re-renders the whole figure.
+        self._cross: list = []
+        self._snap_np = None    # (times_num, values, label) for single-PV snap
+        self._units = ""
+        self._blit_bg = None
+        self._mouse_ev = None
+        self._mouse_pending = False
+        self.canvas.mpl_connect("draw_event", self._on_draw)
+        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.canvas.mpl_connect("figure_leave_event",
+                                lambda _e: self._hide_cursor())
 
     def set_yaxis(self, lo, hi):
         """Fix the Y range (lo, hi), or pass (None, None) to restore autoscale."""
@@ -2529,19 +2618,28 @@ class GraphPanel(QWidget):
                     self.ax.axhline(val, color=color, linestyle=ls,
                                     linewidth=lw, alpha=0.6)
 
+    def _pv_units(self, pv: PVConfig) -> str:
+        rt = self._win.runtime.get(pv.name)
+        return (rt.current_units if rt and rt.current_units else pv.units) or ""
+
     def redraw(self):
         self.ax.clear()
         sel = self.combo.currentData()
         win_min = float(self._win.settings["graph_window_minutes"])
 
         cmap = matplotlib.colormaps.get_cmap("tab10")
+        pv = None
         if sel is None:  # "All PVs"
-            for i, pv in enumerate(self._win.pvs):
-                self._plot_one(pv, cmap(i % 10), with_thresholds=False)
+            for i, p in enumerate(self._win.pvs):
+                self._plot_one(p, cmap(i % 10), with_thresholds=False)
+            units = {self._pv_units(p) for p in self._win.pvs} - {""}
+            self._units = units.pop() if len(units) == 1 else ""
         else:
             pv = next((p for p in self._win.pvs if p.name == sel), None)
             if pv:
                 self._plot_one(pv, PRIMARY, with_thresholds=True)
+            self._units = self._pv_units(pv) if pv else ""
+        self.ax.set_ylabel(self._units or "value")
 
         if self.ax.get_legend_handles_labels()[0]:
             self.ax.legend(loc="upper left", fontsize=8)
@@ -2561,7 +2659,113 @@ class GraphPanel(QWidget):
             self.ax.set_ylim(*self._yaxis)
         self.fig.autofmt_xdate()
         self.fig.tight_layout()
+
+        # Cache the plotted samples for the crosshair's nearest-point snap
+        # (single-PV view only; the data line is the first one plotted).
+        self._snap_np = None
+        if pv is not None and self.ax.get_lines():
+            ln = self.ax.get_lines()[0]
+            xd = ln.get_xdata()
+            if len(xd):
+                self._snap_np = (np.asarray(mdates.date2num(xd), dtype=float),
+                                 np.asarray(ln.get_ydata(), dtype=float),
+                                 pv.display_name)
+        self._make_cursor_artists()
+        self._blit_bg = None
         self.canvas.draw_idle()
+
+    # --- crosshair cursor ------------------------------------------------
+    def _make_cursor_artists(self):
+        vl = self.ax.axvline(color="#888", linewidth=0.8, linestyle="--",
+                             visible=False, animated=True)
+        hl = self.ax.axhline(color="#888", linewidth=0.8, linestyle="--",
+                             visible=False, animated=True)
+        txt = self.ax.annotate(
+            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
+            fontsize=8, color="#111", visible=False, animated=True, zorder=10,
+            bbox=dict(boxstyle="round,pad=0.3", fc="#ffffe0", ec="#888",
+                      alpha=0.9, linewidth=0.6))
+        self._cross = [vl, hl, txt]
+
+    def _on_draw(self, *_):
+        # Fresh blit background: hide the animated overlay so it isn't baked in.
+        for a in self._cross:
+            a.set_visible(False)
+        self._blit_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+
+    def _on_mouse_move(self, event):
+        self._mouse_ev = event
+        if not self._mouse_pending:
+            self._mouse_pending = True
+            QTimer.singleShot(16, self._process_mouse)   # ~60 fps cap
+
+    def _process_mouse(self):
+        self._mouse_pending = False
+        ev = self._mouse_ev
+        if ev is None or not self._cross:
+            return
+        try:
+            self._draw_cursor(ev)
+        except Exception:
+            pass   # replot may tear the figure down mid-hover — harmless
+
+    def _hide_cursor(self):
+        if not self._cross:
+            return
+        for a in self._cross:
+            a.set_visible(False)
+        if self._blit_bg is not None:
+            self.canvas.restore_region(self._blit_bg)
+            self.canvas.blit(self.fig.bbox)
+
+    def _snap_value(self, x_f: float):
+        """(label, value) of the plotted sample nearest to time x_f, or None."""
+        if self._snap_np is None:
+            return None
+        arr, vals, label = self._snap_np
+        pos = int(np.searchsorted(arr, x_f))
+        if pos <= 0:
+            idx = 0
+        elif pos >= len(arr):
+            idx = len(arr) - 1
+        else:
+            idx = pos if (arr[pos] - x_f) < (x_f - arr[pos - 1]) else pos - 1
+        return label, float(vals[idx])
+
+    def _draw_cursor(self, ev):
+        if (ev.inaxes is not self.ax or ev.xdata is None or ev.ydata is None
+                or self._blit_bg is None):
+            self._hide_cursor()
+            return
+        x, y = float(ev.xdata), float(ev.ydata)
+        vl, hl, txt = self._cross
+        vl.set_xdata([x, x])
+        hl.set_ydata([y, y])
+        try:
+            t_str = mdates.num2date(x, tz=api.TZ_PRAGUE).strftime("%H:%M:%S")
+        except Exception:
+            t_str = ""
+        u = f" {self._units}" if self._units else ""
+        lines = [t_str, f"y = {y:.4g}{u}"]
+        snap = self._snap_value(x)
+        if snap is not None:
+            lines.append(f"{snap[0]} = {snap[1]:.4g}{u}")
+        txt.set_text("\n".join(lines))
+        txt.xy = (x, y)
+        # Keep the box inside the axes: flip it near the right/top edges.
+        xlo, xhi = self.ax.get_xlim()
+        ylo, yhi = self.ax.get_ylim()
+        right = x > (xlo + xhi) / 2
+        top = y > (ylo + yhi) / 2
+        txt.set_position((-12 if right else 12, -16 if top else 12))
+        txt.set_horizontalalignment("right" if right else "left")
+        txt.set_verticalalignment("top" if top else "bottom")
+        for a in self._cross:
+            a.set_visible(True)
+        self.canvas.restore_region(self._blit_bg)
+        for a in self._cross:
+            self.ax.draw_artist(a)
+        self.canvas.blit(self.fig.bbox)
 
 
 # ---------------------------------------------------------------------------
@@ -2671,6 +2875,8 @@ class MonitorWidget(QWidget):
         self.pvs: list[PVConfig] = [PVConfig.from_dict(d) for d in cfg["pvs"]]
         self.runtime: dict[str, PVRuntime] = {}
         self._all_channels: list[str] = []
+        # Per-PV "Depends on" dropdowns (recreated on every model reset).
+        self._dep_combos: dict[str, QComboBox] = {}
         # Clipboard for the right-click "Copy settings / Paste settings" feature.
         self._copied_settings: Optional[dict] = None
         self._copied_from: str = ""
@@ -2806,14 +3012,17 @@ class MonitorWidget(QWidget):
         self.table.setDragDropOverwriteMode(False)
         self.table.setDropIndicatorShown(True)
         hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)   # Display name
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)   # PV name
-        for c in (0, 3, 4, 5, 6, 8, 9, 10, 11, 12):
+        # Every column sizes to its longest value (incl. Display name and PV
+        # name) so nothing is elided. "Depends on" hosts the rule dropdowns,
+        # which ResizeToContents can't measure — its width is set explicitly
+        # in _install_dep_combos from the widest dropdown.
+        for c in range(len(COLS)):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(7, QHeaderView.Interactive)  # Depends on
-        self.table.setColumnWidth(7, 130)
+        hh.setSectionResizeMode(DEP_COL, QHeaderView.Interactive)
         self.model.modelReset.connect(self._apply_group_spans)
+        self.model.modelReset.connect(self._install_dep_combos)
         self._apply_group_spans()
+        self._install_dep_combos()
         splitter.addWidget(self.table)
 
         self.graph = GraphPanel(self)
@@ -2875,6 +3084,106 @@ class MonitorWidget(QWidget):
             if kind == "header":
                 self.table.setSpan(r, 0, 1, len(COLS))
 
+    # --- "Depends on" rule dropdowns ------------------------------------
+    def _install_dep_combos(self):
+        """(Re)create the per-row rule dropdown in the 'Depends on' column.
+
+        Every PV with dependency rules gets one. 'Auto (…)' follows whichever
+        rule currently matches the dependency values and shows its name;
+        picking a rule (or 'Global') pins that threshold set until the user
+        changes it again. Model resets destroy index widgets, so this is
+        reconnected to modelReset."""
+        self._dep_combos = {}
+        for r, (kind, ref) in enumerate(self.model._display):
+            if kind != "pv" or not (ref.gate_pvs and ref.profiles):
+                continue
+            pv = ref
+            rt = self.runtime.get(pv.name)
+            if rt is not None and rt.dep_view is not None and not (
+                    -1 <= rt.dep_view < len(pv.profiles)):
+                rt.dep_view = None    # rules changed under a stale pin
+            combo = _NoWheelComboBox()
+            combo.addItem("")         # 'Auto (…)' — text kept fresh below
+            combo.addItem("Global")
+            for i, prof in enumerate(pv.profiles):
+                combo.addItem(_profile_item_text(pv, i, prof))
+            view = rt.dep_view if rt is not None else None
+            combo.setCurrentIndex(
+                0 if view is None else (1 if view == -1 else view + 2))
+            combo.currentIndexChanged.connect(
+                lambda idx, name=pv.name: self._on_dep_combo_changed(name, idx))
+            self.table.setIndexWidget(self.model.index(r, DEP_COL), combo)
+            self._dep_combos[pv.name] = combo
+        self._refresh_dep_combos()
+        # Width: widest dropdown, but never narrower than the plain-text rows
+        # (PVs with a dependency PV but no rules still render text there).
+        w = max([c.sizeHint().width() for c in self._dep_combos.values()]
+                or [0])
+        w = max(w, self.table.sizeHintForColumn(DEP_COL))
+        if w:
+            self.table.setColumnWidth(DEP_COL, w + 8)
+        if self._dep_combos:
+            h = max(c.sizeHint().height() for c in self._dep_combos.values())
+            vh = self.table.verticalHeader()
+            if vh.defaultSectionSize() < h:
+                vh.setDefaultSectionSize(h)
+
+    def _active_limits_label(self, pv: PVConfig, rt: Optional[PVRuntime]) -> str:
+        """Short name of the threshold set in force, for the 'Auto (…)' item."""
+        active = rt.active_profile if rt else None
+        if active is None:
+            return "Global"
+        return ((active.get("label") or "").strip()
+                or _profile_rule_text(pv, active) or "rule")
+
+    def _refresh_dep_combos(self):
+        """Keep every dropdown's 'Auto (…)' text and styling in sync with the
+        rule currently in force (called after each poll and on pin changes)."""
+        for pv in self.pvs:
+            combo = self._dep_combos.get(pv.name)
+            if combo is None:
+                continue
+            rt = self.runtime.get(pv.name)
+            combo.setItemText(0, f"Auto ({self._active_limits_label(pv, rt)})")
+            view = rt.dep_view if rt is not None else None
+            pinned = view is not None
+            # A pinned rule whose conditions don't hold right now falls back to
+            # the Global limits — flag that state in orange.
+            fallback = (pinned and view >= 0
+                        and (rt.active_profile is None if rt else True))
+            color = (f" color:{WARN_COLOR};" if fallback
+                     else " color:#0D47A1;" if pinned else "")
+            weight = " font-weight:600;" if pinned else ""
+            combo.setStyleSheet(
+                "QComboBox { padding:1px 6px;" + color + weight + " }")
+            tip = ("Threshold set in force for this PV.\n"
+                   "Auto — the first rule whose dependency conditions match "
+                   "wins; otherwise the Global limits.\n"
+                   "Pick a rule to pin its limits (applied only while its "
+                   "conditions hold, Global otherwise). Pick Global to force "
+                   "the global limits. Your choice sticks until you change it.")
+            if fallback:
+                tip = ("⚠ Pinned rule's conditions don't match right now — "
+                       "Global limits are in force.\n\n" + tip)
+            combo.setToolTip(tip)
+
+    def _on_dep_combo_changed(self, name: str, idx: int):
+        rt = self.runtime.get(name)
+        pv = next((p for p in self.pvs if p.name == name), None)
+        if rt is None or pv is None:
+            return
+        rt.dep_view = None if idx == 0 else (-1 if idx == 1 else idx - 2)
+        rt.active_profile = self._match_profile(pv)
+        self._refresh_dep_combos()
+        self.model.refresh_all()
+        if rt.dep_view is None:
+            self._log(f"{pv.display_name}: limits follow the active rule (Auto).")
+        elif rt.dep_view == -1:
+            self._log(f"{pv.display_name}: limits pinned to Global.")
+        else:
+            self._log(f"{pv.display_name}: limits pinned to "
+                      f"'{_profile_item_text(pv, rt.dep_view, pv.profiles[rt.dep_view])}'.")
+
     def _selected_pv(self) -> Optional[PVConfig]:
         rows = self.table.selectionModel().selectedRows()
         for idx in rows:
@@ -2915,10 +3224,25 @@ class MonitorWidget(QWidget):
 
     def _match_profile(self, pv: PVConfig) -> Optional[dict]:
         """The conditional profile in force for this PV right now, or None if
-        no rule matches (caller uses the default thresholds)."""
+        the default thresholds apply.
+
+        Auto (nothing pinned): the first rule whose conditions match wins.
+        A rule pinned in the 'Depends on' dropdown replaces that ordering: it
+        is used while its own conditions hold, else the Global limits. Pinning
+        'Global' forces the global thresholds regardless of the rules."""
         if not pv.gate_pvs or not pv.profiles:
             return None
-        return pv.match_profile([self._gate_value(g) for g in pv.gate_pvs])
+        gate_values = [self._gate_value(g) for g in pv.gate_pvs]
+        rt = self.runtime.get(pv.name)
+        view = rt.dep_view if rt is not None else None
+        if view is not None:
+            if 0 <= view < len(pv.profiles):
+                prof = pv.profiles[view]
+                if (PVConfig._profile_matches(prof, gate_values)
+                        and PVConfig.profile_thresholds(prof).is_active()):
+                    return prof
+            return None      # Global pinned, or pinned rule not applicable now
+        return pv.match_profile(gate_values)
 
     def _active_thresholds(self, pv: PVConfig) -> Thresholds:
         """The threshold set in force for this PV right now: the first matching
@@ -3300,6 +3624,7 @@ class MonitorWidget(QWidget):
                 rt.notify_status = ""      # episode over — clear the status cell
                 rt.notify_error = ""
         self.model.refresh_all()
+        self._refresh_dep_combos()
         self.graph.redraw()
 
     def _dispatch_alert(self, pv: PVConfig, rt: PVRuntime, note):

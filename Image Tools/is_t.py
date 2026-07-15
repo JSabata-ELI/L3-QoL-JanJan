@@ -264,10 +264,14 @@ def pv_text_for_ts(ts_ns: "int | None", enabled_names: "list[str]") -> str:
         if not channel:
             continue
         try:
-            val = _pv_last_known(channel, ts_ns)
+            val, status = _pv_last_known_ex(channel, ts_ns)
         except Exception:
-            val = None
+            val, status = None, "error"
         if val is None:
+            # Burn a clear token instead of silently omitting the PV: the saved
+            # frame must show whether the value was missing or the fetch failed.
+            token = cpva.PV_TEXT_ERROR if status == "error" else cpva.PV_TEXT_NOT_FOUND
+            parts.append(f"{name}: {token}")
             continue
         units = PV_UNITS.get(name, "")
         parts.append(f"{name}: {_format_pv_value(channel, val)} {units}".strip())
@@ -633,10 +637,17 @@ ONLINE_ACTIVE_FOLDER_COUNT = 2  # current hour + previous (grace for late writes
 # fails on many SMB/UNC setups), polling IS the data source: start fast, back
 # off while idle, snap back to fast on the first new frame. With 12 cameras this
 # is the difference between hundreds of SMB roundtrips/s and a handful.
-ONLINE_POLL_MIN_INTERVAL_S     = 1.0
+ONLINE_POLL_MIN_INTERVAL_S     = 0.5
 ONLINE_POLL_MAX_INTERVAL_S     = 5.0
 ONLINE_POLL_BACKOFF            = 1.5
-ONLINE_WATCHER_POLL_INTERVAL_S = 10.0
+# Safety-net poll interval while a HEALTHY watcher covers the folder. 3 s (was
+# 10 s): ReadDirectoryChangesW can die silently on SMB while looking healthy —
+# until the strike detector replaces it, this bounds the worst-case lag.
+ONLINE_WATCHER_POLL_INTERVAL_S = 3.0
+# A watcher that "healthily" missed frames the poll found gets a strike; at
+# this many strikes it is killed and recreated (after a cooldown).
+WATCHER_SUSPECT_STRIKES        = 2
+WATCHER_RESTART_COOLDOWN_S     = 30.0
 # Minutes after the UTC hour rollover during which the previous hour folder may
 # still receive late writes and must stay in the scan set.
 ONLINE_ROLLOVER_GRACE_MIN      = 5
@@ -2408,33 +2419,60 @@ class PointingPanel(QWidget):
             self._draw()
         return self._show_path
 
-    def toggle_select_mode(self):
-        """Enable/disable rubber-band selection for point deletion."""
-        if not _MPL_OK or self._cx is None:
-            return False
-        self._select_mode = not self._select_mode
-        if self._select_mode:
-            from matplotlib.widgets import RectangleSelector
-            # We need ax_main — get the first axes in the figure
-            axes = self._fig.get_axes()
-            ax_main = axes[1] if len(axes) > 1 else (axes[0] if axes else None)
-            if ax_main is None:
-                self._select_mode = False
-                return False
-            self._rect_selector = RectangleSelector(
-                ax_main, self._on_rect_selected,
-                useblit=True, button=[1],
-                minspanx=0, minspany=0,
-                spancoords="data", interactive=True)
-        else:
-            if self._rect_selector is not None:
+    def _disarm_selector(self):
+        if self._rect_selector is not None:
+            try:
                 self._rect_selector.set_active(False)
-                self._rect_selector = None
+            except Exception:
+                pass
+            self._rect_selector = None
+
+    def _arm_selector(self) -> bool:
+        """(Re)create the rubber-band selector on the current scatter axes.
+        Must be called again after every _draw() — fig.clear() destroys the
+        axes the previous selector was bound to."""
+        if not _MPL_OK:
+            return False
+        from matplotlib.widgets import RectangleSelector
+        self._disarm_selector()
+        ax_main = self._get_ax_main()
+        if ax_main is None:
+            return False
+        # interactive=False: no leftover resize handles between drags — each
+        # drag deletes immediately and the next drag starts fresh.
+        self._rect_selector = RectangleSelector(
+            ax_main, self._on_rect_selected,
+            useblit=True, button=[1],
+            minspanx=0, minspany=0,
+            spancoords="data", interactive=False)
+        return True
+
+    def set_select_mode(self, on: bool) -> bool:
+        """Persistent Delete mode: while on, every drag-rectangle deletes the
+        points inside it immediately; the mode stays active until toggled off
+        (or new data arrives). Returns the resulting mode state."""
+        if not _MPL_OK or self._cx is None:
+            self._select_mode = False
+            self._disarm_selector()
+            return False
+        if on:
+            self._select_mode = self._arm_selector()
+        else:
+            self._select_mode = False
+            self._disarm_selector()
         return self._select_mode
 
+    def toggle_select_mode(self):
+        """Compat shim — flip Delete mode (see set_select_mode)."""
+        return self.set_select_mode(not self._select_mode)
+
     def _on_rect_selected(self, eclick, erelease):
-        """Delete points inside the rubber-band rectangle."""
+        """Delete points inside the rubber-band rectangle. Delete mode STAYS
+        active — _draw() re-arms the selector on the rebuilt axes."""
         if self._cx is None or self._mask is None:
+            return
+        if eclick.xdata is None or erelease.xdata is None \
+                or eclick.ydata is None or erelease.ydata is None:
             return
         x0, x1 = sorted([eclick.xdata, erelease.xdata])
         y0, y1 = sorted([eclick.ydata, erelease.ydata])
@@ -2443,12 +2481,9 @@ class PointingPanel(QWidget):
         # Build indices into original arrays for currently-visible points
         vis_indices = np.where(self._mask)[0]
         inside = (cx >= x0) & (cx <= x1) & (cy >= y0) & (cy <= y1)
+        if not bool(inside.any()):
+            return   # empty drag — nothing to delete, no redraw needed
         self._mask[vis_indices[inside]] = False
-        # Deactivate selector so user needs to re-enable for next selection
-        if self._rect_selector is not None:
-            self._rect_selector.set_active(False)
-            self._rect_selector = None
-        self._select_mode = False
         self._draw()
         self.region_deleted.emit()
 
@@ -2698,9 +2733,13 @@ class PointingPanel(QWidget):
         if not _MPL_OK: return
         self._hover_annot = None
         self._qt_tooltip.hide()
+        self._rect_selector = None   # fig.clear() kills its axes — never reuse
         self._fig.clear()
         self._render_to_fig(self._fig)
         self._canvas.draw()
+        if self._select_mode:
+            # Delete mode persists across redraws (deletion, replay, restore)
+            self._arm_selector()
 
     def _render_to_fig(self, fig):
         mask = self._mask.copy() if self._mask is not None else np.ones(len(self._cx), dtype=bool)
@@ -5484,24 +5523,28 @@ class ImageView(QWidget):
             p.setPen(QColor(0, 0, 0))
             p.drawText(bar_rect, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter, display_text)
 
-        # Camera name + timestamp labels.
-        # overlay mode (multi-cam): drawn semi-transparent over the bottom of the image.
-        # non-overlay mode (single-cam): drawn in the reserved strip below the image,
-        #   spanning exactly the image width (x0 … x0+img_w).
+        # Camera name + timestamp labels — SAME look as the multi-cam tiles:
+        # name left (1/3, #eee on #444), timestamp right (2/3, #ffd54f on #333,
+        # font 1 px smaller).
+        # overlay mode (multi-cam grid tiles): semi-transparent over the image top.
+        # non-overlay mode (single-cam): drawn in the strip reserved ABOVE the
+        #   image, exactly abutting the image top edge (no gap, no overlap),
+        #   spanning the image width.
         if (self.cam_label_text or self.cam_ts_text) and not self._pix.isNull():
             from PySide6.QtGui import QFont as _QFont
             _fpx = max(8, self.cam_label_font_px)
-            lbl_h = _fpx + 10
             lbl_x = img_rect.left()
             lbl_w = img_rect.width()
             if self.cam_label_use_overlay:
+                lbl_h = _fpx + 10
                 # Semi-transparent strip at the very top of the image rect
                 lbl_y = img_rect.top()
                 lbl_y = min(lbl_y, img_rect.bottom() - lbl_h)
             else:
-                # Reserved strip directly above the image, same x/width as image
-                lbl_y = img_rect.top() - lbl_h - 1
-                lbl_y = max(0, lbl_y)
+                # Drawn height == reserved height → strip ends exactly at the
+                # image top edge (the old "-1" left a visible gap line).
+                lbl_h = self._label_bar_h()
+                lbl_y = max(0, img_rect.top() - lbl_h)
             name_w = lbl_w // 3
             ts_w = lbl_w - name_w
             font = _QFont(); font.setPixelSize(_fpx)
@@ -6928,6 +6971,11 @@ class _DirWatcher(_threading.Thread):
         # False, so health = (ok and is_alive()). A dead watcher must NOT be
         # treated as coverage, or the poll fallback never takes over.
         self.ok = False
+        # Liveness accounting for the silent-death case where the thread stays
+        # alive but RDCW stops delivering (seen on some SMB shares): the poll
+        # cross-checks this against frames it found itself.
+        self.last_event_mono = 0.0
+        self.suspect_strikes = 0
 
     def stop(self):
         self._stop.set()
@@ -6954,6 +7002,7 @@ class _DirWatcher(_threading.Thread):
             return
         self._handle = h
         self.ok = True
+        self.last_event_mono = time.monotonic()   # armed counts as activity
         buf = _ct.create_string_buffer(65536)
         br  = _wt.DWORD(0)
         while not self._stop.is_set():
@@ -6973,6 +7022,8 @@ class _DirWatcher(_threading.Thread):
                     "utf-16-le", errors="replace")
                 if action in (_FILE_ACTION_ADDED, _FILE_ACTION_RENAMED):
                     if Path(name).suffix.lower() in self._img_ext:
+                        self.last_event_mono = time.monotonic()
+                        self.suspect_strikes = 0
                         try:
                             self._signals.new_file.emit(self._cam_i, name)
                         except RuntimeError:
@@ -7857,8 +7908,10 @@ class Viewer(QWidget):
         row_pa2.addWidget(self.btn_pointing_save)
         row_pa2.addWidget(self.btn_pointing_path)
         s_an.body_layout.addLayout(row_pa2)
-        self.btn_pointing_select = QPushButton("◻ Select & Delete")
-        self.btn_pointing_select.setToolTip("Drag a rectangle on the scatter plot to delete those points")
+        self.btn_pointing_select = QPushButton("🗑 Delete mode")
+        self.btn_pointing_select.setToolTip(
+            "Delete mode: every dragged rectangle deletes the points inside it "
+            "immediately. Stays active until you click the button again.")
         self.btn_pointing_select.setEnabled(False)
         self.btn_pointing_select.setCheckable(True)
         self.btn_pointing_select.clicked.connect(self._toggle_pointing_select)
@@ -8506,7 +8559,7 @@ class Viewer(QWidget):
             name_item = QTableWidgetItem(name)
             val_str = self._pv_values.get(name, "…")
             units = PV_UNITS.get(name, "")
-            if val_str not in ("…", "—") and units:
+            if val_str not in ("…", "—", cpva.PV_TEXT_ERROR, cpva.PV_TEXT_NOT_FOUND) and units:
                 val_str = f"{val_str} {units}"
             val_item = QTableWidgetItem(val_str)
             self._pv_table.setItem(i, 0, name_item)
@@ -8515,8 +8568,10 @@ class Viewer(QWidget):
 
     def _pv_trigger_fetch(self):
         """Throttled entry: coalesce rapid frame changes (live mode ~3 Hz,
-        scrubbing) into one fetch at most every ~400 ms. Trailing-edge — the
-        timestamp is resolved when the timer fires, so the newest frame wins."""
+        scrubbing) into one fetch. TRUE trailing-edge debounce — each call
+        restarts the 400 ms timer so the value follows the frame the user
+        STOPPED on — with a 0.7 s max-wait so continuous playback (which never
+        stops re-triggering) still refreshes regularly."""
         if not self._pv_enabled:
             return
         t = getattr(self, "_pv_debounce_timer", None)
@@ -8526,12 +8581,29 @@ class Viewer(QWidget):
             t.setInterval(400)
             t.timeout.connect(self._pv_trigger_fetch_now)
             self._pv_debounce_timer = t
-        if not t.isActive():
-            t.start()
+        first = getattr(self, "_pv_debounce_first_ts", None)
+        now = time.monotonic()
+        if first is None:
+            self._pv_debounce_first_ts = now
+        elif now - first > 0.7:
+            # Max-wait hit — fire immediately instead of postponing forever
+            t.stop()
+            self._pv_trigger_fetch_now()
+            return
+        t.start()   # restart → trailing edge
 
     def _pv_trigger_fetch_now(self):
-        """Start a background fetch for the current displayed timestamp."""
+        """Start a background fetch for the current displayed timestamp.
+
+        Single-flight: at most one fetch runs; triggers while one is in flight
+        set a dirty flag and _pv_on_result re-triggers with the NEWEST frame's
+        timestamp. Unlike the old generation-token drop, a completed fetch is
+        always applied — the overlay can lag briefly but never freezes stale."""
+        self._pv_debounce_first_ts = None
         if not self._pv_enabled:
+            return
+        if getattr(self, "_pv_fetch_inflight", False):
+            self._pv_fetch_dirty = True
             return
         # Determine timestamp: master cam in multi-cam, else current single-cam frame
         ts_ns: "int | None" = None
@@ -8561,7 +8633,7 @@ class Viewer(QWidget):
         if ts_ns is None:
             return
 
-        # Cancel stale fetches
+        self._pv_fetch_inflight = True
         self._pv_fetch_gen += 1
         gen = self._pv_fetch_gen
         names  = list(self._pv_enabled)
@@ -8577,12 +8649,13 @@ class Viewer(QWidget):
         def _fetch_one(name):
             channel = PV_CHANNEL_MAP.get(name)
             if not channel:
-                return name, "—"
+                return name, cpva.PV_TEXT_NOT_FOUND
             val, status = _pv_last_known_ex(channel, ts_ns)
             if val is None:
-                # "error" = fetch failed (not cached → next trigger retries);
-                # distinguish it from a genuine "no data near this timestamp".
-                return name, ("⟳" if status == "error" else "—")
+                # "ERR" = fetch failed (not cached → next trigger retries);
+                # "n/a" = genuinely no sample near this timestamp.
+                return name, (cpva.PV_TEXT_ERROR if status == "error"
+                              else cpva.PV_TEXT_NOT_FOUND)
             txt = f"{val:.0f}" if "RawPos" in channel else f"{val:.3f}"
             if status == "stale":
                 txt += " (old)"
@@ -8591,15 +8664,18 @@ class Viewer(QWidget):
         def _fetch():
             from concurrent.futures import ThreadPoolExecutor, as_completed
             results: dict[str, str] = {}
-            with ThreadPoolExecutor(max_workers=min(len(names), 8)) as ex:
-                futs = {ex.submit(_fetch_one, n): n for n in names}
-                for fut in as_completed(futs):
-                    try:
-                        name, val = fut.result()
-                        results[name] = val
-                    except Exception:
-                        results[futs[fut]] = "—"
-            if gen == self._pv_fetch_gen:
+            try:
+                with ThreadPoolExecutor(max_workers=min(len(names), 8)) as ex:
+                    futs = {ex.submit(_fetch_one, n): n for n in names}
+                    for fut in as_completed(futs):
+                        try:
+                            name, val = fut.result()
+                            results[name] = val
+                        except Exception:
+                            results[futs[fut]] = cpva.PV_TEXT_ERROR
+            finally:
+                # ALWAYS emit — _pv_on_result must clear the in-flight flag,
+                # otherwise one crashed fetch would freeze the overlay forever.
                 self._pv_signals.result.emit(gen, results)
 
         threading.Thread(target=_fetch, daemon=True).start()
@@ -8621,11 +8697,17 @@ class Viewer(QWidget):
         self._pv_trigger_fetch()
 
     def _pv_on_result(self, gen: int, results: dict):
-        if gen != self._pv_fetch_gen:
-            return
-        self._pv_values.update(results)
-        self._pv_rebuild_table()
-        self._pv_update_overlay()
+        # Always apply the completed fetch (it is the newest finished one —
+        # single-flight guarantees no older fetch can still be running), then
+        # re-trigger if frames changed while it ran.
+        self._pv_fetch_inflight = False
+        if results:
+            self._pv_values.update(results)
+            self._pv_rebuild_table()
+            self._pv_update_overlay()
+        if getattr(self, "_pv_fetch_dirty", False):
+            self._pv_fetch_dirty = False
+            self._pv_trigger_fetch_now()
 
     def _pv_update_overlay(self):
         """Refresh the floating PV overlay panel."""
@@ -8644,7 +8726,7 @@ class Viewer(QWidget):
         for name in self._pv_enabled:
             val = self._pv_values.get(name, "…")
             units = PV_UNITS.get(name, "")
-            if val not in ("…", "—", "⟳") and units:
+            if val not in ("…", "—", "⟳", cpva.PV_TEXT_ERROR, cpva.PV_TEXT_NOT_FOUND) and units:
                 val = f"{val} {units}"
             rows.append((name, val))
 
@@ -9282,17 +9364,52 @@ class Viewer(QWidget):
         return max(20, 160 // max(1, n_cams))
 
     def _ensure_dir_watcher(self, cam_i: int, folder: "Path"):
-        """Start a _DirWatcher for folder if not already running."""
+        """Start a _DirWatcher for folder if not already running. Dead watcher
+        threads are replaced (RDCW silently exiting used to leave a dead entry
+        in the dict forever); a killed-as-suspect watcher waits out a cooldown
+        before it is recreated so a chronically failing share doesn't thrash."""
         if not _DIRWATCH_AVAILABLE:
             return
+        if not hasattr(self, "_watcher_restart_block"):
+            self._watcher_restart_block = {}
         key = str(folder)
-        if key in self._dir_watchers:
+        w = self._dir_watchers.get(key)
+        if w is not None:
+            if w.is_alive():
+                return
+            self._dir_watchers.pop(key, None)   # dead thread — replace below
+        if time.monotonic() < self._watcher_restart_block.get(key, 0.0):
             return
         if self._dir_watch_sigs is None:
             return
         w = _DirWatcher(cam_i, folder, self._dir_watch_sigs, IMG_EXT)
         w.start()
         self._dir_watchers[key] = w
+
+    def _watcher_strike(self, folders, poll_start_mono: float):
+        """The listdir poll found frames a 'healthy' watcher should have pushed
+        — RDCW died silently (thread alive, no events). Strike such watchers;
+        at WATCHER_SUSPECT_STRIKES kill them so _ensure_dir_watcher recreates
+        them after the cooldown. While no watcher covers the folder the poll
+        automatically becomes the (fast) data source again."""
+        if not hasattr(self, "_watcher_restart_block"):
+            self._watcher_restart_block = {}
+        for f in folders:
+            key = str(f)
+            w = self._dir_watchers.get(key)
+            if w is None or not (w.ok and w.is_alive()):
+                continue
+            if w.last_event_mono >= poll_start_mono:
+                continue   # it did deliver recently — not suspect
+            w.suspect_strikes += 1
+            if w.suspect_strikes >= WATCHER_SUSPECT_STRIKES:
+                try:
+                    w.stop()
+                except Exception:
+                    pass
+                self._dir_watchers.pop(key, None)
+                self._watcher_restart_block[key] = (
+                    time.monotonic() + WATCHER_RESTART_COOLDOWN_S)
 
     def _stop_dir_watchers(self):
         for w in self._dir_watchers.values():
@@ -9314,7 +9431,31 @@ class Viewer(QWidget):
 
     def _on_dir_watch_new_file(self, cam_i: int, filename: str):
         """Immediate handler for a new image file detected by _DirWatcher."""
-        if not self._online_mode or cam_i >= len(self._cam_items):
+        if not self._online_mode:
+            return
+        if not self._is_multi_cam():
+            # Single-camera: find the watched folder and merge through the same
+            # path the poll uses (its ts cutoff de-duplicates double delivery).
+            folder = None
+            for f in self.opened_folders:
+                w = self._dir_watchers.get(str(f))
+                if w is not None and w._cam_i == cam_i and w._folder == f:
+                    folder = f
+                    break
+            if folder is None and self.opened_folders:
+                folder = self.opened_folders[-1]
+            if folder is None:
+                return
+            p = Path(folder) / filename
+            ts_ns = parse_unix_ns_from_name(p)
+            if ts_ns is None:
+                return
+            cutoff = self.ts_list[-1] if self.ts_list else 0
+            if ts_ns <= cutoff:
+                return
+            self._merge_single_new_items([Item(p, ts_ns)])
+            return
+        if cam_i >= len(self._cam_items):
             return
         # Find the folder this file lives in (watcher key → folder path)
         folder_lists = self._cam_folder_lists
@@ -9373,13 +9514,19 @@ class Viewer(QWidget):
 
     def _start_online_mode(self):
         self._online_mode = True
-        # Start real-time dir watchers for all known camera folders.
+        # Start real-time dir watchers for all known camera folders — single
+        # camera included (it used to rely on polling alone; now both modes get
+        # instant pushes with the poll as safety net).
         if _DIRWATCH_AVAILABLE:
             self._dir_watch_sigs = _DirWatchSignals()
             self._dir_watch_sigs.new_file.connect(self._on_dir_watch_new_file)
-            for cam_i, folder_list in enumerate(self._cam_folder_lists):
-                for folder in active_scan_folders(folder_list):
-                    self._ensure_dir_watcher(cam_i, folder)
+            if self._is_multi_cam():
+                for cam_i, folder_list in enumerate(self._cam_folder_lists):
+                    for folder in active_scan_folders(folder_list):
+                        self._ensure_dir_watcher(cam_i, folder)
+            elif self.opened_folders:
+                for folder in active_scan_folders(self.opened_folders):
+                    self._ensure_dir_watcher(0, folder)
         self._online_timer.start()
         self._btn_auto_follow.setEnabled(True)
         self._btn_auto_follow.blockSignals(True)
@@ -9446,7 +9593,78 @@ class Viewer(QWidget):
                 return
             if getattr(self, '_online_poll_running', False):
                 return
+            # Keep watchers matched to the currently active hour folders
+            active = active_scan_folders(self.opened_folders)
+            if _DIRWATCH_AVAILABLE and self._dir_watch_sigs is not None:
+                self._prune_dir_watchers({str(f) for f in active})
+                for f in active:
+                    self._ensure_dir_watcher(0, f)
+            # With a HEALTHY watcher frames are pushed instantly — the listdir
+            # poll is only a safety net and runs slowly. Without one, polling
+            # is the data source: keep the original fast 200 ms cadence.
+            has_watcher = False
+            for f in poll_scan_folders(self.opened_folders):
+                w = self._dir_watchers.get(str(f))
+                if w is not None and w.ok and w.is_alive():
+                    has_watcher = True
+                    break
+            if has_watcher:
+                now = time.monotonic()
+                last = getattr(self, '_single_last_full_poll_mono', 0.0)
+                if now - last < ONLINE_WATCHER_POLL_INTERVAL_S:
+                    return
+                self._single_last_full_poll_mono = now
             self._online_poll_single_bg()
+
+    def _merge_single_new_items(self, new_items: list):
+        """Merge freshly arrived single-camera frames into the timeline and
+        advance the display. Shared by the listdir poll AND the dir-watcher
+        push — both deliver through the identical code path (the ts cutoff in
+        each caller de-duplicates double delivery)."""
+        if not new_items:
+            return
+        new_items.sort(key=lambda x: x.ts_ns)
+
+        # Capture state BEFORE mutating — needed for correct was_at_end check
+        _prev_len = len(self.items)
+        _prev_current_idx = self.current_idx
+
+        # Append-only — items list is always sorted, new items are all newer
+        self.items = self.items + new_items
+        self.ts_list = self.ts_list + [it.ts_ns for it in new_items]
+
+        # Cap to ONLINE_MAX_ITEMS — drop oldest frames to prevent unbounded growth
+        if len(self.items) > ONLINE_MAX_ITEMS:
+            trim = len(self.items) - ONLINE_MAX_ITEMS
+            self.items = self.items[trim:]
+            self.ts_list = self.ts_list[trim:]
+            if self.current_idx is not None:
+                self.current_idx = max(0, self.current_idx - trim)
+
+        # Rozšiř osu pokud nové snímky přesahují
+        ts_max = self.ts_list[-1]
+        if ts_max > self.axis_max_ns:
+            dt0 = floor_to_hour(_dt_from_ns(self.ts_list[0]))
+            span_hours = math.ceil(
+                (ts_max - ns_from_dt(dt0)) / ONE_HOUR_NS)
+            self.axis_max_ns = ns_from_dt(dt0 + timedelta(hours=span_hours))
+            self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
+
+        self._online_last_new_ns = time.time()
+        self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
+        self.lbl_index.setText(
+            f"{(self.current_idx or 0) + 1} / {len(self.items)}")
+
+        last_idx = len(self.items) - 1
+        # Show newest frame if: auto-follow is on, OR slider was already at the end
+        was_at_end = (
+            _prev_current_idx is not None and
+            _prev_len > 0 and
+            _prev_current_idx >= _prev_len - 1
+        )
+        if self._auto_follow or was_at_end:
+            self._display_exact_index(
+                last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
     def _online_poll_single_bg(self):
         """Spustí background scan pro single-camera — neblokuje UI."""
@@ -9455,6 +9673,7 @@ class Viewer(QWidget):
         # whole accumulated list every tick is what made live mode lag grow over time.
         folders = poll_scan_folders(self.opened_folders)
         gen = self._gen
+        poll_start_mono = time.monotonic()
         # Use ts_ns cutoff instead of path set — much faster O(n) single pass
         cutoff_ns = self.ts_list[-1] if self.ts_list else 0
 
@@ -9462,49 +9681,10 @@ class Viewer(QWidget):
             self._online_poll_running = False
             if gen != self._gen or not new_items:
                 return
-            new_items.sort(key=lambda x: x.ts_ns)
-
-            # Capture state BEFORE mutating — needed for correct was_at_end check
-            _prev_len = len(self.items)
-            _prev_current_idx = self.current_idx
-
-            # Append-only — items list is always sorted, new items are all newer
-            self.items = self.items + new_items
-            self.ts_list = self.ts_list + [it.ts_ns for it in new_items]
-
-            # Cap to ONLINE_MAX_ITEMS — drop oldest frames to prevent unbounded growth
-            if len(self.items) > ONLINE_MAX_ITEMS:
-                trim = len(self.items) - ONLINE_MAX_ITEMS
-                self.items = self.items[trim:]
-                self.ts_list = self.ts_list[trim:]
-                if self.current_idx is not None:
-                    self.current_idx = max(0, self.current_idx - trim)
-
-            # Rozšiř osu pokud nové snímky přesahují
-            ts_max = self.ts_list[-1]
-            if ts_max > self.axis_max_ns:
-                dt0 = floor_to_hour(_dt_from_ns(self.ts_list[0]))
-                span_hours = math.ceil(
-                    (ts_max - ns_from_dt(dt0)) / ONE_HOUR_NS)
-                self.axis_max_ns = ns_from_dt(dt0 + timedelta(hours=span_hours))
-                self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
-
-            self._online_last_new_ns = time.time()
-            self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
-            self.lbl_index.setText(
-                f"{(self.current_idx or 0) + 1} / {len(self.items)}")
-
-            last_idx = len(self.items) - 1
-            # Show newest frame if: auto-follow is on, OR slider was already at the end
-            was_at_end = (
-                _prev_current_idx is not None and
-                _prev_len > 0 and
-                _prev_current_idx >= _prev_len - 1
-            )
-            if self._auto_follow or was_at_end:
-                self._display_exact_index(
-                    last_idx, self.items[last_idx].ts_ns, update_slider=True)
-
+            # The poll found frames itself — if a "healthy" watcher covers these
+            # folders it silently missed them (RDCW death) → strike/replace it.
+            self._watcher_strike(folders, poll_start_mono)
+            self._merge_single_new_items(new_items)
 
         class _PollSignals2(QObject):
             found = Signal(list, list)  # (new_items, new_folders)
@@ -9512,11 +9692,15 @@ class Viewer(QWidget):
         sig2 = _PollSignals2()
 
         def on_found_with_folders(new_items, new_folders):
-            # Register newly discovered hour-folders so future polls scan them too
+            # Register newly discovered hour-folders so future polls scan them
+            # too, and watch them (hour rollover).
             if new_folders:
                 for nf in new_folders:
                     if nf not in self.opened_folders:
                         self.opened_folders.append(nf)
+                if self._online_mode:
+                    for f in active_scan_folders(self.opened_folders):
+                        self._ensure_dir_watcher(0, f)
             on_found(new_items)
 
         sig2.found.connect(on_found_with_folders)
@@ -9630,11 +9814,19 @@ class Viewer(QWidget):
 
         # Keep dir-watchers only on the folders we still actively scan, so a long
         # session does not leak one open SMB handle + thread per elapsed hour.
+        # Re-ensure afterwards: dead/struck watchers get replaced (post-cooldown).
         active_keys: set[str] = set()
+        active_per_cam: "list[list]" = []
         for cam_i in range(n_cams):
-            for f in active_scan_folders(folder_lists[cam_i]):
+            act = active_scan_folders(folder_lists[cam_i])
+            active_per_cam.append(act)
+            for f in act:
                 active_keys.add(str(f))
         self._prune_dir_watchers(active_keys)
+        if _DIRWATCH_AVAILABLE and self._dir_watch_sigs is not None:
+            for cam_i in range(n_cams):
+                for f in active_per_cam[cam_i]:
+                    self._ensure_dir_watcher(cam_i, f)
 
         for cam_i in range(n_cams):
             if self._cam_poll_running[cam_i]:
@@ -9667,11 +9859,18 @@ class Viewer(QWidget):
             sig = _CamPollSignals()
             self._cam_poll_sigs[cam_i] = sig  # keep reference so it isn't GC'd
 
-            def make_callback(ci, g):
+            def make_callback(ci, g, _folders=folders, _had_watcher=has_watcher,
+                              _poll_start=now):
                 def on_cam_found(cam_idx: int, new_items: list, new_folders: list):
                     self._cam_poll_running[cam_idx] = False
                     if g != self._gen:
                         return
+                    if new_items and _had_watcher:
+                        # The safety-net poll beat a "healthy" watcher to these
+                        # frames — RDCW died silently. Strike/replace it so the
+                        # camera drops back to fast polling instead of lagging
+                        # behind a dead watcher.
+                        self._watcher_strike(_folders, _poll_start)
                     # Adaptive pacing: an active camera polls fast again, an
                     # idle one backs off (bounded) to spare the SMB share.
                     if hasattr(self, '_cam_poll_interval') and cam_idx < len(self._cam_poll_interval):
@@ -10857,6 +11056,17 @@ class Viewer(QWidget):
         self.lbl_scan_progress.setText("Scanning..."); self.btn_cancel_scan.setVisible(True)
 
     def _start_scan(self, folders, axis_override, folder_label):
+        # _start_scan is the SINGLE-camera scan path — clear stale multi-cam
+        # state here, or a previous multi session's _cam_folder_lists makes
+        # _start_online_mode arm watchers on dead folders and _is_multi_cam()
+        # can stay wrongly True (leftover _cam_names).
+        if len(self._cam_names) > 1:
+            self._cam_names = self._cam_names[:1]
+        self._cam_folder_lists = []
+        self._cam_folders = []
+        self._cam_items = []
+        self._cam_ts = []
+        self._cam_poll_max_ts = []
         self._gen += 1; gen = self._gen
         if self._scan_task is not None:
             self._scan_task.cancel(); self._scan_task = None
@@ -12011,6 +12221,9 @@ class Viewer(QWidget):
         self.btn_pointing_path.setText("〰 Show Path")
         self.btn_pointing_close.setEnabled(True)
         self.btn_pointing_select.setEnabled(True)
+        # New dataset — panel.plot() reset Delete mode; mirror it on the button
+        self.btn_pointing_select.setChecked(False)
+        self._style_pointing_select_btn(False)
         self.btn_pointing_restore.setEnabled(False)
 
     def _on_pointing_live_toggled(self, checked: bool):
@@ -12107,24 +12320,32 @@ class Viewer(QWidget):
             self.btn_pointing_live.setStyleSheet("")
             self._stop_pointing_replay()
         self.pointing_panel.setVisible(False)
+        self.pointing_panel.set_select_mode(False)
         self.btn_pointing_close.setEnabled(False)
         self.btn_pointing_path.setEnabled(False)
         self.btn_pointing_save.setEnabled(False)
         self.btn_pointing_select.setEnabled(False)
+        self.btn_pointing_select.setChecked(False)
+        self._style_pointing_select_btn(False)
         self.btn_pointing_restore.setEnabled(False)
         self.btn_pointing_path.setText("〰 Show Path")
 
     def _toggle_pointing_select(self, checked: bool):
-        if checked:
-            active = self.pointing_panel.toggle_select_mode()
-            if not active:
-                self.btn_pointing_select.setChecked(False)
-        else:
-            if self.pointing_panel._select_mode:
-                self.pointing_panel.toggle_select_mode()
+        active = self.pointing_panel.set_select_mode(checked)
+        if checked and not active:
+            self.btn_pointing_select.setChecked(False)
+        self._style_pointing_select_btn(active)
+
+    def _style_pointing_select_btn(self, on: bool):
+        self.btn_pointing_select.setText("🗑 Delete mode ON" if on
+                                         else "🗑 Delete mode")
+        self.btn_pointing_select.setStyleSheet(
+            "background-color: #c62828; color: white; font-weight: bold;"
+            if on else "")
 
     def _on_pointing_region_deleted(self):
-        self.btn_pointing_select.setChecked(False)
+        # Delete mode stays active — each drag deletes immediately; the button
+        # keeps its checked state until the user toggles it off.
         # update status label with new N
         panel = self.pointing_panel
         if panel._mask is not None and panel._cx is not None:

@@ -290,15 +290,19 @@ def _load_csv_for_day(day: date, cols: "list[str]",
 
 def _load_api_for_day(day: date, cols: "list[str]",
                       log=None,
-                      csv_root: "str | None" = None) -> "tuple[list[dict], dict[str, list[dict]]]":
+                      csv_root: "str | None" = None
+                      ) -> "tuple[list[dict], dict[str, list[dict]], dict[str, dict]]":
     """
     Query the CPVA archiver for all requested PV columns over the full day.
-    Falls back to CSV if API returns no data for a column.
+    Falls back to CSV only when the API answered successfully with no samples —
+    an API fetch FAILURE must not be papered over with possibly-zero CSV values
+    (that silent source mixing produced alternating real/0 values day to day).
 
-    Returns (merged_rows, per_col_rows) where:
+    Returns (merged_rows, per_col_rows, col_meta) where:
       - merged_rows: list of row dicts merged by timestamp across all channels
       - per_col_rows: dict mapping col → sorted list of single-col row dicts
         (used for closest-timestamp extra-column matching)
+      - col_meta: col → {"source": "api"|"csv"|"none", "status": "ok"|"stale"|"error"|"empty"}
 
     Each row dict has:
       "_dt" : datetime (Prague-naive)
@@ -309,31 +313,26 @@ def _load_api_for_day(day: date, cols: "list[str]",
         if log is not None:
             log(msg)
 
-    if PRAGUE is None:
-        day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc)
-    else:
-        day_start = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=PRAGUE)
-        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=PRAGUE)
-
-    start_ns = int(day_start.timestamp() * 1_000_000_000)
-    end_ns   = int(day_end.timestamp()   * 1_000_000_000)
-
     # Per-column sample lists (API first, CSV fallback per column)
     per_col: dict[str, list[dict]] = {}
+    col_meta: dict[str, dict] = {}
 
-    def _fetch_one_col(col: str) -> tuple[str, list[dict]]:
+    def _fetch_one_col(col: str) -> "tuple[str, list[dict], dict]":
         # Preset cols map to a friendly channel; arbitrary cols ARE the channel.
         channel = CPVA_CHANNEL_MAP.get(col, col)
         col_rows: list[dict] = []
+        meta = {"source": "none", "status": "empty"}
         if channel:
             date_key = day.strftime("%Y-%m-%d")
             # Shared day cache: repeat searches over the same days are served
             # from memory; the ".value" channel-suffix retry happens inside.
             res = cpva.get_day(channel, date_key, timeout=CPVA_HTTP_TIMEOUT)
+            meta["status"] = res.status
             if res.status == "error":
-                _log(f"  API {col} ({channel}) FETCH FAILED (will retry) — falling back to CSV")
-            elif res.status == "stale":
+                _log(f"  API {col} ({channel}) FETCH FAILED — shown as ERR "
+                     f"(no CSV fallback: mixing sources hides the outage)")
+                return col, [], meta
+            if res.status == "stale":
                 _log(f"  API {col} ({channel}): fetch failed, using "
                      f"{len(res.samples)} samples from {res.age_s:.0f}s ago")
             for t_ns, v in res.samples:
@@ -344,6 +343,7 @@ def _load_api_for_day(day: date, cols: "list[str]",
                     dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
                 col_rows.append({"_dt": dt_local, "_ns": t_ns, col: str(v)})
             if col_rows:
+                meta["source"] = "api"
                 _log(f"  API {col} ({channel}): {len(col_rows)} samples")
         else:
             _log(f"  {col}: no CPVA channel mapping, trying CSV only")
@@ -351,20 +351,26 @@ def _load_api_for_day(day: date, cols: "list[str]",
             _, csv_per = _load_csv_for_day(day, [col], csv_root=csv_root)
             col_rows = csv_per.get(col, [])
             if col_rows:
+                meta["source"] = "csv"
+                meta["status"] = "ok"
                 _log(f"  CSV fallback {col}: {len(col_rows)} rows")
             else:
                 _log(f"  CSV fallback {col}: no data")
-        return col, col_rows
+        return col, col_rows, meta
 
     with ThreadPoolExecutor(max_workers=max(1, len(cols))) as _aex:
         _col_futs = {_aex.submit(_fetch_one_col, c): c for c in cols}
         for _fut in as_completed(_col_futs):
             try:
-                _col, _col_rows = _fut.result()
+                _col, _col_rows, _meta = _fut.result()
+                col_meta[_col] = _meta
                 if _col_rows:
                     per_col[_col] = _col_rows
             except Exception as exc:
                 _log(f"  col fetch ERROR: {type(exc).__name__}: {exc}")
+
+    for c in cols:
+        col_meta.setdefault(c, {"source": "none", "status": "error"})
 
     # Merge all per-col rows into a single list keyed by _ns
     by_ts: dict[int, dict] = {}
@@ -380,39 +386,99 @@ def _load_api_for_day(day: date, cols: "list[str]",
     _log(f"  {day}: merged {len(merged)} rows; samples per col: {counts}")
     for c in cols:
         if not per_col.get(c):
-            _log(f"  ⚠ {day}: NO data for '{c}' (API+CSV both empty)")
-    return merged, per_col
+            st = col_meta[c]["status"]
+            _log(f"  ⚠ {day}: NO data for '{c}' "
+                 f"({'fetch FAILED' if st == 'error' else 'API+CSV both empty'})")
+    return merged, per_col, col_meta
 
 
 def _find_closest_col_value(per_col: "dict[str, list[dict]]", col: str,
                              target_ns: int, tol_s: float = EXTRA_COL_MATCH_TOL_S,
                              log=None) -> str:
+    """Compat wrapper around _lookup_col_value — formatted-ish raw value or "—"."""
+    raw, state = _lookup_col_value(per_col, {}, col, target_ns, tol_s=tol_s,
+                                   allow_network=False, log=log)
+    return raw if state == "ok" else "—"
+
+
+def _lookup_col_value(per_col: "dict[str, list[dict]]", col_meta: "dict[str, dict]",
+                      col: str, target_ns: int,
+                      tol_s: float = EXTRA_COL_MATCH_TOL_S,
+                      allow_network: bool = True,
+                      log=None) -> "tuple[str, str]":
     """
-    Find the closest-timestamp value for `col` within tol_s seconds of target_ns.
-    Returns formatted value string or "—" if no match.
+    Resolve the value of `col` at target_ns. Returns (raw_value, state):
+      state "ok"        — sample within tol_s (or slow-PV look-back hit); raw is valid
+      state "error"     — the fetch for this column FAILED (display "ERR")
+      state "not_found" — data loaded fine but no sample matches (display "n/a")
+
+    Slow PVs (waveplate — archived on-change, so the last sample can be days
+    old) fall back to the archiver's last-at-or-before lookup. Fast energy PVs
+    never do: a value from a different shot minutes away would be wrong.
+    allow_network=False (UI thread) still serves look-back cache hits.
     """
+    meta = col_meta.get(col, {})
     rows = per_col.get(col)
-    if not rows:
-        if log is not None:
-            log(f"  closest '{col}': no samples loaded → —")
-        return "—"
-    ts_list = [r["_ns"] for r in rows]
-    idx = bisect.bisect_left(ts_list, target_ns)
     best = None
     best_diff = float("inf")
-    for i in [idx - 1, idx]:
-        if 0 <= i < len(rows):
-            diff = abs(rows[i]["_ns"] - target_ns)
-            if diff < best_diff:
-                best_diff = diff
-                best = rows[i]
-    tol_ns = int(tol_s * 1_000_000_000)
-    if best is not None and best_diff <= tol_ns:
-        return best.get(col, "—")
-    if log is not None and best is not None:
-        log(f"  closest '{col}': nearest sample {best_diff/1e9:.1f}s away "
-            f"(> {tol_s:.0f}s window) → —")
-    return "—"
+    if rows:
+        ts_list = [r["_ns"] for r in rows]
+        idx = bisect.bisect_left(ts_list, target_ns)
+        for i in [idx - 1, idx]:
+            if 0 <= i < len(rows):
+                diff = abs(rows[i]["_ns"] - target_ns)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = rows[i]
+        tol_ns = int(tol_s * 1_000_000_000)
+        if best is not None and best_diff <= tol_ns:
+            return best.get(col, ""), "ok"
+
+    # No sample in window — slow PVs look back for the last known value.
+    channel = CPVA_CHANNEL_MAP.get(col, col)
+    if channel in cpva.FORWARD_CHANNELS:
+        res = cpva.value_at_or_before(channel, int(target_ns),
+                                      timeout=CPVA_HTTP_TIMEOUT,
+                                      network_ok=allow_network)
+        if res.value is not None:
+            if log is not None:
+                log(f"  '{col}': look-back hit (last change "
+                    f"{(target_ns - (res.ts_ns or target_ns)) / 1e9 / 3600:.1f} h before)")
+            return str(res.value), "ok"
+        if res.status == "error":
+            return "", "error"
+
+    if not rows and meta.get("status") == "error":
+        return "", "error"
+    if log is not None:
+        if best is not None:
+            log(f"  closest '{col}': nearest sample {best_diff/1e9:.1f}s away "
+                f"(> {tol_s:.0f}s window) → n/a")
+        else:
+            log(f"  closest '{col}': no samples loaded → n/a")
+    return "", "not_found"
+
+
+def _format_value_state(col: str, raw: str, state: str) -> str:
+    """Tri-state display: real value (incl. genuine 0) / "ERR" / "n/a"."""
+    if state == "error":
+        return cpva.PV_TEXT_ERROR
+    if state != "ok" or raw == "":
+        return cpva.PV_TEXT_NOT_FOUND
+    return _format_value(col, raw)
+
+
+def _format_diff(col: str, diff_csv: float) -> str:
+    """Format a |value − target| difference (CSV units) in the column's UI units."""
+    if col == "sbw4":
+        return f"{diff_csv * SBW4_TRANSMISSION:.4f} J"
+    if col in MJ_COLUMNS:
+        return f"{diff_csv * 1000:.2f} mJ"
+    if col == "waveplate":
+        return f"{diff_csv:.0f}"
+    if col in PV_COLUMNS:
+        return f"{diff_csv:.4f} J"
+    return f"{diff_csv:.4g}"
 
 
 def _find_best_match(rows: list[dict], col: str, target: float) -> dict | None:
@@ -621,7 +687,13 @@ class _DayResult:
     def __init__(self, day: date, best_row: dict, col: str,
                  actual, diff, target_csv: float, hour_folder,
                  rows_in_tol: "list | None" = None,
-                 per_col: "dict | None" = None):
+                 per_col: "dict | None" = None,
+                 search_cols: "list | None" = None,
+                 extra_cols: "list | None" = None,
+                 criteria_csv: "list | None" = None,
+                 cam: "str | None" = None,
+                 col_meta: "dict | None" = None,
+                 img_path=None):
         self.day          = day
         self.best_row     = best_row
         self.col          = col
@@ -631,6 +703,15 @@ class _DayResult:
         self.hour_folder  = hour_folder
         self.rows_in_tol  = rows_in_tol or []
         self.per_col      = per_col or {}
+        # Search-time state, persisted so later UI (double-click dialog, save,
+        # open-in-slider) reflects what was actually searched — not whatever
+        # the left panel happens to show now.
+        self.search_cols  = search_cols or [col]
+        self.extra_cols   = extra_cols or []
+        self.criteria_csv = criteria_csv or []
+        self.cam          = cam
+        self.col_meta     = col_meta or {}
+        self.img_path     = img_path   # matched image file (resolved in worker)
         # Prefer exact UTC ns from API rows; fall back to Prague-naive datetime
         if best_row.get("_ns") is not None:
             self.ts_ns = int(best_row["_ns"])
@@ -1587,15 +1668,18 @@ class ShotFinderWidget(QWidget):
     def _build_energy_text(self, dr, row: dict, row_ns) -> str:
         """Multi-PV preview caption: search PVs + 'also show' PVs at this shot.
         Used by both the main-table preview and the per-shot dialog preview so
-        an expanded shot keeps the same backreflection / extra-PV info."""
-        search_cols = list(self._criteria_cols)
-        extra_cols = [c for c in self._extra_cols_sel if c not in search_cols]
+        an expanded shot keeps the same backreflection / extra-PV info.
+        Columns come from dr (search-time state), not the live left panel."""
+        search_cols = list(dr.search_cols)
+        extra_cols = [c for c in dr.extra_cols if c not in search_cols]
         parts = []
         for sc in search_cols + extra_cols:
-            raw = row.get(sc, "")
+            raw, state = row.get(sc, ""), "ok"
             if not raw and row_ns is not None:
-                raw = _find_closest_col_value(dr.per_col, sc, row_ns)
-            parts.append(f"{self._col_short(sc)}: {_format_value(sc, raw)}")
+                raw, state = _lookup_col_value(dr.per_col, dr.col_meta, sc, row_ns,
+                                               tol_s=EXTRA_COL_MATCH_TOL_S,
+                                               allow_network=False)
+            parts.append(f"{self._col_short(sc)}: {_format_value_state(sc, raw, state)}")
         return "  |  ".join(parts)
 
     def _on_selection_changed(self):
@@ -1612,7 +1696,7 @@ class ShotFinderWidget(QWidget):
         if r >= len(self._day_results):
             return
         dr = self._day_results[r]
-        cam = self._active_cam
+        cam = dr.cam or self._active_cam
         if not cam or dr.hour_folder is None:
             return
         dt_obj = dr.best_row.get("_dt")
@@ -1626,16 +1710,19 @@ class ShotFinderWidget(QWidget):
         def _resolve_and_load():
             # Folder probing + _find_image_for_ts (os.scandir over SMB) used to
             # run on the UI thread — a row click froze the GUI on a slow share.
-            cam_folder = dr.hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    return
-            img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
+            if dr.img_path is not None:
+                img = Path(dr.img_path)
+            else:
+                cam_folder = dr.hour_folder / cam
+                if not cam_folder.exists():
+                    try:
+                        for sub in dr.hour_folder.iterdir():
+                            if sub.is_dir() and sub.name.lower() == cam.lower():
+                                cam_folder = sub
+                                break
+                    except Exception:
+                        return
+                img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
             if gen != self._preview_gen:
                 return
             if img is None:
@@ -1947,8 +2034,8 @@ class ShotFinderWidget(QWidget):
             for i, day in enumerate(days):
                 try:
                     _emit_log(f"{day}: querying API+CSV for cols={all_cols}")
-                    rows, per_col = _load_api_for_day(day, all_cols, log=_emit_log,
-                                                      csv_root=csv_root)
+                    rows, per_col, col_meta = _load_api_for_day(
+                        day, all_cols, log=_emit_log, csv_root=csv_root)
                     if not rows:
                         _emit_log(f"{day}: no data (API + CSV) — see lines above for details")
                         self._sig.result.emit(None)
@@ -1982,9 +2069,12 @@ class ShotFinderWidget(QWidget):
                             # Try the merged row first
                             raw_sec = row.get(sec_col, "")
                             if not raw_sec:
-                                # Fallback: per-col closest-timestamp (5s window)
-                                raw_sec = _find_closest_col_value(
-                                    per_col, sec_col, row_ns, tol_s=5.0)
+                                # Fallback: per-col closest-timestamp (same window
+                                # the display uses — a shot must never qualify on
+                                # one value and show a different one)
+                                raw_sec, _sec_state = _lookup_col_value(
+                                    per_col, col_meta, sec_col, row_ns,
+                                    tol_s=EXTRA_COL_MATCH_TOL_S)
                             try:
                                 v_sec = float(raw_sec)
                             except Exception:
@@ -2001,14 +2091,17 @@ class ShotFinderWidget(QWidget):
                         best = _find_best_match(rows, day_col, target_csv)
                     else:
                         # Best = row with minimum sum of normalized distances across all criteria
-                        def _norm_dist(row, _crit_csv=criteria_csv, _pc=per_col):
+                        def _norm_dist(row, _crit_csv=criteria_csv, _pc=per_col,
+                                       _cm=col_meta):
                             total = 0.0
                             rn = row.get("_ns", 0)
                             for crit in _crit_csv:
                                 cc = crit["col"]; ct = crit["target_csv"]
                                 raw = row.get(cc, "")
                                 if not raw:
-                                    raw = _find_closest_col_value(_pc, cc, rn, tol_s=5.0)
+                                    raw, _st = _lookup_col_value(
+                                        _pc, _cm, cc, rn,
+                                        tol_s=EXTRA_COL_MATCH_TOL_S)
                                 try:
                                     v = float(raw)
                                     total += abs(v - ct) / max(abs(ct), 1e-9)
@@ -2038,6 +2131,48 @@ class ShotFinderWidget(QWidget):
                         hour_utc = _folder_hour_from_prague(dt_obj.hour, day)
                         hour_folder = _find_hour_folder(day, hour_utc, images_root=images_root)
 
+                    # Resolve camera folder + matched image here (worker thread) —
+                    # keeps SMB probing off the UI thread and lets the Folder cell
+                    # select the exact file in Explorer.
+                    best_ns = best.get("_ns")
+                    folder_path = None
+                    img_path = None
+                    if hour_folder is not None:
+                        if cam:
+                            cam_folder = hour_folder / cam
+                            if not cam_folder.exists():
+                                try:
+                                    for sub in hour_folder.iterdir():
+                                        if sub.is_dir() and sub.name.lower() == cam.lower():
+                                            cam_folder = sub
+                                            break
+                                except Exception:
+                                    pass
+                            try:
+                                if cam_folder.exists() and cam_folder.is_dir():
+                                    folder_path = cam_folder
+                                    if dt_obj is not None:
+                                        img_path = _find_image_for_ts(
+                                            cam_folder, dt_obj, ts_ns_override=best_ns)
+                            except Exception:
+                                pass
+                        if folder_path is None:
+                            folder_path = hour_folder
+
+                    # Display values for every searched + also-show PV at the best
+                    # shot — resolved HERE so the UI thread never hits the network
+                    # and the table shows exactly what the search matched on.
+                    display_vals: dict = {}
+                    if best_ns is not None:
+                        for cc in dict.fromkeys(search_cols + extra_cols):
+                            raw_cc = best.get(cc, "")
+                            if raw_cc:
+                                display_vals[cc] = (raw_cc, "ok")
+                            else:
+                                display_vals[cc] = _lookup_col_value(
+                                    per_col, col_meta, cc, best_ns,
+                                    tol_s=EXTRA_COL_MATCH_TOL_S, log=_emit_log)
+
                     result = {
                         "day":          day,
                         "best_row":     best,
@@ -2047,11 +2182,15 @@ class ShotFinderWidget(QWidget):
                         "diff":         diff_best,
                         "target_csv":   target_csv,
                         "hour_folder":  hour_folder,
+                        "folder_path":  folder_path,
+                        "img_path":     img_path,
                         "cam":          cam,
                         "extra_cols":   extra_cols,
                         "search_cols":  search_cols,
                         "per_col":      per_col,
+                        "col_meta":     col_meta,
                         "criteria_csv": criteria_csv,
+                        "display_vals": display_vals,
                     }
                     self._sig.log_msg.emit(
                         f"{day}: best={_format_value(day_col, raw_best)} "
@@ -2087,28 +2226,19 @@ class ShotFinderWidget(QWidget):
             day=day, best_row=best_row, col=col,
             actual=result["actual"], diff=result["diff"],
             target_csv=result["target_csv"], hour_folder=hour_folder,
-            rows_in_tol=rows_in_tol, per_col=per_col)
+            rows_in_tol=rows_in_tol, per_col=per_col,
+            search_cols=result.get("search_cols"),
+            extra_cols=result.get("extra_cols"),
+            criteria_csv=result.get("criteria_csv"),
+            cam=cam,
+            col_meta=result.get("col_meta"),
+            img_path=result.get("img_path"))
         self._day_results.append(dr)
 
-        # Folder path
-        folder_path = None
-        if hour_folder is not None:
-            if cam:
-                cam_folder = hour_folder / cam
-                if not cam_folder.exists():
-                    try:
-                        for sub in hour_folder.iterdir():
-                            if sub.is_dir() and sub.name.lower() == cam.lower():
-                                cam_folder = sub
-                                break
-                    except Exception:
-                        pass
-                if cam_folder.exists() and cam_folder.is_dir():
-                    folder_path = cam_folder
-            if folder_path is None:
-                folder_path = hour_folder
-
-        folder_str = str(folder_path) if folder_path else "Not found"
+        # Folder + matched image were resolved in the worker (SMB off UI thread)
+        folder_path = result.get("folder_path")
+        img_path    = result.get("img_path")
+        folder_str  = str(folder_path) if folder_path else "Not found"
 
         prague_str = dt_obj.strftime("%H:%M:%S.%f")[:-3]
         best_ns    = best_row.get("_ns")
@@ -2118,18 +2248,24 @@ class ShotFinderWidget(QWidget):
             criteria_csv_res = [{"col": col, "target_csv": result["target_csv"],
                                  "tol_ui": self._tol_sb.value()}]
 
+        display_vals = result.get("display_vals", {})
+
         def _val_at(cc):
+            """(raw, state) at the best shot — precomputed in the worker."""
+            hit = display_vals.get(cc)
+            if hit is not None:
+                return hit
             raw = best_row.get(cc, "")
-            if not raw and best_ns is not None:
-                raw = _find_closest_col_value(per_col, cc, best_ns)
-            return raw
+            return (raw, "ok") if raw else ("", "not_found")
 
         def _diff_ui(cc, target_csv):
             """Return (diff_in_ui_units, formatted_str)."""
+            raw, state = _val_at(cc)
             try:
-                v = float(_val_at(cc))
+                v = float(raw)
             except (ValueError, TypeError):
-                return None, "—"
+                return None, (cpva.PV_TEXT_ERROR if state == "error"
+                              else cpva.PV_TEXT_NOT_FOUND)
             d = abs(v - target_csv)
             if cc == "sbw4":
                 return d * SBW4_TRANSMISSION, f"{d * SBW4_TRANSMISSION:.4f} J"
@@ -2141,13 +2277,15 @@ class ShotFinderWidget(QWidget):
                 return d, f"{d:.4f} J"
             return d, f"{d:.4g}"
 
-        # One line per search PV across the PV / Value / Δ columns
-        pv_lines, val_lines, diff_lines, off_pvs = [], [], [], []
+        # PV / Δ columns keep one line per search PV; the Value cell is a single
+        # combined line with EVERY searched PV (+ also-show extras).
+        pv_lines, val_parts, diff_lines, off_pvs = [], [], [], []
         for crit in criteria_csv_res:
             cc = crit["col"]
             short = self._col_short(cc)
             pv_lines.append(short)
-            val_lines.append(f"{short}: {_format_value(cc, _val_at(cc))}")
+            raw_cc, state_cc = _val_at(cc)
+            val_parts.append(f"{short}: {_format_value_state(cc, raw_cc, state_cc)}")
             dval, dstr = _diff_ui(cc, crit["target_csv"])
             diff_lines.append(f"{short}: {dstr}")
             if dval is not None and dval > crit.get("tol_ui", 0.0):
@@ -2155,13 +2293,12 @@ class ShotFinderWidget(QWidget):
 
         # 'Also show' PVs appended to the Value cell
         extra_cols = result.get("extra_cols", [])
-        if best_ns is not None:
-            for ec in extra_cols:
-                raw_ec = _find_closest_col_value(per_col, ec, best_ns)
-                val_lines.append(f"{self._col_short(ec)}: {_format_value(ec, raw_ec)}")
+        for ec in extra_cols:
+            raw_ec, state_ec = _val_at(ec)
+            val_parts.append(f"{self._col_short(ec)}: {_format_value_state(ec, raw_ec, state_ec)}")
 
         pv_str   = "\n".join(pv_lines)
-        val_str  = "\n".join(val_lines)
+        val_str  = " | ".join(val_parts)
         diff_str = "\n".join(diff_lines)
 
         n_tol = len(rows_in_tol)
@@ -2198,29 +2335,43 @@ class ShotFinderWidget(QWidget):
             if c == 6:
                 if folder_path is not None:
                     item.setData(Qt.ItemDataRole.UserRole, str(folder_path))
+                    if img_path is not None:
+                        item.setData(Qt.ItemDataRole.UserRole + 1, str(img_path))
+                        item.setToolTip("Click to open the folder with the image selected")
+                    else:
+                        item.setToolTip("Click to open this folder in Explorer "
+                                        "(matched image not found)")
                     item.setForeground(QColor("#2d7dff"))
-                    item.setToolTip("Click to open this folder in Explorer")
                 else:
                     item.setForeground(QColor("#cc0000"))
+                    item.setToolTip("Image folder not found on the share")
             self._table.setItem(r, c, item)
         # Row height scales with the number of stacked lines
-        n_lines = max(len(pv_lines), len(val_lines), len(diff_lines), 1)
+        n_lines = max(len(pv_lines), len(diff_lines), 1)
         if n_lines > 1:
             self._table.setRowHeight(r, 18 * n_lines + 8)
 
     def _on_table_cell_clicked(self, row: int, col: int):
-        """Click the Folder cell (col 6) to open that folder in Explorer."""
+        """Click the Folder cell (col 6): open Explorer with the matched image
+        selected; fall back to opening the folder when the image is unknown."""
         if col != 6:
             return
         item = self._table.item(row, col)
         if item is None:
             return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
+        folder = item.data(Qt.ItemDataRole.UserRole)
+        img = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not folder and not img:
+            self._log("EXPLORER: no folder resolved for this row")
             return
         try:
-            subprocess.Popen(["explorer", str(path)])
-            self._log(f"EXPLORER: {path}")
+            if img:
+                # /select, and the path must stay ONE argument (comma included)
+                subprocess.Popen(f'explorer /select,"{img}"')
+                self._log(f"EXPLORER: select {img}")
+            else:
+                subprocess.Popen(["explorer", str(folder)])
+                self._log(f"EXPLORER: {folder} (image not resolved — opening folder)")
         except Exception as e:
             QMessageBox.critical(self, "Error",
                                  f"Could not open folder:\n{type(e).__name__}: {e}")
@@ -2251,60 +2402,65 @@ class ShotFinderWidget(QWidget):
         lbl = QLabel(f"{len(rows_in_tol)} shot(s) in range on {dr.day}:")
         lay.addWidget(lbl)
 
-        # Extra cols shown in dialog: secondary search PVs + 'also show' PVs +
-        # any other loaded PV — ordered, deduped, excluding the primary col.
-        extra_cols_in_tol: list[str] = []
-        for c in (list(self._criteria_cols) + list(self._extra_cols_sel)
-                  + list(dr.per_col.keys())):
-            if c != col and c in dr.per_col and c not in extra_cols_in_tol:
-                extra_cols_in_tol.append(c)
-        n_extra = len(extra_cols_in_tol)
-        tbl = QTableWidget(0, 3 + n_extra)
-        base_headers = ["Prague Time", "Value", "Δ from target"]
-        extra_headers = [self._col_short(c) for c in extra_cols_in_tol]
-        tbl.setHorizontalHeaderLabels(base_headers + extra_headers)
-        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        for ec_idx in range(n_extra):
+        # Columns come from the SEARCH-TIME state stored on dr — the left panel
+        # may have changed since this search ran and must not affect old rows.
+        criteria = dr.criteria_csv or [{"col": col, "target_csv": target_csv}]
+        extra_cols_dlg = [c for c in dr.extra_cols
+                          if c not in {cr["col"] for cr in criteria}]
+
+        headers = ["Prague Time"]
+        for cr in criteria:
+            short = self._col_short(cr["col"])
+            headers += [short, f"Δ {short}"]
+        headers += [self._col_short(c) for c in extra_cols_dlg]
+
+        tbl = QTableWidget(0, len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        for h_idx in range(len(headers)):
             tbl.horizontalHeader().setSectionResizeMode(
-                3 + ec_idx, QHeaderView.ResizeMode.ResizeToContents)
+                h_idx, QHeaderView.ResizeMode.ResizeToContents)
         tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
+        def _row_col_value(row, cc, row_ns):
+            raw = row.get(cc, "")
+            if raw:
+                return raw, "ok"
+            return _lookup_col_value(dr.per_col, dr.col_meta, cc, row_ns,
+                                     tol_s=EXTRA_COL_MATCH_TOL_S,
+                                     allow_network=False)
+
         for row in rows_in_tol:
             dt_obj = row.get("_dt")
-            raw_val = row.get(col, "")
+            row_ns = row.get("_ns", 0)
             ts_str = dt_obj.strftime("%H:%M:%S.%f")[:-3] if dt_obj else "?"
-            val_str = _format_value(col, raw_val)
-            try:
-                v = float(raw_val)
-                diff = abs(v - target_csv)
-                if col == "sbw4":
-                    diff_str = f"{diff * SBW4_TRANSMISSION:.4f} J"
-                elif col in MJ_COLUMNS:
-                    diff_str = f"{diff * 1000:.2f} mJ"
-                else:
-                    diff_str = f"{diff:.4f}"
-            except Exception:
-                diff_str = "—"
             r2 = tbl.rowCount()
             tbl.insertRow(r2)
             tbl.setItem(r2, 0, QTableWidgetItem(ts_str))
-            tbl.setItem(r2, 1, QTableWidgetItem(val_str))
-            tbl.setItem(r2, 2, QTableWidgetItem(diff_str))
-            # Extra PV columns
-            row_ns = row.get("_ns", 0)
-            for ec_idx, ec in enumerate(extra_cols_in_tol):
-                raw_ec = _find_closest_col_value(dr.per_col, ec, row_ns)
-                ec_str = _format_value(ec, raw_ec)
-                tbl.setItem(r2, 3 + ec_idx, QTableWidgetItem(ec_str))
+            c_idx = 1
+            for cr in criteria:
+                cc = cr["col"]
+                raw_cc, state_cc = _row_col_value(row, cc, row_ns)
+                tbl.setItem(r2, c_idx, QTableWidgetItem(
+                    _format_value_state(cc, raw_cc, state_cc)))
+                try:
+                    diff_str = _format_diff(cc, abs(float(raw_cc) - cr["target_csv"]))
+                except (ValueError, TypeError):
+                    diff_str = (cpva.PV_TEXT_ERROR if state_cc == "error"
+                                else cpva.PV_TEXT_NOT_FOUND)
+                tbl.setItem(r2, c_idx + 1, QTableWidgetItem(diff_str))
+                c_idx += 2
+            for ec in extra_cols_dlg:
+                raw_ec, state_ec = _row_col_value(row, ec, row_ns)
+                tbl.setItem(r2, c_idx, QTableWidgetItem(
+                    _format_value_state(ec, raw_ec, state_ec)))
+                c_idx += 1
 
         lay.addWidget(tbl, 1)
 
         cam_folder_ref = [None]
-        # Zjisti cam_folder pro preview
-        cam = self._active_cam
+        # Zjisti cam_folder pro preview — camera captured at search time
+        cam = dr.cam or self._active_cam
         if cam and dr.hour_folder is not None:
             cf = dr.hour_folder / cam
             if not cf.exists():
@@ -2405,7 +2561,7 @@ class ShotFinderWidget(QWidget):
                 idxs = sorted(set(i.row() for i in selected_rows))
                 sel_rows_in_tol = [rows_in_tol[i] for i in idxs]
 
-            cam = self._active_cam
+            cam = dr.cam or self._active_cam
             if not cam:
                 QMessageBox.warning(dlg, "No camera", "Select a camera first.")
                 return
@@ -2520,22 +2676,29 @@ class ShotFinderWidget(QWidget):
             results_to_open = self._day_results
 
         for dr in results_to_open:
+            # Fast path: the search worker already resolved the matched image
+            if dr.img_path is not None:
+                files_to_copy.append(Path(dr.img_path))
+                self._log(f"{dr.day}: ✓ {Path(dr.img_path).name}")
+                continue
+
             if dr.hour_folder is None:
                 self._log(f"{dr.day}: no hour folder, skipping")
                 continue
 
-            cam_folder = dr.hour_folder / cam
+            dr_cam = dr.cam or cam
+            cam_folder = dr.hour_folder / dr_cam
             if not cam_folder.exists():
                 try:
                     for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
+                        if sub.is_dir() and sub.name.lower() == dr_cam.lower():
                             cam_folder = sub
                             break
                 except Exception:
                     pass
 
             if not cam_folder.exists():
-                self._log(f"{dr.day}: camera {cam} not found")
+                self._log(f"{dr.day}: camera {dr_cam} not found")
                 continue
 
             dt_obj = dr.best_row.get("_dt")
@@ -2584,36 +2747,15 @@ class ShotFinderWidget(QWidget):
 
         self._log(f"Copied {copied} images → {self._temp_dir}")
 
-        # Sestav energy map — filename -> text pro zobrazení v slideru
+        # Sestav energy map — filename -> text pro zobrazení v slideru.
+        # PVs come from each result's search-time state (dr), not the live panel.
         energy_map: dict[str, str] = {}
-        search_cols_slider = list(self._criteria_cols)
-        search_cols_slider_set = set(search_cols_slider)
-        extra_cols = [c for c in self._extra_cols_sel
-                      if c not in search_cols_slider_set]
-
         for src, dst, i in copied_files:
             if i >= len(results_to_open):
                 continue
             dr = results_to_open[i]
             best_ns = dr.best_row.get("_ns")
-            parts = []
-            for sc in search_cols_slider:
-                if sc == dr.col:
-                    val = _format_value(sc, dr.best_row.get(sc, ""))
-                elif best_ns is not None:
-                    raw = _find_closest_col_value(dr.per_col, sc, best_ns)
-                    val = _format_value(sc, raw)
-                else:
-                    val = _format_value(sc, dr.best_row.get(sc, ""))
-                short = PV_COLUMNS.get(sc, sc).split(" [")[0]
-                parts.append(f"{short}: {val}")
-            if best_ns is not None:
-                for ec in extra_cols:
-                    raw_ec = _find_closest_col_value(dr.per_col, ec, best_ns)
-                    ev = _format_value(ec, raw_ec)
-                    short = PV_COLUMNS.get(ec, ec).split(" [")[0]
-                    parts.append(f"{short}: {ev}")
-            energy_map[dst.name] = "  |  ".join(parts)
+            energy_map[dst.name] = self._build_energy_text(dr, dr.best_row, best_ns)
 
         self._tab_widget.setCurrentIndex(1)
         self._slider_ref._discrete_mode = True
@@ -2657,41 +2799,40 @@ class ShotFinderWidget(QWidget):
         else:
             results_to_save = self._day_results
 
-        search_cols_save = list(self._criteria_cols)
-        search_cols_save_set = set(search_cols_save)
-        extra_cols = [c for c in self._extra_cols_sel
-                      if c not in search_cols_save_set]
-
         copied = 0
         errors = 0
         for dr in results_to_save:
-            if dr.hour_folder is None:
-                self._log(f"{dr.day}: no hour folder, skipping")
-                errors += 1
-                continue
-
-            cam_folder = dr.hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    pass
-
-            if not cam_folder.exists():
-                self._log(f"{dr.day}: camera {cam} not found")
-                errors += 1
-                continue
-
             dt_obj = dr.best_row.get("_dt")
             if dt_obj is None:
                 errors += 1
                 continue
 
-            img = _find_image_for_ts(cam_folder, dt_obj,
-                                     ts_ns_override=dr.best_row.get("_ns"))
+            # Fast path: the search worker already resolved the matched image
+            img = Path(dr.img_path) if dr.img_path is not None else None
+            if img is None:
+                if dr.hour_folder is None:
+                    self._log(f"{dr.day}: no hour folder, skipping")
+                    errors += 1
+                    continue
+
+                dr_cam = dr.cam or cam
+                cam_folder = dr.hour_folder / dr_cam
+                if not cam_folder.exists():
+                    try:
+                        for sub in dr.hour_folder.iterdir():
+                            if sub.is_dir() and sub.name.lower() == dr_cam.lower():
+                                cam_folder = sub
+                                break
+                    except Exception:
+                        pass
+
+                if not cam_folder.exists():
+                    self._log(f"{dr.day}: camera {dr_cam} not found")
+                    errors += 1
+                    continue
+
+                img = _find_image_for_ts(cam_folder, dt_obj,
+                                         ts_ns_override=dr.best_row.get("_ns"))
             if img is None:
                 self._log(f"{dr.day}: no image near {dt_obj.strftime('%H:%M:%S')}")
                 errors += 1
@@ -2714,24 +2855,9 @@ class ShotFinderWidget(QWidget):
             dst = out_path / dst_name
 
             try:
-                # Sestav energy text pro anotaci
+                # Sestav energy text pro anotaci — from search-time state (dr)
                 _best_ns_save = dr.best_row.get("_ns")
-                parts = []
-                for sc in search_cols_save:
-                    if sc == dr.col:
-                        val = _format_value(sc, dr.best_row.get(sc, ""))
-                    elif _best_ns_save is not None:
-                        raw = _find_closest_col_value(dr.per_col, sc, _best_ns_save)
-                        val = _format_value(sc, raw)
-                    else:
-                        val = _format_value(sc, dr.best_row.get(sc, ""))
-                    short = PV_COLUMNS.get(sc, sc).split(" [")[0]
-                    parts.append(f"{short}: {val}")
-                for ec in extra_cols:
-                    ev = _format_value(ec, dr.best_row.get(ec, ""))
-                    short = PV_COLUMNS.get(ec, ec).split(" [")[0]
-                    parts.append(f"{short}: {ev}")
-                energy_text = "  |  ".join(parts)
+                energy_text = self._build_energy_text(dr, dr.best_row, _best_ns_save)
 
                 # Ulož s anotací jako PNG
                 dst = dst.with_suffix(".png")

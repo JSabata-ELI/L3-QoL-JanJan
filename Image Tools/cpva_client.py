@@ -396,6 +396,14 @@ def nearest_sample(samples: "list[tuple[int, float]]", ts_ns: int,
     prefer="after": mirrored (waveplate motor settles after the trigger).
     samples must be sorted by t_ns.
     """
+    s = nearest_sample_ex(samples, ts_ns, window_ns=window_ns, prefer=prefer)
+    return None if s is None else s[1]
+
+
+def nearest_sample_ex(samples: "list[tuple[int, float]]", ts_ns: int,
+                      *, window_ns: int, prefer: str = "before"
+                      ) -> "tuple[int, float] | None":
+    """Like nearest_sample but returns the full (t_ns, value) sample."""
     if not samples:
         return None
     ts_list = [s[0] for s in samples]
@@ -405,7 +413,138 @@ def nearest_sample(samples: "list[tuple[int, float]]", ts_ns: int,
     after = samples[idx_f] if idx_f < len(samples) and (samples[idx_f][0] - ts_ns) <= window_ns else None
     first, second = (before, after) if prefer == "before" else (after, before)
     if first is not None:
-        return first[1]
+        return first
     if second is not None:
-        return second[1]
+        return second
     return None
+
+
+# ── high-level value lookup (shared tri-state contract) ───────────────────────
+# Display convention for every PV value in every tab:
+#   status "ok" with value 0.0  → a REAL archiver zero — format it as a number.
+#   status "not_found"          → lookup succeeded, no sample matches → "n/a".
+#   status "error"              → fetch failed (retryable, never cached) → "ERR".
+#   status "stale"              → value from an older successful fetch → value + " (old)".
+
+PV_TEXT_ERROR = "ERR"
+PV_TEXT_NOT_FOUND = "n/a"
+PV_TEXT_STALE_SUFFIX = " (old)"
+
+
+class LookupResult(NamedTuple):
+    value: "float | None"
+    ts_ns: "int | None"      # timestamp of the sample actually used
+    status: str              # "ok" | "not_found" | "stale" | "error"
+
+
+def format_lookup(res: "LookupResult", num_fmt) -> str:
+    """Render a LookupResult with the tri-state convention. num_fmt is a
+    callable float → str (units/precision differ per tab)."""
+    if res.status == "error":
+        return PV_TEXT_ERROR
+    if res.value is None:
+        return PV_TEXT_NOT_FOUND
+    txt = num_fmt(res.value)
+    if res.status == "stale":
+        txt += PV_TEXT_STALE_SUFFIX
+    return txt
+
+
+# Channels matched by looking FORWARD from the image timestamp: the waveplate
+# motor settles AFTER the shot command, so the stable position is recorded
+# slightly after the image. Everything else (energy detectors) fires just
+# before the image → prefer "before".
+FORWARD_CHANNELS: frozenset = frozenset({"L3-PFWP6-MTR03-1:RawPos"})
+
+# Progressively widening look-back windows (days). Stop at the first that has
+# data, so a slow PV that last changed a month (or more) ago is still resolved
+# in 1–4 queries.
+LOOKBACK_WINDOWS_DAYS = (2, 8, 32, 120, 400)
+
+# Cache of "last sample at or before this day" per (channel, date_key) — a whole
+# save range of older images reuses one wide look-back query instead of N.
+_before_cache: "OrderedDict[tuple[str, str], tuple[float, int] | None]" = OrderedDict()
+_before_lock = threading.Lock()
+_BEFORE_CACHE_MAX = 256
+
+
+def value_at_or_before(channel: str, ts_ns: int, *,
+                       lookback_days: "tuple[int, ...]" = LOOKBACK_WINDOWS_DAYS,
+                       timeout: float = DEFAULT_TIMEOUT,
+                       network_ok: bool = True) -> LookupResult:
+    """Last sample at or before ts_ns, searching progressively further back in
+    time (covers PVs whose last change was days/weeks/months earlier). Cached
+    per (channel, Prague day); fetch failures are NEVER cached — the next call
+    retries. network_ok=False serves only cache hits (for UI-thread callers):
+    a miss returns "not_found" without touching the network."""
+    ck = (channel, date_key_for_ns(ts_ns))
+    with _before_lock:
+        if ck in _before_cache:
+            hit = _before_cache[ck]
+            _before_cache.move_to_end(ck)
+            if hit is None:
+                return LookupResult(None, None, "not_found")
+            return LookupResult(hit[0], hit[1], "ok")
+    if not network_ok:
+        return LookupResult(None, None, "not_found")
+    found: "tuple[float, int] | None" = None
+    try:
+        for d in lookback_days:
+            samples = fetch_values(channel, ts_ns - d * DAY_NS, ts_ns,
+                                   timeout=timeout, try_value_suffix=False)
+            if samples:
+                t_ns, val = samples[-1]   # query end is ts_ns → all samples ≤ ts_ns
+                found = (val, t_ns)
+                break
+    except CpvaError:
+        return LookupResult(None, None, "error")
+    with _before_lock:
+        _before_cache[ck] = found
+        _before_cache.move_to_end(ck)
+        while len(_before_cache) > _BEFORE_CACHE_MAX:
+            _before_cache.popitem(last=False)
+    if found is None:
+        return LookupResult(None, None, "not_found")
+    return LookupResult(found[0], found[1], "ok")
+
+
+def lookup_near(channel: str, ts_ns: int, *,
+                window_ns: int = 30 * 1_000_000_000,
+                prefer: "str | None" = None,
+                fallback_before: bool = False,
+                today_ttl: float = 3.0,
+                timeout: float = DEFAULT_TIMEOUT) -> LookupResult:
+    """Sample nearest ts_ns within ±window_ns, consulting the previous/current/
+    next Prague day caches (handles midnight boundaries).
+
+    prefer=None picks "after" for FORWARD_CHANNELS, "before" otherwise.
+    fallback_before=True chains to value_at_or_before() when nothing is inside
+    the window — the slow-PV (waveplate) look-back. Fast channels should leave
+    it False so a value from a different session hours away is never shown.
+    """
+    if prefer is None:
+        prefer = "after" if channel in FORWARD_CHANNELS else "before"
+    date_key = date_key_for_ns(ts_ns)
+    candidates: "list[tuple[int, float]]" = []
+    status = "ok"
+    for dk in (prev_date_key(date_key), date_key, next_date_key(date_key)):
+        res = get_day(channel, dk, today_ttl=today_ttl, timeout=timeout)
+        if res.samples:
+            candidates.extend(res.samples)
+        if res.status == "error":
+            status = "error"
+        elif res.status == "stale" and status != "error":
+            status = "stale"
+    candidates.sort(key=lambda x: x[0])
+    hit = nearest_sample_ex(candidates, ts_ns, window_ns=window_ns, prefer=prefer)
+    if hit is not None:
+        return LookupResult(hit[1], hit[0], status if status != "ok" else "ok")
+    if fallback_before or channel in FORWARD_CHANNELS:
+        back = value_at_or_before(channel, ts_ns, timeout=timeout)
+        if back.status == "error" and status == "error":
+            return back
+        if back.value is not None:
+            return back
+    if status == "error":
+        return LookupResult(None, None, "error")
+    return LookupResult(None, None, "not_found")
