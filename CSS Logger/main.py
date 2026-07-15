@@ -865,9 +865,9 @@ class _GraphPopupWindow(QWidget):
             self._owner._restore_graph_from_popup(); return
         if ev.key() == Qt.Key.Key_F11:
             if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                self._owner._graph_popout(windowed=True)
-            else:
                 self._owner._graph_popout(windowed=False)
+            else:
+                self._owner._graph_popout(windowed=True)
             return
         super().keyPressEvent(ev)
 
@@ -1203,9 +1203,12 @@ class CSSLoggerWidget(QWidget):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(2)
 
-        # Controls row
-        ctrl = QHBoxLayout()
-        lay.addLayout(ctrl)
+        # Controls row (wrapped in a container so it can be hidden in the
+        # fullscreen / windowed "graph only" pop-out).
+        self._graph_ctrl_bar = QWidget()
+        ctrl = QHBoxLayout(self._graph_ctrl_bar)
+        ctrl.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self._graph_ctrl_bar)
 
         b_clean = QPushButton("Clean graph"); b_clean.clicked.connect(self._clean_graph); ctrl.addWidget(b_clean)
         b_save  = QPushButton("Save graph"); b_save.clicked.connect(self._save_graph); ctrl.addWidget(b_save)
@@ -1297,6 +1300,7 @@ class CSSLoggerWidget(QWidget):
 
         # Bottom pane: axis settings table
         axis_pane = QWidget()
+        self._graph_axis_pane = axis_pane
         self._build_axis_settings_panel(axis_pane)
         self._graph_v_splitter.addWidget(axis_pane)
         # Give all spare vertical space to the graph; keep the table compact and
@@ -1934,6 +1938,20 @@ class CSSLoggerWidget(QWidget):
         self._mpl_figure = fig
         self._graph_axes = axes
 
+        # Centre the rotated Y-tick numbers exactly on their tick. rotation_mode
+        # "anchor" applies ha/va AFTER the 90° rotation, so ha="center"/va="center"
+        # pins the label's middle to the tick (default alignment left it hanging
+        # to one side). Re-run on every draw so a resize/re-tick can't undo it.
+        def _center_y_ticklabels(_evt=None):
+            for _ax in axes:
+                for _lbl in _ax.get_yticklabels(which="both"):
+                    _lbl.set_rotation(90)
+                    _lbl.set_rotation_mode("anchor")
+                    _lbl.set_horizontalalignment("center")
+                    _lbl.set_verticalalignment("center")
+        _center_y_ticklabels()
+        canvas.mpl_connect("draw_event", _center_y_ticklabels)
+
         # Crosshair
         self._crosshair_vlines = []; self._crosshair_hlines = []; self._crosshair_texts = []
         self._x_cursor_ann = None
@@ -2430,14 +2448,14 @@ class CSSLoggerWidget(QWidget):
     # ── Fullscreen / windowed graph (F11 / Ctrl+F11) ──────────────────────────
 
     def _install_graph_shortcuts(self):
-        # Application-scoped so they fire from the popup window too. F11 = graph
-        # fullscreen, Ctrl+F11 = graph in a free-floating resizable window.
+        # Application-scoped so they fire from the popup window too. Matches the
+        # image slider: F11 = free-floating resizable window, Ctrl+F11 = fullscreen.
         sc_f11 = QShortcut(QKeySequence("F11"), self)
         sc_f11.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc_f11.activated.connect(lambda: self._graph_popout(windowed=False))
+        sc_f11.activated.connect(lambda: self._graph_popout(windowed=True))
         sc_ctrl_f11 = QShortcut(QKeySequence("Ctrl+F11"), self)
         sc_ctrl_f11.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        sc_ctrl_f11.activated.connect(lambda: self._graph_popout(windowed=True))
+        sc_ctrl_f11.activated.connect(lambda: self._graph_popout(windowed=False))
 
     def _graph_popout(self, windowed: bool):
         """Show the Graph tab in its own window. F11 → fullscreen, Ctrl+F11 →
@@ -2471,6 +2489,9 @@ class CSSLoggerWidget(QWidget):
         self._notebook.removeTab(self._graph_tab_index)
         pl.addWidget(self._tab_graph)
         self._tab_graph.show()
+        # "Graph only": hide the toolbar and the axis-settings table.
+        self._graph_ctrl_bar.hide()
+        self._graph_axis_pane.hide()
         self._graph_popup = popup
         if windowed:
             popup.resize(1200, 800)
@@ -2488,6 +2509,9 @@ class CSSLoggerWidget(QWidget):
         if lay is not None:
             lay.removeWidget(self._tab_graph)
         self._tab_graph.setParent(None)
+        # Restore the toolbar and axis-settings table hidden during pop-out.
+        self._graph_ctrl_bar.show()
+        self._graph_axis_pane.show()
         self._notebook.insertTab(self._graph_tab_index, self._tab_graph,
                                  self._graph_tab_label)
         self._notebook.setCurrentWidget(self._tab_graph)
