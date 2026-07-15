@@ -680,7 +680,12 @@ def _apply_result_to_pv(pv: "PVConfig", r: dict) -> None:
 # ---------------------------------------------------------------------------
 
 COLS = ["On", "Display name", "PV name", "Value", "Units", "State",
-        "Alarm status", "Warn lo/hi", "Alarm lo/hi", "Updated"]
+        "Alarm status", "Depends on", "Warn ≤", "Warn ≥", "Alarm ≤",
+        "Alarm ≥", "Updated"]
+
+# Threshold columns (double-click opens the limits popup); kept as one place so
+# data(), flags() and the double-click handler stay in sync.
+THR_COLS = (8, 9, 10, 11)
 
 PV_MIME = "application/x-pv-monitor-row"
 GROUP_HEADER_BG = QColor("#d7e3f4")
@@ -903,6 +908,8 @@ class PVTableModel(QAbstractTableModel):
                 active = rt.active_profile if rt else None
                 label = (active.get("label") or "conditional") if active else "default"
                 tip += f"\nActive limits: {label}"
+            if col in THR_COLS:
+                tip += "\nDouble-click to edit limits (default + rules)."
             if rt and rt.last_error:
                 tip += f"\nLast error: {rt.last_error}"
             return tip
@@ -929,7 +936,7 @@ class PVTableModel(QAbstractTableModel):
             if role == Qt.ForegroundRole and rt.notify_status == "failed":
                 return QColor("white")
 
-        if role == Qt.TextAlignmentRole and col in (3, 4, 5, 6, 7, 8):
+        if role == Qt.TextAlignmentRole and col in (3, 4, 5, 6, 8, 9, 10, 11):
             return int(Qt.AlignCenter)
 
         if role == Qt.DisplayRole:
@@ -953,20 +960,23 @@ class PVTableModel(QAbstractTableModel):
                 return level.label.lower()
             if col == 6:
                 return _alarm_status_text(pv, rt)
-            # Threshold columns show whichever profile is currently in force:
-            # the matched conditional profile, else the default set.
-            active = rt.active_profile if rt else None
-            if active is not None:
-                thr = pv.profile_thresholds(active)
-                mark = f" ({active.get('label') or 'cond'})"
-            else:
-                thr = pv.thresholds()
-                mark = ""
             if col == 7:
-                return f"{_fmt(thr.warn_low)} / {_fmt(thr.warn_high)}{mark}"
+                return _cond_summary(pv)
+            # Threshold columns show whichever set is currently in force: the
+            # matched conditional profile, else the default set. (Which one is
+            # active is spelled out in the row tooltip.)
+            active = rt.active_profile if rt else None
+            thr = pv.profile_thresholds(active) if active is not None \
+                else pv.thresholds()
             if col == 8:
-                return f"{_fmt(thr.alarm_low)} / {_fmt(thr.alarm_high)}{mark}"
+                return _fmt(thr.warn_low)
             if col == 9:
+                return _fmt(thr.warn_high)
+            if col == 10:
+                return _fmt(thr.alarm_low)
+            if col == 11:
+                return _fmt(thr.alarm_high)
+            if col == 12:
                 if rt and rt.last_update_ns:
                     return api.ns_to_prague(rt.last_update_ns).strftime("%H:%M:%S")
                 return "–"
@@ -1035,104 +1045,321 @@ class OptionalDoubleField(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Conditional-threshold rule row (used inside PVEditDialog)
+# Compact condition parsing/formatting for the thresholds editor
 # ---------------------------------------------------------------------------
 
-class _ProfileRow(QGroupBox):
-    """One conditional-threshold rule: dependency conditions + its limits.
+def _to_float(text) -> Optional[float]:
+    """Parse a cell string to float, or None if blank/invalid."""
+    try:
+        return float(str(text).strip().replace(",", "."))
+    except (ValueError, TypeError):
+        return None
 
-    Both dependency slots are always shown; the caption for each reflects the
-    dependency PV chosen above (or marks it unused). On save the dialog keeps
-    only the conditions for the dependency slots that actually have a PV.
+
+def _fmt_num(v: Optional[float]) -> str:
+    """Compact number for a cell: '' for None, no trailing zeros otherwise."""
+    if v is None:
+        return ""
+    return f"{v:g}"
+
+
+def _parse_cond(text: str) -> list:
+    """Parse a compact dependency condition into ``[lo, hi]`` (None = open).
+
+    '' / 'any' / '*'      -> [None, None]      (any value)
+    '5'                   -> [5, 5]            (exactly 5)
+    '1-3' / '1..3' / '1:3'-> [1, 3]            (range)
+    '>=5' / '≥5' / '>5'   -> [5, None]         (at least)
+    '<=5' / '≤5' / '<5'   -> [None, 5]         (at most)
     """
+    t = (text or "").strip().lower().replace(" ", "")
+    if t in ("", "any", "*", "-", "—"):
+        return [None, None]
+    for pref in ("≥", ">=", ">"):
+        if t.startswith(pref):
+            return [_to_float(t[len(pref):]), None]
+    for pref in ("≤", "<=", "<"):
+        if t.startswith(pref):
+            return [None, _to_float(t[len(pref):])]
+    for sep in ("..", "…", "–", "—", ":"):
+        if sep in t:
+            a, _, b = t.partition(sep)
+            return [_to_float(a), _to_float(b)]
+    # bare hyphen range, but not a leading minus sign (negative number)
+    if "-" in t[1:]:
+        idx = t.index("-", 1)
+        return [_to_float(t[:idx]), _to_float(t[idx + 1:])]
+    v = _to_float(t)
+    return [v, v]
 
-    def __init__(self, on_remove):
-        super().__init__()
-        self.setStyleSheet(_GROUP_STYLE)
-        v = QVBoxLayout(self)
 
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Label"))
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("e.g. sys-rate 10")
-        self.name_edit.setToolTip(
-            "A short name for this rule, shown in the table and tooltips when "
-            "the rule is active (e.g. 'sys-rate 10').")
-        top.addWidget(self.name_edit, 1)
-        rm = QPushButton("✕ Remove rule")
-        rm.setStyleSheet(SECONDARY_STYLE)
-        rm.clicked.connect(lambda: on_remove(self))
-        top.addWidget(rm)
-        v.addLayout(top)
+def _fmt_cond(cond) -> str:
+    """Inverse of :func:`_parse_cond` for display in a cell."""
+    lo, hi = (list(cond) + [None, None])[:2] if cond else (None, None)
+    if lo is None and hi is None:
+        return ""
+    if lo is not None and hi is not None:
+        return _fmt_num(lo) if lo == hi else f"{_fmt_num(lo)}–{_fmt_num(hi)}"
+    return f"≥{_fmt_num(lo)}" if hi is None else f"≤{_fmt_num(hi)}"
 
-        self.dep_caption: list[QLabel] = []
-        self.c_min: list[OptionalDoubleField] = []
-        self.c_max: list[OptionalDoubleField] = []
-        for _ in range(2):
-            cap = QLabel()
-            cap.setStyleSheet("color:#444; font-weight:600;")
-            v.addWidget(cap)
-            row = QHBoxLayout()
-            cmin = OptionalDoubleField("value ≥")
-            cmin.setToolTip(
-                "Lower edge of this dependency's range for this rule. For an "
-                "exact value, tick both ≥ and ≤ with the same number (or a "
-                "narrow window). Unticked = no lower limit.")
-            cmax = OptionalDoubleField("value ≤")
-            cmax.setToolTip(
-                "Upper edge of this dependency's range for this rule. "
-                "Unticked = no upper limit.")
-            row.addWidget(cmin)
-            row.addWidget(cmax)
-            row.addStretch(1)
-            v.addLayout(row)
-            self.dep_caption.append(cap)
-            self.c_min.append(cmin)
-            self.c_max.append(cmax)
 
-        self.warn_low = OptionalDoubleField("Warn low ≤")
-        self.warn_high = OptionalDoubleField("Warn high ≥")
-        self.alarm_low = OptionalDoubleField("Alarm low ≤")
-        self.alarm_high = OptionalDoubleField("Alarm high ≥")
-        for a, b in ((self.warn_low, self.warn_high),
-                     (self.alarm_low, self.alarm_high)):
-            row = QHBoxLayout()
-            row.addWidget(a)
-            row.addWidget(b)
-            row.addStretch(1)
-            v.addLayout(row)
+def _cond_summary(pv: "PVConfig") -> str:
+    """One-line, read-only summary of a PV's dependency rules for the table.
 
-    def set_dep_labels(self, names: list[str]):
-        for i, cap in enumerate(self.dep_caption):
-            name = names[i] if i < len(names) else ""
-            if name:
-                cap.setText(f"When {api.shorten_pv_name(name)} is in range:")
-            else:
-                cap.setText(f"Dependency {i + 1} — set a dependency PV above to use")
-
-    def load(self, prof: dict):
-        self.name_edit.setText(prof.get("label", ""))
+    Each rule's active dependencies are ANDed ('&'); rules are ORed (' / ').
+    e.g. 'HighPower=1' or 'Low=1 / High=1'."""
+    if not pv.gate_pvs or not pv.profiles:
+        return ", ".join(api.shorten_pv_name(g) for g in pv.gate_pvs)
+    rules = []
+    for prof in pv.profiles:
         conds = prof.get("conds") or []
-        for i in range(2):
+        parts = []
+        for i, name in enumerate(pv.gate_pvs):
             cond = conds[i] if i < len(conds) else None
             lo, hi = (list(cond) + [None, None])[:2] if cond else (None, None)
-            self.c_min[i].set_value(lo)
-            self.c_max[i].set_value(hi)
-        self.warn_low.set_value(prof.get("warn_low"))
-        self.warn_high.set_value(prof.get("warn_high"))
-        self.alarm_low.set_value(prof.get("alarm_low"))
-        self.alarm_high.set_value(prof.get("alarm_high"))
+            if lo is None and hi is None:
+                continue
+            short = api.shorten_pv_name(name)
+            if lo is not None and hi is not None and lo == hi:
+                parts.append(f"{short}={_fmt_num(lo)}")
+            else:
+                parts.append(f"{short}{_fmt_cond(cond)}")
+        rules.append(" & ".join(parts) if parts else (prof.get("label") or "any"))
+    return " / ".join(r for r in rules if r)
 
-    def cond(self, slot: int) -> list:
-        return [self.c_min[slot].value(), self.c_max[slot].value()]
 
-    def is_empty(self) -> bool:
-        vals = (self.c_min[0].value(), self.c_max[0].value(),
-                self.c_min[1].value(), self.c_max[1].value(),
-                self.warn_low.value(), self.warn_high.value(),
-                self.alarm_low.value(), self.alarm_high.value())
-        return not (self.name_edit.text().strip()
-                    or any(v is not None for v in vals))
+# ---------------------------------------------------------------------------
+# Compact thresholds editor: default limits + conditional rules in one table
+# ---------------------------------------------------------------------------
+
+class ThresholdsEditor(QWidget):
+    """One compact table editing a PV's alert limits.
+
+    The pinned first row ('Default') holds the limits used when no rule matches.
+    Each further row is a conditional rule. Within a row every dependency
+    condition must hold (AND); rules are checked top to bottom and the first
+    match wins, so separate rows act as OR. An empty limit cell means that side
+    is not checked; an empty dependency cell means 'any value'.
+    """
+
+    HDR = ["Rule", "Dep 1", "Dep 2", "Warn ≤", "Warn ≥", "Alarm ≤", "Alarm ≥"]
+
+    def __init__(self, win, pv: "PVConfig", parent=None):
+        super().__init__(parent)
+        self._win = win
+        self._dep_names = ["", ""]
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        dep_box = QGroupBox("Dependency PVs  (other PVs the rules below react to)")
+        dep_box.setStyleSheet(_GROUP_STYLE)
+        dv = QVBoxLayout(dep_box)
+        self.dep_edits: list[QLineEdit] = []
+        for i in range(2):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"Dependency PV {i + 1}"))
+            edit = QLineEdit()
+            edit.setPlaceholderText("blank = not used")
+            edit.setToolTip(
+                "Another PV whose value a rule below can require to sit in a "
+                "range (e.g. High/Low power status, sys-rate). Leave blank to "
+                "use fewer dependencies.")
+            edit.textChanged.connect(self._refresh_dep_headers)
+            row.addWidget(edit, 1)
+            br = QPushButton("Browse…")
+            br.setStyleSheet(SECONDARY_STYLE)
+            br.setToolTip("Pick this dependency PV from the CPVA channel list.")
+            br.clicked.connect(lambda _=False, e=edit: self._browse_into(e))
+            row.addWidget(br)
+            self.dep_edits.append(edit)
+            dv.addLayout(row)
+        lay.addWidget(dep_box)
+
+        self.table = QTableWidget(0, len(self.HDR))
+        self.table.setHorizontalHeaderLabels(self.HDR)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, len(self.HDR)):
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+            self.table.setColumnWidth(c, 78)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(150)
+        self.table.setToolTip(
+            "Row 'Default' = limits used when no rule matches.\n"
+            "Add rules that depend on the PVs above. Within a row all "
+            "conditions must hold (AND); the first matching rule wins, so "
+            "rules act as OR.\n\n"
+            "Condition syntax:  blank = any · 1 = exactly 1 · 1-3 = range · "
+            "≥5 = at least 5 · ≤5 = at most 5.\n"
+            "Empty limit cell = that side not checked.")
+        lay.addWidget(self.table)
+
+        btns = QHBoxLayout()
+        add = QPushButton("+ Add rule")
+        add.setStyleSheet(SECONDARY_STYLE)
+        add.setToolTip("Add a conditional rule (a new row).")
+        add.clicked.connect(lambda: self._add_rule())
+        rm = QPushButton("Remove rule")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.setToolTip("Delete the selected rule row(s). The Default row stays.")
+        rm.clicked.connect(self._remove_selected)
+        btns.addWidget(add)
+        btns.addWidget(rm)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+        hint = QLabel(
+            "AND within a row · OR across rows (first match wins). Leave a "
+            "dependency blank in a rule to mean 'any value'.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#777; font-size:11px;")
+        lay.addWidget(hint)
+
+        if pv is not None:
+            self.load(pv)
+
+    # --- dependency headers / editability ------------------------------
+    def _refresh_dep_headers(self):
+        self._dep_names = [e.text().strip() for e in self.dep_edits]
+        for i in range(2):
+            name = self._dep_names[i]
+            hdr = api.shorten_pv_name(name) if name else f"Dep {i + 1} (unused)"
+            self.table.horizontalHeaderItem(1 + i).setText(hdr)
+        self._sync_dep_editable()
+
+    def _sync_dep_editable(self):
+        """Grey out dependency cells with no PV set, and the Default row's."""
+        for r in range(self.table.rowCount()):
+            is_default = (r == 0)
+            for i in range(2):
+                item = self.table.item(r, 1 + i)
+                if item is None:
+                    continue
+                usable = bool(self._dep_names[i]) and not is_default
+                if usable:
+                    item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled
+                                  | Qt.ItemIsEditable)
+                else:
+                    item.setText("—" if is_default else "")
+                    item.setFlags(Qt.ItemIsSelectable)
+
+    def _browse_into(self, edit: QLineEdit):
+        dlg = PVBrowserDialog(self._win, self._win._all_channels,
+                              float(self._win.settings["http_timeout_s"]))
+        if not self._win._all_channels and dlg._all:
+            self._win._all_channels = dlg._all
+        if dlg.exec() == QDialog.Accepted and dlg.selected:
+            edit.setText(dlg.selected[0])
+
+    # --- rows ----------------------------------------------------------
+    def _new_row(self, label: str, label_locked: bool, conds: list, thr: list):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        li = QTableWidgetItem(label)
+        if label_locked:
+            li.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            f = li.font()
+            f.setBold(True)
+            li.setFont(f)
+        self.table.setItem(r, 0, li)
+        for i in range(2):
+            cond = conds[i] if i < len(conds) else None
+            self.table.setItem(r, 1 + i, QTableWidgetItem(_fmt_cond(cond)))
+        for j in range(4):
+            self.table.setItem(r, 3 + j, QTableWidgetItem(_fmt_num(thr[j])))
+        return r
+
+    def _add_rule(self, prof: Optional[dict] = None):
+        conds = (prof.get("conds") or []) if prof else []
+        thr = ([prof.get("warn_low"), prof.get("warn_high"),
+                prof.get("alarm_low"), prof.get("alarm_high")]
+               if prof else [None, None, None, None])
+        self._new_row(prof.get("label", "") if prof else "", False, conds, thr)
+        self._sync_dep_editable()
+
+    def _remove_selected(self):
+        # Row 0 is the pinned Default set and is never removed.
+        rows = sorted({i.row() for i in self.table.selectedIndexes()
+                       if i.row() > 0}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+
+    # --- load / apply --------------------------------------------------
+    def load(self, pv: "PVConfig"):
+        for i in range(2):
+            self.dep_edits[i].setText(
+                pv.gate_pvs[i] if i < len(pv.gate_pvs) else "")
+        self.table.setRowCount(0)
+        self._new_row("Default", True, [None, None],
+                      [pv.warn_low, pv.warn_high, pv.alarm_low, pv.alarm_high])
+        for prof in pv.profiles:
+            self._add_rule(prof)
+        self._refresh_dep_headers()
+
+    def set_default_thresholds(self, wl, wh, al, ah):
+        """Fill the Default row (used by Learn)."""
+        for j, v in enumerate((wl, wh, al, ah)):
+            self.table.setItem(0, 3 + j, QTableWidgetItem(_fmt_num(v)))
+
+    def _cell(self, r: int, c: int) -> str:
+        item = self.table.item(r, c)
+        return item.text().strip() if item else ""
+
+    def apply_to(self, pv: "PVConfig"):
+        """Write edited default limits, dependency PVs and rules back into pv."""
+        pv.warn_low = _to_float(self._cell(0, 3))
+        pv.warn_high = _to_float(self._cell(0, 4))
+        pv.alarm_low = _to_float(self._cell(0, 5))
+        pv.alarm_high = _to_float(self._cell(0, 6))
+        kept = [(name, slot) for slot, name in
+                enumerate(e.text().strip() for e in self.dep_edits) if name]
+        pv.gate_pvs = [name for name, _ in kept]
+        profiles = []
+        for r in range(1, self.table.rowCount()):
+            label = self._cell(r, 0)
+            conds_full = [_parse_cond(self._cell(r, 1)),
+                          _parse_cond(self._cell(r, 2))]
+            thr = [_to_float(self._cell(r, 3)), _to_float(self._cell(r, 4)),
+                   _to_float(self._cell(r, 5)), _to_float(self._cell(r, 6))]
+            cond_set = any(conds_full[slot] != [None, None] for _, slot in kept)
+            if not (label or cond_set or any(v is not None for v in thr)):
+                continue
+            profiles.append({
+                "label": label,
+                "conds": [conds_full[slot] for _, slot in kept],
+                "warn_low": thr[0], "warn_high": thr[1],
+                "alarm_low": thr[2], "alarm_high": thr[3],
+            })
+        pv.profiles = profiles
+
+
+class ThresholdsPopup(QDialog):
+    """Small dialog wrapping :class:`ThresholdsEditor` for one PV, opened from
+    the main table's threshold cells so the user picks default vs a conditional
+    rule and edits the numbers in place."""
+
+    def __init__(self, win, pv: "PVConfig"):
+        super().__init__(win)
+        self.setWindowTitle(f"Limits — {pv.display_name}")
+        self.resize(620, 460)
+        self.pv = pv
+        lay = QVBoxLayout(self)
+        info = QLabel(pv.name)
+        info.setStyleSheet("color:#555;")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.editor = ThresholdsEditor(win, pv)
+        lay.addWidget(self.editor, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Save).setStyleSheet(_BTN_SUCCESS)
+        bb.accepted.connect(self._save)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def _save(self):
+        self.editor.apply_to(self.pv)
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -1276,86 +1503,12 @@ class PVEditDialog(QDialog):
         form.addRow("", self.enabled_chk)
         lay.addLayout(form)
 
-        grp = QGroupBox("Default thresholds  (laser off / no gate — "
-                        "unchecked = that side not checked)")
-        grp.setStyleSheet(_GROUP_STYLE)
-        gl = QVBoxLayout(grp)
-        self.f_warn_low = OptionalDoubleField("Warning low ≤")
-        self.f_warn_low.setToolTip(
-            "Tick and set a value: a Warning is raised when the reading falls to "
-            "or below it. Leave unticked to not watch the low side for warnings.")
-        self.f_warn_high = OptionalDoubleField("Warning high ≥")
-        self.f_warn_high.setToolTip(
-            "Tick and set a value: a Warning is raised when the reading rises to "
-            "or above it. Leave unticked to not watch the high side for warnings.")
-        self.f_alarm_low = OptionalDoubleField("Alarm low ≤")
-        self.f_alarm_low.setToolTip(
-            "Tick and set a value: an Alarm (more severe than Warning) is raised "
-            "when the reading falls to or below it. Usually set below Warning low.")
-        self.f_alarm_high = OptionalDoubleField("Alarm high ≥")
-        self.f_alarm_high.setToolTip(
-            "Tick and set a value: an Alarm (more severe than Warning) is raised "
-            "when the reading rises to or above it. Usually set above Warning high.")
-        for f in (self.f_warn_low, self.f_warn_high,
-                  self.f_alarm_low, self.f_alarm_high):
-            gl.addWidget(f)
-        self.f_warn_low.set_value(pv.warn_low)
-        self.f_warn_high.set_value(pv.warn_high)
-        self.f_alarm_low.set_value(pv.alarm_low)
-        self.f_alarm_high.set_value(pv.alarm_high)
-        lay.addWidget(grp)
-
-        # --- Conditional thresholds (dependency PVs) -----------------------
-        gate = QGroupBox("Conditional thresholds  (depend on up to 2 other PVs)")
-        gate.setStyleSheet(_GROUP_STYLE)
-        gvl = QVBoxLayout(gate)
-
-        self.dep_edits: list[QLineEdit] = []
-        for i in range(2):
-            grow = QHBoxLayout()
-            grow.addWidget(QLabel(f"Dependency PV {i + 1}"))
-            edit = QLineEdit(pv.gate_pvs[i] if i < len(pv.gate_pvs) else "")
-            edit.setPlaceholderText("blank = not used")
-            edit.setToolTip(
-                "A PV this one depends on (e.g. hall state, sys-rate). Each rule "
-                "below can require this PV to sit in a given range. Leave blank "
-                "to use fewer dependencies.")
-            edit.textChanged.connect(self._refresh_dep_labels)
-            grow.addWidget(edit, 1)
-            br = QPushButton("Browse…")
-            br.setStyleSheet(SECONDARY_STYLE)
-            br.setToolTip("Pick this dependency PV from the CPVA channel list.")
-            br.clicked.connect(lambda _=False, e=edit: self._browse_into(e))
-            grow.addWidget(br)
-            self.dep_edits.append(edit)
-            gvl.addLayout(grow)
-
-        self._profiles_host = QVBoxLayout()
-        gvl.addLayout(self._profiles_host)
-        self._profile_rows: list[_ProfileRow] = []
-
-        add_rule = QPushButton("+ Add rule")
-        add_rule.setStyleSheet(SECONDARY_STYLE)
-        add_rule.setToolTip(
-            "Add a conditional rule. The first rule whose dependency conditions "
-            "all match — and that has at least one limit set — decides the active "
-            "limits. If no rule matches, the default thresholds above apply.")
-        add_rule.clicked.connect(lambda: self._add_profile_row())
-        gvl.addWidget(add_rule)
-
-        ghint = QLabel(
-            "Rules are checked top to bottom; the first match wins. A rule with "
-            "no limits set is ignored. Example: 3 rules on sys-rate (0.2 / 3.3 / "
-            "10) give each rate its own limits; leave a dependency's range empty "
-            "to mean 'any value'.")
-        ghint.setWordWrap(True)
-        ghint.setStyleSheet("color:#777; font-size:11px;")
-        gvl.addWidget(ghint)
-        lay.addWidget(gate)
-
-        for prof in pv.profiles:
-            self._add_profile_row(prof)
-        self._refresh_dep_labels()
+        thr_box = QGroupBox("Alert limits  (Default row + conditional rules)")
+        thr_box.setStyleSheet(_GROUP_STYLE)
+        tbl = QVBoxLayout(thr_box)
+        self.thr_editor = ThresholdsEditor(parent, pv)
+        tbl.addWidget(self.thr_editor)
+        lay.addWidget(thr_box)
 
         vrg = QGroupBox("Valid range  (sensor-error filter)")
         vrg.setStyleSheet(_GROUP_STYLE)
@@ -1478,10 +1631,8 @@ class PVEditDialog(QDialog):
     def _on_learned(self, r: dict):
         self.learn_btn.setEnabled(True)
         self.learn_prog.setVisible(False)
-        self.f_warn_low.set_value(r["warn_low"])
-        self.f_warn_high.set_value(r["warn_high"])
-        self.f_alarm_low.set_value(r["alarm_low"])
-        self.f_alarm_high.set_value(r["alarm_high"])
+        self.thr_editor.set_default_thresholds(
+            r["warn_low"], r["warn_high"], r["alarm_low"], r["alarm_high"])
         if r.get("units") and not self.units_combo.currentText().strip():
             self.units_combo.setCurrentText(r["units"])
         self._pending_stats = _stats_from_result(r)
@@ -1499,65 +1650,13 @@ class PVEditDialog(QDialog):
         self.learn_prog.setVisible(False)
         self.learn_status.setText(f"⚠ {msg}")
 
-    def _browse_into(self, edit: QLineEdit):
-        dlg = PVBrowserDialog(self._win, self._win._all_channels,
-                              float(self._win.settings["http_timeout_s"]))
-        if not self._win._all_channels and dlg._all:
-            self._win._all_channels = dlg._all
-        if dlg.exec() == QDialog.Accepted and dlg.selected:
-            edit.setText(dlg.selected[0])
-
-    def _add_profile_row(self, prof: Optional[dict] = None) -> _ProfileRow:
-        row = _ProfileRow(self._remove_profile_row)
-        if prof:
-            row.load(prof)
-        self._profile_rows.append(row)
-        self._profiles_host.addWidget(row)
-        self._refresh_dep_labels()
-        return row
-
-    def _remove_profile_row(self, row: _ProfileRow):
-        if row in self._profile_rows:
-            self._profile_rows.remove(row)
-            row.setParent(None)
-            row.deleteLater()
-
-    def _refresh_dep_labels(self):
-        names = [e.text().strip() for e in self.dep_edits]
-        for row in self._profile_rows:
-            row.set_dep_labels(names)
-
-    def _collect_gating(self) -> tuple:
-        """Build (gate_pvs, profiles) from the dependency fields and rule rows.
-
-        Only dependency slots with a PV name are kept; each rule's conditions
-        are aligned to those kept slots. Empty rules are dropped."""
-        kept = [(name, slot) for slot, name in
-                enumerate(e.text().strip() for e in self.dep_edits) if name]
-        gate_pvs = [name for name, _ in kept]
-        profiles = []
-        for row in self._profile_rows:
-            if row.is_empty():
-                continue
-            profiles.append({
-                "label": row.name_edit.text().strip(),
-                "conds": [row.cond(slot) for _, slot in kept],
-                "warn_low": row.warn_low.value(), "warn_high": row.warn_high.value(),
-                "alarm_low": row.alarm_low.value(), "alarm_high": row.alarm_high.value(),
-            })
-        return gate_pvs, profiles
-
     def _save(self):
         pv = self.pv
         pv.display_name = self.name_edit.text().strip() or pv.display_name
         pv.units = self.units_combo.currentText().strip()
         pv.group = self.group_combo.currentText().strip()
         pv.enabled = self.enabled_chk.isChecked()
-        pv.warn_low = self.f_warn_low.value()
-        pv.warn_high = self.f_warn_high.value()
-        pv.alarm_low = self.f_alarm_low.value()
-        pv.alarm_high = self.f_alarm_high.value()
-        pv.gate_pvs, pv.profiles = self._collect_gating()
+        self.thr_editor.apply_to(pv)   # default limits + gate_pvs + profiles
         pv.valid_min = self.f_valid_min.value()
         pv.valid_max = self.f_valid_max.value()
         if hasattr(self, "_pending_stats"):
@@ -2590,6 +2689,7 @@ class MonitorWidget(QWidget):
         self._cmd_last_logged_error = ""
         self._cmd_bot_id = None
         self._cmd_poll_inflight = False
+        self._cmd_poll_started_ns = 0   # when the in-flight poll was dispatched
         self._cmd_bot_id_inflight = False
         self._cmd_gen = 0
 
@@ -2693,7 +2793,7 @@ class MonitorWidget(QWidget):
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.doubleClicked.connect(lambda *_: self.edit_pv())
+        self.table.doubleClicked.connect(self._on_table_double_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.verticalHeader().setVisible(False)
@@ -2708,8 +2808,10 @@ class MonitorWidget(QWidget):
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(1, QHeaderView.Stretch)   # Display name
         hh.setSectionResizeMode(2, QHeaderView.Stretch)   # PV name
-        for c in (0, 3, 4, 5, 6, 7, 8, 9):
+        for c in (0, 3, 4, 5, 6, 8, 9, 10, 11, 12):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(7, QHeaderView.Interactive)  # Depends on
+        self.table.setColumnWidth(7, 130)
         self.model.modelReset.connect(self._apply_group_spans)
         self._apply_group_spans()
         splitter.addWidget(self.table)
@@ -2888,6 +2990,27 @@ class MonitorWidget(QWidget):
             self.graph.refresh_combo()
             self.persist()
             self._log(f"Updated {pv.display_name}.")
+
+    def _on_table_double_clicked(self, index):
+        """Double-click a threshold cell to edit limits in a popup; any other
+        cell opens the full PV editor."""
+        if index.column() in THR_COLS:
+            self.edit_thresholds(self.model.pv_at_row(index.row()))
+        else:
+            self.edit_pv()
+
+    def edit_thresholds(self, pv: Optional[PVConfig]):
+        """Popup limits editor (default set + conditional rules) for one PV.
+
+        Same underlying data as the full PV editor, so edits made here also show
+        up there. Dependency/rule changes take effect on the next poll."""
+        if pv is None:
+            return
+        dlg = ThresholdsPopup(self, pv)
+        if dlg.exec() == QDialog.Accepted:
+            self.model.reset()
+            self.persist()
+            self._log(f"Updated limits for {pv.display_name}.")
 
     # --- copy / paste settings ----------------------------------------
     # Fields carried by copy/paste: limits, dependency gating and valid range.
@@ -3328,10 +3451,27 @@ class MonitorWidget(QWidget):
         if not self.hub.webex.can_listen():
             return
         if self._cmd_poll_inflight:
-            return   # previous poll hasn't returned yet — never overlap requests
+            # Watchdog: a poll worker that never reports back (dropped queued
+            # signal, thread-pool starvation, or a network stall around a
+            # screen lock / WiFi power-save) would wedge this flag True forever
+            # and silently kill the command listener — while alerts, which use
+            # a generation counter instead of this flag, keep working. That is
+            # exactly the "notifies but ignores /list, /stop" failure. If the
+            # in-flight poll has outlived any plausible completion time, treat
+            # it as lost, discard its result (bump gen), and let a fresh poll
+            # proceed so the listener self-heals without an app restart.
+            timeout = float(self.settings.get("http_timeout_s", 10.0))
+            poll_s = max(1, int(self.settings.get("webex_command_poll_s", 1)))
+            max_wait_ns = int(max(poll_s * 5, timeout * 2 + 5) * 1e9)
+            if api.now_ns() - self._cmd_poll_started_ns < max_wait_ns:
+                return   # previous poll still plausibly running — never overlap
+            self._log("⚠ Webex command poll stalled — restarting it "
+                      "(listener self-healing).")
+            self._cmd_gen += 1   # discard the zombie poll's result when it lands
         if not self._cmd_bot_id:
             self._resolve_bot_id()   # keep retrying until it resolves, off the UI thread
         self._cmd_poll_inflight = True
+        self._cmd_poll_started_ns = api.now_ns()
         gen = self._cmd_gen
         sig = _CmdPollSignals(self)
         sig.done.connect(lambda result, g=gen: self._on_commands(result, g))
