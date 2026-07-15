@@ -5,19 +5,24 @@
     "avg_last_n": 20,
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
-    "renotify_cooldown_minutes": 10,
+    "renotify_cooldown_minutes": 30,
+    "settle_default_minutes": 0,
+    "settle_minutes": {
+      "L3-SIS-KEY:HighPowerStatus": 15,
+      "L3-SIS-KEY:LowPowerStatus": 15
+    },
     "recovery_notify": true,
     "debounce_count": 2,
     "hysteresis_frac": 0.05,
-    "history_minutes": 720,
+    "history_minutes": 10080,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
     "valid_min_default": 5.0,
     "valid_max_default": 80.0,
-    "graph_window_minutes": 360,
+    "graph_window_minutes": 180,
     "start_monitoring_on_launch": true,
-    "alert_plot_hours": 4,
+    "alert_plot_hours": 1,
     "teams_enabled": false,
     "email_enabled": false,
     "webex_enabled": true,
@@ -53,7 +58,7 @@
       }
     ],
     "webex_commands_enabled": true,
-    "webex_command_poll_s": 2,
+    "webex_command_poll_s": 5,
     "webex_command_allowlist": []
   },
   "pvs": [
@@ -63,10 +68,10 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "warn_low": 12.8,
+      "warn_high": 23.0,
+      "alarm_low": 12.0,
+      "alarm_high": 25.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
       ],
@@ -75,7 +80,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -88,7 +93,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -109,10 +114,10 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "warn_low": 11.0,
+      "warn_high": 23.0,
+      "alarm_low": 10.0,
+      "alarm_high": 25.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
       ],
@@ -121,7 +126,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -134,7 +139,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -155,10 +160,10 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "warn_low": 7.8,
+      "warn_high": 23.0,
+      "alarm_low": 7.0,
+      "alarm_high": 25.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
       ],
@@ -167,7 +172,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -180,7 +185,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -201,10 +206,10 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "warn_low": 7.0,
+      "warn_high": 23.0,
+      "alarm_low": 6.0,
+      "alarm_high": 25.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
       ],
@@ -213,7 +218,7 @@
           "label": "0,2 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -226,7 +231,7 @@
           "label": "3,3 Hz",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -248,18 +253,18 @@
       "group": "Temperatures",
       "enabled": true,
       "warn_low": 17.0,
-      "warn_high": 23.0,
+      "warn_high": 25.0,
       "alarm_low": 15.0,
-      "alarm_high": 25.0,
+      "alarm_high": 27.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
       ],
       "profiles": [
         {
-          "label": "",
+          "label": "High power operation",
           "conds": [
             [
-              0.0,
+              1.0,
               1.0
             ]
           ],
@@ -289,19 +294,41 @@
       "units": "DegC",
       "group": "Temperatures",
       "enabled": true,
-      "warn_low": 19.5,
-      "warn_high": 20.5,
-      "alarm_low": 19.0,
-      "alarm_high": 21.0,
+      "warn_low": 17.0,
+      "warn_high": 23.0,
+      "alarm_low": 15.0,
+      "alarm_high": 25.0,
       "gate_pvs": [
-        "L3-SIS-KEY:LowPowerStatus"
+        "L3-SIS-KEY:LowPowerStatus",
+        "L3-SIS-KEY:HighPowerStatus"
       ],
       "profiles": [
+        {
+          "label": "Operations",
+          "conds": [
+            [
+              1.0,
+              1.0
+            ],
+            [
+              null,
+              null
+            ]
+          ],
+          "warn_low": 19.7,
+          "warn_high": 20.3,
+          "alarm_low": 19.4,
+          "alarm_high": 20.6
+        },
         {
           "label": "",
           "conds": [
             [
-              0.0,
+              null,
+              null
+            ],
+            [
+              1.0,
               1.0
             ]
           ],

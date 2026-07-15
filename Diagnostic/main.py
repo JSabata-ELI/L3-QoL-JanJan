@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QPlainTextEdit, QProxyStyle, QStyle,
 )
 from PySide6.QtCore import QThread, Signal
+from PySide6.QtGui import QPalette, QColor
 
 from operation_history_logic import OperationHistoryLogic
 from monitor_tab import MonitorWidget
@@ -271,9 +272,30 @@ class MainWindow(QMainWindow):
 # Entry point
 # ===========================================================================
 
+def _light_palette():
+    """A light QPalette so Qt (and matplotlib's toolbar, which reads the palette
+    to pick its icon color) match the light APP_STYLESHEET even when Windows is
+    in dark mode. Without this, matplotlib sees a dark palette and paints the
+    toolbar icons white -> invisible on our light background."""
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor("#f3f3f3"))
+    pal.setColor(QPalette.WindowText, QColor("#111111"))
+    pal.setColor(QPalette.Base, QColor("#ffffff"))
+    pal.setColor(QPalette.AlternateBase, QColor("#f3f3f3"))
+    pal.setColor(QPalette.Text, QColor("#111111"))
+    pal.setColor(QPalette.Button, QColor("#e8e8e8"))
+    pal.setColor(QPalette.ButtonText, QColor("#111111"))
+    pal.setColor(QPalette.ToolTipBase, QColor("#ffffcc"))
+    pal.setColor(QPalette.ToolTipText, QColor("#111111"))
+    pal.setColor(QPalette.Highlight, QColor("#1565C0"))
+    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    return pal
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle(ToolTipDelayStyle("Fusion"))
+    app.setPalette(_light_palette())
     app.setStyleSheet(APP_STYLESHEET)
 
     window = MainWindow()

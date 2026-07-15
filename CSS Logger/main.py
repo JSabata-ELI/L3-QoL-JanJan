@@ -44,7 +44,7 @@ from PySide6.QtCore import (
     Qt, QObject, QTimer, Signal, QDate, QLocale, QRect, QSize, QPoint,
 )
 from PySide6.QtGui import (
-    QColor, QIcon, QPalette, QPainter, QPen,
+    QColor, QIcon, QPalette, QPainter, QPen, QShortcut, QKeySequence,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -848,6 +848,35 @@ class _FlowLayout(QLayout):
         return y + line_height - rect.y()
 
 
+# ── Floating graph window (F11 fullscreen / Ctrl+F11 windowed) ──────────────
+
+class _GraphPopupWindow(QWidget):
+    """Top-level window that hosts the Graph tab when popped out. Closing it (or
+    pressing Esc / F11) hands the tab back to the notebook instead of destroying
+    it."""
+
+    def __init__(self, owner):
+        super().__init__(None)
+        self._owner = owner
+        self.setWindowTitle("CSS Logger — Graph")
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape:
+            self._owner._restore_graph_from_popup(); return
+        if ev.key() == Qt.Key.Key_F11:
+            if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self._owner._graph_popout(windowed=True)
+            else:
+                self._owner._graph_popout(windowed=False)
+            return
+        super().keyPressEvent(ev)
+
+    def closeEvent(self, ev):
+        # Never lose the tab — reparent it back into the notebook.
+        ev.ignore()
+        self._owner._restore_graph_from_popup()
+
+
 # ── CSSLoggerWidget ────────────────────────────────────────────────────────
 
 class CSSLoggerWidget(QWidget):
@@ -858,6 +887,7 @@ class CSSLoggerWidget(QWidget):
         self._init_state()
         self._build_ui()
         self._populate_ui()
+        self._install_graph_shortcuts()
         # Graph tab defaults to live mode — start it shortly after the window shows
         # (deferred so the UI is fully realised and the Operation preset PVs are loaded).
         QTimer.singleShot(600, self._maybe_autostart_live)
@@ -964,6 +994,8 @@ class CSSLoggerWidget(QWidget):
         self._axis_tv_cols = ("show", "pv", "display_name", "color", "cursor_val",
                                "ymin", "ymax", "auto_scale", "width", "smooth", "grid",
                                "blank")
+        self._axis_last_clicked_row = -1
+        self._graph_popup = None       # floating graph window (F11 / Ctrl+F11)
         self._load_data_repository()
 
     # ── Top-level layout ───────────────────────────────────────────────────
@@ -1313,9 +1345,12 @@ class CSSLoggerWidget(QWidget):
                                        QAbstractItemView.EditTrigger.SelectedClicked)
         # White background (incl. the empty area beneath the rows) and let the
         # table fill the pane so no dead gap opens between the heading and it.
+        # Lighter-blue row selection (the default palette Highlight is a strong
+        # #1565C0 that reads as "sytě modrá"); dark text keeps it legible.
         self._axis_tv.setStyleSheet(
             "QTableWidget{background:#ffffff;}"
-            "QTableWidget QTableCornerButton::section{background:#ffffff;}")
+            "QTableWidget QTableCornerButton::section{background:#ffffff;}"
+            "QTableWidget::item:selected{background:#BBDEFB;color:#0D47A1;}")
         self._axis_tv.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         hdr = self._axis_tv.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -1338,6 +1373,8 @@ class CSSLoggerWidget(QWidget):
         self._axis_tv.setItemDelegateForColumn(3, self._color_delegate)
 
         self._axis_tv.cellDoubleClicked.connect(self._on_axis_tv_double_click)
+        # Second click on an already-selected row clears the highlight (toggle).
+        self._axis_tv.clicked.connect(self._on_axis_tv_clicked)
         lay.addWidget(self._axis_tv)
 
     # ── XY tab ─────────────────────────────────────────────────────────────
@@ -1359,7 +1396,7 @@ class CSSLoggerWidget(QWidget):
 
         b_plot = QPushButton("Plot XY"); b_plot.setStyleSheet(_BTN_SUCCESS)
         b_plot.clicked.connect(self._plot_xy); ctrl.addWidget(b_plot)
-        b_clean = QPushButton("Clean XY"); b_clean.clicked.connect(self._clear_xy_plot); ctrl.addWidget(b_clean)
+        b_clean = QPushButton("Clean XY"); b_clean.clicked.connect(self._clean_xy); ctrl.addWidget(b_clean)
         b_cond  = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
         self._btn_xy_back = QPushButton("↩ XY Back"); self._btn_xy_back.clicked.connect(self._xy_zoom_back); ctrl.addWidget(self._btn_xy_back)
         b_cpv   = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
@@ -1783,10 +1820,14 @@ class CSSLoggerWidget(QWidget):
             lo, hi = self._band_ylim(i, n, dmin, dmax, autosc)
             ax.set_ylim(lo, hi)
 
-        # One shared grid for the whole graph (driven by the first visible PV).
-        first_pv = pvs_for_axes[0] if pvs_for_axes else None
-        show_grid = self._pv_settings.get(first_pv, {}).get("grid", True) if first_pv else True
-        axes[0].grid(show_grid)
+        # This is a single shared plot (one X axis, stacked Y bands), so a grid
+        # can only line up with ONE Y scale — a per-PV grid is meaningless here.
+        # Treat the Grid column as a global toggle: draw the shared grid if ANY
+        # visible PV has Grid ticked (previously only the FIRST PV's checkbox was
+        # read, so ticking other rows appeared to do nothing).
+        show_grid = any(
+            self._pv_settings.get(pv, {}).get("grid", False) for pv in pvs_for_axes)
+        axes[0].grid(show_grid, which="major", alpha=0.4)
 
         # X-axis (the single shared bottom axis, axes[0])
         ax0 = ax_x
@@ -2367,8 +2408,91 @@ class CSSLoggerWidget(QWidget):
             self._log(f"Graph saved: {path}")
 
     def _clean_graph(self):
-        self._clear_graph()
-        self._lbl_graph_info.setText("")
+        # Clear only the plotted data points — keep the plot frame (axes,
+        # gridlines, labels) visible so "Clean graph" empties the graph rather
+        # than tearing the whole canvas down.
+        if self._mpl_canvas is not None and self._graph_lines:
+            for line_group in self._graph_lines:
+                for ln in line_group:
+                    try:
+                        ln.set_data([], [])
+                    except Exception:
+                        pass
+            self._graph_raw    = []
+            self._graph_raw_np = []
+            self._clear_stats()
+            self._mpl_canvas.draw_idle()
+            self._lbl_graph_info.setText("Graph cleared — data points removed.")
+        else:
+            self._clear_graph()
+            self._lbl_graph_info.setText("")
+
+    # ── Fullscreen / windowed graph (F11 / Ctrl+F11) ──────────────────────────
+
+    def _install_graph_shortcuts(self):
+        # Application-scoped so they fire from the popup window too. F11 = graph
+        # fullscreen, Ctrl+F11 = graph in a free-floating resizable window.
+        sc_f11 = QShortcut(QKeySequence("F11"), self)
+        sc_f11.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        sc_f11.activated.connect(lambda: self._graph_popout(windowed=False))
+        sc_ctrl_f11 = QShortcut(QKeySequence("Ctrl+F11"), self)
+        sc_ctrl_f11.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        sc_ctrl_f11.activated.connect(lambda: self._graph_popout(windowed=True))
+
+    def _graph_popout(self, windowed: bool):
+        """Show the Graph tab in its own window. F11 → fullscreen, Ctrl+F11 →
+        resizable window. Pressing the same shortcut again docks it back."""
+        # Ignore the app-wide shortcut when the user is on another tool's tab and
+        # nothing is popped out yet.
+        if self._graph_popup is None and not self.isVisible():
+            return
+
+        if self._graph_popup is not None:
+            is_full = self._graph_popup.isFullScreen()
+            # Same mode again → dock back; different mode → switch.
+            if windowed and not is_full:
+                self._restore_graph_from_popup(); return
+            if (not windowed) and is_full:
+                self._restore_graph_from_popup(); return
+            if windowed:
+                self._graph_popup.showNormal()
+                self._graph_popup.resize(1200, 800)
+            else:
+                self._graph_popup.showFullScreen()
+            return
+
+        # Pop the Graph tab out of the notebook into a floating window.
+        idx = self._notebook.indexOf(self._tab_graph)
+        self._graph_tab_index = idx if idx >= 0 else 0
+        self._graph_tab_label = self._notebook.tabText(self._graph_tab_index)
+        popup = _GraphPopupWindow(self)
+        pl = QVBoxLayout(popup)
+        pl.setContentsMargins(0, 0, 0, 0)
+        self._notebook.removeTab(self._graph_tab_index)
+        pl.addWidget(self._tab_graph)
+        self._tab_graph.show()
+        self._graph_popup = popup
+        if windowed:
+            popup.resize(1200, 800)
+            popup.show()
+        else:
+            popup.showFullScreen()
+        self._lbl_status.setText("Graph popped out — F11/Ctrl+F11/Esc to dock back.")
+
+    def _restore_graph_from_popup(self):
+        if self._graph_popup is None:
+            return
+        popup = self._graph_popup
+        self._graph_popup = None
+        lay = popup.layout()
+        if lay is not None:
+            lay.removeWidget(self._tab_graph)
+        self._tab_graph.setParent(None)
+        self._notebook.insertTab(self._graph_tab_index, self._tab_graph,
+                                 self._graph_tab_label)
+        self._notebook.setCurrentWidget(self._tab_graph)
+        popup.deleteLater()
+        self._lbl_status.setText("Graph docked back.")
 
     # ── Downsampling / averaging ──────────────────────────────────────────────
 
@@ -2851,25 +2975,28 @@ class CSSLoggerWidget(QWidget):
 
         def _worker():
             try:
-                from cpva_core import cpva_fetch_samples_chunked, cpva_decode_value
+                from cpva_core import cpva_fetch_many_chunked, cpva_decode_value
                 new_samples: dict = {}
                 added_count = 0
                 errors: list = []
+                # Fetch every PV concurrently in one shared thread pool instead of
+                # one HTTP request after another — with many PVs the sequential
+                # loop made each tick take (n_pvs × latency), so 12 PVs updated
+                # only ~every 3 s. This matches how CS Studio stays responsive.
+                raw_by_pv, fetch_errs = cpva_fetch_many_chunked(pvs, start_ns, end_ns)
                 for pv in pvs:
-                    try:
-                        raw = cpva_fetch_samples_chunked(pv, start_ns, end_ns)
-                        new_pts = []
-                        for s in raw:
-                            t_ns = s.get("time")
-                            if t_ns is None or int(t_ns) <= start_ns: continue
-                            value = cpva_decode_value(s)
-                            units = (s.get("metaData") or {}).get("units", "") or ""
-                            new_pts.append((int(t_ns), value, units))
-                        if new_pts:
-                            new_samples[pv] = new_pts
-                            added_count += len(new_pts)
-                    except Exception as exc:
-                        errors.append(f"{shorten_pv_name(pv)}: {exc}")
+                    if pv in fetch_errs:
+                        errors.append(f"{shorten_pv_name(pv)}: {fetch_errs[pv]}")
+                    new_pts = []
+                    for s in raw_by_pv.get(pv, []):
+                        t_ns = s.get("time")
+                        if t_ns is None or int(t_ns) <= start_ns: continue
+                        value = cpva_decode_value(s)
+                        units = (s.get("metaData") or {}).get("units", "") or ""
+                        new_pts.append((int(t_ns), value, units))
+                    if new_pts:
+                        new_samples[pv] = new_pts
+                        added_count += len(new_pts)
                 sig.done.emit((new_samples, added_count, end_ns, errors))
             except Exception as exc:
                 sig.done.emit(({}, 0, end_ns, [str(exc)]))
@@ -3339,6 +3466,23 @@ class CSSLoggerWidget(QWidget):
         col_name = list(self._axis_tv_cols)[col] if col < len(self._axis_tv_cols) else ""
         if col_name in ("pv", "cursor_val"): return
 
+    def _on_axis_tv_clicked(self, index):
+        # Toggle behaviour: clicking an already-selected row again clears the
+        # highlight. Skip the checkbox/color columns so ticking Show/Auto/Grid or
+        # picking a colour doesn't fight with (de)selecting the row.
+        col_name = (list(self._axis_tv_cols)[index.column()]
+                    if index.column() < len(self._axis_tv_cols) else "")
+        if col_name in ("show", "auto_scale", "grid", "color"):
+            self._axis_last_clicked_row = index.row()
+            return
+        row = index.row()
+        selected = {i.row() for i in self._axis_tv.selectionModel().selectedRows()}
+        if row == self._axis_last_clicked_row and row in selected:
+            self._axis_tv.clearSelection()
+            self._axis_last_clicked_row = -1
+        else:
+            self._axis_last_clicked_row = row
+
     def _on_axis_color_changed(self, row, color_hex):
         if row < len(self._pv_order):
             pv = self._pv_order[row]
@@ -3513,6 +3657,23 @@ class CSSLoggerWidget(QWidget):
         self._xy_zoom_history.append((ax.get_xlim(), ax.get_ylim()))
         ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
         self._xy_canvas.draw_idle()
+
+    def _clean_xy(self):
+        # Clear only the plotted points — keep the axes frame visible. Falls back
+        # to a full teardown if there is nothing drawn yet.
+        if self._xy_canvas is not None and self._xy_figure and self._xy_figure.axes:
+            ax = self._xy_figure.axes[0]
+            for coll in list(ax.collections):
+                try:
+                    coll.remove()
+                except Exception:
+                    pass
+            self._xy_rect_selector = None
+            self._xy_zoom_history = []
+            self._xy_canvas.draw_idle()
+            self._lbl_xy_info.setText("XY cleared — points removed.")
+        else:
+            self._clear_xy_plot()
 
     def _clear_xy_plot(self):
         if self._xy_canvas is not None:

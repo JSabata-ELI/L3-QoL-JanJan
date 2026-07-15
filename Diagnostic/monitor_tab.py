@@ -210,6 +210,17 @@ DEFAULT_SETTINGS = {
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
     "renotify_cooldown_minutes": 30,
+    # Settle ("grace") window: when a dependency/gate PV turns on (rises 0 -> 1),
+    # every monitored PV that depends on it holds its alerts for this many
+    # minutes, so the transient while chillers etc. re-stabilise to their new
+    # setpoint doesn't fire a false alarm. Per-gate overrides live in
+    # ``settle_minutes`` (keyed by gate PV name); ``settle_default_minutes``
+    # applies to any gate PV without its own entry. 0 = no hold.
+    "settle_default_minutes": 0,
+    "settle_minutes": {
+        "L3-SIS-KEY:HighPowerStatus": 15,
+        "L3-SIS-KEY:LowPowerStatus": 15,
+    },
     "recovery_notify": True,
     "debounce_count": 2,
     "hysteresis_frac": 0.05,
@@ -263,6 +274,9 @@ def load_config() -> dict:
             pass
     settings = dict(DEFAULT_SETTINGS)
     settings.update(data.get("settings") or {})
+    # Detach nested containers from the shared DEFAULT_SETTINGS templates so a
+    # config that omits them can't mutate the defaults in place.
+    settings["settle_minutes"] = dict(settings.get("settle_minutes") or {})
     _migrate_settings(settings)
     data["settings"] = settings
     data.setdefault("pvs", [])
@@ -437,6 +451,9 @@ class PVRuntime:
     bad_data: bool = False   # last poll returned samples but all out of range
     # Conditional profile in force at the last poll (None = default thresholds).
     active_profile: Optional[dict] = None
+    # While > now, this PV is inside a settle/grace window (a gate PV it depends
+    # on just turned on) and its alerts are held. 0 = not settling.
+    settling_until_ns: int = 0
     # Delivery state of the current non-OK episode's alert, for the "Alarm status"
     # column: "" (nothing to send / OK), "sending", "sent", "failed".
     notify_status: str = ""
@@ -726,6 +743,9 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     committed alert has nothing to send yet ("pending")."""
     if rt is None or not pv.enabled:
         return ""
+    if rt.settling_until_ns and api.now_ns() < rt.settling_until_ns:
+        return "settling → " + api.ns_to_prague(
+            rt.settling_until_ns).strftime("%H:%M")
     if rt.alert.level == AlertLevel.OK:
         return ""
     if rt.notify_status == "failed":
@@ -741,6 +761,11 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
 def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     if rt is None or not pv.enabled:
         return "Alerting off for this PV."
+    if rt.settling_until_ns and api.now_ns() < rt.settling_until_ns:
+        return ("Settling window: a dependency PV just turned on, so alerts for "
+                "this PV are held until " + api.ns_to_prague(
+                    rt.settling_until_ns).strftime("%H:%M:%S")
+                + " while it re-stabilises.")
     if rt.alert.level == AlertLevel.OK:
         return "No active alert."
     lines = [f"State: {rt.alert.level.label}"]
@@ -1918,6 +1943,86 @@ class WebexRoomsWidget(QWidget):
         return next((r["room_id"] for r in self.rows() if r["listen"]), "")
 
 
+class SettleWidget(QWidget):
+    """Editable Dependency-PV / hold-minutes table for settle windows.
+
+    One row per gate (dependency) PV: when that PV turns on (rises 0 -> 1),
+    every monitored PV depending on it holds its alerts for the given minutes.
+    Rows are pre-populated with the gate PVs currently in use plus any already
+    configured; extra dependencies can be added by hand for future use.
+    """
+
+    COLS = ["Dependency PV", "Hold (min)"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table.setColumnWidth(1, 90)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(110)
+        lay.addWidget(self.table)
+
+        row = QHBoxLayout()
+        add = QPushButton("Add")
+        add.setStyleSheet(SECONDARY_STYLE)
+        add.setToolTip("Add a dependency PV row so it, too, holds alerts for a "
+                       "while after it turns on.")
+        add.clicked.connect(lambda: self._add_row(start_edit=True))
+        rm = QPushButton("Remove selected")
+        rm.setStyleSheet(SECONDARY_STYLE)
+        rm.setToolTip("Delete the selected dependency row(s).")
+        rm.clicked.connect(self._remove_selected)
+        row.addWidget(add)
+        row.addWidget(rm)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+    def _add_row(self, name: str = "", minutes: float = 0.0,
+                 start_edit: bool = False):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        name_item = QTableWidgetItem(name)
+        self.table.setItem(r, 0, name_item)
+        spin = _NoWheelDoubleSpinBox()
+        spin.setRange(0, 1440)
+        spin.setDecimals(0)
+        spin.setValue(float(minutes or 0))
+        spin.setToolTip("Minutes to hold this dependency's dependent PVs' alerts "
+                        "after it turns on. 0 = no hold.")
+        self.table.setCellWidget(r, 1, spin)
+        if start_edit:
+            self.table.setCurrentItem(name_item)
+            self.table.editItem(name_item)
+
+    def _remove_selected(self):
+        for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
+            self.table.removeRow(r)
+
+    def set_rows(self, mapping: dict):
+        self.table.setRowCount(0)
+        for name in sorted(mapping):
+            self._add_row(name, mapping.get(name) or 0)
+
+    def mapping(self) -> dict:
+        out: dict[str, float] = {}
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            name = item.text().strip() if item else ""
+            if not name:
+                continue
+            spin = self.table.cellWidget(r, 1)
+            minutes = spin.value() if spin else 0
+            out[name] = int(minutes)
+        return out
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: "MonitorWidget"):
         super().__init__(parent)
@@ -2201,6 +2306,39 @@ class SettingsDialog(QDialog):
         self.autostart.setChecked(bool(s["start_monitoring_on_launch"]))
         form.addRow("", self.autostart)
         lay.addWidget(form_grp)
+
+        # --- Settle window (grace period after a dependency turns on) ------
+        settle_grp = QGroupBox("Settle window after a dependency turns on")
+        settle_grp.setStyleSheet(_GROUP_STYLE)
+        sgl = QVBoxLayout(settle_grp)
+        hint = QLabel(
+            "When a dependency (gate) PV rises 0 → 1 — e.g. High/Low power "
+            "starts and the chillers begin chasing a new setpoint — the PVs "
+            "depending on it hold their alerts for the minutes below, so the "
+            "warm-up transient doesn't fire a false alarm.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666; font-size:11px;")
+        sgl.addWidget(hint)
+        sform = QFormLayout()
+        self.settle_default = _NoWheelSpinBox()
+        self.settle_default.setRange(0, 1440)
+        self.settle_default.setToolTip(
+            "Hold time applied to any dependency PV that has no explicit row "
+            "below. 0 = don't hold unless listed. Range 0–1440 min.")
+        self.settle_default.setValue(int(s.get("settle_default_minutes", 0) or 0))
+        sform.addRow("Default hold (min, 0=off)", self.settle_default)
+        sgl.addLayout(sform)
+        self.settle_table = SettleWidget()
+        # Pre-fill with configured entries, then surface every gate PV actually
+        # in use so the operator can see/tune it (falling back to the default).
+        default_min = int(s.get("settle_default_minutes", 0) or 0)
+        mapping = dict(s.get("settle_minutes") or {})
+        for g in sorted(parent._gate_pv_names()):
+            mapping.setdefault(g, default_min)
+        self.settle_table.set_rows(mapping)
+        sgl.addWidget(self.settle_table)
+        lay.addWidget(settle_grp)
+
         lay.addStretch(1)
 
         self.test_status = QLabel("")
@@ -2287,6 +2425,8 @@ class SettingsDialog(QDialog):
         s["debounce_count"] = self.debounce.value()
         s["hysteresis_frac"] = self.hyst.value()
         s["renotify_cooldown_minutes"] = self.cooldown.value()
+        s["settle_default_minutes"] = self.settle_default.value()
+        s["settle_minutes"] = self.settle_table.mapping()
         s["recovery_notify"] = self.recovery.isChecked()
         s["history_minutes"] = self.hist.value()
         s["graph_window_minutes"] = self.graph_win.value()
@@ -2308,8 +2448,28 @@ from matplotlib.backends.backend_qtagg import (  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 import matplotlib.dates as mdates  # noqa: E402
+from matplotlib import cbook  # noqa: E402
+from PySide6.QtGui import QIcon, QPixmap  # noqa: E402
 
 MAX_GRAPH_POINTS = 3000
+
+
+class _LightNavToolbar(NavToolbar):
+    """Navigation toolbar whose icons are always painted dark, so they stay
+    clearly visible on our light toolbar background. Matplotlib normally recolors
+    icons white when it judges the ambient palette to be dark, which made the
+    buttons blend into the background (invisible 'white' buttons)."""
+
+    def _icon(self, name):
+        path = cbook._get_data_path("images", name)
+        large = path.with_name(path.name.replace(".png", "_large.png"))
+        pm = QPixmap(str(large if large.exists() else path))
+        pm.setDevicePixelRatio(self.devicePixelRatioF() or 1)
+        mask = pm.createMaskFromColor(QColor("black"),
+                                      Qt.MaskMode.MaskOutColor)
+        pm.fill(QColor("#111111"))
+        pm.setMask(mask)
+        return QIcon(pm)
 
 
 def render_pv_png(pv_name: str, display_name: str, hours: float,
@@ -2345,17 +2505,47 @@ def render_pv_png(pv_name: str, display_name: str, hours: float,
     fig = Figure(figsize=(8, 4), dpi=110)
     ax = fig.add_subplot(111)
     ax.plot(xs, ys, drawstyle="steps-post", color=PRIMARY, linewidth=1.5)
+    has_warn = has_alarm = False
     for val, ls, lw in ((thr.warn_low, "--", 1.0), (thr.warn_high, "--", 1.0),
                         (thr.alarm_low, "-.", 1.5), (thr.alarm_high, "-.", 1.5)):
         if val is not None:
             ax.axhline(val, linestyle=ls, linewidth=lw, alpha=0.7,
                        color=ALARM_COLOR if ls == "-." else WARN_COLOR)
+            if ls == "-.":
+                has_alarm = True
+            else:
+                has_warn = True
     ax.set_title(f"{display_name}  (last {hours:g} h)")
     ax.set_ylabel(units)
     ax.grid(True, alpha=0.3)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=api.TZ_PRAGUE))
-    fig.autofmt_xdate()
-    fig.tight_layout()
+
+    # (1)/(2) X axis: time only, more detail, no rotation.
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=6, maxticks=12))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=api.TZ_PRAGUE))
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(0)
+        lbl.set_ha("center")
+
+    # (3) Legend describing the threshold lines.
+    from matplotlib.lines import Line2D  # noqa: E402
+    handles = [Line2D([0], [0], color=PRIMARY, linewidth=1.5, label=display_name)]
+    if has_warn:
+        handles.append(Line2D([0], [0], color=WARN_COLOR, linestyle="--",
+                              alpha=0.7, label="Warning limit"))
+    if has_alarm:
+        handles.append(Line2D([0], [0], color=ALARM_COLOR, linestyle="-.",
+                              alpha=0.7, label="Alarm limit"))
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.16),
+              ncol=len(handles), fontsize=8, frameon=False)
+
+    # (4) Basic statistics as a caption under the graph.
+    arr = np.asarray(ys, dtype=float)
+    u = f" {units}" if units else ""
+    stats = (f"min {arr.min():.4g}{u}    max {arr.max():.4g}{u}    "
+             f"mean {arr.mean():.4g}{u}    n = {arr.size}")
+    fig.text(0.5, 0.02, stats, ha="center", va="bottom", fontsize=8, color="0.35")
+
+    fig.tight_layout(rect=(0, 0.13, 1, 1))
 
     buf = BytesIO()
     FigureCanvasAgg(fig).print_png(buf)
@@ -2384,7 +2574,7 @@ class GraphPanel(QWidget):
         self.fig = Figure(figsize=(6, 3), dpi=96)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
-        lay.addWidget(NavToolbar(self.canvas, self))
+        lay.addWidget(_LightNavToolbar(self.canvas, self))
         lay.addWidget(self.canvas, 1)
 
     def set_yaxis(self, lo, hi):
@@ -2460,7 +2650,10 @@ class GraphPanel(QWidget):
                 pass
         if self._yaxis is not None:
             self.ax.set_ylim(*self._yaxis)
-        self.fig.autofmt_xdate()
+        # Horizontal time labels (no rotation) — autofmt_xdate would tilt them.
+        for lbl in self.ax.get_xticklabels():
+            lbl.set_rotation(0)
+            lbl.set_ha("center")
         self.fig.tight_layout()
         self.canvas.draw_idle()
 
@@ -2578,6 +2771,11 @@ class MonitorWidget(QWidget):
         # Latest value of every gate PV that isn't itself a monitored PV,
         # refreshed each poll so state-dependent thresholds can switch.
         self._gate_values: dict[str, Optional[float]] = {}
+        # Settle windows: last observed value of each gate PV (to detect the
+        # 0 -> 1 rising edge) and, per gate PV, the ns until which its dependent
+        # PVs hold their alerts.
+        self._gate_prev: dict[str, Optional[float]] = {}
+        self._settle_until: dict[str, int] = {}
         self._poll_gen = 0
         self._monitoring = False
         self._sim_timer: Optional[QTimer] = None
@@ -2810,6 +3008,50 @@ class MonitorWidget(QWidget):
         if rt is not None and rt.current_value is not None:
             return rt.current_value
         return self._gate_values.get(name)
+
+    # --- settle / grace window ----------------------------------------
+    def _settle_minutes_for(self, gate: str) -> float:
+        """Hold time (minutes) when this gate PV turns on: its own entry in
+        ``settle_minutes``, else the global default. 0 = no hold."""
+        table = self.settings.get("settle_minutes") or {}
+        try:
+            if gate in table and table[gate] is not None:
+                return float(table[gate])
+            return float(self.settings.get("settle_default_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _update_settle_windows(self, now: int) -> None:
+        """Open a settle window for any gate PV that just rose 0 -> 1.
+
+        Only a genuine observed off->on edge triggers it: an unknown (None)
+        previous value never does, so a gate PV that is already on when
+        monitoring starts doesn't spuriously hold alerts.
+        """
+        for g in self._gate_pv_names():
+            cur = self._gate_value(g)
+            prev = self._gate_prev.get(g)
+            rising = (prev is not None and prev < 0.5
+                      and cur is not None and cur >= 0.5)
+            if rising:
+                mins = self._settle_minutes_for(g)
+                if mins > 0:
+                    self._settle_until[g] = now + int(mins * 60 * 1e9)
+                    until = api.ns_to_prague(self._settle_until[g]).strftime("%H:%M")
+                    self._log(f"{api.shorten_pv_name(g)} on — holding dependent "
+                              f"alerts {mins:g} min (until {until}) while things settle.")
+            if cur is not None:
+                self._gate_prev[g] = cur
+
+    def _settle_until_for_pv(self, pv: PVConfig, now: int) -> int:
+        """The latest active settle deadline among this PV's gate PVs, or 0 if
+        none is currently holding it."""
+        deadline = 0
+        for g in pv.gate_pvs:
+            until = self._settle_until.get(g, 0)
+            if until and now < until:
+                deadline = max(deadline, until)
+        return deadline
 
     def _match_profile(self, pv: PVConfig) -> Optional[dict]:
         """The conditional profile in force for this PV right now, or None if
@@ -3052,25 +3294,39 @@ class MonitorWidget(QWidget):
                           sort_keys=True, default=str)
 
     def open_settings(self):
+        # Non-modal so the main window stays movable/usable while Settings is
+        # open. Reuse the existing instance if it's already shown.
+        dlg = getattr(self, "_settings_dlg", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_()
+            dlg.activateWindow()
+            return
         before = self._cmd_settings_snapshot()
         dlg = SettingsDialog(self)
-        if dlg.exec() == QDialog.Accepted:
-            self.hub = NotificationHub.from_settings(self.settings)
-            self.evaluator = AlertEvaluator(self._eval_config())
-            ml = self._history_maxlen()
-            for rt in self.runtime.values():
-                if rt.history.maxlen != ml:
-                    rt.history = deque(rt.history, maxlen=ml)
-            if self._monitoring:
-                self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
-            # Only restart the Webex command listener when its own settings
-            # changed (or it isn't running) — a needless restart re-primes and
-            # briefly drops commands for no reason.
-            if self._cmd_settings_snapshot() != before or self._cmd_timer is None:
-                self._start_cmd_listener()
-            self.persist()
-            self._update_status()
-            self._log("Settings saved.")
+        self._settings_dlg = dlg
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.accepted.connect(lambda b=before: self._on_settings_accepted(b))
+        dlg.destroyed.connect(lambda *_: setattr(self, "_settings_dlg", None))
+        dlg.show()
+
+    def _on_settings_accepted(self, before: str):
+        self.hub = NotificationHub.from_settings(self.settings)
+        self.evaluator = AlertEvaluator(self._eval_config())
+        ml = self._history_maxlen()
+        for rt in self.runtime.values():
+            if rt.history.maxlen != ml:
+                rt.history = deque(rt.history, maxlen=ml)
+        if self._monitoring:
+            self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
+        # Only restart the Webex command listener when its own settings
+        # changed (or it isn't running) — a needless restart re-primes and
+        # briefly drops commands for no reason.
+        if self._cmd_settings_snapshot() != before or self._cmd_timer is None:
+            self._start_cmd_listener()
+        self.persist()
+        self._update_status()
+        self._log("Settings saved.")
 
     # --- monitoring loop ----------------------------------------------
     def toggle_monitoring(self, on: bool):
@@ -3081,6 +3337,11 @@ class MonitorWidget(QWidget):
         self.btn_monitor.setText("⏹ Stop monitoring" if on else "▶ Start monitoring")
         self.btn_monitor.setStyleSheet(STOP_BUTTON_STYLE if on else BUTTON_STYLE)
         if on:
+            # Re-prime edge detection: the first poll after a start records gate
+            # values without triggering (prev is unknown), so a gate PV already
+            # on at start-up doesn't open a spurious settle window.
+            self._gate_prev.clear()
+            self._settle_until.clear()
             self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
             self.timer.start()
             self._log("Monitoring started.")
@@ -3147,6 +3408,9 @@ class MonitorWidget(QWidget):
             res = results.get(g)
             if res is not None:
                 self._gate_values[g] = res[0]
+        # Open/refresh settle windows before evaluating, so a gate PV that
+        # turned on this pass already holds its dependents' alerts below.
+        self._update_settle_windows(now)
         for pv in self.pvs:
             res = results.get(pv.name)
             if res is None:
@@ -3169,10 +3433,20 @@ class MonitorWidget(QWidget):
             rt.active_profile = self._match_profile(pv)
             thr = (pv.profile_thresholds(rt.active_profile)
                    if rt.active_profile is not None else pv.thresholds())
+            settle_until = self._settle_until_for_pv(pv, now)
+            rt.settling_until_ns = settle_until
             if pv.enabled and thr.is_active():
-                note = self.evaluator.evaluate(rt.alert, val, thr, now)
-                if note is not None:
-                    self._dispatch_alert(pv, rt, note)
+                if settle_until:
+                    # In the grace window after a gate PV turned on: freeze the
+                    # state machine (don't evaluate/commit/notify) so the
+                    # settling transient is ignored entirely. Drop any pending
+                    # debounce so a half-formed transition can't survive it.
+                    rt.alert.pending_level = None
+                    rt.alert.pending_count = 0
+                else:
+                    note = self.evaluator.evaluate(rt.alert, val, thr, now)
+                    if note is not None:
+                        self._dispatch_alert(pv, rt, note)
             if rt.alert.level == AlertLevel.OK:
                 rt.notify_status = ""      # episode over — clear the status cell
                 rt.notify_error = ""
@@ -3381,15 +3655,21 @@ class MonitorWidget(QWidget):
             if self.hub.webex.is_own_message(it.get("id")):
                 continue
             text = (it.get("text") or "").strip()
+            mentioned = bool(self._cmd_bot_id
+                             and self._cmd_bot_id in (it.get("mentionedPeople") or []))
             if "/" in text:
                 if not text.startswith("/"):
                     text = text[text.index("/"):]   # strip a leading @mention
             else:
                 # Be forgiving: a bare "help"/"?"/"commands" (no slash) is
-                # treated as /help. Anything else without a slash is ignored
-                # so the bot stays quiet during normal conversation.
+                # treated as /help. If the bot was @mentioned without any
+                # recognizable command, greet with the basics rather than
+                # staying silent. Anything else without a slash is ignored so
+                # the bot stays quiet during normal conversation.
                 low = text.lower()
                 if low in ("help", "?", "commands") or low.endswith(" help"):
+                    text = "/help"
+                elif mentioned:
                     text = "/help"
                 else:
                     continue
@@ -3506,17 +3786,20 @@ class MonitorWidget(QWidget):
 
     def _cmd_help(self) -> str:
         return (
-            "**PV Monitor commands:**\n"
-            "- `/status` — all PVs + values + state\n"
+            "**PV Monitor — I watch the L3 beamline PVs and alert on "
+            "warning/alarm limits.** Mention me and send one of these:\n"
+            "- `/status` — all PVs + current values + state\n"
             "- `/list` — list configured PVs\n"
-            "- `/plot <pv>` — send current plot of a PV\n"
+            "- `/plot <pv>` — send a current plot (PNG) of a PV\n"
+            "- `/graph <pv|all>` — set which PV the live graph shows\n"
             "- `/start` — monitoring on\n"
             "- `/stop [hours]` — monitoring off; with hours, auto-resume later "
             "(e.g. `/stop 10`)\n"
-            "- `/enable <pv>` `/disable <pv>` — alerting per PV\n"
-            "- `/graph <pv|all>` — set the live graph\n"
-            "- `/window <minutes>` — graph time window\n"
-            "- `/yaxis <lo> <hi>` | `/yaxis auto` — graph Y range")
+            "- `/enable <pv>` `/disable <pv>` — alerting on/off per PV\n"
+            "- `/window <minutes>` — live-graph time window\n"
+            "- `/yaxis <lo> <hi>` | `/yaxis auto` — live-graph Y range\n"
+            "- `/help` — this list\n"
+            "\n_PV names accept partial matches (e.g. `/plot chiller`)._")
 
     def _cmd_status(self) -> str:
         if not self.pvs:

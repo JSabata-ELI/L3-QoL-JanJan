@@ -125,87 +125,113 @@ last_processed_day  YYYY-MM-DD — builder resumes from the next day
 
 ---
 
-### Notifikace — přidání druhé Webex roomky a e-mail (Seznam / Outlook)
+### Notifications — adding a second Webex room and e-mail (Seznam / Outlook)
 
-Aplikace už umí posílat alerty do **více Webex roomek zároveň** (jeden bot vysílá do N roomek) — žádná úprava kódu není potřeba, jen doplnit nastavení v GUI.
+The app can already send alerts to **several Webex rooms at once** (one bot broadcasts to N rooms) — no code change needed, just fill in the settings in the GUI.
 
-#### Přidání druhé Webex roomky
+#### Adding a second Webex room
 
-1. **PV Monitor** tab → **Settings** → **Notification channels** → zaškrtnout **Webex**, dole v sekci **Webex** nastavit **Mode = bot**.
-2. Do políčka **Bot token** vyplnit token bota (stejný pro všechny roomky — jeden bot vysílá do všech).
-3. V tabulce **Rooms** kliknout **Add**, vyplnit:
-   - **Name** — libovolný popisek
-   - **Room ID** — ID dané roomky (viz níže, jak ho získat)
-   - **On** — zaškrtnout, aby do ní chodily alerty
-   - **Listen for commands** — max. jedna roomka smí mít zaškrtnuto (bot čte obousměrné příkazy jen z jedné roomky)
+1. **PV Monitor** tab → **Settings** → **Notification channels** → tick **Webex**, then in the **Webex** section set **Mode = bot**.
+2. In the **Bot token** field enter the bot's token (the same for all rooms — one bot broadcasts to all).
+3. In the **Rooms** table click **Add** and fill in:
+   - **Name** — any label
+   - **Room ID** — the room's ID (see below how to get it)
+   - **On** — tick so alerts go to it
+   - **Listen for commands** — at most one room may be ticked (the bot reads two-way commands from a single room only)
 4. **Save**.
 
-#### Jak získat Room ID (ty "kódy")
+#### How to get the Room ID (those "codes")
 
-Webex API vrací jen roomky, jejichž je bot **členem** — ne všechny roomky obecně. Postup:
+The Webex API returns only the rooms the bot is a **member** of — not every room in general. Steps:
 
-1. **Přidat bota do cílové roomky jako běžného účastníka**
-   - Otevřít Webex (aplikace nebo web) → danou roomku → ikona lidí **People** → **Add People**
-   - Zadat e-mail bota (formát `neco@webex.bot`) a potvrdit
-   - E-mail bota (i jeho access token, stejný jako `webex_bot_token`) najdeš na https://developer.webex.com/my-apps → kliknout na daného bota
+1. **Add the bot to the target room as a regular participant**
+   - Open Webex (app or web) → the room → the **People** icon → **Add People**
+   - Enter the bot's e-mail (format `something@webex.bot`) and confirm
+   - The bot's e-mail (and its access token, the same as `webex_bot_token`) is at https://developer.webex.com/my-apps → click the bot
 
-2. **Zavolat API, které vypíše všechny roomky bota** — nejjednodušší přímo v prohlížeči, bez curl/PowerShell:
-   - Jít na https://developer.webex.com/docs/api/v1/rooms/list-rooms
-   - Vpravo v panelu **Try It** vložit bot token do pole Authorization
-   - Kliknout **Run** — vrátí se JSON se všemi roomkami, kde je bot členem
+2. **Call the API that lists all of the bot's rooms** — easiest right in the browser, without curl/PowerShell:
+   - Go to https://developer.webex.com/docs/api/v1/rooms/list-rooms
+   - In the **Try It** panel on the right paste the bot token into the Authorization field
+   - Click **Run** — it returns JSON with every room the bot is a member of
 
-   Alternativa přes PowerShell:
+   Alternative via PowerShell:
    ```powershell
    $resp = Invoke-RestMethod -Uri "https://webexapis.com/v1/rooms" -Headers @{Authorization="Bearer <bot_token>"}
    $resp.items | Select-Object title, id
    ```
-   nebo v bashi:
+   or in bash:
    ```bash
    curl -H "Authorization: Bearer <bot_token>" https://webexapis.com/v1/rooms
    ```
 
-3. **Najít správnou roomku a zkopírovat `id`** — výstup vypadá takto (zkráceně):
+3. **Find the right room and copy its `id`** — the output looks like this (abbreviated):
    ```json
    {
      "items": [
-       { "id": "Y2lzY29zcGFyazovL3VybjpURUFN...", "title": "Diagnostika – druhá roomka", "type": "group" },
+       { "id": "Y2lzY29zcGFyazovL3VybjpURUFN...", "title": "Diagnostics – second room", "type": "group" },
        { "id": "Y2lzY29zcGFyazovL3VybjpURUFN...", "title": "Main", "type": "group" }
      ]
    }
    ```
-   Podle `title` (názvu roomky, jak ji vidíš ve Webexu) najdi tu správnou a zkopíruj hodnotu jejího `id` — to je přesně to, co se vloží do sloupce **Room ID** v tabulce Rooms v Settings.
+   Use `title` (the room name as you see it in Webex) to find the right one and copy the value of its `id` — that is exactly what goes into the **Room ID** column in the Rooms table in Settings.
 
-   Poznámka: pokud bota do roomky teprve přidáváš, projeví se v seznamu roomek až po přidání — ne dřív.
+   Note: if you are only just adding the bot to the room, it shows up in the room list after it is added — not before.
 
-#### E-mail (SMTP) — Seznam.cz a Outlook.com
+#### E-mail (SMTP) — Seznam.cz and Outlook.com
 
-Settings → Notification channels → zaškrtnout **Email**, pak v sekci **Email (SMTP)**:
+Settings → Notification channels → tick **Email**, then in the **Email (SMTP)** section:
 
-| Provider | SMTP host | Port | Security | Poznámka |
+| Provider | SMTP host | Port | Security | Note |
 |---|---|---|---|---|
-| Seznam.cz | `smtp.seznam.cz` | 587 | starttls | Běžné heslo ke schránce funguje, pokud není zapnuté 2FA |
-| Outlook.com / Microsoft 365 | `smtp-mail.outlook.com` (nebo `smtp.office365.com` pro firemní M365) | 587 | starttls | Při zapnutém 2FA je nutné aplikační heslo, běžné heslo bude odmítnuto |
+| Seznam.cz | `smtp.seznam.cz` | 587 | starttls | A normal mailbox password works if 2FA is not enabled |
+| Outlook.com / Microsoft 365 | `smtp-mail.outlook.com` (or `smtp.office365.com` for corporate M365) | 587 | starttls | With 2FA enabled an app password is required; a normal password is rejected |
 
-**Username** = celá e-mailová adresa, **From address** = odesílací adresa (může být stejná), **Recipients** = tabulka příjemců alertů (zaškrtnout **On** u každého, kdo má dostávat e-maily).
+**Username** = the full e-mail address, **From address** = the sending address (may be the same), **Recipients** = the table of alert recipients (tick **On** for everyone who should receive e-mails).
 
-Kde najít/vytvořit aplikační heslo:
-- **Seznam.cz**: přihlásit se na email.seznam.cz → Nastavení → Zabezpečení → "Hesla pro aplikace" → vytvořit nové, vložit do pole **Password**.
-- **Outlook.com / Microsoft 365**: https://account.microsoft.com/security → Security → Advanced security options → App passwords (dostupné jen když je zapnuté dvoufázové ověření).
+Where to find/create an app password:
+- **Seznam.cz**: sign in at email.seznam.cz → Settings → Security → "App passwords" → create a new one, paste it into the **Password** field.
+- **Outlook.com / Microsoft 365**: https://account.microsoft.com/security → Security → Advanced security options → App passwords (available only when two-factor authentication is enabled).
 
-Heslo/token se při **Save** automaticky zašifruje (Windows DPAPI, jen pro aktuální Windows účet) — viz `secrets_util.py`. Do gitu se nikdy neukládá čitelné heslo; alternativa je zapsat `${ENV:NAME}` a heslo držet v proměnné prostředí.
+The password/token is encrypted automatically on **Save** (Windows DPAPI, for the current Windows account only) — see `secrets_util.py`. A readable password is never committed to git; an alternative is to write `${ENV:NAME}` and keep the password in an environment variable.
 
 #### Microsoft Teams
 
-Aplikace posílá alerty přes klasický **Incoming Webhook** konektor (formát "MessageCard") — ne přes novější Power Automate Workflows.
+The app sends alerts via the classic **Incoming Webhook** connector ("MessageCard" format) — not the newer Power Automate Workflows.
 
-1. V Teams otevřít cílový kanál → **...** (More options) → **Connectors** (nebo Manage channel → Connectors).
-2. Najít **Incoming Webhook** → **Configure** (případně Add).
-3. Zadat jméno (např. "PV Monitor alerts"), volitelně nahrát ikonu → **Create**.
-4. Zkopírovat vygenerovanou URL webhooku.
-5. V aplikaci: Settings → Notification channels → zaškrtnout **Teams** → do pole **Incoming Webhook URL** vložit zkopírovanou URL → **Save**.
-6. Otestovat tlačítkem **Send test to Teams**.
+1. In Teams open the target channel → **...** (More options) → **Connectors** (or Manage channel → Connectors).
+2. Find **Incoming Webhook** → **Configure** (or Add).
+3. Enter a name (e.g. "PV Monitor alerts"), optionally upload an icon → **Create**.
+4. Copy the generated webhook URL.
+5. In the app: Settings → Notification channels → tick **Teams** → paste the copied URL into the **Incoming Webhook URL** field → **Save**.
+6. Test it with the **Send test to Teams** button.
 
-**Poznámka:** Microsoft postupně ruší staré "Office 365 Connectors" (klasické Incoming Webhooks) ve prospěch Workflows. Pokud v daném týmu/kanálu možnost **Connectors** chybí, znamená to, že tenant už byl migrován — pak je nutné použít šablonu Workflows "Post to a channel when a webhook request is received". Ta ale očekává jiný formát payloadu (Adaptive Card, ne MessageCard), takže by vyžadovala úpravu kódu v `alerting.py` (`build_messagecard`), aby zprávy vypadaly správně.
+**Note:** Microsoft is gradually retiring the old "Office 365 Connectors" (classic Incoming Webhooks) in favor of Workflows. If the **Connectors** option is missing in a given team/channel, the tenant has already been migrated — then you must use the Workflows template "Post to a channel when a webhook request is received". That, however, expects a different payload format (Adaptive Card, not MessageCard), so it would require a code change in `alerting.py` (`build_messagecard`) for the messages to render correctly.
+
+---
+
+### Webex bot commands (two-way control)
+
+When **Listen for commands** is enabled in Settings (with `Mode = bot` and a bot token set), the bot reads commands from one room and replies into it. Send a command by **@mentioning the bot and typing the command** — order doesn't matter (`@Diagnostics /help` and `/help @Diagnostics` both work). If you just @mention the bot without a recognized command, it replies with this help.
+
+| Command | What it does |
+|---|---|
+| `/help`, `/?` | Print the command list (also works without a slash: `help`, `?`, `commands`, or just @mentioning the bot) |
+| `/status` | All PVs with current value and state (ok / warning / alarm / off / no data) + whether monitoring is running |
+| `/list` | List the configured PVs |
+| `/plot <pv>` | Post a current plot of a PV as a PNG (window set by "Alert plot window" in Settings) |
+| `/graph <pv\|all>` | Set which PV the live graph in the GUI shows (`all` = every PV) |
+| `/start` | Turn monitoring on |
+| `/stop [hours]` | Turn monitoring off; with a number it auto-resumes after that many hours (e.g. `/stop 10`), without a number it stays off |
+| `/enable <pv>` | Enable alerting for a PV |
+| `/disable <pv>` | Disable alerting for a PV |
+| `/window <minutes>` | Live-graph time window |
+| `/yaxis <lo> <hi>` | Fixed Y range for the live graph |
+| `/yaxis auto` | Return the Y axis to autoscale |
+
+Notes:
+- PV names accept partial, case-insensitive matches (`/plot chiller` finds "DA3 Chiller"); if several PVs match, the bot replies with the options.
+- If a **Command allowlist** is set in Settings, commands are accepted only from the listed e-mails; others get a polite "not allowed" reply.
+- The bot reads commands only from the room that has **Listen for commands** ticked in the Rooms table (at most one).
 
 ---
 
