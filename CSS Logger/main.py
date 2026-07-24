@@ -464,6 +464,19 @@ class DatePickerDialog(QDialog):
 # this fall back to 1 hour. 366 days keeps year-long relative windows working.
 _LIVE_MAX_SPAN_S = 86400 * 366
 
+# Rebuilding the whole QTableWidget on every live tick gets visibly laggy once
+# the row count grows large, so only the most recent rows are ever rendered.
+# Export/graph/XY-plot always use the full, untruncated _table_rows.
+_MAX_TABLE_ROWS = 5000
+
+# The live tick polls every 300 ms (see _schedule_live_tick), but re-merging +
+# re-filtering + re-plotting the WHOLE accumulated history (which only grows
+# over a live session) is too expensive to redo every single tick — on a long
+# session it starts taking longer than the tick period itself, so the GUI
+# thread never gets an idle moment and the app appears frozen. New samples are
+# still appended every tick; the expensive rebuild is throttled to this cadence.
+_LIVE_REBUILD_MIN_INTERVAL_NS = int(1.0 * 1e9)
+
 
 class TimeWindowDialog(QDialog):
     """CS-Studio-style Start/End time picker.
@@ -959,6 +972,7 @@ class CSSLoggerWidget(QWidget):
         self._live_mode     = False
         self._live_last_ts  = None
         self._live_window_span = None
+        self._live_last_rebuild_ns = 0
         self._live_autoscroll  = True
         self._live_programmatic_scroll = False
         self._live_timer = QTimer(self)
@@ -2187,9 +2201,13 @@ class CSSLoggerWidget(QWidget):
                     sf_info = (self._graph_spine_xpos[ax_i]
                                if ax_i < len(self._graph_spine_xpos) else (0.0, "left"))
                     xfrac, side = sf_info
-                    val_str = _fmt_cursor_value(y_mouse)
+                    # Show/position this label at the PV's own value at the
+                    # hovered X (snap_val), not at the mouse's raw Y position —
+                    # the latter is arbitrary and unrelated to the PV's data.
+                    has_data = snap_val is not None
+                    val_str = _fmt_cursor_value(snap_val) if has_data else "—"
                     txt = f" {val_str}" if side == "right" else f"{val_str} "
-                    y_ann = y_mouse
+                    y_ann = snap_val if has_data else y_mouse
                     # Stagger every other axis label onto a second row, with
                     # enough vertical padding that the two rows' boxes clear
                     # each other (box height ≈ font size + bbox padding).
@@ -2734,8 +2752,9 @@ class CSSLoggerWidget(QWidget):
         # Custom PVs — append the defined channels and compute their values.
         self._rebuild_custom_pvs()
 
-        # Master-multiple filter + conditions
-        unfiltered_count = len(self._table_rows_unfiltered)
+        # Master-multiple filter + conditions (both fall back to showing
+        # everything rather than silently blanking the table — see their
+        # own _log() calls if that fallback triggers).
         rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
         self._table_rows = self._apply_conditions_to_rows(rows)
 
@@ -2756,12 +2775,6 @@ class CSSLoggerWidget(QWidget):
             self._log("Load errors:\n" + "\n".join(errors))
         extra = f" + {n_custom} custom" if n_custom else ""
         filter_note = ""
-        if unfiltered_count > 0 and len(self._table_rows) == 0:
-            mpv = self._get_master_pv(); mmul = self._get_master_multiple()
-            filter_note = f"  ⚠ All rows filtered by master-multiple ({mpv} / {mmul})"
-            self._log(f"WARNING: {unfiltered_count} rows fetched but all removed by "
-                      f"master-multiple filter (master PV={mpv}, multiple={mmul}). "
-                      "Check 'Keep multiples of' setting or master PV is not loaded.")
         self._log(f"Loaded {n_real}{extra} PVs, {total_pts} samples, "
                   f"{len(self._table_rows)} merged rows.")
         self._lbl_status.setText(
@@ -2839,6 +2852,7 @@ class CSSLoggerWidget(QWidget):
             self._lbl_status.setText("Live: initial load…")
             self._btn_load.setEnabled(False)
             self._live_last_ts = None
+            self._live_last_rebuild_ns = 0
             self._live_initial_load()
 
     def _live_initial_load(self):
@@ -2957,9 +2971,13 @@ class CSSLoggerWidget(QWidget):
                 pv for pv, s in self._samples_by_pv.items()
                 if any(isinstance(v, (int, float)) for _, v, _ in s)
             }
-            self._table_rows_unfiltered = self._build_table_rows(samples_by_pv, pv_order)
+            rows = self._build_table_rows(samples_by_pv, pv_order)
+            rows = self._remove_master_only_rows(rows)
+            rows = self._remove_fake_hour_boundary_rows(rows)
+            self._table_rows_unfiltered = rows
             self._rebuild_custom_pvs()          # add + compute derived channels
-            self._table_rows = self._apply_conditions_to_rows()
+            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+            self._table_rows = self._apply_conditions_to_rows(rows)
             for i, pv in enumerate(self._pv_order):
                 if pv not in self._pv_settings:
                     self._pv_settings[pv] = self._get_pv_default_settings(pv, i)
@@ -3037,6 +3055,16 @@ class CSSLoggerWidget(QWidget):
                 new_samples, added_count, end_ns = result; errors = []
             self._live_tick_count = getattr(self, "_live_tick_count", 0) + 1
 
+            # Re-merging + re-filtering + re-plotting the WHOLE accumulated
+            # history is too expensive to redo on every 300 ms tick once a
+            # live session has run for a while — throttle it to at most once
+            # a second. New samples are still appended below on every tick;
+            # only the expensive rebuild/redraw is deferred.
+            now = now_ns()
+            refresh_due = (now - self._live_last_rebuild_ns) >= _LIVE_REBUILD_MIN_INTERVAL_NS
+            if refresh_due:
+                self._live_last_rebuild_ns = now
+
             if added_count > 0:
                 # Advance the cursor to the newest sample we actually received —
                 # NOT to wall-clock "now" — so archiver ingestion lag can't make
@@ -3057,11 +3085,16 @@ class CSSLoggerWidget(QWidget):
                     else:
                         self._samples_by_pv[pv] = existing
 
-                self._table_rows_unfiltered = self._build_table_rows(
-                    self._samples_by_pv, self._base_pv_order or self._pv_order)
-                self._rebuild_custom_pvs()          # recompute derived channels live
-                self._table_rows = self._apply_conditions_to_rows()
-                self._populate_table()
+                if refresh_due:
+                    rows = self._build_table_rows(
+                        self._samples_by_pv, self._base_pv_order or self._pv_order)
+                    rows = self._remove_master_only_rows(rows)
+                    rows = self._remove_fake_hour_boundary_rows(rows)
+                    self._table_rows_unfiltered = rows
+                    self._rebuild_custom_pvs()          # recompute derived channels live
+                    rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+                    self._table_rows = self._apply_conditions_to_rows(rows)
+                    self._populate_table()
                 total_pts = sum(len(v) for v in self._samples_by_pv.values())
                 self._lbl_status.setText(
                     f"Live +{added_count} pts  |  total {total_pts}")
@@ -3092,21 +3125,23 @@ class CSSLoggerWidget(QWidget):
                 self._log(f"Live polling (tick {self._live_tick_count}); "
                           f"last data {ns_to_local_str(last_ns)[:19] if last_ns else '—'}")
 
-            # Always refresh the graph each tick so the live window scrolls to
-            # "now" even when no new points arrived (otherwise it looks frozen).
+            # Refresh the graph on the same throttled cadence as the table so
+            # the live window keeps scrolling to "now" without redoing the
+            # (expensive, full-history) redraw every 300 ms tick.
             # If the graph has no lines yet or a PV just gained its first numeric
             # data, the existing artists can't represent it — do a full replot;
             # otherwise just mutate the existing artists (fast path).
-            numeric_now = {
-                pv for pv in self._pv_order
-                if self._pv_settings.get(pv, {}).get("show", True)
-                and any(isinstance(v, (int, float))
-                        for _, v, _ in self._samples_by_pv.get(pv, []))
-            }
-            if not self._graph_lines or not numeric_now.issubset(set(self._graph_pvs)):
-                self._plot_graph()
-            else:
-                self._update_graph_data()
+            if refresh_due:
+                numeric_now = {
+                    pv for pv in self._pv_order
+                    if self._pv_settings.get(pv, {}).get("show", True)
+                    and any(isinstance(v, (int, float))
+                            for _, v, _ in self._samples_by_pv.get(pv, []))
+                }
+                if not self._graph_lines or not numeric_now.issubset(set(self._graph_pvs)):
+                    self._plot_graph()
+                else:
+                    self._update_graph_data()
         except Exception:
             # A failed incremental update must NOT kill the live loop or crash
             # the Qt timer callback — log and keep polling.
@@ -3141,10 +3176,20 @@ class CSSLoggerWidget(QWidget):
             rows = self._table_rows_unfiltered
         if not self._conditions:
             return list(rows)
-        return [
+        filtered = [
             (ts, row_dict) for ts, row_dict in rows
             if self._row_matches_conditions(row_dict)
         ]
+        if not filtered and rows:
+            # Never let stale/misconfigured Conditions blank a table that
+            # otherwise has data — fall back to showing everything (matches
+            # what the graph shows) instead of silently rendering "No rows".
+            pv_list = ", ".join(c.get("pv", "?") for c in self._conditions)
+            self._log(f"Conditions matched 0/{len(rows)} rows (active PVs: "
+                      f"{pv_list}) — showing all rows instead. Check the "
+                      "Conditions dialog if this is unexpected.")
+            return list(rows)
+        return filtered
 
     def _row_matches_conditions(self, row_dict):
         # Old cssl.py semantics: {pv, min, max}. A condition PV that is absent
@@ -3236,7 +3281,10 @@ class CSSLoggerWidget(QWidget):
         # If master PV has no data in the loaded set, skip filtering silently
         if not any(master_pv in row_dict for _, row_dict in rows):
             return rows
-        tolerance = max(1e-6, abs(multiple) * 1e-9)
+        # Tolerance scales with the multiple itself (0.5%) so a real-world
+        # master PV (encoder jitter, float rounding) can still land "on" a
+        # step — a fixed near-zero epsilon only ever matches a bit-exact value.
+        tolerance = max(1e-6, abs(multiple) * 5e-3)
         filtered = []
         for ts_ns, row_dict in rows:
             if master_pv not in row_dict:
@@ -3247,6 +3295,12 @@ class CSSLoggerWidget(QWidget):
             nearest = round(value / multiple) * multiple
             if abs(value - nearest) <= tolerance:
                 filtered.append((ts_ns, row_dict))
+        if not filtered:
+            # Never let this filter blank a table that otherwise has data —
+            # fall back to showing everything (matches what the graph shows).
+            self._log(f"Master-multiple filter matched 0/{len(rows)} rows "
+                      f"(master={master_pv}, multiple={multiple}) — showing all rows instead.")
+            return rows
         return filtered
 
     # ── Custom PVs ───────────────────────────────────────────────────────────
@@ -3367,6 +3421,7 @@ class CSSLoggerWidget(QWidget):
     # ── Table population ────────────────────────────────────────────────────
 
     def _populate_table(self):
+        self._table_display_offset = 0
         if not self._table_rows:
             self._table_widget.setRowCount(0)
             self._table_widget.setColumnCount(1)
@@ -3376,12 +3431,14 @@ class CSSLoggerWidget(QWidget):
 
         pvs = self._pv_order
         cols = ["Timestamp"] + [shorten_pv_name(p) for p in pvs]
+        shown_rows = self._table_rows[-_MAX_TABLE_ROWS:]
+        self._table_display_offset = len(self._table_rows) - len(shown_rows)
         self._table_widget.setUpdatesEnabled(False)
         self._table_widget.setColumnCount(len(cols))
         self._table_widget.setHorizontalHeaderLabels(cols)
-        self._table_widget.setRowCount(len(self._table_rows))
+        self._table_widget.setRowCount(len(shown_rows))
 
-        for row_i, (ts, row_dict) in enumerate(self._table_rows):
+        for row_i, (ts, row_dict) in enumerate(shown_rows):
             ts_item = QTableWidgetItem(ns_to_local_str(ts))
             ts_item.setFlags(ts_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self._table_widget.setItem(row_i, 0, ts_item)
@@ -3397,8 +3454,13 @@ class CSSLoggerWidget(QWidget):
                 self._table_widget.setItem(row_i, col_j, item)
 
         self._table_widget.setUpdatesEnabled(True)
-        self._lbl_table_info.setText(
-            f"{len(self._table_rows)} rows  ({len(pvs)} PVs)")
+        if len(shown_rows) < len(self._table_rows):
+            self._lbl_table_info.setText(
+                f"Showing last {len(shown_rows)} of {len(self._table_rows)} rows  "
+                f"({len(pvs)} PVs)  |  Export CSV still uses all rows.")
+        else:
+            self._lbl_table_info.setText(
+                f"{len(self._table_rows)} rows  ({len(pvs)} PVs)")
 
     def _format_value(self, val):
         if val is None: return ""
@@ -3434,6 +3496,7 @@ class CSSLoggerWidget(QWidget):
         self._try_open_image_at_row(row)
 
     def _try_open_image_at_row(self, row):
+        row += getattr(self, "_table_display_offset", 0)
         if row < 0 or row >= len(self._table_rows): return
         ts, row_dict = self._table_rows[row]
         for pv, (val, _) in row_dict.items():
@@ -3956,7 +4019,8 @@ class CSSLoggerWidget(QWidget):
         dlg = _ConditionsDialog(self._conditions, pvs, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._conditions = dlg.result_conditions
-            self._apply_conditions_to_rows()
+            rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
+            self._table_rows = self._apply_conditions_to_rows(rows)
             self._populate_table()
 
     # ── Reference lines dialog ───────────────────────────────────────────────

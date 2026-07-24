@@ -16,8 +16,10 @@ This folder ("Git Work") shows up under the "Personal" tab in the Launcher.
 import html
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QRunnable, QThreadPool, QObject, Signal
@@ -641,6 +643,10 @@ class App(QWidget):
         mrow = QHBoxLayout()
         self.msg_edit = QLineEdit()
         self.msg_edit.setPlaceholderText("What did you change?")
+        # Start every day's message with the date, the team's convention
+        # (e.g. "15072026 konec dne"). A bare date still counts as "no
+        # message" — see _commit_message.
+        self.msg_edit.setText(self._today_prefix() + " ")
         mrow.addWidget(self.msg_edit, 1)
         self.msg_expand_btn = QPushButton("▼ More")
         self.msg_expand_btn.setFixedWidth(70)
@@ -918,16 +924,25 @@ class App(QWidget):
             self.msg_edit.show()
             self.msg_expand_btn.setText("▼ More")
 
+    @staticmethod
+    def _today_prefix() -> str:
+        return datetime.now().strftime("%d%m%Y")
+
     def _commit_message(self) -> str:
         # The big box wins while it has a multi-line message whose first line
         # still matches the collapsed one-liner (user just collapsed the view).
         multi = self.msg_multi.toPlainText().strip()
         line = self.msg_edit.text().strip()
         if not self.msg_multi.isHidden():
-            return multi
-        if multi and "\n" in multi and multi.splitlines()[0].strip() == line:
-            return multi
-        return line
+            msg = multi
+        elif multi and "\n" in multi and multi.splitlines()[0].strip() == line:
+            msg = multi
+        else:
+            msg = line
+        # An untouched date prefill alone (today's or a stale one from before
+        # midnight) is not a message: keep the "empty = just push what is
+        # already committed" behavior.
+        return "" if re.fullmatch(r"\d{8}", msg) else msg
 
     def _on_switch(self):
         target = self._selected_branch()
@@ -1102,8 +1117,18 @@ class App(QWidget):
         self._worker = worker
         self.pool.start(worker)
 
+    def _reset_commit_message(self):
+        """Fresh date prefill after a successful action (also rolls the date
+        over midnight). A failed job keeps the message for the retry."""
+        self.msg_multi.clear()
+        self.msg_edit.setText(self._today_prefix() + " ")
+        if not self.msg_multi.isHidden():
+            self.msg_multi.setPlainText(self._today_prefix() + " ")
+
     def _on_job_done(self, ok):
         self._append("--- done ---" if ok else "--- stopped ---", "ok" if ok else "err")
+        if ok:
+            self._reset_commit_message()
         self.busy = False
         self._set_ui_enabled(True)
         self._worker = None

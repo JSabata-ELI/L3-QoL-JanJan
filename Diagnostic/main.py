@@ -6,10 +6,13 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QPlainTextEdit, QProxyStyle, QStyle,
 )
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 
-from operation_history_logic import OperationHistoryLogic
-from monitor_tab import MonitorWidget
+# NOTE: pandas (via operation_history_logic) and matplotlib (via monitor_tab)
+# are the heavy part of startup — on a cold OS file cache their import can take
+# tens of seconds. They are imported lazily (operation_history_logic inside
+# HistoryTab._run; monitor_tab inside main() after the splash is shown) so the
+# window/splash paints before that cost is paid instead of after.
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -213,6 +216,10 @@ class HistoryTab(QWidget):
         self._btn_run.setEnabled(False)
         self._btn_stop.setEnabled(True)
 
+        # Imported here, not at module load: this pulls in pandas, which is a
+        # large chunk of the cold-start import cost and is only needed once the
+        # user actually runs an analysis.
+        from operation_history_logic import OperationHistoryLogic
         history = OperationHistoryLogic(APP_DIR)
 
         def work():
@@ -245,11 +252,19 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Diagnostika")
-        self.resize(1400, 900)
+        # Fallback size for when the window is un-maximized; on launch the
+        # window opens maximized (see main()). Wide enough that the PV table
+        # shows all columns without a horizontal scrollbar.
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1720, screen.width() - 40),
+                    min(950, screen.height() - 60))
 
         tabs = QTabWidget()
         tabs.setTabPosition(QTabWidget.North)
 
+        # Lazy import: constructing the monitor tab pulls in matplotlib. Done
+        # here so main() can show the splash first (see main()).
+        from monitor_tab import MonitorWidget
         self._monitor_tab = MonitorWidget()
         tabs.addTab(self._monitor_tab, "PV Monitor")
         tabs.addTab(HistoryTab(), "History")
@@ -276,8 +291,25 @@ def main():
     app.setStyle(ToolTipDelayStyle("Fusion"))
     app.setStyleSheet(APP_STYLESHEET)
 
+    # Cold-start feedback: building MainWindow imports matplotlib (and touches
+    # a large compiled dependency tree that Windows may re-scan on a cold file
+    # cache), which can take tens of seconds. Paint a splash first and force it
+    # on screen with processEvents() so the user isn't staring at nothing while
+    # that happens — only PySide6 is loaded at this point, so the splash is
+    # near-instant.
+    splash = QLabel("Loading Diagnostics…")
+    splash.setAlignment(Qt.AlignCenter)
+    splash.setWindowFlags(Qt.SplashScreen | Qt.WindowStaysOnTopHint)
+    splash.setFixedSize(360, 120)
+    splash.setStyleSheet(
+        "background:#f3f3f3; color:#1565C0; font-size:16px; font-weight:600; "
+        "border:1px solid #ccc;")
+    splash.show()
+    app.processEvents()
+
     window = MainWindow()
-    window.show()
+    window.showMaximized()
+    splash.close()
     sys.exit(app.exec())
 
 

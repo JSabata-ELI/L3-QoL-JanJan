@@ -2747,11 +2747,11 @@ class PointingPanel(QWidget):
             mask &= (self._ts_int <= self._replay_ts)
         cx_urad = self._cx[mask]
         cy_urad = self._cy[mask]
+        # n_shots may be 0 (e.g. replay before the first visible point) — still
+        # draw the empty axes so the graph frame is present from the start.
         n_shots = len(cx_urad)
-        if n_shots == 0:
-            return
-        x_std = float(np.std(cx_urad))
-        y_std = float(np.std(cy_urad))
+        x_std = float(np.std(cx_urad)) if n_shots else 0.0
+        y_std = float(np.std(cy_urad)) if n_shots else 0.0
         ts_masked = self._ts[mask] if self._ts is not None else None
 
         if self._show_path and ts_masked is not None:
@@ -2771,7 +2771,8 @@ class PointingPanel(QWidget):
             ax_histy = fig.add_axes([0.81, 0.10, 0.16, 0.60], sharey=ax_main)
             ax_path  = None
 
-        n_deleted = int((~mask).sum())
+        # Count only truly deleted points, not those hidden by the replay filter.
+        n_deleted = int((~self._mask).sum()) if self._mask is not None else 0
         deleted_note = f"  [{n_deleted} deleted]" if n_deleted else ""
 
         # ── Scatter ──────────────────────────────────────────────
@@ -2809,7 +2810,7 @@ class PointingPanel(QWidget):
             fontsize=8, pad=3)
 
         # ── Path ─────────────────────────────────────────────────
-        if ax_path is not None and ts_masked is not None:
+        if ax_path is not None and ts_masked is not None and n_shots > 0:
             from matplotlib.collections import LineCollection
             ts = ts_masked.astype(np.float64)
             t_norm = (ts - ts.min()) / max(float(ts.max() - ts.min()), 1.0)
@@ -12249,6 +12250,9 @@ class Viewer(QWidget):
             return
         # Start from index 0 in the pointing results
         self._pointing_replay_idx = 0
+        # Show the empty graph frame immediately — points then appear one by
+        # one as the replay steps through them.
+        panel.set_replay_ts(int(panel._ts_int[0]) - 1)
         if not hasattr(self, '_pointing_replay_timer'):
             self._pointing_replay_timer = QTimer(self)
             self._pointing_replay_timer.timeout.connect(self._pointing_replay_step)
@@ -12269,6 +12273,11 @@ class Viewer(QWidget):
             return
         idx = getattr(self, '_pointing_replay_idx', 0)
         n = len(panel._ts_int)
+        # Skip points deleted from the analysis — replay only frames that
+        # actually contributed a point to the graph.
+        if panel._mask is not None:
+            while idx < n and not bool(panel._mask[idx]):
+                idx += 1
         if idx >= n:
             # Replay finished — stop and reset button
             self._pointing_replay_timer.stop()

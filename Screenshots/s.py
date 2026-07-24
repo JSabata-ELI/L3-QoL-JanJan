@@ -532,6 +532,21 @@ IDENTIFY_MS = 2000
 MODE_TOKENS = {"NF", "FF", "DF"}
 TS_IN_NAME_RE = re.compile(r"_(\d{12,})\.(png|jpg|jpeg|tif|tiff|bmp)$", re.IGNORECASE)
 
+# Matches the "YYYY-MM-DD__HH-MM-SS" timestamp produced by TS_FMT / RUN_FOLDER_FMT,
+# wherever it lands in a saved filename (prefix, middle, or suffix).
+_TIMESTAMP_IN_FILENAME_RE = re.compile(r"\d{4}-\d{2}-\d{2}__\d{2}-\d{2}-\d{2}")
+
+
+def display_name_without_timestamp(name: str) -> str:
+    """Strip the run/file timestamp out of a filename for UI display only.
+    The timestamp always stays in the actual saved file — this only affects
+    what the preview grid caption shows."""
+    stripped = _TIMESTAMP_IN_FILENAME_RE.sub("", name)
+    stripped = re.sub(r"_{2,}", "_", stripped)   # collapse separators left behind
+    stripped = re.sub(r"_+\.", ".", stripped)     # "_.png" -> ".png"
+    stripped = stripped.strip("_")
+    return stripped or name
+
 
 @contextmanager
 def timed(log, label: str):
@@ -731,6 +746,10 @@ user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
 user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
@@ -793,27 +812,72 @@ def _get_window_text(hwnd: int) -> str:
 def _norm_win_title(s: str) -> str:
     return _NORM_ALNUM_RE.sub("", (s or "").lower())
 
-def find_window_by_title_substring(substr: str) -> int | None:
+def _get_window_class(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value or ""
+
+# Window classes that belong to everyday desktop apps, never to the CSS camera
+# viewer — a title match against one of these is almost always a false positive
+# (e.g. a browser tab or Explorer window whose title happens to mention a
+# camera name because a previously saved screenshot file was opened/browsed).
+_EXCLUDED_WINDOW_CLASSES = {
+    "chrome_widgetwin_1",       # Edge / Chrome / most Electron apps
+    "cabinetwclass",            # File Explorer
+    "notepad",
+    "applicationframewindow",   # UWP apps (Settings, Photos, ...)
+    "windows.ui.core.corewindow",
+    "framework::cframe",        # Office (Word/Excel/OneNote)
+    "rctrl_renwnd32",           # Outlook
+    "tktoplevel",               # our own tkinter tools
+    "tk",
+}
+
+def find_window_by_title_substring(substr: str, log=None) -> int | None:
     if not substr:
         return None
     needle = _norm_win_title(substr)
     if not needle:
         return None
-    found: list[int] = []
+
+    exact_matches: list[tuple[int, str]] = []
+    loose_matches: list[tuple[int, str]] = []
 
     def _cb(hwnd, lparam):
         if not user32.IsWindowVisible(hwnd):
             return 1
+        if user32.IsIconic(hwnd):
+            return 1  # minimized — not usable as a capture target, and often a stale leftover
         title = _get_window_text(hwnd)
         if not title:
             return 1
-        if needle in _norm_win_title(title):
-            found.append(int(hwnd) & 0xFFFFFFFFFFFFFFFF)
-            return 0  # stop enum
+        norm_title = _norm_win_title(title)
+        if norm_title == needle:
+            exact_matches.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title))
+            return 1  # keep scanning in case of duplicates; exact match always wins anyway
+        if needle in norm_title:
+            cls = _get_window_class(hwnd).lower()
+            if cls in _EXCLUDED_WINDOW_CLASSES:
+                if log:
+                    log(f"[WIN] ignored '{title}' (class={cls}) — not a camera window")
+                return 1
+            loose_matches.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title))
         return 1
 
     user32.EnumWindows(EnumWindowsProc(_cb), 0)
-    return found[0] if found else None
+
+    if exact_matches:
+        return exact_matches[0][0]
+    if loose_matches:
+        # A real CSS window's title is (almost) exactly the needle. A title that
+        # merely *contains* the needle (e.g. a saved screenshot filename opened in
+        # another app) is longer — so the shortest candidate is the safest bet.
+        loose_matches.sort(key=lambda hw: len(hw[1]))
+        if log and len(loose_matches) > 1:
+            log(f"[WIN] multiple candidates for '{substr}': "
+                f"{[t for _, t in loose_matches]} -> picked '{loose_matches[0][1]}'")
+        return loose_matches[0][0]
+    return None
 
 def _get_window_bounds(hwnd: int) -> tuple[int, int, int, int]:
     h = ctypes.c_void_p(int(hwnd) & 0xFFFFFFFFFFFFFFFF)
@@ -2065,11 +2129,13 @@ class PreviewWindow(tk.Toplevel):
             lbl.bind("<Leave>", lambda e, p=path: self._on_hover_leave(e))
             lbl.bind("<Button-1>", lambda e, p=path: self._on_click(p))
 
-            name = path.name
+            name = display_name_without_timestamp(path.name)
             if len(name) > 22:
                 name = name[:10] + "…" + name[-10:]
-            ttk.Label(cell, text=name, font=("Segoe UI", 7),
-                      foreground="gray").pack()
+            name_lbl = ttk.Label(cell, text=name, font=("Segoe UI", 7),
+                                  foreground="gray")
+            name_lbl.pack()
+            ToolTip(name_lbl, lambda p=path: p.name)  # full filename incl. timestamp on hover
 
     # ── large preview popup ───────────────────────────────────────
     def _show_popup(self, path: Path):
@@ -4182,7 +4248,7 @@ class App(tk.Tk):
                             hwnd = None
                             needles = self.build_window_needles(cam)
                             for needle in needles:
-                                hwnd = find_window_by_title_substring(needle)
+                                hwnd = find_window_by_title_substring(needle, log=self.log)
                                 if hwnd:
                                     self.log(f"[WIN] matched by: '{needle}'")
                                     break

@@ -21,6 +21,7 @@ import copy
 import json
 import re
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -38,13 +39,14 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit,
     QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSpinBox,
-    QSplitter, QTableView, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSplitter, QTableView, QTableWidget, QTableWidgetItem, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import cpva_api as api
 from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
-    NotificationHub, Thresholds, describe_reason,
+    NotificationHub, Thresholds, Trend, classify_trend, describe_reason,
 )
 from secrets_util import encrypt_secret
 
@@ -207,14 +209,34 @@ CONFIG_FILE = api.APP_DIR / "monitor_config.json"
 DEFAULT_SETTINGS = {
     # monitoring
     "poll_interval_s": 30,
+    # Max PVs fetched concurrently per poll. The archiver call is I/O-bound
+    # HTTP, so a pass's wall-clock is ~ceil(N / this) * per-request time; too
+    # low a value makes a pass with many PVs overrun the interval, which skips
+    # ticks and makes the table lag (see _PollWorker / _start_poll).
+    "poll_max_workers": 24,
     "avg_last_n": 25,
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
     "renotify_cooldown_minutes": 30,
     "recovery_notify": True,
     "debounce_count": 2,
-    "hysteresis_frac": 0.05,
+    "settle_minutes": 5.0,
+    "stable_seconds": 120,
+    # Trend-adaptive reminders: for an already-alarming PV, speed up / slow down
+    # the re-notify reminders based on its recent value trend (worsening ->
+    # faster, self-correcting -> slower). Only touches the reminder rhythm, not
+    # the alert state machine.
+    "trend_adaptive_enabled": True,
+    "trend_lookback_minutes": 10.0,
+    "trend_flat_frac": 0.02,        # < this relative change (old->new) = "flat"
+    "trend_speedup_factor": 2.0,    # worsening: reminder cooldown / this
+    "trend_slowdown_factor": 2.0,   # improving: reminder cooldown * this
     "history_minutes": 720,
+    # Data watchdog: alerts once when every monitored PV fails to fetch data
+    # for this many consecutive polls (a network/archiver outage, not a
+    # single PV's own no-data), and once more when data flow resumes.
+    "data_watchdog_enabled": True,
+    "data_watchdog_fail_polls": 2,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
@@ -248,7 +270,7 @@ DEFAULT_SETTINGS = {
     "webex_rooms": [],      # [{"name":..., "room_id":..., "enabled":..., "listen":...}, ...]
     # webex two-way commands (bot mode only)
     "webex_commands_enabled": True,
-    "webex_command_poll_s": 1,
+    "webex_command_poll_s": 5,   # <5 s tends to trip Webex HTTP 429 rate limits
     "webex_command_allowlist": [],   # sender emails allowed; empty = anyone in room
 }
 
@@ -309,7 +331,10 @@ class PVConfig:
     display_name: str = ""
     units: str = ""
     group: str = ""
+    subgroup: str = ""
     enabled: bool = False
+    # Whether the PV is drawn in the trend graph (the 'Show' column).
+    show_in_graph: bool = True
     # Default thresholds — used when no conditional profile below matches (the
     # ordinary single-profile case, and the fallback for the gated case).
     warn_low: Optional[float] = None
@@ -382,7 +407,9 @@ class PVConfig:
     def to_dict(self) -> dict:
         return {
             "name": self.name, "display_name": self.display_name,
-            "units": self.units, "group": self.group, "enabled": self.enabled,
+            "units": self.units, "group": self.group,
+            "subgroup": self.subgroup, "enabled": self.enabled,
+            "show_in_graph": self.show_in_graph,
             "warn_low": self.warn_low, "warn_high": self.warn_high,
             "alarm_low": self.alarm_low, "alarm_high": self.alarm_high,
             "gate_pvs": list(self.gate_pvs),
@@ -397,7 +424,9 @@ class PVConfig:
         return cls(
             name=d["name"], display_name=d.get("display_name", ""),
             units=d.get("units", ""), group=d.get("group", ""),
+            subgroup=d.get("subgroup", ""),
             enabled=bool(d.get("enabled", False)),
+            show_in_graph=bool(d.get("show_in_graph", True)),
             warn_low=d.get("warn_low"), warn_high=d.get("warn_high"),
             alarm_low=d.get("alarm_low"), alarm_high=d.get("alarm_high"),
             gate_pvs=gate_pvs, profiles=profiles,
@@ -436,11 +465,15 @@ class PVRuntime:
     last_error: str = ""
     rejected_count: int = 0
     bad_data: bool = False   # last poll returned samples but all out of range
+    # Most recent raw reading regardless of range, kept so the Value column
+    # can still show what the PV reports while it's out of [min, max] and
+    # current_value is None (bad data). Not used for alerting/history.
+    raw_value: Optional[float] = None
     # Conditional profile in force at the last poll (None = default thresholds).
     active_profile: Optional[dict] = None
     # Which threshold set the user pinned in the 'Depends on' dropdown:
-    # None = Auto (follow the first matching rule), -1 = Default forced,
-    # i >= 0 = pin profiles[i] (in force only while its conditions hold).
+    # None = Automatic (follow the first matching rule), -1 = Global forced,
+    # i >= 0 = pin profiles[i] (its limits apply unconditionally).
     dep_view: Optional[int] = None
     # Delivery state of the current non-OK episode's alert, for the "Alarm status"
     # column: "" (nothing to send / OK), "sending", "sent", "failed".
@@ -463,12 +496,16 @@ def _out_of_range(v: float, vmin, vmax) -> bool:
 
 
 def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
-    """Return (avg_or_None, units, last_ts_ns, n_rejected) from raw CPVA samples.
+    """Return (avg_or_None, units, last_ts_ns, n_rejected, last_raw) from raw
+    CPVA samples.
 
-    Readings outside [vmin, vmax] are treated as sensor errors and dropped;
-    n_rejected counts how many were discarded this pass.
+    Readings outside [vmin, vmax] are treated as sensor errors and dropped
+    from the average used for alerting/history; n_rejected counts how many
+    were discarded this pass. last_raw is the most recent decoded reading
+    regardless of range, for display purposes only.
     """
     vals, units, last_ts, rejected = [], "", 0, 0
+    last_raw, last_raw_ts = None, -1
     for s in samples:
         v = api.cpva_decode_value(s)
         if isinstance(v, bool):
@@ -480,6 +517,8 @@ def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
                 units = u
             t = s.get("time")
             ts = int(t) if isinstance(t, (int, float)) else 0
+            if ts >= last_raw_ts:
+                last_raw, last_raw_ts = fv, ts
             if _out_of_range(fv, vmin, vmax):
                 rejected += 1
                 if ts:
@@ -489,9 +528,9 @@ def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
             if ts:
                 last_ts = max(last_ts, ts)
     if not vals:
-        return None, units, last_ts, rejected
+        return None, units, last_ts, rejected, last_raw
     recent = vals[-max(1, avg_n):]
-    return sum(recent) / len(recent), units, last_ts, rejected
+    return sum(recent) / len(recent), units, last_ts, rejected, last_raw
 
 
 def _safe_emit(sig_fn, value):
@@ -502,7 +541,7 @@ def _safe_emit(sig_fn, value):
 
 
 class _PollSignals(QObject):
-    done = Signal(object)   # {name: (val_or_None, units, last_ts_ns, err, n_rejected)}
+    done = Signal(object)   # {name: (val_or_None, units, last_ts_ns, err, n_rejected, raw_val)}
     log = Signal(str)
 
 
@@ -521,21 +560,98 @@ class _PollWorker(QRunnable):
         timeout = float(self._s["http_timeout_s"])
         end = api.now_ns()
         start = end - window_ns
-        out = {}
-        for name in self._names:
+
+        def fetch_one(name):
             lo, hi = self._ranges.get(name, (None, None))
             try:
                 samples = api.cpva_fetch_samples(name, start, end, timeout)
-                val, units, last_ts, rejected = _avg_recent_numeric(
+                val, units, last_ts, rejected, raw_val = _avg_recent_numeric(
                     samples, avg_n, lo, hi)
                 if rejected:
                     err = (f"dropped {rejected} out-of-range reading(s) "
                            f"[{_fmt(lo)}..{_fmt(hi)}]")
                 else:
                     err = ""
-                out[name] = (val, units, last_ts or end, err, rejected)
+                return (val, units, last_ts or end, err, rejected, raw_val)
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
-                out[name] = (None, "", end, str(e), 0)
+                return (None, "", end, str(e), 0, None)
+
+        # Archiver responses can take seconds each; fetching sequentially made
+        # a full pass slower than the poll interval, so results were always
+        # stale. Fetch PVs concurrently instead (same pattern as
+        # cpva_fetch_samples_chunked). Concurrency is user-tunable
+        # (poll_max_workers) because the ceiling that keeps a pass under the
+        # poll interval scales with the number of monitored PVs.
+        workers = int(self._s.get("poll_max_workers", 24))
+        out = {}
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(self._names)))) as ex:
+            futures = {ex.submit(fetch_one, n): n for n in self._names}
+            for fut in as_completed(futures):
+                out[futures[fut]] = fut.result()
+        _safe_emit(self._sig.done.emit, out)
+
+
+class _BackfillSignals(QObject):
+    done = Signal(object)   # {name: [(ts_ns, value), ...] sorted by time}
+    log = Signal(str)
+
+
+class _BackfillWorker(QRunnable):
+    """Fetch archive samples covering the graph window so the plot starts
+    pre-filled with recent history instead of only data polled from now on."""
+
+    def __init__(self, sig: _BackfillSignals, names: list[str],
+                 start_ns: int, end_ns: int, timeout: float,
+                 ranges: dict, max_points: int):
+        super().__init__()
+        self._sig = sig
+        self._names = names
+        self._start = start_ns
+        self._end = end_ns
+        self._timeout = timeout
+        self._ranges = ranges
+        self._max_points = max(10, max_points)
+
+    def run(self):
+        def fetch_one(name):
+            try:
+                return name, api.cpva_fetch_samples_chunked(
+                    name, self._start, self._end, self._timeout,
+                    max_workers=4)
+            except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
+                _safe_emit(self._sig.log.emit,
+                           f"History backfill failed for "
+                           f"{api.shorten_pv_name(name)}: {e}")
+                return name, None
+
+        # Sequential single-shot fetches over the full (multi-hour) history
+        # window made launch's backfill take minutes with several PVs -- the
+        # archiver is only reliable for <=1h windows, so a wide window was
+        # both slow and dubious. Same fix as _PollWorker: fetch PVs
+        # concurrently, each internally chunked into <=1h windows.
+        out = {}
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(self._names)))) as ex:
+            futures = {ex.submit(fetch_one, n): n for n in self._names}
+            for fut in as_completed(futures):
+                name, samples = fut.result()
+                if samples is None:
+                    continue
+                lo, hi = self._ranges.get(name, (None, None))
+                pts = []
+                for s in samples:
+                    v = api.cpva_decode_value(s)
+                    if isinstance(v, bool) or not isinstance(v, (int, float)):
+                        continue
+                    t = s.get("time")
+                    ts = int(t) if isinstance(t, (int, float)) else 0
+                    if not ts or _out_of_range(float(v), lo, hi):
+                        continue
+                    pts.append((ts, float(v)))
+                pts.sort()
+                if len(pts) > self._max_points:  # thin evenly to fit the history
+                    step = len(pts) / self._max_points
+                    pts = [pts[int(i * step)] for i in range(self._max_points)]
+                out[name] = pts
         _safe_emit(self._sig.done.emit, out)
 
 
@@ -684,21 +800,33 @@ def _apply_result_to_pv(pv: "PVConfig", r: dict) -> None:
 # Table model
 # ---------------------------------------------------------------------------
 
-COLS = ["On", "Display name", "PV name", "Value", "Units", "State",
+COLS = ["On", "Show", "Display name", "PV name", "Value", "Units", "State",
         "Alarm status", "Depends on", "Alarm ≤", "Warn ≤", "Warn ≥",
         "Alarm ≥", "Updated"]
 
-# Threshold columns (double-click opens the limits popup); kept as one place so
-# data(), flags() and the double-click handler stay in sync.
-THR_COLS = (8, 9, 10, 11)
+# Column indices, kept as one place so data(), flags(), the view and the
+# double-click handler stay in sync.
+(COL_ON, COL_SHOW, COL_NAME, COL_PV, COL_VALUE, COL_UNITS, COL_STATE,
+ COL_ALARM_STATUS, DEP_COL) = range(9)
+COL_UPDATED = 13
 
-# "Depends on" column — hosts the per-row rule dropdown for gated PVs.
-DEP_COL = 7
+# Threshold columns (double-click opens the limits popup).
+THR_COLS = (9, 10, 11, 12)
 
 PV_MIME = "application/x-pv-monitor-row"
 GROUP_HEADER_BG = QColor("#d7e3f4")
+SUBGROUP_HEADER_BG = QColor("#e9f0fa")
 GROUP_HEADER_FG = QColor("#0D47A1")
 UNGROUPED_LABEL = "Ungrouped"
+
+# 'Show in graph' column: layer-panel style eye instead of a checkbox.
+# Visible = open dark eye, hidden = closed eyelid (kept dark enough to stay
+# legible on coloured rows), mixed (on group/subgroup rows) = mid-grey eye.
+EYE_GLYPH = "\U0001F441"       # 👁 open eye
+EYE_OFF_GLYPH = "◡"       # ◡ closed eyelid
+EYE_ON_FG = QColor("#1c1c1c")
+EYE_MIXED_FG = QColor("#8fa3bd")
+EYE_OFF_FG = QColor("#4a5560")
 
 
 def _fmt(x) -> str:
@@ -741,6 +869,11 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
         return ""
     if rt.alert.level == AlertLevel.OK:
         return ""
+    if rt.alert.settle_until_ns:
+        return "settling → " + api.ns_to_prague(
+            rt.alert.settle_until_ns).strftime("%H:%M")
+    if rt.alert.hold_since_ns:
+        return "stabilising…"
     if rt.notify_status == "failed":
         return "⚠ not sent"
     if rt.notify_status == "sending":
@@ -757,6 +890,15 @@ def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     if rt.alert.level == AlertLevel.OK:
         return "No active alert."
     lines = [f"State: {rt.alert.level.label}"]
+    if rt.alert.settle_until_ns:
+        lines.append("Settle window open — alert held until " + api.ns_to_prague(
+            rt.alert.settle_until_ns).strftime("%H:%M:%S")
+            + " to let the value stabilise.")
+    if rt.alert.hold_since_ns:
+        lines.append("Stability hold — the alert is held until the level has "
+                     "stayed unchanged long enough (level last changed at "
+                     + api.ns_to_prague(rt.alert.hold_since_ns).strftime("%H:%M:%S")
+                     + ").")
     if rt.alert.first_notified_ns:
         lines.append("First alert sent: " + api.ns_to_prague(
             rt.alert.first_notified_ns).strftime("%Y-%m-%d %H:%M:%S"))
@@ -774,12 +916,13 @@ def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
 
 
 class PVTableModel(QAbstractTableModel):
-    """Flat PV list rendered with per-group header rows.
+    """Flat PV list rendered with per-group (and per-subgroup) header rows.
 
     ``self.pvs`` is the single source of truth (kept group-contiguous by the
-    widget). ``self._display`` is the derived view: a list of ("header", group)
-    and ("pv", PVConfig) entries. Header rows appear only when at least one PV
-    has a non-empty group, so an ungrouped setup looks exactly as before.
+    widget). ``self._display`` is the derived view: a list of ("header", group),
+    ("subheader", (group, subgroup)) and ("pv", PVConfig) entries. Header rows
+    appear only when at least one PV has a non-empty group, so an ungrouped
+    setup looks exactly as before.
     """
 
     def __init__(self, pvs: list[PVConfig], runtime: dict[str, PVRuntime], parent=None):
@@ -787,18 +930,42 @@ class PVTableModel(QAbstractTableModel):
         self.pvs = pvs
         self.runtime = runtime
         self._display: list[tuple] = []
+        # Collapsed rows: ("g", group) hides a group's contents, ("s", (group,
+        # subgroup)) hides one subgroup's PVs. In-memory only (not persisted).
+        self.collapsed: set = set()
         self._rebuild()
 
     def _rebuild(self):
-        show_headers = any(p.group for p in self.pvs)
+        show_headers = any(p.group or p.subgroup for p in self.pvs)
         disp: list[tuple] = []
-        last = object()   # sentinel so the first PV always opens a header
+        last_g = object()   # sentinel so the first PV always opens a header
+        last_s = object()
         for pv in self.pvs:
-            if show_headers and pv.group != last:
+            if show_headers and pv.group != last_g:
                 disp.append(("header", pv.group))
-                last = pv.group
+                last_g = pv.group
+                last_s = object()
+            g_folded = ("g", pv.group) in self.collapsed
+            if show_headers and pv.subgroup != last_s:
+                if pv.subgroup and not g_folded:
+                    disp.append(("subheader", (pv.group, pv.subgroup)))
+                last_s = pv.subgroup
+            if g_folded or (pv.subgroup and
+                            ("s", (pv.group, pv.subgroup)) in self.collapsed):
+                continue
             disp.append(("pv", pv))
         self._display = disp
+
+    @staticmethod
+    def _collapse_key(kind: str, ref):
+        return ("g", ref) if kind == "header" else ("s", ref)
+
+    def _header_pvs(self, kind: str, ref) -> list[PVConfig]:
+        """PVs covered by a header/subheader row."""
+        if kind == "header":
+            return [p for p in self.pvs if p.group == ref]
+        g, s = ref
+        return [p for p in self.pvs if p.group == g and p.subgroup == s]
 
     def reset(self):
         """Structural refresh: rebuild the display rows and repaint everything."""
@@ -828,11 +995,11 @@ class PVTableModel(QAbstractTableModel):
         if not index.isValid():
             return Qt.ItemIsDropEnabled
         kind, _ = self._display[index.row()]
-        if kind == "header":
+        if kind in ("header", "subheader"):
             return Qt.ItemIsEnabled | Qt.ItemIsDropEnabled
         base = (Qt.ItemIsEnabled | Qt.ItemIsSelectable
                 | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
-        if index.column() == 0:
+        if index.column() == COL_ON:
             base |= Qt.ItemIsUserCheckable
         return base
 
@@ -884,16 +1051,38 @@ class PVTableModel(QAbstractTableModel):
         kind, ref = self._display[index.row()]
         col = index.column()
 
-        if kind == "header":
-            if role == Qt.DisplayRole and col == 0:
-                return ref or UNGROUPED_LABEL
+        if kind in ("header", "subheader"):
+            if col == COL_SHOW:
+                shown = [p.show_in_graph for p in self._header_pvs(kind, ref)]
+                if role == Qt.DisplayRole:
+                    return EYE_GLYPH if any(shown) else EYE_OFF_GLYPH
+                if role == Qt.ForegroundRole:
+                    if all(shown):
+                        return EYE_ON_FG
+                    return EYE_MIXED_FG if any(shown) else EYE_OFF_FG
+                if role == Qt.TextAlignmentRole:
+                    return int(Qt.AlignCenter)
+                if role == Qt.ToolTipRole:
+                    what = "group" if kind == "header" else "subgroup"
+                    return (f"Click to show/hide every PV of this {what} "
+                            "in the graph.")
+            if role == Qt.DisplayRole and col == COL_NAME:
+                arrow = "▸" if self._collapse_key(kind, ref) in self.collapsed \
+                    else "▾"
+                if kind == "header":
+                    return f"{arrow} " + (ref or UNGROUPED_LABEL)
+                return f"      {arrow} {ref[1]}"
+            if role == Qt.ToolTipRole and col == COL_NAME:
+                return "Click to collapse/expand."
             if role == Qt.BackgroundRole:
-                return GROUP_HEADER_BG
+                return SUBGROUP_HEADER_BG if kind == "subheader" \
+                    else GROUP_HEADER_BG
             if role == Qt.ForegroundRole:
                 return GROUP_HEADER_FG
-            if role == Qt.FontRole:
+            if role == Qt.FontRole and col == COL_NAME:
                 f = QFont()
-                f.setBold(True)
+                f.setBold(kind == "header")
+                f.setItalic(kind == "subheader")
                 return f
             if role == Qt.TextAlignmentRole:
                 return int(Qt.AlignVCenter | Qt.AlignLeft)
@@ -902,11 +1091,20 @@ class PVTableModel(QAbstractTableModel):
         pv = ref
         rt = self.runtime.get(pv.name)
 
-        if role == Qt.CheckStateRole and col == 0:
+        if role == Qt.CheckStateRole and col == COL_ON:
             return Qt.Checked if pv.enabled else Qt.Unchecked
+        if col == COL_SHOW:
+            if role == Qt.DisplayRole:
+                return EYE_GLYPH if pv.show_in_graph else EYE_OFF_GLYPH
+            if role == Qt.ForegroundRole:
+                return EYE_ON_FG if pv.show_in_graph else EYE_OFF_FG
+            if role == Qt.TextAlignmentRole:
+                return int(Qt.AlignCenter)
 
         if role == Qt.ToolTipRole:
-            if col == 6:
+            if col == COL_SHOW:
+                return "Click to show/hide this PV in the graph."
+            if col == COL_ALARM_STATUS:
                 return _alarm_status_tooltip(pv, rt)
             tip = pv.name
             if pv.gate_pvs:
@@ -926,40 +1124,49 @@ class PVTableModel(QAbstractTableModel):
         level = rt.display_level() if rt else None
         bad = bool(rt and rt.bad_data and level is None and pv.enabled)
 
-        if role == Qt.BackgroundRole and col == 5:
+        if role == Qt.BackgroundRole and col == COL_STATE:
             if bad:
                 return QColor(BADDATA_COLOR)
             if level is None:
                 return QColor(NODATA_COLOR)
             return _STATE_BG[level]
-        if role == Qt.ForegroundRole and col == 5:
+        if role == Qt.ForegroundRole and col == COL_STATE:
             if level in (AlertLevel.WARNING, AlertLevel.ALARM) or level is None:
                 return QColor("white")
             return QColor(SUCCESS)
 
         # Alarm-status cell: paint red only when a send failed, so a lost alert
         # stands out; other states use plain text.
-        if col == 6 and rt is not None:
+        if col == COL_ALARM_STATUS and rt is not None:
             if role == Qt.BackgroundRole and rt.notify_status == "failed":
                 return QColor(ALARM_COLOR)
             if role == Qt.ForegroundRole and rt.notify_status == "failed":
                 return QColor("white")
 
-        if role == Qt.TextAlignmentRole and col in (3, 4, 5, 6, 8, 9, 10, 11):
+        if role == Qt.TextAlignmentRole and col in (
+                COL_VALUE, COL_UNITS, COL_STATE, COL_ALARM_STATUS) + THR_COLS:
             return int(Qt.AlignCenter)
 
         if role == Qt.DisplayRole:
-            if col == 0:
+            if col in (COL_ON, COL_SHOW):
                 return None
-            if col == 1:
+            if col == COL_NAME:
                 return pv.display_name
-            if col == 2:
+            if col == COL_PV:
                 return pv.name
-            if col == 3:
-                return _fmt(rt.current_value) if rt else "–"
-            if col == 4:
+            if col == COL_VALUE:
+                if not rt:
+                    return "–"
+                if rt.current_value is not None:
+                    return _fmt(rt.current_value)
+                # Bad data (all readings out of range): still show what the
+                # PV last reported, rather than blanking the cell.
+                if bad and rt.raw_value is not None:
+                    return _fmt(rt.raw_value)
+                return "–"
+            if col == COL_UNITS:
                 return (rt.current_units if rt and rt.current_units else pv.units) or ""
-            if col == 5:
+            if col == COL_STATE:
                 if not pv.enabled:
                     return "off"
                 if bad:
@@ -967,9 +1174,9 @@ class PVTableModel(QAbstractTableModel):
                 if level is None:
                     return "no data"
                 return level.label.lower()
-            if col == 6:
+            if col == COL_ALARM_STATUS:
                 return _alarm_status_text(pv, rt)
-            if col == 7:
+            if col == DEP_COL:
                 if pv.gate_pvs and pv.profiles:
                     return None      # cell is covered by the rule dropdown
                 return _cond_summary(pv)
@@ -979,32 +1186,64 @@ class PVTableModel(QAbstractTableModel):
             active = rt.active_profile if rt else None
             thr = pv.profile_thresholds(active) if active is not None \
                 else pv.thresholds()
-            if col == 8:
+            if col == THR_COLS[0]:
                 return _fmt(thr.alarm_low)
-            if col == 9:
+            if col == THR_COLS[1]:
                 return _fmt(thr.warn_low)
-            if col == 10:
+            if col == THR_COLS[2]:
                 return _fmt(thr.warn_high)
-            if col == 11:
+            if col == THR_COLS[3]:
                 return _fmt(thr.alarm_high)
-            if col == 12:
+            if col == COL_UPDATED:
                 if rt and rt.last_update_ns:
                     return api.ns_to_prague(rt.last_update_ns).strftime("%H:%M:%S")
                 return "–"
         return None
 
     def setData(self, index, value, role=Qt.EditRole):
-        if index.column() == 0 and role == Qt.CheckStateRole:
-            pv = self.pv_at_row(index.row())
-            if pv is None:
-                return False
-            pv.enabled = (Qt.CheckState(value) == Qt.Checked)
-            self.dataChanged.emit(index, index)
-            win = self.parent()
-            if isinstance(win, MonitorWidget):
-                win.persist()
-            return True
-        return False
+        if role != Qt.CheckStateRole or index.column() != COL_ON:
+            return False
+        pv = self.pv_at_row(index.row())
+        if pv is None:
+            return False
+        pv.enabled = (Qt.CheckState(value) == Qt.Checked)
+        self.dataChanged.emit(index, index)
+        win = self.parent()
+        if isinstance(win, MonitorWidget):
+            win.persist()
+        return True
+
+    def toggle_show(self, row: int):
+        """Flip the eye on a PV row; on a (sub)group row show everything unless
+        everything is already shown, then hide it all."""
+        if not (0 <= row < len(self._display)):
+            return
+        kind, ref = self._display[row]
+        if kind in ("header", "subheader"):
+            pvs = self._header_pvs(kind, ref)
+            if not pvs:
+                return
+            target = not all(p.show_in_graph for p in pvs)
+            for p in pvs:
+                p.show_in_graph = target
+        else:
+            ref.show_in_graph = not ref.show_in_graph
+        self.refresh_all()       # eyes on parent/child rows update too
+        win = self.parent()
+        if isinstance(win, MonitorWidget):
+            win.persist()
+            win.graph.redraw()
+
+    def toggle_collapse(self, row: int):
+        """Fold/unfold a group or subgroup header row."""
+        if not (0 <= row < len(self._display)):
+            return
+        kind, ref = self._display[row]
+        if kind not in ("header", "subheader"):
+            return
+        key = self._collapse_key(kind, ref)
+        self.collapsed.symmetric_difference_update({key})
+        self.reset()
 
     def refresh_all(self):
         if self._display:
@@ -1542,6 +1781,17 @@ class PVEditDialog(QDialog):
             self.group_combo.addItem(g)
         self.group_combo.setCurrentText(pv.group)
         form.addRow("Group", self.group_combo)
+        self.subgroup_combo = _NoWheelComboBox()
+        self.subgroup_combo.setEditable(True)
+        self.subgroup_combo.setToolTip(
+            "Optional second grouping level shown as an indented sub-header "
+            "inside the group (e.g. 'Chillers' under 'Temperatures'). "
+            "Leave blank for none.")
+        self.subgroup_combo.addItem("")
+        for s in sorted({p.subgroup for p in parent.pvs if p.subgroup}):
+            self.subgroup_combo.addItem(s)
+        self.subgroup_combo.setCurrentText(pv.subgroup)
+        form.addRow("Subgroup", self.subgroup_combo)
         self.enabled_chk = QCheckBox("Enable alerting for this PV")
         self.enabled_chk.setStyleSheet(_CHK_STYLE)
         self.enabled_chk.setToolTip(
@@ -1704,6 +1954,7 @@ class PVEditDialog(QDialog):
         pv.display_name = self.name_edit.text().strip() or pv.display_name
         pv.units = self.units_combo.currentText().strip()
         pv.group = self.group_combo.currentText().strip()
+        pv.subgroup = self.subgroup_combo.currentText().strip()
         pv.enabled = self.enabled_chk.isChecked()
         self.thr_editor.apply_to(pv)   # default limits + gate_pvs + profiles
         pv.valid_min = self.f_valid_min.value()
@@ -1712,6 +1963,212 @@ class PVEditDialog(QDialog):
             pv.learned_at = datetime.now(api.TZ_PRAGUE).isoformat(timespec="seconds")
             pv.learn_stats = self._pending_stats
         self.accept()
+
+
+class GroupsDialog(QDialog):
+    """Manage the group / subgroup structure in one place.
+
+    Tree: groups → subgroups → PVs. Double-click a group/subgroup to rename
+    it; drag PVs (or whole subgroups) where they belong; buttons add new
+    groups/subgroups. On Save the tree order becomes the table order and each
+    PV adopts the group/subgroup it sits under.
+    """
+
+    _UNGROUPED = "\x00ungrouped"   # marker in item data for the '(Ungrouped)' node
+
+    def __init__(self, parent: "MonitorWidget"):
+        super().__init__(parent)
+        self.setWindowTitle("Groups")
+        self.resize(480, 560)
+        lay = QVBoxLayout(self)
+        hint = QLabel("Drag PVs (or whole subgroups) to move them between "
+                      "groups. Double-click a group or subgroup to rename it. "
+                      "Deleting a group/subgroup keeps its PVs (they move up "
+                      "one level); empty groups disappear on Save. The "
+                      "(Ungrouped) node is automatic — it can't be renamed "
+                      "or deleted.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#555;")
+        lay.addWidget(hint)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setDragDropMode(QAbstractItemView.InternalMove)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.tree.setDefaultDropAction(Qt.MoveAction)
+        root = self.tree.invisibleRootItem()
+        root.setFlags(root.flags() & ~Qt.ItemIsDropEnabled)
+        lay.addWidget(self.tree, 1)
+
+        # Build: groups in first-appearance order; "" group last as (Ungrouped).
+        groups: list[str] = []
+        for pv in parent.pvs:
+            if pv.group not in groups:
+                groups.append(pv.group)
+        if "" in groups:                      # keep ungrouped at the bottom
+            groups.remove("")
+            groups.append("")
+        for g in groups:
+            g_item = self._make_group_item(g)
+            subs_seen: dict[str, QTreeWidgetItem] = {}
+            for pv in parent.pvs:
+                if pv.group != g:
+                    continue
+                host = g_item
+                if pv.subgroup:
+                    if pv.subgroup not in subs_seen:
+                        subs_seen[pv.subgroup] = self._make_subgroup_item(
+                            g_item, pv.subgroup)
+                    host = subs_seen[pv.subgroup]
+                self._make_pv_item(host, pv)
+        self.tree.expandAll()
+
+        btns = QHBoxLayout()
+        b_group = QPushButton("New group")
+        b_group.setStyleSheet(SECONDARY_STYLE)
+        b_group.clicked.connect(self._new_group)
+        b_sub = QPushButton("New subgroup")
+        b_sub.setStyleSheet(SECONDARY_STYLE)
+        b_sub.setToolTip("Adds a subgroup under the selected group.")
+        b_sub.clicked.connect(self._new_subgroup)
+        b_ren = QPushButton("Rename")
+        b_ren.setStyleSheet(SECONDARY_STYLE)
+        b_ren.setToolTip("Rename the selected group/subgroup "
+                         "(same as double-clicking it).")
+        b_ren.clicked.connect(self._rename)
+        b_del = QPushButton("Delete")
+        b_del.setStyleSheet(SECONDARY_STYLE)
+        b_del.setToolTip("Dissolve the selected group/subgroup — its PVs move "
+                         "up one level (group → Ungrouped, subgroup → its "
+                         "group).")
+        b_del.clicked.connect(self._delete)
+        btns.addWidget(b_group)
+        btns.addWidget(b_sub)
+        btns.addWidget(b_ren)
+        btns.addWidget(b_del)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Save).setStyleSheet(_BTN_SUCCESS)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    # --- item factories --------------------------------------------------
+    def _make_group_item(self, group: str) -> QTreeWidgetItem:
+        it = QTreeWidgetItem(self.tree)
+        f = QFont()
+        f.setBold(True)
+        it.setFont(0, f)
+        if group:
+            it.setText(0, group)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable
+                        | Qt.ItemIsDropEnabled | Qt.ItemIsEditable)
+        else:
+            it.setText(0, f"({UNGROUPED_LABEL})")
+            it.setData(0, Qt.UserRole, self._UNGROUPED)
+            it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsDropEnabled)
+        return it
+
+    def _make_subgroup_item(self, parent_item, name: str) -> QTreeWidgetItem:
+        it = QTreeWidgetItem(parent_item)
+        it.setText(0, name)
+        f = QFont()
+        f.setItalic(True)
+        it.setFont(0, f)
+        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+                    | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+        return it
+
+    def _make_pv_item(self, parent_item, pv: PVConfig) -> QTreeWidgetItem:
+        it = QTreeWidgetItem(parent_item)
+        it.setText(0, f"{pv.display_name}   ({pv.name})")
+        it.setData(0, Qt.UserRole, pv.name)
+        it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled)
+        return it
+
+    # --- buttons ----------------------------------------------------------
+    def _new_group(self):
+        it = self._make_group_item("New group")
+        self.tree.editItem(it, 0)
+
+    def _new_subgroup(self):
+        sel = self.tree.currentItem()
+        # Walk up to the top-level (group) ancestor of the selection.
+        while sel is not None and sel.parent() is not None:
+            sel = sel.parent()
+        if sel is None or sel.data(0, Qt.UserRole) == self._UNGROUPED:
+            QMessageBox.information(
+                self, "New subgroup",
+                "Select a group first (subgroups live inside a group).")
+            return
+        it = self._make_subgroup_item(sel, "New subgroup")
+        sel.setExpanded(True)
+        self.tree.editItem(it, 0)
+
+    def _rename(self):
+        it = self.tree.currentItem()
+        if it is None or not (it.flags() & Qt.ItemIsEditable):
+            QMessageBox.information(
+                self, "Rename",
+                "Select a group or subgroup to rename. PVs are renamed via "
+                "Edit in the main window; (Ungrouped) is automatic.")
+            return
+        self.tree.editItem(it, 0)
+
+    def _delete(self):
+        it = self.tree.currentItem()
+        if it is None or it.data(0, Qt.UserRole) is not None:
+            # a PV row or the (Ungrouped) node
+            QMessageBox.information(
+                self, "Delete",
+                "Select a group or subgroup to delete. Its PVs are kept — "
+                "they move up one level. (PVs themselves are removed via "
+                "Remove in the main window.)")
+            return
+        children = it.takeChildren()
+        parent = it.parent()
+        if parent is None:                    # group → contents go to (Ungrouped)
+            self._ungrouped_item().addChildren(children)
+            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(it))
+        else:                                 # subgroup → contents go to group
+            parent.addChildren(children)
+            parent.removeChild(it)
+
+    def _ungrouped_item(self) -> QTreeWidgetItem:
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            if root.child(i).data(0, Qt.UserRole) == self._UNGROUPED:
+                return root.child(i)
+        it = self._make_group_item("")        # (re)create it at the bottom
+        it.setExpanded(True)
+        return it
+
+    # --- result -----------------------------------------------------------
+    def result_assignments(self) -> list[tuple]:
+        """[(pv_name, group, subgroup)] in tree order after the user's edits."""
+        out: list[tuple] = []
+
+        def walk(item, group: str, subgroup: str):
+            name = item.data(0, Qt.UserRole)
+            if name is not None and name != self._UNGROUPED:
+                out.append((name, group, subgroup))
+                return
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if child.data(0, Qt.UserRole) is None:   # subgroup node
+                    walk(child, group, child.text(0).strip())
+                else:
+                    walk(child, group, subgroup)
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            top = root.child(i)
+            group = "" if top.data(0, Qt.UserRole) == self._UNGROUPED \
+                else top.text(0).strip()
+            walk(top, group, "")
+        return out
 
 
 class _LearnParamsDialog(QDialog):
@@ -2245,9 +2702,9 @@ class SettingsDialog(QDialog):
         self.webex_cmd_poll.setRange(1, 120)
         self.webex_cmd_poll.setToolTip(
             "How often (seconds) the bot checks the listen room for new "
-            "commands. Lower = snappier replies but more API calls. Range "
-            "1–120 s.")
-        self.webex_cmd_poll.setValue(int(s.get("webex_command_poll_s", 1)))
+            "commands. Lower = snappier replies but more API calls; below "
+            "~5 s Webex starts rejecting polls with HTTP 429. Range 1–120 s.")
+        self.webex_cmd_poll.setValue(int(s.get("webex_command_poll_s", 5)))
         wf.addRow("Command poll (s)", self.webex_cmd_poll)
         self.webex_allow = QLineEdit("; ".join(s.get("webex_command_allowlist", [])))
         self.webex_allow.setPlaceholderText("allowed sender e-mails, empty = anyone in room")
@@ -2271,6 +2728,15 @@ class SettingsDialog(QDialog):
             "5–3600 s.")
         self.poll.setValue(int(s["poll_interval_s"]))
         form.addRow("Poll interval (s)", self.poll)
+        self.poll_workers = _NoWheelSpinBox(); self.poll_workers.setRange(1, 64)
+        self.poll_workers.setToolTip(
+            "How many PVs are fetched from the archiver at once each poll. The "
+            "fetch is network-bound, so a pass takes about "
+            "ceil(PV count / this) x per-request time; when that exceeds the "
+            "poll interval, ticks are skipped and the table lags. Raise this "
+            "when monitoring many PVs. Range 1-64.")
+        self.poll_workers.setValue(int(s.get("poll_max_workers", 24)))
+        form.addRow("Concurrent fetches", self.poll_workers)
         self.avg_n = _NoWheelSpinBox(); self.avg_n.setRange(1, 500)
         self.avg_n.setToolTip(
             "Each poll averages up to this many recent samples before comparing "
@@ -2292,14 +2758,25 @@ class SettingsDialog(QDialog):
             "1 = alert immediately. Range 1–20 polls.")
         self.debounce.setValue(int(s["debounce_count"]))
         form.addRow("Debounce (polls)", self.debounce)
-        self.hyst = _NoWheelDoubleSpinBox(); self.hyst.setRange(0, 0.5)
-        self.hyst.setSingleStep(0.01); self.hyst.setDecimals(3)
-        self.hyst.setToolTip(
-            "Dead-band around each threshold, as a fraction of it, that the "
-            "reading must clear before the state resets — stops flapping when a "
-            "value hovers on a limit. E.g. 0.05 = 5 %. Range 0–0.5.")
-        self.hyst.setValue(float(s["hysteresis_frac"]))
-        form.addRow("Hysteresis (fraction)", self.hyst)
+        self.settle = _NoWheelDoubleSpinBox(); self.settle.setRange(0, 120)
+        self.settle.setDecimals(1); self.settle.setSingleStep(0.5)
+        self.settle.setToolTip(
+            "When a PV first leaves its limits, hold the alert this many "
+            "minutes to give the value a chance to settle. After the wait one "
+            "message is sent only if the Warning/Alarm is still ongoing; an "
+            "excursion that recovered within the window sends nothing. "
+            "0 = alert immediately. Range 0–120 min.")
+        self.settle.setValue(float(s.get("settle_minutes", 5.0)))
+        form.addRow("Settle wait (min, 0=off)", self.settle)
+        self.stable = _NoWheelSpinBox(); self.stable.setRange(0, 3600)
+        self.stable.setToolTip(
+            "A state change is only announced once the level has stayed "
+            "unchanged for this many seconds; every further change restarts "
+            "the clock. A value oscillating across a limit therefore sends "
+            "nothing until it settles — and nothing at all if it ends up back "
+            "where it started. 0 = announce immediately. Range 0–3600 s.")
+        self.stable.setValue(int(s.get("stable_seconds", 120)))
+        form.addRow("Stability hold (s, 0=off)", self.stable)
         self.cooldown = _NoWheelSpinBox(); self.cooldown.setRange(0, 1440)
         self.cooldown.setToolTip(
             "Minimum minutes between repeat notifications for a PV that stays in "
@@ -2314,6 +2791,37 @@ class SettingsDialog(QDialog):
             "after a Warning/Alarm. When off, recoveries are silent.")
         self.recovery.setChecked(bool(s["recovery_notify"]))
         form.addRow("", self.recovery)
+        self.trend_adaptive = QCheckBox("Adapt reminder rate to the value trend")
+        self.trend_adaptive.setStyleSheet(_CHK_STYLE)
+        self.trend_adaptive.setToolTip(
+            "For a PV that is already in Warning/Alarm, adjust how often it is "
+            "re-notified based on its recent trend: send reminders twice as "
+            "fast while the value is drifting further past the limit "
+            "(worsening), and twice as slow while it is moving back toward "
+            "normal (self-correcting). A steady value keeps the normal "
+            "re-notify cooldown. Only affects reminder timing, never the "
+            "alarm state itself.")
+        self.trend_adaptive.setChecked(bool(s.get("trend_adaptive_enabled", True)))
+        form.addRow("", self.trend_adaptive)
+        self.trend_lookback = _NoWheelDoubleSpinBox()
+        self.trend_lookback.setRange(1, 120)
+        self.trend_lookback.setDecimals(1); self.trend_lookback.setSingleStep(1.0)
+        self.trend_lookback.setToolTip(
+            "How many minutes of recent history the trend check looks at when "
+            "deciding whether an alarming value is improving or worsening. "
+            "Range 1–120 min.")
+        self.trend_lookback.setValue(float(s.get("trend_lookback_minutes", 10.0)))
+        form.addRow("Trend look-back (min)", self.trend_lookback)
+        self.trend_flat = _NoWheelDoubleSpinBox()
+        self.trend_flat.setRange(0.1, 50.0)
+        self.trend_flat.setDecimals(1); self.trend_flat.setSingleStep(0.5)
+        self.trend_flat.setSuffix(" %")
+        self.trend_flat.setToolTip(
+            "How much the averaged value must change across the look-back "
+            "window to count as a real trend rather than 'steady'. Below this "
+            "the reminder rate stays normal. Range 0.1–50 %.")
+        self.trend_flat.setValue(float(s.get("trend_flat_frac", 0.02)) * 100.0)
+        form.addRow("Trend 'steady' band (%)", self.trend_flat)
         self.hist = _NoWheelSpinBox(); self.hist.setRange(10, 10080)
         self.hist.setToolTip(
             "How many minutes of polled samples are kept in memory per PV for "
@@ -2430,12 +2938,17 @@ class SettingsDialog(QDialog):
         s["webex_command_allowlist"] = _parse_recipients(self.webex_allow.text())
         # monitoring
         s["poll_interval_s"] = self.poll.value()
+        s["poll_max_workers"] = self.poll_workers.value()
         s["avg_last_n"] = self.avg_n.value()
         s["sample_window_s"] = self.window_s.value()
         s["debounce_count"] = self.debounce.value()
-        s["hysteresis_frac"] = self.hyst.value()
+        s["settle_minutes"] = self.settle.value()
+        s["stable_seconds"] = self.stable.value()
         s["renotify_cooldown_minutes"] = self.cooldown.value()
         s["recovery_notify"] = self.recovery.isChecked()
+        s["trend_adaptive_enabled"] = self.trend_adaptive.isChecked()
+        s["trend_lookback_minutes"] = self.trend_lookback.value()
+        s["trend_flat_frac"] = self.trend_flat.value() / 100.0
         s["history_minutes"] = self.hist.value()
         s["graph_window_minutes"] = self.graph_win.value()
         s["valid_min_default"] = self.valid_min.value()
@@ -2464,16 +2977,49 @@ class _LightNavToolbar(NavToolbar):
     """Matplotlib nav toolbar with a light background and forced near-black
     icons. The stock toolbar recolors its glyphs from the Qt palette, so with
     Windows in dark mode they come out white — invisible on this app's light
-    UI. Recoloring here makes the buttons legible regardless of the OS theme."""
+    UI. Recoloring here makes the buttons legible regardless of the OS theme.
 
-    def __init__(self, canvas, parent=None):
+    It also reports view changes: after every zoom/pan/back/forward it calls
+    ``on_user_view`` so the panel can pin the user's view across the periodic
+    redraws, and Home calls ``on_home`` to return to the live rolling window
+    instead of matplotlib's stale first-drawn view."""
+
+    def __init__(self, canvas, parent=None, on_user_view=None, on_home=None):
         super().__init__(canvas, parent)
+        self._on_user_view = on_user_view
+        self._on_home = on_home
         self.setStyleSheet(
             "QToolBar { background: #f2f2f2; border: 1px solid #ccc; }"
             "QToolButton { background: transparent; color: #111; }"
             "QToolButton:hover { background: #d8e8ff; }"
             "QToolButton:checked { background: #cfe0f7; }"
             "QLabel { color: #111; }")
+
+    def _notify_user_view(self):
+        if self._on_user_view is not None:
+            self._on_user_view()
+
+    def release_zoom(self, event):
+        super().release_zoom(event)
+        self._notify_user_view()
+
+    def release_pan(self, event):
+        super().release_pan(event)
+        self._notify_user_view()
+
+    def back(self, *args):
+        super().back(*args)
+        self._notify_user_view()
+
+    def forward(self, *args):
+        super().forward(*args)
+        self._notify_user_view()
+
+    def home(self, *args):
+        if self._on_home is not None:
+            self._on_home()
+        else:
+            super().home(*args)
 
     def _icon(self, name):
         p = Path(matplotlib.get_data_path()) / "images" / name
@@ -2536,11 +3082,63 @@ def render_pv_png(pv_name: str, display_name: str, hours: float,
     return buf.getvalue()
 
 
+class _AxisRangeDialog(QDialog):
+    """Small lo/hi prompt for the graph's axis right-click menu."""
+
+    def __init__(self, parent, title: str, lo: float, hi: float):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        form = QFormLayout(self)
+        self.lo = QDoubleSpinBox()
+        self.hi = QDoubleSpinBox()
+        for sb in (self.lo, self.hi):
+            sb.setRange(-1e12, 1e12)
+            sb.setDecimals(4)
+        self.lo.setValue(lo)
+        self.hi.setValue(hi)
+        form.addRow("Min", self.lo)
+        form.addRow("Max", self.hi)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def values(self) -> tuple[float, float]:
+        return self.lo.value(), self.hi.value()
+
+
+_DT_FMT = "%Y-%m-%d %H:%M"
+
+
+class _AxisDateRangeDialog(QDialog):
+    """Lo/hi prompt for the X (time) axis, in human-readable local time."""
+
+    def __init__(self, parent, lo_dt: datetime, hi_dt: datetime):
+        super().__init__(parent)
+        self.setWindowTitle("X range (Europe/Prague)")
+        form = QFormLayout(self)
+        self.lo = QLineEdit(lo_dt.strftime(_DT_FMT))
+        self.hi = QLineEdit(hi_dt.strftime(_DT_FMT))
+        form.addRow("From", self.lo)
+        form.addRow("To", self.hi)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def values(self) -> tuple[datetime, datetime]:
+        return (datetime.strptime(self.lo.text().strip(), _DT_FMT),
+                datetime.strptime(self.hi.text().strip(), _DT_FMT))
+
+
 class GraphPanel(QWidget):
     def __init__(self, win: "MonitorWidget"):
         super().__init__()
         self._win = win
         self._yaxis: Optional[tuple] = None   # (lo, hi) fixed Y range, or None=auto
+        # (xlim, ylim) pinned by a toolbar zoom/pan. While set, the periodic
+        # redraws keep this view instead of snapping back to the rolling window.
+        self._user_view: Optional[tuple] = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
 
@@ -2551,34 +3149,175 @@ class GraphPanel(QWidget):
             "Choose what the graph below plots: 'All PVs' overlays every PV "
             "(no threshold lines), or pick a single PV to see it alone with its "
             "Warning/Alarm threshold lines drawn in.")
-        self.combo.currentIndexChanged.connect(lambda *_: self.redraw())
+        self.combo.currentIndexChanged.connect(self._on_combo_changed)
         top.addWidget(self.combo, 1)
+        self.btn_reset_zoom = QPushButton("⤺ Reset zoom")
+        self.btn_reset_zoom.setStyleSheet(SECONDARY_STYLE)
+        self.btn_reset_zoom.setToolTip(
+            "Drop the current zoom/pan and return to the live rolling window "
+            "(same as the toolbar's Home button). The ◀ toolbar arrow steps "
+            "back one zoom at a time.")
+        self.btn_reset_zoom.clicked.connect(self.reset_zoom)
+        top.addWidget(self.btn_reset_zoom)
+        self.btn_refresh = QPushButton("⟳ Refresh")
+        self.btn_refresh.setStyleSheet(_BTN_PRIMARY)
+        self.btn_refresh.setToolTip(
+            "Reload the PV list into the selector and redraw the graph from "
+            "scratch with autoscaled axes (clears any fixed Y range and zoom).")
+        self.btn_refresh.clicked.connect(self.reset_view)
+        top.addWidget(self.btn_refresh)
         lay.addLayout(top)
 
         self.fig = Figure(figsize=(6, 3), dpi=96)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
-        lay.addWidget(_LightNavToolbar(self.canvas, self))
+        self.toolbar = _LightNavToolbar(
+            self.canvas, self,
+            on_user_view=self._capture_user_view, on_home=self.reset_zoom)
+        lay.addWidget(self.toolbar)
         lay.addWidget(self.canvas, 1)
 
         # Crosshair cursor: artists are recreated on every redraw (ax.clear()
         # drops them); animated=True keeps them out of the blit background so
         # moving the mouse never re-renders the whole figure.
         self._cross: list = []
+        self._extra_axes: list = []   # twin y-axes, one per extra unit
         self._snap_np = None    # (times_num, values, label) for single-PV snap
         self._units = ""
         self._blit_bg = None
         self._mouse_ev = None
         self._mouse_pending = False
+        self._grid_on = True
+        # Fixed Y range per extra (twin) axis, keyed by its index in
+        # self._extra_axes. self._yaxis (above) already covers the main axis.
+        self._extra_yaxis: dict[int, tuple] = {}
         self.canvas.mpl_connect("draw_event", self._on_draw)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
-        self.canvas.mpl_connect("figure_leave_event",
-                                lambda _e: self._hide_cursor())
+        self.canvas.mpl_connect("figure_leave_event", self._on_leave)
+        self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+
+    def _on_combo_changed(self, *_):
+        # New selection = different data/scale; a zoom pinned on the previous
+        # selection would show a nonsense viewport, so drop it.
+        self._user_view = None
+        self.redraw()
+
+    def _capture_user_view(self):
+        """Pin the current axes view (called after a toolbar zoom/pan) so
+        periodic redraws stop snapping back to the rolling window."""
+        self._user_view = (self.ax.get_xlim(), self.ax.get_ylim())
+
+    def reset_zoom(self):
+        """Unpin the user's zoom/pan and return to the live rolling window."""
+        self._user_view = None
+        self.toolbar.update()      # flush the toolbar's back/forward history
+        self.redraw()
+
+    def reset_view(self):
+        """Reload the PV list, drop any fixed Y range and redraw autoscaled."""
+        self._yaxis = None
+        self._user_view = None
+        self.toolbar.update()
+        self.refresh_combo()
+        self.redraw()
 
     def set_yaxis(self, lo, hi):
         """Fix the Y range (lo, hi), or pass (None, None) to restore autoscale."""
         self._yaxis = None if lo is None or hi is None else (float(lo), float(hi))
+        self._user_view = None    # an explicit Y command overrides a pinned zoom
         self.redraw()
+
+    # --- right-click axis settings menu -----------------------------------
+
+    def _axis_at(self, event):
+        """Return ('x', ax) or ('y', ax) for the axis under a click, else None.
+
+        Hit-tests against each axis's rendered tick-label bbox rather than
+        guessing pixel offsets, so it works no matter how many twin (unit)
+        axes are stacked on the right.
+        """
+        renderer = self.canvas.get_renderer()
+        if renderer is None or event.x is None or event.y is None:
+            return None
+        xb = self.ax.xaxis.get_tightbbox(renderer)
+        if xb is not None and xb.contains(event.x, event.y):
+            return ("x", self.ax)
+        for a in [self.ax] + self._extra_axes:
+            yb = a.yaxis.get_tightbbox(renderer)
+            if yb is not None and yb.contains(event.x, event.y):
+                return ("y", a)
+        return None
+
+    def _on_canvas_click(self, event):
+        if event.button != 3:   # right-click only
+            return
+        hit = self._axis_at(event)
+        if hit is None:
+            return
+        kind, ax = hit
+        gui_ev = event.guiEvent
+        pos = gui_ev.position().toPoint() if hasattr(gui_ev, "position") \
+            else gui_ev.pos()
+        self._show_axis_menu(kind, ax, self.canvas.mapToGlobal(pos))
+
+    def _show_axis_menu(self, kind: str, ax, global_pos):
+        menu = QMenu(self)
+        if kind == "x":
+            menu.addAction("Set X range…", lambda: self._prompt_xrange(ax))
+            menu.addAction("Reset X to rolling window", self.reset_zoom)
+        else:
+            menu.addAction("Set Y range…", lambda: self._prompt_yrange(ax))
+            menu.addAction("Autoscale this Y axis",
+                            lambda: self._clear_yrange(ax))
+        menu.addSeparator()
+        grid_action = menu.addAction("Grid lines")
+        grid_action.setCheckable(True)
+        grid_action.setChecked(self._grid_on)
+        grid_action.toggled.connect(self._set_grid_on)
+        menu.exec(global_pos)
+
+    def _set_grid_on(self, on: bool):
+        self._grid_on = on
+        self.redraw()
+
+    def _prompt_xrange(self, ax):
+        lo, hi = ax.get_xlim()
+        lo_dt = mdates.num2date(lo, tz=api.TZ_PRAGUE)
+        hi_dt = mdates.num2date(hi, tz=api.TZ_PRAGUE)
+        dlg = _AxisDateRangeDialog(self, lo_dt, hi_dt)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            new_lo, new_hi = dlg.values()
+        except ValueError:
+            QMessageBox.warning(self, "Invalid date",
+                                 f"Use the format {_DT_FMT}.")
+            return
+        new_lo = new_lo.replace(tzinfo=api.TZ_PRAGUE)
+        new_hi = new_hi.replace(tzinfo=api.TZ_PRAGUE)
+        self._user_view = ((mdates.date2num(new_lo), mdates.date2num(new_hi)),
+                            ax.get_ylim())
+        self.redraw()
+
+    def _prompt_yrange(self, ax):
+        lo, hi = ax.get_ylim()
+        dlg = _AxisRangeDialog(self, "Y range", lo, hi)
+        if dlg.exec() == QDialog.Accepted:
+            new_lo, new_hi = dlg.values()
+            if ax is self.ax:
+                self.set_yaxis(new_lo, new_hi)
+            else:
+                idx = self._extra_axes.index(ax)
+                self._extra_yaxis[idx] = (new_lo, new_hi)
+                self.redraw()
+
+    def _clear_yrange(self, ax):
+        if ax is self.ax:
+            self.set_yaxis(None, None)
+        else:
+            idx = self._extra_axes.index(ax)
+            self._extra_yaxis.pop(idx, None)
+            self.redraw()
 
     def select_pv(self, name_or_all: Optional[str]):
         """Set the combo to a PV name (or None for 'All PVs'). Returns True if found."""
@@ -2602,62 +3341,153 @@ class GraphPanel(QWidget):
         self.combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo.blockSignals(False)
 
-    def _plot_one(self, pv: PVConfig, color, with_thresholds: bool):
+    def _plot_one(self, pv: PVConfig, color, with_thresholds: bool, ax=None):
+        ax = ax if ax is not None else self.ax
         rt = self._win.runtime.get(pv.name)
         if not rt or not rt.history:
             return
-        pts = list(rt.history)[-MAX_GRAPH_POINTS:]
+        pts = list(rt.history)
+        if len(pts) > MAX_GRAPH_POINTS:
+            # Thin evenly across the whole history (a plain tail-cut would
+            # silently shorten the graph's time span); keep the newest point.
+            step = len(pts) / MAX_GRAPH_POINTS
+            last = pts[-1]
+            pts = [pts[int(i * step)] for i in range(MAX_GRAPH_POINTS)]
+            pts[-1] = last
         xs = [api.ns_to_prague(t) for t, _ in pts]
         ys = [v for _, v in pts]
-        self.ax.plot(xs, ys, drawstyle="steps-post", color=color,
-                     label=pv.display_name, linewidth=1.6)
+        ax.plot(xs, ys, drawstyle="steps-post", color=color,
+                label=pv.display_name, linewidth=1.6)
         if with_thresholds:
             for val, ls, lw in ((pv.warn_low, "--", 1.0), (pv.warn_high, "--", 1.0),
                                 (pv.alarm_low, "-.", 1.6), (pv.alarm_high, "-.", 1.6)):
                 if val is not None:
-                    self.ax.axhline(val, color=color, linestyle=ls,
-                                    linewidth=lw, alpha=0.6)
+                    ax.axhline(val, color=color, linestyle=ls,
+                               linewidth=lw, alpha=0.6)
 
     def _pv_units(self, pv: PVConfig) -> str:
         rt = self._win.runtime.get(pv.name)
         return (rt.current_units if rt and rt.current_units else pv.units) or ""
 
+    # Units differing only in spelling/case ("DegC" vs "degC") share one axis.
+    @staticmethod
+    def _unit_key(unit: str) -> str:
+        return (unit or "").strip().lower()
+
+    _UNIT_LABELS = {
+        "degc": "Temperature [°C]", "°c": "Temperature [°C]",
+        "c": "Temperature [°C]", "k": "Temperature [K]",
+        "degf": "Temperature [°F]",
+        "pa": "Pressure [Pa]", "kpa": "Pressure [kPa]",
+        "mpa": "Pressure [MPa]", "bar": "Pressure [bar]",
+        "mbar": "Pressure [mbar]",
+        "l/min": "Flow [l/min]", "lpm": "Flow [l/min]",
+        "torr": "Pressure [Torr]", "mtorr": "Pressure [mTorr]",
+    }
+
+    # Units that count as temperature — kept on the familiar left axis.
+    _TEMP_UNIT_KEYS = ("degc", "°c", "c", "k", "degf")
+
+    @classmethod
+    def _axis_label(cls, unit: str) -> str:
+        return cls._UNIT_LABELS.get(cls._unit_key(unit),
+                                    (unit or "").strip() or "value")
+
     def redraw(self):
+        for a in self._extra_axes:
+            a.remove()
+        self._extra_axes = []
         self.ax.clear()
         sel = self.combo.currentData()
         win_min = float(self._win.settings["graph_window_minutes"])
 
         cmap = matplotlib.colormaps.get_cmap("tab10")
         pv = None
-        if sel is None:  # "All PVs"
-            for i, p in enumerate(self._win.pvs):
-                self._plot_one(p, cmap(i % 10), with_thresholds=False)
-            units = {self._pv_units(p) for p in self._win.pvs} - {""}
-            self._units = units.pop() if len(units) == 1 else ""
+        if sel is None:  # "All PVs" — everything with its eye switched on
+            visible = [p for p in self._win.pvs if p.show_in_graph]
+            # Only PVs that actually have data get plotted — and only their
+            # units get an axis, so a unit-less PV with no samples yet can't
+            # spawn an empty 'value' axis.
+            plottable = [p for p in visible
+                         if (rt := self._win.runtime.get(p.name))
+                         and rt.history]
+            # One y-axis per distinct (normalized) unit: the first unit owns
+            # the main axis, each further unit gets a twin axis on the right.
+            units_order: list[str] = []
+            unit_text: dict[str, str] = {}
+            for p in plottable:
+                k = self._unit_key(self._pv_units(p))
+                if k not in units_order:
+                    units_order.append(k)
+                    unit_text[k] = self._pv_units(p)
+            # Temperature owns the left (main) axis regardless of PV order;
+            # other units (pressure, flow, …) go to twin axes on the right.
+            units_order.sort(
+                key=lambda k: 0 if k in self._TEMP_UNIT_KEYS else 1)
+            ax_of_unit = {}
+            for j, k in enumerate(units_order):
+                if j == 0:
+                    ax_of_unit[k] = self.ax
+                else:
+                    tw = self.ax.twinx()
+                    if j >= 2:   # push 3rd+ axis outward so labels don't overlap
+                        tw.spines["right"].set_position(("outward", 48 * (j - 1)))
+                    self._extra_axes.append(tw)
+                    ax_of_unit[k] = tw
+            for i, p in enumerate(plottable):
+                self._plot_one(p, cmap(i % 10), with_thresholds=False,
+                               ax=ax_of_unit[self._unit_key(self._pv_units(p))])
+            for k, a in ax_of_unit.items():
+                a.set_ylabel(self._axis_label(unit_text[k]))
+            # Any fixed range pinned via the extra-axis context menu wins over
+            # autoscale (main axis fixed range is applied further below).
+            for idx, a in enumerate(self._extra_axes):
+                if idx in self._extra_yaxis:
+                    a.set_ylim(*self._extra_yaxis[idx])
+            self._units = unit_text[units_order[0]] if len(units_order) == 1 \
+                else ""
         else:
             pv = next((p for p in self._win.pvs if p.name == sel), None)
             if pv:
                 self._plot_one(pv, PRIMARY, with_thresholds=True)
             self._units = self._pv_units(pv) if pv else ""
-        self.ax.set_ylabel(self._units or "value")
+            self.ax.set_ylabel(self._axis_label(self._units))
 
-        if self.ax.get_legend_handles_labels()[0]:
-            self.ax.legend(loc="upper left", fontsize=8)
-        self.ax.grid(True, alpha=0.3)
+        # One combined legend for all axes, hosted on the main axis.
+        handles, labels = [], []
+        for a in [self.ax] + self._extra_axes:
+            h, l = a.get_legend_handles_labels()
+            handles += h
+            labels += l
+        if handles:
+            self.ax.legend(handles, labels, loc="upper left", fontsize=8)
+        self.ax.grid(self._grid_on, alpha=0.3)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=api.TZ_PRAGUE))
 
-        # Limit x to the configured window if we have data
-        all_x = [ln.get_xdata() for ln in self.ax.get_lines()]
-        if any(len(x) for x in all_x):
-            try:
-                xmax = max(x[-1] for x in all_x if len(x))
-                xmin = xmax - (win_min / (24 * 60))
-                self.ax.set_xlim(xmin, xmax)
-            except Exception:
-                pass
-        if self._yaxis is not None:
-            self.ax.set_ylim(*self._yaxis)
-        self.fig.autofmt_xdate()
+        # A view the user zoomed/panned to is pinned and always wins over the
+        # rolling window, so periodic redraws never yank the zoom away.
+        if self._user_view is not None:
+            self.ax.set_xlim(self._user_view[0])
+            self.ax.set_ylim(self._user_view[1])
+        else:
+            # Limit x to the configured window if we have data. orig=False
+            # gives the unit-converted float date numbers (the original data
+            # are datetimes, which can't take a float offset). Twin axes share
+            # x, so clamping the main axis clamps them all.
+            all_x = [ln.get_xdata(orig=False)
+                     for a in [self.ax] + self._extra_axes for ln in a.get_lines()]
+            if any(len(x) for x in all_x):
+                try:
+                    xmax = max(x[-1] for x in all_x if len(x))
+                    xmin = xmax - (win_min / (24 * 60))
+                    self.ax.set_xlim(xmin, xmax)
+                except Exception:
+                    pass
+            if self._yaxis is not None:
+                self.ax.set_ylim(*self._yaxis)
+        for lbl in self.ax.get_xticklabels():
+            lbl.set_rotation(0)
+            lbl.set_ha("center")
         self.fig.tight_layout()
 
         # Cache the plotted samples for the crosshair's nearest-point snap
@@ -2676,22 +3506,47 @@ class GraphPanel(QWidget):
 
     # --- crosshair cursor ------------------------------------------------
     def _make_cursor_artists(self):
-        vl = self.ax.axvline(color="#888", linewidth=0.8, linestyle="--",
+        # Park the (hidden) crosshair lines mid-view: axvline/axhline take
+        # part in autoscale even when invisible, so the default x=0 would
+        # drag a date axis all the way back to 1970 (and y=0 pull the y range
+        # down to zero).
+        x_mid = sum(self.ax.get_xlim()) / 2
+        y_mid = sum(self.ax.get_ylim()) / 2
+        vl = self.ax.axvline(x_mid, color="#888", linewidth=0.8, linestyle="--",
                              visible=False, animated=True)
-        hl = self.ax.axhline(color="#888", linewidth=0.8, linestyle="--",
+        hl = self.ax.axhline(y_mid, color="#888", linewidth=0.8, linestyle="--",
                              visible=False, animated=True)
         txt = self.ax.annotate(
             "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
             fontsize=8, color="#111", visible=False, animated=True, zorder=10,
             bbox=dict(boxstyle="round,pad=0.3", fc="#ffffe0", ec="#888",
                       alpha=0.9, linewidth=0.6))
-        self._cross = [vl, hl, txt]
+        # Exact readouts pinned to the axes (CSS-studio style): the time on
+        # the X axis under the cursor, the value on the Y axis beside it.
+        _axis_bbox = dict(boxstyle="round,pad=0.25", fc="#ffffe0", ec="#888",
+                          alpha=0.95, linewidth=0.6)
+        xlab = self.ax.annotate(
+            "", xy=(x_mid, 0), xycoords=("data", "axes fraction"),
+            xytext=(0, -6), textcoords="offset points",
+            ha="center", va="top", fontsize=8, color="#111",
+            visible=False, animated=True, zorder=10, bbox=_axis_bbox)
+        ylab = self.ax.annotate(
+            "", xy=(0, y_mid), xycoords=("axes fraction", "data"),
+            xytext=(-8, 0), textcoords="offset points",
+            ha="right", va="center", fontsize=8, color="#111",
+            visible=False, animated=True, zorder=10, bbox=_axis_bbox)
+        self._cross = [vl, hl, txt, xlab, ylab]
 
     def _on_draw(self, *_):
         # Fresh blit background: hide the animated overlay so it isn't baked in.
         for a in self._cross:
             a.set_visible(False)
         self._blit_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+        # A periodic redraw just wiped the crosshair; if the mouse is still
+        # over the canvas, repaint it at its last position once this draw is
+        # done (the cursor only uses pixel coords, so a stale event is fine).
+        if self._mouse_ev is not None and self.canvas.underMouse():
+            QTimer.singleShot(0, self._process_mouse)
 
     def _on_mouse_move(self, event):
         self._mouse_ev = event
@@ -2708,6 +3563,10 @@ class GraphPanel(QWidget):
             self._draw_cursor(ev)
         except Exception:
             pass   # replot may tear the figure down mid-hover — harmless
+
+    def _on_leave(self, _e):
+        self._mouse_ev = None    # stop the redraw hook resurrecting the cursor
+        self._hide_cursor()
 
     def _hide_cursor(self):
         if not self._cross:
@@ -2733,12 +3592,15 @@ class GraphPanel(QWidget):
         return label, float(vals[idx])
 
     def _draw_cursor(self, ev):
-        if (ev.inaxes is not self.ax or ev.xdata is None or ev.ydata is None
-                or self._blit_bg is None):
+        # Work from pixel coordinates against the main axis: with twin y-axes
+        # present, ev.inaxes/ev.ydata belong to the topmost twin, not self.ax.
+        if (self._blit_bg is None or ev.x is None or ev.y is None
+                or not self.ax.bbox.contains(ev.x, ev.y)):
             self._hide_cursor()
             return
-        x, y = float(ev.xdata), float(ev.ydata)
-        vl, hl, txt = self._cross
+        x, y = self.ax.transData.inverted().transform((ev.x, ev.y))
+        x, y = float(x), float(y)
+        vl, hl, txt, xlab, ylab = self._cross
         vl.set_xdata([x, x])
         hl.set_ydata([y, y])
         try:
@@ -2746,6 +3608,10 @@ class GraphPanel(QWidget):
         except Exception:
             t_str = ""
         u = f" {self._units}" if self._units else ""
+        xlab.xy = (x, 0)
+        xlab.set_text(t_str)
+        ylab.xy = (0, y)
+        ylab.set_text(f"{y:.4g}")
         lines = [t_str, f"y = {y:.4g}{u}"]
         snap = self._snap_value(x)
         if snap is not None:
@@ -2880,10 +3746,12 @@ class MonitorWidget(QWidget):
         # Clipboard for the right-click "Copy settings / Paste settings" feature.
         self._copied_settings: Optional[dict] = None
         self._copied_from: str = ""
+        self._copied_desc: str = "settings"
         # Latest value of every gate PV that isn't itself a monitored PV,
         # refreshed each poll so state-dependent thresholds can switch.
         self._gate_values: dict[str, Optional[float]] = {}
         self._poll_gen = 0
+        self._poll_inflight = False
         self._monitoring = False
         self._sim_timer: Optional[QTimer] = None
         self._resume_timer: Optional[QTimer] = None   # auto-resume after /stop <h>
@@ -2898,6 +3766,9 @@ class MonitorWidget(QWidget):
         self._cmd_poll_started_ns = 0   # when the in-flight poll was dispatched
         self._cmd_bot_id_inflight = False
         self._cmd_gen = 0
+        self._cmd_backoff_until_ns = 0   # honour Webex 429 Retry-After
+        self._watchdog_fail_streak = 0   # consecutive fully-failed polls
+        self._watchdog_bad = False       # True once the "no data" alert fired
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -2915,9 +3786,10 @@ class MonitorWidget(QWidget):
         s = self.settings
         return EvalConfig(
             debounce_count=int(s["debounce_count"]),
-            hysteresis_frac=float(s["hysteresis_frac"]),
             renotify_cooldown_minutes=float(s["renotify_cooldown_minutes"]),
             recovery_notify=bool(s["recovery_notify"]),
+            settle_minutes=float(s.get("settle_minutes", 5.0)),
+            stable_seconds=float(s.get("stable_seconds", 120)),
         )
 
     def _history_maxlen(self) -> int:
@@ -2959,9 +3831,12 @@ class MonitorWidget(QWidget):
             "Simulate alert": "Inject a fake alarm for the selected PV to test "
                               "that notification channels are wired up "
                               "correctly. No real data is changed.",
+            "Groups": "Organize PVs into groups and subgroups: rename, create "
+                      "and drag PVs between them in one tree view.",
         }
         for label, slot in (("Add PV", self.add_pv),
                             ("Edit", self.edit_pv),
+                            ("Groups", self.manage_groups),
                             ("Learn selected", self.learn_selected),
                             ("Remove", self.remove_pv),
                             ("Poll now", self.poll_now),
@@ -2999,6 +3874,7 @@ class MonitorWidget(QWidget):
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.clicked.connect(self._on_table_clicked)
         self.table.doubleClicked.connect(self._on_table_double_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
@@ -3078,20 +3954,22 @@ class MonitorWidget(QWidget):
         self.persist()
 
     def _apply_group_spans(self):
-        """Make each group-header row span the full width of the table."""
+        """Make each (sub)group-header row span the table width from the name
+        column on — the On/Show cells stay separate so the header's group-wide
+        Show checkbox remains clickable."""
         self.table.clearSpans()
         for r, (kind, _ref) in enumerate(self.model._display):
-            if kind == "header":
-                self.table.setSpan(r, 0, 1, len(COLS))
+            if kind in ("header", "subheader"):
+                self.table.setSpan(r, COL_NAME, 1, len(COLS) - COL_NAME)
 
     # --- "Depends on" rule dropdowns ------------------------------------
     def _install_dep_combos(self):
         """(Re)create the per-row rule dropdown in the 'Depends on' column.
 
-        Every PV with dependency rules gets one. 'Auto (…)' follows whichever
-        rule currently matches the dependency values and shows its name;
-        picking a rule (or 'Global') pins that threshold set until the user
-        changes it again. Model resets destroy index widgets, so this is
+        Every PV with dependency rules gets one. 'Automatic (…)' follows
+        whichever rule currently matches the dependency values and shows its
+        name; picking a rule (or 'Global') pins that threshold set until the
+        user changes it again. Model resets destroy index widgets, so this is
         reconnected to modelReset."""
         self._dep_combos = {}
         for r, (kind, ref) in enumerate(self.model._display):
@@ -3103,7 +3981,7 @@ class MonitorWidget(QWidget):
                     -1 <= rt.dep_view < len(pv.profiles)):
                 rt.dep_view = None    # rules changed under a stale pin
             combo = _NoWheelComboBox()
-            combo.addItem("")         # 'Auto (…)' — text kept fresh below
+            combo.addItem("")         # 'Automatic (…)' — text kept fresh below
             combo.addItem("Global")
             for i, prof in enumerate(pv.profiles):
                 combo.addItem(_profile_item_text(pv, i, prof))
@@ -3129,7 +4007,8 @@ class MonitorWidget(QWidget):
                 vh.setDefaultSectionSize(h)
 
     def _active_limits_label(self, pv: PVConfig, rt: Optional[PVRuntime]) -> str:
-        """Short name of the threshold set in force, for the 'Auto (…)' item."""
+        """Short name of the threshold set in force, for the 'Automatic (…)'
+        item."""
         active = rt.active_profile if rt else None
         if active is None:
             return "Global"
@@ -3137,35 +4016,29 @@ class MonitorWidget(QWidget):
                 or _profile_rule_text(pv, active) or "rule")
 
     def _refresh_dep_combos(self):
-        """Keep every dropdown's 'Auto (…)' text and styling in sync with the
-        rule currently in force (called after each poll and on pin changes)."""
+        """Keep every dropdown's 'Automatic (…)' text and styling in sync with
+        the rule currently in force (called after each poll and on pin
+        changes)."""
         for pv in self.pvs:
             combo = self._dep_combos.get(pv.name)
             if combo is None:
                 continue
             rt = self.runtime.get(pv.name)
-            combo.setItemText(0, f"Auto ({self._active_limits_label(pv, rt)})")
+            combo.setItemText(
+                0, f"Automatic ({self._active_limits_label(pv, rt)})")
             view = rt.dep_view if rt is not None else None
             pinned = view is not None
-            # A pinned rule whose conditions don't hold right now falls back to
-            # the Global limits — flag that state in orange.
-            fallback = (pinned and view >= 0
-                        and (rt.active_profile is None if rt else True))
-            color = (f" color:{WARN_COLOR};" if fallback
-                     else " color:#0D47A1;" if pinned else "")
+            color = " color:#0D47A1;" if pinned else ""
             weight = " font-weight:600;" if pinned else ""
             combo.setStyleSheet(
                 "QComboBox { padding:1px 6px;" + color + weight + " }")
-            tip = ("Threshold set in force for this PV.\n"
-                   "Auto — the first rule whose dependency conditions match "
-                   "wins; otherwise the Global limits.\n"
-                   "Pick a rule to pin its limits (applied only while its "
-                   "conditions hold, Global otherwise). Pick Global to force "
-                   "the global limits. Your choice sticks until you change it.")
-            if fallback:
-                tip = ("⚠ Pinned rule's conditions don't match right now — "
-                       "Global limits are in force.\n\n" + tip)
-            combo.setToolTip(tip)
+            combo.setToolTip(
+                "Threshold set in force for this PV.\n"
+                "Automatic — the first rule whose dependency conditions match "
+                "wins; otherwise the Global limits.\n"
+                "Pick a rule to pin its limits unconditionally, or pick "
+                "Global to force the global limits. Your choice sticks until "
+                "you change it.")
 
     def _on_dep_combo_changed(self, name: str, idx: int):
         rt = self.runtime.get(name)
@@ -3177,7 +4050,8 @@ class MonitorWidget(QWidget):
         self._refresh_dep_combos()
         self.model.refresh_all()
         if rt.dep_view is None:
-            self._log(f"{pv.display_name}: limits follow the active rule (Auto).")
+            self._log(f"{pv.display_name}: limits follow the active rule "
+                      "(Default).")
         elif rt.dep_view == -1:
             self._log(f"{pv.display_name}: limits pinned to Global.")
         else:
@@ -3224,24 +4098,24 @@ class MonitorWidget(QWidget):
 
     def _match_profile(self, pv: PVConfig) -> Optional[dict]:
         """The conditional profile in force for this PV right now, or None if
-        the default thresholds apply.
+        the global thresholds apply.
 
-        Auto (nothing pinned): the first rule whose conditions match wins.
-        A rule pinned in the 'Depends on' dropdown replaces that ordering: it
-        is used while its own conditions hold, else the Global limits. Pinning
-        'Global' forces the global thresholds regardless of the rules."""
+        Automatic (nothing pinned): the first rule whose conditions match wins.
+        A rule pinned in the 'Depends on' dropdown applies unconditionally —
+        its thresholds are in force regardless of the dependency values.
+        Pinning 'Global' forces the global thresholds regardless of the
+        rules."""
         if not pv.gate_pvs or not pv.profiles:
             return None
-        gate_values = [self._gate_value(g) for g in pv.gate_pvs]
         rt = self.runtime.get(pv.name)
         view = rt.dep_view if rt is not None else None
         if view is not None:
             if 0 <= view < len(pv.profiles):
                 prof = pv.profiles[view]
-                if (PVConfig._profile_matches(prof, gate_values)
-                        and PVConfig.profile_thresholds(prof).is_active()):
+                if PVConfig.profile_thresholds(prof).is_active():
                     return prof
-            return None      # Global pinned, or pinned rule not applicable now
+            return None      # Global pinned (or pinned rule has no limits set)
+        gate_values = [self._gate_value(g) for g in pv.gate_pvs]
         return pv.match_profile(gate_values)
 
     def _active_thresholds(self, pv: PVConfig) -> Thresholds:
@@ -3315,9 +4189,24 @@ class MonitorWidget(QWidget):
             self.persist()
             self._log(f"Updated {pv.display_name}.")
 
+    def _on_table_clicked(self, index):
+        """Single click: the eye column toggles graph visibility; clicking a
+        group/subgroup header row folds/unfolds it."""
+        if not index.isValid():
+            return
+        if index.column() == COL_SHOW:
+            self.model.toggle_show(index.row())
+            return
+        kind = self.model._display[index.row()][0]
+        if kind in ("header", "subheader"):
+            self.model.toggle_collapse(index.row())
+
     def _on_table_double_clicked(self, index):
         """Double-click a threshold cell to edit limits in a popup; any other
-        cell opens the full PV editor."""
+        PV cell opens the full PV editor."""
+        kind = self.model._display[index.row()][0] if index.isValid() else None
+        if kind != "pv" or index.column() == COL_SHOW:
+            return   # header rows fold on single click; the eye just toggles
         if index.column() in THR_COLS:
             self.edit_thresholds(self.model.pv_at_row(index.row()))
         else:
@@ -3337,11 +4226,18 @@ class MonitorWidget(QWidget):
             self._log(f"Updated limits for {pv.display_name}.")
 
     # --- copy / paste settings ----------------------------------------
-    # Fields carried by copy/paste: limits, dependency gating and valid range.
-    # Identity (name/display_name/group), the enabled flag and learned-history
-    # stats stay with each target PV.
+    # Fields carried by a full copy/paste: limits, dependency gating and valid
+    # range. Identity (name/display_name/group), the enabled flag and
+    # learned-history stats stay with each target PV. Partial copies (submenu)
+    # carry only a subset of these keys, or a single conditional rule.
+    # _GATING_KEYS also includes the Global row (warn/alarm) so pasting
+    # dependencies+rules doesn't leave the target's fallback limits stale.
     _COPY_KEYS = ("units", "warn_low", "warn_high", "alarm_low", "alarm_high",
                   "gate_pvs", "profiles", "valid_min", "valid_max")
+    _GLOBAL_KEYS = ("warn_low", "warn_high", "alarm_low", "alarm_high")
+    _VALID_KEYS = ("valid_min", "valid_max")
+    _GATING_KEYS = ("gate_pvs", "profiles", "warn_low", "warn_high",
+                    "alarm_low", "alarm_high")
 
     def _show_context_menu(self, pos):
         idx = self.table.indexAt(pos)
@@ -3352,11 +4248,32 @@ class MonitorWidget(QWidget):
         act_edit = menu.addAction("Edit…")
         act_edit.setEnabled(pv is not None)
         menu.addSeparator()
-        act_copy = menu.addAction("Copy settings")
-        act_copy.setEnabled(pv is not None)
+
+        copy_menu = menu.addMenu("Copy settings")
+        copy_menu.setEnabled(pv is not None)
+        copy_actions = {}   # QAction -> (keys, profile_index)
+        if pv is not None:
+            copy_actions[copy_menu.addAction("All settings")] = \
+                (self._COPY_KEYS, None)
+            copy_menu.addSeparator()
+            copy_actions[copy_menu.addAction("Global limits (warn/alarm)")] = \
+                (self._GLOBAL_KEYS, None)
+            copy_actions[copy_menu.addAction("Valid range")] = \
+                (self._VALID_KEYS, None)
+            act = copy_menu.addAction("Dependencies && all rules (incl. values)")
+            act.setEnabled(bool(pv.gate_pvs or pv.profiles))
+            copy_actions[act] = (self._GATING_KEYS, None)
+            if pv.profiles:
+                copy_menu.addSeparator()
+                for i, prof in enumerate(pv.profiles):
+                    act = copy_menu.addAction(
+                        f"Rule: {_profile_item_text(pv, i, prof)}")
+                    copy_actions[act] = (None, i)
+
         paste_label = "Paste settings"
         if self._copied_settings is not None:
-            paste_label += f" from {self._copied_from} → {len(targets)} PV(s)"
+            paste_label = (f"Paste {self._copied_desc} from "
+                           f"{self._copied_from} → {len(targets)} PV(s)")
         act_paste = menu.addAction(paste_label)
         act_paste.setEnabled(self._copied_settings is not None and bool(targets))
         menu.addSeparator()
@@ -3374,39 +4291,77 @@ class MonitorWidget(QWidget):
                 self.graph.refresh_combo()
                 self.persist()
                 self._log(f"Updated {pv.display_name}.")
-        elif chosen == act_copy and pv is not None:
-            self._copy_pv_settings(pv)
+        elif chosen in copy_actions and pv is not None:
+            keys, prof_idx = copy_actions[chosen]
+            self._copy_pv_settings(pv, keys=keys, profile_index=prof_idx)
         elif chosen == act_paste:
             self._paste_pv_settings(targets)
         elif chosen == act_remove:
             self.remove_pv()
 
-    def _copy_pv_settings(self, pv: PVConfig):
+    def _copy_pv_settings(self, pv: PVConfig, keys=None, profile_index=None):
+        """Fill the clipboard from ``pv``. Either a set of plain attribute
+        ``keys``, or one conditional rule (``profile_index``) together with the
+        dependency PVs its conditions are aligned to."""
         d = pv.to_dict()
-        self._copied_settings = {k: copy.deepcopy(d[k]) for k in self._COPY_KEYS}
+        if profile_index is not None:
+            prof = d["profiles"][profile_index]
+            self._copied_settings = {
+                "gate_pvs": copy.deepcopy(d["gate_pvs"]),
+                "_profile": copy.deepcopy(prof),
+            }
+            self._copied_desc = (f"rule '{_profile_item_text(pv, profile_index, prof)}'")
+        else:
+            keys = tuple(keys or self._COPY_KEYS)
+            self._copied_settings = {k: copy.deepcopy(d[k]) for k in keys}
+            self._copied_desc = {
+                self._COPY_KEYS: "all settings",
+                self._GLOBAL_KEYS: "global limits",
+                self._VALID_KEYS: "valid range",
+                self._GATING_KEYS: "dependencies, rules & global values",
+            }.get(keys, "settings")
         self._copied_from = pv.display_name
-        self._log(f"Copied settings from {pv.display_name} "
-                  "(limits, dependencies, valid range).")
+        self._log(f"Copied {self._copied_desc} from {pv.display_name}.")
 
     def _paste_pv_settings(self, targets: list[PVConfig]):
         if not self._copied_settings or not targets:
             return
+        prof = self._copied_settings.get("_profile")
         names = ", ".join(pv.display_name for pv in targets)
+        detail = ""
+        if prof is not None:
+            detail = ("\n\nThe rule is merged into each PV's rule list "
+                      "(replacing a same-label rule if present) and the "
+                      "dependency PVs are set to the copied ones.")
         if QMessageBox.question(
                 self, "Paste settings",
-                f"Overwrite limits, dependencies and valid range of "
-                f"{len(targets)} PV(s) with the settings copied from "
-                f"{self._copied_from}?\n\n{names}") != QMessageBox.Yes:
+                f"Apply {self._copied_desc} copied from {self._copied_from} "
+                f"to {len(targets)} PV(s)?{detail}\n\n{names}") \
+                != QMessageBox.Yes:
             return
         for pv in targets:
-            for k in self._COPY_KEYS:
-                setattr(pv, k, copy.deepcopy(self._copied_settings[k]))
+            for k, v in self._copied_settings.items():
+                if k != "_profile":
+                    setattr(pv, k, copy.deepcopy(v))
+            if prof is not None:
+                self._merge_profile(pv, copy.deepcopy(prof))
         self._recluster()
         self.model.reset()
         self.graph.refresh_combo()
         self.persist()
-        self._log(f"Pasted settings from {self._copied_from} onto "
+        self._log(f"Pasted {self._copied_desc} from {self._copied_from} onto "
                   f"{len(targets)} PV(s).")
+
+    @staticmethod
+    def _merge_profile(pv: PVConfig, prof: dict):
+        """Insert one conditional rule: replace the target's rule with the same
+        label (if any), otherwise append it."""
+        label = (prof.get("label") or "").strip()
+        for i, existing in enumerate(pv.profiles):
+            if label and (existing.get("label") or "").strip() == label:
+                pv.profiles[i] = prof
+                return
+        pv.profiles.append(prof)
 
     def remove_pv(self):
         pv = self._selected_pv()
@@ -3424,19 +4379,22 @@ class MonitorWidget(QWidget):
         self._log(f"Removed {pv.display_name}.")
 
     def _recluster(self):
-        """Reorder self.pvs so each group's PVs are contiguous.
+        """Reorder self.pvs so each group's PVs are contiguous, and within a
+        group each subgroup's PVs are contiguous too.
 
-        Group order follows first appearance; within-group order is preserved.
-        This keeps the group-header view coherent after edits and drops.
+        Group/subgroup order follows first appearance; order inside a subgroup
+        is preserved. This keeps the header view coherent after edits/drops.
         """
-        buckets: dict[str, list] = {}
+        buckets: dict[str, dict[str, list]] = {}
         order: list[str] = []
         for pv in self.pvs:
             if pv.group not in buckets:
-                buckets[pv.group] = []
+                buckets[pv.group] = {}
                 order.append(pv.group)
-            buckets[pv.group].append(pv)
-        self.pvs[:] = [pv for g in order for pv in buckets[g]]
+            sub = buckets[pv.group]
+            sub.setdefault(pv.subgroup, []).append(pv)
+        self.pvs[:] = [pv for g in order
+                       for pvs in buckets[g].values() for pv in pvs]
 
     def drop_pvs(self, names: list[str], target_disp: int):
         """Move dragged PVs (by name) to a display row; adopt that spot's group.
@@ -3458,29 +4416,37 @@ class MonitorWidget(QWidget):
         after = None           # ...or immediately after this PV
         if cur is None:                                   # dropped past the end
             group = self.pvs[-1].group if self.pvs else ""
+            subgroup = self.pvs[-1].subgroup if self.pvs else ""
         elif cur[0] == "pv":                              # before a PV row
             anchor = cur[1]
-            group = anchor.group
+            group, subgroup = anchor.group, anchor.subgroup
+        elif cur[0] == "subheader":                       # top of that subgroup
+            group, subgroup = cur[1]
+            nxt = disp[target_disp + 1] if target_disp + 1 < n else None
+            anchor = nxt[1] if nxt and nxt[0] == "pv" else None
         else:                                             # on a group header
             prev = disp[target_disp - 1] if target_disp - 1 >= 0 else None
-            if prev is None:                              # top of the first group
-                group = cur[1]
+            if prev is None or prev[0] != "pv":           # top of the first group
+                group, subgroup = cur[1], ""
                 nxt = disp[target_disp + 1] if target_disp + 1 < n else None
                 anchor = nxt[1] if nxt and nxt[0] == "pv" else None
             else:                                         # end of the prior group
                 after = prev[1]
-                group = after.group
+                group, subgroup = after.group, after.subgroup
 
         reduced = [p for p in self.pvs if p.name not in moving_names]
         for p in moving:
             p.group = group
+            p.subgroup = subgroup
 
         if anchor is not None and anchor.name not in moving_names:
             idx = reduced.index(anchor)
         elif after is not None and after.name not in moving_names:
             idx = reduced.index(after) + 1
         else:                                             # end of the target group
-            idxs = [i for i, p in enumerate(reduced) if p.group == group]
+            idxs = [i for i, p in enumerate(reduced)
+                    if p.group == group and p.subgroup == subgroup] \
+                or [i for i, p in enumerate(reduced) if p.group == group]
             idx = (idxs[-1] + 1) if idxs else len(reduced)
 
         reduced[idx:idx] = moving
@@ -3531,6 +4497,7 @@ class MonitorWidget(QWidget):
             self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
             self.timer.start()
             self._log("Monitoring started.")
+            self._backfill_history()
             self._start_poll()
         else:
             self.timer.stop()
@@ -3564,14 +4531,87 @@ class MonitorWidget(QWidget):
         if self.hub.webex.can_listen():
             self._reply("▶ Monitoring auto-resumed (scheduled /stop elapsed).")
 
+    def manage_groups(self):
+        dlg = GroupsDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        assignments = dlg.result_assignments()
+        by_name = {p.name: p for p in self.pvs}
+        new_order: list[PVConfig] = []
+        for name, group, subgroup in assignments:
+            pv = by_name.pop(name, None)
+            if pv is None:
+                continue
+            pv.group = group
+            pv.subgroup = subgroup
+            new_order.append(pv)
+        new_order += list(by_name.values())   # safety net: never lose a PV
+        self.pvs[:] = new_order
+        self._recluster()
+        self.model.reset()
+        self.graph.refresh_combo()
+        self.persist()
+        self._log("Groups updated.")
+
     def poll_now(self):
         self._log("Manual poll.")
         self._start_poll()
+
+    # --- graph history backfill ----------------------------------------
+    def _backfill_history(self):
+        """Pre-fill each PV's history with archive data covering the graph
+        window, so the plot shows the whole window right away instead of only
+        samples collected since monitoring started."""
+        names = [pv.name for pv in self.pvs]
+        if not names:
+            return
+        end = api.now_ns()
+        # Cover the whole kept history, not just the default view, so zooming
+        # or panning back past the graph window still finds data.
+        minutes = max(float(self.settings["graph_window_minutes"]),
+                      float(self.settings["history_minutes"]))
+        start = end - int(minutes * 60e9)
+        ranges = {pv.name: self._valid_range(pv) for pv in self.pvs}
+        sig = _BackfillSignals(self)
+        sig.log.connect(self._log)
+        sig.done.connect(self._on_backfill)
+        self._backfill_sig = sig           # keep signals alive while running
+        QThreadPool.globalInstance().start(_BackfillWorker(
+            sig, names, start, end, float(self.settings["http_timeout_s"]),
+            ranges, self._history_maxlen()))
+        self._log("Fetching archive history for the graph window…")
+
+    def _on_backfill(self, results: dict):
+        filled = 0
+        for name, pts in results.items():
+            rt = self.runtime.get(name)
+            if rt is None or not pts:
+                continue
+            # Only add points older than what live polling has produced, so
+            # re-starting monitoring never duplicates samples.
+            oldest_live = rt.history[0][0] if rt.history else None
+            older = [p for p in pts
+                     if oldest_live is None or p[0] < oldest_live]
+            if not older:
+                continue
+            rt.history = deque(older + list(rt.history),
+                               maxlen=rt.history.maxlen)
+            filled += 1
+        if filled:
+            self._log(f"Backfilled graph history for {filled} PV(s).")
+            self.graph.redraw()
 
     def _start_poll(self):
         monitored = {pv.name for pv in self.pvs}
         names = [pv.name for pv in self.pvs]
         if not names:
+            return
+        # If the previous pass is still fetching, let it finish instead of
+        # invalidating it — otherwise a pass slower than the poll interval
+        # means no result ever lands and the table stays on "no data".
+        if self._poll_inflight:
+            self._log("Previous poll still fetching — skipping this tick "
+                      "(raise Concurrent fetches or the poll interval).")
             return
         # Also fetch any gate PV that isn't already monitored, so its value is
         # available this pass to switch state-dependent thresholds.
@@ -3579,12 +4619,17 @@ class MonitorWidget(QWidget):
         ranges = {pv.name: self._valid_range(pv) for pv in self.pvs}
         self._poll_gen += 1
         gen = self._poll_gen
+        self._poll_inflight = True
         sig = _PollSignals(self)
-        sig.done.connect(lambda res, g=gen: self._on_poll(res)
-                         if g == self._poll_gen else None)
+        sig.done.connect(lambda res, g=gen: self._poll_done(res, g))
         self._poll_sig = sig
         QThreadPool.globalInstance().start(
             _PollWorker(sig, names, dict(self.settings), ranges))
+
+    def _poll_done(self, results: dict, gen: int):
+        self._poll_inflight = False
+        if gen == self._poll_gen:      # stale results (stop/restart) are dropped
+            self._on_poll(results)
 
     def _on_poll(self, results: dict):
         now = api.now_ns()
@@ -3598,10 +4643,11 @@ class MonitorWidget(QWidget):
             res = results.get(pv.name)
             if res is None:
                 continue
-            val, units, last_ts, err, rejected = res
+            val, units, last_ts, err, rejected, raw_val = res
             rt = self.runtime[pv.name]
             prev_rej = rt.rejected_count
             rt.current_value = val
+            rt.raw_value = raw_val
             rt.current_units = units or rt.current_units
             rt.last_update_ns = last_ts or now
             rt.last_error = err
@@ -3617,15 +4663,108 @@ class MonitorWidget(QWidget):
             thr = (pv.profile_thresholds(rt.active_profile)
                    if rt.active_profile is not None else pv.thresholds())
             if pv.enabled and thr.is_active():
-                note = self.evaluator.evaluate(rt.alert, val, thr, now)
+                scale, worsening = self._trend_cooldown_scale(rt, thr, now)
+                note = self.evaluator.evaluate(rt.alert, val, thr, now,
+                                               cooldown_scale=scale)
                 if note is not None:
+                    if worsening and note.kind == "reminder":
+                        note.reason += " — worsening"
                     self._dispatch_alert(pv, rt, note)
             if rt.alert.level == AlertLevel.OK:
                 rt.notify_status = ""      # episode over — clear the status cell
                 rt.notify_error = ""
+        self._check_data_watchdog(results)
         self.model.refresh_all()
         self._refresh_dep_combos()
         self.graph.redraw()
+
+    def _check_data_watchdog(self, results: dict):
+        """Alert once when every monitored PV stops getting data (fetch errors
+        across the board — an archiver/network outage), and once more when it
+        recovers. Distinct from a single PV's own no-data/threshold alerts."""
+        if not self.settings.get("data_watchdog_enabled", True) or not self.pvs:
+            return
+
+        def _is_conn_failure(res) -> bool:
+            if res is None:
+                return True
+            val, _units, _ts, err, rejected, _raw = res
+            return val is None and rejected == 0 and bool(err)
+
+        all_failed = all(_is_conn_failure(results.get(pv.name)) for pv in self.pvs)
+        if all_failed:
+            self._watchdog_fail_streak += 1
+            threshold = max(1, int(self.settings.get("data_watchdog_fail_polls", 2)))
+            if not self._watchdog_bad and self._watchdog_fail_streak >= threshold:
+                self._watchdog_bad = True
+                self._send_watchdog_alert(
+                    AlertLevel.ALARM,
+                    "No data received from any monitored PV for "
+                    f"{self._watchdog_fail_streak} consecutive polls.")
+        else:
+            self._watchdog_fail_streak = 0
+            if self._watchdog_bad:
+                self._watchdog_bad = False
+                self._send_watchdog_alert(AlertLevel.OK, "Data flow restored.")
+
+    def _send_watchdog_alert(self, level: AlertLevel, reason: str):
+        prev = AlertLevel.ALARM if level == AlertLevel.OK else AlertLevel.OK
+        self._log(f"WATCHDOG: {reason}")
+        payload = AlertPayload(
+            level=level, prev_level=prev,
+            pv_name="System", display_name="Data connection",
+            value=0.0, units="", reason=reason,
+            timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="transition")
+        self._launch_alert_worker(payload, Thresholds(), tag="watchdog",
+                                  render_plot=False)
+
+    def _trend_cooldown_scale(self, rt: PVRuntime, thr: Thresholds,
+                              now: int) -> tuple[float, bool]:
+        """Adaptive re-notify pacing for an already-alarming PV, from its recent
+        value trend. Returns (cooldown_scale, worsening).
+
+          - improving (value moving back toward the crossed bound) -> slow the
+            reminders down (scale = slowdown_factor).
+          - worsening (value drifting further past the bound)      -> speed them
+            up (scale = 1 / speedup_factor) and flag worsening=True.
+          - flat / feature off / not yet alarming                  -> scale 1.0.
+
+        Trend direction is mapped to improving/worsening by which side alarmed:
+        a high-side alarm improves as the value falls, a low-side alarm improves
+        as it rises.
+        """
+        s = self.settings
+        if not s.get("trend_adaptive_enabled", True) \
+                or rt.alert.level == AlertLevel.OK:
+            return 1.0, False
+
+        trend = classify_trend(
+            rt.history, now,
+            float(s.get("trend_lookback_minutes", 10.0)) * 60.0,
+            5, float(s.get("trend_flat_frac", 0.02)))
+        if trend == Trend.FLAT:
+            return 1.0, False
+
+        high_side = thr.warn_high is not None or thr.alarm_high is not None
+        low_side = thr.warn_low is not None or thr.alarm_low is not None
+        # If both sides are configured, decide by which bound the value is past.
+        if high_side and low_side:
+            val = rt.current_value
+            hi = thr.alarm_high if thr.alarm_high is not None else thr.warn_high
+            high_side = val is not None and hi is not None and val >= hi
+            low_side = not high_side
+
+        if high_side:
+            improving = trend == Trend.FALLING
+        elif low_side:
+            improving = trend == Trend.RISING
+        else:
+            return 1.0, False
+
+        if improving:
+            return float(s.get("trend_slowdown_factor", 2.0)), False
+        speedup = float(s.get("trend_speedup_factor", 2.0))
+        return (1.0 / speedup if speedup > 0 else 1.0), True
 
     def _dispatch_alert(self, pv: PVConfig, rt: PVRuntime, note):
         self._log(f"ALERT {pv.display_name}: {note.prev_level.label}→"
@@ -3650,7 +4789,7 @@ class MonitorWidget(QWidget):
             rt.notify_error = "no notification channel configured"
 
     def _launch_alert_worker(self, payload: AlertPayload, thr: Thresholds, tag: str,
-                             valid_range=(None, None)) -> bool:
+                             valid_range=(None, None), render_plot: bool = True) -> bool:
         """Start the render+dispatch worker. Returns True if a worker was
         launched, False if there is nothing to send it to."""
         if not self.hub.is_any_configured():
@@ -3658,7 +4797,7 @@ class MonitorWidget(QWidget):
             if tag == "manual":
                 self.btn_sendplot.setEnabled(True)
             return False
-        hours = float(self.settings.get("alert_plot_hours", 12))
+        hours = float(self.settings.get("alert_plot_hours", 12)) if render_plot else 0.0
         timeout = float(self.settings["http_timeout_s"])
         vmin, vmax = valid_range
         sig = _AlertSignals(self)
@@ -3730,8 +4869,9 @@ class MonitorWidget(QWidget):
         self._cmd_last_id = None
         self._cmd_bot_id = None
         self._cmd_poll_inflight = False
+        self._cmd_backoff_until_ns = 0
         self._resolve_bot_id()
-        poll_s = max(1, int(self.settings.get("webex_command_poll_s", 1)))
+        poll_s = max(1, int(self.settings.get("webex_command_poll_s", 5)))
         self._cmd_timer = QTimer(self)
         self._cmd_timer.timeout.connect(self._poll_commands)
         self._cmd_timer.setInterval(poll_s * 1000)
@@ -3775,6 +4915,8 @@ class MonitorWidget(QWidget):
     def _poll_commands(self):
         if not self.hub.webex.can_listen():
             return
+        if api.now_ns() < self._cmd_backoff_until_ns:
+            return   # rate-limited (HTTP 429) — waiting out Retry-After
         if self._cmd_poll_inflight:
             # Watchdog: a poll worker that never reports back (dropped queued
             # signal, thread-pool starvation, or a network stall around a
@@ -3786,7 +4928,7 @@ class MonitorWidget(QWidget):
             # it as lost, discard its result (bump gen), and let a fresh poll
             # proceed so the listener self-heals without an app restart.
             timeout = float(self.settings.get("http_timeout_s", 10.0))
-            poll_s = max(1, int(self.settings.get("webex_command_poll_s", 1)))
+            poll_s = max(1, int(self.settings.get("webex_command_poll_s", 5)))
             max_wait_ns = int(max(poll_s * 5, timeout * 2 + 5) * 1e9)
             if api.now_ns() - self._cmd_poll_started_ns < max_wait_ns:
                 return   # previous poll still plausibly running — never overlap
@@ -3818,6 +4960,10 @@ class MonitorWidget(QWidget):
             self._cmd_last_logged_error = err
         elif not err:
             self._cmd_last_logged_error = ""
+        ra = getattr(self.hub.webex, "retry_after_s", 0.0)
+        if ra:
+            self._cmd_backoff_until_ns = api.now_ns() + int(ra * 1e9)
+            self.hub.webex.retry_after_s = 0.0
         if not self._cmd_primed:
             # Establish a baseline WITHOUT processing backlog. Only prime on a
             # *successful* poll: priming on a failed one (newest_id=None) would
@@ -3905,6 +5051,8 @@ class MonitorWidget(QWidget):
                         f"- {p.display_name}" for p in self.pvs))
             elif cmd == "/status":
                 self._reply(self._cmd_status())
+            elif cmd == "/alarms":
+                self._reply(self._cmd_alarms())
             elif cmd == "/start":
                 self.toggle_monitoring(True)
                 self._reply("▶ Monitoring started.")
@@ -3954,6 +5102,17 @@ class MonitorWidget(QWidget):
                 else:
                     self._send_plot_for(pv, tag="cmd")
                     self._reply(f"📈 Sending plot for {pv.display_name}…")
+            elif cmd == "/datawatchdog":
+                if args and args[0].lower() in ("on", "off"):
+                    enabled = args[0].lower() == "on"
+                    self.settings["data_watchdog_enabled"] = enabled
+                    self.persist()
+                    self._reply(f"Data watchdog {'enabled' if enabled else 'disabled'}.")
+                else:
+                    state = "on" if self.settings.get(
+                        "data_watchdog_enabled", True) else "off"
+                    self._reply(f"Data watchdog is {state}. "
+                                "Use `/datawatchdog on|off` to change.")
             elif cmd in ("/enable", "/disable"):
                 pv, err = self._find_pv(" ".join(args))
                 if not pv:
@@ -3973,12 +5132,15 @@ class MonitorWidget(QWidget):
         return (
             "**PV Monitor commands:**\n"
             "- `/status` — all PVs + values + state\n"
+            "- `/alarms` — only PVs currently in warning/alarm\n"
             "- `/list` — list configured PVs\n"
             "- `/plot <pv>` — send current plot of a PV\n"
             "- `/start` — monitoring on\n"
             "- `/stop [hours]` — monitoring off; with hours, auto-resume later "
             "(e.g. `/stop 10`)\n"
             "- `/enable <pv>` `/disable <pv>` — alerting per PV\n"
+            "- `/datawatchdog on|off` — toggle the 'no data at all' alert "
+            "(no args: show current state)\n"
             "- `/graph <pv|all>` — set the live graph\n"
             "- `/window <minutes>` — graph time window\n"
             "- `/yaxis <lo> <hi>` | `/yaxis auto` — graph Y range")
@@ -3989,10 +5151,20 @@ class MonitorWidget(QWidget):
         lines = []
         for p in self.pvs:
             rt = self.runtime.get(p.name)
-            val = _fmt(rt.current_value) if rt else "–"
+            bad = bool(rt and rt.bad_data and rt.current_value is None and p.enabled)
+            if rt and rt.current_value is not None:
+                val = _fmt(rt.current_value)
+            elif bad and rt.raw_value is not None:
+                val = _fmt(rt.raw_value)
+            elif rt:
+                val = "–"
+            else:
+                val = "–"
             units = (rt.current_units if rt and rt.current_units else p.units) or ""
             if not p.enabled:
                 state = "off"
+            elif bad:
+                state = "bad data"
             elif rt and rt.display_level() is not None:
                 state = rt.display_level().label.lower()
             else:
@@ -4000,6 +5172,22 @@ class MonitorWidget(QWidget):
             lines.append(f"- **{p.display_name}**: {val} {units} [{state}]")
         mon = "MONITORING" if self._monitoring else "stopped"
         return f"**Status ({mon}):**\n" + "\n".join(lines)
+
+    def _cmd_alarms(self) -> str:
+        lines = []
+        for p in self.pvs:
+            if not p.enabled:
+                continue
+            rt = self.runtime.get(p.name)
+            level = rt.display_level() if rt else None
+            if level not in (AlertLevel.WARNING, AlertLevel.ALARM):
+                continue
+            val = _fmt(rt.current_value) if rt else "–"
+            units = (rt.current_units if rt and rt.current_units else p.units) or ""
+            lines.append(f"- **{p.display_name}**: {val} {units} [{level.label.lower()}]")
+        if not lines:
+            return "✅ No PVs currently in warning/alarm."
+        return "**Current alarms:**\n" + "\n".join(lines)
 
     # --- simulate ------------------------------------------------------
     def simulate_alert(self):
@@ -4024,6 +5212,12 @@ class MonitorWidget(QWidget):
         seq = [mid, excursion, excursion, excursion, mid, mid]
         self._log(f"Simulating alert on {pv.display_name} (bypassing CPVA)…")
         self._sim_state = AlertState()
+        # The simulation runs in seconds, so skip the settle wait — it would
+        # hold every simulated alert for minutes and nothing would be sent.
+        sim_cfg = self._eval_config()
+        sim_cfg.settle_minutes = 0.0
+        sim_cfg.stable_seconds = 0.0   # same reason — the sim runs in seconds
+        self._sim_eval = AlertEvaluator(sim_cfg)
         self._sim_pv = pv
         self._sim_seq = list(seq)
         if self._sim_timer is None:
@@ -4043,7 +5237,7 @@ class MonitorWidget(QWidget):
         rt.current_value = v
         rt.last_update_ns = api.now_ns()
         rt.history.append((rt.last_update_ns, v))
-        note = self.evaluator.evaluate(self._sim_state, v, self._active_thresholds(pv),
+        note = self._sim_eval.evaluate(self._sim_state, v, self._active_thresholds(pv),
                                        rt.last_update_ns)
         # Reflect simulated level in the table without touching the real alert state.
         rt.alert.level = self._sim_state.level

@@ -5,16 +5,24 @@
     "avg_last_n": 20,
     "sample_window_s": 60,
     "http_timeout_s": 10.0,
-    "renotify_cooldown_minutes": 10,
+    "renotify_cooldown_minutes": 60,
     "recovery_notify": true,
     "debounce_count": 2,
-    "hysteresis_frac": 0.05,
+    "settle_minutes": 5.0,
+    "stable_seconds": 120,
+    "trend_adaptive_enabled": true,
+    "trend_lookback_minutes": 10.0,
+    "trend_flat_frac": 0.02,
+    "trend_speedup_factor": 2.0,
+    "trend_slowdown_factor": 2.0,
     "history_minutes": 720,
+    "data_watchdog_enabled": true,
+    "data_watchdog_fail_polls": 2,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
-    "valid_min_default": 5.0,
-    "valid_max_default": 80.0,
+    "valid_min_default": 0.0,
+    "valid_max_default": 50.0,
     "graph_window_minutes": 360,
     "start_monitoring_on_launch": true,
     "alert_plot_hours": 4,
@@ -53,8 +61,9 @@
       }
     ],
     "webex_commands_enabled": true,
-    "webex_command_poll_s": 2,
-    "webex_command_allowlist": []
+    "webex_command_poll_s": 10,
+    "webex_command_allowlist": [],
+    "hysteresis_frac": 0.05
   },
   "pvs": [
     {
@@ -62,13 +71,16 @@
       "display_name": "DA1 Chiller",
       "units": "DegC",
       "group": "Temperatures",
+      "subgroup": "Chillers",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "show_in_graph": true,
+      "warn_low": 7.5,
+      "warn_high": 22.0,
+      "alarm_low": 7.0,
+      "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus"
+        "L3-SIS-KEY:HighPowerStatus",
+        "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
         {
@@ -77,6 +89,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              0.2,
+              0.2
             ]
           ],
           "warn_low": 16.2,
@@ -90,6 +106,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              2.3,
+              2.3
             ]
           ],
           "warn_low": 13.8,
@@ -108,13 +128,16 @@
       "display_name": "DA2 Chiller",
       "units": "DegC",
       "group": "Temperatures",
+      "subgroup": "Chillers",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "show_in_graph": true,
+      "warn_low": 7.5,
+      "warn_high": 22.0,
+      "alarm_low": 7.0,
+      "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus"
+        "L3-SIS-KEY:HighPowerStatus",
+        "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
         {
@@ -123,6 +146,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              0.2,
+              0.2
             ]
           ],
           "warn_low": 14.6,
@@ -136,6 +163,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              2.0,
+              3.0
             ]
           ],
           "warn_low": 12.1,
@@ -154,13 +185,16 @@
       "display_name": "DA3 Chiller",
       "units": "DegC",
       "group": "Temperatures",
+      "subgroup": "Chillers",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "show_in_graph": true,
+      "warn_low": 7.5,
+      "warn_high": 22.0,
+      "alarm_low": 7.0,
+      "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus"
+        "L3-SIS-KEY:HighPowerStatus",
+        "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
         {
@@ -169,6 +203,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              0.2,
+              0.2
             ]
           ],
           "warn_low": 11.4,
@@ -182,6 +220,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              2.0,
+              3.0
             ]
           ],
           "warn_low": 8.6,
@@ -200,13 +242,16 @@
       "display_name": "DA4 Chiller",
       "units": "DegC",
       "group": "Temperatures",
+      "subgroup": "Chillers",
       "enabled": true,
-      "warn_low": 16.0,
-      "warn_high": 21.0,
-      "alarm_low": 14.0,
-      "alarm_high": 23.0,
+      "show_in_graph": true,
+      "warn_low": 7.5,
+      "warn_high": 22.0,
+      "alarm_low": 7.0,
+      "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus"
+        "L3-SIS-KEY:HighPowerStatus",
+        "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
         {
@@ -215,6 +260,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              0.2,
+              0.2
             ]
           ],
           "warn_low": 11.1,
@@ -228,6 +277,10 @@
             [
               1.0,
               1.0
+            ],
+            [
+              2.0,
+              3.0
             ]
           ],
           "warn_low": 8.2,
@@ -246,17 +299,19 @@
       "display_name": "He Chiller",
       "units": "DegC",
       "group": "Temperatures",
+      "subgroup": "Chillers",
       "enabled": true,
-      "warn_low": 15.8,
+      "show_in_graph": true,
+      "warn_low": 15.5,
       "warn_high": 23.0,
-      "alarm_low": 15.5,
+      "alarm_low": 15.0,
       "alarm_high": 25.0,
       "gate_pvs": [
         "L3-SIS-KEY:HighPowerStatus"
       ],
       "profiles": [
         {
-          "label": "",
+          "label": "Operations",
           "conds": [
             [
               1.0,
@@ -288,17 +343,19 @@
       "display_name": "Utility Chiller",
       "units": "DegC",
       "group": "Temperatures",
+      "subgroup": "Chillers",
       "enabled": true,
-      "warn_low": 19.5,
-      "warn_high": 20.5,
-      "alarm_low": 19.0,
-      "alarm_high": 21.0,
+      "show_in_graph": true,
+      "warn_low": 19.0,
+      "warn_high": 21.5,
+      "alarm_low": 18.0,
+      "alarm_high": 22.5,
       "gate_pvs": [
         "L3-SIS-KEY:LowPowerStatus"
       ],
       "profiles": [
         {
-          "label": "",
+          "label": "Operation",
           "conds": [
             [
               1.0,
@@ -327,13 +384,31 @@
       "display_name": "L3-UTIL-DAQ-TE902 - Temp",
       "units": "",
       "group": "Temperatures",
+      "subgroup": "Heat Exchangers",
       "enabled": true,
-      "warn_low": null,
-      "warn_high": null,
-      "alarm_low": null,
-      "alarm_high": null,
-      "gate_pvs": [],
-      "profiles": [],
+      "show_in_graph": true,
+      "warn_low": 17.5,
+      "warn_high": 20.5,
+      "alarm_low": 16.0,
+      "alarm_high": 22.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "Operations",
+          "conds": [
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "warn_low": 18.5,
+          "warn_high": 20.0,
+          "alarm_low": 18.0,
+          "alarm_high": 21.0
+        }
+      ],
       "valid_min": null,
       "valid_max": null,
       "learned_at": null,
@@ -344,7 +419,79 @@
       "display_name": "L3-UTIL-DAQ-TE903 - Temp",
       "units": "",
       "group": "Temperatures",
+      "subgroup": "Heat Exchangers",
       "enabled": true,
+      "show_in_graph": true,
+      "warn_low": 16.5,
+      "warn_high": 20.5,
+      "alarm_low": 16.0,
+      "alarm_high": 22.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "Operations",
+          "conds": [
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "warn_low": 17.0,
+          "warn_high": 19.0,
+          "alarm_low": 16.0,
+          "alarm_high": 20.0
+        }
+      ],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-TE904:Temp",
+      "display_name": "L3-UTIL-DAQ-TE904 - Temp",
+      "units": "DegC",
+      "group": "Temperatures",
+      "subgroup": "Heat Exchangers",
+      "enabled": true,
+      "show_in_graph": true,
+      "warn_low": 19.0,
+      "warn_high": 21.0,
+      "alarm_low": 18.0,
+      "alarm_high": 22.0,
+      "gate_pvs": [
+        "L3-SIS-KEY:HighPowerStatus"
+      ],
+      "profiles": [
+        {
+          "label": "Operations",
+          "conds": [
+            [
+              1.0,
+              1.0
+            ]
+          ],
+          "warn_low": 17.0,
+          "warn_high": 19.0,
+          "alarm_low": 16.0,
+          "alarm_high": 20.0
+        }
+      ],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-TE901:Temp",
+      "display_name": "L3-UTIL-DAQ-TE901 - Temp",
+      "units": "",
+      "group": "Temperatures",
+      "subgroup": "Heat Exchangers",
+      "enabled": false,
+      "show_in_graph": true,
       "warn_low": null,
       "warn_high": null,
       "alarm_low": null,
@@ -357,11 +504,402 @@
       "learn_stats": null
     },
     {
-      "name": "L3-UTIL-DAQ-TE904:Temp",
-      "display_name": "L3-UTIL-DAQ-TE904 - Temp",
-      "units": "",
-      "group": "Temperatures",
+      "name": "L3-UTIL-DAQ-PresSource:Press",
+      "display_name": "L3-UTIL-DAQ-PresSource - Press",
+      "units": "Torr",
+      "group": "Pressures",
+      "subgroup": "",
       "enabled": true,
+      "show_in_graph": true,
+      "warn_low": 0.0,
+      "warn_high": 0.09,
+      "alarm_low": 0.0,
+      "alarm_high": 0.01,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": "2026-07-16T13:39:25+02:00",
+      "learn_stats": {
+        "center": 0.003447,
+        "spread": 0.000819,
+        "method": "median_mad",
+        "n": 350798,
+        "rejected": 0,
+        "days": 7,
+        "window_start": "2026-07-09T13:38:59+02:00",
+        "window_end": "2026-07-16T13:38:59+02:00"
+      }
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresBetaSP6:Press",
+      "display_name": "L3-UTIL-DAQ-PresBetaSP6 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL1:Press",
+      "display_name": "PLFE VRT1",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL2:Press",
+      "display_name": "PLFE VRT2",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL3:Press",
+      "display_name": "PLFE VRT3",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL4:Press",
+      "display_name": "PLFE VRT4",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTSP1:Press",
+      "display_name": "GPL Transport VRT1",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTSP2:Press",
+      "display_name": "GPL Transport VRT2",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTSP3:Press",
+      "display_name": "Alpha Vessel",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTSP4:Press",
+      "display_name": "Alpha Output VRT1",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTSP6:Press",
+      "display_name": "GPL transport tube",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT1+LT2",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL5:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL5 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT7",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL6:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL6 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT7",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL7:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL7 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT7",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL8:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL8 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT7",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL9:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL9 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT6",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL11:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL11 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT6",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL12:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL12 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT6",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL10:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL10 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT6",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTPL13:Press",
+      "display_name": "L3-UTIL-DAQ-PresVRTPL13 - Press",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT6",
+      "enabled": false,
+      "show_in_graph": false,
+      "warn_low": null,
+      "warn_high": null,
+      "alarm_low": null,
+      "alarm_high": null,
+      "gate_pvs": [],
+      "profiles": [],
+      "valid_min": null,
+      "valid_max": null,
+      "learned_at": null,
+      "learn_stats": null
+    },
+    {
+      "name": "L3-UTIL-DAQ-PresVRTSP5:Press",
+      "display_name": "PCM3 Telescope",
+      "units": "",
+      "group": "Pressures",
+      "subgroup": "LT6",
+      "enabled": false,
+      "show_in_graph": false,
       "warn_low": null,
       "warn_high": null,
       "alarm_low": null,

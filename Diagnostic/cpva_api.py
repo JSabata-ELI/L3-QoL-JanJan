@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
 
 TZ_PRAGUE = ZoneInfo("Europe/Prague")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -52,6 +53,14 @@ CHUNK_SIZE_NS = int(3600 * 1e9)   # 1 hour in nanoseconds
 
 _SESSION = requests.Session()
 _SESSION.verify = False
+# The PV Monitor polls many channels concurrently. urllib3's default pool
+# (10 connections) throttles that and forces connection churn -- each evicted
+# connection means a fresh TLS handshake on the next request, which is slower
+# than the fetch itself. Size the pool to the largest poll concurrency the UI
+# allows (poll_max_workers, capped at 64) so the pool is never the bottleneck.
+_adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+_SESSION.mount("https://", _adapter)
+_SESSION.mount("http://", _adapter)
 
 
 # ---------------------------------------------------------------------------
@@ -82,18 +91,6 @@ def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
     return data
 
 
-def _chunk_is_night(chunk_start_ns: int, chunk_end_ns: int) -> bool:
-    """Return True if the entire chunk is within 22:00-06:00 Prague time (no data expected)."""
-    now_ns_val = int(datetime.now(timezone.utc).timestamp() * 1e9)
-    # Never skip chunks that extend to current time or future
-    if chunk_end_ns >= now_ns_val - 60 * 1_000_000_000:  # within 1 min of now
-        return False
-    dt_start = datetime.fromtimestamp(chunk_start_ns / 1e9, tz=TZ_PRAGUE)
-    dt_end   = datetime.fromtimestamp(chunk_end_ns   / 1e9, tz=TZ_PRAGUE)
-    def is_night(h): return h >= 22 or h < 6
-    return is_night(dt_start.hour) and is_night(dt_end.hour)
-
-
 def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
                                timeout: float = CPVA_HTTP_TIMEOUT,
                                log_fn=None,
@@ -110,8 +107,7 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
 
     while cs < end_ns:
         ce = min(cs + CHUNK_SIZE_NS, end_ns)
-        if not _chunk_is_night(cs, ce):
-            chunks.append((i, cs, ce))
+        chunks.append((i, cs, ce))
         i += 1
         cs = ce
 

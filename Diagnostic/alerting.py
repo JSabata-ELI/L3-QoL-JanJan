@@ -11,8 +11,15 @@ Design:
     a warn bound, else OK. Any bound may be None (that side is not checked).
   - Debounce: a new severity must persist `debounce_count` consecutive polls
     before it is committed (filters noise on top of the value averaging).
-  - Hysteresis: de-escalation requires the value to move back inside by a
-    deadband (fraction of the threshold span) -> no flapping at the boundary.
+  - Settle: when a PV first leaves OK, notifications are held for
+    `settle_minutes` to let a transient excursion stabilise. When the window
+    closes, one message is sent if the PV is still in Warning/Alarm; an
+    excursion that recovered within the window stays completely silent.
+  - Stability hold: a committed transition is only announced after the level
+    has stayed unchanged for `stable_seconds`; every further transition inside
+    the window restarts the clock. A value oscillating across a limit thus
+    sends nothing until it sticks — and nothing at all if it ends up back at
+    the level it started from.
   - Notify only on a committed transition; re-notify a stuck WARNING/ALARM at
     most every `renotify_cooldown_minutes`. NODATA (value None) never alerts.
 
@@ -72,6 +79,18 @@ class AlertState:
     first_notified_ns: int = 0
     pending_level: Optional[AlertLevel] = None
     pending_count: int = 0
+    # Settle window: when a PV first leaves OK, notifications are held until
+    # this deadline to give the value a chance to stabilise. 0 = not settling.
+    settle_until_ns: int = 0
+    # Worst committed level seen during the settle window (for the summary).
+    settle_peak_level: AlertLevel = AlertLevel.OK
+    # Stability hold: when a transition commits, the notification is held
+    # until the level has stayed unchanged for `stable_seconds`. Every further
+    # transition restarts the clock. 0 = no hold pending.
+    hold_since_ns: int = 0
+    # Level in force before the (possibly flapping) episode began; the eventual
+    # message reports prev -> current, or nothing if it flapped back to prev.
+    hold_prev_level: AlertLevel = AlertLevel.OK
 
 
 @dataclass
@@ -87,9 +106,18 @@ class Notification:
 @dataclass
 class EvalConfig:
     debounce_count: int = 2
-    hysteresis_frac: float = 0.05
     renotify_cooldown_minutes: float = 30.0
     recovery_notify: bool = True
+    # When a PV first leaves OK, hold every notification for this many minutes
+    # so a transient excursion can settle. After the wait, one message is sent
+    # only if the PV is still in Warning/Alarm; if it recovered within the
+    # window, nothing is sent. 0 = notify immediately (legacy behaviour).
+    settle_minutes: float = 5.0
+    # A committed transition is only announced once the level has stayed
+    # unchanged for this many seconds; each further transition restarts the
+    # clock, so a value oscillating across a limit stays silent until it
+    # sticks. 0 = announce immediately (legacy behaviour).
+    stable_seconds: float = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -106,36 +134,14 @@ def _raw_severity(value: float, thr: Thresholds) -> AlertLevel:
     return AlertLevel.OK
 
 
-def _deadband(thr: Thresholds, frac: float) -> float:
-    """Hysteresis deadband, scaled from the threshold span."""
-    if frac <= 0:
-        return 0.0
-    if thr.warn_low is not None and thr.warn_high is not None:
-        return frac * abs(thr.warn_high - thr.warn_low)
-    if thr.alarm_low is not None and thr.alarm_high is not None:
-        return frac * abs(thr.alarm_high - thr.alarm_low)
-    # One-sided thresholds: scale from the magnitude of whatever bound exists.
-    for b in (thr.warn_low, thr.warn_high, thr.alarm_low, thr.alarm_high):
-        if b is not None and b != 0:
-            return frac * abs(b)
-    return 0.0
-
-
-def _tightened(thr: Thresholds, deadband: float) -> Thresholds:
-    """Pull every bound inward by the deadband (stricter -> used for recovery)."""
-    return Thresholds(
-        warn_low   = thr.warn_low   + deadband if thr.warn_low   is not None else None,
-        warn_high  = thr.warn_high  - deadband if thr.warn_high  is not None else None,
-        alarm_low  = thr.alarm_low  + deadband if thr.alarm_low  is not None else None,
-        alarm_high = thr.alarm_high - deadband if thr.alarm_high is not None else None,
-    )
-
-
 def fmt_value(x: float) -> str:
-    """Format a measured value for messages: always at least one decimal
-    (tenths), e.g. 20 -> '20.0', 20.013 -> '20.0'. Kept consistent across all
-    channels so a reading never shows as a bare integer."""
-    return f"{x:.1f}"
+    """Format a measured value for messages: at least one decimal for
+    ordinary magnitudes (20 -> '20.0', 20.013 -> '20.0'), but significant
+    digits for small ones so e.g. a pressure of 0.0104 Torr doesn't collapse
+    to '0.0'. Kept consistent across all channels."""
+    if x == 0 or abs(x) >= 0.1:
+        return f"{x:.1f}"
+    return f"{x:.3g}"
 
 
 def describe_reason(level: AlertLevel, value: float, thr: Thresholds) -> str:
@@ -148,7 +154,86 @@ def describe_reason(level: AlertLevel, value: float, thr: Thresholds) -> str:
         return f"{name} low: {fmt_value(value)} ≤ {lo:g}"
     if hi is not None and value >= hi:
         return f"{name} high: {fmt_value(value)} ≥ {hi:g}"
-    return f"{name}: {fmt_value(value)}"
+    # Committed level no longer matches the raw bounds: the value is back
+    # inside the limits but the recovery hasn't finished debouncing /
+    # stabilising yet.
+    return (f"{name} held: {fmt_value(value)} is back within limits, "
+            f"recovery pending")
+
+
+# ---------------------------------------------------------------------------
+# Recent-trend classification (pure) — used to speed up / slow down the
+# re-notify reminders of an already-alarming PV. Kept free of Qt/history
+# objects so it can be unit tested: the caller passes raw (timestamp, value)
+# samples read from wherever it keeps them.
+# ---------------------------------------------------------------------------
+
+class Trend(IntEnum):
+    FALLING = -1
+    FLAT = 0
+    RISING = 1
+
+
+def classify_trend(samples, now_ns: int, lookback_s: float,
+                   n_windows: int = 5, flat_frac: float = 0.02) -> Trend:
+    """Classify the recent direction of a value from time-stamped samples.
+
+    `samples` is any iterable of (timestamp_ns, value) pairs (any order); only
+    those within the last `lookback_s` seconds of `now_ns` are considered. That
+    span is split into `n_windows` overlapping windows (50% overlap); each
+    window's mean is taken, ordered old -> new. The classification is:
+
+      - FLAT if there is too little data (< 2 non-empty windows), if the
+        relative change between the oldest and newest window means is smaller
+        than `flat_frac`, or if the per-window means do not move consistently
+        in one direction (choppy data).
+      - RISING / FALLING otherwise, describing the raw value only. The caller
+        maps that to "improving" vs "worsening" using which bound alarmed.
+
+    Overlapping, pre-averaged windows make this robust to single-sample noise
+    and stop slow wander from being read as a real local trend.
+    """
+    if lookback_s <= 0 or n_windows < 2:
+        return Trend.FLAT
+
+    start_ns = now_ns - int(lookback_s * 1e9)
+    pts = [(t, v) for (t, v) in samples
+           if v is not None and t >= start_ns and t <= now_ns]
+    if len(pts) < n_windows:
+        return Trend.FLAT
+    pts.sort(key=lambda p: p[0])
+
+    span_ns = now_ns - start_ns
+    # width = span * 2/(n+1), step = width/2  =>  n windows with 50% overlap
+    # tiling [start, now]; window i covers [start + i*step, start + i*step + width].
+    width_ns = span_ns * 2.0 / (n_windows + 1)
+    step_ns = width_ns / 2.0
+
+    means: list[float] = []
+    for i in range(n_windows):
+        w_lo = start_ns + i * step_ns
+        w_hi = w_lo + width_ns
+        vals = [v for (t, v) in pts if w_lo <= t <= w_hi]
+        if vals:
+            means.append(sum(vals) / len(vals))
+    if len(means) < 2:
+        return Trend.FLAT
+
+    mean_old, mean_new = means[0], means[-1]
+    denom = max(abs(mean_old), 1e-12)
+    rel_change = (mean_new - mean_old) / denom
+    if abs(rel_change) < flat_frac:
+        return Trend.FLAT
+
+    overall = 1 if mean_new > mean_old else -1
+    # Consistency guard: the majority of consecutive steps must agree with the
+    # overall direction, otherwise the data is choppy and we call it FLAT.
+    steps = [means[i + 1] - means[i] for i in range(len(means) - 1)]
+    agree = sum(1 for d in steps if (d > 0) == (overall > 0) and d != 0)
+    if agree * 2 < len(steps):
+        return Trend.FLAT
+
+    return Trend.RISING if overall > 0 else Trend.FALLING
 
 
 # ---------------------------------------------------------------------------
@@ -160,12 +245,19 @@ class AlertEvaluator:
         self.config = config or EvalConfig()
 
     def evaluate(self, state: AlertState, value: Optional[float],
-                 thr: Thresholds, now_ns: int) -> Optional[Notification]:
+                 thr: Thresholds, now_ns: int,
+                 cooldown_scale: float = 1.0) -> Optional[Notification]:
         """Update `state` in place; return a Notification to send, or None.
 
         value is None (NODATA) leaves the committed level untouched and never
         alerts; it only clears any pending debounce so a gap doesn't commit a
         stale transition.
+
+        `cooldown_scale` stretches (>1) or shrinks (<1) only the re-notify
+        reminder interval for a stuck WARNING/ALARM — the caller sets it from
+        the value's recent trend (improving -> slower, worsening -> faster).
+        The default 1.0 leaves the reminder rhythm exactly as configured and
+        affects nothing else in the state machine.
         """
         cfg = self.config
 
@@ -176,15 +268,8 @@ class AlertEvaluator:
 
         committed = state.level
 
-        # --- target severity with hysteresis -------------------------------
-        raw = _raw_severity(value, thr)
-        if raw >= committed:
-            target = raw                      # escalation is immediate
-        else:
-            db = _deadband(thr, cfg.hysteresis_frac)
-            target = _raw_severity(value, _tightened(thr, db))
-            if target > committed:            # safety clamp
-                target = committed
+        # --- target severity: the raw thresholds, nothing else --------------
+        target = _raw_severity(value, thr)
 
         # --- debounce ------------------------------------------------------
         if target == committed:
@@ -198,12 +283,41 @@ class AlertEvaluator:
                 state.pending_count = 1
 
             if state.pending_count >= max(1, cfg.debounce_count):
-                return self._commit(state, target, value, thr, now_ns)
+                note = self._commit(state, target, value, thr, now_ns)
+                # A commit while a settle window is open is suppressed (note is
+                # None) — fall through so the window can resolve this pass.
+                if note is not None or not state.settle_until_ns:
+                    return note
+
+        # --- settle window: held notifications resolve here -----------------
+        if state.settle_until_ns:
+            if now_ns < state.settle_until_ns:
+                return None                     # still giving it time to settle
+            return self._resolve_settle(state, value, thr, now_ns)
+
+        # --- stability hold: announce only once the level stops changing ----
+        if state.hold_since_ns:
+            stable_ns = int(cfg.stable_seconds * 1e9)
+            if now_ns - state.hold_since_ns < stable_ns:
+                return None                     # still waiting for it to stick
+            prev = state.hold_prev_level
+            state.hold_since_ns = 0
+            state.hold_prev_level = AlertLevel.OK
+            if state.level == prev or not self._should_notify(prev, state.level):
+                return None      # flapped back to where it started — silent
+            state.last_notified_ns = now_ns
+            if state.level != AlertLevel.OK and state.first_notified_ns == 0:
+                state.first_notified_ns = now_ns
+            reason = (describe_reason(state.level, value, thr)
+                      + f" — stable for {cfg.stable_seconds:g} s")
+            return Notification(level=state.level, prev_level=prev,
+                                value=value, reason=reason, kind="transition")
 
         # --- re-notify cooldown for a stuck WARNING/ALARM ------------------
         if committed in (AlertLevel.WARNING, AlertLevel.ALARM) and \
                 cfg.renotify_cooldown_minutes > 0:
-            cooldown_ns = int(cfg.renotify_cooldown_minutes * 60 * 1e9)
+            scale = cooldown_scale if cooldown_scale > 0 else 1.0
+            cooldown_ns = int(cfg.renotify_cooldown_minutes * 60 * 1e9 * scale)
             if now_ns - state.last_notified_ns >= cooldown_ns:
                 state.last_notified_ns = now_ns
                 return Notification(
@@ -223,16 +337,64 @@ class AlertEvaluator:
         if target == AlertLevel.OK:
             state.first_notified_ns = 0        # episode ended — arm for the next
 
-        notify = self._should_notify(prev, target)
-        if notify:
-            state.last_notified_ns = now_ns
-            if target != AlertLevel.OK and state.first_notified_ns == 0:
-                state.first_notified_ns = now_ns
-            return Notification(
-                level=target, prev_level=prev, value=value,
-                reason=describe_reason(target, value, thr), kind="transition",
-            )
-        return None
+        settle_ns = int(self.config.settle_minutes * 60 * 1e9)
+        if settle_ns > 0:
+            if state.settle_until_ns:
+                # Window already open: track the worst level, stay silent.
+                if target > state.settle_peak_level:
+                    state.settle_peak_level = target
+                return None
+            if prev == AlertLevel.OK and target != AlertLevel.OK \
+                    and not state.hold_since_ns:
+                # First departure from OK: open the settle window instead of
+                # notifying right away. (Not while a stability hold is open —
+                # the hold already covers the flapping episode.)
+                state.settle_until_ns = now_ns + settle_ns
+                state.settle_peak_level = target
+                return None
+
+        if not self._should_notify(prev, target):
+            return None
+
+        stable_ns = int(self.config.stable_seconds * 1e9)
+        if stable_ns > 0:
+            # Don't announce yet: (re)start the stability clock. The level in
+            # force before the episode began is kept, so the eventual message
+            # reports the true transition — or nothing if it flapped back.
+            if not state.hold_since_ns:
+                state.hold_prev_level = prev
+            state.hold_since_ns = now_ns or 1   # 0 would read as "no hold"
+            return None
+
+        state.last_notified_ns = now_ns
+        if target != AlertLevel.OK and state.first_notified_ns == 0:
+            state.first_notified_ns = now_ns
+        return Notification(
+            level=target, prev_level=prev, value=value,
+            reason=describe_reason(target, value, thr), kind="transition",
+        )
+
+    def _resolve_settle(self, state: AlertState, value: float,
+                        thr: Thresholds, now_ns: int) -> Optional[Notification]:
+        """Close an expired settle window and report the state it ended in."""
+        mins = self.config.settle_minutes
+        state.settle_until_ns = 0
+        state.settle_peak_level = AlertLevel.OK
+        level = state.level
+
+        if level == AlertLevel.OK:
+            # Excursion came and went within the window. Nothing was ever
+            # announced, so stay silent — an all-clear for an alert nobody
+            # saw is just noise.
+            return None
+
+        state.last_notified_ns = now_ns
+        if state.first_notified_ns == 0:
+            state.first_notified_ns = now_ns
+        reason = (describe_reason(level, value, thr)
+                  + f" — did not settle within {mins:g} min")
+        return Notification(level=level, prev_level=AlertLevel.OK,
+                            value=value, reason=reason, kind="transition")
 
     def _should_notify(self, prev: AlertLevel, new: AlertLevel) -> bool:
         if new > prev:
@@ -494,6 +656,12 @@ class WebexNotifier:
         self.listen_room_id = listen_room_id or (self.room_ids[0] if self.room_ids else "")
         self.timeout = timeout
         self.last_error: str = ""
+        # Set when Webex answers HTTP 429; the poller reads it and pauses for
+        # that many seconds (Retry-After header) before polling again.
+        self.retry_after_s: float = 0.0
+        # Group spaces 403 unless mentionedPeople=me is set. Once we learn
+        # that, keep using the filter instead of paying two requests per poll.
+        self._mentioned_only = False
         # IDs of messages this bot itself posted — a hard backstop against the
         # bot reading back and "replying to" its own messages (personId
         # filtering in the caller can fail transiently; this cannot, since it
@@ -585,6 +753,16 @@ class WebexNotifier:
     def _bot_headers(self) -> dict:
         return {"Authorization": f"Bearer {_resolve_secret(self.bot_token)}"}
 
+    def _note_rate_limit(self, resp) -> None:
+        """Record a 429 so the caller can honour Retry-After instead of hammering."""
+        try:
+            ra = float(resp.headers.get("Retry-After", "") or 30.0)
+        except (TypeError, ValueError):
+            ra = 30.0
+        self.retry_after_s = min(max(ra, 5.0), 600.0)
+        self.last_error = (f"HTTP 429: rate limited by Webex — pausing polls "
+                           f"for {self.retry_after_s:.0f}s (Retry-After)")
+
     def get_me_id(self) -> Optional[str]:
         """Return the bot's own personId (to skip its own messages). None on error."""
         if not self.can_listen():
@@ -595,6 +773,9 @@ class WebexNotifier:
             if 200 <= resp.status_code < 300:
                 self.last_error = ""
                 return resp.json().get("id")
+            if resp.status_code == 429:
+                self._note_rate_limit(resp)
+                return None
             self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
         except Exception as e:  # noqa: BLE001
             self.last_error = str(e)
@@ -610,16 +791,22 @@ class WebexNotifier:
         if not self.can_listen():
             return []
         params = {"roomId": self.listen_room_id, "max": max_count}
+        if self._mentioned_only:
+            params["mentionedPeople"] = "me"
         try:
             resp = requests.get(WEBEX_MESSAGES_URL, headers=self._bot_headers(),
                                 params=params, timeout=self.timeout)
-            if resp.status_code == 403:
+            if resp.status_code == 403 and not self._mentioned_only:
+                self._mentioned_only = True
                 resp = requests.get(
                     WEBEX_MESSAGES_URL, headers=self._bot_headers(),
                     params={**params, "mentionedPeople": "me"}, timeout=self.timeout)
             if 200 <= resp.status_code < 300:
                 self.last_error = ""
                 return resp.json().get("items", [])
+            if resp.status_code == 429:
+                self._note_rate_limit(resp)
+                return []
             self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
         except Exception as e:  # noqa: BLE001
             self.last_error = str(e)
