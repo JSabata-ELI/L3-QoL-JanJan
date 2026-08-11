@@ -46,8 +46,31 @@ Each program is shown as a card with:
 
   [📂]              — opens the program's folder in Explorer.
 
-  [🔽]              — dropdown of archived older versions with
-                      timestamps; click to launch that version.
+  [🔽]              — dropdown of archived older versions;
+                      click to launch that version. Older builds
+                      are labelled "v1.2.3 (date time)", newer
+                      archive snapshots just "v1.2.3".
+
+  Right-click a card to move the program to another category
+  (or to reset it back to its default one). The choice is saved.
+
+
+=================================================================
+LAUNCHING AN OLD VERSION
+=================================================================
+
+  An archived build needs the program folder's _internal folder,
+  so the Launcher temporarily swaps files:
+
+    1. the current exe/py are moved to archive\_temp_latest\
+    2. the archived exe/py are copied into the program folder
+    3. the old version runs
+    4. on exit the current files are moved back
+
+  If the program is closed abnormally the swap may be left
+  unfinished. The Launcher then refuses to start that program
+  again and offers to restore it — on the next scan, or right
+  away via the 🧹 Clean button.
 
 
 =================================================================
@@ -77,8 +100,24 @@ CATEGORIES
 NOTES
 =================================================================
 
-  The Notes button (lower right) opens the shared notes.txt file
-  from the current Scratch path.
+  The Notes button opens the shared notes.txt file from the
+  current Scratch path.
+
+
+=================================================================
+CLEAN (🧹 button)
+=================================================================
+
+  Runs two housekeeping checks on the loaded programs:
+
+  - Versioned exe files (…__20260101_120000.exe) sitting in a
+    program folder instead of its archive folder — offers to
+    move them.
+  - Programs left in an unfinished old-version swap
+    (archive\_temp_latest\ still present) — offers to restore
+    the latest files.
+
+  Both checks also run automatically after every scan.
 
 
 =================================================================
@@ -88,8 +127,13 @@ GENERAL NOTES
   - Supports two exe layouts:
       Scratch:   <Program folder>/<Program>.exe
       Programy:  dist/<Program>/vX.Y.Z/<Program>.exe
-  - Archive versions are read from the archive/ subfolder.
+  - Archive versions are read from the archive/ subfolder:
+      archive/vX.Y.Z/<Program> vX.Y.Z.exe          (new, one
+        entry per version folder; " (2)" copies are ignored)
+      archive/<Program> vX.Y.Z__<date>_<time>.exe  (legacy flat)
   - Program icons are loaded from icon.ico in the exe folder.
+  - Office sources are disabled on lab machines.
   - Config: %APPDATA%\Launcher\config.json
+    (paths, acknowledged versions, custom categories)
 
 -----------------------------------------------------------------

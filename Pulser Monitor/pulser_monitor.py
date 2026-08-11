@@ -4077,12 +4077,27 @@ def main():
     status_bar.addPermanentWidget(btn_stop)
 
     try:
-        here = Path(__file__).resolve().parent
-        for icon_name in ("icon.ico", "icon.png", "pulser_monitor.ico"):
-            icon_path = here / icon_name
-            if icon_path.exists():
-                win.setWindowIcon(QIcon(str(icon_path)))
-                break
+        # The icon sits next to the exe. In a frozen build __file__ points into
+        # the bundle, not the exe folder, so searching only there silently finds
+        # nothing and the app ends up with the generic Windows icon.
+        search_dirs = []
+        if getattr(sys, "frozen", False):
+            search_dirs.append(Path(sys.executable).resolve().parent)
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                search_dirs.append(Path(meipass))
+        else:
+            search_dirs.append(Path(__file__).resolve().parent)
+        for here in search_dirs:
+            for icon_name in ("icon.ico", "icon.png", "pulser_monitor.ico"):
+                icon_path = here / icon_name
+                if icon_path.exists():
+                    app.setWindowIcon(QIcon(str(icon_path)))
+                    win.setWindowIcon(QIcon(str(icon_path)))
+                    break
+            else:
+                continue
+            break
     except Exception:
         pass
 

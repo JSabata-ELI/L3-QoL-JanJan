@@ -36,7 +36,22 @@ from PySide6.QtWidgets import (
 CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "GitWork" / "config.json"
 TARGET = "main"          # shared branch we merge into
 PROTECTED = {"main", "master"}
-ICON = Path(__file__).resolve().parent / "icon.ico"
+def _icon_file() -> Path:
+    """icon.ico sits next to the exe. In a frozen build __file__ points into the
+    bundle (_internal), not the exe folder, so resolving from __file__ silently
+    yields a path that does not exist and the app ends up with no icon at all."""
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent / "icon.ico"
+        if exe_dir.exists():
+            return exe_dir
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass) / "icon.ico"
+        return exe_dir
+    return Path(__file__).resolve().parent / "icon.ico"
+
+
+ICON = _icon_file()
 
 # Colours (readable on the light #f0f0f0 / white surfaces).
 C_TEXT = "#111111"
@@ -1154,31 +1169,12 @@ def _set_app_id():
             pass
 
 
-def _force_taskbar_icon(widget, ico_path):
-    """Force icon.ico into every Win32 icon slot so the Windows 11 taskbar
-    picks it up. setWindowIcon alone only reliably sets the title bar; the
-    taskbar reads the small icon slots + window-class icon. Same verified
-    approach as the Tk apps' set_app_icon helper. Call after show()."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        u = ctypes.windll.user32
-        hwnd = int(widget.winId())
-        hwnd = u.GetAncestor(hwnd, 2) or hwnd  # GA_ROOT
-        # LR_LOADFROMFILE=0x10, LR_DEFAULTSIZE=0x40, IMAGE_ICON=1
-        big = u.LoadImageW(None, str(ico_path), 1, 0, 0, 0x10 | 0x40)
-        sm = u.LoadImageW(None, str(ico_path), 1, 16, 16, 0x10)
-        for which, h in ((1, big), (0, sm), (2, sm)):  # BIG, SMALL, SMALL2
-            if h:
-                u.SendMessageW(hwnd, 0x0080, which, h)  # WM_SETICON
-        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
-        if big:
-            set_cls(hwnd, -14, big)   # GCLP_HICON
-        if sm:
-            set_cls(hwnd, -34, sm)    # GCLP_HICONSM
-    except Exception:
-        pass
+# Note: a WM_SETICON / SetClassLongPtr "force taskbar icon" helper used to live
+# here. Measured on Win11: with the window icon and the window-class icon set to
+# two deliberately different images, the taskbar draws the *window* icon, so for
+# Qt apps setWindowIcon is already sufficient and forcing the class icon does
+# nothing. (The Tk apps still need their set_app_icon helper, because there
+# iconbitmap leaves the small slots on Tk's default feather.)
 
 
 def main():
@@ -1188,8 +1184,6 @@ def main():
         app.setWindowIcon(QIcon(str(ICON)))
     w = App()
     w.show()
-    if ICON.exists():
-        _force_taskbar_icon(w, ICON)
     sys.exit(app.exec())
 
 

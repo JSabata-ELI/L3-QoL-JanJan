@@ -304,6 +304,103 @@ def test_dialog_accept_parsing():
         cpv._accept()
 
 
+def test_custom_pv_expression_vars():
+    """Only real channel letters are treated as variables."""
+    assert app_main._cpv_vars("A+B") == ["A", "B"]
+    assert app_main._cpv_vars("F/(F+H)*100") == ["F", "H"]
+    assert app_main._cpv_vars("math.log(A) + 1E5 + round(B, 2)") == ["A", "B"]
+    # Simultaneous rename — no cascading through an already-rewritten letter.
+    assert app_main._cpv_rewrite("F+H", {"F": "A", "H": "F"}) == "A+F"
+
+
+def test_custom_pv_bindings_follow_pvs():
+    """A formula must keep its PVs when the list order changes — the whole point
+    of storing bindings instead of relying on the channel position."""
+    _install_network_mock()
+    _install_dialog_mocks()
+    w = _new_widget()
+    pv1, pv2 = "L3-TEST-A:Energy", "L3-TEST-B:Energy"
+    w._custom_pvs = [{"name": "Sum", "expr": "A+B",
+                      "bindings": {"A": pv1, "B": pv2}}]
+
+    def _one_row():
+        return [(1_000, {pv1: (1.0, "J"), pv2: (10.0, "J")})]
+
+    w._pv_order = [pv1, pv2, "Sum"]
+    rows = _one_row()
+    w._compute_custom_pvs_in_rows(rows)
+    assert rows[0][1]["Sum"][0] == 11.0
+
+    # Same PVs, swapped positions: A/B now mean the other channels, the result
+    # must not change.
+    w._pv_order = [pv2, pv1, "Sum"]
+    rows = _one_row()
+    w._compute_custom_pvs_in_rows(rows)
+    assert rows[0][1]["Sum"][0] == 11.0, "custom PV did not follow its PVs"
+
+    # A bound PV dropped from the list: empty value, channel still present, and
+    # a diagnostic that names the missing PV.
+    w._pv_order = [pv1, "Sum"]
+    rows = [(1_000, {pv1: (1.0, "J")})]
+    w._compute_custom_pvs_in_rows(rows)
+    assert rows[0][1]["Sum"][0] is None
+    assert any(pv2 in m for m in w._cpv_diag), "missing binding not reported"
+
+    # The unloaded PV still gets a letter in the dialog, marked not-loaded.
+    chans = w._cpv_dialog_channels()
+    assert (pv2, False) in [(pv, ld) for _lt, pv, _d, ld in chans]
+
+    # Display letters follow the current order and canonicalise back unchanged.
+    w._pv_order = [pv2, pv1, "Sum"]
+    chans = w._cpv_dialog_channels()
+    letter_by_pv = {pv: lt for lt, pv, _d, _ld in chans}
+    pv_by_letter = {lt: pv for lt, pv, _d, _ld in chans}
+    disp, unbound = app_main._cpv_to_display(w._custom_pvs[0], letter_by_pv)
+    assert disp == "B+A" and not unbound
+    _expr, bindings = app_main._cpv_from_display(disp, pv_by_letter)
+    assert bindings == {"B": pv1, "A": pv2}
+    w.close()
+
+
+def test_custom_pv_binding_migration():
+    """Entries saved before bindings existed get them from the legacy order."""
+    _install_network_mock()
+    _install_dialog_mocks()
+    w = _new_widget()
+    w._custom_pvs = [{"name": "Sum of Green [J]", "expr": "F+H"}]
+    w._migrate_custom_pv_bindings()
+    assert w._custom_pvs[0]["bindings"] == {
+        "F": "L3-PM03-025:Energy",
+        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+    }
+    # Already-bound entries are left alone.
+    w._custom_pvs = [{"name": "X", "expr": "A", "bindings": {"A": "keep:me"}}]
+    w._migrate_custom_pv_bindings()
+    assert w._custom_pvs[0]["bindings"] == {"A": "keep:me"}
+    w.close()
+
+
+def test_custom_pv_bad_expression_is_reported():
+    """A broken formula yields an empty channel and says so, instead of being
+    silently indistinguishable from missing data."""
+    _install_network_mock()
+    _install_dialog_mocks()
+    w = _new_widget()
+    pv1 = "L3-TEST-A:Energy"
+    w._custom_pvs = [
+        {"name": "Broken", "expr": "A +", "bindings": {"A": pv1}},
+        {"name": "DivZero", "expr": "A/0", "bindings": {"A": pv1}},
+    ]
+    w._pv_order = [pv1, "Broken", "DivZero"]
+    rows = [(1_000, {pv1: (1.0, "J")})]
+    w._compute_custom_pvs_in_rows(rows)
+    assert rows[0][1]["Broken"][0] is None
+    assert rows[0][1]["DivZero"][0] is None
+    assert any("invalid expression" in m for m in w._cpv_diag)
+    assert any("ZeroDivisionError" in m for m in w._cpv_diag)
+    w.close()
+
+
 # ── Standalone runner ────────────────────────────────────────────────────────
 
 def _main():

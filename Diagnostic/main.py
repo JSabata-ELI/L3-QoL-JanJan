@@ -1,3 +1,4 @@
+import atexit
 import sys
 import os
 from pathlib import Path
@@ -19,6 +20,25 @@ from PySide6.QtCore import Qt, QThread, Signal
 # ---------------------------------------------------------------------------
 
 APP_DIR = Path(__file__).parent
+
+# PID lock file: lets remote_launcher.py tell whether the app is already
+# running (so a Webex "run diagnostic" command doesn't spawn a second copy).
+LOCK_FILE = APP_DIR / "diagnostic.lock"
+
+
+def _acquire_lock():
+    try:
+        LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _release_lock():
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -286,8 +306,39 @@ class MainWindow(QMainWindow):
 # Entry point
 # ===========================================================================
 
+def _icon_file() -> Path | None:
+    """icon.ico sits next to the exe. APP_DIR is __file__-based, which in a
+    frozen build points into the bundle rather than the exe folder."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+    cands.append(APP_DIR / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
 def main():
+    _acquire_lock()
+    atexit.register(_release_lock)
+
+    # Give the taskbar button its own identity instead of grouping under the
+    # generic host process, and hand it our icon.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Diagnostic")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
+    _ico = _icon_file()
+    if _ico:
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(_ico)))
     app.setStyle(ToolTipDelayStyle("Fusion"))
     app.setStyleSheet(APP_STYLESHEET)
 
@@ -308,6 +359,9 @@ def main():
     app.processEvents()
 
     window = MainWindow()
+    if _ico:
+        from PySide6.QtGui import QIcon
+        window.setWindowIcon(QIcon(str(_ico)))
     window.showMaximized()
     splash.close()
     sys.exit(app.exec())

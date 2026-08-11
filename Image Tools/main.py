@@ -21,7 +21,7 @@ if getattr(sys, "frozen", False):
         with open(Path(sys.executable).resolve().parent / "debug_pil.txt", "w") as _f:
             _f.write(f"PIL import error: {e}\n")
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton, QLabel, QStatusBar
+from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton, QLabel
 from PySide6.QtCore import Qt, QTimer
 
 # ── version from exe name ─────────────────────────────────────────────────────
@@ -40,6 +40,32 @@ def _detect_version() -> str:
 
 APP_VERSION = _detect_version()
 APP_TITLE   = f"Image Tools {APP_VERSION}".strip()
+
+
+# ── icon helpers ──────────────────────────────────────────────────────────────
+def _icon_file() -> Path | None:
+    """Locate icon.ico next to the exe (frozen) or the script, with a
+    PyInstaller _MEIPASS fallback for one-file builds."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+    else:
+        cands.append(Path(__file__).resolve().parent / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
+# Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
+# here. Measured on Win11: with the window icon and the window-class icon
+# deliberately set to two different images, the taskbar draws the *window*
+# icon, so Qt's setWindowIcon is already sufficient and forcing the class icon
+# changes nothing. (That helper is only needed for the Tk apps, where
+# iconbitmap leaves the small slots on Tk's default feather.)
 
 
 # ── main window ───────────────────────────────────────────────────────────────
@@ -97,12 +123,8 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     win.setWindowTitle(APP_TITLE)
     try:
         from PySide6.QtGui import QIcon
-        if getattr(sys, "frozen", False):
-            _base = Path(sys.executable).resolve().parent
-        else:
-            _base = Path(__file__).resolve().parent
-        _icon_path = _base / "icon.ico"
-        if _icon_path.exists():
+        _icon_path = _icon_file()
+        if _icon_path:
             win.setWindowIcon(QIcon(str(_icon_path)))
     except Exception:
         pass
@@ -142,16 +164,15 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
 
     win.setCentralWidget(tabs)
 
-    # Stop All tlačítko ve status baru
-    status_bar = QStatusBar()
-    win.setStatusBar(status_bar)
-
+    # Stop All tlačítko v řádku záložek (corner widget) — status bar se nepoužívá,
+    # takže tabs vyplní celou výšku okna až po spodní hranu.
     btn_stop_all = QPushButton("⏹ Stop All")
     btn_stop_all.setToolTip("Stop all running background operations")
     btn_stop_all.setStyleSheet(
         "QPushButton { background: #cc3300; color: #fff; font-weight: 700; "
         "padding: 3px 12px; border-radius: 3px; margin: 2px; }"
         "QPushButton:hover { background: #aa2200; }")
+    tabs.setCornerWidget(btn_stop_all, Qt.Corner.TopRightCorner)
 
     def _stop_all():
         try: finder.cancel_scan()
@@ -168,7 +189,6 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         except Exception: pass
 
     btn_stop_all.clicked.connect(_stop_all)
-    status_bar.addPermanentWidget(btn_stop_all)
 
     if folder_arg is not None:
         QTimer.singleShot(200, lambda: _open_folder_in_slider(viewer, tabs, folder_arg))
@@ -217,13 +237,10 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv)
 
     # Nastav ikonu na úrovni aplikace — platí pro taskbar i alt-tab
+    _ico = _icon_file()
     try:
         from PySide6.QtGui import QIcon
-        _here = (Path(sys.executable).resolve().parent
-                 if getattr(sys, "frozen", False)
-                 else Path(__file__).resolve().parent)
-        _ico = _here / "icon.ico"
-        if _ico.exists():
+        if _ico:
             app.setWindowIcon(QIcon(str(_ico)))
     except Exception:
         pass

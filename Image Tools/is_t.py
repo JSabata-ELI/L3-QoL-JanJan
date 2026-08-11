@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from functools import lru_cache
@@ -29,10 +29,12 @@ except Exception:
     _MPL_OK = False
 
 from PySide6.QtCore import (
-    Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPoint, QPointF, QDate, QModelIndex
+    Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPoint, QPointF, QDate,
+    QModelIndex, QTime, QLocale, QBuffer, QByteArray
 )
 from PySide6.QtGui import (
-    QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QBrush, QGuiApplication, QTextCharFormat
+    QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QBrush, QGuiApplication,
+    QTextCharFormat, QPalette
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QDoubleSpinBox, QScrollArea,
@@ -40,6 +42,7 @@ from PySide6.QtWidgets import (
     QComboBox, QCheckBox, QDialog, QCalendarWidget, QDialogButtonBox, QFileSystemModel,
     QSpinBox, QFrame, QSizePolicy, QStyledItemDelegate, QAbstractItemView, QTreeView, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout, QColorDialog, QToolButton,
+    QTimeEdit, QMenu, QStyle,
 )
 
 # ---------------- CONFIG ----------------
@@ -48,19 +51,226 @@ TZ_PRAGUE = ZoneInfo("Europe/Prague")
 _NS_19_RE = re.compile(r'\d{19}')
 SLIDER_MAX = 1_000_000
 SCRUB_INTERVAL_MS = 33
+NAV_TICK_MS = 33            # per-camera navigation coalescing tick (see _nav_timer). Same
+                            # 33 ms as SCRUB_INTERVAL_MS, and PreciseTimer for the same
+                            # reason — a coarse timer turns it into 21 Hz on Windows.
 SCRUB_MAX_SIDE = 900
 FAST_SCRUB_MAX_SIDE = 320
 PLAY_MAX_SIDE_SLOW = 320
 PLAY_MAX_SIDE_FAST = 240
+FULL_RES_SIDE = 0   # max_side=0 → load_image_scaled skips downscaling (native resolution)
+# Quality the frame the user SETTLED on is brought up to, outside live mode. Well above
+# the scrub sizes (so stopping visibly sharpens the picture) but below native: the image
+# view is never taller than ~1100 px unzoomed, so native only bought a ~22 MB
+# QPixmap.fromImage on the GUI thread after every release. Live mode is untouched — it
+# still decodes every arriving frame at FULL_RES_SIDE (see _current_decode_side).
+REFINE_MAX_SIDE = 1600
+HEAVY_RENDER_SIDE = 1200  # at or above this a render counts as "heavy": memory-capped in
+                          # PixCache and treated as a settle-only render everywhere else
 CACHE_SIZE = 320
+# One native-resolution pixmap of a 2560×2160 camera is ~22 MB, so a plain LRU of
+# CACHE_SIZE full-res renders would be worth gigabytes. Native renders are capped
+# separately (see PixCache) — only the last few settled frames are worth keeping.
+NATIVE_CACHE_KEEP = 4
+
+# ---- Whole-window preview ("proxy") layer -------------------------------------
+# With live mode OFF the tool preloads the ENTIRE loaded time window at this small
+# size, so dragging the slider repaints from memory instead of waiting on one SMB
+# read + decode per position. Stopping on a frame then re-renders it at native
+# resolution (see _schedule_refine / _refine_current_frame).
+PROXY_MAX_SIDE   = 224      # decoded side of a preview frame, up to 4 cameras
+PROXY_SIDE_MANY  = 160      # 5-8 cameras
+PROXY_SIDE_MOST  = 128      # 9+ cameras. See _proxy_side: at 12 cameras the REAL render
+                            # during a fast drag is only 180 px anyway, so this is not a
+                            # visible downgrade — and it is what lets the whole window fit.
+PROXY_KNEE_CODE  = 239      # last 8-bit code of a stored preview frame's MAIN band. Codes
+                            # above it carry the p99.9..max highlight tail — see
+                            # load_proxy_gray for why the tail needs its own segment.
+PROXY_STORE_8BIT = True     # store preview frames as 8-bit codes plus the (lo, hi) the
+                            # p0.5/p99.5 stretch used, instead of raw uint16. Halves the RAM
+                            # (so twice as many frames fit — often the whole window) and
+                            # moves the percentile pass off the GUI thread. Auto contrast is
+                            # unaffected: the percentiles are still taken on the 16-bit data,
+                            # in the worker. See load_proxy_gray for what is and is not lost.
+                            # Set False to go back to raw uint16 storage.
+PROXY_RAM_BUDGET_MB = 2000  # RAM the whole-window preview may occupy, across all cameras.
+                            # The frame COUNT is derived from this and the measured size of
+                            # a decoded preview frame (_proxy_frame_bytes), because that is
+                            # what actually varies: a 445x420 camera downscales to ~47 kB at
+                            # PROXY_MAX_SIDE, a 2560x2160 one to the same, but a camera
+                            # smaller than PROXY_MAX_SIDE is not downscaled at all. A fixed
+                            # count was therefore either wasteful or far too sparse
+                            # depending on the camera. Every camera now costs 1 byte/px here
+                            # (PROXY_STORE_8BIT above), so at 224 px a 4-camera window of
+                            # ~27k frames needs ~1.2 GB and fits at EVERY frame — which was
+                            # not true at 2 bytes/px and 1200 MB: it sampled 1-in-3, so a
+                            # drag could not show what it was dragged across no matter how
+                            # fast the rest of the pipeline became.
+PROXY_SWEEP_BUDGET_S = 300  # how long the sweep may take to build the whole preview, and in
+                            # practice the ceiling that actually binds. A preview frame costs
+                            # a WHOLE file read (setScaledSize saves decode CPU, not I/O) and
+                            # the sweep runs at ~100 frames/s, so 5 minutes buys ~30k frames
+                            # — enough for a 4-camera 2-hour window at every frame. Beyond
+                            # that, planning frames nobody will reach for 25 minutes is not
+                            # coverage; sampling the window evenly is the honest answer.
+PROXY_SWEEP_FPS_EST = 100   # measured sweep rate on \\users-L3 with PROXY_WORKERS threads
+                            # (the diag log shows a 26 182-frame window swept in ~4 min).
+PROXY_STEP_SNAP_SLACK = 0.12  # allow the plan to overshoot the budget by this much if it
+                            # buys a smaller step. `step` is ceil(want/per), so a window a
+                            # few frames over budget jumped from step 2 to step 3 and left a
+                            # third of the RAM unused — measured on the logged session: 846
+                            # of 1200 MB, at 1-in-3 sampling, when 1-in-2 was affordable.
+PROXY_MAX_FRAMES = 200000   # hard ceiling on planned preview frames regardless of the RAM
+                            # budget, so a pathologically small camera cannot plan a
+                            # hundred thousand reads. Per window, shared by all cameras.
+                            # On the usual 16-bit cameras the RAM budget above binds first
+                            # (~94 kB per frame → ~13k frames); this ceiling only matters
+                            # for cameras small enough that frames are nearly free. Longer
+                            # windows are sampled evenly; the exact frame is always
+                            # re-rendered once the user stops on it.
+                            #
+                            # A preview frame costs a WHOLE file read off the share:
+                            # QImageReader.setScaledSize only saves decode CPU, not
+                            # I/O (a PNG must be read end-to-end). So this number IS
+                            # the sweep's price — 2400 frames × ~10 MB ≈ 24 GB was
+                            # what made "Preloading preview…" take forever and starve
+                            # the frame under the slider. Shared across cameras, but see
+                            # the per-track floor in _proxy_start.
+PROXY_BATCH      = 1        # frames decoded per background task. ONE on purpose: a task
+                            # handed to the pool always runs to completion, so the batch
+                            # size is exactly how long the sweep keeps competing for share
+                            # bandwidth after the user starts dragging. At 1, _proxy_pump
+                            # re-checks that per frame (it is called from every
+                            # _on_proxy_batch), which is the finest yield available
+                            # without teaching _ProxyTask to abandon work mid-batch.
+PROXY_QUEUE_SPARE = 2       # queued batches beyond one per worker. Kept tiny for the same
+                            # reason: every queued batch is a read that will still happen
+                            # after the user has already grabbed the slider.
+PROXY_WORKERS    = 16       # decode threads. The sweep is background work on the SAME
+                            # share as the frame the user is waiting on, so what keeps it
+                            # out of the way is _proxy_pump standing down while the user
+                            # is active — not a small worker count. With PROXY_BATCH=1 and
+                            # the backlog below, at most WORKERS + PROXY_QUEUE_SPARE reads
+                            # are still running when a drag starts (it was 32).
+                            # An SMB read is latency-bound, not bandwidth-bound: 4 threads
+                            # left the share mostly idle and made a full window take tens
+                            # of minutes, which is why the preview was never ready when it
+                            # was needed. The other pools here already run 8–16.
+PROXY_DRAG_WORKERS = 10     # reads the sweep may keep running WHILE the user drags. Not
+                            # zero any more: with the cursor-first ordering below, those
+                            # reads are exactly the frames the drag is about to need, so
+                            # standing down completely just means the drag is served one
+                            # blocking share read per camera at a time — the "one image a
+                            # second" case.
+                            #
+                            # Was 2, and that was measured to be self-defeating. From the
+                            # diag log of a real 4-camera session: a drag produced 923
+                            # preview paints and 55 real loads in a minute — i.e. it asked
+                            # the share for 0.9 loads/s, on a share that does 204/s. So the
+                            # sweep was being throttled 15x (110 -> 14 frames/s) to protect
+                            # half a percent of capacity, and the thing being throttled is
+                            # the only thing that frees that capacity up: the preview never
+                            # got built, so the drag fell back to loads, so the throttle
+                            # looked justified. 10 reads is ~69 frames/s and still leaves
+                            # room for the fallback loads, which need far less than that.
+                            # PROXY_BATCH = 1 keeps the yield granularity per frame.
+PROXY_FOCUS_GRID = 4096     # how far (in plan grid points, each side) the cursor-first
+                            # search looks for an undecoded frame before giving up and
+                            # falling back to the global coarse→fine order.
+PROXY_FOCUS_BATCH = 3       # frames the cursor-first pass may hand out per task WHILE the
+                            # user is moving. The plan walk stays at PROXY_BATCH so its
+                            # tasks remain interruptible; the neighbourhood of the handle is
+                            # the only place a read can still help within the next few
+                            # hundred ms, so it is worth committing a little more to it.
+PROXY_FOCUS_SCAN_MAX = 256  # grid points one _proxy_focus_jobs call may examine. That scan
+                            # runs on the GUI thread inside the scrub tick, and an
+                            # exhausted neighbourhood used to cost the full FOCUS_GRID
+                            # (8192 membership tests per camera, per pump, every drag
+                            # tick). The plan walk in _proxy_next_batch supplies whatever
+                            # a bounded call does not find, so the bound costs nothing but
+                            # the ordering of a few frames.
+PROXY_HOLD_MS    = 120      # retry delay when the sweep is held off (drag / playback /
+                            # a display load in flight). Was 400: one in-flight display
+                            # load stalling the sweep for 400 ms is 40 preview frames not
+                            # read, and the load it is waiting for takes ~145 ms.
+PROXY_DRAG_MS    = 60       # retry delay while the user is dragging. The drag needs its
+                            # neighbourhood filled NOW, so the pump re-checks at roughly
+                            # the scrub tick instead of PROXY_HOLD_MS.
+PROXY_IDLE_GRACE_S = 0.25   # quiet time required after a drag / playback before the sweep
+                            # goes back to full speed. Long enough for the frame the user
+                            # landed on to win the first read, and no longer: it used to be
+                            # 1.5 s AND to be re-armed from inside _proxy_pump's dragging
+                            # branch every 60 ms, so a user who drags in bursts — which is
+                            # how anyone uses a slider — never let the full sweep run at
+                            # all. It is now set at the interaction EDGES (release / stop),
+                            # which is what it was always meant to measure.
+PROXY_COVERED_FRAC = 0.98   # decoded share of the planned frames at which the preview is
+                            # trusted to carry a drag (see _proxy_covered_track)
+PROXY_COVERED_TRACK_FRAC = 0.9  # share of CAMERAS that must be covered before the viewer as
+                            # a whole counts as covered. Requiring all of them let one slow
+                            # or partly-unreadable camera hold every other tile in the
+                            # not-covered state — big scrub renders and a tight load cap —
+                            # indefinitely.
+PROXY_MOTION_TOL_MAX = 8    # ceiling, in multiples of the finished plan's spacing, on how
+                            # far a preview frame may be from the requested moment while
+                            # the user is moving (_proxy_motion_tol). Without it the first
+                            # few decoded frames — spacing = the whole window — would be
+                            # accepted for every position and a drag would paint a frame
+                            # hours away from the timestamp on the label.
+                            # Was 64, which was not a ceiling in any useful sense: on a 4 h
+                            # window with step 3 (ts_gap 6.4 s) it permitted 6.9 MINUTES.
+PROXY_MOTION_TOL_MAX_S = 2.0  # and the same ceiling in WALL-CLOCK seconds, which is the one
+                            # that actually binds. The multiple above scales with the plan,
+                            # so on a coarse plan it grew without limit; measured on the
+                            # logged 4-camera session, a drag at prox=4 % painted frames
+                            # 5.4 MINUTES from the requested moment and reported them
+                            # against a 6.4 s tolerance — every tile red, and truthfully so.
+                            # 2 s is ~6 frames at the usual 3.3 Hz: close enough to carry
+                            # motion, far too close to show a different shot. Once the
+                            # window is fully preloaded this never binds at all.
+PROXY_HOLD_MAX   = 25       # consecutive holds tolerated for an in-flight display load
+                            # (~10 s) before the sweep proceeds anyway, so a stranded
+                            # _inflight key can never park the preview forever
+PROXY_REFINE_MS  = 200      # settle time before the full-quality re-render
+PROXY_TOPUP_MS   = 2000     # debounce for extending the preview after a refresh
 PREFETCH_RADIUS_IDLE = 6
 PREFETCH_AHEAD_PLAY = 3
 TICK_STEP_MINUTES = 10
+TICKBAR_DISCRETE_MAX = 200  # above this frame count the axis stays a plain time axis:
+                            # per-frame ticks are redrawn on every cursor move
 PLAY_TICK_MS = 33
+PLAY_TICK_MS_PREVIEW = 16   # playback tick while the RAM preview is carrying the frames.
+                            # The % setting is a WALL-CLOCK rate, so the number of frames a
+                            # tick must cover is (rate / tick_rate) — doubling the tick rate
+                            # halves the stride and therefore halves how many frames get
+                            # skipped, at exactly the same playback speed. 1 %/s over 6700
+                            # frames wants 67 frames/s: at 30 Hz that is a stride of 2.2
+                            # (more than half the frames never shown), at 60 Hz it is 1.1.
+                            # Only used when the frames come from RAM — at 33 ms a share
+                            # read cannot keep up either way.
 AXIS_TOLERANCE_S = 5 * 60
 PLAY_EXACT_PCT_PER_S_THRESHOLD = 0.5
 SAVE_RANGE_WARN_COUNT = 500
-ONLINE_MAX_ITEMS = 50_000   # max frames kept per camera in live mode (~4 h at 3.3 Hz)
+SLAVE_SYNC_MAX_NS = 3_000_000_000   # how far a slave camera's nearest frame may be from
+                            # the master's moment before the slave is left alone rather
+                            # than shown something unrelated (_per_cam_slave_targets).
+                            # Was 0.4 s, hard-coded in the function body: cameras that run
+                            # slower than ~2.5 Hz, or that have a gap, then had NO frame in
+                            # the window and their tile simply never redrew — a permanently
+                            # frozen picture next to three moving ones, with nothing saying
+                            # why. 3 s still refuses a genuinely unrelated moment, and the
+                            # tile's own "~" label now says when it is a neighbour.
+ONLINE_MAX_ITEMS = 3_600    # max frames kept PER CAMERA *while live mode is ON*
+                            # (~18 min at 3.3 Hz). Deliberately small: live mode is
+                            # for watching the latest frames, and keeping tens of
+                            # thousands of in-memory frames per camera was what made
+                            # the whole app bog down after ~2 h.
+                            #
+                            # This cap applies ONLY with live mode ON. Trimming is
+                            # memory-only (never disk), and turning live mode OFF
+                            # re-scans the opened folders and puts the full history
+                            # back (_restore_full_history), so browsing back hours is
+                            # never blocked by the live cap.
 
 # ---------------- PV / CPVA ----------------
 import ssl
@@ -75,17 +285,25 @@ CPVA_HTTP_TIMEOUT = 8.0
 # All available PV channels the user can pick from
 PV_CHANNEL_MAP: dict[str, str] = {
     "PTM1":      "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-    "PCM2":      "HAPLS-ENER_IN_PCM2_LT6_DIAG2:Energy",
+    "PCM2":      "L3-PM03-025:Energy",
     "PCM4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
     "PAP1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
     "SBW4":      "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    # Derived: same archiver channel as SBW4, scaled by PV_SCALE below.
+    "Compressed SBW4": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
     "Back_Ref":  "L3-PM03-023:Energy",
     "Waveplate": "L3-PFWP6-MTR03-1:RawPos",
 }
 
 PV_UNITS: dict[str, str] = {
     "PTM1": "J", "PCM2": "J", "PCM4": "J", "PAP1": "J", "SBW4": "J",
-    "Back_Ref": "J", "Waveplate": "",
+    "Compressed SBW4": "J", "Back_Ref": "J", "Waveplate": "",
+}
+
+# Multiplicative factor applied to the raw archiver value before display/burn-in.
+# Names not listed here use 1.0 (the raw value).
+PV_SCALE: dict[str, float] = {
+    "Compressed SBW4": 0.749,
 }
 
 
@@ -108,8 +326,10 @@ def _import_cpva_client():
 
 cpva = _import_cpva_client()
 
-# Today's cache expires after this many seconds (live mode gets fresh data periodically)
-_PV_TODAY_CACHE_TTL = 3.0
+# Today's cache expires after this many seconds (live mode gets fresh data
+# periodically). The refresh is an incremental tail query in cpva.get_day, not a
+# whole-day download, so this can stay short without flooding the archiver.
+_PV_TODAY_CACHE_TTL = 1.5
 
 
 def _pv_date_key(ts_ns: int) -> str:
@@ -119,18 +339,6 @@ def _pv_date_key(ts_ns: int) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def _pv_load_day_res(channel: str, date_key: str) -> "cpva.DayResult":
-    """Samples + status for channel on date_key via the shared day cache.
-    status: "ok" | "empty" | "stale" (fetch failed, older data shown) | "error"."""
-    return cpva.get_day(channel, date_key, today_ttl=_PV_TODAY_CACHE_TTL,
-                        timeout=CPVA_HTTP_TIMEOUT)
-
-
-def _pv_load_day(channel: str, date_key: str) -> "list[tuple[int, float]]":
-    """Fetch (or return cached) sorted (t_ns, value) list for channel on date_key."""
-    return _pv_load_day_res(channel, date_key).samples
-
-
 def _pv_prev_date_key(date_key: str) -> str:
     """Return 'YYYY-MM-DD' for the day before date_key (Prague time)."""
     y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
@@ -138,108 +346,55 @@ def _pv_prev_date_key(date_key: str) -> str:
     return prev.strftime("%Y-%m-%d")
 
 
-def _pv_next_date_key(date_key: str) -> str:
-    """Return 'YYYY-MM-DD' for the day after date_key (Prague time)."""
-    y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
-    nxt = datetime(y, m, d, tzinfo=TZ_PRAGUE) + timedelta(days=1)
-    return nxt.strftime("%Y-%m-%d")
-
-
-def _pv_query_range(channel: str, start_ns: int, end_ns: int) -> "list[tuple[int, float]]":
-    """One archiver query for samples in [start_ns, end_ns], sorted by time.
-    Unlike _pv_load_day this is not day-aligned/cached — used for wide look-backs.
-    Raises cpva.CpvaError on fetch failure (so callers can avoid caching None)."""
-    return cpva.fetch_values(channel, int(start_ns), int(end_ns),
-                             timeout=CPVA_HTTP_TIMEOUT, try_value_suffix=False)
-
-
-# Cache of "last value at or before this day" per (channel, date_key) — so a whole
-# save range of older images reuses one wide look-back query instead of N.
-_pv_before_cache: dict[tuple[str, str], "float | None"] = {}
-_pv_before_lock = threading.Lock()
-# Progressively widening windows (days). Stop at the first that has data, so a slow
-# PV that last changed a month (or more) ago is still resolved — in 1–4 queries.
-_PV_LOOKBACK_WINDOWS_DAYS = (2, 8, 32, 120, 400)
-_DAY_NS = 86_400 * 1_000_000_000
-
-# Channels that should be matched by looking FORWARD from the image timestamp.
-# Waveplate: the motor settles AFTER the shot command, so the stable position
-# is recorded slightly after the image timestamp.
-_PV_FORWARD_CHANNELS: frozenset = frozenset({"L3-PFWP6-MTR03-1:RawPos"})
-# ±window (ns) used when searching for a "nearby" sample around the image timestamp.
-# Energy detectors fire within a second of the image; waveplate within tens of seconds.
-_PV_WINDOW_NS: int = 30 * 1_000_000_000  # 30 s
-
-
-def _pv_value_at_or_before(channel: str, ts_ns: int) -> "float | None":
-    """Last sample value at or before ts_ns, searching progressively further back
-    in time (covers PVs whose last change was days/weeks/months earlier). Cached."""
-    ck = (channel, _pv_date_key(ts_ns))
-    with _pv_before_lock:
-        if ck in _pv_before_cache:
-            return _pv_before_cache[ck]
-    val: "float | None" = None
-    try:
-        for d in _PV_LOOKBACK_WINDOWS_DAYS:
-            samples = _pv_query_range(channel, ts_ns - d * _DAY_NS, ts_ns)
-            if samples:
-                val = samples[-1][1]   # query end is ts_ns → all samples are ≤ ts_ns
-                break
-    except cpva.CpvaError:
-        # Fetch failed — do NOT cache: a transient outage must not poison this
-        # (channel, day) with None until restart. Next call retries.
-        return None
-    with _pv_before_lock:
-        _pv_before_cache[ck] = val
-        if len(_pv_before_cache) > 256:
-            _pv_before_cache.pop(next(iter(_pv_before_cache)))
-    return val
+# ±window (ns) used when searching for a "nearby" sample around the image
+# timestamp. Applies to the energy detectors only — they fire together with the
+# image, so nothing further away belongs to this shot. Step channels (the
+# waveplate, see cpva.STEP_CHANNELS) are archived only when they CHANGE and are
+# resolved by "last sample at or before the image" instead of by a window.
+#
+# Measured against 1000 real frames (2026-08-04, 3.3 Hz, 0.301 s between shots):
+# the sample belonging to a frame sits at p50 0.025 s / p90 0.30 s from it, on
+# EITHER side. The old ±30 s window therefore always found "something" — a
+# neighbouring shot's value for 43 % of frames, off by up to 91 J — and never
+# admitted that a frame has no archived shot. 0.3 s keeps every real pairing and
+# reports n/a for the rest; beyond PV_EXACT_MATCH_NS the value is marked "~".
+_PV_WINDOW_NS: int = 300_000_000          # 0.3 s
+_PV_PREFER: str = "nearest"               # NOT "before" — see cpva.lookup_near
 
 
 def _pv_last_known_ex(channel: str, ts_ns: int) -> "tuple[float | None, str]":
-    """Return (nearest sample to ts_ns within ±_PV_WINDOW_NS, fetch status).
+    """Return (value for ts_ns, fetch status) using the shared lookup.
 
-    Status is the worst across the consulted days: "ok"/"empty" → data reliable,
-    "stale" → shown from an older successful fetch (this fetch failed),
-    "error" → fetch failed and nothing cached (caller should show a retry hint,
-    not a permanent "—").
+    Matching rules live in cpva.lookup_near (one implementation for every tab):
+    energy channels take the sample CLOSEST in time within ±_PV_WINDOW_NS (None
+    when nothing is that close — never a value from another shot), step channels
+    such as the waveplate take the last sample at or before ts_ns, bisected per
+    frame so a held position keeps reading its real value.
 
-    Strategy differs by channel type:
-    - Forward channels (waveplate): prefer the FIRST sample at or AFTER ts_ns
-      within the window (motor settles after the trigger); fall back to the
-      last-ever-known value if nothing is close.
-    - Energy channels: prefer the LAST sample at or BEFORE ts_ns within the
-      window (detector fires just before the image).  If ts_ns is slightly
-      before the first sample of the day, also accept the next sample within
-      the window.  Returns None when no sample is within 30 s — never shows a
-      value from a completely different session hours/days earlier.
+    Status: "ok" → reliable, "approx" → matched, but far enough from the frame
+    that it may belong to the neighbouring shot, "stale" → served from an older
+    successful fetch, "error" → fetch failed and nothing cached (retry hint).
     """
-    date_key = _pv_date_key(ts_ns)
-    # Collect candidates from same day + adjacent days (handles midnight boundary)
-    candidates: list[tuple[int, float]] = []
-    status = "ok"
-    for dk in (_pv_prev_date_key(date_key), date_key, _pv_next_date_key(date_key)):
-        res = _pv_load_day_res(channel, dk)
-        if res.samples:
-            candidates.extend(res.samples)
-        if res.status == "error":
-            status = "error"
-        elif res.status == "stale" and status != "error":
-            status = "stale"
-    if not candidates:
-        if channel in _PV_FORWARD_CHANNELS:
-            return _pv_value_at_or_before(channel, ts_ns), status
-        return None, status
+    res = cpva.lookup_near(channel, int(ts_ns), window_ns=_PV_WINDOW_NS,
+                           prefer=_PV_PREFER,
+                           today_ttl=_PV_TODAY_CACHE_TTL,
+                           timeout=CPVA_HTTP_TIMEOUT)
+    if res.status in ("stale", "error"):
+        return res.value, res.status
+    if (res.value is not None and res.ts_ns is not None
+            and channel not in cpva.STEP_CHANNELS
+            and abs(res.ts_ns - int(ts_ns)) > cpva.PV_EXACT_MATCH_NS):
+        return res.value, "approx"
+    return res.value, "ok"
 
-    candidates.sort(key=lambda x: x[0])
-    prefer = "after" if channel in _PV_FORWARD_CHANNELS else "before"
-    val = cpva.nearest_sample(candidates, ts_ns, window_ns=_PV_WINDOW_NS, prefer=prefer)
-    if val is None and channel in _PV_FORWARD_CHANNELS:
-        # Fallback: last-known backward (waveplate position may be set days ago)
-        return _pv_value_at_or_before(channel, ts_ns), status
-    # Energy channels: no sample within 30 s stays None — don't show a stale
-    # value from hours/days ago
-    return val, status
+
+def _pv_decorate(txt: str, status: str) -> str:
+    """Apply the shared display convention to an already-formatted number."""
+    if status == "approx":
+        return cpva.PV_TEXT_APPROX_PREFIX + txt
+    if status == "stale":
+        return txt + cpva.PV_TEXT_STALE_SUFFIX
+    return txt
 
 
 def _pv_last_known(channel: str, ts_ns: int) -> "float | None":
@@ -273,8 +428,10 @@ def pv_text_for_ts(ts_ns: "int | None", enabled_names: "list[str]") -> str:
             token = cpva.PV_TEXT_ERROR if status == "error" else cpva.PV_TEXT_NOT_FOUND
             parts.append(f"{name}: {token}")
             continue
+        val *= PV_SCALE.get(name, 1.0)
         units = PV_UNITS.get(name, "")
-        parts.append(f"{name}: {_format_pv_value(channel, val)} {units}".strip())
+        txt = _pv_decorate(_format_pv_value(channel, val), status)
+        parts.append(f"{name}: {txt} {units}".strip())
     return "  |  ".join(parts)
 
 
@@ -502,7 +659,40 @@ CIRCLE_SOFT_MAX_R_FRAC = 0.80   # a větší
 
 DEFAULT_OPEN_DIR  = r"\\users-L3.tier0.lcs.local\cpva-image-2026\2026"
 DEFAULT_OPEN_ROOT = r"\\users-L3.tier0.lcs.local\cpva-image-2026"
-DEFAULT_SAVE_DIR  = r"\\hapls-share.lcs.local\scratch"
+# Where the Save dialogs open FIRST, before the user has picked anywhere.
+#
+# It used to be the scratch share root (\\hapls-share.lcs.local\scratch). Handing the
+# native Windows save dialog a UNC path makes it enumerate that share before it can
+# draw itself, and that name is unreachable from the office network: every "Save
+# Image" click paid the full SMB timeout (~48 s) before a dialog appeared. A local
+# folder opens instantly, and once the user saves anywhere the dialog follows them
+# there (self._last_save_dir), so saving straight to the share still works — it just
+# is not on the blocking path of the very first click.
+def _default_save_dir() -> str:
+    home = Path.home()
+    for cand in (home / "Downloads", home / "Pictures", home):
+        try:
+            if cand.is_dir():
+                return str(cand)
+        except OSError:
+            continue
+    return str(home)
+
+
+DEFAULT_SAVE_DIR = _default_save_dir()
+
+# Each year's images live in their own network share: cpva-image-<year>
+# (e.g. …\cpva-image-2025\2025\<month>\<day>\<hour>\<camera>). Always derive
+# the share from the selected year — do NOT hardcode a single year's share.
+IMAGES_ROOT_BASE = r"\\users-L3.tier0.lcs.local"
+
+def container_root_for_year(year: int) -> Path:
+    """Return the network share holding a given year's images (cpva-image-<year>)."""
+    return Path(IMAGES_ROOT_BASE) / f"cpva-image-{year}"
+
+# INFO-panel reference line: normal state and the "subtraction has no reference" warning.
+_REF_STATUS_STYLE = "font-size: 10px; color: #666; padding: 1px 0;"
+_REF_WARN_STYLE   = "font-size: 10px; font-weight: 700; color: #b36b00; padding: 1px 0;"
 
 _CHECKBOX_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; background: transparent; }
@@ -548,23 +738,37 @@ def fmt_prague_full_from_ns(ts_ns: int) -> str:
     ms  = (ts_ns % 1_000_000_000) // 1_000_000
     return f"{_dt_from_sec(sec):%Y-%m-%d %H:%M:%S}.{ms:03d}"
 
+def fmt_prague_date_from_ns(ts_ns: int) -> str:
+    """Date only (no time) — used by the INFO panel's Date row."""
+    return f"{_dt_from_sec(ts_ns // 1_000_000_000):%Y-%m-%d (%a)}"
+
 def prague_stamp_for_filename(ts_ns: int) -> str:
     sec = ts_ns // 1_000_000_000
     ms  = (ts_ns % 1_000_000_000) // 1_000_000
     return f"{_dt_from_sec(sec):%Y-%m-%d_%H-%M-%S}-{ms:03d}"
 
+_CAM_IMG_MARK_RE = re.compile(r"[-_]+IMG(?=$|[-_])", re.IGNORECASE)
+_CAM_CONTAINER_RE = re.compile(r"^C\d{2}[-_]", re.IGNORECASE)
+
+def clean_cam_for_filename(cam: str) -> str:
+    """Camera token as it should appear in a saved file name:
+    'C03-040-PFM13NF-_-IMG' -> '040-PFM13NF'.
+
+    The '-IMG' marker and the leading container code carry no information for the
+    person looking at the file. Cameras without a 'Cxx-' prefix keep whatever
+    they have."""
+    s = _CAM_IMG_MARK_RE.sub("", cam).strip("-_")
+    return _CAM_CONTAINER_RE.sub("", s, count=1).strip("-_")
+
 def replace_unix_ns_with_prague_in_filename(p: Path, ts_ns: int) -> str:
     stamp = prague_stamp_for_filename(ts_ns)
     stem = p.stem
-    # Strip trailing -_-IMG / _-_IMG suffix from camera part
-    stem = re.sub(r"[-_]+-IMG$", "", stem, flags=re.IGNORECASE)
-    # Replace _-_<19-digit-ns> separator+timestamp with _<stamp>
-    new_stem, n = re.subn(r"_-_\d{19}", f"_{stamp}", stem, count=1)
-    if n == 0:
-        # Try plain 19-digit ns anywhere in stem
-        new_stem, n = re.subn(r"(?<!\d)\d{19}(?!\d)", stamp, stem, count=1)
-    if n == 0:
-        new_stem = f"{stem}_{stamp}"
+    # Split the camera token off the 19-digit ns timestamp (with its "_-_" glue)
+    # so the camera part can be cleaned on its own.
+    m = re.search(r"[-_]*(?<!\d)\d{19}(?!\d)", stem)
+    cam, tail = (stem[:m.start()], stem[m.end():]) if m else (stem, "")
+    cam = clean_cam_for_filename(cam)
+    new_stem = f"{cam}_{stamp}{tail}" if cam else f"{stamp}{tail}"
     return f"{new_stem}{p.suffix}"
 
 def _strip_cam_name(name: str) -> str:
@@ -580,11 +784,51 @@ def _cam_short_label(name: str) -> str:
         return m.group(1)
     return s.split("-")[-1] if "-" in s else s
 
+# Real frame aspects (width/height) observed per camera, remembered across tile
+# rebuilds AND across sessions. Without it every rebuild (a time-window rescan
+# recreates all CameraViews) fell back to the coarse name hint below, so the auto
+# layout was computed for square tiles and visibly jumped once the frames arrived.
+_CAM_ASPECT_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_aspects.json"
+_CAM_ASPECTS: "dict[str, float] | None" = None   # None = not loaded yet
+
+def _cam_aspects_store() -> dict:
+    global _CAM_ASPECTS
+    if _CAM_ASPECTS is None:
+        try:
+            _CAM_ASPECTS = {k: float(v) for k, v in
+                            json.loads(_CAM_ASPECT_PATH.read_text(encoding="utf-8")).items()
+                            if float(v) > 0}
+        except Exception:
+            _CAM_ASPECTS = {}
+    return _CAM_ASPECTS
+
+def remember_cam_aspect(name: str, w: int, h: int) -> bool:
+    """Record a camera's real frame aspect. Returns True when it is new or changed
+    (i.e. the layout computed from the old value is now stale)."""
+    if not name or w <= 0 or h <= 0:
+        return False
+    store = _cam_aspects_store()
+    a = w / h
+    old = store.get(name)
+    if old is not None and abs(old - a) <= 0.01:
+        return False
+    store[name] = a
+    try:
+        _CAM_ASPECT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CAM_ASPECT_PATH.write_text(json.dumps(store, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return True
+
 def _cam_aspect_hint(name: str) -> float:
-    """Rough width/height hint for a camera by name, used to lay out tiles before
-    a real frame is loaded. Portrait diode arrays (PD[1-4]M1xDF) are tall; the
-    rest are treated as square. The real frame is still fit with KeepAspectRatio,
-    so an imperfect hint only costs a little letterbox, never correctness."""
+    """Width/height hint for a camera by name, used to lay out tiles before a real
+    frame is loaded. Prefers the aspect actually seen for that camera; otherwise
+    portrait diode arrays (PD[1-4]M1xDF) are tall and the rest are treated as
+    square. The real frame is still fit with KeepAspectRatio, so an imperfect hint
+    only costs a little letterbox, never correctness."""
+    learned = _cam_aspects_store().get(name)
+    if learned:
+        return learned
     return 0.45 if re.search(r"PD[1-4]M1.?DF", name, re.IGNORECASE) else 1.0
 
 def ns_from_dt(dt: datetime) -> int:
@@ -644,10 +888,45 @@ ONLINE_POLL_BACKOFF            = 1.5
 # 10 s): ReadDirectoryChangesW can die silently on SMB while looking healthy —
 # until the strike detector replaces it, this bounds the worst-case lag.
 ONLINE_WATCHER_POLL_INTERVAL_S = 3.0
+# A per-camera image load that stays in flight longer than this is treated as
+# hung (usually an SMB read that never returns); the watchdog releases its
+# in-flight slot and relaunches so the camera never freezes permanently.
+CAM_LOAD_WATCHDOG_S            = 6.0
+# ---- multi-camera tile decoding -----------------------------------------------
+# ONE pool for all camera tiles, sized to this share's measured optimum (see the
+# _open_reader docstring: 31 / 106 / 204 frames/s at 1 / 8 / 16 threads). It used to
+# be one 2-thread pool PER camera, which is wrong in both directions — a single
+# camera got 2 threads while 14 sat idle, and twelve cameras got 24, past the point
+# where more concurrency helps a latency-bound SMB share. Fairness comes from the
+# per-camera depth cap below, not from partitioning the threads.
+CAM_POOL_THREADS               = 16
+# In-flight reads allowed per camera (see _cam_inflight_depth). The old code allowed
+# exactly one — a boolean gate — which capped every tile at ~7 frames/s no matter
+# how idle the machine was, and is the reason the cameras appeared to take turns.
+CAM_INFLIGHT_MAX               = 4
+CAM_INFLIGHT_MIN               = 2
+# _reset_cam_pipeline only force-releases a camera whose load has already been
+# running this long. Below it the load counts as healthy and is left alone, so a
+# setting change hands over through _cam_want instead of starting a second,
+# competing render of the same tile.
+CAM_PIPELINE_GRACE_S           = 1.5
 # A watcher that "healthily" missed frames the poll found gets a strike; at
 # this many strikes it is killed and recreated (after a cooldown).
 WATCHER_SUSPECT_STRIKES        = 2
 WATCHER_RESTART_COOLDOWN_S     = 30.0
+# Per-camera refresh dot. It must track ARRIVING FRAMES, not the health of the
+# poll loop: a camera whose folder stopped receiving images still completes its
+# polls forever, so anything bumped on "poll finished" blinks green while the
+# picture is frozen. Green = a new frame was appended within this window,
+# red = live mode is on but nothing new arrived (source down / wrong folder /
+# dead watcher). Keep >= ONLINE_WATCHER_POLL_INTERVAL_S so the safety-net poll
+# can always deliver within one window.
+CAM_DOT_FRESH_S                = 5.0
+# While following live, a tile trailing the newest arrival by less than this is
+# catching up normally (the decode of frame N is still running when N+1 lands),
+# so it must not be marked stale. Only used for paints made in live auto-follow;
+# a manually scrubbed frame is still required to match exactly.
+LIVE_PAINT_TOL_NS              = 1_500_000_000   # 1.5 s
 # Minutes after the UTC hour rollover during which the previous hour folder may
 # still receive late writes and must stay in the scan set.
 ONLINE_ROLLOVER_GRACE_MIN      = 5
@@ -702,6 +981,55 @@ def _is_dir_quiet(p: "Path") -> bool:
         return p.is_dir()
     except OSError:
         return False
+
+
+def _dir_access_error(p: "Path") -> "str | None":
+    """Probe a directory and classify the outcome for user-facing messages.
+
+    `_is_dir_quiet` collapses 'missing' and 'access/network error' into a single
+    False. That is fine for hot polling loops but makes the UI lie: a path that
+    is unreachable (wrong credentials, process running elevated, no authenticated
+    SMB session to the server, share offline) gets reported as 'not found'. This
+    recovers the difference.
+
+    Returns:
+        None                → exists and is a directory
+        "does_not_exist"    → server reachable but the path is genuinely absent
+        <human message>     → is_dir() raised (access/network problem)
+    """
+    try:
+        return None if p.is_dir() else "does_not_exist"
+    except OSError as e:
+        we = getattr(e, "winerror", None)
+        known = {
+            5:    "access denied (WinError 5) — try running WITHOUT administrator, "
+                  "or open the server once in Explorer first so the session authenticates",
+            53:   "network path not found (WinError 53) — server unreachable / not on the lab network / VPN",
+            67:   "network name not found (WinError 67) — share name wrong or server offline",
+            1326: "logon failure (WinError 1326) — not authenticated to this server in this Windows session",
+        }.get(we)
+        if known:
+            return known
+        return f"{e.strerror or e}" + (f" (WinError {we})" if we else "")
+
+
+def _camera_folder_problem(cam_name: str, folders: "list[Path]") -> str:
+    """Build a precise message explaining why none of a camera's candidate
+    folders are usable — distinguishes 'genuinely absent' (wrong day/hour, no
+    data yet) from 'unreachable' (access denied, not authenticated, server down).
+    Called only on the error path, so the extra stats cost nothing in normal use."""
+    access_errs = []
+    for f in folders:
+        err = _dir_access_error(f)
+        if err and err != "does_not_exist":
+            access_errs.append((f, err))
+    if access_errs:
+        f, err = access_errs[0]
+        return (f"Camera folder '{cam_name}' could not be accessed:\n{err}\n\n"
+                f"Path: {f}")
+    shown = folders[0] if folders else "(no path)"
+    return (f"Camera folder '{cam_name}' not found — no data for the selected "
+            f"day/hour, or the path does not exist.\n\nPath: {shown}")
 
 
 # Negative-probe cache for hour-folder discovery. Probing candidate folders that
@@ -797,71 +1125,49 @@ def _read_tiff_max_sample(path: Path) -> int | None:
     return _read_image_max_sample(path)
 
 
-def _read_img_max_value(path: Path) -> float | None:
-    """Read imgMaxValue from PNG tEXt metadata — the physical maximum value
-    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
-    Returns float or None if not found."""
-    if path.suffix.lower() != ".png":
-        return None
-    try:
-        from PIL import Image as _PilImg
-        with _PilImg.open(str(path)) as pil:
-            info = pil.info
-            # Try to get the 12th tEXt chunk by index (Matlab uses index 12)
-            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
-            # Index 12 in Matlab is 1-based → index 11 in Python
-            if len(chunks) >= 12:
-                v = chunks[11][1]
-                try:
-                    return float(v)
-                except (ValueError, TypeError):
-                    pass
-            # Fallback: try any numeric-looking value in range
-            for k, v in chunks:
-                try:
-                    f = float(v)
-                    if 0 < f <= 65535:
-                        return f
-                except (ValueError, TypeError):
-                    pass
-    except Exception:
-        pass
-    return None
-
-
-# imgMaxValue is the camera's physical full-scale (e.g. 4095) written identically
-# into every frame of a given camera/run — it is NOT the per-frame pixel maximum
-# (that is computed separately as arr_px_max on every decode). It is therefore
-# constant within a source folder, so we cache it per folder to avoid re-opening
-# every PNG a second time with PIL just to read metadata (halves I/O over SMB in
-# the default-gradient live path). Load runs on LoadTask worker threads, so guard
-# the dict with a lock; cap with an LRU so a long session can't grow it unbounded.
-_IMG_MAX_VALUE_CACHE: "OrderedDict[str, float | None]" = OrderedDict()
-_IMG_MAX_VALUE_LOCK = threading.Lock()
-_IMG_MAX_VALUE_CACHE_MAX = 256
-
-
-def _read_img_max_value_cached(path: Path) -> float | None:
-    """Per-folder cached wrapper around _read_img_max_value (see note above)."""
-    if path.suffix.lower() != ".png":
-        return None
-    key = str(path.parent)
-    with _IMG_MAX_VALUE_LOCK:
-        if key in _IMG_MAX_VALUE_CACHE:
-            _IMG_MAX_VALUE_CACHE.move_to_end(key)
-            return _IMG_MAX_VALUE_CACHE[key]
-    # Read outside the lock (PIL open can block on SMB); a rare duplicate read
-    # under contention is harmless.
-    val = _read_img_max_value(path)
-    with _IMG_MAX_VALUE_LOCK:
-        _IMG_MAX_VALUE_CACHE[key] = val
-        _IMG_MAX_VALUE_CACHE.move_to_end(key)
-        while len(_IMG_MAX_VALUE_CACHE) > _IMG_MAX_VALUE_CACHE_MAX:
-            _IMG_MAX_VALUE_CACHE.popitem(last=False)
-    return val
+# The imgMaxValue / MaxValue tEXt reader that used to live here is gone: it was
+# only ever used to scale the display and it was wrong for that (see
+# _norm16_to8_full_scale below). It also cost one extra PIL open per folder on
+# the SMB path, and it identified the tag by tEXt chunk INDEX, so an unusual
+# chunk list silently produced a nonsense scale factor.
 
 # ---------------- BRIGHTNESS ----------------
-def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
+# The archiver writes 16-bit frames scaled so the CAMERA's full scale lands on
+# 65535: the stored value is raw_counts * 65535/(2**bits - 1), i.e. ×16 for a
+# 12-bit camera, ×32 for 11-bit, ×64.06 for 10-bit, ×128.25 for 9-bit, ×257 for
+# 8-bit, ×516 for 7-bit, ×1040 for 6-bit (verified across the whole camera list
+# and back to January archives — the same camera even switches depth between
+# frames). Dividing by 65535 is therefore THE camera-independent absolute scale.
+#
+# The old path did `MaxValue * arr / arr.max()` and then divided by a hardcoded
+# 4095. MaxValue (PNG tEXt) is the per-frame peak in raw counts, so that expression
+# collapses to `arr / 65535 * (full_scale / 4095)`: exact for 12-bit cameras and
+# wrong by that factor for every other depth. On the 6–9 bit diode cameras it
+# squeezed the frame into the bottom 2–12 % of the range, which is why a lit diode
+# array rendered nearly black until Auto contrast was switched on — and why the
+# same camera looked right on frames where it happened to run 12-bit.
+_FULL_SCALE_16 = 65535.0
+
+
+def _norm16_to8_full_scale(arr16: np.ndarray) -> np.ndarray:
+    """16-bit frame → uint8 on the camera's absolute full-scale range (see note
+    above). Deterministic per pixel value, so brightness stays comparable between
+    frames and between cameras without any per-frame auto-scaling."""
+    return np.clip(arr16.astype(np.float32) * (255.0 / _FULL_SCALE_16), 0, 255).astype(np.uint8)
+
+
+def _gain_to_contrast_slider(gain: float) -> int:
+    """Inverse of the manual contrast curve in _apply_contrast: return the slider
+    value whose gain matches `gain` (1.0 → 0). Used to park the disabled Contrast
+    slider where Auto actually put it."""
+    if not (gain > 0) or not math.isfinite(gain):
+        return 0
+    c = 127.0 * 259.0 * (gain - 1.0) / (259.0 + 127.0 * gain)
+    return int(round(max(-127.0, min(127.0, c))))
+
+
+def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
+                   out: dict | None = None) -> np.ndarray:
     """Percentile contrast stretch on a full-precision float array → uint8.
 
     Used for auto-stretch so weak images are stretched from their REAL data range
@@ -869,61 +1175,337 @@ def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) 
     means a few hot/saturated pixels can't dominate the scale and crush the rest of
     the frame to black. Falls back to min/max if the percentile window is degenerate,
     then to a flat black image only if the data is truly uniform.
+
+    `out`, when given, receives {"contrast": slider value equivalent to the applied
+    stretch} so the UI can show where Auto landed.
     """
     if arr_f.size == 0:
         return np.zeros(arr_f.shape, dtype=np.uint8)
-    lo = float(np.percentile(arr_f, p_low))
-    hi = float(np.percentile(arr_f, p_high))
+    s = _stat_sample(arr_f)
+    lo = float(np.percentile(s, p_low))
+    hi = float(np.percentile(s, p_high))
     if hi <= lo:
         lo, hi = float(arr_f.min()), float(arr_f.max())
     if hi <= lo:
         return np.zeros(arr_f.shape, dtype=np.uint8)
+    if out is not None:
+        # Gain relative to the absolute-scale (non-auto) rendering of the same frame.
+        out["contrast"] = _gain_to_contrast_slider(_FULL_SCALE_16 / (hi - lo))
     return np.clip((arr_f - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
 
 
-def _autostretch_gray(img: QImage, p_low: float = 0.5, p_high: float = 99.5) -> QImage:
-    if img.isNull():
-        return img
-    if img.format() != QImage.Format.Format_Grayscale8:
-        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
-    w, h = img.width(), img.height()
-    if w <= 0 or h <= 0:
-        return img
+# ---------------- 8-BIT BRIGHTNESS / CONTRAST PRIMITIVES ----------------
+# Everything below works on both Grayscale8 and colour images. Colour is handled as
+# RGB32 with the statistics taken from the luma, so a gain or a shift moves all three
+# channels together and the colour balance survives — needed because the "Default"
+# palette keeps RGB sources in colour and must still honour the sliders.
+_BLACK_PCT = 0.5      # percentile treated as the frame's black level
+_HIGH_PCT  = 99.5     # percentile treated as the frame's highlight level
+# Where Auto brightness parks the frame's median, and the highlight level it refuses
+# to push past. See _bc_auto_offset.
+_AUTO_BRIGHT_TARGET = 128.0
+_AUTO_BRIGHT_CEIL   = 250.0
+
+
+# Percentile anchors are read from a subsample, not from every pixel. np.percentile on
+# a native-resolution frame costs ~100 ms per pass and a render makes up to three of
+# them — that alone was more than the whole 33 ms scrub budget. A deterministic stride
+# over ~250k pixels lands within a code or two of the exact value. The stride is forced
+# odd so it cannot lock onto a single set of columns: these sensors have vertical
+# banding, and an even stride divides the row width on every square frame.
+_STAT_MAX_SAMPLES = 250_000
+
+
+def _stat_sample(a: np.ndarray) -> np.ndarray:
+    n = a.size
+    if n <= _STAT_MAX_SAMPLES:
+        return a
+    return np.ravel(a)[::(n // _STAT_MAX_SAMPLES) | 1]
+
+
+def _img_planes(img: QImage):
+    """(pixel array as float32, statistics plane as float32, is_gray).
+
+    Grayscale returns the same array for both. Colour returns the BGR channels and a
+    luma plane, so percentiles are measured on perceived brightness rather than on one
+    arbitrary channel."""
+    if img.format() == QImage.Format.Format_Grayscale8:
+        ptr = img.bits()
+        if hasattr(ptr, "setsize"):
+            ptr.setsize(img.sizeInBytes())
+        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(
+            img.height(), img.bytesPerLine())[:, :img.width()].astype(np.float32)
+        return arr, arr, True
+    img = img.convertToFormat(QImage.Format.Format_RGB32)
     ptr = img.bits()
     if hasattr(ptr, "setsize"):
         ptr.setsize(img.sizeInBytes())
-    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, img.bytesPerLine())[:, :w]
-    lo, hi = np.quantile(arr, [p_low / 100.0, p_high / 100.0])
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(
+        img.height(), img.bytesPerLine() // 4, 4)[:, :img.width(), :3].astype(np.float32)
+    stat = 0.114 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.299 * arr[:, :, 2]  # BGR order
+    return arr, stat, False
+
+
+def _img_from_planes(arr: np.ndarray, is_gray: bool, w: int, h: int) -> QImage:
+    a8 = np.clip(arr, 0, 255).astype(np.uint8)
+    if is_gray:
+        return QImage(a8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+    bgra = np.empty((h, w, 4), dtype=np.uint8)
+    bgra[:, :, :3] = a8
+    bgra[:, :, 3] = 255
+    return QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_RGB32).copy()
+
+
+def _contrast_gain(contrast: int) -> float:
+    """Slider value in [-127, 127] → multiplicative gain (0 → 1.0)."""
+    c = float(max(-127, min(127, contrast)))
+    return (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+
+
+def _bc_auto_offset(stat: np.ndarray) -> int:
+    """Additive offset for Auto brightness: park the frame's MEDIAN at mid-grey.
+
+    It used to park the 99.5th percentile at 255, which is not an exposure at all —
+    on these frames the whole tonal range lives in the bottom quarter (p50 ≈ 29,
+    p99.5 ≈ 65 on the absolute scale), so that rule added +190 and every pixel came
+    out between 195 and 255: a white rectangle with the picture clipped away. Anchoring
+    on the median is what "auto level" means, and the highlight cap keeps the bright
+    content from being clipped when a frame is already well exposed."""
+    s = _stat_sample(stat)
+    med = float(np.percentile(s, 50.0))
+    hi  = float(np.percentile(s, _HIGH_PCT))
+    off = _AUTO_BRIGHT_TARGET - med
+    if hi + off > _AUTO_BRIGHT_CEIL:
+        off = _AUTO_BRIGHT_CEIL - hi
+    return int(round(max(-255.0, min(255.0, off))))
+
+
+def _apply_stretch(img: QImage, p_low: float = 0.5, p_high: float = 99.5,
+                   out: dict | None = None) -> QImage:
+    """Percentile contrast stretch of an 8-bit image (grayscale or colour)."""
+    if img.isNull():
+        return img
+    w, h = img.width(), img.height()
+    if w <= 0 or h <= 0:
+        return img
+    arr, stat, is_gray = _img_planes(img)
+    lo, hi = (float(v) for v in np.percentile(_stat_sample(stat), [p_low, p_high]))
     if hi <= lo + 2:
         # Degenerate percentile window (dim image with sparse bright content):
         # fall back to the real min/max so we still use the full available range
         # instead of returning a black image unchanged.
-        lo, hi = float(arr.min()), float(arr.max())
+        lo, hi = float(stat.min()), float(stat.max())
     if hi <= lo:
         return img
-    stretched = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
-    out = QImage(stretched.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
-    return out.copy()
+    if out is not None:
+        out["contrast"] = _gain_to_contrast_slider(255.0 / (hi - lo))
+    return _img_from_planes((arr - lo) * (255.0 / (hi - lo)), is_gray, w, h)
+
+
+# Kept as the name the detection helpers call positionally.
+def _autostretch_gray(img: QImage, p_low: float = 0.5, p_high: float = 99.5,
+                      out: dict | None = None) -> QImage:
+    return _apply_stretch(img, p_low, p_high, out)
+
+
+def _apply_bc(img: QImage, contrast: int = 0, auto_bright: int = 0, offset: int = 0,
+              out: dict | None = None) -> QImage:
+    """Manual contrast, then Auto brightness OR a manual brightness offset.
+
+    Contrast is a multiplicative gain pivoted on the frame's own BLACK LEVEL, not on
+    mid-grey. Mid-grey was unusable here: an absolute-scale frame sits around code 29,
+    so `gain*(29-128)+128` drove it further down and a contrast of +20 — one nudge of
+    the slider — turned the picture black (measured: p50 29 → 3). Pivoting on the black
+    level means contrast only spreads the signal ABOVE the background, which is what the
+    control is for and what makes small moves small.
+
+    `out`, when given, receives {"offset": the Auto offset applied} for the UI."""
+    if img.isNull():
+        return img
+    if not contrast and not auto_bright and not offset:
+        return img
+    w, h = img.width(), img.height()
+    if w <= 0 or h <= 0:
+        return img
+    arr, stat, is_gray = _img_planes(img)
+    if contrast:
+        pivot = float(np.percentile(_stat_sample(stat), _BLACK_PCT))
+        gain = _contrast_gain(contrast)
+        arr = (arr - pivot) * gain + pivot
+        stat = arr if is_gray else (stat - pivot) * gain + pivot
+    if auto_bright:
+        off = _bc_auto_offset(stat)
+        if out is not None:
+            out["offset"] = off
+    else:
+        off = int(max(-255, min(255, offset)))
+    if off:
+        arr = arr + off
+    return _img_from_planes(arr, is_gray, w, h)
+
 
 def _apply_brightness_offset(img: QImage, offset: int) -> QImage:
-    """Přidá konstantní offset jasu ke grayscale obrazu."""
-    if offset == 0: return img
-    if img.format() != QImage.Format.Format_Grayscale8:
-        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
-    w, h = img.width(), img.height()
-    if w <= 0 or h <= 0: return img
+    return _apply_bc(img, offset=offset)
+
+
+def _apply_contrast(img: QImage, contrast: int) -> QImage:
+    return _apply_bc(img, contrast=contrast)
+
+
+def _apply_auto_brightness(img: QImage, out: dict | None = None) -> QImage:
+    return _apply_bc(img, auto_bright=1, out=out)
+
+
+# Brightness/contrast render params carried through the async load pipeline.
+# offset: manual brightness offset (-255..255); contrast: manual contrast (-127..127);
+# auto:   1 = auto-level brightness (offset ignored). Hashable → usable in cache keys.
+_RenderBC = namedtuple("_RenderBC", "offset contrast auto")
+_RENDER_BC_NONE = _RenderBC(0, 0, 0)
+
+
+# Where the Auto passes actually landed for the last render of each frame, so the
+# greyed-out Contrast / Brightness sliders can be parked on the effective value
+# instead of sitting at 0 and lying about what is on screen. Written from loader
+# threads, read on the UI thread; LRU-capped like the other render side-channels.
+_AUTO_BC_LOCK = threading.Lock()
+_AUTO_BC: OrderedDict = OrderedDict()
+_AUTO_BC_MAX = 256
+
+
+def _auto_bc_put(path, vals: dict):
+    if not vals:
+        return
+    key = str(path)
+    with _AUTO_BC_LOCK:
+        _AUTO_BC[key] = dict(vals)
+        _AUTO_BC.move_to_end(key)
+        while len(_AUTO_BC) > _AUTO_BC_MAX:
+            _AUTO_BC.popitem(last=False)
+
+
+def _auto_bc_get(path) -> "dict | None":
+    with _AUTO_BC_LOCK:
+        return _AUTO_BC.get(str(path))
+
+
+# ---------------- SUBTRACTION (REFERENCE DIFF) ----------------
+# Difference statistics of the last rendered subtraction frames, keyed by the
+# render cache key the caller passed to LoadTask. Written from loader threads,
+# read on the UI thread (dict ops only, guarded by a lock); bounded so a long
+# session cannot grow it without limit.
+_DIFF_STATS_LOCK = threading.Lock()
+_DIFF_STATS: OrderedDict = OrderedDict()
+_DIFF_STATS_MAX = 512
+
+
+def _diff_stats_put(key, stats: dict):
+    with _DIFF_STATS_LOCK:
+        _DIFF_STATS[key] = stats
+        _DIFF_STATS.move_to_end(key)
+        while len(_DIFF_STATS) > _DIFF_STATS_MAX:
+            _DIFF_STATS.popitem(last=False)
+
+
+def _diff_stats_get(key) -> "dict | None":
+    with _DIFF_STATS_LOCK:
+        return _DIFF_STATS.get(key)
+
+
+def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int = 0,
+                          sub_offset: int = 0, stats_out: dict | None = None) -> QImage:
+    """|current − reference| as a Grayscale8 QImage.
+
+    ±1 is always zeroed (integer round-trip noise), then `sub_threshold` cuts
+    small differences. `stats_out` receives the TRUE difference statistics —
+    measured before `sub_offset` is added, so the numbers stay physical.
+    `sub_offset` lifts every remaining non-zero pixel by that intensity, which
+    makes 1–2 count differences visible at the cost of absolute readability.
+    """
     ptr = img.bits()
     if hasattr(ptr, "setsize"):
         ptr.setsize(img.sizeInBytes())
-    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, img.bytesPerLine())[:, :w].copy()
-    arr = np.clip(arr.astype(np.int16) + offset, 0, 255).astype(np.uint8)
-    out = QImage(arr.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+    arr_cur = np.frombuffer(ptr, dtype=np.uint8).reshape(
+        img.height(), img.bytesPerLine())[:, :img.width()].copy().astype(np.float32)
+    if ref_image.shape != arr_cur.shape:
+        from PIL import Image as PilImage
+        ref_pil = PilImage.fromarray(ref_image.astype(np.uint8))
+        ref_pil = ref_pil.resize(
+            (arr_cur.shape[1], arr_cur.shape[0]),
+            PilImage.Resampling.NEAREST)
+        ref_arr = np.asarray(ref_pil, dtype=np.float32)
+    else:
+        ref_arr = ref_image.copy()
+    diff = np.abs(arr_cur - ref_arr)
+    diff[diff <= 1] = 0
+    if sub_threshold > 1:
+        diff[diff < sub_threshold] = 0
+    nz = diff > 0
+    n_nz = int(nz.sum())
+    if stats_out is not None:
+        vals = diff[nz]
+        stats_out.update({
+            "count": n_nz,
+            "total": int(diff.size),
+            "mean": float(vals.mean()) if n_nz else 0.0,
+            "min":  float(vals.min())  if n_nz else 0.0,
+            "max":  float(vals.max())  if n_nz else 0.0,
+        })
+    if sub_offset and n_nz:
+        diff[nz] += float(sub_offset)
+    diff = np.clip(diff, 0, 255).astype(np.uint8)
+    out = QImage(diff.tobytes(), img.width(), img.height(),
+                 img.width(), QImage.Format.Format_Grayscale8)
     return out.copy()
 
+
 # ---------------- FAST IMAGE LOAD ----------------
-def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: int = 0, brightness_offset: int = 0, ref_image: np.ndarray | None = None, sub_threshold: int = 0) -> QImage:
+# Largest file still read into RAM before decoding (see _open_reader). Beyond this the
+# doubled peak memory outweighs the win, so those stream from the path as before.
+_INMEM_READ_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _open_reader(path: Path):
+    """QImageReader over the file's BYTES, not over its path.
+
+    This is the single biggest win in the whole loader, and it is not about decoding at
+    all. QImageReader given a UNC path performs its network I/O *without releasing the
+    GIL*, so on this share every frame froze the ENTIRE Python process — GUI thread
+    included — for the whole round trip. Measured on \\\\users-L3 (445x420 frames, 0.27 MB):
+
+        QImageReader(path):  27 -> 32 frames/s from 1 to 16 threads (no scaling at all),
+                             and a 5 ms GUI ticker managed 132 ticks in 3 s,
+                             p99 153 ms, max 170 ms.
+        bytes + decode:      31 -> 106 -> 204 frames/s at 1 / 8 / 16 threads,
+                             664 ticks in 3 s, p99 6.1 ms, max 8.3 ms.
+
+    Python's open().read() releases the GIL for the network wait, and decoding from memory
+    is a couple of ms. Same handler, same pixels — only the source of the bytes changes.
+    The returned buffer and byte array MUST be kept alive by the caller for as long as the
+    reader is used, hence returning all three.
+
+    Falls back to the path-based reader when the bytes cannot be read (file locked by the
+    camera writer, or too large to buffer), so behaviour never gets worse than before."""
+    try:
+        if path.stat().st_size <= _INMEM_READ_MAX_BYTES:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            ba = QByteArray(data)
+            buf = QBuffer(ba)
+            buf.open(QBuffer.OpenModeFlag.ReadOnly)
+            r = QImageReader(buf)
+            r.setAutoTransform(True)
+            # No format hint: QImageReader sniffs the magic bytes, which is strictly more
+            # reliable than trusting the extension.
+            return r, buf, ba
+    except Exception:
+        pass
     r = QImageReader(str(path))
     r.setAutoTransform(True)
+    return r, None, None
+
+
+def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: int = 0, brightness_offset: int = 0, ref_image: np.ndarray | None = None, sub_threshold: int = 0, contrast: int = 0, auto_bright: int = 0, sub_offset: int = 0, stats_out: dict | None = None) -> QImage:
+    r, _buf, _ba = _open_reader(path)
     sz = r.size()
     if sz.isValid():
         w, h = sz.width(), sz.height()
@@ -936,119 +1518,56 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
         return QImage()
 
     # True once a full-precision percentile stretch has already been applied to 16-bit
-    # data, so the 8-bit _autostretch_gray pass below is skipped (would be redundant).
+    # data, so the 8-bit _apply_stretch pass below is skipped (would be redundant).
     did_autostretch = False
+    # Effective Auto contrast / brightness of this render, published for the sliders.
+    auto_out: dict = {}
 
-    # "Default" = show original colors, skip grayscale conversion.
-    # All other palettes convert to grayscale first (needed for LUT mapping).
-    if gradient_id == GRADIENT_ID_DEFAULT:
-        # 16-bit originals still need normalization to 8-bit for display, but keep RGB if present
-        if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
-            ptr = img.bits()
-            if hasattr(ptr, "setsize"):
-                ptr.setsize(img.sizeInBytes())
-            arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
-            arr_f = arr16.astype(np.float32)
-            img_max_val = _read_img_max_value_cached(path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                # Matlab: img = imgMaxValue * img / max(img), then imagesc([0, 65535])
-                arr_f = img_max_val * arr_f / arr_px_max
-                arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
-            elif arr_px_max > 0:
-                # No imgMaxValue metadata: fall back to per-frame max normalization so
-                # dim 16-bit frames still display instead of appearing black. This
-                # matches the metadata path (which also stretches each frame to its max).
-                arr8 = np.clip(arr_f / arr_px_max * 255.0, 0, 255).astype(np.uint8)
-            else:
-                arr8 = np.zeros(arr_f.shape, dtype=np.uint8)
-            img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
-        # Apply subtraction if requested (requires grayscale)
+    # "Default" = show the original colours (no grayscale conversion, no LUT). Every
+    # other palette goes to Grayscale8 first, which is what the LUT maps.
+    #
+    # Default used to `return` right after the 16-bit normalization, which quietly made
+    # Auto contrast, Auto brightness and BOTH sliders dead controls on that palette —
+    # the preview layer applied them, the refined render did not, so a drag showed one
+    # picture and settling showed another. The enhancement chain below is now shared.
+    is_default = (gradient_id == GRADIENT_ID_DEFAULT)
+
+    if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
+        ptr = img.bits()
+        if hasattr(ptr, "setsize"):
+            ptr.setsize(img.sizeInBytes())
+        arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
+        if brighten and ref_image is None:
+            # Auto-stretch: percentile-stretch the FULL-PRECISION 16-bit data so weak
+            # frames are revealed and a few hot pixels can't crush the rest to black.
+            # Done here (not on the 8-bit result) because the absolute-scale path
+            # below would otherwise lose the dim content before _apply_stretch
+            # can see it.
+            arr8 = _stretch_arr_f(arr16.astype(np.float32), out=auto_out)
+            did_autostretch = True
+        else:
+            arr8 = _norm16_to8_full_scale(arr16)
+        img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
+    elif is_default:
+        # Keep the original colours; subtraction is the one operation that needs mono.
         if ref_image is not None and img.format() != QImage.Format.Format_Grayscale8:
             img = img.convertToFormat(QImage.Format.Format_Grayscale8)
-        if ref_image is not None:
-            ptr2 = img.bits()
-            if hasattr(ptr2, "setsize"):
-                ptr2.setsize(img.sizeInBytes())
-            arr_cur = np.frombuffer(ptr2, dtype=np.uint8).reshape(
-                img.height(), img.bytesPerLine())[:, :img.width()].copy().astype(np.float32)
-            if ref_image.shape != arr_cur.shape:
-                from PIL import Image as PilImage
-                ref_pil = PilImage.fromarray(ref_image.astype(np.uint8))
-                ref_pil = ref_pil.resize(
-                    (arr_cur.shape[1], arr_cur.shape[0]),
-                    PilImage.Resampling.NEAREST)
-                ref_arr = np.asarray(ref_pil, dtype=np.float32)
-            else:
-                ref_arr = ref_image.copy()
-            diff = np.abs(arr_cur - ref_arr)
-            diff[diff <= 1] = 0
-            if sub_threshold > 1:
-                diff[diff < sub_threshold] = 0
-            diff = np.clip(diff, 0, 255).astype(np.uint8)
-            img = QImage(diff.tobytes(), img.width(), img.height(),
-                         img.width(), QImage.Format.Format_Grayscale8)
-        # Return original (possibly RGB) image without forced grayscale conversion
-        return img
     else:
-        # All non-Default palettes: normalize 16-bit then convert to Grayscale8 for LUT processing
-        if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
-            ptr = img.bits()
-            if hasattr(ptr, "setsize"):
-                ptr.setsize(img.sizeInBytes())
-            arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
-            arr_f = arr16.astype(np.float32)
-            if brighten and ref_image is None:
-                # Auto-stretch: percentile-stretch the FULL-PRECISION 16-bit data so weak
-                # frames are revealed and a few hot pixels can't crush the rest to black.
-                # Done here (not on the 8-bit result) because the per-frame-max path below
-                # would otherwise lose the dim content before _autostretch_gray can see it.
-                arr8 = _stretch_arr_f(arr_f)
-                did_autostretch = True
-            else:
-                img_max_val = _read_img_max_value_cached(path)
-                arr_px_max = float(arr_f.max())
-                if img_max_val is not None and arr_px_max > 0:
-                    arr_f = img_max_val * arr_f / arr_px_max
-                    arr8 = np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(np.uint8)
-                elif arr_px_max > 0:
-                    # No imgMaxValue metadata: per-frame max normalization (see DEFAULT branch).
-                    arr8 = np.clip(arr_f / arr_px_max * 255.0, 0, 255).astype(np.uint8)
-                else:
-                    arr8 = np.zeros(arr_f.shape, dtype=np.uint8)
-            img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
-        else:
-            img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
 
     if ref_image is not None:
-        ptr2 = img.bits()
-        if hasattr(ptr2, "setsize"):
-            ptr2.setsize(img.sizeInBytes())
-        arr_cur = np.frombuffer(ptr2, dtype=np.uint8).reshape(
-            img.height(), img.bytesPerLine())[:, :img.width()].copy().astype(np.float32)
-        if ref_image.shape != arr_cur.shape:
-            from PIL import Image as PilImage
-            ref_pil = PilImage.fromarray(ref_image.astype(np.uint8))
-            ref_pil = ref_pil.resize(
-                (arr_cur.shape[1], arr_cur.shape[0]),
-                PilImage.Resampling.NEAREST)
-            ref_arr = np.asarray(ref_pil, dtype=np.float32)
-        else:
-            ref_arr = ref_image.copy()
-        diff = np.abs(arr_cur - ref_arr)
-        # Always suppress rounding noise (±1 from integer round-trip)
-        diff[diff <= 1] = 0
-        if sub_threshold > 1:
-            diff[diff < sub_threshold] = 0
-        diff = np.clip(diff, 0, 255).astype(np.uint8)
-        img = QImage(diff.tobytes(), img.width(), img.height(),
-                     img.width(), QImage.Format.Format_Grayscale8)
+        img = _apply_reference_diff(img, ref_image, sub_threshold, sub_offset, stats_out)
 
     if brighten and ref_image is None and not did_autostretch:
-        img = _autostretch_gray(img)
+        img = _apply_stretch(img, out=auto_out)
 
-    if brightness_offset != 0:
-        img = _apply_brightness_offset(img, brightness_offset)
+    img = _apply_bc(img, contrast=contrast, auto_bright=auto_bright,
+                    offset=brightness_offset, out=auto_out)
+
+    _auto_bc_put(path, auto_out)
+
+    if is_default:
+        return img
 
     # gradient_id == GRADIENT_ID_GRAYSCALE (1): no LUT, already grayscale
     # gradient_id >= 2: apply color LUT
@@ -1077,10 +1596,78 @@ def _apply_lut(img: QImage, lut: np.ndarray) -> QImage:
     out = QImage(bgra.tobytes(), w, h, w * 4, QImage.Format.Format_RGB32)
     return out.copy()
 
+
+# ---- process working set, for _diag_log ---------------------------------------
+_RSS_PROBE = None   # (GetProcessMemoryInfo, _PMC, byref, sizeof) resolved once
+
+
+def _rss_mb() -> float:
+    """Process working set in MB, or -1.0 if it cannot be read.
+
+    The previous inline version returned -1 on EVERY line of EVERY run — the whole
+    reason this log exists (finding which resource grows before the ~2 h freeze) was
+    therefore never actually measured. Cause: neither `restype` nor `argtypes` was
+    declared, so ctypes defaulted GetCurrentProcess to restype=c_int. The pseudo
+    handle (HANDLE)-1 came back as Python -1 and was then marshalled as a 32-bit
+    value, so the callee saw 0x00000000FFFFFFFF and failed with ERROR_INVALID_HANDLE
+    (6). Declaring the prototypes fixes it.
+
+    K32GetProcessMemoryInfo (kernel32) is preferred over psapi's export so a frozen
+    build does not have to carry psapi.dll. Resolved once and cached: the old code
+    re-loaded the DLL every minute."""
+    global _RSS_PROBE
+    try:
+        if _RSS_PROBE is None:
+            import ctypes as _c
+            from ctypes import wintypes as _w
+
+            class _PMC(_c.Structure):
+                _fields_ = [("cb", _w.DWORD), ("PageFaultCount", _w.DWORD),
+                            ("PeakWorkingSetSize", _c.c_size_t), ("WorkingSetSize", _c.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", _c.c_size_t), ("QuotaPagedPoolUsage", _c.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", _c.c_size_t), ("QuotaNonPagedPoolUsage", _c.c_size_t),
+                            ("PagefileUsage", _c.c_size_t), ("PeakPagefileUsage", _c.c_size_t)]
+
+            k32 = _c.WinDLL("kernel32", use_last_error=True)
+            fn = getattr(k32, "K32GetProcessMemoryInfo", None)
+            if fn is None:
+                fn = _c.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+            k32.GetCurrentProcess.restype = _w.HANDLE
+            k32.GetCurrentProcess.argtypes = []
+            fn.restype = _w.BOOL
+            fn.argtypes = [_w.HANDLE, _c.POINTER(_PMC), _w.DWORD]
+            _RSS_PROBE = (k32, fn, _PMC, _c)
+        k32, fn, _PMC, _c = _RSS_PROBE
+        pmc = _PMC()
+        pmc.cb = _c.sizeof(_PMC)
+        if fn(k32.GetCurrentProcess(), _c.byref(pmc), pmc.cb):
+            return pmc.WorkingSetSize / (1024 * 1024)
+    except Exception:
+        pass
+    return -1.0
+
+
 class PixCache:
-    def __init__(self, max_items: int):
+    """LRU of rendered pixmaps keyed by (idx, max_side, …).
+
+    `native_keep` additionally caps how many NATIVE-resolution entries (max_side
+    == FULL_RES_SIDE) may live here at once: those are ~22 MB each, so letting the
+    plain LRU fill up with them was worth gigabytes. Pass None for caches whose
+    keys are not (idx, max_side, …) tuples."""
+
+    def __init__(self, max_items: int, native_keep: "int | None" = NATIVE_CACHE_KEEP):
         self.max_items = max_items
+        self.native_keep = native_keep
         self._d: OrderedDict = OrderedDict()
+
+    @staticmethod
+    def _is_native(key) -> bool:
+        # REFINE_MAX_SIDE renders are ~9 MB each — not native, but far too big to let
+        # CACHE_SIZE of them accumulate, so they are capped the same way.
+        if not (isinstance(key, tuple) and len(key) > 1):
+            return False
+        side = key[1]
+        return side == FULL_RES_SIDE or side >= HEAVY_RENDER_SIDE
 
     def get(self, key) -> QPixmap | None:
         if key in self._d:
@@ -1093,6 +1680,297 @@ class PixCache:
         self._d.move_to_end(key)
         while len(self._d) > self.max_items:
             self._d.popitem(last=False)
+        if self.native_keep is not None and self._is_native(key):
+            # OrderedDict iterates oldest-used first, so this drops the least
+            # recently shown full-res frames and keeps the newest ones.
+            natives = [k for k in self._d if self._is_native(k)]
+            for k in natives[:max(0, len(natives) - self.native_keep)]:
+                self._d.pop(k, None)
+
+    def clear(self):
+        self._d.clear()
+
+
+# ---------------- WHOLE-WINDOW PREVIEW (PROXY) LAYER ----------------
+def load_proxy_gray(path: Path, max_side: int = PROXY_MAX_SIDE):
+    """Decode one frame for the preview layer → (u8_array, lo, hi) or None.
+
+    No brightness/contrast, no palette: those are re-applied to the tiny array at paint
+    time (_proxy_render), so one stored frame serves every render setting.
+
+    STORAGE IS 8-BIT, BUT THE STRETCH IS TAKEN ON THE 16-BIT DATA. That distinction is the
+    whole design, and getting it wrong either way costs something real:
+
+      - Storing the raw uint16 (what this used to do) costs 2 bytes/px, so the RAM budget
+        buys half as many frames. On a 4-camera 4-hour window that meant the preview could
+        only ever hold every 2nd or 3rd frame, and a drag therefore could not show what it
+        was dragged across, however fast the rest of the pipeline got.
+      - Flattening to uint8 on the ABSOLUTE full scale (the obvious saving) throws away
+        exactly what Auto contrast needs: these frames sit in the bottom few percent of the
+        range — a 445x420 PFM frame runs p0.5..p99.5 = 1400..3060 out of 65535, i.e. six
+        8-bit codes — so stretching the uint8 version spread six codes over the full range
+        and the preview came out in harsh posterized bands while the refined render of the
+        same frame was smooth.
+
+    So: compute p0.5/p99.5 on the 16-bit pixels HERE (on a worker thread, off the GUI
+    thread where _proxy_render used to spend ~1 ms per tile per frame doing it), store the
+    frame already mapped into those 256 codes, and keep (lo, hi) alongside so the absolute
+    scale can be recovered exactly. Auto ON is then bit-identical to the old behaviour;
+    Auto OFF is an affine LUT of the stored codes, accurate to within one output code.
+
+    The one real loss is that pixels outside p0.5..p99.5 are clipped in storage, so with
+    Auto OFF a saturated spike renders at the p99.5 level instead of pure white. It is
+    bounded by the downscale (setScaledSize already averages a few hot pixels away at this
+    size) and undone entirely by _refine_current_frame, which re-reads the settled frame
+    from disk. Set PROXY_STORE_8BIT = False to go back to raw uint16."""
+    try:
+        # Bytes first, then decode — see _open_reader. The sweep is the heaviest user of
+        # the share, so it benefits most from not holding the GIL through each read.
+        r, _buf, _ba = _open_reader(path)
+        sz = r.size()
+        if sz.isValid():
+            w, h = sz.width(), sz.height()
+            if w > 0 and h > 0 and max_side > 0:
+                scale = max(w, h) / max_side
+                if scale > 1.0:
+                    r.setScaledSize(QSize(max(1, int(w / scale)), max(1, int(h / scale))))
+        img = r.read()
+        if img.isNull():
+            return None
+        if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
+            ptr = img.bits()
+            if hasattr(ptr, "setsize"):
+                ptr.setsize(img.sizeInBytes())
+            arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(
+                img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
+            if not PROXY_STORE_8BIT:
+                return arr16, 0.0, _FULL_SCALE_16, _FULL_SCALE_16
+            # A TWO-SEGMENT ramp, because 256 codes cannot cover both a narrow data band and
+            # a 20x outlier with one linear scale:
+            #   codes 0..239   span p0.1..p99.9 — the picture
+            #   codes 240..255 span p99.9..max  — the highlight tail
+            # (lo, hi, mx) travel with the frame so _proxy_render can invert both segments.
+            #
+            # Why not one linear scale over 0..65535: these frames run p0.1..p99.9 ≈
+            # 1536..2868 out of 65535, so the actual picture would be about five codes wide
+            # — the harsh posterised banding the raw-uint16 storage existed to avoid.
+            #
+            # Why not simply clip at p99.9: with Auto OFF a clipped saturated spot renders
+            # at the p99.9 LEVEL, i.e. dark — measured 11 instead of 253, so a saturated
+            # spot read as a dim one for the whole drag. On a laser diagnostic that is a
+            # wrong reading, not a quality trade.
+            #
+            # Why a ramp and not one reserved code: with a single "≥ p99.9" code every pixel
+            # above the knee renders at the frame MAXIMUM, so a mildly bright pixel and a
+            # saturated one look identical (measured 234 codes too bright). 16 codes over
+            # the tail keeps them apart, and costs the main band 240 codes instead of 256 —
+            # under one code of extra quantisation.
+            s = _stat_sample(arr16)
+            lo = float(np.percentile(s, 0.1))
+            hi = float(np.percentile(s, 99.9))
+            mx = float(arr16.max())
+            if hi <= lo:
+                lo, hi = float(arr16.min()), mx
+            if hi <= lo:
+                return np.zeros(arr16.shape, dtype=np.uint8), 0.0, _FULL_SCALE_16, mx
+            f = arr16.astype(np.float32)
+            u8 = np.clip((f - lo) / (hi - lo) * PROXY_KNEE_CODE,
+                         0, PROXY_KNEE_CODE).astype(np.uint8)
+            if mx > hi:
+                tail = f > hi
+                if tail.any():
+                    u8[tail] = (PROXY_KNEE_CODE + 1 + np.clip(
+                        (f[tail] - hi) / (mx - hi) * (254 - PROXY_KNEE_CODE),
+                        0, 254 - PROXY_KNEE_CODE)).astype(np.uint8)
+            return u8, lo, hi, max(mx, hi)
+        if img.format() != QImage.Format.Format_Grayscale8:
+            img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+        ptr = img.bits()
+        if hasattr(ptr, "setsize"):
+            ptr.setsize(img.sizeInBytes())
+        arr8 = np.frombuffer(ptr, dtype=np.uint8).reshape(
+            img.height(), img.bytesPerLine())[:, :img.width()].copy()
+        # An 8-bit source is already on its own full scale; lo/hi say "no remapping".
+        return arr8, 0.0, 255.0, 255.0
+    except Exception:
+        return None
+
+
+def _proxy_plan(items: list, budget: int) -> "tuple[list[int], int, int]":
+    """Pick which frames of `items` to preload, ordered coarse → fine.
+
+    Returns (indices, ts_gap, step). The order doubles the sampling density on every
+    pass, so the WHOLE window is covered after a small fraction of the work and
+    each further pass only tightens it — scrubbing anywhere is useful immediately
+    instead of only inside an already-finished prefix. `ts_gap` is the distance
+    between two frames of the FINISHED plan; while the sweep is still running the
+    accepted distance follows the density actually decoded so far (see
+    _ProxyTrack.current_gap) — pinning acceptance to the finished spacing is what
+    made the coarse passes above worthless: the preview refused every position
+    until the last pass, which is half of all the reads. `step` is the plan's grid
+    spacing in item indices, used to search the plan around the cursor."""
+    n = len(items)
+    if n <= 0 or budget <= 0:
+        return [], 0, 1
+    step = max(1, math.ceil(n / budget))
+    base = list(range(0, n, step))
+    if base and base[-1] != n - 1:
+        base.append(n - 1)
+    order: list[int] = []
+    seen: set[int] = set()
+    stride = 1
+    while stride < len(base):
+        stride *= 2
+    while stride >= 1:
+        for i in range(0, len(base), stride):
+            v = base[i]
+            if v not in seen:
+                seen.add(v)
+                order.append(v)
+        stride //= 2
+    span = items[-1].ts_ns - items[0].ts_ns
+    # ONE sampling step, not two. The preview stands in for a frame it did not
+    # actually decode, so this gap is how far the picture may be from the timestamp
+    # the info panel is showing. 2× made a sampled window show a frame dozens of
+    # positions away; 1× halves that and simply refuses more often, falling back to
+    # a real load — which is always correct.
+    ts_gap = max(1, int(span / max(1, len(base) - 1))) if span > 0 else 1 << 62
+    return order, ts_gap, step
+
+
+class _ProxyTrack:
+    """Preloaded preview frames of one timeline (single-cam, or one camera).
+
+    Keyed by ts_ns, not by list index: the item list grows and shifts (Refresh,
+    live-cap backfill) while a preview stays valid, and timestamps come from the
+    file names so they never move."""
+
+    def __init__(self):
+        self.frames: dict = {}                    # ts_ns → (u8 array, lo, hi)
+        self.planned: list[int] = []              # item indices, coarse→fine order
+        self.pos = 0                              # how far through `planned`
+        self.ts_gap = 0                           # accepted ts distance, finished plan
+        self.step = 1                             # plan grid spacing, in item indices
+        self.side = 0                             # decoded side these frames were read at.
+                                                  # Frames of the wrong size have to be
+                                                  # dropped when _proxy_side changes (a
+                                                  # camera added or removed), and the track
+                                                  # is reused across _proxy_start calls
+                                                  # whenever the track COUNT matches — which
+                                                  # it does when only the size changed.
+        self.taken: set[int] = set()              # item indices already dispatched
+        self.focus_g0 = -1                        # grid point the cursor scan started at
+        self.focus_d  = 0                         # how far out that scan already got
+        self.focus_turn = 0                       # alternates cursor-first / coarse-plan
+                                                  # batches for THIS track — see
+                                                  # _proxy_next_batch
+        self.failed = 0                           # planned frames that would not decode
+                                                  # (file caught mid-write, truncated PNG).
+                                                  # Discounted by _proxy_covered_track:
+                                                  # they can never land in `frames`, so
+                                                  # counting them made a camera with a few
+                                                  # bad files hold the whole viewer in the
+                                                  # "not covered" state forever.
+        self._sorted: list[int] = []
+        self._dirty = True
+        self._cur_gap = 0                         # cached current_gap()
+
+    def add(self, ts_ns: int, arr: np.ndarray):
+        # Insert into the sorted view instead of invalidating it: a full re-sort of up to
+        # 6000 keys ran on the GUI thread after every arriving batch (~100/s at full
+        # sweep), and both current_gap() and nearest() pull on it from inside the 33 ms
+        # scrub tick. _dirty / _sorted_ts stay as the correct fallback.
+        if ts_ns in self.frames:
+            # Re-decode of a frame already held: the sorted view is still correct, so do
+            # NOT dirty it. Marking it dirty here forced a full re-sort of up to 6000 keys
+            # on the GUI thread for a batch that changed nothing about the ordering.
+            self.frames[ts_ns] = arr
+            return
+        if not self._dirty:
+            bisect.insort(self._sorted, ts_ns)
+            s = self._sorted
+            self._cur_gap = (2 * (s[-1] - s[0]) // max(1, len(s) - 1)) if len(s) > 1 else 0
+        self.frames[ts_ns] = arr
+
+    def _sorted_ts(self) -> list:
+        if self._dirty:
+            self._sorted = sorted(self.frames)
+            self._dirty = False
+            s = self._sorted
+            # Spacing of what is DECODED right now. The sweep walks the plan
+            # coarse → fine, so the decoded set stays roughly evenly spread over the
+            # whole window at every moment: after the first pass it is one frame every
+            # span/2, then span/4, span/8 … Doubling covers the half that the pass in
+            # progress has not tightened yet, so a position there is served instead of
+            # refused. This is the tolerance a drag uses; standing still keeps ts_gap.
+            self._cur_gap = (2 * (s[-1] - s[0]) // max(1, len(s) - 1)) if len(s) > 1 else 0
+        return self._sorted
+
+    def current_gap(self) -> int:
+        """Max distance worth accepting from the frames decoded SO FAR (0 = none)."""
+        self._sorted_ts()
+        return self._cur_gap
+
+    def nbytes(self) -> int:
+        """RAM this track's decoded frames occupy. Logged per minute (proxMB): the
+        preview's cost was previously invisible — the budget was a constant nobody
+        could check against reality, and the rss field that would have caught it was
+        broken (see _rss_mb)."""
+        for a in self.frames.values():
+            # Every frame in a track has the same shape and dtype, so one sample is
+            # enough — summing .nbytes over 80k arrays runs on the GUI thread.
+            if isinstance(a, tuple):
+                a = a[0]
+            return len(self.frames) * int(getattr(a, "nbytes", 0))
+        return 0
+
+    def nearest(self, ts_ns: int, tol_ns: "int | None" = None) -> "tuple[int, np.ndarray] | None":
+        """Preloaded frame closest in time to ts_ns, or None if the gap is too big
+        (that part of the window has not been preloaded yet). `tol_ns` overrides the
+        finished-plan tolerance — see current_gap()."""
+        if not self.frames:
+            return None
+        s = self._sorted_ts()
+        limit = self.ts_gap if tol_ns is None else max(self.ts_gap, tol_ns)
+        j = bisect.bisect_left(s, ts_ns)
+        best = None
+        best_d = None
+        for k in (j - 1, j):
+            if 0 <= k < len(s):
+                d = abs(s[k] - ts_ns)
+                if best_d is None or d < best_d:
+                    best, best_d = s[k], d
+        if best is None or best_d > limit:
+            return None
+        return best, self.frames[best]
+
+
+class _ProxySignals(QObject):
+    batch = Signal(int, int, object)   # (gen, track index, [(ts_ns, arr|None), …])
+
+
+class _ProxyTask(QRunnable):
+    """Decode one batch of preview frames off the UI thread."""
+
+    def __init__(self, gen, track, jobs, signals, stop_flag, side=PROXY_MAX_SIDE):
+        super().__init__()
+        self.gen = gen
+        self.track = track
+        self.jobs = jobs
+        self.signals = signals
+        self.stop_flag = stop_flag
+        self.side = side
+
+    def run(self):
+        out = []
+        for ts_ns, path in self.jobs:
+            if self.stop_flag.is_set():
+                break
+            out.append((ts_ns, load_proxy_gray(path, self.side)))
+        try:
+            self.signals.batch.emit(self.gen, self.track, out)
+        except RuntimeError:
+            pass
 
 
 # ---------------- ASYNC LOADER ----------------
@@ -1100,21 +1978,46 @@ class _PvSignals(QObject):
     result = Signal(int, object)   # (gen, results_dict)
 
 class LoaderSignals(QObject):
-    loaded = Signal(int, int, int, int, int, int, int, QImage)
+    # 7th arg is the _RenderBC render-params tuple (was a plain brightness_offset int).
+    # 9th arg (key) is the EXACT cache key the caller computed at launch time. It is
+    # echoed back so the completion handler never has to recompute ref-id / sub-threshold
+    # from live UI state — recomputing there mismatched the launch key whenever the user
+    # changed reference/subtraction/gradient mid-flight, which leaked _inflight entries
+    # (loads that never re-fire), poisoned the cache with wrong-key pixmaps, and stranded
+    # _display_load_key so the view froze after the app had been running a while.
+    loaded = Signal(int, int, int, int, int, int, object, QImage, object)
 
 class LoadTask(QRunnable):
-    def __init__(self, gen, req_id, idx, path, max_side, brighten, gradient_id, signals, brightness_offset=0, ref_image=None, sub_threshold=0):
+    def __init__(self, gen, req_id, idx, path, max_side, brighten, gradient_id, signals, bc=_RENDER_BC_NONE, ref_image=None, sub_threshold=0, sub_offset=0, key=None):
         super().__init__()
         self.gen = gen; self.req_id = req_id; self.idx = idx
         self.path = path; self.max_side = max_side; self.brighten = brighten
-        self.gradient_id = gradient_id; self.brightness_offset = brightness_offset
+        self.gradient_id = gradient_id; self.bc = bc
         self.ref_image = ref_image; self.sub_threshold = sub_threshold
+        self.sub_offset = sub_offset
+        self.key = key
         self.signals = signals
 
     def run(self):
-        img = load_image_scaled(self.path, self.max_side, bool(self.brighten), self.gradient_id, self.brightness_offset, self.ref_image, self.sub_threshold)
+        # load_image_scaled must never raise out of this thread: QThreadPool swallows
+        # unhandled exceptions silently (no traceback, no signal), which used to leave
+        # the caller's busy/in-flight bookkeeping stuck forever — that camera (or that
+        # frame slot) would then never load again even though new frames kept arriving,
+        # e.g. a fast multi-cam camera getting caught mid-write over the network share
+        # more often than a slow one. Always emit, using a null QImage on failure, so
+        # _on_cam_loaded / _on_loaded release their busy flags and retry the next frame.
+        # Difference statistics are collected only for subtraction renders and
+        # published under the SAME cache key the pixmap is stored under, so the UI
+        # can label a frame whether it came from this load or from the pixmap cache.
+        stats = {} if self.ref_image is not None else None
         try:
-            self.signals.loaded.emit(self.gen, self.req_id, self.idx, self.max_side, self.brighten, self.gradient_id, self.brightness_offset, img)
+            img = load_image_scaled(self.path, self.max_side, bool(self.brighten), self.gradient_id, self.bc.offset, self.ref_image, self.sub_threshold, self.bc.contrast, self.bc.auto, self.sub_offset, stats)
+        except Exception:
+            img = QImage()
+        if stats and self.key is not None and not img.isNull():
+            _diff_stats_put(self.key, stats)
+        try:
+            self.signals.loaded.emit(self.gen, self.req_id, self.idx, self.max_side, self.brighten, self.gradient_id, self.bc, img, self.key)
         except RuntimeError:
             pass
 
@@ -2392,6 +3295,28 @@ class PointingPanel(QWidget):
         )
         self._qt_tooltip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._qt_tooltip.hide()
+        # ── Time cursor on the beam-path colour bar ──────────────────────────
+        # Draggable dot riding the Start→End gradient, with the timestamp shown
+        # beside it. Both are Qt children of the canvas, NOT matplotlib artists,
+        # so Save Plot writes the figure without them.
+        self._cbar_ax = None        # colorbar axes of the current draw
+        self._cbar_ts_min = None    # ns at the bottom of the gradient
+        self._cbar_ts_max = None    # ns at the top of the gradient
+        self._cbar_frac = 0.0       # cursor position: 0 = Start … 1 = End
+        self._cbar_drag = False
+        _host = self._canvas if self._canvas is not None else self
+        self._cbar_handle = QLabel(_host)
+        self._cbar_handle.setFixedSize(15, 15)
+        self._cbar_handle.setStyleSheet(
+            "background:#ffffff; border:2px solid #111; border-radius:7px;")
+        self._cbar_handle.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._cbar_handle.hide()
+        self._cbar_time_lbl = QLabel(_host)
+        self._cbar_time_lbl.setStyleSheet(
+            "background:#ffffff; border:1px solid #888; border-radius:3px;"
+            " padding:1px 5px; font-size:10px; color:#111;")
+        self._cbar_time_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._cbar_time_lbl.hide()
         if _MPL_OK and self._canvas is not None:
             self._canvas.installEventFilter(self)
 
@@ -2410,6 +3335,7 @@ class PointingPanel(QWidget):
         self._user_ylim = None
         self._select_mode = False
         self._rect_selector = None
+        self._cbar_frac = 0.0     # time cursor back to Start
         self._draw()
         self.setVisible(True)
 
@@ -2539,6 +3465,11 @@ class PointingPanel(QWidget):
         if obj is self._canvas and self._cx is not None:
             t = event.type()
             if t == QEvent.Type.MouseButtonPress:
+                if (event.button() == _Qt.MouseButton.LeftButton
+                        and self._cbar_hit(event.position().x(), event.position().y())):
+                    self._cbar_drag = True
+                    self._set_cbar_from_qt(event.position().y())
+                    return True
                 if event.button() == _Qt.MouseButton.MiddleButton:
                     self._pan_start = (event.position().x(), event.position().y())
                     self._pan_xlim = None
@@ -2551,13 +3482,21 @@ class PointingPanel(QWidget):
                 else:
                     self._handle_qt_click(event.position().x(), event.position().y())
             elif t == QEvent.Type.MouseMove:
+                if self._cbar_drag:
+                    self._set_cbar_from_qt(event.position().y())
+                    return True
                 if hasattr(self, '_pan_start') and self._pan_start is not None:
                     self._handle_qt_pan(event.position().x(), event.position().y())
                 else:
                     self._handle_qt_hover(event.position().x(), event.position().y())
             elif t == QEvent.Type.MouseButtonRelease:
+                if self._cbar_drag:
+                    self._cbar_drag = False
+                    return True
                 if event.button() == _Qt.MouseButton.MiddleButton:
                     self._pan_start = None
+            elif t == QEvent.Type.Resize:
+                self._update_cbar_marker()
             elif t == QEvent.Type.Wheel:
                 self._handle_qt_zoom(event.position().x(), event.position().y(),
                                      event.angleDelta().y())
@@ -2729,6 +3668,70 @@ class PointingPanel(QWidget):
             return False  # no canvas redraw needed
         return False
 
+    # ── Time cursor on the beam-path colour bar ──────────────────────────────
+    def _cbar_rect_px(self):
+        """(x_left, y_top, x_right, y_bottom) of the colour bar in canvas
+        pixels, or None when no colour bar is drawn."""
+        if self._cbar_ax is None or self._canvas is None:
+            return None
+        try:
+            bbox = self._cbar_ax.get_position()
+        except Exception:
+            return None
+        w = self._canvas.width(); h = self._canvas.height()
+        if w <= 0 or h <= 0:
+            return None
+        return (bbox.x0 * w, (1.0 - bbox.y1) * h,
+                bbox.x1 * w, (1.0 - bbox.y0) * h)
+
+    def _cbar_hit(self, qx: float, qy: float) -> bool:
+        """True if the press is on (or right next to) the colour bar — the bar
+        itself is only a few pixels wide, so the grab zone is padded."""
+        rect = self._cbar_rect_px()
+        if rect is None or self._cbar_ts_min is None:
+            return False
+        x0, y_top, x1, y_bot = rect
+        return (x0 - 12 <= qx <= x1 + 12) and (y_top - 10 <= qy <= y_bot + 10)
+
+    def _set_cbar_from_qt(self, qy: float):
+        rect = self._cbar_rect_px()
+        if rect is None:
+            return
+        _, y_top, _, y_bot = rect
+        span = max(y_bot - y_top, 1e-6)
+        frac = (y_bot - qy) / span        # bottom = Start, top = End
+        self._cbar_frac = min(1.0, max(0.0, float(frac)))
+        self._update_cbar_marker()
+
+    def _update_cbar_marker(self):
+        """Place the draggable dot on the gradient and the timestamp beside it."""
+        rect = self._cbar_rect_px()
+        if rect is None or self._cbar_ts_min is None:
+            self._cbar_handle.hide()
+            self._cbar_time_lbl.hide()
+            return
+        x0, y_top, x1, y_bot = rect
+        mid_x = (x0 + x1) / 2.0
+        cy = y_bot - self._cbar_frac * (y_bot - y_top)
+        hw = self._cbar_handle.width(); hh = self._cbar_handle.height()
+        self._cbar_handle.move(int(mid_x - hw / 2), int(cy - hh / 2))
+        self._cbar_handle.show(); self._cbar_handle.raise_()
+
+        ts = int(round(self._cbar_ts_min
+                       + self._cbar_frac * (self._cbar_ts_max - self._cbar_ts_min)))
+        # HH:MM only — it has to fit the narrow strip beside the colour bar.
+        self._cbar_time_lbl.setText(fmt_prague_full_from_ns(ts)[11:16])
+        self._cbar_time_lbl.adjustSize()
+        host_w = self._canvas.width(); host_h = self._canvas.height()
+        lw = self._cbar_time_lbl.width(); lh = self._cbar_time_lbl.height()
+        lx = int(x1 + 8)
+        if lx + lw > host_w:              # no room on the right → flip to the left
+            lx = int(x0 - 8 - lw)
+        lx = max(0, min(lx, host_w - lw))
+        ly = max(0, min(int(cy - lh / 2), host_h - lh))
+        self._cbar_time_lbl.move(lx, ly)
+        self._cbar_time_lbl.show(); self._cbar_time_lbl.raise_()
+
     def _draw(self):
         if not _MPL_OK: return
         self._hover_annot = None
@@ -2737,11 +3740,14 @@ class PointingPanel(QWidget):
         self._fig.clear()
         self._render_to_fig(self._fig)
         self._canvas.draw()
+        self._update_cbar_marker()
         if self._select_mode:
             # Delete mode persists across redraws (deletion, replay, restore)
             self._arm_selector()
 
     def _render_to_fig(self, fig):
+        if fig is self._fig:
+            self._cbar_ax = None      # re-established below when a colour bar is drawn
         mask = self._mask.copy() if self._mask is not None else np.ones(len(self._cx), dtype=bool)
         if self._replay_ts is not None and self._ts_int is not None:
             mask &= (self._ts_int <= self._replay_ts)
@@ -2846,6 +3852,13 @@ class PointingPanel(QWidget):
             cbar.set_ticks([0, 0.5, 1])
             cbar.set_ticklabels(["Start", "Mid", "End"])
             cbar.ax.tick_params(labelsize=7)
+            if fig is self._fig:
+                # Anchor the draggable time cursor to this colour bar.
+                ts_int = (self._ts_int[mask] if self._ts_int is not None
+                          else ts.astype(np.int64))
+                self._cbar_ax = cbar.ax
+                self._cbar_ts_min = int(ts_int.min())
+                self._cbar_ts_max = int(ts_int.max())
 
     def save_figure(self, path: str):
         if not _MPL_OK: return
@@ -2875,6 +3888,232 @@ class WeekendDelegate(QStyledItemDelegate):
             option.palette.setColor(option.palette.ColorRole.Text, QColor("#cc0000"))
             option.palette.setColor(option.palette.ColorRole.ButtonText, QColor("#cc0000"))
 
+# ── MULTI-SELECT CALENDAR (house style: Monday-first, gray header, red weekends,
+#    white cells) — same widget the Image Finder uses ──────────────────────────
+_MS_CAL_STYLE = """
+QCalendarWidget QWidget { background: #ffffff; color: #111; }
+QCalendarWidget QAbstractItemView:enabled {
+    background: #ffffff; color: #111;
+    selection-background-color: #1565C0; selection-color: white;
+}
+QCalendarWidget QWidget#qt_calendar_navigationbar { background: #eeeeee; }
+QCalendarWidget QToolButton {
+    color: #222; background: transparent;
+    font-weight: 700; font-size: 13px;
+    border-radius: 3px; padding: 3px 6px;
+}
+QCalendarWidget QToolButton:hover { background: #d0d0d0; }
+QCalendarWidget QSpinBox {
+    color: #222; background: #eeeeee; border: none; font-weight: 700;
+}
+QCalendarWidget QMenu { color: #111; background: #fff; }
+"""
+
+
+class _MultiSelectDelegate(QStyledItemDelegate):
+    """Paint calendar cells: selected days = blue fill, Sat/Sun = red text, the
+    focused day = blue outline. initStyleOption strips State_Selected from every
+    cell that is not in the selection, so Qt's own highlight never bleeds through
+    and the painted days are exactly the ones the caller selected."""
+
+    def __init__(self, cal: QCalendarWidget):
+        super().__init__(cal)
+        self._cal = cal
+        self._selected_keys: set = set()     # (year, month, day)
+        self._focus_key = None               # (year, month, day) | None
+
+    def _first_cell(self) -> "tuple[int, int]":
+        """Row/column of the first *day* cell. Qt drops the header row when
+        NoHorizontalHeader is set and the week-number column when
+        NoVerticalHeader is set, so the grid does not always start at (1, 1)."""
+        first_row = 1
+        if (self._cal.horizontalHeaderFormat()
+                == QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader):
+            first_row = 0
+        first_col = 1
+        if (self._cal.verticalHeaderFormat()
+                == QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader):
+            first_col = 0
+        return first_row, first_col
+
+    def _date_for_index(self, index) -> "QDate | None":
+        # The model knows the real date for in-month cells — always prefer it.
+        d = index.data(Qt.ItemDataRole.UserRole)
+        if isinstance(d, QDate) and d.isValid():
+            return d
+        first_row, first_col = self._first_cell()
+        if index.row() < first_row or index.column() < first_col:
+            return None                       # header row / week-number column
+        first = QDate(self._cal.yearShown(), self._cal.monthShown(), 1)
+        if not first.isValid():
+            return None
+        # Column offset of the 1st within the first displayed week.
+        offset = (first.dayOfWeek() - self._cal.firstDayOfWeek().value) % 7
+        row = index.row() - first_row
+        # Qt shifts the whole grid one week back when the 1st sits in the very
+        # first column (QCalendarModel::dateForCell, MinimumDayOffset = 1), so
+        # row 0 then shows the PREVIOUS week. Without this the painted days are
+        # a week off (clicking one day highlighted a different one).
+        if offset < 1:
+            row -= 1
+        start = first.addDays(-offset)
+        return start.addDays(row * 7 + (index.column() - first_col))
+
+    def _repaint(self):
+        view = self._cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
+        if view is not None:
+            view.viewport().update()
+
+    def set_selected(self, dates: "list[QDate]"):
+        self._selected_keys = {(d.year(), d.month(), d.day()) for d in dates}
+        self._repaint()
+
+    def set_focus_date(self, d: "QDate | None"):
+        self._focus_key = None if d is None else (d.year(), d.month(), d.day())
+        self._repaint()
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        d = self._date_for_index(index)
+        if d is not None and (d.year(), d.month(), d.day()) not in self._selected_keys:
+            option.state = option.state & ~QStyle.StateFlag.State_Selected
+
+    def paint(self, painter, option, index):
+        d = self._date_for_index(index)
+        if d is None:
+            super().paint(painter, option, index)
+            return
+        key = (d.year(), d.month(), d.day())
+        is_weekend = d.dayOfWeek() in (6, 7)
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        if key in self._selected_keys:
+            painter.save()
+            painter.fillRect(option.rect, QColor("#1565C0"))
+            painter.setPen(QColor("#ffcccc") if is_weekend else QColor("#ffffff"))
+            painter.setFont(option.font)
+            painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, text)
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
+            if is_weekend:
+                painter.save()
+                painter.setPen(QColor("#cc0000"))
+                painter.setFont(option.font)
+                painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, text)
+                painter.restore()
+        if key == self._focus_key:
+            painter.save()
+            painter.setPen(QPen(QColor("#1565C0"), 2))
+            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
+            painter.restore()
+
+
+def _make_multiselect_calendar(initial: "QDate | None" = None
+                               ) -> "tuple[QFrame, QCalendarWidget]":
+    """Return (wrapper_frame, cal) — one calendar with a gray day-name header, a
+    light nav bar (month button + year spin) and the multi-select delegate
+    installed. Selection is driven by the caller via cal._wk_delegate."""
+    cal = QCalendarWidget()
+    cal.setGridVisible(True)
+    cal.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedKingdom))
+    cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
+    cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+    cal.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader)
+    if initial:
+        cal.setSelectedDate(initial)
+    cal.setStyleSheet(_MS_CAL_STYLE)
+
+    nav_internal = cal.findChild(QWidget, "qt_calendar_navigationbar")
+    if nav_internal:
+        nav_internal.hide()
+
+    view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
+    if view is not None:
+        cal._wk_delegate = _MultiSelectDelegate(cal)
+        view.setItemDelegate(cal._wk_delegate)
+
+    _MONTHS = ["January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+    nav_row = QWidget()
+    nav_row.setAutoFillBackground(True)
+    nav_pal = nav_row.palette()
+    nav_pal.setColor(QPalette.ColorRole.Window, QColor("#eeeeee"))
+    nav_row.setPalette(nav_pal)
+    nav_lay = QHBoxLayout(nav_row)
+    nav_lay.setContentsMargins(4, 3, 4, 3)
+    nav_lay.setSpacing(4)
+
+    prev_btn = QToolButton(); prev_btn.setText("◀")
+    prev_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 18px; padding: 1px 6px; }"
+                           "QToolButton:hover { background: #d0d0d0; border-radius: 3px; }")
+    month_btn = QPushButton(); month_btn.setMinimumWidth(100)
+    month_btn.setStyleSheet(
+        "QPushButton { border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;"
+        " color: #111; font-weight: bold; font-size: 12px; padding: 2px 10px; }"
+        "QPushButton:hover { background: #e0e0e0; }")
+    year_spin = QSpinBox()
+    year_spin.setRange(2000, 2100)
+    year_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+    year_spin.setStyleSheet(
+        "QSpinBox { border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;"
+        " color: #111; padding: 1px 4px; font-weight: bold; font-size: 12px; }")
+    year_spin.setFixedWidth(60)
+    next_btn = QToolButton(); next_btn.setText("▶")
+    next_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 18px; padding: 1px 6px; }"
+                           "QToolButton:hover { background: #d0d0d0; border-radius: 3px; }")
+
+    nav_lay.addWidget(prev_btn); nav_lay.addStretch()
+    nav_lay.addWidget(month_btn); nav_lay.addWidget(year_spin)
+    nav_lay.addStretch(); nav_lay.addWidget(next_btn)
+
+    def _update_nav():
+        month_btn.setText(_MONTHS[cal.monthShown() - 1])
+        year_spin.blockSignals(True)
+        year_spin.setValue(cal.yearShown())
+        year_spin.blockSignals(False)
+
+    def _on_month_btn():
+        menu = QMenu(month_btn)
+        for i, name in enumerate(_MONTHS, 1):
+            menu.addAction(name).setData(i)
+        chosen = menu.exec(month_btn.mapToGlobal(month_btn.rect().bottomLeft()))
+        if chosen:
+            cal.setCurrentPage(cal.yearShown(), chosen.data())
+
+    prev_btn.clicked.connect(cal.showPreviousMonth)
+    next_btn.clicked.connect(cal.showNextMonth)
+    month_btn.clicked.connect(_on_month_btn)
+    year_spin.valueChanged.connect(lambda y: cal.setCurrentPage(y, cal.monthShown()))
+    cal.currentPageChanged.connect(lambda _y, _m: _update_nav())
+    _update_nav()
+
+    hdr_row = QWidget()
+    hdr_row.setAutoFillBackground(True)
+    hdr_pal = hdr_row.palette()
+    hdr_pal.setColor(QPalette.ColorRole.Window, QColor("#bdbdbd"))
+    hdr_row.setPalette(hdr_pal)
+    hdr_lay = QHBoxLayout(hdr_row)
+    hdr_lay.setContentsMargins(0, 0, 0, 0)
+    hdr_lay.setSpacing(0)
+    for i, name in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
+        lbl = QLabel(name)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        colour = "#cc0000" if i >= 5 else "#111111"
+        lbl.setStyleSheet(f"color: {colour}; font-weight: 700; padding: 4px 0;")
+        hdr_lay.addWidget(lbl, stretch=1)
+
+    wrapper = QFrame()
+    wrapper.setStyleSheet("QFrame { border: 1px solid #b0b0b0; border-radius: 3px; }")
+    w_lay = QVBoxLayout(wrapper)
+    w_lay.setContentsMargins(0, 0, 0, 0)
+    w_lay.setSpacing(0)
+    w_lay.addWidget(nav_row)
+    w_lay.addWidget(hdr_row)
+    w_lay.addWidget(cal)
+    return wrapper, cal
+
+
 def _hsep_dialog() -> QFrame:
     f = QFrame()
     f.setFrameShape(QFrame.Shape.HLine)
@@ -2883,17 +4122,163 @@ def _hsep_dialog() -> QFrame:
     return f
 
 # ---------------- DATE PICKER DIALOG ----------------
+# One selected time window on one calendar day (Prague local wall time). The
+# "to" time is the EXCLUSIVE end of the window, so a whole hour reads as an
+# exact hour span — 12:00–13:00, not 12:00–12:59.
+PickSeg = namedtuple("PickSeg", "date h_from m_from h_to m_to")
+
+# Preset window for every multi-day selection (both multi-day modes) — the lab
+# shift. Any single day can still be given its own window with the ⚙ editor.
+_MULTIDAY_FROM = QTime(7, 0)
+_MULTIDAY_TO   = QTime(21, 0)
+
+
+def _seg_fields(seg) -> tuple:
+    """Unpack a PickSeg — or a legacy (date, hour_from, hour_to) tuple."""
+    if isinstance(seg, PickSeg):
+        return seg.date, seg.h_from, seg.m_from, seg.h_to, seg.m_to
+    d, hf, ht = seg
+    return d, int(hf), 0, int(ht) + 1, 0
+
+
+def hour_end_hm(hour: int) -> "tuple[int, int]":
+    """Exclusive end of `hour` as (hour, minute) — the next whole hour.
+    23 → 23:59, the closest a QTimeEdit can express to midnight; seg_bounds_ns
+    stretches that back out to the next day's 00:00."""
+    h = max(0, min(23, int(hour)))
+    return (h + 1, 0) if h < 23 else (23, 59)
+
+
+def seg_bounds_ns(seg) -> "tuple[int, int]":
+    """[start_ns, end_ns) of a segment.
+
+    The "to" time is the EXCLUSIVE end: 12:00–13:00 is exactly one hour and
+    touches only the 12 h archive folder (see utc_hour_cells_for_window).
+    A "to" of 23:59 means "to the end of the day" — a QTimeEdit cannot show
+    24:00 — and is stretched to the next midnight."""
+    d, hf, mf, ht, mt = _seg_fields(seg)
+    if (ht, mt) == (23, 59):
+        ht, mt = 24, 0
+    midnight = datetime(d.year, d.month, d.day, tzinfo=TZ_PRAGUE)
+    start = midnight + timedelta(hours=hf, minutes=mf)
+    end   = midnight + timedelta(hours=ht, minutes=mt)
+    if end <= start:
+        end = start + timedelta(minutes=1)
+    return ns_from_dt(start), ns_from_dt(end)
+
+
+def utc_hour_cells_for_window(start_ns: int, end_ns: int) -> "list[tuple[int, int, int, int]]":
+    """UTC (year, month, day, hour) folder coordinates covering [start_ns, end_ns).
+    The archive tree is year/month/day/hour in UTC (see axis_from_hour_folder_exact),
+    so a Prague-time window must be converted before folders are enumerated —
+    Prague 00:30 lives in the PREVIOUS day's 22 or 23 folder."""
+    from datetime import timezone as _tz
+    if end_ns <= start_ns:
+        end_ns = start_ns + 1
+    # Integer seconds — ts/1e9 loses the last digits of a ns timestamp and would
+    # round an exclusive end of 10:00:00.000000000 up into the next hour folder.
+    cur = datetime.fromtimestamp(start_ns // 1_000_000_000, tz=_tz.utc).replace(
+        minute=0, second=0, microsecond=0)
+    last = datetime.fromtimestamp((end_ns - 1) // 1_000_000_000, tz=_tz.utc)
+    out = []
+    while cur <= last:
+        out.append((cur.year, cur.month, cur.day, cur.hour))
+        cur += timedelta(hours=1)
+    return out
+
+
+def hour_dirs_for_windows(windows: "list[tuple[int, int]]") -> "list[Path]":
+    """Archive hour folders (…/year/month/day/hour) covering the given windows,
+    de-duplicated and in chronological order."""
+    seen: set = set()
+    out: list[Path] = []
+    for start_ns, end_ns in windows:
+        for y, m, d, h in utc_hour_cells_for_window(start_ns, end_ns):
+            key = (y, m, d, h)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(container_root_for_year(y) / str(y) / str(m) / str(d) / str(h))
+    return out
+
+
+def cameras_for_windows(windows: "list[tuple[int, int]]"
+                        ) -> "tuple[list[tuple[str, str]], str]":
+    """UNION of the camera folders present anywhere in the selection.
+
+    Returns (cameras, status) where cameras is [(number, folder_name)…] sorted by
+    name and status is "" (ok), "no_data" (archive readable, nothing there) or
+    "error" (archive root unreachable).
+
+    Every window is visited, so one empty day or hour can no longer make the whole
+    list come back empty — that used to happen because only the FIRST window was
+    scanned ("cameras are the same everywhere"), which is true only for windows
+    that actually have data. Within a single window the scan does stop at the
+    first hour folder that has cameras, since the set does not change there.
+    """
+    cameras: "list[tuple[str, str]]" = []
+    seen: set = set()
+    now_ns = int(time.time() * 1_000_000_000)
+    reachable = False
+    root_checked: set = set()
+    for start_ns, end_ns in windows:
+        # Online-mode windows carry an open end (1 << 62) — enumerating hour
+        # folders up to that would never finish. A pick window never spans more
+        # than one day, so 25 h is a safe ceiling for the folder walk.
+        end_ns = min(end_ns, now_ns + ONE_HOUR_NS, start_ns + 25 * ONE_HOUR_NS)
+        if end_ns <= start_ns:
+            end_ns = start_ns + 1
+        for hour_dir in hour_dirs_for_windows([(start_ns, end_ns)]):
+            root = hour_dir.parents[3]
+            if root not in root_checked:
+                root_checked.add(root)
+                try:
+                    if root.exists():
+                        reachable = True
+                except OSError:
+                    pass
+            try:
+                if not (hour_dir.exists() and hour_dir.is_dir()):
+                    continue
+                subs = sorted([p.name for p in hour_dir.iterdir() if p.is_dir()],
+                              key=str.lower)
+            except OSError:
+                continue
+            reachable = True
+            for name in subs:
+                if name in seen:
+                    continue
+                seen.add(name)
+                m = re.match(r"^C\d{2}-(\d{2,3})-", name)
+                cameras.append((m.group(1) if m else "", name))
+            if subs:
+                break   # this window is covered; move on to the next day/segment
+    cameras.sort(key=lambda t: t[1].lower())
+    if cameras:
+        return cameras, ""
+    return cameras, ("no_data" if reachable else "error")
+
+
 class DatePickerDialog(QDialog):
-    def __init__(self, start_folder=None, hour_from_init=None, hour_to_init=None, parent=None):
+    """Time-window picker: one calendar, minute-resolution From/To times and two
+    mutually exclusive multi-day modes (continuous day range, or one explicit
+    window per day)."""
+
+    def __init__(self, start_folder=None, hour_from_init=None, hour_to_init=None,
+                 parent=None, min_from_init=None, min_to_init=None,
+                 init_date=None, init_segments=None, init_range_mode=False):
         super().__init__(parent)
-        self.setWindowTitle("Pick date")
-        self._camera_mode = False  # set to True by open_folder
-        self._segments: "list[tuple]" = []  # per-day selection: (date, hour_from, hour_to)
+        self.setWindowTitle("Time window")
+        self._camera_mode = False              # set to True by open_folder
+        self._segments: "list[PickSeg]" = []   # per-day windows (both multi modes)
+        self._range_start: "date | None" = None
+        self._range_end:   "date | None" = None
+        # date -> (h_from, m_from, h_to, m_to) set through the per-day ⚙ editor.
+        # Survives rebuilds of the day list and the global From/To fields.
+        self._day_overrides: dict = {}
 
         init_dt = datetime.now(TZ_PRAGUE)
         init_hour = init_dt.hour
-        # Remember if caller passed explicit hours — if not, default to online mode
-        _explicit_hours = (hour_from_init is not None or hour_to_init is not None)
 
         if start_folder is not None:
             ax = axis_from_any_folder(start_folder)
@@ -2904,69 +4289,36 @@ class DatePickerDialog(QDialog):
                 except Exception:
                     pass
 
+        # The dialog always reopens on the previous pick — the day (and the whole
+        # multi-day list, restored further down) the user chose last time. The Now
+        # button is the way back to today.
+        if init_date is not None:
+            init_dt = datetime(init_date.year, init_date.month, init_date.day,
+                               init_dt.hour, tzinfo=TZ_PRAGUE)
+
+        # Default window = the whole current hour, expressed hour-exact
+        # (12:00–13:00, never 12:00–12:59).
+        _def_h_to, _def_m_to = hour_end_hm(init_hour)
         if hour_from_init is None: hour_from_init = init_hour
-        if hour_to_init is None:   hour_to_init   = init_hour
+        if hour_to_init is None:   hour_to_init   = _def_h_to
+        if min_from_init is None:  min_from_init  = 0
+        if min_to_init is None:    min_to_init    = _def_m_to
 
-        self.cal = QCalendarWidget(self)
-        self.cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-        view = self.cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if view:
-            view.setItemDelegate(WeekendDelegate(view))
-        self.cal.setSelectedDate(QDate(init_dt.year, init_dt.month, init_dt.day))
-        self.cal.setGridVisible(True)
-        self.cal.setNavigationBarVisible(False)
+        self._cal_frame, self.cal = _make_multiselect_calendar(
+            QDate(init_dt.year, init_dt.month, init_dt.day))
+        self.cal.setMinimumWidth(260)
+        self.cal.clicked.connect(self._on_calendar_clicked)
 
-        hf = QTextCharFormat()
-        hf = QTextCharFormat()
-        hf.setForeground(QColor("#111111"))
-        self.cal.setHeaderTextFormat(hf)
-
-        wf = QTextCharFormat()
-        wf.setForeground(QColor("#111111"))
-        for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                    Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-            self.cal.setWeekdayTextFormat(day, wf)
-
-        wf_weekend = QTextCharFormat()
-        wf_weekend.setForeground(QColor("#cc0000"))
-        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-            self.cal.setWeekdayTextFormat(day, wf_weekend)
-
-        self.cal.setStyleSheet("""
-        QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
-        QCalendarWidget QAbstractItemView {
-            background: #fcfcfc; color: #111;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            alternate-background-color: #f2f2f2; gridline-color: #d8d8d8; }
-        QCalendarWidget QTableView {
-            background: #fcfcfc; alternate-background-color: #b5b5b5;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            gridline-color: #d8d8d8; outline: 0; }
-        QCalendarWidget QToolButton {
-            background: #efefef; border: 1px solid #c8c8c8;
-            padding: 4px 8px; border-radius: 4px; color: #111; }
-        QCalendarWidget QSpinBox, QCalendarWidget QComboBox {
-            background: #fff; border: 1px solid #c8c8c8; padding: 2px 6px; color: #111; }
-        QCalendarWidget QAbstractItemView:enabled {
-            color: #111; }
-        QCalendarWidget QAbstractItemView:enabled {
-            color: #cc0000; }
-        """)
-
-        self.month_cb = QComboBox(self)
-        for m in range(1, 13):
-            self.month_cb.addItem(datetime(2000, m, 1).strftime("%B").capitalize(), m)
-        self.month_cb.setCurrentIndex(init_dt.month - 1)
-        self.month_cb.setMinimumWidth(120)
-
-        self.year_sb = QSpinBox(self)
-        self.year_sb.setRange(2000, 2100); self.year_sb.setValue(init_dt.year); self.year_sb.setFixedWidth(80)
-
-        self.hour_from = QSpinBox(self)
-        self.hour_from.setRange(0, 23); self.hour_from.setValue(max(0, min(23, int(hour_from_init)))); self.hour_from.setFixedWidth(70)
-
-        self.hour_to = QSpinBox(self)
-        self.hour_to.setRange(0, 23); self.hour_to.setValue(max(0, min(23, int(hour_to_init)))); self.hour_to.setFixedWidth(70)
+        self.time_from = QTimeEdit(self)
+        self.time_from.setDisplayFormat("HH:mm")
+        self.time_from.setTime(QTime(max(0, min(23, int(hour_from_init))),
+                                    max(0, min(59, int(min_from_init)))))
+        self.time_from.setFixedWidth(74)
+        self.time_to = QTimeEdit(self)
+        self.time_to.setDisplayFormat("HH:mm")
+        self.time_to.setTime(QTime(max(0, min(23, int(hour_to_init))),
+                                  max(0, min(59, int(min_to_init)))))
+        self.time_to.setFixedWidth(74)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         btns.accepted.connect(self._on_accept); btns.rejected.connect(self.reject)
@@ -2974,63 +4326,63 @@ class DatePickerDialog(QDialog):
         _cb_style = _CHECKBOX_STYLE + (
             "QCheckBox { font-size: 11px; font-weight: 700; color: #1a3a8f; }"
         )
-        self.cb_now = QCheckBox("Now (online mode)")
+        self.cb_now = QCheckBox("Live mode")
         self.cb_now.setToolTip(
-            "To hour = current hour. Viewer will automatically load new images as they arrive.")
+            "Today, from the start of the current hour to the end of it. Viewer will "
+            "automatically load and follow new images as they arrive.\n"
+            "Off = the window is loaded once and nothing follows live.")
         self.cb_now.setStyleSheet(_cb_style)
         self.cb_now.stateChanged.connect(self._on_now_changed)
 
-        # ── Multi-day checkbox + To-date calendar ──────────────────────────────
-        self.cb_multiday = QCheckBox("Multi-day / per-day selection")
-        self.cb_multiday.setChecked(False)
-        self.cb_multiday.setStyleSheet(_cb_style)
+        # ── Two multi-day modes (mutually exclusive) ───────────────────────────
+        self.cb_range = QCheckBox("Multiple day selection (day → day)")
+        self.cb_range.setToolTip(
+            f"Click the first and then the last day in the calendar. Every day in "
+            f"between is loaded with the same time window, preset to "
+            f"{_MULTIDAY_FROM.toString('HH:mm')}–{_MULTIDAY_TO.toString('HH:mm')}. "
+            f"Change From/To to move all days at once, or press ⚙ next to a single "
+            f"day in the list to give just that day its own window.")
+        self.cb_range.setStyleSheet(_cb_style)
 
-        self.cal_to = QCalendarWidget(self)
-        self.cal_to.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-        view2 = self.cal_to.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if view2:
-            view2.setItemDelegate(WeekendDelegate(view2))
-        self.cal_to.setSelectedDate(QDate(init_dt.year, init_dt.month, init_dt.day))
-        self.cal_to.setGridVisible(True)
-        self.cal_to.setNavigationBarVisible(False)
-        # Same styling as cal
-        self.cal_to.setHeaderTextFormat(hf)
-        for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                    Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-            self.cal_to.setWeekdayTextFormat(day, wf)
-        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-            self.cal_to.setWeekdayTextFormat(day, wf_weekend)
-        self.cal_to.setStyleSheet(self.cal.styleSheet())
-        self.cal_to.setVisible(False)
-        self._lbl_cal_to = QLabel("End date (for 'Add range'):")
-        self._lbl_cal_to.setVisible(False)
+        self.cb_perday = QCheckBox("Multiple days – time window per day")
+        self.cb_perday.setToolTip(
+            f"Pick a day, set From/To, press 'Add day'. Repeat for as many days as "
+            f"needed — each day keeps its own time window "
+            f"(preset {_MULTIDAY_FROM.toString('HH:mm')}–{_MULTIDAY_TO.toString('HH:mm')}, "
+            f"editable per day with ⚙).")
+        self.cb_perday.setStyleSheet(_cb_style)
 
-        self.cb_multiday.stateChanged.connect(self._on_multiday_toggled)
+        self.cb_range.stateChanged.connect(self._on_range_toggled)
+        self.cb_perday.stateChanged.connect(self._on_perday_toggled)
 
-        # ── Per-day selection: Add buttons + table ─────────────────────────────
-        self.btn_add_seg = QPushButton("Add to selection")
-        self.btn_add_seg.setToolTip(
-            "Add the selected (start) date with the chosen From/To hours to the list below.")
-        self.btn_add_seg.clicked.connect(self._on_add_segment)
+        self.btn_add_day = QPushButton("Add day")
+        self.btn_add_day.setToolTip("Add the selected day with the chosen From/To time.")
+        self.btn_add_day.clicked.connect(self._on_add_day)
+        self.btn_add_day.setVisible(False)
 
-        self.btn_add_range = QPushButton("Add range")
-        self.btn_add_range.setToolTip(
-            "Add every day from start date to end date below, all with the chosen From/To hours.")
-        self.btn_add_range.clicked.connect(self._on_add_range)
+        self.btn_clear_days = QPushButton("Clear")
+        self.btn_clear_days.clicked.connect(self._clear_selection)
+        self.btn_clear_days.setVisible(False)
 
-        self._lbl_seg = QLabel("Per-day selection:")
-        self._lbl_seg.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
-        self._lbl_seg.setVisible(False)
+        self._add_row_widget = QWidget()
+        _add_row = QHBoxLayout(self._add_row_widget)
+        _add_row.setContentsMargins(0, 0, 0, 0)
+        _add_row.addWidget(self.btn_add_day)
+        _add_row.addWidget(self.btn_clear_days)
+        _add_row.addStretch(1)
+        self._add_row_widget.setVisible(False)
 
-        self._seg_table = QTableWidget(0, 3)
-        self._seg_table.setHorizontalHeaderLabels(["Date", "Hours", ""])
+        # Date | Time | ⚙ (edit this day's window) | ✕ (remove, per-day mode only)
+        self._seg_table = QTableWidget(0, 4)
+        self._seg_table.setHorizontalHeaderLabels(["Date", "Time", "", ""])
         self._seg_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch)
         self._seg_table.horizontalHeader().setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents)
-        self._seg_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Fixed)
-        self._seg_table.setColumnWidth(2, 28)
+        for _c in (2, 3):
+            self._seg_table.horizontalHeader().setSectionResizeMode(
+                _c, QHeaderView.ResizeMode.Fixed)
+            self._seg_table.setColumnWidth(_c, 28)
         self._seg_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self._seg_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._seg_table.verticalHeader().setVisible(False)
@@ -3038,301 +4390,474 @@ class DatePickerDialog(QDialog):
         self._seg_table.setVisible(False)
 
         btn_now = QPushButton("Now")
-        btn_now.setToolTip("Set date and hour to current date and time")
+        btn_now.setToolTip("Jump to today and the current hour (also switches Live mode on)")
         btn_now.setFixedWidth(48)
         btn_now.clicked.connect(self._go_to_now)
 
         top = QHBoxLayout()
-        top.addWidget(QLabel("Year:")); top.addWidget(self.year_sb); top.addSpacing(10)
-        top.addWidget(QLabel("Month:")); top.addWidget(self.month_cb); top.addSpacing(10)
-        top.addWidget(QLabel("From hour:")); top.addWidget(self.hour_from); top.addSpacing(10)
-        top.addWidget(QLabel("To hour:")); top.addWidget(self.hour_to)
+        top.addWidget(QLabel("From:")); top.addWidget(self.time_from); top.addSpacing(10)
+        top.addWidget(QLabel("To:"));   top.addWidget(self.time_to)
         top.addSpacing(10); top.addWidget(btn_now)
         top.addSpacing(10); top.addWidget(self.cb_now); top.addStretch(1)
 
-        self.cal.selectionChanged.connect(self._sync_controls_from_calendar)
-        self.month_cb.currentIndexChanged.connect(self._on_year_month_changed)
-        self.year_sb.valueChanged.connect(self._on_year_month_changed)
-        self.hour_from.valueChanged.connect(self._on_hours_changed)
-        self.hour_to.valueChanged.connect(self._on_hours_changed)
-        self._sync_controls_from_calendar()
+        self.time_from.timeChanged.connect(self._on_times_changed)
+        self.time_to.timeChanged.connect(self._on_times_changed)
+
         # Spusť scan kamer hned při otevření dialogu
         self._cam_signals = _CamLoaderSignals()
         self._cam_signals.finished.connect(self._on_cameras_preloaded)
         self._preloaded: list[tuple[str, str]] = []
         self._load_cameras_bg()
-        add_row = QHBoxLayout()
-        add_row.addWidget(self.btn_add_seg)
-        add_row.addWidget(self.btn_add_range)
-        add_row.addStretch(1)
-        self._add_row_widget = QWidget()
-        self._add_row_widget.setLayout(add_row)
-        self._add_row_widget.setVisible(False)
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Select date and hour range"))
+        lay.addWidget(QLabel("Select date and time range"))
+        lay.addWidget(self._cal_frame)
         lay.addLayout(top)
-        lay.addWidget(self.cb_multiday)
-        lay.addWidget(QLabel("Start date:"))
-        lay.addWidget(self.cal)
-        lay.addWidget(self._lbl_cal_to)
-        lay.addWidget(self.cal_to)
+        lay.addWidget(self.cb_range)
+        lay.addWidget(self.cb_perday)
         lay.addWidget(self._add_row_widget)
-        lay.addWidget(self._lbl_seg)
         lay.addWidget(self._seg_table)
         lay.addWidget(btns)
 
-        # Default: online mode on (current hour) when no explicit hours were passed
-        if not _explicit_hours:
-            self.cb_now.setChecked(True)
+        # Reopen with the previous multi-day pick intact (before the first
+        # highlight/camera scan below, so both see the restored days).
+        if init_segments:
+            self._restore_segments(init_segments, bool(init_range_mode))
+
+        # Keyboard/programmatic date changes must repaint too (clicked() only
+        # covers the mouse). Connected last — the handler reads the checkboxes.
+        self.cal.selectionChanged.connect(self._refresh_highlight)
+        self._refresh_highlight()
+
+        # Live mode is OPT-IN: it is never pre-ticked, so nothing starts following
+        # the newest frame unless the user asks for it here (or presses Now). The
+        # dialog still opens on the last used window / the current hour.
+        self._load_cameras_bg()
+
+    # ── selection state ───────────────────────────────────────────────────────
+    def _restore_segments(self, segments, range_mode: bool):
+        """Re-enter the multi-day mode of the previous pick with its day list.
+        Ticking the checkbox through setChecked would reset the times and wipe
+        the list, so the mode is applied with the signals blocked."""
+        segs = sorted((PickSeg(*_seg_fields(s)) for s in segments),
+                      key=lambda s: (s.date, s.h_from, s.m_from))
+        if not segs:
+            return
+        cb = self.cb_range if range_mode else self.cb_perday
+        cb.blockSignals(True); cb.setChecked(True); cb.blockSignals(False)
+        self._apply_mode()
+        self._segments = segs
+        if range_mode:
+            self._range_start, self._range_end = segs[0].date, segs[-1].date
+        # Days whose window differs from the global From/To were edited with ⚙ —
+        # keep them marked so a From/To change does not silently overwrite them.
+        glob = self.selected_times()
+        self._day_overrides = {
+            s.date: (s.h_from, s.m_from, s.h_to, s.m_to)
+            for s in segs if (s.h_from, s.m_from, s.h_to, s.m_to) != glob}
+        self._refresh_seg_table()
+
+    def is_multiday(self) -> bool:
+        return self.cb_range.isChecked() or self.cb_perday.isChecked()
+
+    def is_range_mode(self) -> bool:
+        """True = day→day range, False = per-day windows (only meaningful when
+        is_multiday())."""
+        return self.cb_range.isChecked()
+
+    def is_online_mode(self) -> bool:
+        return self.cb_now.isChecked()
+
+    def selected_times(self) -> "tuple[int, int, int, int]":
+        """(from_hour, from_minute, to_hour, to_minute)."""
+        tf, tt = self.time_from.time(), self.time_to.time()
+        return tf.hour(), tf.minute(), tt.hour(), tt.minute()
+
+    def selected_hours(self) -> tuple[int, int]:
+        """Whole-hour span (folder granularity) — kept for existing callers."""
+        return self.time_from.time().hour(), self.time_to.time().hour()
+
+    def selected_date_obj(self):
+        d = self.cal.selectedDate()
+        return datetime(d.year(), d.month(), d.day(), tzinfo=TZ_PRAGUE).date()
+
+    def selected_segments(self) -> "list[PickSeg] | None":
+        """Per-day windows when a multi-day mode is active, else None."""
+        if self.is_multiday() and self._segments:
+            return list(self._segments)
+        return None
+
+    def selected_windows(self) -> "list[tuple[int, int]]":
+        """[(start_ns, end_ns)) …] for the whole selection — one entry per day."""
+        segs = self.selected_segments()
+        if segs is None:
+            hf, mf, ht, mt = self.selected_times()
+            segs = [PickSeg(self.selected_date_obj(), hf, mf, ht, mt)]
+        return [seg_bounds_ns(s) for s in segs]
+
+    def selected_axis(self) -> tuple[int, int]:
+        """Slider axis = bounding box of the selection (gaps stay blank)."""
+        wins = self.selected_windows()
+        return min(w[0] for w in wins), max(w[1] for w in wins)
+
+    def selected_folders(self) -> list[Path]:
+        """Archive hour folders (no camera) for the current selection."""
+        return hour_dirs_for_windows(self.selected_windows())
 
     @staticmethod
     def selected_folders_static(date, hour_from, hour_to, camera_folder: Path,
                                  extra_dates: "list | None" = None,
-                                 segments: "list | None" = None) -> list[Path]:
+                                 segments: "list | None" = None,
+                                 min_from: int = 0, min_to: int = 0) -> list[Path]:
         """
-        Return list of archiver folder Paths for a camera over a date+hour range.
+        Return list of archiver folder Paths for a camera over the selection.
         Precedence:
-          - segments (list of (date, hour_from, hour_to)) → per-day hours, or
+          - segments (PickSeg list, or legacy (date, hour_from, hour_to) tuples), or
           - extra_dates (list of date objects) → all those days share hour_from..hour_to, or
           - single date with hour_from..hour_to.
-        Hours are interpreted as Prague lab time.
+        hour_to/min_to are the EXCLUSIVE end of the window (see seg_bounds_ns), so
+        the default 13:00 covers the 12 h folder only.
+        Times are Prague lab time; folders are UTC (see utc_hour_cells_for_window).
         """
         cam_name = camera_folder.name
-        if segments is not None:
-            plan = [(d, hf, ht) for (d, hf, ht) in segments]
+        if segments:
+            plan = list(segments)
         elif extra_dates is not None:
-            plan = [(d, hour_from, hour_to) for d in extra_dates]
+            plan = [PickSeg(d, int(hour_from), int(min_from), int(hour_to), int(min_to))
+                    for d in extra_dates]
         else:
-            plan = [(date, hour_from, hour_to)]
-        out = []
-        for dt_day, hf, ht in plan:
-            y, m, day = dt_day.year, dt_day.month, dt_day.day
-            for hh in range(hf, ht + 1):
-                ref_dt = datetime(y, m, day, hh, 0, 0, tzinfo=TZ_PRAGUE)
-                folder_hh = folder_hour_from_prague_hour(hh, ref_dt)
-                out.append(Path(DEFAULT_OPEN_ROOT) / str(y) / str(m) / str(day) / str(folder_hh) / cam_name)
-        return out
+            plan = [PickSeg(date, int(hour_from), int(min_from),
+                            int(hour_to), int(min_to))]
+        windows = [seg_bounds_ns(s) for s in plan]
+        return [f / cam_name for f in hour_dirs_for_windows(windows)]
 
     def preloaded_cameras(self) -> list[tuple[str, str]]:
         return self._preloaded
 
-    
     def _load_cameras_bg(self):
         import threading as _thr
-        # Cameras are identical across hours/days, so the first segment (if any) suffices.
-        if self._segments:
-            date_obj, hour_from, hour_to = self._segments[0]
-        else:
-            date_obj  = self.selected_date_obj()
-            hour_from = self.hour_from.value()
-            hour_to   = self.hour_to.value()
-        signals   = self._cam_signals
+        # Union over EVERY day/segment of the selection — a day without data must
+        # not empty the list (see cameras_for_windows).
+        windows = self.selected_windows()
+        key = tuple(windows)
+        if key == getattr(self, "_cam_scan_key", None):
+            return   # same selection (every calendar click used to rescan)
+        self._cam_scan_key = key
+        self._cam_scan_gen = getattr(self, "_cam_scan_gen", 0) + 1
+        gen = self._cam_scan_gen
+        signals = self._cam_signals
 
         def worker():
-            cameras: list[tuple[str, str]] = []
             try:
-                base = Path(DEFAULT_OPEN_ROOT) / str(date_obj.year) / str(date_obj.month) / str(date_obj.day)
-                for hh in range(hour_from, hour_to + 1):
-                    ref_dt = datetime(date_obj.year, date_obj.month, date_obj.day,
-                                    hh, 0, 0, tzinfo=TZ_PRAGUE)
-                    folder_h = folder_hour_from_prague_hour(hh, ref_dt)
-                    hour_dir = base / str(folder_h)
-                    if hour_dir.exists() and hour_dir.is_dir():
-                        try:
-                            subs = sorted(
-                                [p.name for p in hour_dir.iterdir() if p.is_dir()],
-                                key=str.lower)
-                            for name in subs:
-                                m = re.match(r"^C\d{2}-(\d{2,3})-", name)
-                                num = m.group(1) if m else ""
-                                if not any(n == name for _, n in cameras):
-                                    cameras.append((num, name))
-                        except Exception:
-                            continue
+                cameras, status = cameras_for_windows(windows)
             except Exception:
-                pass
-            signals.finished.emit(cameras, "")
+                cameras, status = [], "error"
+            # A slower scan of an older selection must not overwrite a newer one.
+            if gen == self._cam_scan_gen:
+                signals.finished.emit(cameras, status)
 
         _thr.Thread(target=worker, daemon=True).start()
 
     def _on_cameras_preloaded(self, cameras: list, status: str = ""):
         self._preloaded = cameras
 
-    def _reapply_weekend_format(self):
-        wf_weekend = QTextCharFormat()
-        wf_weekend.setForeground(QColor("#cc0000"))
-        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-            self.cal.setWeekdayTextFormat(day, wf_weekend)
+    # ── mode toggles ──────────────────────────────────────────────────────────
+    def _apply_multiday_default_times(self):
+        """Multi-day selections start at the lab shift (07:00–21:00)."""
+        for w, t in ((self.time_from, _MULTIDAY_FROM), (self.time_to, _MULTIDAY_TO)):
+            w.blockSignals(True)
+            w.setTime(t)
+            w.blockSignals(False)
 
-    def _on_multiday_toggled(self, state: int):
-        multi = bool(state)
-        self.cal_to.setVisible(multi)
-        self._lbl_cal_to.setVisible(multi)
+    def _on_range_toggled(self, state: int):
+        on = bool(state)
+        if on and self.cb_perday.isChecked():
+            self.cb_perday.blockSignals(True)
+            self.cb_perday.setChecked(False)
+            self.cb_perday.blockSignals(False)
+        self._apply_mode()
+        self._day_overrides = {}
+        if on:
+            self._apply_multiday_default_times()
+            # Seed with the day that is already selected as a COMPLETE one-day
+            # range, so the next two clicks read as "first day … last day".
+            self._range_start = self._range_end = self.selected_date_obj()
+            self._rebuild_range_segments()
+        else:
+            self._range_start = self._range_end = None
+            self._segments = []
+            self._refresh_seg_table()
+        self._refresh_highlight()
+
+    def _on_perday_toggled(self, state: int):
+        on = bool(state)
+        if on and self.cb_range.isChecked():
+            self.cb_range.blockSignals(True)
+            self.cb_range.setChecked(False)
+            self.cb_range.blockSignals(False)
+        self._apply_mode()
+        if on:
+            self._apply_multiday_default_times()
+        self._range_start = self._range_end = None
+        self._segments = []
+        self._day_overrides = {}
+        self._refresh_seg_table()
+        self._refresh_highlight()
+
+    def _apply_mode(self):
+        multi = self.is_multiday()
+        self.btn_add_day.setVisible(self.cb_perday.isChecked())
+        self.btn_clear_days.setVisible(multi)
         self._add_row_widget.setVisible(multi)
-        self._lbl_seg.setVisible(multi)
         self._seg_table.setVisible(multi)
         if multi:
-            # Online mode is single-day-only; disable while building a per-day list
+            # Live mode is single-day-only
             self.cb_now.setChecked(False)
             self.cb_now.setEnabled(False)
         else:
             self.cb_now.setEnabled(True)
-            self._segments = []
-            self._refresh_seg_table()
         self.adjustSize()
 
-    def is_multiday(self) -> bool:
-        return self.cb_multiday.isChecked()
-
-    def _on_add_segment(self):
-        hf, ht = self.selected_hours()
-        if hf > ht:
-            QMessageBox.warning(self, "Chyba", '"From" nesmí být větší než "To".')
-            return
-        self._upsert_segment(self.selected_date_obj(), hf, ht)
+    def _clear_selection(self):
+        self._range_start = self._range_end = None
+        self._segments = []
+        self._day_overrides = {}
         self._refresh_seg_table()
+        self._refresh_highlight()
+
+    # ── calendar interaction ──────────────────────────────────────────────────
+    def _on_calendar_clicked(self, qd: QDate):
+        d = datetime(qd.year(), qd.month(), qd.day(), tzinfo=TZ_PRAGUE).date()
+        # Online mode only makes sense on today — picking another day leaves it,
+        # otherwise the viewer would poll a finished day for new frames.
+        if self.cb_now.isChecked() and d != datetime.now(TZ_PRAGUE).date():
+            self.cb_now.setChecked(False)
+        if self.cb_range.isChecked():
+            if self._range_start is None or self._range_end is not None:
+                # First click of a new range
+                self._range_start, self._range_end = d, None
+            else:
+                self._range_end = d
+                if self._range_end < self._range_start:
+                    self._range_start, self._range_end = self._range_end, self._range_start
+            self._rebuild_range_segments()
+        self._refresh_highlight()
+        self._load_cameras_bg()   # another day → rescan (no-op if unchanged)
+
+    def _range_days(self) -> "list":
+        if self._range_start is None:
+            return []
+        end = self._range_end or self._range_start
+        days, cur = [], self._range_start
+        while cur <= end:
+            days.append(cur)
+            cur += timedelta(days=1)
+        return days
+
+    def _rebuild_range_segments(self):
+        """Range mode: every day of the range gets the same From/To window (preset
+        to the lab shift), except days the user edited through the ⚙ button."""
+        days = self._range_days()
+        hf, mf, ht, mt = self.selected_times()
+        segs: list[PickSeg] = []
+        for d in days:
+            ovr = self._day_overrides.get(d)
+            segs.append(PickSeg(d, *ovr) if ovr else PickSeg(d, hf, mf, ht, mt))
+        self._segments = segs
+        self._refresh_seg_table()
+
+    def _refresh_highlight(self):
+        delegate = getattr(self.cal, "_wk_delegate", None)
+        if delegate is None:
+            return
+        if self.is_multiday():
+            days = [s.date for s in self._segments]
+        else:
+            days = [self.selected_date_obj()]
+        delegate.set_selected([QDate(d.year, d.month, d.day) for d in days])
+        cur = self.cal.selectedDate()
+        delegate.set_focus_date(cur if self.cb_perday.isChecked() else None)
+
+    # ── per-day list ──────────────────────────────────────────────────────────
+    def _on_add_day(self):
+        hf, mf, ht, mt = self.selected_times()
+        if (hf, mf) >= (ht, mt):
+            QMessageBox.warning(self, "Invalid time", '"From" must be earlier than "To".')
+            return
+        self._upsert_segment(PickSeg(self.selected_date_obj(), hf, mf, ht, mt))
+        self._refresh_seg_table()
+        self._refresh_highlight()
         self._load_cameras_bg()
 
-    def _on_add_range(self):
-        hf, ht = self.selected_hours()
-        if hf > ht:
-            QMessageBox.warning(self, "Chyba", '"From" nesmí být větší než "To".')
+    def _edit_segment(self, d):
+        """⚙ — give this one day its own time window, in either multi-day mode."""
+        cur = next((s for s in self._segments if _seg_fields(s)[0] == d), None)
+        if cur is None:
             return
-        for d in self.selected_date_range():
-            self._upsert_segment(d, hf, ht)
+        _d, hf, mf, ht, mt = _seg_fields(cur)
+        dlg = _DayTimeDialog(d, QTime(hf, mf), QTime(min(23, ht), mt), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        hm = dlg.selected_hm()
+        self._day_overrides[d] = hm
+        self._upsert_segment(PickSeg(d, *hm))
         self._refresh_seg_table()
+        self._refresh_highlight()
         self._load_cameras_bg()
 
-    def _upsert_segment(self, d, hf: int, ht: int):
-        """Insert or replace the segment for date d, keeping the list sorted by date."""
-        self._segments = [s for s in self._segments if s[0] != d]
-        self._segments.append((d, int(hf), int(ht)))
-        self._segments.sort(key=lambda s: s[0])
+    def _upsert_segment(self, seg: PickSeg):
+        """Insert or replace the window for that date, keeping the list sorted."""
+        self._segments = [s for s in self._segments if s.date != seg.date]
+        self._segments.append(seg)
+        self._segments.sort(key=lambda s: (s.date, s.h_from, s.m_from))
 
     def _remove_segment(self, d):
-        self._segments = [s for s in self._segments if s[0] != d]
+        """Per-day mode only — a day→day range is redefined by clicking its ends
+        (or Clear), so removing one day out of the middle is not offered."""
+        self._segments = [s for s in self._segments if s.date != d]
+        self._day_overrides.pop(d, None)
         self._refresh_seg_table()
+        self._refresh_highlight()
 
     def _refresh_seg_table(self):
         self._seg_table.setRowCount(0)
-        for d, hf, ht in self._segments:
+        removable = self.cb_perday.isChecked()
+        for s in self._segments:
             r = self._seg_table.rowCount()
             self._seg_table.insertRow(r)
-            self._seg_table.setItem(r, 0, QTableWidgetItem(d.strftime("%d.%m.%Y")))
-            hours_txt = f"{hf:02d}h" if hf == ht else f"{hf:02d}–{ht:02d}h"
-            self._seg_table.setItem(r, 1, QTableWidgetItem(hours_txt))
-            btn = QPushButton("✕")
-            btn.setFixedSize(24, 24)
-            btn.setStyleSheet("font-size: 10px; padding: 0;")
-            btn.clicked.connect(lambda checked, dd=d: self._remove_segment(dd))
-            self._seg_table.setCellWidget(r, 2, btn)
+            self._seg_table.setItem(r, 0, QTableWidgetItem(s.date.strftime("%d.%m.%Y")))
+            edited = s.date in self._day_overrides
+            t_item = QTableWidgetItem(
+                f"{s.h_from:02d}:{s.m_from:02d} – {s.h_to:02d}:{s.m_to:02d}"
+                + (" *" if edited else ""))
+            if edited:
+                t_item.setToolTip("Time window edited for this day only")
+            self._seg_table.setItem(r, 1, t_item)
+            gear = QPushButton("⚙")
+            gear.setFixedSize(24, 24)
+            gear.setStyleSheet("font-size: 12px; padding: 0;")
+            gear.setToolTip("Edit the time window of this day")
+            gear.clicked.connect(lambda checked, dd=s.date: self._edit_segment(dd))
+            self._seg_table.setCellWidget(r, 2, gear)
+            if removable:
+                btn = QPushButton("✕")
+                btn.setFixedSize(24, 24)
+                btn.setStyleSheet("font-size: 10px; padding: 0;")
+                btn.clicked.connect(lambda checked, dd=s.date: self._remove_segment(dd))
+                self._seg_table.setCellWidget(r, 3, btn)
 
-    def selected_segments(self):
-        """Return the per-day segment list when in multi/per-day mode, else None."""
-        if self.is_multiday() and self._segments:
-            return list(self._segments)
-        return None
+    # ── time controls ─────────────────────────────────────────────────────────
+    def _on_times_changed(self):
+        # "To" is the exclusive end, so From == To is an EMPTY window: keep the
+        # fields at least one whole hour apart by pushing the other one.
+        if self.time_from.time() >= self.time_to.time():
+            if self.sender() is self.time_to:
+                t = self.time_to.time().addSecs(-3600)
+                self.time_from.blockSignals(True)
+                self.time_from.setTime(max(QTime(0, 0), t))
+                self.time_from.blockSignals(False)
+            else:
+                t = self.time_from.time().addSecs(3600)
+                self.time_to.blockSignals(True)
+                self.time_to.setTime(t if t > self.time_from.time() else QTime(23, 59))
+                self.time_to.blockSignals(False)
+        if self.cb_range.isChecked():
+            self._rebuild_range_segments()
 
-    def selected_date_range(self) -> "list[datetime.date]":
-        """Return list of date objects from start to end (inclusive), when multiday."""
-        from datetime import date as _date, timedelta as _td
-        d1 = self.cal.selectedDate()
-        d2 = self.cal_to.selectedDate()
-        start = _date(d1.year(), d1.month(), d1.day())
-        end   = _date(d2.year(), d2.month(), d2.day())
-        if end < start:
-            end = start
-        days = []
-        cur = start
-        while cur <= end:
-            days.append(cur)
-            cur += _td(days=1)
-        return days
+    def _now_window(self) -> "tuple[QTime, QTime]":
+        """Today's current hour as an hour-exact window: 9:20 → 09:00–10:00, so the
+        selection is 'the last 20 minutes' and online mode keeps extending it."""
+        h = datetime.now(TZ_PRAGUE).hour
+        ht, mt = hour_end_hm(h)
+        return QTime(h, 0), QTime(ht, mt)
+
+    def _apply_now_window(self):
+        t_from, t_to = self._now_window()
+        for w, t in ((self.time_from, t_from), (self.time_to, t_to)):
+            w.blockSignals(True)
+            w.setTime(t)
+            w.blockSignals(False)
+
+    def _go_to_now(self):
+        """Now button — today, current hour, live mode. Leaves any multi-day mode,
+        which is what makes the jump land on a single, live day."""
+        now_dt = datetime.now(TZ_PRAGUE)
+        for cb in (self.cb_range, self.cb_perday):
+            if cb.isChecked():
+                cb.setChecked(False)   # handler clears the day list and refreshes
+        self.cal.setSelectedDate(QDate(now_dt.year, now_dt.month, now_dt.day))
+        self._apply_now_window()
+        self.cb_now.setChecked(True)
+        self._refresh_highlight()
+        self._load_cameras_bg()
+
+    def _on_now_changed(self, state: int):
+        if state:
+            # Live mode is always "today, the current hour" — jump there so the
+            # checkbox and the Now button cannot disagree.
+            now_dt = datetime.now(TZ_PRAGUE)
+            if self.selected_date_obj() != now_dt.date():
+                self.cal.setSelectedDate(QDate(now_dt.year, now_dt.month, now_dt.day))
+            self._apply_now_window()
+            self._refresh_highlight()
 
     def _on_accept(self):
         if self.is_multiday():
             if not self._segments:
-                QMessageBox.warning(self, "Chyba",
-                    "Přidej alespoň jeden den do výběru ('Add to selection')."); return
+                QMessageBox.warning(self, "Nothing selected",
+                    "Pick the days in the calendar first "
+                    "(range mode: click the first and the last day; "
+                    "per-day mode: select a day and press 'Add day')."); return
             if len(self._segments) > 14:
                 r = QMessageBox.question(self, "Multi-day",
-                    f"Vybráno {len(self._segments)} dní. Pokračovat?",
+                    f"{len(self._segments)} days selected. Continue?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                 if r != QMessageBox.StandardButton.Yes:
                     return
-        elif self.hour_from.value() > self.hour_to.value():
-            QMessageBox.warning(self, "Chyba", '"Od" nesmí být větší než "Do".'); return
+        else:
+            hf, mf, ht, mt = self.selected_times()
+            if (hf, mf) >= (ht, mt):
+                QMessageBox.warning(self, "Invalid time",
+                                    '"From" must be earlier than "To".'); return
         self.accept()
 
-    def _go_to_now(self):
-        now_dt = datetime.now(TZ_PRAGUE)
-        self.cal.setSelectedDate(QDate(now_dt.year, now_dt.month, now_dt.day))
-        self.hour_from.setValue(now_dt.hour)
-        self.hour_to.setValue(now_dt.hour)
-        self.cb_now.setChecked(True)
 
-    def _on_now_changed(self, state: int):
-        now_dt = datetime.now(TZ_PRAGUE)
-        if state:
-            self.hour_to.setValue(now_dt.hour)
+class _DayTimeDialog(QDialog):
+    """⚙ editor — the time window of ONE day of a multi-day selection."""
 
-    def is_online_mode(self) -> bool:
-        return self.cb_now.isChecked()
+    def __init__(self, day, t_from: QTime, t_to: QTime, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(day.strftime("Time window — %d.%m.%Y"))
+        self.time_from = QTimeEdit(self); self.time_from.setDisplayFormat("HH:mm")
+        self.time_from.setTime(t_from); self.time_from.setFixedWidth(74)
+        self.time_to = QTimeEdit(self); self.time_to.setDisplayFormat("HH:mm")
+        self.time_to.setTime(t_to); self.time_to.setFixedWidth(74)
 
-    def _on_year_month_changed(self):
-        year = int(self.year_sb.value()); month = int(self.month_cb.currentData())
-        current = self.cal.selectedDate()
-        day = min(current.day(), QDate(year, month, 1).daysInMonth())
-        self.cal.setSelectedDate(QDate(year, month, day))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("From:")); row.addWidget(self.time_from)
+        row.addSpacing(10)
+        row.addWidget(QLabel("To:"));   row.addWidget(self.time_to)
+        row.addStretch(1)
 
-    def _sync_controls_from_calendar(self):
-        d = self.cal.selectedDate()
-        self.year_sb.blockSignals(True); self.month_cb.blockSignals(True)
-        self.year_sb.setValue(d.year()); self.month_cb.setCurrentIndex(d.month() - 1)
-        self.year_sb.blockSignals(False); self.month_cb.blockSignals(False)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel, self)
+        btns.accepted.connect(self._on_accept); btns.rejected.connect(self.reject)
 
-    def _on_hours_changed(self):
-        if self.hour_from.value() > self.hour_to.value():
-            sender = self.sender()
-            if sender is self.hour_from:
-                self.hour_to.blockSignals(True); self.hour_to.setValue(self.hour_from.value()); self.hour_to.blockSignals(False)
-            else:
-                self.hour_from.blockSignals(True); self.hour_from.setValue(self.hour_to.value()); self.hour_from.blockSignals(False)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(day.strftime("%A %d.%m.%Y")))
+        lay.addLayout(row)
+        lay.addWidget(btns)
 
-    def selected_hours(self) -> tuple[int, int]:
-        return int(self.hour_from.value()), int(self.hour_to.value())
+    def selected_hm(self) -> "tuple[int, int, int, int]":
+        tf, tt = self.time_from.time(), self.time_to.time()
+        return tf.hour(), tf.minute(), tt.hour(), tt.minute()
 
-    def selected_date_obj(self):
-        d = self.cal.selectedDate()
-        return datetime(d.year(), d.month(), d.day(), tzinfo=TZ_PRAGUE).date()
-
-    def selected_folders(self) -> list[Path]:
-        d = self.cal.selectedDate()
-        y, m, day = d.year(), d.month(), d.day()
-        h0, h1 = self.selected_hours()
-        out = []
-        for hh in range(h0, h1 + 1):
-            ref_dt = datetime(y, m, day, hh, 0, 0, tzinfo=TZ_PRAGUE)
-            folder_hh = folder_hour_from_prague_hour(hh, ref_dt)
-            out.append(Path(DEFAULT_OPEN_ROOT) / str(y) / str(m) / str(day) / str(folder_hh))
-        return out
-
-    def selected_axis(self) -> tuple[int, int]:
-        if self.is_multiday() and self._segments:
-            # Bounding box over all per-day segments (gaps are blank on the axis).
-            starts, ends = [], []
-            for d, hf, ht in self._segments:
-                starts.append(ns_from_dt(datetime(d.year, d.month, d.day, hf, 0, 0, tzinfo=TZ_PRAGUE)))
-                ends.append(ns_from_dt(datetime(d.year, d.month, d.day, ht + 1, 0, 0, tzinfo=TZ_PRAGUE)))
-            return min(starts), max(ends)
-        else:
-            d = self.cal.selectedDate()
-            y, m, day = d.year(), d.month(), d.day()
-            h0, h1 = self.selected_hours()
-            start = datetime(y, m, day, h0, 0, 0, tzinfo=TZ_PRAGUE)
-            end   = datetime(y, m, day, h1 + 1, 0, 0, tzinfo=TZ_PRAGUE)
-        return ns_from_dt(start), ns_from_dt(end)
+    def _on_accept(self):
+        hf, mf, ht, mt = self.selected_hm()
+        if (hf, mf) >= (ht, mt):
+            QMessageBox.warning(self, "Invalid time",
+                                '"From" must be earlier than "To".'); return
+        self.accept()
 
 # ---------------- PDXM1 GRID CONFIG ----------------
 from dataclasses import dataclass as _dataclass, field as _field, asdict as _asdict
@@ -3384,7 +4909,7 @@ class Pdxm1GridConfig:
     font_color: str = "#ffffff"
     font_alpha: int = 210
     font_outline: int = 1                             # 0 = no outline; >0 = outline thickness in px
-    show: bool = True                                # whether the grid overlay is visible
+    show: bool = False                               # grid overlay hidden until the user turns it on
     grid_left:   float = 0.0                         # left border as fraction of image width
     grid_right:  float = 1.0                         # right border as fraction of image width
     grid_top:    float = 0.0                         # top border as fraction of image height
@@ -3424,9 +4949,9 @@ def get_pdxm1_grid_config(cam_name: str) -> Pdxm1GridConfig:
     key = _cam_type_key(cam_name)
     saved = _load_pdxm1_grid_configs()
     cfg = Pdxm1GridConfig()
-    # Non-PDXM1 cameras default to hidden grid; PDXM1 cameras default to visible.
-    is_pdxm1 = bool(re.search(r'PD[1-4]M1(?!\d)', cam_name, re.IGNORECASE))
-    cfg.show = is_pdxm1
+    # Grid overlay defaults to hidden for all cameras (diodes included);
+    # the user turns it on per-type via the config dialog.
+    cfg.show = False
     cfg.col_reversed = key in _PDXM1_REVERSED_TYPES
     if key in saved:
         d = saved[key]
@@ -4600,7 +6125,7 @@ class CameraPickerDialog(QDialog):
     def __init__(self, date_obj, hour_from: int, hour_to: int,
                  last_cam_names: list[str], parent=None,
                  preloaded_cameras: list | None = None,
-                 multi_grid=None):
+                 multi_grid=None, windows: "list | None" = None):
         super().__init__(parent)
         self.setWindowTitle("Select cameras")
         self.resize(660, 640)
@@ -4610,6 +6135,9 @@ class CameraPickerDialog(QDialog):
         self._date_obj = date_obj
         self._hour_from = hour_from
         self._hour_to = hour_to
+        # Every window of the pick (one per day/segment). The camera list is the
+        # UNION over all of them, so an empty day cannot hide the cameras.
+        self._windows = list(windows) if windows else None
         self._presets: dict[str, list[str]] = self._load_presets()
         self._multi_grid = multi_grid
 
@@ -4802,45 +6330,15 @@ class CameraPickerDialog(QDialog):
 
     def _load_cameras_async(self):
         import threading as _thr
-        date_obj  = self._date_obj
-        hour_from = self._hour_from
-        hour_to   = self._hour_to
-        signals   = self._signals
+        windows = self._windows or [
+            seg_bounds_ns(PickSeg(self._date_obj, self._hour_from, 0, self._hour_to, 0))]
+        signals = self._signals
 
         def worker():
-            cameras: list[tuple[str, str]] = []
-            status = ""   # "" ok, "no_data" = archive ok but nothing here, "error" = can't read
             try:
-                root = Path(DEFAULT_OPEN_ROOT)
-                try:
-                    reachable = root.exists()
-                except OSError:
-                    reachable = False
-                if not reachable:
-                    status = "error"   # archive root unreachable → software/access error
-                else:
-                    base = root / str(date_obj.year) / str(date_obj.month) / str(date_obj.day)
-                    for hh in range(hour_from, hour_to + 1):
-                        ref_dt = datetime(date_obj.year, date_obj.month, date_obj.day,
-                                          hh, 0, 0, tzinfo=TZ_PRAGUE)
-                        folder_h = folder_hour_from_prague_hour(hh, ref_dt)
-                        hour_dir = base / str(folder_h)
-                        try:
-                            if hour_dir.exists() and hour_dir.is_dir():
-                                subs = sorted(
-                                    [p.name for p in hour_dir.iterdir() if p.is_dir()],
-                                    key=str.lower)
-                                for name in subs:
-                                    m = re.match(r"^C\d{2}-(\d{2,3})-", name)
-                                    num = m.group(1) if m else ""
-                                    if not any(n == name for _, n in cameras):
-                                        cameras.append((num, name))
-                        except OSError:
-                            continue
-                    if not cameras:
-                        status = "no_data"   # archive reachable, just nothing for this date/time
+                cameras, status = cameras_for_windows(windows)
             except Exception:
-                status = "error"
+                cameras, status = [], "error"
             signals.finished.emit(cameras, status)
 
         _thr.Thread(target=worker, daemon=True).start()
@@ -4857,8 +6355,12 @@ class CameraPickerDialog(QDialog):
             self._status_lbl.setText("⚠ Could not read the camera archive (network / path error).")
             self._status_lbl.setStyleSheet("font-size: 10px; color: #c0392b; font-weight: 700;")
         else:
-            # Archive reachable, just no camera folders for this date/time.
-            self._status_lbl.setText("No camera records for this date / time.")
+            # Archive reachable, just no camera folders anywhere in the selection
+            # (every day / segment was scanned, not only the first one).
+            self._status_lbl.setText(
+                "No camera records in any of the selected days / times."
+                if len(self._windows or []) > 1 else
+                "No camera records for this date / time.")
             self._status_lbl.setStyleSheet("font-size: 10px; color: #555;")
         self._highlight_selected()
 
@@ -5019,10 +6521,21 @@ def _fit_circle_kasa(points):
 
 # ---------------- IMAGE VIEW ----------------
 class ImageView(QWidget):
+    # Zoom changed (set or reset). The owner re-renders the frame at the resolution the
+    # new zoom needs: zooming crops the pixmap ALREADY held, so without this a settled
+    # frame refined to REFINE_MAX_SIDE stayed at that size and a zoomed-in crop was an
+    # upscale of it — visibly soft — until the user stepped to a different frame.
+    zoom_changed = Signal()
+    # First frame of a camera (or one whose resolution changed) has arrived and its
+    # aspect differs from what the tile geometry was computed from. The auto layout
+    # listens so tiles resize to the real frame instead of the name-based hint.
+    frame_aspect_changed = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._pix: QPixmap | None = None
+        self._aspect_seen: float | None = None   # aspect last reported to the layout
         self._scaled: QPixmap | None = None
         self.bg_color: QColor = QColor("#f3f3f3")  # overrideable per-instance
 
@@ -5035,6 +6548,7 @@ class ImageView(QWidget):
         self.timestamp_text: str = ""   # shown as large white overlay in top-left
         self.cam_label_text: str = ""   # camera name label below image
         self.cam_ts_text: str = ""      # timestamp label below image
+        self.cam_ref_text: str = ""     # subtraction-reference badge (same as multi-cam tiles)
         self.cam_label_font_px: int = 12  # controlled by Label size spinbox
 
         self.show_circle = False
@@ -5080,23 +6594,55 @@ class ImageView(QWidget):
 
     def set_pixmap(self, pm: QPixmap):
         self._pix = pm; self._scaled = None; self.update()
+        # Learn the camera's true aspect from the frame itself. Both checks are a
+        # float compare, so the drag path pays nothing: the signal fires only when
+        # a camera's aspect actually changes — in practice its first frame.
+        if pm is not None and not pm.isNull() and pm.height() > 0:
+            a = pm.width() / pm.height()
+            if self._aspect_seen is None or abs(self._aspect_seen - a) > 0.01:
+                self._aspect_seen = a
+                remember_cam_aspect(self.pdxm1_cam_name, pm.width(), pm.height())
+                self.frame_aspect_changed.emit()
 
     def clear(self):
         self._pix = None; self._scaled = None; self.update()
 
     def set_zoom(self, zoom_norm: "tuple[float,float,float,float] | None"):
+        changed = self._zoom_norm != zoom_norm
         self._zoom_norm = zoom_norm
         self._scaled = None
         self.update()
+        if changed:
+            self.zoom_changed.emit()
 
     def reset_zoom(self):
         self.set_zoom(None)
 
+    def _name_bar_h(self) -> int:
+        """Height of the camera-name / timestamp strip."""
+        return max(8, self.cam_label_font_px) + 10
+
+    def _ref_bar_h(self) -> int:
+        """Height of the reference badge strip (0 when no reference is set)."""
+        if not self.cam_ref_text:
+            return 0
+        return max(8, self.cam_label_font_px - 1) + 8
+
     def _label_bar_h(self) -> int:
-        """Height in pixels reserved for the label bar below the image (0 when overlay mode)."""
+        """Total height reserved for the label strips above the image (0 in overlay mode)."""
         if self.cam_label_use_overlay:
             return 0
-        return max(8, self.cam_label_font_px) + 10
+        return self._name_bar_h() + self._ref_bar_h()
+
+    def set_cam_ref_text(self, text: str):
+        """Set/clear the subtraction-reference badge (single-cam layout counterpart of
+        CameraView.set_ref_status — the two layouts must show the same information)."""
+        text = text or ""
+        if text == self.cam_ref_text:
+            return
+        self.cam_ref_text = text
+        self._scaled = None   # reserved strip height changed → re-scale the frame
+        self.update()
 
     def _ensure_scaled(self):
         if self._pix is None or self._pix.isNull():
@@ -5531,21 +7077,21 @@ class ImageView(QWidget):
         # non-overlay mode (single-cam): drawn in the strip reserved ABOVE the
         #   image, exactly abutting the image top edge (no gap, no overlap),
         #   spanning the image width.
-        if (self.cam_label_text or self.cam_ts_text) and not self._pix.isNull():
+        if (self.cam_label_text or self.cam_ts_text or self.cam_ref_text) and not self._pix.isNull():
             from PySide6.QtGui import QFont as _QFont
             _fpx = max(8, self.cam_label_font_px)
             lbl_x = img_rect.left()
             lbl_w = img_rect.width()
             if self.cam_label_use_overlay:
-                lbl_h = _fpx + 10
+                lbl_h = self._name_bar_h()
                 # Semi-transparent strip at the very top of the image rect
                 lbl_y = img_rect.top()
                 lbl_y = min(lbl_y, img_rect.bottom() - lbl_h)
             else:
                 # Drawn height == reserved height → strip ends exactly at the
                 # image top edge (the old "-1" left a visible gap line).
-                lbl_h = self._label_bar_h()
-                lbl_y = max(0, img_rect.top() - lbl_h)
+                lbl_h = self._name_bar_h()
+                lbl_y = max(0, img_rect.top() - self._label_bar_h())
             name_w = lbl_w // 3
             ts_w = lbl_w - name_w
             font = _QFont(); font.setPixelSize(_fpx)
@@ -5566,6 +7112,19 @@ class ImageView(QWidget):
                 p.drawText(ts_rect.adjusted(4, 0, -4, 0),
                            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                            self.cam_ts_text)
+            # Reference badge — own centered strip right below the name/ts strip,
+            # same colours as CameraView._ref_lbl in the multi-cam tiles.
+            if self.cam_ref_text:
+                ref_h = self._ref_bar_h()
+                ref_rect = QRect(lbl_x, lbl_y + lbl_h, lbl_w, ref_h)
+                p.fillRect(ref_rect, QColor(0xc8, 0xe6, 0xc9,
+                                            220 if self.cam_label_use_overlay else 255))
+                p.setPen(QColor(0x22, 0x22, 0x22))
+                ref_font = _QFont(); ref_font.setPixelSize(max(8, _fpx - 1))
+                p.setFont(ref_font)
+                p.drawText(ref_rect.adjusted(4, 0, -4, 0),
+                           Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter,
+                           self.cam_ref_text)
 
         # Spatial contrast top-N pixel markers
         if getattr(self, 'sc_topn_points_norm', None) and not self._pix.isNull():
@@ -5983,6 +7542,21 @@ class CameraView(QWidget):
     """Jeden panel v multi-camera gridu — ImageView + label + výběr."""
     clicked = Signal(int)  # camera index
 
+    # Three states, because there are three genuinely different situations and folding
+    # the middle one into either neighbour is what made this label useless:
+    #   OK     amber  — showing exactly the frame the slider asked for
+    #   APPROX blue   — showing the nearest PRELOADED frame, within the stated tolerance.
+    #                   Normal, designed behaviour while the window is still preloading;
+    #                   the text carries a leading "~" so it does not depend on colour.
+    #   STALE  red    — the preview refused and no load has landed: really behind.
+    # Same size and padding throughout so nothing reflows when the state flips.
+    _TS_STYLE_OK = ("font-size: 11px; color: #ffd54f; background: #333; "
+                    "padding: 2px 4px; border-radius: 2px;")
+    _TS_STYLE_APPROX = ("font-size: 11px; color: #90caf9; background: #333; "
+                        "padding: 2px 4px; border-radius: 2px;")
+    _TS_STYLE_STALE = ("font-size: 11px; color: #ffffff; background: #a02020; "
+                       "padding: 2px 4px; border-radius: 2px;")
+
     def __init__(self, cam_index: int, cam_name: str, parent=None):
         super().__init__(parent)
         self.cam_index = cam_index
@@ -6008,15 +7582,16 @@ class CameraView(QWidget):
 
         self._ts_lbl = QLabel("")
         self._ts_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._ts_lbl.setStyleSheet(
-            "font-size: 11px; color: #ffd54f; background: #333; "
-            "padding: 2px 4px; border-radius: 2px;")
+        self._ts_kind = 0        # 0 exact / 1 nearest preloaded / 2 behind
+        self._ts_lbl.setStyleSheet(self._TS_STYLE_OK)
         top_row.addWidget(self._ts_lbl, 2)
 
         self._refresh_dot = QLabel()
         self._refresh_dot.setFixedSize(12, 12)
         self._refresh_dot.setStyleSheet("background: #444; border-radius: 6px;")
-        self._refresh_dot.setToolTip("Camera refresh indicator — bliká zeleně pokud se kamera obnovuje")
+        self._refresh_dot.setToolTip(
+            "Camera refresh indicator — green: new frames are arriving, "
+            "red: live mode on but no new frame, grey: live mode off")
         top_row.addWidget(self._refresh_dot)
 
         lay.addLayout(top_row)
@@ -6046,31 +7621,88 @@ class CameraView(QWidget):
             overhead += self._ref_lbl.sizeHint().height() + lay.spacing()
         return int(overhead)
 
-    def set_timestamp(self, text: str):
-        self._ts_lbl.setText(text)
+    def set_timestamp(self, text: str, stale: bool = False, approx: bool = False):
+        """Timestamp of the frame ACTUALLY ON SCREEN — never of the one requested.
 
-    def pulse_refresh_dot(self, blink_on: bool, is_main: bool = False):
-        if is_main:
-            color = "#55ff44" if blink_on else "#22aa22"
-            size = 18  # větší kruh pro hlavní kameru
+        `stale` means this tile is behind what the slider is asking for; `approx` means it
+        is showing the nearest PRELOADED frame instead of the exact one. Both colour the
+        label, and `approx` also prefixes it with "~", so the distinction survives for
+        anyone who cannot pick blue out of amber. Setting the label at request time was
+        the original bug: the timestamps marched on across every tile while the pictures
+        sat still."""
+        kind = 2 if stale else (1 if approx else 0)
+        want = ("~" + text) if kind == 1 else text
+        if want != self._ts_lbl.text():
+            self._ts_lbl.setText(want)
+        if kind == getattr(self, "_ts_kind", None):
+            return
+        self._ts_kind = kind
+        self._ts_lbl.setStyleSheet(
+            (self._TS_STYLE_STALE, self._TS_STYLE_APPROX, self._TS_STYLE_OK)[2 - kind])
+
+    def set_stale(self, stale: bool, approx: bool = False):
+        """Re-colour the timestamp WITHOUT touching its text.
+
+        This is all _cam_refresh_stale_marks ever wanted, and routing it through
+        set_timestamp meant re-running fmt_hhmmss_ms_from_ns for every tile on every
+        call — which, before the navigation tick existed, happened once per camera per
+        mouse-move event, i.e. O(cameras^2) formats per event, all of it discarded by
+        set_timestamp's own text-equality check."""
+        kind = 2 if stale else (1 if approx else 0)
+        if kind == getattr(self, "_ts_kind", None):
+            return
+        # The "~" prefix belongs to the approx state, so a state change has to fix the
+        # text too — otherwise a tile that recovers keeps a tilde it no longer earns.
+        txt = self._ts_lbl.text().lstrip("~")
+        self._ts_lbl.setText(("~" + txt) if kind == 1 else txt)
+        self._ts_kind = kind
+        self._ts_lbl.setStyleSheet(
+            (self._TS_STYLE_STALE, self._TS_STYLE_APPROX, self._TS_STYLE_OK)[2 - kind])
+
+    def pulse_refresh_dot(self, blink_on: bool, is_main: bool = False,
+                          fresh: bool = True, tip: str = ""):
+        """Blink the dot. fresh=True → green (image is updating), fresh=False →
+        red (live mode on, but this camera's image is not updating). `tip` is the
+        tooltip text explaining which — built by the caller, which owns the state."""
+        size = 18 if is_main else 12  # větší kruh pro hlavní kameru
+        if fresh:
+            if is_main:
+                color = "#55ff44" if blink_on else "#22aa22"
+            else:
+                color = "#22dd22" if blink_on else "#0a5a0a"
         else:
-            color = "#22dd22" if blink_on else "#0a5a0a"
-            size = 12
+            if is_main:
+                color = "#ff5544" if blink_on else "#aa2222"
+            else:
+                color = "#dd2222" if blink_on else "#5a0a0a"
         half = size // 2
         self._refresh_dot.setFixedSize(size, size)
         self._refresh_dot.setStyleSheet(f"background: {color}; border-radius: {half}px;")
+        if tip:
+            self._refresh_dot.setToolTip(tip)
 
     def dim_refresh_dot(self):
         self._refresh_dot.setFixedSize(12, 12)
         self._refresh_dot.setStyleSheet("background: #444; border-radius: 6px;")
+        self._refresh_dot.setToolTip("Live mode off")
 
     def set_label_font_size(self, px: int):
         self._name_lbl.setStyleSheet(
             f"font-size: {px}px; color: #eee; background: #444; "
             "padding: 2px 4px; border-radius: 2px;")
+        # Rebuild ALL THREE timestamp styles at the new size and keep whichever is in
+        # force, so a font-size change cannot silently turn a stale (red) or approximate
+        # (blue) label back to normal.
+        ts_px = max(8, px - 1)
+        self._TS_STYLE_OK = (f"font-size: {ts_px}px; color: #ffd54f; background: #333; "
+                             "padding: 2px 4px; border-radius: 2px;")
+        self._TS_STYLE_APPROX = (f"font-size: {ts_px}px; color: #90caf9; background: #333; "
+                                 "padding: 2px 4px; border-radius: 2px;")
+        self._TS_STYLE_STALE = (f"font-size: {ts_px}px; color: #ffffff; background: #a02020; "
+                                "padding: 2px 4px; border-radius: 2px;")
         self._ts_lbl.setStyleSheet(
-            f"font-size: {max(8, px - 1)}px; color: #ffd54f; background: #333; "
-            "padding: 2px 4px; border-radius: 2px;")
+            (self._TS_STYLE_STALE, self._TS_STYLE_APPROX,
+             self._TS_STYLE_OK)[2 - getattr(self, "_ts_kind", 0)])
         self._ref_lbl.setStyleSheet(
             f"font-size: {max(8, px - 1)}px; color: #222; background: #c8e6c9; "
             "padding: 1px 4px; border-radius: 2px;")
@@ -6144,6 +7776,11 @@ class _JustifiedRowsContainer(QWidget):
         for v in views:
             v.setParent(self)
             v.show()
+            # A tile laid out from the name hint must be re-laid out as soon as the
+            # camera's real frame shows its true aspect, else the arrangement stays
+            # the suboptimal one until the window is resized or the layout editor's
+            # auto-arrange is used.
+            v.img_view.frame_aspect_changed.connect(self._apply)
         self._apply()
 
     def resizeEvent(self, event):
@@ -6160,10 +7797,21 @@ class _JustifiedRowsContainer(QWidget):
                 out.append(_cam_aspect_hint(v.cam_name))
         return out
 
+    def detach(self):
+        """Drop the aspect subscriptions before this container is replaced, so a
+        stale instance can never re-position tiles that now belong to a new one."""
+        for v in self._views:
+            try:
+                v.img_view.frame_aspect_changed.disconnect(self._apply)
+            except Exception:
+                pass
+
     def _apply(self):
         W, H = self.width(), self.height()
         if W < 1 or H < 1 or not self._views:
             return
+        if self._views[0].parentWidget() is not self:
+            return   # tiles have moved to another container — not ours to lay out
         top_px = self._views[0].image_overhead_px()
         entries = compute_justified_layout(self._aspects(), W, H, top_px)
         if len(entries) != len(self._views):
@@ -6233,6 +7881,8 @@ class MultiCameraGrid(QWidget):
             cv.setParent(None)
         self._cam_views.clear()
         if self._reg_container is not None:
+            if hasattr(self._reg_container, "detach"):
+                self._reg_container.detach()
             self._reg_container.setParent(None)
             self._reg_container = None
         self._cam_names_list = list(cam_names)
@@ -6245,7 +7895,7 @@ class MultiCameraGrid(QWidget):
             if name in self._overlay_store:
                 self._restore_iv_overlay(cv.img_view, self._overlay_store[name])
             # Enable grid overlay for all cameras; show flag comes from saved config
-            # (PDXM1 cameras default to visible, all others default to hidden).
+            # (defaults to hidden for all cameras, diodes included).
             _cam_cfg = get_pdxm1_grid_config(name)
             cv.img_view.show_pdxm1_grid = _cam_cfg.show
             cv.img_view.pdxm1_cam_name  = name
@@ -6311,6 +7961,8 @@ class MultiCameraGrid(QWidget):
         for cv in self._cam_views:
             self._grid.removeWidget(cv)
         if self._reg_container is not None:
+            if hasattr(self._reg_container, "detach"):
+                self._reg_container.detach()
             self._grid.removeWidget(self._reg_container)
             self._reg_container.setParent(None)
             self._reg_container = None
@@ -6373,17 +8025,38 @@ class MultiCameraGrid(QWidget):
             return self._cam_views[idx].img_view
         return None
 
-    def set_cam_timestamp(self, cam_idx: int, text: str):
+    def set_cam_timestamp(self, cam_idx: int, text: str, stale: bool = False,
+                          approx: bool = False):
         if 0 <= cam_idx < len(self._cam_views):
-            self._cam_views[cam_idx].set_timestamp(text)
+            self._cam_views[cam_idx].set_timestamp(text, stale=stale, approx=approx)
+
+    def set_cam_stale(self, cam_idx: int, stale: bool, approx: bool = False):
+        """Re-colour one tile's timestamp without rebuilding its text — see
+        CameraView.set_stale."""
+        if 0 <= cam_idx < len(self._cam_views):
+            self._cam_views[cam_idx].set_stale(stale, approx=approx)
 
     def set_label_font_size(self, px: int):
         for cv in self._cam_views:
             cv.set_label_font_size(px)
+        self.refresh_auto_layout()   # label bar height feeds the tile split
+
+    def refresh_auto_layout(self):
+        """Recompute the auto layout in place. Needed whenever a tile's non-image
+        overhead changes (label font, reference badge appearing) — the split between
+        image and header is baked into the geometry, so without this the frames end
+        up letterboxed or clipped until the next resize."""
+        c = self._reg_container
+        if c is not None and hasattr(c, "_apply"):
+            c._apply()
 
     def set_cam_ref_status(self, cam_idx: int, text: str):
         if 0 <= cam_idx < len(self._cam_views):
-            self._cam_views[cam_idx].set_ref_status(text)
+            cv = self._cam_views[cam_idx]
+            was = cv._ref_lbl.isVisible()
+            cv.set_ref_status(text)
+            if was != bool(text):
+                self.refresh_auto_layout()
 
     def cam_count(self) -> int:
         return len(self._cam_views)
@@ -6450,16 +8123,29 @@ class TickBar(QWidget):
             p.setPen(QPen(QColor(160, 160, 160)))
             p.drawLine(lo, h // 2, w, h // 2)
 
-            last_label_x = lo - 9999
-            for i, t in enumerate(ticks):
+            # Pens hoisted out of the loop, and minor ticks deduplicated by PIXEL: this
+            # runs on every set_cursor (i.e. every playback frame and every scrub tick),
+            # and allocating a QPen + drawing one line per frame meant thousands of
+            # operations per repaint on the GUI thread — several hundred ms for a
+            # multi-day range search, which is what jammed the slider. Only one line per
+            # x is visible anyway.
+            minor_pen = QPen(QColor(140, 140, 140, 160)); minor_pen.setWidth(1)
+            major_pen = QPen(QColor(80, 80, 80, 200));    major_pen.setWidth(1)
+            p.setPen(minor_pen)
+            drawn_x: set[int] = set()
+            for t in ticks:
                 x = _x(t)
-                # Minor tick for every frame
-                pen = QPen(QColor(140, 140, 140, 160)); pen.setWidth(1); p.setPen(pen)
-                p.drawLine(x, h // 2 - 3, x, h // 2 + 3)
-                if i % step != 0:
+                if x in drawn_x:
                     continue
+                drawn_x.add(x)
+                p.drawLine(x, h // 2 - 3, x, h // 2 + 3)
+
+            last_label_x = lo - 9999
+            for i in range(0, n, step):
+                t = ticks[i]
+                x = _x(t)
                 # Major tick
-                pen = QPen(QColor(80, 80, 80, 200)); pen.setWidth(1); p.setPen(pen)
+                p.setPen(major_pen)
                 p.drawLine(x, h // 2 - 6, x, h // 2 + 6)
                 if self.discrete_tick_labels and i < len(self.discrete_tick_labels):
                     label = self.discrete_tick_labels[i]
@@ -6506,7 +8192,19 @@ class TickBar(QWidget):
         span = self.axis_max_ns - self.axis_min_ns
         span_hours = span / ONE_HOUR_NS
 
-        if span_hours >= 6:
+        # The ladder must stay bounded by SPAN, not just by zoom level: _aligned_ticks
+        # walks a datetime per minor tick over the whole axis, and this paintEvent now
+        # runs on every set_cursor (each scrub tick, each playback frame). With the old
+        # ladder topping out at minor_min=5, a multi-day range search built thousands of
+        # datetimes per repaint — 27 ms for a 30-day span, 200 ms for 180 days, i.e. the
+        # whole 33 ms budget spent on the GUI thread drawing the axis.
+        if span_hours >= 720:      # ~30 days+
+            step_min = 10080; minor_min = 1440
+        elif span_hours >= 168:    # ~7 days+
+            step_min = 1440;  minor_min = 360
+        elif span_hours >= 24:
+            step_min = 360;   minor_min = 60
+        elif span_hours >= 6:
             step_min = 60;  minor_min = 5
         elif span_hours >= 3:
             step_min = 30;  minor_min = 5
@@ -6519,7 +8217,11 @@ class TickBar(QWidget):
 
         def _aligned_ticks(step_m: int) -> list[int]:
             start_dt = _dt_from_ns(self.axis_min_ns).replace(second=0, microsecond=0)
-            rem = start_dt.minute % step_m
+            # Align on minutes since midnight, not on the minute field: for every step up
+            # to 30 the two agree (hour*60 is a multiple of them), but the new multi-hour
+            # and multi-day steps need the hour too, or a 6 h grid would start at an
+            # arbitrary hour instead of on a 6 h boundary.
+            rem = (start_dt.hour * 60 + start_dt.minute) % step_m
             if rem:
                 start_dt = start_dt - timedelta(minutes=rem)
             end_dt = _dt_from_ns(self.axis_max_ns).replace(second=0, microsecond=0)
@@ -6678,21 +8380,41 @@ class CollapsibleSection(QWidget):
     toggled = Signal(str, bool)
 
     _ACCENT = "#4a78c0"
-    _HEADER_QSS = (
-        "QToolButton {"
-        "  text-align: left; border: none;"
-        "  border-left: 3px solid %(accent)s; padding: 5px 6px;"
-        "  margin-top: 4px; font-weight: 700; font-size: 11px;"
-        "  letter-spacing: 1px; color: #333; background: transparent;"
-        "}"
-        "QToolButton:hover { background: #d8e8ff; }"
-    ) % {"accent": _ACCENT}
 
-    def __init__(self, title: str, key: str, expanded: bool = True, parent=None):
+    @staticmethod
+    def _shade(hex_color: str, factor: float) -> str:
+        """Return hex_color scaled toward black (factor<1) or white (factor>1)."""
+        try:
+            h = hex_color.lstrip("#")
+            r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+            if factor <= 1.0:
+                r, g, b = (int(c * factor) for c in (r, g, b))
+            else:
+                r, g, b = (int(c + (255 - c) * (factor - 1.0)) for c in (r, g, b))
+            r, g, b = (max(0, min(255, c)) for c in (r, g, b))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return hex_color
+
+    @classmethod
+    def _header_qss(cls, accent: str) -> str:
+        return (
+            "QToolButton {"
+            "  text-align: left; border: none; border-radius: 4px;"
+            "  padding: 7px 9px; margin-top: 6px;"
+            "  font-weight: 700; font-size: 11px; letter-spacing: 1px;"
+            "  color: #fff; background: %(acc)s;"
+            "}"
+            "QToolButton:hover { background: %(hov)s; }"
+        ) % {"acc": accent, "hov": cls._shade(accent, 0.85)}
+
+    def __init__(self, title: str, key: str, expanded: bool = True, parent=None,
+                 accent: str | None = None):
         super().__init__(parent)
         self._key = key
         self._title = title
         self._expanded = expanded
+        accent = accent or self._ACCENT
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -6703,13 +8425,17 @@ class CollapsibleSection(QWidget):
         self._header.setChecked(expanded)
         self._header.setCursor(Qt.CursorShape.PointingHandCursor)
         self._header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._header.setStyleSheet(self._HEADER_QSS)
+        self._header.setStyleSheet(self._header_qss(accent))
         self._header.clicked.connect(self._on_header_clicked)
         lay.addWidget(self._header)
 
         self.body = QWidget()
+        self.body.setObjectName("secBody")
+        # Accent-tinted left stripe ties the body to its colored header.
+        self.body.setStyleSheet(
+            f"#secBody {{ border-left: 3px solid {self._shade(accent, 1.35)}; }}")
         self.body_layout = QVBoxLayout(self.body)
-        self.body_layout.setContentsMargins(8, 2, 0, 6)
+        self.body_layout.setContentsMargins(8, 3, 0, 7)
         self.body_layout.setSpacing(4)
         lay.addWidget(self.body)
 
@@ -6951,7 +8677,14 @@ except AttributeError:
 
 
 class _DirWatchSignals(QObject):
-    new_file = Signal(int, str)   # cam_i, filename (no path, just name)
+    # cam_i, the watched folder, filename. The folder MUST travel with the event:
+    # a camera has a watcher on the current AND the previous hour folder, and the
+    # receiver cannot tell which one an event came from. Guessing it (first folder
+    # in the camera's list that has a watcher) always named the OLDEST folder, so
+    # every pushed frame got a path in the previous hour — a file that does not
+    # exist. The tile then never painted, and because the bogus item had already
+    # advanced the poll cutoff, the safety-net poll rejected the real file too.
+    new_file = Signal(int, str, str)
 
 
 class _DirWatcher(_threading.Thread):
@@ -7026,7 +8759,8 @@ class _DirWatcher(_threading.Thread):
                         self.last_event_mono = time.monotonic()
                         self.suspect_strikes = 0
                         try:
-                            self._signals.new_file.emit(self._cam_i, name)
+                            self._signals.new_file.emit(
+                                self._cam_i, str(self._folder), name)
                         except RuntimeError:
                             return  # Qt object deleted during shutdown
                 if nxt == 0:
@@ -7041,7 +8775,8 @@ class _CamPollTask(QRunnable):
     Also probes next UTC hour-folders for auto-discovery."""
 
     def __init__(self, cam_idx: int, folders: list, cutoff: int,
-                 cam_name: str, signal: "_CamPollSignals"):
+                 cam_name: str, signal: "_CamPollSignals",
+                 seen_map: "dict[str, set[str]] | None" = None):
         super().__init__()
         self.setAutoDelete(True)
         self._cam_i    = cam_idx
@@ -7049,13 +8784,23 @@ class _CamPollTask(QRunnable):
         self._cutoff   = cutoff
         self._cam_name = cam_name
         self._sig      = signal
+        self._seen_map = seen_map   # folder_str -> set(names already parsed)
 
     def run(self):
         new_items: list = []
         for folder in self._folders:
             try:
                 folder_path = Path(folder)
+                # Names already parsed on a previous tick are skipped with a cheap
+                # C-level set hit — turns O(all files) per poll into O(new files),
+                # which is what stops the hour-end GIL starvation. Single writer per
+                # folder (one cam owns it, guarded by _cam_poll_running), so no lock.
+                seen = None if self._seen_map is None else self._seen_map.get(str(folder))
                 for name in os.listdir(folder):
+                    if seen is not None:
+                        if name in seen:
+                            continue
+                        seen.add(name)
                     # String-level extension check — avoids a Path object per
                     # file in a loop that runs over thousands of entries.
                     dot = name.rfind(".")
@@ -7127,7 +8872,14 @@ class _CamPollTask(QRunnable):
             if new_items:
                 new_items.sort(key=lambda x: x.ts_ns)
 
-        self._sig.found.emit(self._cam_i, new_items, new_folders)
+        # Always emit, even if the signal's C++ object was already deleted (app
+        # closing mid-poll) — the caller flips _cam_poll_running[cam_i] back to
+        # False inside this callback, so a swallowed emit would leave that
+        # camera's polling stuck "running" forever and it would never poll again.
+        try:
+            self._sig.found.emit(self._cam_i, new_items, new_folders)
+        except RuntimeError:
+            pass
 
 
 # ================================================================== PER-CAM SLIDER ROW
@@ -7337,8 +9089,15 @@ class Viewer(QWidget):
         self.last_pick_date = now_dt.date()
         self.last_pick_hour_from: "int | None" = None   # None = first open, default to live mode
         self.last_pick_hour_to:   "int | None" = None
+        self.last_pick_min_from:  int = 0               # minute part of the picked window
+        self.last_pick_min_to:    int = 0               # exclusive end (see seg_bounds_ns)
         self.last_pick_axis_override: tuple[int, int] | None = None
-        self._last_pick_segments: "list | None" = None  # per-day (date, hf, ht) list, or None
+        self._last_pick_segments: "list | None" = None  # per-day PickSeg list, or None
+        self._last_pick_range_mode = False   # last multi-day pick was day→day
+        # Loaded-frame filter: folders are hour-granular, so minute-precise
+        # windows (and per-day windows) are enforced on the scanned items.
+        # None = keep everything the folders contain.
+        self._ts_windows: "list[tuple[int, int]] | None" = None
         self.last_pick_cam_names: list[str] = []   # paměť vybraných kamer
 
         self.pending_slider = None
@@ -7360,6 +9119,12 @@ class Viewer(QWidget):
 
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(PLAY_TICK_MS)
+        # Qt's default CoarseTimer snaps to the Windows 15.625 ms scheduler tick, so a
+        # 33 ms interval really fires every 46.9 ms — 21 ticks/s instead of 30. A third of
+        # playback's frames were lost before any image work happened. Measured: 21.2 →
+        # 30.3 ticks/s, and with the preview serving them that is 30 painted frames per
+        # second per camera.
+        self.play_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.play_timer.timeout.connect(self._autoplay_step)
 
         self._prefetch_debounce = QTimer(self)
@@ -7370,14 +9135,89 @@ class Viewer(QWidget):
         self._prefetch_debounce.timeout.connect(self._run_prefetch_after_idle)
 
         self._scrub_side = SCRUB_MAX_SIDE
+        # Decode size latched for the duration of one slider drag (see _on_slider_pressed).
+        self._drag_side  = SCRUB_MAX_SIDE
         self.cache = PixCache(CACHE_SIZE)
+
+        # ── Whole-window preview layer (live mode OFF) ───────────────────────
+        self._proxy_gen      = 0
+        self._proxy_tracks: "list[_ProxyTrack]" = []
+        self._proxy_stop     = threading.Event()
+        self._proxy_inflight = 0
+        self._proxy_total    = 0
+        self._proxy_done     = 0
+        self._proxy_rr       = -1     # round-robin cursor over the tracks
+        self._proxy_cursor_ts_ns = 0  # timeline moment last displayed (_set_info_for);
+                                      # the sweep fills its neighbourhood first
+        self._proxy_holds    = 0      # consecutive _proxy_pump holds (see PROXY_HOLD_MAX)
+        # Per-minute paint counters for the diag log: how a frame reached the screen.
+        # "Is the slider smooth" is otherwise a matter of opinion; prev/load is the
+        # number that decides it (a share load is ~1/s per camera, a preview paint is
+        # bounded only by the 33 ms tick).
+        self._diag_prev = 0   # painted from the RAM preview
+        self._diag_miss = 0   # preview asked but too coarse / not there yet
+        self._diag_load = 0   # painted from a real share read
+        self._diag_cach = 0   # painted from the rendered-pixmap cache (revisited frame)
+        # Per-paint ledger for bench_drag.py / bench_play.py, off unless the env var is
+        # set. The per-minute counters above aggregate across cameras and cannot answer
+        # the question the whole preview layer exists for: how far was the frame that
+        # actually got painted from the one the slider asked for. Recording it here —
+        # in the app, at the one funnel every paint goes through (_cam_note_painted) —
+        # keeps the harness measuring the shipping code instead of a copy that drifts.
+        self._bench = [] if os.environ.get("IMAGE_TOOLS_BENCH") else None
+        self._proxy_grace_until = 0.0  # monotonic deadline; no dispatch before it
+        self._proxy_was_enabled = None   # last _proxy_enabled() seen by _proxy_sync_enabled
+        self._proxy_signals  = _ProxySignals()
+        self._proxy_signals.batch.connect(self._on_proxy_batch)
+        self._proxy_pool = QThreadPool(self)
+        self._proxy_pool.setMaxThreadCount(PROXY_WORKERS)
+        # Rendered previews (auto-stretch / contrast / palette applied to the small
+        # array). Keys are not (idx, max_side, …) → no native cap here. 96 was too few
+        # to survive one drag across a long window, so every pass re-ran autostretch +
+        # LUT on frames it had just rendered. 384 × ~170 kB ≈ 65 MB.
+        self._proxy_render_cache = PixCache(384, native_keep=None)
+        self._proxy_topup = QTimer(self)
+        self._proxy_topup.setSingleShot(True)
+        self._proxy_topup.timeout.connect(self._proxy_start)
+        # Re-dispatch after _proxy_pump held the sweep off. Deliberately NOT _proxy_topup:
+        # that one restarts the whole sweep (bumps _proxy_gen, discarding every batch in
+        # flight), so retrying through it would have thrown away work every 400 ms.
+        self._proxy_resume = QTimer(self)
+        self._proxy_resume.setSingleShot(True)
+        self._proxy_resume.timeout.connect(self._proxy_pump)
+        # Debounced full-quality re-render of the frame the user settled on.
+        self._refine_timer = QTimer(self)
+        self._refine_timer.setSingleShot(True)
+        self._refine_timer.timeout.connect(self._refine_current_frame)
 
         self.scan_pool = QThreadPool(self); self.scan_pool.setMaxThreadCount(4)
         # Separate pool for online polling — one thread per camera so they run in parallel
         self._poll_pool = QThreadPool(self); self._poll_pool.setMaxThreadCount(8)
+        # Per-folder cache of filenames the online poller has already parsed, so a
+        # near-full hour-folder (~12k files just before UTC rollover) is NOT
+        # Path+regex re-parsed on every 0.5 s tick × every camera. Re-parsing the
+        # whole folder held the GIL for hundreds of ms per tick and starved the Qt
+        # UI thread (cameras kept drawing, but buttons/gradient froze) — the ~2 h
+        # "gets stuck" report. Bounded: only the newest 1-2 folders per camera are
+        # ever scanned; stale keys are pruned at rollover (see _online_poll_multi).
+        self._poll_seen: dict[str, set[str]] = {}
         # Image decode is I/O-bound over SMB (read latency dominates decode CPU)
         # — more threads keep scrubbing/prefetch responsive on a slow share.
-        self.load_pool = QThreadPool(self); self.load_pool.setMaxThreadCount(8)
+        #
+        # 8 → 16 only became worth anything once _open_reader stopped holding the GIL
+        # through the network read. Before that, throughput was pinned at ~30 frames/s no
+        # matter how many threads ran (measured: 27/32/29 fps at 1/8/16 threads); after it,
+        # the same share gives 31/106/204 fps at 1/8/16. This is what makes scrubbing
+        # smooth — the share was never the limit.
+        self.load_pool = QThreadPool(self); self.load_pool.setMaxThreadCount(16)
+        # Multi-camera tiles decode here, in ONE pool shared by every camera, created once
+        # for the life of the Viewer. load_pool above is the single-camera timeline's; the
+        # tiles used to get one 2-thread pool each, rebuilt on every camera (re)load, so
+        # load_pool's 16 threads were unreachable in multi-cam while pools and threads
+        # accumulated. Fairness between cameras is the per-camera depth cap
+        # (_cam_inflight_depth), not a partition of the threads.
+        self._cam_pool = QThreadPool(self)
+        self._cam_pool.setMaxThreadCount(CAM_POOL_THREADS)
         self.analysis_pool = QThreadPool(self); self.analysis_pool.setMaxThreadCount(1)
 
         self.load_signals = LoaderSignals()
@@ -7385,7 +9225,14 @@ class Viewer(QWidget):
 
         self._display_req_id = 0
         self._inflight: set = set()
+        # key → the display EPOCH that asked for it. The epoch is bumped only by discrete
+        # navigation (_display_exact_index: release, stop, arrow step, seek, settings
+        # change), never per scrub tick or per playback frame. So a load that lands late
+        # within the SAME interaction still paints — which is what makes a drag or a
+        # playback look alive on a slow share — while one left over from a view the user
+        # has navigated away from is dropped. See _on_loaded.
         self._want_display_req: dict = {}
+        self._display_epoch = 0
         self._scan_task: ScanTask | None = None
         self._save_task: SaveRangeTask | None = None
         self._refresh_task: RefreshScanTask | None = None
@@ -7393,7 +9240,9 @@ class Viewer(QWidget):
         self.mark_b_ns: int | None = None
         self._pointing_task: PointingAnalysisTask | None = None
         self._brightness_offset: int = 0  # -255 .. +255
-        self._ref_image: np.ndarray | None = None  # reference frame pro subtraction
+        self._ref_image: np.ndarray | None = None  # reference frame pro subtraction (full-res, jen pro status/existence)
+        self._ref_path: "Path | None" = None        # cesta k reference snímku (re-decode na displej. rozlišení)
+        self._ref_scaled: dict = {}                 # max_side -> np.ndarray reference zmenšená stejným pipeline jako aktuální snímek
         self._sf_energy_map: dict[str, str] = {}  # filename -> energie ze Shot Finderu
         self._saved_timestamps: list[tuple[int, str]] = []  # (ts_ns, label)
 
@@ -7401,13 +9250,17 @@ class Viewer(QWidget):
         self._cam_names:        list[str]         = []   # jména načtených kamer
         self._cam_folders:      list[Path]        = []   # jedna (první) složka per-camera (legacy)
         self._cam_folder_lists: list[list[Path]]  = []   # všechny složky per-camera (pro online poll)
-        # Per-camera items, ts_list, cache, load_pools
+        # Per-camera items, ts_list, cache, in-flight registry
         self._cam_items:   list[list]  = []        # list of list[Item]
         self._cam_ts:      list[list]  = []        # list of list[int]
         self._cam_caches:     list        = []        # list of PixCache
-        self._cam_pools:      list        = []        # list of QThreadPool
+        self._cam_inflight_at: list      = []        # list of {req_id: launch_monotonic}
+        self._cam_req_seq:    int        = 0
         self._cam_signals:    list        = []        # list of LoaderSignals
-        self._cam_ref_images: list        = []        # list of np.ndarray | None, per-camera subtraction reference
+        self._cam_ref_images: list        = []        # list of np.ndarray | None, per-camera subtraction reference (full-res, jen status)
+        self._cam_ref_paths:  list        = []        # list of Path | None, cesta k reference snímku per-camera
+        self._cam_ref_scaled: list        = []        # list of dict (max_side -> np.ndarray), reference zmenšená per-camera
+        self._cam_diff_stats: dict        = {}        # cam_i -> last difference stats (for the info line)
 
         # ── Online mode state ────────────────────────────────────────────────
         self._dir_watch_sigs:  "_DirWatchSignals | None" = None
@@ -7417,6 +9270,14 @@ class Viewer(QWidget):
         self._online_timer.setInterval(200)
         self._online_timer.timeout.connect(self._online_poll)
         self._auto_follow    = False   # sleduj nejnovější snímek
+        # True once the live cap dropped frames from memory — turning live mode
+        # off then re-scans from disk to put the full history back.
+        self._live_trimmed   = False
+        # Running number of frames the live cap has dropped off the FRONT of
+        # self.items / self._cam_items[i]. Pixmap-cache keys add it to the index
+        # so a key names a frame and not a position — see _ck().
+        self._items_offset   = 0
+        self._cam_offsets: list[int] = []
         self._online_blink_state = False
         self._online_last_new_ns = 0.0  # čas posledního nového snímku
         self._online_last_poll_ts = 0.0  # čas posledního spuštění polleru
@@ -7425,14 +9286,42 @@ class Viewer(QWidget):
         self._online_blink_timer.timeout.connect(self._on_online_blink)
         # Per-camera last-update timestamps for refresh dots
         self._cam_last_update_ts: list[float] = []
+        # Per-camera display tracking for the same dots: ts_ns of the frame last
+        # PAINTED and when that frame changed. Frames arriving is not enough —
+        # a stuck display must not blink green (see _on_cam_dot_blink).
+        self._cam_shown_ts_ns: list[int] = []
+        self._cam_shown_mono: list[float] = []
+        # ts_ns the slider / playback last ASKED each tile for, and how far the frame it
+        # actually painted was allowed to be from it. Together with _cam_shown_ts_ns these
+        # are the only source of truth for the tile's timestamp label and its refresh dot
+        # (see _cam_note_target / _cam_note_painted / _cam_is_stale).
+        self._cam_target_ts_ns: list[int] = []
+        self._cam_paint_tol_ns: list[int] = []
+        # Whether the frame on each tile is a preview STAND-IN for the requested one
+        # (within tolerance, so not stale) rather than the exact frame. Its own label
+        # state, because "close enough on purpose" is neither "exact" nor "behind".
+        self._cam_paint_preview: list[bool] = []
         self._cam_dot_blink_state: bool = False
         self._cam_dot_timer = QTimer(self)
         self._cam_dot_timer.setInterval(600)
         self._cam_dot_timer.timeout.connect(self._on_cam_dot_blink)
 
+        # ── Diagnostics: periodic health snapshot ────────────────────────────
+        # Writes one line/min to image_tools_diag.log (next to the exe) so the
+        # slow degradation/freeze that shows up after ~2 h online can be traced
+        # to whichever metric keeps growing (RSS memory, thread/pool/child count,
+        # live QPixmap/QImage count, item lists, watchers…). Cheap, always on.
+        self._diag_t0 = time.monotonic()
+        self._diag_timer = QTimer(self)
+        self._diag_timer.setInterval(60_000)
+        self._diag_timer.timeout.connect(self._diag_log)
+        self._diag_timer.start()
+
         # ── PV state ─────────────────────────────────────────────────────────
         self._pv_enabled: list[str] = []       # ordered list of selected PV names
         self._pv_values:  dict[str, str] = {}  # name → displayed value string
+        self._pv_values_ts: "int | None" = None  # frame ts the values belong to
+        self._pv_fetch_ts:  "int | None" = None  # frame ts of the in-flight fetch
         self._pv_fetch_gen: int = 0            # incremented each fetch to cancel stale results
         self._pv_signals = _PvSignals()
         self._pv_signals.result.connect(self._pv_on_result)
@@ -7466,6 +9355,129 @@ class Viewer(QWidget):
             self._UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._UI_STATE_PATH.write_text(
                 json.dumps(self._ui_state, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _diag_log(self):
+        """One-line/min health snapshot → image_tools_diag.log next to the exe.
+        Purely diagnostic: pinpoints which resource grows before the ~2 h freeze.
+        Must never raise (it runs on a timer)."""
+        try:
+            import gc, sys as _sys
+            # Process working-set (RSS) in MB via Windows PSAPI — no psutil needed.
+            rss_mb = _rss_mb()
+            n_threads = threading.active_count()
+            try:    n_pools = len(self.findChildren(QThreadPool))
+            except Exception: n_pools = -1
+            try:    n_children = len(self.children())
+            except Exception: n_children = -1
+            n_items   = len(self.items) if getattr(self, "items", None) else 0
+            cam_items = getattr(self, "_cam_items", []) or []
+            cam_total = sum(len(c) for c in cam_items)
+            cam_max   = max((len(c) for c in cam_items), default=0)
+            watchers  = getattr(self, "_dir_watchers", {}) or {}
+            n_watch   = len(watchers)
+            n_walive  = sum(1 for w in watchers.values()
+                            if getattr(w, "is_alive", lambda: False)())
+            # Tiles share ONE pool now; log its active thread count instead of a pool count
+            # that is always 1 (the old per-camera pools are what this field was watching
+            # accumulate, and they no longer exist).
+            try:    n_campools = self._cam_pool.activeThreadCount()
+            except Exception: n_campools = -1
+            n_saved    = len(getattr(self, "_saved_timestamps", []) or [])
+            # Counting QPixmap/QImage instances meant two Python-level passes over
+            # gc.get_objects() — 700k+ objects once a long window is scanned — on the
+            # event loop, i.e. a several-hundred-ms freeze every minute. The counts
+            # never told us anything the RSS figure doesn't, so only the cheap total
+            # is kept (one list build, no per-object work).
+            n_gc = -1
+            n_pix = n_img = -1
+            try:
+                n_gc = len(gc.get_objects())
+            except Exception:
+                pass
+            try:    axis_h = (self.axis_max_ns - self.axis_min_ns) / 3.6e12
+            except Exception: axis_h = -1
+            up = (time.monotonic() - getattr(self, "_diag_t0", time.monotonic())) / 60.0
+            # How the last minute's frames reached the screen, and how much of the
+            # preview is decoded. prev ≫ load means the slider is running from RAM;
+            # load-only with prox < 100 % is the "a frame a second" state.
+            tracks  = getattr(self, "_proxy_tracks", []) or []
+            planned = sum(len(t.planned) for t in tracks)
+            decoded = sum(len(t.frames) for t in tracks)
+            prox    = int(100 * decoded / planned) if planned else -1
+            # Refusal RATE, not just the raw count: `miss` alone cannot be read without
+            # knowing how many paints it sat next to, and this ratio is the single
+            # number that says whether the preview is carrying the drag.
+            _served = self._diag_prev + self._diag_miss
+            refuse  = int(100 * self._diag_miss / _served) if _served else -1
+            paints  = (f"prev={self._diag_prev:6d} cach={self._diag_cach:6d} "
+                       f"miss={self._diag_miss:6d} load={self._diag_load:5d} "
+                       f"prox={prox:4d}% refuse={refuse:4d}% ")
+            self._diag_prev = self._diag_miss = self._diag_load = self._diag_cach = 0
+            # What the preview actually costs, and how coarse it is. The RAM budget was
+            # never verifiable before (rss was always -1) and the plan step — the thing
+            # that decides whether a drag can show every frame — was never logged at
+            # all, so a sampled preview looked identical to a complete one.
+            prox_mb = -1.0
+            try:
+                prox_mb = sum(t.nbytes() for t in tracks) / (1024 * 1024)
+            except Exception:
+                pass
+            render_mb = -1.0
+            try:
+                _rc = getattr(self, "_proxy_render_cache", None)
+                if _rc is not None:
+                    render_mb = sum(
+                        (pm.width() * pm.height() * pm.depth() / 8)
+                        for pm in _rc._d.values()) / (1024 * 1024)
+            except Exception:
+                pass
+            steps   = ",".join(str(getattr(t, "step", -1)) for t in tracks) or "-"
+            # The distance a preview paint may currently stand in at — the number that
+            # decides whether a tile reads amber or red (see _proxy_motion_tol).
+            tol_s = -1.0
+            try:
+                if tracks:
+                    tol_s = max(self._proxy_motion_tol(i)
+                                for i in range(len(tracks))) / 1e9
+            except Exception:
+                pass
+            prox_txt = (f"proxMB={prox_mb:7.1f} renderMB={render_mb:6.1f} "
+                        f"step={steps:11s} tolS={tol_s:7.2f} ")
+            # The two live lags, kept apart because they have different owners.
+            # srcLag = wall clock − newest frame we know of: how far behind real
+            # time the ARCHIVE is, which no amount of local work can shorten.
+            # shownLag = newest known frame − frame actually on the tile: the part
+            # that is ours. Worst camera of each; -1 when not applicable.
+            src_lag = shown_lag = -1.0
+            try:
+                cam_ts_lists = getattr(self, "_cam_ts", []) or []
+                newest = [c[-1] for c in cam_ts_lists if c]
+                if newest:
+                    src_lag = max(0.0, time.time() - max(newest) / 1e9)
+                    shown = getattr(self, "_cam_shown_ts_ns", []) or []
+                    lags = [(c[-1] - shown[i]) / 1e9
+                            for i, c in enumerate(cam_ts_lists)
+                            if c and i < len(shown) and shown[i]]
+                    if lags:
+                        shown_lag = max(0.0, max(lags))
+            except Exception:
+                pass
+            lags_txt = f"srcLag={src_lag:6.1f}s shownLag={shown_lag:6.1f}s "
+            line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} up={up:6.1f}m " + paints +
+                    prox_txt + lags_txt +
+                    f"rss={rss_mb:8.1f}MB thr={n_threads:3d} pools={n_pools:3d} "
+                    f"campools={n_campools:2d} children={n_children:6d} "
+                    f"items={n_items:7d} camTot={cam_total:8d} camMax={cam_max:7d} "
+                    f"watch={n_watch}/{n_walive} saved={n_saved} gcObj={n_gc:8d} "
+                    f"qpix={n_pix:6d} qimg={n_img:6d} axisH={axis_h:5.1f} "
+                    f"online={int(bool(getattr(self, '_online_mode', False)))}\n")
+            base = (Path(_sys.executable).resolve().parent
+                    if getattr(_sys, "frozen", False)
+                    else Path(__file__).resolve().parent)
+            with open(base / "image_tools_diag.log", "a", encoding="utf-8") as f:
+                f.write(line)
         except Exception:
             pass
 
@@ -7507,9 +9519,9 @@ class Viewer(QWidget):
         self._ui_state = self._load_ui_state()
         self._sections: "dict[str, CollapsibleSection]" = {}
 
-        def _add_section(key, title, default_expanded):
+        def _add_section(key, title, default_expanded, accent=None):
             expanded = bool(self._ui_state.get(key, default_expanded))
-            sec = CollapsibleSection(title, key, expanded)
+            sec = CollapsibleSection(title, key, expanded, accent=accent)
             sec.toggled.connect(self._on_section_toggled)
             self._sections[key] = sec
             llay.addWidget(sec)
@@ -7529,13 +9541,13 @@ class Viewer(QWidget):
         _exp_row.addWidget(_btn_collapse_all)
         llay.addLayout(_exp_row)
 
-        s_src  = _add_section("source",   "Source",           True)
-        s_tl   = _add_section("timeline", "Timeline & Range", True)
-        s_pv   = _add_section("pv",       "PV Values",        True)
-        s_save = _add_section("save",     "Save",             True)
-        s_disp = _add_section("display",  "Image / Display",  False)
-        s_ovl  = _add_section("overlays", "Overlays",         False)
-        s_an   = _add_section("analysis", "Analysis",         False)
+        s_src  = _add_section("source",   "Source",           True,  "#2f6fd0")  # blue
+        s_save = _add_section("save",     "Save",             True,  "#c0392b")  # red
+        s_tl   = _add_section("timeline", "Timeline & Range", True,  "#2e9e5b")  # green
+        s_disp = _add_section("display",  "Image / Display",  False, "#7a4fc0")  # purple
+        s_pv   = _add_section("pv",       "PV Values",        True,  "#1a9e9e")  # teal
+        s_ovl  = _add_section("overlays", "Overlays",         False, "#d08a1e")  # amber
+        s_an   = _add_section("analysis", "Analysis",         False, "#b0396b")  # magenta
 
         # ══════════════════ Section: SOURCE ═══════════════════════
         self.btn_date = QPushButton("Time window")
@@ -7544,23 +9556,28 @@ class Viewer(QWidget):
         self.btn_open = QPushButton("Camera")
         self.btn_open.setToolTip("Select a camera folder to load images from")
         self.btn_open.clicked.connect(self.open_folder)
+        # Refresh has no purpose in live/online mode, so it is removed from the
+        # Source UI. The widget is still created (never added to a layout) so the
+        # many setEnabled/setText calls elsewhere keep working without changes.
         self.btn_refresh = QPushButton("⟳ Refresh")
         self.btn_refresh.setToolTip("Reload new frames from the same folders without resetting position")
         self.btn_refresh.setEnabled(False)
+        self.btn_refresh.setVisible(False)
         self.btn_refresh.clicked.connect(self.refresh_folder)
-        self._btn_auto_follow = QPushButton("⇢ Auto-follow")
+        self._btn_auto_follow = QPushButton("⇢ Live mode")
         self._btn_auto_follow.setCheckable(True)
         self._btn_auto_follow.setEnabled(False)
         self._btn_auto_follow.setToolTip(
-            "When enabled, slider jumps to newest image automatically.\n"
-            "Disabled automatically when you move the slider.")
+            "Live mode: new images are loaded as they arrive and the slider follows "
+            "the newest one.\nTurns itself off when you move the slider.\n"
+            "Green = on, red = off. Enable it in the Time window dialog to start live.")
         self._btn_auto_follow.toggled.connect(self._on_auto_follow_toggled)
+        self._refresh_live_btn_style()
         row = QHBoxLayout(); row.addWidget(self.btn_date); row.addWidget(self.btn_open)
         s_src.body_layout.addLayout(row)
-        row_ref_follow = QHBoxLayout()
-        row_ref_follow.addWidget(self.btn_refresh)
-        row_ref_follow.addWidget(self._btn_auto_follow)
-        s_src.body_layout.addLayout(row_ref_follow)
+        row_follow = QHBoxLayout()
+        row_follow.addWidget(self._btn_auto_follow)
+        s_src.body_layout.addLayout(row_follow)
 
         # ══════════════════ Section: TIMELINE & RANGE ═════════════
         self.btn_prev = QPushButton("◀"); self.btn_prev.setToolTip("Previous image (←)"); self.btn_prev.setEnabled(False)
@@ -7582,8 +9599,12 @@ class Viewer(QWidget):
 
         self.speed_cb = PopupBelowComboBox()
         self.speed_cb.setToolTip(
-            "Speed = % of images per second.")
+            "Speed = % of the loaded images per second.")
         self.speed_cb.setMaxVisibleItems(12)
+        # Nothing above 5 %/s: on a window of any size those rates need a stride far
+        # larger than one frame, so they skip most of what they play — the file names
+        # scroll but almost nothing is actually shown. The slow end is where the useful
+        # settings are.
         for label, val in [
             ("0.10 %/s", 0.10),
             ("0.25 %/s",  0.25),
@@ -7591,9 +9612,6 @@ class Viewer(QWidget):
             ("1 %/s",  1.0),
             ("2 %/s",   2.0),
             ("5 %/s",   5.0),
-            ("10 %/s",   10.0),
-            ("15 %/s",   15.0),
-            ("20 %/s",   20.0)
         ]:
             self.speed_cb.addItem(label, val)
         self.speed_cb.setCurrentIndex(3)  # default 1 %/s
@@ -7663,17 +9681,28 @@ class Viewer(QWidget):
         s_save.body_layout.addWidget(self.btn_send_workshop)
         row2c = QHBoxLayout()
         self.cb_save_overlay = QCheckBox("Save with overlay")
-        self.cb_save_overlay.setToolTip("When saving, burn overlays (cross/circle/square) into the image")
+        self.cb_save_overlay.setToolTip("When saving, burn overlays (cross/circle/square) and PV values into the image")
         self.cb_save_overlay.setStyleSheet(_CHECKBOX_STYLE)
         row2c.addWidget(self.cb_save_overlay)
+        row2c.addStretch(1)
+        s_save.body_layout.addLayout(row2c)
+        # Range-save (± N frames around current) — off by default, spinbox is the count.
+        row2d = QHBoxLayout()
+        self.cb_save_around = QCheckBox("Save ±")
+        self.cb_save_around.setToolTip("Also save N frames before and after the current one")
+        self.cb_save_around.setStyleSheet(_CHECKBOX_STYLE)
+        row2d.addWidget(self.cb_save_around)
         self.save_around_n_sb = QSpinBox()
         self.save_around_n_sb.setRange(0, 10000)
         self.save_around_n_sb.setValue(0)
         self.save_around_n_sb.setFixedWidth(48)
-        self.save_around_n_sb.setToolTip("Number of frames before and after current to save (0 = only current)")
-        row2c.addWidget(self.save_around_n_sb)
-        row2c.addWidget(QLabel("±"))
-        s_save.body_layout.addLayout(row2c)
+        self.save_around_n_sb.setEnabled(False)
+        self.save_around_n_sb.setToolTip("Number of frames before and after current to save")
+        self.cb_save_around.toggled.connect(self.save_around_n_sb.setEnabled)
+        row2d.addWidget(self.save_around_n_sb)
+        row2d.addWidget(QLabel("frames"))
+        row2d.addStretch(1)
+        s_save.body_layout.addLayout(row2d)
         self.cb_save_metadata_txt = QCheckBox("Save metadata .txt")
         self.cb_save_metadata_txt.setToolTip("Also write a sidecar .txt file with the original image metadata")
         self.cb_save_metadata_txt.setStyleSheet(_CHECKBOX_STYLE)
@@ -7685,9 +9714,52 @@ class Viewer(QWidget):
         s_save.body_layout.addWidget(self.cb_save_original)
 
         # ══════════════════ Section: IMAGE / DISPLAY ══════════════
-        self.cb_bright = QCheckBox("Auto-stretch contrast"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
-        self.cb_bright.setToolTip("Auto-stretch contrast for better visibility")
-        self.cb_bright.stateChanged.connect(self._on_brightness_changed)
+        # Contrast: manual slider + "Auto" checkbox (percentile auto-stretch).
+        # The Auto checkbox overrides the slider — the app-wide "checkbox is
+        # superior to slider" rule for each enhancement pair.
+        self.cb_bright = QCheckBox("Auto"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_bright.setToolTip("Auto-stretch contrast (percentile) — overrides the Contrast slider")
+        self.cb_bright.stateChanged.connect(self._on_contrast_auto_changed)
+        row_contrast = QHBoxLayout()
+        row_contrast.addWidget(QLabel("Contrast:"))
+        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.contrast_slider.setRange(-127, 127)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.setToolTip("Manual contrast (-127 to +127)")
+        self.contrast_slider.valueChanged.connect(self._on_contrast_slider_changed)
+        # The manual value to come back to when Auto is switched off — the greyed-out
+        # slider is overwritten while Auto is on (see _refresh_auto_bc_sliders).
+        self._contrast_manual = 0
+        row_contrast.addWidget(self.contrast_slider, 1)
+        self.btn_contrast_reset = QPushButton("↺")
+        self.btn_contrast_reset.setFixedWidth(28)
+        self.btn_contrast_reset.setToolTip("Reset contrast")
+        self.btn_contrast_reset.clicked.connect(self._reset_contrast_slider)
+        row_contrast.addWidget(self.btn_contrast_reset)
+        row_contrast.addWidget(self.cb_bright)
+        s_disp.body_layout.addLayout(row_contrast)
+        # Brightness: manual offset slider + "Auto" checkbox (auto-level).
+        self.cb_bright_auto = QCheckBox("Auto"); self.cb_bright_auto.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_bright_auto.setToolTip("Auto-level brightness — overrides the Brightness slider")
+        self.cb_bright_auto.stateChanged.connect(self._on_bright_auto_changed)
+        row_bright_slider = QHBoxLayout()
+        row_bright_slider.addWidget(QLabel("Brightness:"))
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(-255, 255)
+        self.brightness_slider.setValue(0)
+        self.brightness_slider.setToolTip("Manual brightness offset (-255 to +255)")
+        self.brightness_slider.valueChanged.connect(self._on_brightness_slider_changed)
+        # Same as _contrast_manual: the value to come back to when Auto is switched off.
+        self._brightness_manual = 0
+        row_bright_slider.addWidget(self.brightness_slider, 1)
+        self.btn_brightness_reset = QPushButton("↺")
+        self.btn_brightness_reset.setFixedWidth(28)
+        self.btn_brightness_reset.setToolTip("Reset brightness")
+        self.btn_brightness_reset.clicked.connect(self._reset_brightness_slider)
+        row_bright_slider.addWidget(self.btn_brightness_reset)
+        row_bright_slider.addWidget(self.cb_bright_auto)
+        s_disp.body_layout.addLayout(row_bright_slider)
+        # Palette / gradient
         self.gradient_cb = PopupBelowComboBox()
         self.gradient_cb.setToolTip("Color gradient for image display")
         for name in GRADIENT_NAMES:
@@ -7697,24 +9769,10 @@ class Viewer(QWidget):
             "QComboBox { padding: 3px 6px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }"
             "QComboBox QAbstractItemView { background: #fff; }")
         self.gradient_cb.currentIndexChanged.connect(self._on_gradient_changed)
-        row_bright_grad = QHBoxLayout()
-        row_bright_grad.addWidget(self.cb_bright)
-        row_bright_grad.addWidget(self.gradient_cb, 1)
-        s_disp.body_layout.addLayout(row_bright_grad)
-        row_bright_slider = QHBoxLayout()
-        row_bright_slider.addWidget(QLabel("Brightness offset:"))
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(-255, 255)
-        self.brightness_slider.setValue(0)
-        self.brightness_slider.setToolTip("Manual brightness offset (-255 to +255)")
-        self.brightness_slider.valueChanged.connect(self._on_brightness_slider_changed)
-        row_bright_slider.addWidget(self.brightness_slider, 1)
-        self.btn_brightness_reset = QPushButton("↺")
-        self.btn_brightness_reset.setFixedWidth(28)
-        self.btn_brightness_reset.setToolTip("Reset brightness")
-        self.btn_brightness_reset.clicked.connect(self._reset_brightness_slider)
-        row_bright_slider.addWidget(self.btn_brightness_reset)
-        s_disp.body_layout.addLayout(row_bright_slider)
+        row_grad = QHBoxLayout()
+        row_grad.addWidget(QLabel("Palette:"))
+        row_grad.addWidget(self.gradient_cb, 1)
+        s_disp.body_layout.addLayout(row_grad)
         row_sub = QHBoxLayout()
         self.cb_subtract = QCheckBox("Subtraction")
         self.cb_subtract.setStyleSheet(_CHECKBOX_STYLE)
@@ -7729,6 +9787,20 @@ class Viewer(QWidget):
         row_sub.addWidget(self.btn_set_ref)
         row_sub.addStretch(1)
         s_disp.body_layout.addLayout(row_sub)
+        self.cb_preload_preview = QCheckBox("Preload preview")
+        self.cb_preload_preview.setStyleSheet(_CHECKBOX_STYLE)
+        self.cb_preload_preview.setToolTip(
+            "Decode the whole loaded time window once in the background at low\n"
+            "resolution, so dragging the slider repaints from memory instead of\n"
+            "reading one image off the share per position. Progress appears in the\n"
+            "INFO panel; the frame you stop on is always re-rendered at full\n"
+            "resolution.\n\n"
+            "Turn it off to keep all share bandwidth for the frame you are looking\n"
+            "at — the slider then loads on demand and will lag on ranges it has not\n"
+            "read yet.")
+        self.cb_preload_preview.setChecked(bool(self._ui_state.get("preload_preview", True)))
+        self.cb_preload_preview.stateChanged.connect(self._on_preload_preview_changed)
+        s_disp.body_layout.addWidget(self.cb_preload_preview)
         row_sub_thr = QHBoxLayout()
         row_sub_thr.addWidget(QLabel("Diff threshold:"))
         self.sub_threshold_sb = QSpinBox()
@@ -7739,8 +9811,25 @@ class Viewer(QWidget):
             "Pixels with |current − reference| below this value are shown as black.\n"
             "0 = show all differences (default).\n"
             "Useful for ignoring noise and tiny fluctuations.")
+        # Without this, typing "100" emits valueChanged for 1, then 10, then 100 —
+        # three full re-renders of every camera off the share for one edit.
+        self.sub_threshold_sb.setKeyboardTracking(False)
         self.sub_threshold_sb.valueChanged.connect(self._on_subtract_changed)
         row_sub_thr.addWidget(self.sub_threshold_sb)
+        row_sub_thr.addSpacing(6)
+        row_sub_thr.addWidget(QLabel("Offset:"))
+        self.sub_offset_sb = QSpinBox()
+        self.sub_offset_sb.setRange(0, 255)
+        self.sub_offset_sb.setValue(0)
+        self.sub_offset_sb.setFixedWidth(55)
+        self.sub_offset_sb.setToolTip(
+            "Adds this intensity (0–255 display scale) to every pixel whose\n"
+            "|current − reference| is non-zero. Zero-difference pixels stay black.\n"
+            "Makes differences of 1–2 counts visible; absolute difference values\n"
+            "can no longer be read off the image (the statistics line still shows them).")
+        self.sub_offset_sb.setKeyboardTracking(False)
+        self.sub_offset_sb.valueChanged.connect(self._on_subtract_changed)
+        row_sub_thr.addWidget(self.sub_offset_sb)
         row_sub_thr.addStretch(1)
         s_disp.body_layout.addLayout(row_sub_thr)
         # reset zoom (moved here from old Playback group)
@@ -8099,27 +10188,27 @@ class Viewer(QWidget):
         self._sc_preview_pixmap: "QPixmap | None" = None
         self._sc_task_running = False
         self._sc_pending      = False
+        self._sc_task_gen     = -1   # scan generation the in-flight/last task was launched for
         self._sc_topn_points: "list[tuple[int,int]]" = []
         self._sc_topn_img_shape: "tuple[int,int] | None" = None
 
         # ══════════════════ Section: PV VALUES ════════════════════
         pv_header_row = QHBoxLayout()
-        self._btn_pv_cfg = QPushButton("⚙")
-        self._btn_pv_cfg.setFixedWidth(26)
+        self._btn_pv_cfg = QPushButton("⚙ Configure")
         self._btn_pv_cfg.setToolTip("Select which PV channels to display")
         self._btn_pv_cfg.clicked.connect(self._open_pv_config)
         pv_header_row.addWidget(self._btn_pv_cfg)
-        self._btn_pv_refresh = QPushButton("↻")
-        self._btn_pv_refresh.setFixedWidth(26)
+        self._btn_pv_refresh = QPushButton("↻ Refresh")
         self._btn_pv_refresh.setToolTip("Refresh PV values for current frame")
         self._btn_pv_refresh.clicked.connect(self._pv_force_refresh)
         pv_header_row.addWidget(self._btn_pv_refresh)
-        self._btn_pv_overlay_settings = QPushButton("⚙ overlay")
+        s_pv.body_layout.addLayout(pv_header_row)
+        pv_overlay_row = QHBoxLayout()
+        self._btn_pv_overlay_settings = QPushButton("⚙ Overlay settings")
         self._btn_pv_overlay_settings.setToolTip("PV overlay display settings")
         self._btn_pv_overlay_settings.clicked.connect(self._open_pv_overlay_settings)
-        pv_header_row.addWidget(self._btn_pv_overlay_settings)
-        pv_header_row.addStretch(1)
-        s_pv.body_layout.addLayout(pv_header_row)
+        pv_overlay_row.addWidget(self._btn_pv_overlay_settings)
+        s_pv.body_layout.addLayout(pv_overlay_row)
 
         self._pv_table = QTableWidget(0, 2)
         self._pv_table.setHorizontalHeaderLabels(["PV", "Value"])
@@ -8142,37 +10231,59 @@ class Viewer(QWidget):
         # ── Info labels (definice — zobrazí se v ukotvené sekci nahoře) ───
         info_style = "font-size: 11px; color: #222; padding: 1px 0;"
         self.lbl_index          = QLabel("0 / 0")
+        self.lbl_date           = QLabel("Date: —")
         self.lbl_selected_range = QLabel("Range: —")
         self.lbl_filename       = QLabel("Filename: —")
         self.lbl_axis_time      = QLabel("Axis: —")
         self.lbl_prague_time    = QLabel("Prague Time: —")
         self.lbl_ref_status     = QLabel("")
+        self.lbl_diff_stats     = QLabel("")
         self.lbl_scan_progress  = QLabel("")
         self.lbl_meta_status    = QLabel("")
-        for lbl in [self.lbl_index, self.lbl_selected_range, self.lbl_filename,
+        for lbl in [self.lbl_index, self.lbl_date, self.lbl_selected_range, self.lbl_filename,
                     self.lbl_axis_time, self.lbl_prague_time, self.lbl_ref_status,
-                    self.lbl_scan_progress, self.lbl_meta_status]:
+                    self.lbl_diff_stats, self.lbl_scan_progress, self.lbl_meta_status]:
             lbl.setWordWrap(True)
             lbl.setStyleSheet(info_style)
+        # The frame counter must stay on ONE line. Its "(merged)" suffix comes and
+        # goes while the user switches cameras, and a wrapped second line here
+        # resized the INFO panel and shifted the whole left column. Fixed width so
+        # the suffix cannot re-wrap the Range label next to it either.
+        _idx_font = self.lbl_index.font()
+        _idx_font.setPixelSize(11)
+        self.lbl_index.setFont(_idx_font)
+        self.lbl_index.setWordWrap(False)
+        self.lbl_index.setFixedWidth(
+            QFontMetrics(_idx_font).horizontalAdvance("99999 / 99999 (merged)") + 6)
         from PySide6.QtCore import Qt as _Qt2
         self.lbl_scan_progress.setTextFormat(_Qt2.TextFormat.RichText)
-        # Warning style for the metadata-status note (no imgMaxValue → auto-normalized)
+        # Warning style for per-frame notes in the INFO panel (auto-hides when empty)
         self.lbl_meta_status.setStyleSheet("font-size: 10px; color: #b36b00; padding: 1px 0;")
-        self.lbl_meta_status.setToolTip(
-            "This image has no imgMaxValue metadata. It is auto-normalized to its own "
-            "peak pixel for display, so absolute brightness is not comparable between frames.")
 
         # Auto-hide labels when their text is empty so the INFO panel has no blank lines.
         import types as _types
         def _auto_setText(lbl_self, text):
             QLabel.setText(lbl_self, text)
             lbl_self.setVisible(bool(text.strip()))
-        for _lbl in (self.lbl_filename, self.lbl_ref_status, self.lbl_scan_progress,
-                     self.lbl_meta_status):
+        for _lbl in (self.lbl_filename, self.lbl_ref_status, self.lbl_diff_stats,
+                     self.lbl_scan_progress, self.lbl_meta_status):
             _lbl.setText = _types.MethodType(_auto_setText, _lbl)
 
-        self.lbl_ref_status.setStyleSheet("font-size: 10px; color: #666; padding: 1px 0;")
+        self.lbl_ref_status.setStyleSheet(_REF_STATUS_STYLE)
+        self.lbl_diff_stats.setStyleSheet("font-size: 10px; color: #1b5e20; padding: 1px 0;")
+        self.lbl_diff_stats.setToolTip(
+            "Pixels whose difference from the reference is non-zero (after the diff\n"
+            "threshold), their share of the frame, and the mean / min / max of those\n"
+            "differences on the 0–255 display scale. Measured on the frame as shown,\n"
+            "before the visibility offset is added.")
         self.lbl_selected_range.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; padding: 1px 0;")
+        # Date of the frame on screen. The on-image timestamp stays time-only, so this
+        # is the only place the day is readable — it matters for multi-day selections.
+        # Same bold style as Range, and never wrapping: the INFO panel must keep the
+        # exact same number of lines whatever date is shown (a wrapped second line
+        # would shift the whole left column, see the lbl_index note above).
+        self.lbl_date.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; padding: 1px 0;")
+        self.lbl_date.setWordWrap(False)
         self.lbl_axis_time.setVisible(False)
         self.lbl_prague_time.setVisible(False)
         self.prog = QProgressBar(); self.prog.setVisible(False)
@@ -8251,6 +10362,9 @@ class Viewer(QWidget):
         self.img_view.sc_topn_marker_thick  = self._sc_marker_thick_sb.value()
         # Labels drawn below image (reserved strip), not overlapping the image
         self.img_view.cam_label_use_overlay = False
+        # Zooming needs a native-resolution render; unzooming can go back to
+        # REFINE_MAX_SIDE. Either way the settled frame must be re-rendered.
+        self.img_view.zoom_changed.connect(self._schedule_refine)
         _swl.addWidget(self.img_view, 1)
 
         # PV overlay — floating draggable panel over single-cam image
@@ -8296,17 +10410,37 @@ class Viewer(QWidget):
         self._online_dot_top.setToolTip("Online mode indicator")
         info_title_row.addWidget(self._online_dot_top)
         ilay.addLayout(info_title_row)
+        ilay.addWidget(self.lbl_date)
         _idx_range_row = QHBoxLayout()
         _idx_range_row.setSpacing(6)
         _idx_range_row.addWidget(self.lbl_index)
         _idx_range_row.addWidget(self.lbl_selected_range, 1)
         ilay.addLayout(_idx_range_row)
         for lbl in [self.lbl_filename, self.lbl_meta_status, self.lbl_ref_status,
-                    self.lbl_scan_progress]:
+                    self.lbl_diff_stats, self.lbl_scan_progress]:
             lbl.setVisible(bool(lbl.text()))
             ilay.addWidget(lbl)
         ilay.addWidget(self.prog)
         ilay.addWidget(self.btn_cancel_scan)
+        ilay.addStretch(1)   # spare height collects here, labels stay top-aligned
+
+        # The optional INFO rows (filename, warnings, scan progress, progress bar)
+        # appear and disappear during normal use. Let the panel only ever GROW:
+        # once a row has been seen the space stays reserved, so the SOURCE/SAVE/…
+        # sections below never shift while the user is aiming at a button.
+        from PySide6.QtCore import QEvent as _QEvent
+
+        class _HeightRatchet(QObject):
+            def eventFilter(self, obj, ev):
+                if ev.type() == _QEvent.Type.LayoutRequest:
+                    h = obj.sizeHint().height()
+                    if h > obj.minimumHeight():
+                        obj.setMinimumHeight(h)
+                return False
+
+        self._info_height_ratchet = _HeightRatchet(info_panel)
+        info_panel.installEventFilter(self._info_height_ratchet)
+        self._info_panel = info_panel
 
         left_col = QWidget()
         left_col.setFixedWidth(275)
@@ -8335,7 +10469,55 @@ class Viewer(QWidget):
 
         self.scrub_timer = QTimer(self)
         self.scrub_timer.setInterval(SCRUB_INTERVAL_MS)
+        # Same as play_timer: a coarse 33 ms timer fires at 21 Hz on Windows, so the drag
+        # could never paint more than 21 positions a second no matter how fast the frames
+        # were available.
+        self.scrub_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.scrub_timer.timeout.connect(self._apply_scrub)
+
+        # Slider moves that never emit sliderPressed/sliderReleased — mouse wheel,
+        # arrow / PageUp keys, a click on the groove — have no drag to hang a render
+        # off, so _on_slider_changed arms this instead.
+        self._keynav_debounce = QTimer(self)
+        self._keynav_debounce.setSingleShot(True)
+        self._keynav_debounce.timeout.connect(self._apply_keynav)
+
+        # Per-camera navigation gets its own coalescing tick. _on_per_cam_value_changed
+        # used to render EVERY camera synchronously on each QSlider.valueChanged — i.e.
+        # once per mouse-move event, up to ~125/s — including a full stale-mark pass and a
+        # diff-stats relayout per camera, so a drag spent the GUI thread on O(cameras^2)
+        # label work and the tiles crawled. Now a move only RECORDS what it wants.
+        #
+        # Deliberately NOT the shared scrub_timer / _apply_scrub:
+        #   - _apply_scrub drives off pending_slider, i.e. the slider that multi-cam HIDES;
+        #   - its multi-cam branch calls _display_multicam_index, which snaps every camera
+        #     to one merged-timeline moment, while _per_cam_sync_slaves deliberately leaves
+        #     a slave alone when it has no frame within SLAVE_SYNC_MAX_NS;
+        #   - independent mode (_per_cam_master_idx < 0) has no merged position at all;
+        #   - and _apply_scrub coalesces on `idx == self.current_idx`, which
+        #     _per_cam_display_one writes itself — so the second tick of any drag would
+        #     return early.
+        self._nav_timer = QTimer(self)
+        self._nav_timer.setInterval(NAV_TICK_MS)
+        # Same reason as play_timer / scrub_timer: a coarse 33 ms timer fires at 21 Hz on
+        # Windows, capping the drag at 21 positions/s however fast the frames arrive.
+        self._nav_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._nav_timer.timeout.connect(self._per_cam_nav_tick)
+        self._nav_pending: dict = {}    # cam_idx → wanted ts_ns (already snapped)
+        self._nav_frame: dict = {}      # cam_idx → wanted FRAME index (see _per_cam_step)
+        self._nav_cursor_ts: int = 0    # last ts written to the tickbar / clocks
+
+    def _apply_keynav(self):
+        """Render the position a non-drag slider move landed on."""
+        if not self.items or self.pending_slider is None: return
+        if self._is_scrubbing or self._is_playing: return
+        idx = self._time_to_nearest_index(self._slider_to_time_ns(self.pending_slider))
+        if not (0 <= idx < len(self.items)): return
+        if self._is_multi_cam():
+            self._display_multicam_index(idx, update_slider=False)
+        else:
+            self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=False)
+        self._schedule_refine()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -8543,6 +10725,7 @@ class Viewer(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._pv_enabled = [n for n in PV_CHANNEL_MAP if checks[n].isChecked()]
             self._pv_values  = {}
+            self._pv_values_ts = None
             self._pv_rebuild_table()
             self._pv_trigger_fetch()
             self._pv_update_overlay()
@@ -8556,6 +10739,7 @@ class Viewer(QWidget):
         self._pv_table.setRowCount(len(self._pv_enabled))
         row_h = 20
         self._pv_table.setMaximumHeight(row_h * len(self._pv_enabled) + 26)
+        pending = self._pv_is_pending()
         for i, name in enumerate(self._pv_enabled):
             name_item = QTableWidgetItem(name)
             val_str = self._pv_values.get(name, "…")
@@ -8563,6 +10747,11 @@ class Viewer(QWidget):
             if val_str not in ("…", "—", cpva.PV_TEXT_ERROR, cpva.PV_TEXT_NOT_FOUND) and units:
                 val_str = f"{val_str} {units}"
             val_item = QTableWidgetItem(val_str)
+            if pending:
+                # These numbers were fetched for another frame — say so instead of
+                # letting them read as this frame's values.
+                val_item.setForeground(QColor("#888888"))
+                val_item.setToolTip("Refreshing — value belongs to the previous frame")
             self._pv_table.setItem(i, 0, name_item)
             self._pv_table.setItem(i, 1, val_item)
             self._pv_table.setRowHeight(i, row_h)
@@ -8593,6 +10782,40 @@ class Viewer(QWidget):
             return
         t.start()   # restart → trailing edge
 
+    def _pv_current_ts(self) -> "int | None":
+        """Timestamp of the frame the PV panel is supposed to describe: the master
+        camera in multi-cam mode, otherwise the current single-cam frame."""
+        if self._is_multi_cam():
+            master = self._per_cam_master_idx
+            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
+                # latest displayed index for master cam
+                cam_items = self._cam_items[master]
+                cam_idx = 0
+                if hasattr(self, '_cam_current_idx') and master < len(self._cam_current_idx):
+                    cam_idx = min(self._cam_current_idx[master], len(cam_items) - 1)
+                if cam_items:
+                    return cam_items[cam_idx].ts_ns
+            elif self._cam_items:
+                # No master — use first cam
+                for ci, cam_items in enumerate(self._cam_items):
+                    if cam_items:
+                        cam_idx = 0
+                        if hasattr(self, '_cam_current_idx') and ci < len(self._cam_current_idx):
+                            cam_idx = min(self._cam_current_idx[ci], len(cam_items) - 1)
+                        return cam_items[cam_idx].ts_ns
+            return None
+        if self.current_idx is not None and self.items:
+            return self.items[self.current_idx].ts_ns
+        return None
+
+    def _pv_is_pending(self) -> bool:
+        """True when the values on display were fetched for a DIFFERENT frame than
+        the one now shown (a fetch is in flight, or was never started for it)."""
+        if not self._pv_values:
+            return False
+        cur = self._pv_current_ts()
+        return cur is not None and self._pv_values_ts != cur
+
     def _pv_trigger_fetch_now(self):
         """Start a background fetch for the current displayed timestamp.
 
@@ -8606,34 +10829,12 @@ class Viewer(QWidget):
         if getattr(self, "_pv_fetch_inflight", False):
             self._pv_fetch_dirty = True
             return
-        # Determine timestamp: master cam in multi-cam, else current single-cam frame
-        ts_ns: "int | None" = None
-        if self._is_multi_cam():
-            master = self._per_cam_master_idx
-            if master >= 0 and master < len(self._cam_ts) and self._cam_ts[master]:
-                # latest displayed index for master cam
-                cam_items = self._cam_items[master]
-                cam_idx = 0
-                if hasattr(self, '_cam_current_idx') and master < len(self._cam_current_idx):
-                    cam_idx = min(self._cam_current_idx[master], len(cam_items) - 1)
-                if cam_items:
-                    ts_ns = cam_items[cam_idx].ts_ns
-            elif self._cam_items:
-                # No master — use first cam
-                for ci, cam_items in enumerate(self._cam_items):
-                    if cam_items:
-                        cam_idx = 0
-                        if hasattr(self, '_cam_current_idx') and ci < len(self._cam_current_idx):
-                            cam_idx = min(self._cam_current_idx[ci], len(cam_items) - 1)
-                        ts_ns = cam_items[cam_idx].ts_ns
-                        break
-        else:
-            if self.current_idx is not None and self.items:
-                ts_ns = self.items[self.current_idx].ts_ns
+        ts_ns = self._pv_current_ts()
 
         if ts_ns is None:
             return
 
+        self._pv_fetch_ts = ts_ns
         self._pv_fetch_inflight = True
         self._pv_fetch_gen += 1
         gen = self._pv_fetch_gen
@@ -8657,10 +10858,8 @@ class Viewer(QWidget):
                 # "n/a" = genuinely no sample near this timestamp.
                 return name, (cpva.PV_TEXT_ERROR if status == "error"
                               else cpva.PV_TEXT_NOT_FOUND)
-            txt = f"{val:.0f}" if "RawPos" in channel else f"{val:.3f}"
-            if status == "stale":
-                txt += " (old)"
-            return name, txt
+            val *= PV_SCALE.get(name, 1.0)
+            return name, _pv_decorate(_format_pv_value(channel, val), status)
 
         def _fetch():
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8683,18 +10882,20 @@ class Viewer(QWidget):
 
     def _pv_force_refresh(self):
         """Clear PV day-cache for current frame's date and re-fetch."""
-        ts_ns: "int | None" = None
-        if self._is_multi_cam() and self._cam_items:
+        ts_ns = self._pv_current_ts()
+        if ts_ns is None and self._is_multi_cam() and self._cam_items:
             for cam_items in self._cam_items:
                 if cam_items:
                     ts_ns = cam_items[0].ts_ns
                     break
-        elif self.items and self.current_idx is not None:
-            ts_ns = self.items[self.current_idx].ts_ns
         if ts_ns is not None:
             date_key = _pv_date_key(ts_ns)
             cpva.invalidate(date_key=date_key)
             cpva.invalidate(date_key=_pv_prev_date_key(date_key))
+            cpva.invalidate(date_key=cpva.next_date_key(date_key))
+            # Also drop the day-boundary look-back anchors, or a step PV keeps
+            # reporting the value cached before the refresh.
+            cpva.invalidate_lookback()
         self._pv_trigger_fetch()
 
     def _pv_on_result(self, gen: int, results: dict):
@@ -8703,6 +10904,9 @@ class Viewer(QWidget):
         # re-trigger if frames changed while it ran.
         self._pv_fetch_inflight = False
         if results:
+            # Remember WHICH frame these numbers describe, so the panel can admit
+            # it when the displayed frame has moved on since.
+            self._pv_values_ts = getattr(self, "_pv_fetch_ts", None)
             self._pv_values.update(results)
             self._pv_rebuild_table()
             self._pv_update_overlay()
@@ -8724,11 +10928,16 @@ class Viewer(QWidget):
             return
 
         rows = []
+        pending = self._pv_is_pending()
         for name in self._pv_enabled:
             val = self._pv_values.get(name, "…")
             units = PV_UNITS.get(name, "")
             if val not in ("…", "—", "⟳", cpva.PV_TEXT_ERROR, cpva.PV_TEXT_NOT_FOUND) and units:
                 val = f"{val} {units}"
+            if pending:
+                # Burned-in-looking panel: never let another frame's number sit
+                # there unmarked while the fetch for this frame is still running.
+                val = f"⟳ {val}"
             rows.append((name, val))
 
         if is_multi:
@@ -8830,7 +11039,11 @@ class Viewer(QWidget):
                     ov.apply_settings(orig_fs, orig_ff, orig_op, orig_fc, orig_bc)
 
     def _pv_text(self) -> str:
-        """Return a formatted single-line PV string for burn-in under saved images."""
+        """Return a formatted single-line PV string for burn-in under saved images.
+        The on-screen PV overlay is a view-only annotation — PV values are burned
+        into saved files only when 'Save with overlay' is enabled."""
+        if not self.cb_save_overlay.isChecked():
+            return ""
         if not self._pv_enabled or not self._pv_values:
             return ""
         parts = []
@@ -8847,14 +11060,36 @@ class Viewer(QWidget):
         return len(self._cam_names) > 1
 
     def _cam_enhance_on(self, cam_i: int) -> bool:
-        """In multi-cam, auto-stretch / brightness-offset apply only to the SELECTED
-        camera(s). If no camera is selected, they apply to all (backward-compatible
-        global behaviour)."""
-        try:
-            sel = self._multi_grid.selected_cam_indices()
-        except Exception:
-            sel = []
-        return (not sel) or (cam_i in sel)
+        """Auto-stretch / brightness / contrast apply to ALL cameras (global).
+
+        They are driven by their own controls (checkboxes / sliders) and take
+        effect when those controls change — the same enhancement on every camera.
+        Camera SELECTION deliberately no longer scopes or re-applies enhancement:
+        tying it to the selected camera meant a plain click silently rebuilt every
+        cache and re-rendered all panels, which both surprised the user ("clicking
+        a camera applies the changes") and thrashed the decode pipeline."""
+        return True
+
+    def _cam_set_shown_key(self, cam_i: int, key):
+        """Record the render the tile cam_i must end up showing (see _cam_shown_key).
+        Written by every display path so _on_cam_loaded can reject a render whose
+        params the user has already changed."""
+        if not hasattr(self, "_cam_shown_key"):
+            self._cam_shown_key = []
+        while len(self._cam_shown_key) <= cam_i:
+            self._cam_shown_key.append(None)
+        self._cam_shown_key[cam_i] = key
+
+    def _redraw_cam_in_place(self, cam_i: int) -> bool:
+        """Re-render one camera at the frame it is currently showing. Returns False
+        if that camera has no frames yet."""
+        cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+        if not cam_ts:
+            return False
+        cur = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else 0
+        cur = max(0, min(cur, len(cam_ts) - 1))
+        self._per_cam_display_one(cam_i, cam_ts[cur])
+        return True
 
     def _redraw_all_cams_in_place(self):
         """Re-render every camera at the frame it is CURRENTLY showing (its own per-cam
@@ -8864,12 +11099,7 @@ class Viewer(QWidget):
         if not self._is_multi_cam() or not self._cam_items:
             return
         for cam_i in range(len(self._cam_items)):
-            cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
-            if not cam_ts:
-                continue
-            cur = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else 0
-            cur = max(0, min(cur, len(cam_ts) - 1))
-            self._per_cam_display_one(cam_i, cam_ts[cur])
+            self._redraw_cam_in_place(cam_i)
 
     def _on_multicam_selected(self, idx: int):
         """Kamera v gridu byla vybrána kliknutím."""
@@ -8894,9 +11124,11 @@ class Viewer(QWidget):
 
         if idx < len(self._cam_ref_images) and self._cam_ref_images[idx] is not None:
             cam_name = self._cam_names[idx] if idx < len(self._cam_names) else f"cam {idx}"
-            self.lbl_ref_status.setText(f"Ref set: {_strip_cam_name(cam_name)}")
+            self._set_ref_status(f"Ref set: {_strip_cam_name(cam_name)}")
         else:
-            self.lbl_ref_status.setText("")
+            # Clearing the line must not swallow the "subtraction has no reference"
+            # warning — clicking a camera would otherwise hide it again.
+            self._refresh_ref_warning()
         # Update draw mode checkboxes/buttons to reflect selected camera's state
         iv = self._multi_grid.selected_img_view()
         if iv is not None:
@@ -8911,13 +11143,11 @@ class Viewer(QWidget):
             self.cb_square.blockSignals(False)
             self._refresh_draw_btns()
 
-        # Auto-stretch / brightness apply only to selected camera(s): selection just
-        # changed, so re-render to stretch the newly-selected and un-stretch the rest.
-        # Redraw each cam at its own current frame (don't snap all to the shared time).
-        if (self.cb_bright.isChecked() or self._brightness_offset != 0) \
-                and self._is_multi_cam() and self.current_idx is not None:
-            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
-            self._redraw_all_cams_in_place()
+        # Enhancement (auto-stretch / brightness / contrast) is global now
+        # (see _cam_enhance_on), so selecting a camera must NOT re-render or change
+        # any image — it only updates draw-mode / reference status above. This is
+        # what the user asked for: settings change only when a control is clicked,
+        # never as a side effect of picking a camera.
 
         if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
                 and hasattr(self, '_run_spatial_contrast')):
@@ -8951,6 +11181,12 @@ class Viewer(QWidget):
 
     def _build_per_cam_sliders(self, cam_names: list[str]):
         """(Re)vytvoří řady per-camera sliderů. Voláno při každém setup_multi_cam."""
+        # The pending navigation is keyed by CAMERA INDEX, and the rows it would index are
+        # about to be destroyed — a leftover entry from a larger camera set would index
+        # _per_cam_rows out of range on the next tick.
+        self._nav_timer.stop()
+        self._nav_pending.clear()
+        self._nav_frame.clear()
         # Odstraň staré řady
         for row in self._per_cam_rows:
             row.setParent(None)
@@ -9040,6 +11276,17 @@ class Viewer(QWidget):
 
     def _on_per_cam_pressed(self, cam_idx: int):
         self._per_cam_scrubbing_cam = cam_idx
+        # A per-camera drag IS a scrub, and nothing said so. _is_scrubbing was written only
+        # by the SHARED slider's handlers — the slider multi-cam hides — so on the path the
+        # user actually drags, _cam_tile_side never applied its 0.7x / 0.45x motion
+        # downscale, _current_decode_side never saw the drag, and _last_motion_ips stayed
+        # 0.0 for the whole gesture. Every "the user is moving" optimisation was dead.
+        self._is_scrubbing = True
+        self._reset_motion_tracking()
+        self._drag_side = self._scrub_side
+        # Same as the shared slider: get the per-camera subtraction references off the
+        # share now, so the first move of this slider doesn't block the GUI thread on one.
+        self._prewarm_drag_references()
         if self._is_playing:
             self.stop()
         # Grabbing a slider means the user wants to inspect a moment manually, so
@@ -9049,9 +11296,27 @@ class Viewer(QWidget):
         # re-enables Auto-follow when ready to watch live again.
         if self._online_mode:
             self._stop_online_mode()
+            self._restore_full_history()
+            if not self._live_trimmed:
+                self._proxy_kick()
+        # Render the frame the drag starts on through the same tick as the rest.
+        if cam_idx < len(self._per_cam_rows):
+            self._nav_request(cam_idx, self._per_cam_slider_to_ts(
+                cam_idx, self._per_cam_rows[cam_idx].value()))
 
     def _on_per_cam_released(self, cam_idx: int):
+        # Drop the drag's queued positions: they are frames already scrolled past, and
+        # rendering them delays the one the user landed on.
+        self._nav_timer.stop()
+        self._nav_pending.clear()
         self._per_cam_scrubbing_cam = -1
+        self._is_scrubbing = False
+        # Back to full tile quality for the settle render (see _cam_tile_side).
+        self._reset_motion_tracking()
+        # The drag ran the sweep at PROXY_DRAG_WORKERS — let it back up to full speed after
+        # a short grace. Before the early return below: that is the one path where the flag
+        # was just cleared and nothing else would ever resume the sweep.
+        self._proxy_idle_grace()
         if not self._cam_items or cam_idx >= len(self._cam_items):
             return
         row = self._per_cam_rows[cam_idx]
@@ -9062,24 +11327,116 @@ class Viewer(QWidget):
             t_ns = cam_ts[frame_idx]
             snapped = self._per_cam_ts_to_slider(cam_idx, t_ns)
             row.set_value(snapped)
+        # Release the drag's leftover coalescing state so the settle render always
+        # relaunches, exactly as _on_slider_released does for the shared slider.
+        self._reset_cam_pipeline()
         self._per_cam_display_one(cam_idx, t_ns)
         if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
             self._per_cam_sync_slaves(cam_idx, t_ns)
         if cam_idx == self._per_cam_master_idx or self._per_cam_master_idx < 0:
             self._pv_trigger_fetch()
+        # …and bring every tile up to full tile resolution now that the user has stopped.
+        self._schedule_refine()
 
     def _on_per_cam_value_changed(self, cam_idx: int, v: int):
-        """Voláno při každém pohybu sliderů — time-based s bisect na nejbližší frame."""
+        """Every move of a per-camera slider. Records the wanted moment and moves the axis
+        cursor / clocks; the PICTURE is rendered by _per_cam_nav_tick.
+
+        This used to render all N cameras synchronously, once per mouse-move event, on the
+        GUI thread — including an O(cameras^2) stale-mark pass and a diff-stats relayout
+        per camera. The cursor and the two clocks stay here on purpose: they belong to the
+        slider handle, not to the render pipeline (same split as _on_slider_changed)."""
         if not self._cam_items or cam_idx >= len(self._cam_items):
             return
         t_ns = self._per_cam_slider_to_ts(cam_idx, v)
         cam_ts = self._cam_ts[cam_idx] if cam_idx < len(self._cam_ts) else []
+        frame_idx = None
         if cam_ts:
             frame_idx = max(0, bisect.bisect_right(cam_ts, t_ns) - 1)
             t_ns = cam_ts[frame_idx]
-        self._per_cam_display_one(cam_idx, t_ns)
-        if self._per_cam_master_idx >= 0 and cam_idx == self._per_cam_master_idx:
-            self._per_cam_sync_slaves(cam_idx, t_ns)
+            snapped = self._per_cam_ts_to_slider(cam_idx, t_ns)
+            if snapped != v and cam_idx < len(self._per_cam_rows):
+                # set_value blocks signals, so this cannot re-enter here.
+                self._per_cam_rows[cam_idx].set_value(snapped)
+        if self._per_cam_is_info_cam(cam_idx):
+            self._per_cam_write_clocks(t_ns)
+        self._nav_request(cam_idx, t_ns, frame_idx)
+
+    def _per_cam_is_info_cam(self, cam_idx: int) -> bool:
+        """Whether this camera owns the shared info panel / axis cursor: the master, or
+        in independent mode whichever camera is being dragged."""
+        return (cam_idx == self._per_cam_master_idx) or (
+            self._per_cam_master_idx < 0 and cam_idx == self._per_cam_scrubbing_cam)
+
+    def _per_cam_write_clocks(self, real_ts: int):
+        """Axis cursor + the two clock labels. Called at mouse rate — they belong to the
+        handle — but guarded against repeats: TickBar.set_cursor calls update()
+        unconditionally and each setText relayouts the info panel."""
+        if real_ts == self._nav_cursor_ts:
+            return
+        self._nav_cursor_ts = real_ts
+        self.lbl_prague_time.setText(f"Prague: {fmt_prague_full_from_ns(real_ts)}")
+        self.lbl_axis_time.setText(f"Axis: {fmt_hhmmss_ms_from_ns(real_ts)}")
+        self.tickbar.set_cursor(real_ts)
+
+    def _nav_request(self, cam_idx: int, t_ns: int, frame_idx: "int | None" = None):
+        """Ask for a frame on ONE camera. Every per-camera navigation — master slider,
+        slave sync, the arrows, playback — comes through here, and _per_cam_nav_tick
+        renders at most once per NAV_TICK_MS however fast the requests arrive."""
+        self._nav_pending[cam_idx] = t_ns
+        if frame_idx is None:
+            frame_idx = self._per_cam_ts_to_frame(cam_idx, t_ns)
+        # Kept up to date SYNCHRONOUSLY even though the render is deferred: _per_cam_step
+        # steps relative to this, and _cam_current_idx is only written when the tick
+        # actually runs — so two arrow presses inside one tick would otherwise both read
+        # the same origin and the second keypress would be lost.
+        self._nav_frame[cam_idx] = frame_idx
+        if not self._nav_timer.isActive():
+            self._nav_timer.start()
+
+    def _per_cam_nav_tick(self):
+        """Render whatever the per-camera sliders asked for since the last tick — once per
+        camera, once per tick, with the label/stat passes hoisted out of the per-camera
+        loop (they used to run once per camera per mouse-move event)."""
+        if not self._is_multi_cam() or not self._per_cam_rows or not self._nav_pending:
+            self._nav_timer.stop()
+            self._nav_pending.clear()
+            return
+        pending = self._nav_pending
+        self._nav_pending = {}
+        n = len(self._cam_items)
+        master = self._per_cam_master_idx
+
+        if master >= 0 and master in pending:
+            t_ns = pending.pop(master)
+            # ONE motion sample per tick, in master frames per second. This is what
+            # _cam_tile_side and _adaptive_stride read, and the per-camera path never fed
+            # it before — so every drag looked stationary to them.
+            self._update_motion_speed(self._nav_frame.get(master, 0))
+            self._per_cam_display_one(master, t_ns, defer_labels=True)
+            self._per_cam_sync_shared_widgets(master, t_ns)
+            # Slaves resolved ONCE per tick instead of once per mouse-move event.
+            for i, ts in self._per_cam_slave_targets(master, t_ns):
+                if i in pending or not (0 <= i < n):
+                    continue      # a slave the user is dragging himself wins
+                self._per_cam_rows[i].set_value(self._per_cam_ts_to_slider(i, ts))
+                self._nav_frame[i] = self._per_cam_ts_to_frame(i, ts)
+                self._per_cam_display_one(i, ts, defer_labels=True)
+
+        for i, t_ns in pending.items():
+            if 0 <= i < n:
+                self._per_cam_display_one(i, t_ns, defer_labels=True)
+
+        # Once per TICK, not once per camera per mouse-move.
+        self._flush_cam_diff_stats()
+        self._cam_refresh_stale_marks()
+        # Self-stopping, which is also what makes this cover wheel / arrow / groove moves
+        # on a per-camera row: those emit valueChanged with no sliderPressed, so nothing
+        # would ever stop a timer started on their behalf. One tick later it renders once
+        # and stops — no separate keynav debounce needed.
+        if not self._nav_pending and not self._is_playing \
+                and self._per_cam_scrubbing_cam < 0:
+            self._nav_timer.stop()
 
     def _per_cam_ts_to_frame(self, cam_idx: int, ts_ns: int) -> int:
         """Vrátí index nejbližšího framu (v minulosti nebo přesně) pro daný timestamp."""
@@ -9123,8 +11480,42 @@ class Viewer(QWidget):
         frac = (ts_ns - ax_min) / (ax_max - ax_min)
         return max(0, min(SLIDER_MAX, int(frac * SLIDER_MAX)))
 
-    def _per_cam_display_one(self, cam_idx: int, t_ns: int):
-        """Zobrazí frame pro jednu kameru na daném čase."""
+    def _per_cam_sync_shared_widgets(self, cam_idx: int, real_ts: int):
+        """The shared-timeline bookkeeping that follows the info camera: the preview
+        sweep's focus point, the merged position, and the merged index label.
+
+        Once per navigation TICK, not once per mouse-move: _time_to_nearest_index is a
+        binary search over the whole merged list and the setText relayouts the info panel,
+        and nothing here needs mouse resolution.
+
+        Why it exists at all: per-camera scrubbing never reaches _set_info_for, the only
+        other writer. Without it the sweep's focus point stays wherever the SHARED timeline
+        was last left — during per-camera playback, frozen at the moment Play was pressed
+        — and current_idx likewise, so every handler that re-renders via
+        _display_multicam_index(self.current_idx) (Subtraction, Refresh) snapped all
+        cameras to an unrelated time while the per-camera sliders stayed put, subtracting
+        the reference from a completely different frame than the slider showed. Live
+        advance still overrides this right after (_live_advance_cam), so auto-follow is
+        unchanged. Only the info camera writes it — the slaves would scatter it."""
+        self._proxy_cursor_ts_ns = real_ts
+        if self.items and self.ts_list:
+            shared_idx = max(0, min(self._time_to_nearest_index(real_ts),
+                                    len(self.items) - 1))
+            self.current_idx  = shared_idx
+            self.target_idx   = shared_idx
+            self.play_time_ns = self.items[shared_idx].ts_ns
+            self.lbl_index.setText(f"{shared_idx+1} / {len(self.items)} (merged)")
+        # Per-camera navigation never reaches _set_info_for (see above), so the INFO
+        # date would otherwise stay frozen at whatever the shared timeline last showed.
+        self.lbl_date.setText(f"Date: {fmt_prague_date_from_ns(real_ts)}")
+        self._pv_trigger_fetch()
+
+    def _per_cam_display_one(self, cam_idx: int, t_ns: int, defer_labels: bool = False):
+        """Zobrazí frame pro jednu kameru na daném čase.
+
+        `defer_labels` is set by _per_cam_nav_tick, which flushes the diff-stats label and
+        re-colours the timestamps ONCE for the whole pass. Doing it per camera meant
+        O(cameras^2) label work per navigation step."""
         cam_items = self._cam_items[cam_idx] if cam_idx < len(self._cam_items) else []
         cam_ts    = self._cam_ts[cam_idx]    if cam_idx < len(self._cam_ts)    else []
         if not cam_items:
@@ -9132,75 +11523,205 @@ class Viewer(QWidget):
         pos     = bisect.bisect_right(cam_ts, t_ns) - 1
         cam_idx_f = max(0, min(len(cam_items) - 1, pos))
         # Update info panel and tickbar cursor for master camera (or active scrub cam in independent mode)
-        _is_info_cam = (cam_idx == self._per_cam_master_idx) or (
-            self._per_cam_master_idx < 0 and cam_idx == self._per_cam_scrubbing_cam)
+        _is_info_cam = self._per_cam_is_info_cam(cam_idx)
         if _is_info_cam:
             real_ts = cam_ts[cam_idx_f] if cam_ts else t_ns
-            self.lbl_prague_time.setText(f"Prague: {fmt_prague_full_from_ns(real_ts)}")
-            self.lbl_axis_time.setText(f"Axis: {fmt_hhmmss_ms_from_ns(real_ts)}")
-            self.tickbar.set_cursor(real_ts)
+            self._per_cam_write_clocks(real_ts)
+            # The nav tick calls _per_cam_sync_shared_widgets itself, once per pass. The
+            # direct callers (settle, master switch, live advance, in-place redraw) are
+            # one-shots and pay for it here.
+            if not defer_labels:
+                self._per_cam_sync_shared_widgets(cam_idx, real_ts)
         it      = cam_items[cam_idx_f]
 
         if hasattr(self, '_cam_current_idx') and cam_idx < len(self._cam_current_idx):
             self._cam_current_idx[cam_idx] = cam_idx_f
 
-        # Trigger PV fetch when the master (or only) camera frame changes
-        if _is_info_cam:
-            self._pv_trigger_fetch()
-
         n_cams = len(self._cam_items)
-        max_side = 400 if n_cams >= 3 else (500 if n_cams == 2 else self._scrub_side)
-        # Auto-stretch / brightness only on the selected camera(s)
+        max_side = self._cam_tile_side(n_cams)
+        # Auto-stretch / brightness / contrast only on the selected camera(s)
         enh         = self._cam_enhance_on(cam_idx)
         brighten    = (1 if self.cb_bright.isChecked() else 0) if enh else 0
-        boff        = self._brightness_offset if enh else 0
+        bc          = self._bc() if enh else _RENDER_BC_NONE
         gradient_id = self.gradient_cb.currentIndex()
         subtract    = self.cb_subtract.isChecked()
-        ref = self._cam_ref_images[cam_idx] if (subtract and cam_idx < len(self._cam_ref_images)) else None
-        sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
+        ref = self._cam_ref_arr_for(cam_idx, max_side) if subtract else None
+        sub_thr, sub_off = self._sub_params(ref)
 
         cache = self._cam_caches[cam_idx]
-        key   = (cam_idx_f, max_side, brighten, gradient_id, boff,
-                 id(ref) if ref is not None else None, sub_thr)
+        ck    = self._cam_ck(cam_idx, cam_idx_f)
+        key   = (ck, max_side, brighten, gradient_id, bc,
+                 id(ref) if ref is not None else None, sub_thr, sub_off)
+        # From here on this is the ONLY render allowed to reach tile cam_idx.
+        self._cam_set_shown_key(cam_idx, key)
+        # Recorded BEFORE any paint: this is what the slider is asking for, and every
+        # paint path compares against it to decide whether the tile is current.
+        self._cam_note_target(cam_idx, it.ts_ns)
         cached = cache.get(key)
         if cached is not None and not cached.isNull():
             iv = self._multi_grid.get_img_view(cam_idx)
             if iv:
                 iv.set_pixmap(cached)
-            self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
+                self._diag_cach += 1
+            self._cam_note_painted(cam_idx, it.ts_ns)
+            # Collect + one flush per pass when the tick owns the labels, exactly as
+            # _display_multicam_index already does; _update_cam_diff_stats relayouts the
+            # info panel with an N-line string, so per camera per mouse-move it was one of
+            # the most expensive things on the drag path.
+            if defer_labels:
+                self._collect_cam_diff_stats(cam_idx, key)
+            else:
+                self._update_cam_diff_stats(cam_idx, key)
             self._cam_want[cam_idx] = None   # we're current; drop any stale pending load
             return
 
-        self._multi_grid.set_cam_timestamp(cam_idx, fmt_hhmmss_ms_from_ns(it.ts_ns))
+        # NOTE: the timestamp label is deliberately NOT written here. It used to be, which
+        # is what made every tile's clock run ahead of its picture during a drag.
+
+        # Repaint from the preloaded preview so the tile follows the handle, and let
+        # _on_per_cam_released bring it back to full tile resolution when the drag ends.
+        # Not restricted to the camera being dragged any more: the slaves are synced to the
+        # same moment and had to pay a share read each, which is what made "only one camera
+        # refreshes" — the dragged one hit the preview, the others queued reads.
+        if self._proxy_try_paint_cam(cam_idx, cam_idx_f):
+            self._cam_want[cam_idx] = None
+            self._schedule_refine()
+            return
+
         # Coalesced load: remember the latest wanted frame and only kick off a load if
         # this camera isn't already loading one. Intermediate frames are skipped so the
         # display tracks real time instead of replaying a growing backlog.
+        # `ck` travels with the request: recomputing it in _start_cam_load would use
+        # the offset AFTER a trim that may have landed in between, and the pixmap
+        # would be cached under a key naming a different frame.
         self._cam_want[cam_idx] = (cam_idx_f, it.path, max_side, brighten,
-                                   gradient_id, ref, sub_thr, boff)
-        if not self._cam_busy[cam_idx]:
-            self._start_cam_load(cam_idx)
+                                   gradient_id, ref, sub_thr, bc, sub_off, ck)
+        self._start_cam_load(cam_idx)
+        # This tile now wants a frame it has not got — colour its label accordingly
+        # without waiting for the dot tick (see _display_multicam_index). The nav tick does
+        # this once for the whole pass instead.
+        if not defer_labels:
+            self._cam_refresh_stale_marks()
+
+    def _cam_inflight_depth(self) -> int:
+        """Share reads allowed IN FLIGHT PER CAMERA.
+
+        This was effectively 1 (a boolean gate), which put a hard ceiling of ~7 frames/s
+        on every tile: one read + decode off this share costs 130-160 ms, so one at a
+        time is 1/0.145 s however many cores are idle. That ceiling — not the share, not
+        the GUI thread — is why the tiles updated one after another instead of together.
+        Depth D gives roughly 6.9*D frames/s per tile: 4 -> ~27/s, comfortably more than a
+        33 ms navigation tick can ask for.
+
+        Derived from the pool size so N cameras cannot over-subscribe it. The share is
+        latency-bound and its measured optimum is ~16 concurrent reads (see _open_reader:
+        31 / 106 / 204 frames/s at 1 / 8 / 16 threads), so past 4 cameras each one gets a
+        smaller slice rather than the total growing without limit."""
+        n = max(1, len(self._cam_items))
+        return max(CAM_INFLIGHT_MIN, min(CAM_INFLIGHT_MAX, CAM_POOL_THREADS // n))
+
+    def _cam_inflight_count(self, cam_idx: int) -> int:
+        d = (self._cam_inflight_at[cam_idx]
+             if cam_idx < len(getattr(self, "_cam_inflight_at", [])) else None)
+        return len(d) if d else 0
 
     def _start_cam_load(self, cam_idx: int):
-        """Kick off the latest pending load for one camera (see _per_cam_display_one)."""
-        want = self._cam_want[cam_idx] if cam_idx < len(self._cam_want) else None
+        """Kick off the latest pending load for one camera (see _per_cam_display_one).
+
+        The concurrency cap lives HERE rather than at the call sites: callers just ask, and
+        this decides whether there is room. That is what lets several consecutive drag
+        positions decode at once per tile with only a single _cam_want slot."""
+        if cam_idx >= len(self._cam_want):
+            return
+        want = self._cam_want[cam_idx]
         if want is None:
             return
+        if self._cam_inflight_count(cam_idx) >= self._cam_inflight_depth():
+            return
         self._cam_want[cam_idx] = None
-        self._cam_busy[cam_idx] = True
-        cam_idx_f, path, max_side, brighten, gradient_id, ref, sub_thr, boff = want
-        pool = self._cam_pools[cam_idx]
-        sig  = self._cam_signals[cam_idx]
-        pool.start(LoadTask(
-            self._gen, 0, cam_idx_f,
-            path, max_side, brighten, gradient_id,
-            sig, boff, ref, sub_thr))
+        self._cam_req_seq += 1
+        rid = self._cam_req_seq
+        self._cam_inflight_at[cam_idx][rid] = time.monotonic()
+        try:
+            cam_idx_f, path, max_side, brighten, gradient_id, ref, sub_thr, bc, sub_off, ck = want
+            sig  = self._cam_signals[cam_idx]
+            key = (ck, max_side, brighten, gradient_id, bc,
+                   id(ref) if ref is not None else None,
+                   sub_thr if ref is not None else 0, sub_off if ref is not None else 0)
+            # req_id carries the in-flight slot id so _on_cam_loaded can release exactly
+            # the load that finished — it used to be a literal 0 and unused.
+            self._cam_pool.start(LoadTask(
+                self._gen, rid, cam_idx_f,
+                path, max_side, brighten, gradient_id,
+                sig, bc, ref, sub_thr, sub_off, key=key))
+        except Exception:
+            # Never leave the slot occupied if the launch itself failed — _on_cam_loaded
+            # would never fire to release it, and the camera would slowly run out of depth
+            # and then ignore every future frame / setting change.
+            self._cam_inflight_at[cam_idx].pop(rid, None)
 
-    def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
-        """Synchronizuje slave kamery na master_ts_ns.
-        Vybere nejbližší snímek (vlevo nebo vpravo) v rámci 0.4s.
-        Pokud žádný není v limitu, slave kameru nepřekresluje."""
-        SLAVE_SYNC_MAX_NS = 400_000_000  # 0.4 s
-        for i, row in enumerate(self._per_cam_rows):
+    def _reset_cam_pipeline(self):
+        """Drop the per-camera load-coalescing gate so the next redraw always
+        relaunches a load. Mirrors the single-cam handlers that clear _inflight.
+
+        A load that never completes (typically a network-share read that hangs
+        and never returns) leaves its in-flight slot occupied for good. Because a new load
+        only starts while the camera is under _cam_inflight_depth(), enough of those and
+        that camera silently stops repainting: it ignores subtract/gradient toggles and
+        stays blank even though 'Ref set' shows in the info panel. Any explicit user action
+        calls this first so the pipeline can never stay wedged. Clearing _cam_want is
+        safe — the redraw that follows repopulates it. A stale task that finishes later just
+        re-enters _on_cam_loaded, finds its id already gone, and drains harmlessly.
+
+        Only loads older than CAM_PIPELINE_GRACE_S are released. Releasing every
+        camera unconditionally meant a setting change (Offset, Diff threshold,
+        gradient) launched a SECOND render of each tile while the first was still
+        decoding — two renders per camera, with different params. That doubled the work
+        behind every keystroke and, before the render key was checked on completion, let
+        the loser of the race repaint the tile with the old settings.
+
+        The age is now per LOAD, not per camera. With one boolean per camera the only
+        question that could be asked was "is this camera's single load young?", so a
+        healthy new load protected a hung old one indefinitely."""
+        n = len(getattr(self, '_cam_inflight_at', []))
+        if n == 0:
+            return
+        now = time.monotonic()
+        for i in range(n):
+            d = self._cam_inflight_at[i]
+            if not d:
+                continue
+            for rid in [r for r, t in d.items()
+                        if (now - t) >= CAM_PIPELINE_GRACE_S]:
+                d.pop(rid, None)
+        self._cam_want = [None] * n
+
+    def _cam_load_watchdog(self):
+        """Self-heal a camera whose in-flight load has hung. Any load outstanding longer
+        than CAM_LOAD_WATCHDOG_S releases its slot and the camera relaunches whatever it
+        currently wants, so live mode recovers without any user action."""
+        if not self._is_multi_cam() or not getattr(self, '_cam_inflight_at', None):
+            return
+        now = time.monotonic()
+        for i in range(len(self._cam_inflight_at)):
+            d = self._cam_inflight_at[i]
+            hung = [r for r, t in d.items() if (now - t) >= CAM_LOAD_WATCHDOG_S]
+            if not hung:
+                continue
+            for r in hung:
+                d.pop(r, None)
+            self._start_cam_load(i)
+
+    def _per_cam_slave_targets(self, master_cam: int, master_ts_ns: int) -> list:
+        """[(cam_idx, ts_ns)] for every slave that has a frame near enough to the master's
+        moment. Resolution only — nothing is displayed here, so _per_cam_nav_tick can do
+        this once per tick instead of once per mouse-move event.
+
+        A slave with no frame inside the window is left ALONE rather than dragged to its
+        nearest neighbour: that is the difference between this and _display_multicam_index,
+        and the reason the per-camera path cannot just reuse the shared scrub machinery."""
+        out = []
+        for i in range(len(self._per_cam_rows)):
             if i == master_cam:
                 continue
             cam_ts = self._cam_ts[i] if i < len(self._cam_ts) else []
@@ -9222,9 +11743,17 @@ class Viewer(QWidget):
                     best_diff = d; best_idx = right_idx
             if best_idx is None:
                 continue  # žádný snímek v limitu — nech slave beze změny
-            slave_ts = cam_ts[best_idx]
-            sv = self._per_cam_ts_to_slider(i, slave_ts)
-            row.set_value(sv)
+            out.append((i, cam_ts[best_idx]))
+        return out
+
+    def _per_cam_sync_slaves(self, master_cam: int, master_ts_ns: int):
+        """Display every slave at the master's moment. Used by the SETTLE paths (release,
+        master switch, playback end); the drag itself goes through _per_cam_nav_tick, which
+        resolves the same targets once per tick."""
+        for i, slave_ts in self._per_cam_slave_targets(master_cam, master_ts_ns):
+            # set_value blocks signals, so this cannot re-enter _on_per_cam_value_changed.
+            self._per_cam_rows[i].set_value(self._per_cam_ts_to_slider(i, slave_ts))
+            self._nav_frame[i] = self._per_cam_ts_to_frame(i, slave_ts)
             self._per_cam_display_one(i, slave_ts)
 
     def _per_cam_step(self, delta: int):
@@ -9235,16 +11764,19 @@ class Viewer(QWidget):
         cam_ts = self._cam_ts[master]
         if not cam_ts:
             return
-        # Use stored per-cam frame index so navigation steps by screenshot, not by time
-        cur_frame = self._cam_current_idx[master] if master < len(self._cam_current_idx) else 0
+        # Use stored per-cam frame index so navigation steps by screenshot, not by time.
+        # _nav_frame first: the render is deferred to the next tick, so _cam_current_idx
+        # still holds the PREVIOUS frame and two keypresses inside one tick would both step
+        # from it — the second press would be silently lost.
+        cur_frame = self._nav_frame.get(
+            master,
+            self._cam_current_idx[master] if master < len(self._cam_current_idx) else 0)
         new_frame = max(0, min(len(cam_ts) - 1, cur_frame + delta))
         new_ts = cam_ts[new_frame]
         row = self._per_cam_rows[master]
         sv = self._per_cam_ts_to_slider(master, new_ts)
         row.set_value(sv)
-        self._per_cam_display_one(master, new_ts)
-        if self._per_cam_master_idx >= 0:
-            self._per_cam_sync_slaves(master, new_ts)
+        self._nav_request(master, new_ts, new_frame)
 
     def _live_advance_cam(self, cam_idx: int, latest_ts: int, was_at_end: bool):
         """Single source of truth for 'this camera received a fresh live frame'.
@@ -9283,6 +11815,11 @@ class Viewer(QWidget):
         self._cam_folder_lists = cam_folder_lists if cam_folder_lists is not None else [[f] for f in cam_folders]
         n = len(cam_names)
         self._cam_last_update_ts = [0.0] * n  # reset refresh dots on camera switch
+        self._cam_shown_ts_ns    = [0] * n
+        self._cam_shown_mono     = [0.0] * n
+        self._cam_target_ts_ns   = [0] * n
+        self._cam_paint_tol_ns   = [0] * n
+        self._cam_paint_preview  = [False] * n
         # Last time the expensive full os.listdir scan ran per camera (throttled
         # when a dir-watcher is active — see _online_poll_multi).
         self._cam_last_full_poll_ts = [0.0] * n
@@ -9295,24 +11832,52 @@ class Viewer(QWidget):
             self._cam_ts          = [[] for _ in range(n)]
             self._cam_poll_max_ts = [0] * n   # highest ts_ns seen per camera (for fast incremental poll)
         self._cam_caches       = [PixCache(self._cam_cache_size(n)) for _ in range(n)]
+        # Carried forward, never reset: a cache-key index must never be reused
+        # (see _ck). Cameras added later start at 0.
+        _prev_off = getattr(self, "_cam_offsets", [])
+        self._cam_offsets      = [(_prev_off[i] if i < len(_prev_off) else 0)
+                                  for i in range(n)]
         self._cam_ref_images   = [None] * n
+        self._cam_ref_paths    = [None] * n
+        self._cam_ref_scaled   = [dict() for _ in range(n)]
+        self._cam_diff_stats   = {}
+        # References belong to the previous camera set — with Subtraction still on,
+        # tell the user the reference is gone instead of silently rendering plain frames.
+        self._refresh_ref_warning()
         self._cam_current_idx  = [0] * n   # per-camera frame index currently displayed
-        # Per-camera load coalescing: at most ONE image load in flight per camera so
-        # the load pool never backs up at live frame rates (which made the shown frame
-        # fall further and further behind real time). _cam_want holds the latest frame
-        # still waiting to be loaded.
-        self._cam_busy = [False] * n
+        # Per-camera load coalescing. _cam_want holds the latest frame still waiting to be
+        # loaded, so a backlog is never replayed; _cam_inflight_at bounds how many reads a
+        # single camera may have in flight (see _cam_inflight_depth). That used to be a
+        # bare boolean — one read per camera — which is what capped each tile at ~7
+        # frames/s and made the cameras look like they were taking turns.
+        #
+        # A dict {req_id: launch_monotonic} rather than a counter: _reset_cam_pipeline and
+        # _cam_load_watchdog must release SPECIFIC hung loads by age while leaving healthy
+        # ones accounted for, and a load released by either of them can still complete
+        # afterwards — its id is simply gone by then, so its completion cannot decrement a
+        # slot it no longer owns.
+        self._cam_inflight_at = [dict() for _ in range(n)]
+        self._cam_req_seq = 0
         self._cam_want = [None] * n
-        self._cam_pools      = []
-        self._cam_signals    = []
+        # Render key each tile is SUPPOSED to be showing. A LoadTask that finishes
+        # may carry OLDER render params (the user changed Offset / Diff threshold /
+        # gradient while it was decoding); painting it left that tile stale with
+        # nothing in _cam_want to correct it. Compared in _on_cam_loaded.
+        self._cam_shown_key = [None] * n
+        # ONE shared decode pool for every tile, created once in __init__ and only cleared
+        # here. It used to be one 2-thread QThreadPool per camera, rebuilt on every camera
+        # (re)load — which is why pools and their worker threads accumulated for the life of
+        # the process, and why a slow camera's threads sat idle while its neighbour's queue
+        # grew. Clearing drops the previous camera set's queued tasks; any already running
+        # lands in _on_cam_loaded with a req_id absent from the rebuilt _cam_inflight_at and
+        # is discarded harmlessly.
+        self._cam_pool.clear()
+        self._cam_signals = []
         for i in range(n):
-            pool = QThreadPool(self)
-            pool.setMaxThreadCount(2)
-            self._cam_pools.append(pool)
             sig = LoaderSignals()
             sig.loaded.connect(
-                lambda gen, req, idx, ms, br, gid, bo, img, cam_i=i:
-                    self._on_cam_loaded(cam_i, gen, req, idx, ms, br, gid, bo, img))
+                lambda gen, req, idx, ms, br, gid, bo, img, key, cam_i=i:
+                    self._on_cam_loaded(cam_i, gen, req, idx, ms, br, gid, bo, img, key))
             self._cam_signals.append(sig)
 
         self._multi_grid.setup_cameras(cam_names, layout_config=layout_config)
@@ -9334,12 +11899,36 @@ class Viewer(QWidget):
         self.tickbar.set_cursor(None)
 
     # ================================================================ ONLINE MODE
+    def _refresh_live_btn_style(self):
+        """Live mode button: faint green while following live, faint red while off,
+        neutral grey while it cannot be used at all. Called explicitly because the
+        state is also set with signals blocked."""
+        b = self._btn_auto_follow
+        if not b.isEnabled():
+            base = "background: #ececec; color: #777; border: 1px solid #cfcfcf;"
+        elif b.isChecked():
+            base = "background: #d9f2d9; color: #14532d; border: 1px solid #7cb87c;"
+        else:
+            base = "background: #f9dedb; color: #7f1d1d; border: 1px solid #d9a7a1;"
+        b.setStyleSheet(
+            "QPushButton { %s border-radius: 4px; padding: 4px 8px; font-weight: 600; }"
+            % base)
+
     def _on_auto_follow_toggled(self, checked: bool):
         self._auto_follow = checked
+        self._refresh_live_btn_style()
         if checked and not self._online_mode:
             self._start_online_mode()
         elif not checked and self._online_mode:
             self._stop_online_mode()
+            # Leaving live mode = the user wants to browse back, so undo the live
+            # memory cap and load the whole time window from disk again.
+            self._restore_full_history()
+            # Then preload that window at preview quality so the slider is smooth.
+            # When a backfill is still pending (_live_trimmed) the preload starts in
+            # _merge_restored_history instead, on the complete item list.
+            if not self._live_trimmed:
+                self._proxy_kick()
         if checked and self.items:
             last_idx = len(self.items) - 1
             if self._is_multi_cam():
@@ -9361,8 +11950,14 @@ class Viewer(QWidget):
     @staticmethod
     def _cam_cache_size(n_cams: int) -> int:
         """Per-camera pixmap cache size, scaled by camera count so total memory
-        stays bounded (12 cams × 80 pixmaps ≈ 0.5 GB was too much)."""
-        return max(20, 160 // max(1, n_cams))
+        stays bounded (12 cams × 80 pixmaps ≈ 0.5 GB was too much).
+
+        The floor was 20, which at 12 cameras meant 13 entries — a guaranteed miss on any
+        revisit, so nudging the slider back and forth re-read the share every time. These
+        are small tile pixmaps (400 px, ~0.5 MB), and PixCache caps the heavy full-res ones
+        separately via native_keep, so a bigger allowance is cheap: 64 × 12 × 0.5 MB is
+        ~0.4 GB worst case, and far less at the sizes a drag actually renders."""
+        return max(64, 480 // max(1, n_cams))
 
     def _ensure_dir_watcher(self, cam_i: int, folder: "Path"):
         """Start a _DirWatcher for folder if not already running. Dead watcher
@@ -9430,26 +12025,21 @@ class Viewer(QWidget):
                 except Exception:
                     pass
 
-    def _on_dir_watch_new_file(self, cam_i: int, filename: str):
-        """Immediate handler for a new image file detected by _DirWatcher."""
+    def _on_dir_watch_new_file(self, cam_i: int, folder_str: str, filename: str):
+        """Immediate handler for a new image file detected by _DirWatcher.
+
+        `folder_str` is the folder the watcher was actually armed on — it comes
+        with the event and must never be re-derived here (see _DirWatchSignals)."""
         if not self._online_mode:
             return
+        if not folder_str:
+            return
         if not self._is_multi_cam():
-            # Single-camera: find the watched folder and merge through the same
-            # path the poll uses (its ts cutoff de-duplicates double delivery).
-            folder = None
-            for f in self.opened_folders:
-                w = self._dir_watchers.get(str(f))
-                if w is not None and w._cam_i == cam_i and w._folder == f:
-                    folder = f
-                    break
-            if folder is None and self.opened_folders:
-                folder = self.opened_folders[-1]
-            if folder is None:
-                return
-            p = Path(folder) / filename
+            # Single-camera: merge through the same path the poll uses (its ts
+            # cutoff de-duplicates double delivery).
+            p = Path(folder_str) / filename
             ts_ns = parse_unix_ns_from_name(p)
-            if ts_ns is None:
+            if ts_ns is None or not self._in_ts_windows(ts_ns):
                 return
             cutoff = self.ts_list[-1] if self.ts_list else 0
             if ts_ns <= cutoff:
@@ -9458,24 +12048,12 @@ class Viewer(QWidget):
             return
         if cam_i >= len(self._cam_items):
             return
-        # Find the folder this file lives in (watcher key → folder path)
-        folder_lists = self._cam_folder_lists
-        if cam_i >= len(folder_lists):
-            return
-        folder = None
-        for f in folder_lists[cam_i]:
-            if str(f) in self._dir_watchers:
-                watcher = self._dir_watchers[str(f)]
-                if watcher._cam_i == cam_i and watcher._folder == f:
-                    folder = f
-                    break
-        if folder is None and folder_lists[cam_i]:
-            folder = folder_lists[cam_i][-1]  # best guess: most recently added
-        if folder is None:
-            return
-        p     = Path(folder) / filename
+        p     = Path(folder_str) / filename
         ts_ns = parse_unix_ns_from_name(p)
-        if ts_ns is None:
+        # Both poll paths filter to the picked window; this one did not, so a frame
+        # from the previous hour folder that predates the window start got in AND
+        # advanced the cutoff past frames the poll would still have delivered.
+        if ts_ns is None or not self._in_ts_windows(ts_ns):
             return
         cutoff = (self._cam_poll_max_ts[cam_i]
                   if hasattr(self, "_cam_poll_max_ts") and cam_i < len(self._cam_poll_max_ts)
@@ -9492,11 +12070,21 @@ class Viewer(QWidget):
         self._cam_ts[cam_i].append(ts_ns)
         if hasattr(self, "_cam_poll_max_ts") and cam_i < len(self._cam_poll_max_ts):
             self._cam_poll_max_ts[cam_i] = ts_ns
-        if len(self._cam_items[cam_i]) > ONLINE_MAX_ITEMS:
+        # Trim only while live mode is ON — see ONLINE_MAX_ITEMS
+        if self._online_mode and len(self._cam_items[cam_i]) > ONLINE_MAX_ITEMS:
             trim = len(self._cam_items[cam_i]) - ONLINE_MAX_ITEMS
             self._cam_items[cam_i] = self._cam_items[cam_i][trim:]
             self._cam_ts[cam_i]    = self._cam_ts[cam_i][trim:]
+            self._bump_cam_offset(cam_i, trim)
+            # Same index shift the poll path applies: without it the frame this
+            # camera is parked on silently changes identity after a trim (visible
+            # with auto-follow off, where nothing recomputes the index).
+            if cam_i < len(self._cam_current_idx):
+                self._cam_current_idx[cam_i] = max(0, self._cam_current_idx[cam_i] - trim)
+            self._live_trimmed = True
         self._online_last_new_ns = time.time()
+        # A watcher push is the other way frames arrive — record it for the dot.
+        self._note_cam_frames(cam_i)
         self._extend_shared_timeline_from_cams()
         total = sum(len(c) for c in self._cam_items)
         if not self._online_mode:
@@ -9515,6 +12103,9 @@ class Viewer(QWidget):
 
     def _start_online_mode(self):
         self._online_mode = True
+        # Live mode shows the newest frame at full quality — the preloaded preview
+        # is useless there and would keep competing for share bandwidth.
+        self._proxy_cancel(drop=True)
         # Start real-time dir watchers for all known camera folders — single
         # camera included (it used to rely on polling alone; now both modes get
         # instant pushes with the poll as safety net).
@@ -9534,6 +12125,7 @@ class Viewer(QWidget):
         self._btn_auto_follow.setChecked(True)
         self._btn_auto_follow.blockSignals(False)
         self._auto_follow = True
+        self._refresh_live_btn_style()
         self._online_lbl.setText("Online: ON")
         self._online_lbl.setStyleSheet("font-size: 10px; color: #555;")
         self._online_blink_state = False
@@ -9559,6 +12151,7 @@ class Viewer(QWidget):
         self._btn_auto_follow.setChecked(False)
         self._btn_auto_follow.blockSignals(False)
         self._auto_follow = False
+        self._refresh_live_btn_style()
         self._online_lbl.setText("Inactive")
         self._online_lbl.setStyleSheet("font-size: 10px; color: #555;")
         self.lbl_scan_progress.setText(
@@ -9567,6 +12160,162 @@ class Viewer(QWidget):
         self._online_dot.setStyleSheet("font-size: 14px; color: #aaa;")
         self._online_dot_top.setStyleSheet("font-size: 14px; color: #aaa;")
         self._online_poll_running = False
+
+    # ---------------- restoring what the live cap trimmed ----------------
+    @staticmethod
+    def _merge_items_by_ts(mem_items: list, disk_items: list) -> list:
+        """Union of in-memory and freshly scanned items, unique by timestamp and
+        sorted. In-memory items win on a duplicate ts — their path is the one the
+        pixmap cache is already keyed on."""
+        by_ts = {it.ts_ns: it for it in disk_items}
+        by_ts.update({it.ts_ns: it for it in mem_items})
+        return [by_ts[k] for k in sorted(by_ts)]
+
+    def _extend_axis_to_items(self):
+        """Grow the tickbar axis so it covers every timestamp in self.ts_list
+        (restored frames can sit outside the axis live mode had settled on)."""
+        if not self.ts_list:
+            return
+        changed = False
+        if self.ts_list[0] < self.axis_min_ns:
+            self.axis_min_ns = ns_from_dt(floor_to_hour(_dt_from_ns(self.ts_list[0])))
+            changed = True
+        if self.ts_list[-1] > self.axis_max_ns:
+            dt0 = floor_to_hour(_dt_from_ns(self.ts_list[0]))
+            span_h = math.ceil((self.ts_list[-1] - ns_from_dt(dt0)) / ONE_HOUR_NS)
+            self.axis_max_ns = ns_from_dt(dt0 + timedelta(hours=span_h))
+            changed = True
+        if changed:
+            self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
+
+    def _restore_full_history(self):
+        """Live mode keeps only the newest ONLINE_MAX_ITEMS frames per camera in
+        memory. Turning it off means the user wants to scrub back, so re-scan the
+        opened folders and merge the whole time window back in. Runs on the scan
+        pool (SMB shares are slow); the frame on screen stays on screen."""
+        if not getattr(self, "_live_trimmed", False):
+            return
+        if self._is_multi_cam():
+            folder_lists = ([list(fl) for fl in self._cam_folder_lists]
+                            if self._cam_folder_lists
+                            else [[f] for f in self._cam_folders])
+        else:
+            folder_lists = [list(self.opened_folders)] if self.opened_folders else []
+        if not any(folder_lists):
+            return
+        if getattr(self, "_backfill_running", False):
+            return
+        self._backfill_running = True
+        gen = self._gen
+        # Remember the moment being watched, not the index — indices shift once
+        # older frames are prepended.
+        keep_ts = None
+        if self.current_idx is not None and 0 <= self.current_idx < len(self.ts_list):
+            keep_ts = self.ts_list[self.current_idx]
+        self.lbl_scan_progress.setText("Loading full history…")
+
+        class _BackfillSignals(QObject):
+            done = Signal(list)
+
+        sig = _BackfillSignals(self)
+        self._backfill_sig = sig   # keep alive until the merge runs
+
+        def on_done(per_cam: list):
+            self._backfill_running = False
+            if gen != self._gen:
+                return
+            self._merge_restored_history(per_cam, keep_ts)
+
+        sig.done.connect(on_done)
+
+        class _BackfillTask(QRunnable):
+            def __init__(self, folder_lists, signal):
+                super().__init__()
+                self._folder_lists = folder_lists
+                self._sig = signal
+
+            def run(self):
+                result = []
+                for folders in self._folder_lists:
+                    items: list[Item] = []
+                    for folder in folders:
+                        try:
+                            with os.scandir(folder) as it:
+                                for e in it:
+                                    if not e.is_file():
+                                        continue
+                                    name = e.name
+                                    dot = name.rfind(".")
+                                    if dot < 0 or name[dot:].lower() not in IMG_EXT:
+                                        continue
+                                    p = Path(e.path)
+                                    ts_ns = parse_unix_ns_from_name(p)
+                                    if ts_ns is None:
+                                        continue
+                                    items.append(Item(p, ts_ns))
+                        except Exception:
+                            pass
+                    items.sort(key=lambda x: x.ts_ns)
+                    result.append(items)
+                self._sig.done.emit(result)
+
+        self.scan_pool.start(_BackfillTask(folder_lists, sig))
+
+    def _merge_restored_history(self, per_cam: list, keep_ts):
+        """Merge the re-scanned full history into the timeline and put the user
+        back on the frame they were watching."""
+        if self._online_mode:
+            return   # live mode came back on meanwhile — the cap rules again
+        # The re-scan reads whole hour folders — re-apply the picked window so a
+        # minute-precise selection is not widened by turning live mode off.
+        per_cam = [self._filter_to_ts_windows(items) for items in per_cam]
+        if self._is_multi_cam():
+            for cam_i, disk_items in enumerate(per_cam):
+                if cam_i >= len(self._cam_items):
+                    break
+                merged = self._merge_items_by_ts(self._cam_items[cam_i], disk_items)
+                self._cam_items[cam_i] = merged
+                self._cam_ts[cam_i]    = [it.ts_ns for it in merged]
+                if (hasattr(self, "_cam_poll_max_ts")
+                        and cam_i < len(self._cam_poll_max_ts) and merged):
+                    self._cam_poll_max_ts[cam_i] = merged[-1].ts_ns
+            self._rebuild_shared_items_from_cams()
+        else:
+            disk_items = per_cam[0] if per_cam else []
+            merged = self._merge_items_by_ts(self.items, disk_items)
+            self.items   = merged
+            self.ts_list = [it.ts_ns for it in merged]
+        # The restored frames moved in AHEAD of the live window, so every index
+        # shifted and a key issued before this merge would now name a different
+        # frame. Both merges are supersets of what was in memory, so the plain
+        # length bump is enough here.
+        self._invalidate_shared_ckeys()
+        for _ci in range(len(self._cam_items)):
+            self._invalidate_cam_ckeys(_ci)
+        if not self.items:
+            self._live_trimmed = False
+            return
+        self._extend_axis_to_items()
+        self._apply_marks_to_tickbar()
+        # Same scrub-resolution scaling the initial scan applies for big sets
+        n = len(self.items)
+        self._scrub_side = 500 if n >= 15000 else (600 if n >= 6000 else 900)
+        idx = len(self.items) - 1
+        if keep_ts is not None:
+            idx = min(bisect.bisect_left(self.ts_list, keep_ts), len(self.ts_list) - 1)
+        self.current_idx = idx
+        self.target_idx  = idx
+        if self._is_multi_cam():
+            self._display_multicam_index(idx, update_slider=True)
+        else:
+            self._display_exact_index(idx, self.ts_list[idx], update_slider=True)
+        total = (sum(len(c) for c in self._cam_items) if self._is_multi_cam()
+                 else len(self.items))
+        self.lbl_scan_progress.setText(f"Frames: {total}")
+        self.lbl_index.setText(f"{idx + 1} / {len(self.items)}")
+        self._live_trimmed = False
+        # The full window is back — preload it at preview quality for smooth scrubbing.
+        self._proxy_kick()
 
     def _on_online_blink(self):
         """Blikání kolečka online indikátoru: zelené = poll běží, červené = poll se zasekl."""
@@ -9622,6 +12371,9 @@ class Viewer(QWidget):
         advance the display. Shared by the listdir poll AND the dir-watcher
         push — both deliver through the identical code path (the ts cutoff in
         each caller de-duplicates double delivery)."""
+        # A manual refresh with live mode OFF re-lists whole hour folders, so the
+        # picked window still applies (online mode keeps its end open).
+        new_items = self._filter_to_ts_windows(new_items)
         if not new_items:
             return
         new_items.sort(key=lambda x: x.ts_ns)
@@ -9634,13 +12386,17 @@ class Viewer(QWidget):
         self.items = self.items + new_items
         self.ts_list = self.ts_list + [it.ts_ns for it in new_items]
 
-        # Cap to ONLINE_MAX_ITEMS — drop oldest frames to prevent unbounded growth
-        if len(self.items) > ONLINE_MAX_ITEMS:
+        # Cap to ONLINE_MAX_ITEMS — drop oldest frames to prevent unbounded growth.
+        # Only while live mode is ON; with it OFF the full history must stay
+        # browsable (turning it off restores what was trimmed).
+        if self._online_mode and len(self.items) > ONLINE_MAX_ITEMS:
             trim = len(self.items) - ONLINE_MAX_ITEMS
             self.items = self.items[trim:]
             self.ts_list = self.ts_list[trim:]
             if self.current_idx is not None:
                 self.current_idx = max(0, self.current_idx - trim)
+            self._items_offset += trim
+            self._live_trimmed = True
 
         # Rozšiř osu pokud nové snímky přesahují
         ts_max = self.ts_list[-1]
@@ -9655,6 +12411,9 @@ class Viewer(QWidget):
         self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
         self.lbl_index.setText(
             f"{(self.current_idx or 0) + 1} / {len(self.items)}")
+        # Live mode off means this came from Refresh — extend the preview over the
+        # frames it added (debounced; a no-op while live mode is on).
+        self._proxy_schedule_topup()
 
         last_idx = len(self.items) - 1
         # Show newest frame if: auto-follow is on, OR slider was already at the end
@@ -9664,6 +12423,17 @@ class Viewer(QWidget):
             _prev_current_idx >= _prev_len - 1
         )
         if self._auto_follow or was_at_end:
+            # Live mode always wants the NEWEST frame, so anything still queued for an
+            # older one is dead weight on the same share — and since _open_reader buffers
+            # each file in RAM while it decodes, a backlog costs memory as well as
+            # bandwidth. Measured in the 2 h soak: without this, a run of arrivals faster
+            # than the share could serve piled up 770 queued loads and 700 MB of working
+            # set before draining. The display epoch already stops those from painting;
+            # this stops them from running at all.
+            if self._online_mode:
+                self.load_pool.clear()
+                self._inflight.clear()
+                self._want_display_req.clear()
             self._display_exact_index(
                 last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
@@ -9677,6 +12447,14 @@ class Viewer(QWidget):
         poll_start_mono = time.monotonic()
         # Use ts_ns cutoff instead of path set — much faster O(n) single pass
         cutoff_ns = self.ts_list[-1] if self.ts_list else 0
+        # Same O(new files) optimisation as multi-cam (see _CamPollTask): remember
+        # names already parsed per folder so a near-full hour-folder isn't Path+regex
+        # re-parsed on every tick. Prune sets for folders no longer active.
+        active_keys = {str(f) for f in active_scan_folders(self.opened_folders)}
+        for _k in list(self._poll_seen.keys()):
+            if _k not in active_keys:
+                self._poll_seen.pop(_k, None)
+        seen_map = {str(f): self._poll_seen.setdefault(str(f), set()) for f in folders}
 
         def on_found(new_items):
             self._online_poll_running = False
@@ -9707,11 +12485,12 @@ class Viewer(QWidget):
         sig2.found.connect(on_found_with_folders)
 
         class _PollTask(QRunnable):
-            def __init__(self, folders, cutoff, signal):
+            def __init__(self, folders, cutoff, signal, seen_map=None):
                 super().__init__()
                 self._folders = folders
                 self._cutoff  = cutoff
                 self._sig = signal
+                self._seen_map = seen_map
 
             def run(self):
                 new_items = []
@@ -9719,7 +12498,12 @@ class Viewer(QWidget):
                 for folder in self._folders:
                     try:
                         folder_path = Path(folder)
+                        seen = None if self._seen_map is None else self._seen_map.get(str(folder))
                         for name in os.listdir(folder):
+                            if seen is not None:
+                                if name in seen:
+                                    continue
+                                seen.add(name)
                             dot = name.rfind(".")
                             if dot < 0 or name[dot:].lower() not in IMG_EXT:
                                 continue
@@ -9787,7 +12571,7 @@ class Viewer(QWidget):
                 self._sig.found.emit(new_items, new_folders)
 
         self._poll_sig2 = sig2  # keep alive until next tick (no-parent QObject needs explicit ref)
-        task = _PollTask(folders, cutoff_ns, sig2)
+        task = _PollTask(folders, cutoff_ns, sig2, seen_map)
         self._poll_pool.start(task)
 
     def _online_poll_multi(self):
@@ -9824,6 +12608,12 @@ class Viewer(QWidget):
             for f in act:
                 active_keys.add(str(f))
         self._prune_dir_watchers(active_keys)
+        # Drop seen-name sets for folders no longer scanned (hour rollover) so the
+        # cache stays at the newest 1-2 folders per camera instead of one full
+        # ~12k-name set per elapsed hour.
+        for _k in list(self._poll_seen.keys()):
+            if _k not in active_keys:
+                self._poll_seen.pop(_k, None)
         if _DIRWATCH_AVAILABLE and self._dir_watch_sigs is not None:
             for cam_i in range(n_cams):
                 for f in active_per_cam[cam_i]:
@@ -9866,6 +12656,9 @@ class Viewer(QWidget):
                     self._cam_poll_running[cam_idx] = False
                     if g != self._gen:
                         return
+                    # Polls list whole hour folders — keep the picked window
+                    # (online mode leaves its end open, so live frames pass).
+                    new_items = self._filter_to_ts_windows(new_items)
                     if new_items and _had_watcher:
                         # The safety-net poll beat a "healthy" watcher to these
                         # frames — RDCW died silently. Strike/replace it so the
@@ -9881,10 +12674,12 @@ class Viewer(QWidget):
                             self._cam_poll_interval[cam_idx] = min(
                                 ONLINE_POLL_MAX_INTERVAL_S,
                                 self._cam_poll_interval[cam_idx] * ONLINE_POLL_BACKOFF)
-                    # Heartbeat: update refresh dot even if no new frames arrived
-                    while len(self._cam_last_update_ts) <= cam_idx:
-                        self._cam_last_update_ts.append(0.0)
-                    self._cam_last_update_ts[cam_idx] = time.monotonic()
+                    # The refresh dot must NOT be bumped here unconditionally: a
+                    # camera that stopped writing images keeps completing polls
+                    # forever, which made the dot blink green over a frozen
+                    # picture. Only real new frames count (below).
+                    if new_items:
+                        self._note_cam_frames(cam_idx)
                     if new_folders and cam_idx < len(self._cam_folder_lists):
                         for nf in new_folders:
                             if nf not in self._cam_folder_lists[cam_idx]:
@@ -9896,13 +12691,16 @@ class Viewer(QWidget):
                     _prev_current_idx = self.current_idx
                     self._cam_items[cam_idx].extend(new_items)
                     self._cam_ts[cam_idx].extend(it.ts_ns for it in new_items)
-                    # Cap per-camera list to ONLINE_MAX_ITEMS to prevent unbounded growth
-                    if len(self._cam_items[cam_idx]) > ONLINE_MAX_ITEMS:
+                    # Cap per-camera list to ONLINE_MAX_ITEMS to prevent unbounded
+                    # growth — live mode only (see ONLINE_MAX_ITEMS)
+                    if self._online_mode and len(self._cam_items[cam_idx]) > ONLINE_MAX_ITEMS:
                         trim = len(self._cam_items[cam_idx]) - ONLINE_MAX_ITEMS
                         self._cam_items[cam_idx] = self._cam_items[cam_idx][trim:]
                         self._cam_ts[cam_idx]    = self._cam_ts[cam_idx][trim:]
+                        self._bump_cam_offset(cam_idx, trim)
                         if hasattr(self, '_cam_current_idx') and cam_idx < len(self._cam_current_idx):
                             self._cam_current_idx[cam_idx] = max(0, self._cam_current_idx[cam_idx] - trim)
+                        self._live_trimmed = True
                     if cam_idx < len(self._cam_poll_max_ts):
                         self._cam_poll_max_ts[cam_idx] = self._cam_ts[cam_idx][-1]
                     self._online_last_new_ns = time.time()
@@ -9929,7 +12727,8 @@ class Viewer(QWidget):
             sig.found.connect(make_callback(cam_i, gen))
             self._cam_poll_running[cam_i] = True
             self._cam_last_full_poll_ts[cam_i] = now
-            self._poll_pool.start(_CamPollTask(cam_i, folders, cutoff, cam_name, sig))
+            seen_map = {str(f): self._poll_seen.setdefault(str(f), set()) for f in folders}
+            self._poll_pool.start(_CamPollTask(cam_i, folders, cutoff, cam_name, sig, seen_map))
 
     def _rebuild_shared_items_from_cams(self):
         """
@@ -9950,8 +12749,11 @@ class Viewer(QWidget):
         if not all_items:
             return
         all_items.sort(key=lambda it: it.ts_ns)
+        _prev_len    = len(self.items)
         self.items   = all_items
         self.ts_list = [it.ts_ns for it in self.items]
+        # Every shared index was just re-derived — old cache keys are meaningless.
+        self._invalidate_shared_ckeys(_prev_len)
 
         # Rozšiř osu
         if self.ts_list:
@@ -9992,15 +12794,19 @@ class Viewer(QWidget):
         new_items.sort(key=lambda it: it.ts_ns)
         self.items.extend(new_items)
         self.ts_list.extend(it.ts_ns for it in new_items)
-        # Cap shared timeline to ONLINE_MAX_ITEMS
+        # Cap shared timeline to ONLINE_MAX_ITEMS — live mode only, so a refresh
+        # with live mode off (this method is called from there too) never drops
+        # history the user still wants to scrub back into.
         n_cams = len(self._cam_items)
         shared_cap = ONLINE_MAX_ITEMS * max(1, n_cams)
-        if len(self.items) > shared_cap:
+        if self._online_mode and len(self.items) > shared_cap:
             trim = len(self.items) - shared_cap
             self.items = self.items[trim:]
             self.ts_list = self.ts_list[trim:]
             if self.current_idx is not None:
                 self.current_idx = max(0, self.current_idx - trim)
+            self._items_offset += trim
+            self._live_trimmed = True
         # Extend axis if needed
         ts_max = self.ts_list[-1]
         if ts_max > self.axis_max_ns:
@@ -10017,6 +12823,9 @@ class Viewer(QWidget):
                         continue
                     sv = self._per_cam_ts_to_slider(cam_i, cam_ts[-1])
                     row.set_value(sv)
+        # Live mode off means this came from Refresh — extend the preview over the
+        # frames it added (debounced; a no-op while live mode is on).
+        self._proxy_schedule_topup()
 
     def open_folder(self):
         # Nejdřív zkontroluj že máme nastavené časové okno
@@ -10042,7 +12851,8 @@ class Viewer(QWidget):
             self.last_pick_cam_names,
             self,
             preloaded_cameras=getattr(self, '_preloaded_cameras', None),
-            multi_grid=self._multi_grid)
+            multi_grid=self._multi_grid,
+            windows=getattr(self, '_last_pick_windows', None))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -10067,14 +12877,17 @@ class Viewer(QWidget):
             folders = DatePickerDialog.selected_folders_static(
                 day_obj, hour_from, hour_to,
                 Path(DEFAULT_OPEN_ROOT) / cam_name,
-                segments=segments)
+                segments=segments,
+                min_from=self.last_pick_min_from, min_to=self.last_pick_min_to)
             cam_folders_with_cam = []
             for f in folders:
                 cf = f / cam_name if not f.name == cam_name else f
                 cam_folders_with_cam.append(cf)
             cam_folder_lists.append(cam_folders_with_cam)
 
-        self.lbl_selected_range.setText(self._range_label(segments, hour_from, hour_to))
+        self.lbl_selected_range.setText(self._range_label(
+            segments, hour_from, hour_to,
+            self.last_pick_min_from, self.last_pick_min_to))
 
         if len(cam_names) == 1:
             self._stop_online_mode()
@@ -10090,7 +12903,7 @@ class Viewer(QWidget):
             existing = [f for f in folders if _is_dir_quiet(f)]
             if not existing:
                 QMessageBox.warning(self, "Folder not found",
-                    f"Camera folder '{cam_names[0]}' not found.")
+                    _camera_folder_problem(cam_names[0], folders))
                 return
             self.last_open_dir = existing[0]
             if online:
@@ -10098,9 +12911,10 @@ class Viewer(QWidget):
             # Pre-load grid_state into img_view so _start_scan saves and restores it
             if grid_state is not None:
                 MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
-            # Enable PDXM1 reference grid for single-cam view
-            self.img_view.show_pdxm1_grid = MultiCameraGrid._is_pdxm1_cam(cam_names[0])
-            self.img_view.pdxm1_cam_name = cam_names[0] if self.img_view.show_pdxm1_grid else ''
+            # Reference grid for single-cam view — show flag comes from saved
+            # config (defaults to hidden for all cameras, diodes included).
+            self.img_view.show_pdxm1_grid = get_pdxm1_grid_config(cam_names[0]).show
+            self.img_view.pdxm1_cam_name = cam_names[0]
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -10153,8 +12967,11 @@ class Viewer(QWidget):
         def on_cam_scan_done(cam_i: int, items: list, folders: list):
             if gen != self._gen:
                 return
+            items = self._filter_to_ts_windows(items)
+            _prev_len = len(self._cam_items[cam_i])
             self._cam_items[cam_i] = items
             self._cam_ts[cam_i]    = [it.ts_ns for it in items]
+            self._invalidate_cam_ckeys(cam_i, _prev_len)
             if hasattr(self, '_cam_poll_max_ts') and cam_i < len(self._cam_poll_max_ts):
                 self._cam_poll_max_ts[cam_i] = items[-1].ts_ns if items else 0
             cam_all_folders[cam_i] = folders          # všechny složky
@@ -10173,7 +12990,8 @@ class Viewer(QWidget):
         _signals.done.connect(on_cam_scan_done)
 
         _pick_args = (self.last_pick_date, self.last_pick_hour_from, self.last_pick_hour_to,
-                      getattr(self, '_last_pick_segments', None))
+                      getattr(self, '_last_pick_segments', None),
+                      self.last_pick_min_from, self.last_pick_min_to)
 
         for cam_i, (cam_name, folder_list) in enumerate(
                 zip(cam_names, cam_folder_lists)):
@@ -10195,10 +13013,10 @@ class Viewer(QWidget):
                     existing = [f for f in self._folders if _is_dir_quiet(f)]
                     if not existing:
                         try:
-                            pd, hf, ht, segs = self._pick
+                            pd, hf, ht, segs, mf, mt = self._pick
                             rebuilt = DatePickerDialog.selected_folders_static(
                                 pd, hf, ht, Path(DEFAULT_OPEN_ROOT) / self._cname,
-                                segments=segs)
+                                segments=segs, min_from=mf, min_to=mt)
                             existing = [f for f in rebuilt if _is_dir_quiet(f)]
                         except Exception:
                             existing = []
@@ -10275,6 +13093,7 @@ class Viewer(QWidget):
         self.btn_set_b.setEnabled(True)
         self.btn_clear_marks.setEnabled(True)
         self._btn_auto_follow.setEnabled(True)
+        self._refresh_live_btn_style()
         self.btn_set_ref.setEnabled(True)
         self.btn_pointing.setEnabled(True)
         self.btn_pointing_live.setEnabled(True)
@@ -10298,28 +13117,43 @@ class Viewer(QWidget):
             self.lbl_scan_progress.setText("Online mode: <span style='color:#22bb22;font-weight:700;'>ACTIVE</span>")
             self._start_online_mode()
 
+        # Preload every camera's window at preview quality (no-op in live mode).
+        self._proxy_kick()
+
         QTimer.singleShot(0, self._pv_update_overlay)
 
     @staticmethod
-    def _range_label(segments, hour_from, hour_to) -> str:
+    def _range_label(segments, hour_from, hour_to,
+                     min_from: int = 0, min_to: int = 0) -> str:
         """Build the 'Range: …' status label for single-day or per-day selections."""
-        def _seg_txt(hf, ht):
-            return f"{hf:02d}h" if hf == ht else f"{hf:02d}–{ht:02d}h"
+        def _seg_txt(s):
+            _d, hf, mf, ht, mt = _seg_fields(s)
+            return f"{hf:02d}:{mf:02d}–{ht:02d}:{mt:02d}"
         if not segments:
-            return f"Range: {hour_from:02d}:00 – {hour_to:02d}:59"
+            return f"Range: {hour_from:02d}:{min_from:02d} – {hour_to:02d}:{min_to:02d}"
         if len(segments) == 1:
-            d, hf, ht = segments[0]
-            return f"Range: {d.strftime('%d.%m')} {_seg_txt(hf, ht)}"
-        parts = [f"{d.strftime('%d.%m')} {_seg_txt(hf, ht)}" for d, hf, ht in segments[:3]]
+            d = _seg_fields(segments[0])[0]
+            return f"Range: {d.strftime('%d.%m')} {_seg_txt(segments[0])}"
+        parts = [f"{_seg_fields(s)[0].strftime('%d.%m')} {_seg_txt(s)}"
+                 for s in segments[:3]]
         more = "…" if len(segments) > 3 else ""
         return f"Range: {', '.join(parts)}{more} ({len(segments)} days)"
 
     def open_by_date(self):
+        # Reopen on the last pick (day, day list and mode included). Nothing
+        # picked yet in this session (hour_from is None) → the dialog keeps its
+        # own default of the opened folder's day / today.
+        has_pick = self.last_pick_hour_from is not None
         dlg = DatePickerDialog(
             self.last_open_dir,
             self.last_pick_hour_from,
             self.last_pick_hour_to,
-            self)
+            self,
+            min_from_init=self.last_pick_min_from,
+            min_to_init=self.last_pick_min_to,
+            init_date=self.last_pick_date if has_pick else None,
+            init_segments=self._last_pick_segments if has_pick else None,
+            init_range_mode=getattr(self, "_last_pick_range_mode", False))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -10332,56 +13166,54 @@ class Viewer(QWidget):
         # Per-day segments (None in plain single-day mode → legacy fast path)
         segments = dlg.selected_segments()
         self._last_pick_segments = segments
+        self._last_pick_range_mode = dlg.is_range_mode()
+        hour_from, min_from, hour_to, min_to = dlg.selected_times()
         if segments:
-            self.last_pick_date      = segments[0][0]
-            hour_from, hour_to       = segments[0][1], segments[0][2]
+            first = _seg_fields(segments[0])
+            self.last_pick_date = first[0]
+            hour_from, min_from, hour_to, min_to = first[1], first[2], first[3], first[4]
         else:
-            self.last_pick_date      = dlg.selected_date_obj()
-            hour_from, hour_to       = dlg.selected_hours()
+            self.last_pick_date = dlg.selected_date_obj()
         self.last_pick_hour_from     = hour_from
         self.last_pick_hour_to       = hour_to
+        self.last_pick_min_from      = min_from
+        self.last_pick_min_to        = min_to
         self.last_pick_axis_override = axis_override
+        # Minute-precise (and per-day) filter for the scanned frames. Online mode
+        # keeps the end open so newly arriving images are never filtered out.
+        windows = dlg.selected_windows()
+        # Kept un-mangled for folder/camera enumeration — the online variant below
+        # has an open end that no folder scan could walk.
+        self._last_pick_windows = list(windows)
+        if online and windows:
+            windows = windows[:-1] + [(windows[-1][0], 1 << 62)]
+        self._ts_windows = windows
         # Legacy field kept for backward compatibility (segments supersede it)
         self._last_pick_extra_dates: "list | None" = None
 
-        self.lbl_selected_range.setText(self._range_label(segments, hour_from, hour_to))
+        self.lbl_selected_range.setText(
+            self._range_label(segments, hour_from, hour_to, min_from, min_to))
 
-        # Okamžitě spusť scan kamer na pozadí (z prvního dne výběru)
-        self._preloaded_cameras: list[tuple[str, str]] = []
-        self._cameras_loaded = False
+        # Camera list for the pick. The dialog already scanned the union while it
+        # was open — reuse it and only rescan when it came back empty.
+        self._preloaded_cameras: list[tuple[str, str]] = list(dlg.preloaded_cameras())
+        self._cameras_loaded = bool(self._preloaded_cameras)
 
-        import threading as _thr
-        date_obj  = self.last_pick_date
-        hour_from_scan = hour_from
-        hour_to_scan   = hour_to
+        if not self._cameras_loaded:
+            import threading as _thr
+            # Union over every day/segment — an empty first day used to yield an
+            # empty camera list (see cameras_for_windows).
+            scan_windows = list(self._last_pick_windows)
 
-        def worker():
-            cameras: list[tuple[str, str]] = []
-            try:
-                base = Path(DEFAULT_OPEN_ROOT) / str(date_obj.year) / str(date_obj.month) / str(date_obj.day)
-                for hh in range(hour_from_scan, hour_to_scan + 1):
-                    ref_dt = datetime(date_obj.year, date_obj.month, date_obj.day,
-                                      hh, 0, 0, tzinfo=TZ_PRAGUE)
-                    folder_h = folder_hour_from_prague_hour(hh, ref_dt)
-                    hour_dir = base / str(folder_h)
-                    if hour_dir.exists() and hour_dir.is_dir():
-                        try:
-                            subs = sorted(
-                                [p.name for p in hour_dir.iterdir() if p.is_dir()],
-                                key=str.lower)
-                            for name in subs:
-                                m = re.match(r"^C\d{2}-(\d{2,3})-", name)
-                                num = m.group(1) if m else ""
-                                if not any(n == name for _, n in cameras):
-                                    cameras.append((num, name))
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-            self._preloaded_cameras = cameras
-            self._cameras_loaded = True
+            def worker():
+                try:
+                    cameras, _status = cameras_for_windows(scan_windows)
+                except Exception:
+                    cameras = []
+                self._preloaded_cameras = cameras
+                self._cameras_loaded = True
 
-        _thr.Thread(target=worker, daemon=True).start()
+            _thr.Thread(target=worker, daemon=True).start()
 
         # Pokud máme zapamatované kamery, automaticky použij je
         if self.last_pick_cam_names:
@@ -10412,12 +13244,15 @@ class Viewer(QWidget):
             folders = DatePickerDialog.selected_folders_static(
                 day_obj, hour_from, hour_to,
                 Path(DEFAULT_OPEN_ROOT) / cam_name,
-                extra_dates=extra_dates, segments=segments)
+                extra_dates=extra_dates, segments=segments,
+                min_from=self.last_pick_min_from, min_to=self.last_pick_min_to)
             cam_folder_lists.append([
                 f / cam_name if not f.name == cam_name else f
                 for f in folders])
 
-        self.lbl_selected_range.setText(self._range_label(segments, hour_from, hour_to))
+        self.lbl_selected_range.setText(self._range_label(
+            segments, hour_from, hour_to,
+            self.last_pick_min_from, self.last_pick_min_to))
 
         if len(cam_names) == 1:
             self._stop_online_mode()
@@ -10430,15 +13265,16 @@ class Viewer(QWidget):
             existing = [f for f in cam_folder_lists[0] if _is_dir_quiet(f)]
             if not existing:
                 QMessageBox.warning(self, "Folder not found",
-                    f"Camera folder '{cam_names[0]}' not found.")
+                    _camera_folder_problem(cam_names[0], cam_folder_lists[0]))
                 return
             self.last_open_dir = existing[0]
             # Pre-load grid_state into img_view so _start_scan saves and restores it
             if grid_state is not None:
                 MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
-            # Enable PDXM1 reference grid for single-cam view
-            self.img_view.show_pdxm1_grid = MultiCameraGrid._is_pdxm1_cam(cam_names[0])
-            self.img_view.pdxm1_cam_name = cam_names[0] if self.img_view.show_pdxm1_grid else ''
+            # Reference grid for single-cam view — show flag comes from saved
+            # config (defaults to hidden for all cameras, diodes included).
+            self.img_view.show_pdxm1_grid = get_pdxm1_grid_config(cam_names[0]).show
+            self.img_view.pdxm1_cam_name = cam_names[0]
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -10458,7 +13294,12 @@ class Viewer(QWidget):
         Called once on first Slider tab activation.
         Opens Time window dialog; if accepted on first-ever open, auto-opens Camera picker.
         """
-        if self.items or self._cam_items:
+        # A scan already in flight counts as "something is loaded": another tab
+        # pushed a folder in (Shot Finder → Send to Image Slider switches to this
+        # tab, which queues THIS call) and items/_cam_items are still empty while
+        # that scan runs. Without this guard the Time-window dialog popped over
+        # the pushed images and replaced them with its own scan.
+        if self.items or self._cam_items or self._scan_task is not None:
             return
         is_first_open = self.last_pick_hour_from is None
         self.open_by_date()
@@ -10471,8 +13312,66 @@ class Viewer(QWidget):
             QMessageBox.warning(self, "Folder not found", f"Folder does not exist:\n{folder}"); return
         self.last_open_dir = folder
         ax = axis_from_any_folder(folder)
+        self._ts_windows = None      # explicit folder → no time-window filtering
         self.lbl_selected_range.setText("Range: single folder")
         self._start_scan([folder], axis_override=ax, folder_label=str(folder))
+
+    def receive_external_folder(self, folder: Path, energy_map: "dict | None" = None,
+                                discrete: bool = True,
+                                cam_name: "str | None" = None) -> bool:
+        """Load `folder` no matter what the Slider is currently doing.
+
+        Public handoff for the other tabs ("Send to Image Slider"). open_folder_path
+        alone was not enough: whatever the Slider was set to before could swallow
+        or misrender the pushed images —
+          • a multi-camera grid stayed visible while the pushed frame was decoded
+            into the hidden single-image widget ("nothing happened"),
+          • an armed/active online mode jumped the new session to live-follow and
+            armed watchers on a temp folder,
+          • a subtraction reference from another camera rendered every frame as
+            |new − old ref| (near-black),
+          • focus / watcher fullscreen kept the slider and tickbar hidden,
+          • a stale Shot Finder energy map captioned the new images with old PVs.
+        All of that is cleared here first. Returns False only if `folder` is gone.
+        """
+        folder = Path(folder)
+        if not folder.exists() or not folder.is_dir():
+            return False
+        if getattr(self, "_focus_mode", False):
+            self._toggle_focus_mode()
+        if getattr(self, "_watcher_mode", False):
+            self._toggle_watcher_mode()
+        self._pending_online_mode = False
+        try:
+            self._stop_online_mode()
+        except Exception:
+            pass
+        self.cancel_scan()
+        # Back to the single-image view: _start_scan clears multi-cam DATA but
+        # never un-hides _single_wrapper. cam_name (when the sender knows it)
+        # labels the frames; without it the label stays empty rather than naming
+        # whatever camera happened to be loaded before.
+        self._cam_names = [cam_name] if cam_name else []
+        self._switch_to_single_view()
+        if hasattr(self, "cb_subtract") and self.cb_subtract.isChecked():
+            self.cb_subtract.blockSignals(True)
+            self.cb_subtract.setChecked(False)
+            self.cb_subtract.blockSignals(False)
+        self._ref_path = None
+        self._ref_scaled = {}
+        self._cam_diff_stats = {}
+        if hasattr(self, "lbl_ref_status"):
+            self.lbl_ref_status.setText("")
+        if hasattr(self, "lbl_diff_stats"):
+            self.lbl_diff_stats.setText("")
+        self.img_view.set_cam_ref_text("")
+        # Captions belong to THIS push only. Set before the scan: it survives
+        # _reset_ui_for_new_scan and is read by _set_info_for at scan-done time,
+        # so no post-load timer is needed.
+        self._sf_energy_map = dict(energy_map or {})
+        self._discrete_mode = bool(discrete)
+        self.open_folder_path(folder)
+        return True
 
     def open_file_list(self, files: list):
         """Load an explicit list of image Paths (e.g. from range search). No folder scan."""
@@ -10493,6 +13392,7 @@ class Viewer(QWidget):
         self._hard_reset_runtime()
         self.opened_folders = []
         self.opened_folder = None
+        self._ts_windows = None      # explicit file list → no time-window filtering
         self._real_ts_list = []
         self._fake_ts_map = None
         self.tickbar.discrete_ticks = None
@@ -10501,6 +13401,7 @@ class Viewer(QWidget):
         self.current_idx = None
         self.lbl_prague_time.setText("Prague: —"); self.lbl_axis_time.setText("Axis: —")
         self.lbl_index.setText("0 / 0")
+        self.lbl_date.setText("Date: —")
         self.cache = PixCache(CACHE_SIZE); self._display_req_id = 0
         self._inflight.clear(); self._want_display_req.clear()
         self.img_view.clear()
@@ -10527,11 +13428,19 @@ class Viewer(QWidget):
         self.axis_max_ns = ts_max + pad
         self._real_ts_list = []
         self._fake_ts_map = None
-        self.tickbar.discrete_ticks = self.ts_list[:]
-        self.tickbar.discrete_tick_labels = [
-            f"{_dt_from_ns(ts):%Y-%m-%d %H:%M:%S}"
-            for ts in self.ts_list
-        ]
+        # Per-frame ticks only for small result sets — same cap as _on_scan_finished,
+        # which this path was missing. A multi-day range search returns thousands of
+        # frames, and a per-frame tick list makes every axis repaint (i.e. every
+        # playback frame and every scrub tick) walk the whole list on the GUI thread.
+        if n <= TICKBAR_DISCRETE_MAX:
+            self.tickbar.discrete_ticks = self.ts_list[:]
+            self.tickbar.discrete_tick_labels = [
+                f"{_dt_from_ns(ts):%Y-%m-%d %H:%M:%S}"
+                for ts in self.ts_list
+            ]
+        else:
+            self.tickbar.discrete_ticks = None
+            self.tickbar.discrete_tick_labels = None
         self.axis_override = None
         self.tickbar.set_axis(self.axis_min_ns, self.axis_max_ns)
         self._apply_marks_to_tickbar()
@@ -10546,6 +13455,10 @@ class Viewer(QWidget):
         self.slider.blockSignals(True); self.slider.setValue(sv); self.slider.blockSignals(False)
         self.play_time_ns = ts_min; self.target_idx = 0
         self._display_exact_index(0, ts_min, update_slider=False)
+        # Range search is a normal offline window, so it gets the preview too. This path
+        # was the only loader that never kicked it, which left it with none of the
+        # repaint-from-RAM benefit on precisely the multi-day result sets that need it.
+        self._proxy_kick()
 
     def refresh_folder(self):
         """Donačte nové snímky ze stejných složek, zachová pozici a overlay."""
@@ -10655,9 +13568,15 @@ class Viewer(QWidget):
             return
 
         # Merge a sort
+        _prev_last_ts = self.ts_list[-1] if self.ts_list else None
         merged = sorted(self.items + added, key=lambda it: it.ts_ns)
         self.items = merged
         self.ts_list = [it.ts_ns for it in self.items]
+        # A Refresh can bring in frames OLDER than what is already loaded, and that
+        # shifts every index after the insertion point (see _ck). Pure appends —
+        # the normal case — keep their indices, so the cache survives them.
+        if _prev_last_ts is not None and min(it.ts_ns for it in added) <= _prev_last_ts:
+            self._invalidate_shared_ckeys()
 
         # Rozšiř osu pokud nové snímky přesahují
         if self.axis_override is not None:
@@ -10681,6 +13600,12 @@ class Viewer(QWidget):
             self.slider.blockSignals(False)
 
         n_added = len(added)
+        # Extend the preview over the frames Refresh just added. Without this the plan
+        # stayed at the pre-Refresh size while `items` grew, so _proxy_covered() went on
+        # reporting "covered" — the whole added tail, which is exactly where the user
+        # scrubs after a Refresh, had no preview at all. The live-poll and multi-cam merges
+        # already did this; the manual Refresh path was the one that did not.
+        self._proxy_schedule_topup()
         if self._online_mode:
             self.lbl_scan_progress.setText(f"Online mode: +{n_added} new frame{'s' if n_added != 1 else ''}")
         else:
@@ -10757,11 +13682,118 @@ class Viewer(QWidget):
                 "Could not detect a rectangle.\nTip: enable Auto brightness first."); return
         iv.show_square = True; iv.update()
 
-    # ================================================================ BRIGHTNESS
+    # ================================================================ SUBTRACTION PARAMS / STATS
+    def _sub_params(self, ref) -> "tuple[int, int]":
+        """(diff threshold, visibility offset) for one render. Both are 0 when the
+        frame has no reference, so a non-subtraction render always produces the
+        same cache key regardless of the spinbox values."""
+        if ref is None:
+            return (0, 0)
+        return (int(self.sub_threshold_sb.value()), int(self.sub_offset_sb.value()))
+
+    @staticmethod
+    def _fmt_diff_stats(st: dict, compact: bool = False) -> str:
+        """Difference summary line. `compact` fits one multi-cam tile per row in the
+        275 px info panel; the full form is used for the single-camera view."""
+        n, total = st.get("count", 0), st.get("total", 0)
+        if n <= 0:
+            return "0 px differ" if compact else "Diff: no pixels differ"
+        pct = (100.0 * n / total) if total else 0.0
+        if compact:
+            return f"{n} px · avg {st['mean']:.1f} · {st['min']:.0f}–{st['max']:.0f}"
+        return (f"Diff: {n} px ({pct:.2f}%) · avg {st['mean']:.1f} · "
+                f"min {st['min']:.0f} · max {st['max']:.0f}")
+
+    def _update_diff_stats(self, key):
+        """Refresh the single-cam difference-statistics line for the frame rendered
+        under `key`. Called from every path that shows a frame, so cache hits are
+        labelled too."""
+        if not self.cb_subtract.isChecked() or self._ref_path is None:
+            self.lbl_diff_stats.setText("")
+            return
+        st = _diff_stats_get(key)
+        if st is None:
+            return   # stats evicted / not a diff render — keep the last numbers
+        self.lbl_diff_stats.setText(self._fmt_diff_stats(st))
+
+    def _collect_cam_diff_stats(self, cam_i: int, key):
+        """Record one tile's diff statistics WITHOUT rebuilding the label.
+
+        Formatting the label is O(cameras) and every setText forces a relayout of the
+        info panel, so doing it per camera inside the display loop made one 33 ms scrub
+        tick cost O(cameras²) formats and N relayouts — on the Subtraction path, which
+        has no preview to fall back on either."""
+        if not self.cb_subtract.isChecked():
+            self._cam_diff_stats = {}
+            return
+        st = _diff_stats_get(key)
+        if st is not None:
+            self._cam_diff_stats[cam_i] = st
+
+    def _flush_cam_diff_stats(self):
+        """Write the collected statistics to the info line — once per display pass."""
+        if not self.cb_subtract.isChecked():
+            self.lbl_diff_stats.setText("")
+            return
+        lines = []
+        for c in sorted(self._cam_diff_stats):
+            if c >= len(self._cam_ref_paths) or self._cam_ref_paths[c] is None:
+                continue
+            name = _strip_cam_name(self._cam_names[c]) if c < len(self._cam_names) else f"cam {c}"
+            lines.append(f"{name}: {self._fmt_diff_stats(self._cam_diff_stats[c], compact=True)}")
+        self.lbl_diff_stats.setText("\n".join(lines))
+
+    def _update_cam_diff_stats(self, cam_i: int, key):
+        """Collect + show, for the callers that update a single tile."""
+        self._collect_cam_diff_stats(cam_i, key)
+        self._flush_cam_diff_stats()
+
+    # ================================================================ BRIGHTNESS / CONTRAST
+    def _bc(self) -> _RenderBC:
+        """Brightness/contrast render params, honoring the 'Auto checkbox overrides
+        slider' rule for each pair: contrast Auto (cb_bright) zeroes the manual
+        contrast; brightness Auto (cb_bright_auto) zeroes the manual offset."""
+        contrast = 0 if self.cb_bright.isChecked() else int(self.contrast_slider.value())
+        if self.cb_bright_auto.isChecked():
+            return _RenderBC(0, contrast, 1)
+        return _RenderBC(int(self._brightness_offset), contrast, 0)
+
+    def _refresh_auto_bc_sliders(self, path):
+        """Park the greyed-out Contrast / Brightness sliders on the value the Auto
+        pass actually applied to `path`, instead of leaving them at 0 while the
+        picture on screen is clearly stretched. Signals are blocked: no reload, no
+        cache invalidation.
+
+        DISPLAY ONLY for contrast. Both now pivot on the frame's black level, so the
+        operation matches — but the slider's gain tops out at ~3.9x while the
+        auto-stretch of a dim frame needs 5x and more, so the parked number saturates
+        at +127 and does not reproduce the picture. Unticking Auto therefore restores
+        the user's own value instead (see _on_contrast_auto_changed).
+
+        Brightness is display-only for the same reason of consistency: parking Auto's
+        offset as the backing value meant that ticking Auto on and off once replaced the
+        user's own brightness with Auto's (+99 on a typical frame) and there was no way
+        back to it. An Auto checkbox has to be undoable."""
+        vals = _auto_bc_get(path)
+        if not vals:
+            return
+        c = vals.get("contrast")
+        if c is not None and self.cb_bright.isChecked():
+            self.contrast_slider.blockSignals(True)
+            self.contrast_slider.setValue(int(c))
+            self.contrast_slider.blockSignals(False)
+        o = vals.get("offset")
+        if o is not None and self.cb_bright_auto.isChecked():
+            self.brightness_slider.blockSignals(True)
+            self.brightness_slider.setValue(int(o))
+            self.brightness_slider.blockSignals(False)
+
     def _on_brightness_slider_changed(self, value):
+        # Only user moves reach this (the Auto parking blocks signals), so this is the
+        # value to return to when Auto is switched back off.
         self._brightness_offset = value
+        self._brightness_manual = int(value)
         if not self.items or self.current_idx is None: return
-        self.cache = PixCache(CACHE_SIZE)
         self._inflight.clear(); self._want_display_req.clear()
         if not self._brightness_debounce.isActive():
             self._brightness_debounce.start(60)
@@ -10769,18 +13801,63 @@ class Viewer(QWidget):
     def _reset_brightness_slider(self):
         self.brightness_slider.setValue(0)
 
+    def _on_contrast_slider_changed(self, value):
+        # Only user moves reach this (the Auto parking blocks signals), so this is
+        # the value to return to when Auto is switched back off.
+        self._contrast_manual = int(value)
+        if not self.items or self.current_idx is None: return
+        self._inflight.clear(); self._want_display_req.clear()
+        if not self._brightness_debounce.isActive():
+            self._brightness_debounce.start(60)
+
+    def _reset_contrast_slider(self):
+        self.contrast_slider.setValue(0)
+
+    def _on_contrast_auto_changed(self):
+        # Auto-stretch overrides the manual Contrast slider → grey it out while on.
+        on = self.cb_bright.isChecked()
+        self.contrast_slider.setEnabled(not on)
+        self.btn_contrast_reset.setEnabled(not on)
+        if not on:
+            # Auto off → the manual slider is live again, so it must not be left on
+            # the number Auto parked there (see _refresh_auto_bc_sliders): that is a
+            # different operation with the same gain and it wrecks the picture.
+            self.contrast_slider.blockSignals(True)
+            self.contrast_slider.setValue(int(self._contrast_manual))
+            self.contrast_slider.blockSignals(False)
+        self._on_brightness_changed()
+
+    def _on_bright_auto_changed(self):
+        # Auto-level overrides the manual Brightness slider → grey it out while on.
+        on = self.cb_bright_auto.isChecked()
+        self.brightness_slider.setEnabled(not on)
+        self.btn_brightness_reset.setEnabled(not on)
+        if not on:
+            # Auto off → put back the user's own offset, not the one Auto parked on the
+            # greyed-out slider (see _refresh_auto_bc_sliders). Same rule as contrast.
+            self._brightness_offset = int(self._brightness_manual)
+            self.brightness_slider.blockSignals(True)
+            self.brightness_slider.setValue(int(self._brightness_manual))
+            self.brightness_slider.blockSignals(False)
+        self._on_brightness_changed()
+
     def _apply_brightness_debounced(self):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
             self._redraw_all_cams_in_place()
             return
         idx = self.current_idx
         self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
 
-    def _load_raw_arr(self, path) -> "np.ndarray | None":
-        """Load image as raw float32 grayscale array (no stretch/gradient)."""
-        img = load_image_scaled(path, 99999, False, gradient_id=0, brightness_offset=0)
+    def _load_raw_arr(self, path, max_side: int = 99999) -> "np.ndarray | None":
+        """Load image as raw float32 grayscale array (no stretch/gradient).
+
+        max_side scales exactly like the displayed frame's pipeline, so a
+        reference decoded here matches the current frame pixel-for-pixel: an
+        identical frame subtracts to 0 instead of leaving resample/normalization
+        residue (which happened when the reference was kept at full resolution
+        while the shown frame was downscaled)."""
+        img = load_image_scaled(path, max_side, False, gradient_id=0, brightness_offset=0)
         if img.isNull():
             return None
         if img.format() != QImage.Format.Format_Grayscale8:
@@ -10791,39 +13868,89 @@ class Viewer(QWidget):
         return np.frombuffer(ptr, dtype=np.uint8).reshape(
             img.height(), img.bytesPerLine())[:, :img.width()].copy().astype(np.float32)
 
+    def _ref_arr_for(self, max_side: int) -> "np.ndarray | None":
+        """Single-cam subtraction reference decoded at the current display size.
+        Cached per max_side so the same ndarray (stable id() for cache keys) is
+        reused across frame loads until a new reference is set."""
+        if self._ref_path is None:
+            return None
+        arr = self._ref_scaled.get(max_side)
+        if arr is None:
+            arr = self._load_raw_arr(self._ref_path, max_side)
+            if arr is not None:
+                self._ref_scaled[max_side] = arr
+        return arr
+
+    def _cam_ref_arr_for(self, cam_i: int, max_side: int) -> "np.ndarray | None":
+        """Per-camera subtraction reference decoded at the current display size."""
+        if cam_i >= len(self._cam_ref_paths) or self._cam_ref_paths[cam_i] is None:
+            return None
+        cache = self._cam_ref_scaled[cam_i]
+        arr = cache.get(max_side)
+        if arr is None:
+            arr = self._load_raw_arr(self._cam_ref_paths[cam_i], max_side)
+            if arr is not None:
+                cache[max_side] = arr
+        return arr
+
     def _set_reference_frame(self):
-        if self.current_idx is None or not self.items: return
+        # Multi-cam takes its reference from each camera's OWN frame (_cam_current_idx),
+        # so it must not be gated on the shared timeline's current_idx — that gate made
+        # "Set ref" a silent no-op whenever the merged index wasn't set yet.
+        if self._is_multi_cam():
+            if not self._cam_items or not any(self._cam_items):
+                return
+        elif self.current_idx is None or not self.items:
+            return
 
         if self._is_multi_cam():
             # Per-camera reference: store for all currently selected cameras
             selected_indices = self._multi_grid.selected_cam_indices()
             if not selected_indices:
-                return
-            # Referenční timestamp z aktuální pozice (shared items = kamera 0)
-            ref_ts = self.items[self.current_idx].ts_ns if self.items and self.current_idx < len(self.items) else None
+                # Cameras start UNSELECTED after every scan, so this was the normal
+                # case: the click returned here silently — no badge, no reference, and
+                # Subtraction then rendered every frame unchanged ("nothing happened").
+                # Same fallback the Reset-zoom button uses: offer to cover all cameras.
+                reply = QMessageBox.question(
+                    self, "Set reference",
+                    "No cameras selected — set the reference for ALL cameras?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                selected_indices = [i for i in range(len(self._cam_items))
+                                    if self._cam_items[i]]
+                if not selected_indices:
+                    return
             set_names = []
             for cam_i in selected_indices:
                 if cam_i >= len(self._cam_items) or not self._cam_items[cam_i]:
                     continue
                 cam_items = self._cam_items[cam_i]
-                # Najdi snímek s timestampem nejbližším ref_ts
-                if ref_ts is not None:
-                    cam_ts_arr = [it.ts_ns for it in cam_items]
-                    import bisect
-                    pos = bisect.bisect_left(cam_ts_arr, ref_ts)
-                    if pos >= len(cam_items):
-                        pos = len(cam_items) - 1
-                    elif pos > 0 and abs(cam_ts_arr[pos-1] - ref_ts) < abs(cam_ts_arr[pos] - ref_ts):
-                        pos -= 1
-                    cam_idx = pos
-                else:
-                    cam_idx = min(self.current_idx, len(cam_items) - 1)
+                # Reference the frame this camera is ACTUALLY showing right now. In
+                # multi-cam mode the per-camera sliders drive _cam_current_idx, not the
+                # shared self.current_idx (which stays pinned to the load-time last
+                # frame). Reading current_idx here captured the reference at the wrong
+                # time and — via the redisplay below — yanked every panel ~1 h forward
+                # onto that stale timestamp (often a dark/no-beam frame, so the cameras
+                # looked like they went blank).
+                cam_idx = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else 0
+                cam_idx = max(0, min(cam_idx, len(cam_items) - 1))
                 it = cam_items[cam_idx]
                 try:
-                    arr = self._load_raw_arr(it.path)
-                    if arr is None:
-                        continue
-                    self._cam_ref_images[cam_i] = arr
+                    # Record the reference by PATH only. The actual subtraction
+                    # reference is decoded lazily at DISPLAY size and cached in
+                    # _cam_ref_scaled (see _cam_ref_arr_for). The previous
+                    # _load_raw_arr here did a blocking FULL-RES read of the frame
+                    # from the network share on the UI thread, once per selected
+                    # camera per click — multi-second stalls once the SMB session
+                    # had been open a while — purely to fill _cam_ref_images, which
+                    # is only ever tested for existence. A truthy flag is enough and
+                    # also frees the ~20 MB/cam full-res array that was held for nothing.
+                    self._cam_ref_images[cam_i] = True
+                    self._cam_ref_paths[cam_i]  = it.path
+                    self._cam_ref_scaled[cam_i] = {}   # re-decode at display size, drop stale sizes
                     ts_str = fmt_prague_full_from_ns(it.ts_ns)
                     self._multi_grid.set_cam_ref_status(cam_i, f"Ref: {ts_str}")
                     self._cam_caches[cam_i] = PixCache(self._cam_cache_size(len(self._cam_caches)))
@@ -10832,60 +13959,134 @@ class Viewer(QWidget):
                 except Exception:
                     pass
             if set_names:
-                self.lbl_ref_status.setText(f"Ref: {', '.join(set_names)}")
-            if self.current_idx is not None:
-                self._display_multicam_index(self.current_idx, update_slider=False)
+                self._set_ref_status(f"Ref: {', '.join(set_names)}")
+            else:
+                QMessageBox.information(
+                    self, "Set reference",
+                    "No camera has a loaded frame yet — wait for the scan to finish.")
+                return
+            # Redraw each camera at ITS OWN current frame (don't snap to the shared
+            # timeline) so setting a reference never moves the view. Reset the load
+            # gate first: if a camera was already wedged (in-flight slots never freed), the
+            # redraw below would set _cam_want but never relaunch, so the panel
+            # would stay blank while the info panel shows 'Ref set' — exactly the
+            # "reference is set but nothing on the cameras" symptom, which also made
+            # a second Set-Reference appear to do nothing.
+            self._reset_cam_pipeline()
+            self._redraw_all_cams_in_place()
             return
 
-        # Single-camera path
+        # Single-camera path — record the reference by PATH only; the subtraction
+        # reference is decoded lazily at display size and cached in _ref_scaled
+        # (see _ref_arr_for). Avoids a blocking full-res SMB read on the UI thread
+        # (_ref_image was only ever written here, never read anywhere).
         it = self.items[self.current_idx]
-        try:
-            arr = self._load_raw_arr(it.path)
-            if arr is None:
-                QMessageBox.warning(self, "Reference", "Could not load reference image."); return
-            self._ref_image = arr
-            self.lbl_ref_status.setText(f"Ref: {fmt_prague_full_from_ns(it.ts_ns)}")
-            self.cache = PixCache(CACHE_SIZE)
-            self._inflight.clear(); self._want_display_req.clear()
-            if self.current_idx is not None:
-                self._display_exact_index(
-                    self.current_idx, self.items[self.current_idx].ts_ns,
-                    update_slider=True)
-        except Exception as e:
-            QMessageBox.warning(self, "Reference", f"Could not load reference: {e}")
-
-    def _on_subtract_changed(self):
-        if self._is_multi_cam():
-            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
-            if self.current_idx is not None:
-                self._display_multicam_index(self.current_idx, update_slider=False)
-            return
+        self._ref_path = it.path
+        self._ref_scaled = {}   # re-decode at display size, drop stale sizes
+        ts_str = fmt_prague_full_from_ns(it.ts_ns)
+        self._set_ref_status(f"Ref: {ts_str}")
+        # Badge on the image itself — the 1-camera layout is the multi-camera layout
+        # with one camera, so it gets the same green "Ref: <timestamp>" strip the
+        # tiles get via set_cam_ref_status (only the info-panel text was set here).
+        self.img_view.set_cam_ref_text(f"Ref: {ts_str}")
         self.cache = PixCache(CACHE_SIZE)
         self._inflight.clear(); self._want_display_req.clear()
+        # Drop any pending display gate so a load still in flight from the previous
+        # reference/settings can't strand the pipeline (frozen slider/arrows).
+        self._display_load_key = None; self._deferred_display = None
+        if self.current_idx is not None:
+            self._display_exact_index(
+                self.current_idx, self.items[self.current_idx].ts_ns,
+                update_slider=True)
+
+    def _has_reference(self) -> bool:
+        """True when at least one subtraction reference is set for the current mode."""
+        if self._is_multi_cam():
+            return any(p is not None for p in getattr(self, "_cam_ref_paths", []))
+        return getattr(self, "_ref_path", None) is not None
+
+    def _set_ref_status(self, text: str):
+        """Reference line in the INFO panel, in its normal (grey) style."""
+        self.lbl_ref_status.setStyleSheet(_REF_STATUS_STYLE)
+        self.lbl_ref_status.setText(text)
+
+    def _refresh_ref_warning(self):
+        """Subtraction without a reference renders every frame unchanged and produces
+        no statistics. Say so in the INFO panel instead of leaving a checkbox that
+        silently does nothing (the reference is per camera, and cameras start
+        unselected, so this is easy to hit)."""
+        if self.cb_subtract.isChecked() and not self._has_reference():
+            self.lbl_ref_status.setStyleSheet(_REF_WARN_STYLE)
+            self.lbl_ref_status.setText("⚠ Subtraction on, no reference — click 'Set ref'")
+            self.lbl_diff_stats.setText("")
+        elif not self._has_reference():
+            self._set_ref_status("")
+
+    def _on_subtract_changed(self):
+        """Subtraction on/off, Diff threshold or Offset changed.
+
+        The pixmap caches are NOT dropped: sub_threshold, sub_offset, gradient_id
+        and bc are all part of the render key, so a stale entry can never be served
+        for the wrong settings. Wiping them forced a fresh decode of every camera
+        off the share for every single spinbox step — the multi-second stall after
+        typing an Offset — and threw away the frames needed to step back to the
+        previous value. Keeping them makes a value you have already used instant.
+        """
+        self._refresh_ref_warning()
+        # The preview layer is unusable while Subtraction is on, so _proxy_enabled now
+        # depends on this checkbox: pause the sweep when it goes on, resume when off.
+        # This slot is also wired to the threshold/offset spinboxes, hence the
+        # changed-only variant.
+        self._proxy_sync_enabled()
+        if self._is_multi_cam():
+            self._reset_cam_pipeline()
+            # Re-render each camera at ITS OWN frame (per-cam sliders), like
+            # _set_reference_frame and the brightness/gradient handlers do.
+            # _display_multicam_index snapped every panel to the shared timeline's
+            # current_idx instead — the load-time frame — so toggling Subtraction
+            # jumped the cameras off the frames the reference had been taken from.
+            self._redraw_all_cams_in_place()
+            return
+        self._inflight.clear(); self._want_display_req.clear()
+        self._display_load_key = None; self._deferred_display = None
         if not self.items or self.current_idx is None: return
         self._display_exact_index(
             self.current_idx, self.items[self.current_idx].ts_ns,
             update_slider=True)
 
+    def _on_preload_preview_changed(self):
+        on = self.cb_preload_preview.isChecked()
+        self._ui_state["preload_preview"] = on
+        self._save_ui_state()
+        self._proxy_was_enabled = self._proxy_enabled()
+        if on:
+            self._proxy_kick()
+        else:
+            # Turning it off is an explicit "stop spending memory on this", unlike the
+            # temporary pauses in _proxy_kick — so free the decoded frames too.
+            self._proxy_cancel(drop=True)
+
     def _on_brightness_changed(self):
+        # Caches are keyed on bc/brighten, so they stay — see _on_subtract_changed.
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
+            self._reset_cam_pipeline()
             self._redraw_all_cams_in_place()
             return
-        self.cache = PixCache(CACHE_SIZE)
         self._inflight.clear(); self._want_display_req.clear()
+        self._display_load_key = None; self._deferred_display = None
         idx = self.current_idx
         self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
 
     def _on_gradient_changed(self):
+        # Caches are keyed on gradient_id, so they stay — see _on_subtract_changed.
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._cam_caches = [PixCache(self._cam_cache_size(len(self._cam_caches))) for _ in self._cam_caches]
+            self._reset_cam_pipeline()
             self._redraw_all_cams_in_place()
             return
-        self.cache = PixCache(CACHE_SIZE)
         self._inflight.clear(); self._want_display_req.clear()
+        self._display_load_key = None; self._deferred_display = None
         idx = self.current_idx
         self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
         if getattr(self, '_sc_preview_pixmap', None) is not None:
@@ -10920,13 +14121,883 @@ class Viewer(QWidget):
         if ips < 1500: return 20
         return 40
 
+    def _navigating(self) -> bool:
+        """The user is moving through frames under their own control.
+
+        Deliberately does NOT include _per_cam_scrubbing_cam: _on_per_cam_pressed now sets
+        _is_scrubbing itself, and wheel / arrow / groove moves on a per-camera row have no
+        sliderPressed at all — settled navigation deserves full tile quality. Use
+        _proxy_is_moving where the sweep's own scheduling is concerned."""
+        return bool(self._is_scrubbing or self._is_playing)
+
+    def _cam_tile_side(self, n_cams: int) -> int:
+        """Decode size for one multi-cam tile, scaled by how fast the user is moving.
+
+        The base size is what the tile can actually show; while the user is sweeping
+        through frames, a smaller render is worth far more than detail nobody can see at
+        that speed, and it is N cameras' worth of saving per position. Settling brings the
+        full tile size back (the refine pass re-renders every tile), so quality is only
+        traded away while it cannot be perceived. Live mode never comes here — it decodes
+        arriving frames at native resolution."""
+        base = self._cam_tile_base_side(n_cams)
+        if not self._navigating():
+            return base
+        # With Subtraction on there is no preview to fall back on, so every position is a
+        # real read + decode + subtract — and max_side is part of both the pixmap key and
+        # the reference key, so changing it mid-drag guarantees a cache miss AND a
+        # re-decoded reference at the new size. Keep one size for the whole gesture.
+        if self.cb_subtract.isChecked():
+            return base
+        ips = self._last_motion_ips
+        if ips < 8:            # roughly a frame a second: full tile quality
+            return base
+        if ips < 40:
+            return max(240, int(base * 0.7))
+        return max(180, int(base * 0.45))
+
+    def _cam_tile_base_side(self, n_cams: int) -> int:
+        return 400 if n_cams >= 3 else (500 if n_cams == 2 else self._scrub_side)
+
+    def _cam_tile_sides(self, n_cams: int) -> list:
+        """Every size _cam_tile_side can return. The subtraction reference has to be
+        decoded at each of them up front (_prewarm_drag_references): a size that first
+        appears mid-drag would otherwise decode its reference synchronously on the GUI
+        thread, inside a 33 ms scrub tick, once per camera."""
+        base = self._cam_tile_base_side(n_cams)
+        return sorted({base, max(240, int(base * 0.7)), max(180, int(base * 0.45))})
+
     def _current_decode_side(self):
         ips = self._last_motion_ips
         if self._is_playing:
             return PLAY_MAX_SIDE_SLOW if (self._play_is_exact() and ips < 40) else PLAY_MAX_SIDE_FAST
         if self._is_scrubbing:
-            return self._scrub_side if ips < 40 else FAST_SCRUB_MAX_SIDE
+            # Strictly the size latched at press time. A background history merge can
+            # change _scrub_side mid-drag, but honouring that would ask for a size whose
+            # subtraction reference _prewarm_drag_references never decoded — i.e. a
+            # blocking share read inside the tick. One drag keeps its size; the new cap
+            # applies from the next press.
+            latched = self._drag_side
+            zoomed = getattr(self.img_view, "_zoom_norm", None) is not None
+            # Track 0, not the whole viewer: this branch only ever decides the SINGLE-cam
+            # view's size (the tiles go through _cam_tile_side), so another camera's
+            # coverage is none of its business.
+            if self._proxy_usable() and self._proxy_covered_track(0) and not zoomed:
+                # The preview repaints the drag from memory, so this size only decides
+                # the quality of the occasional real load. Keep it LATCHED: it is part
+                # of the pixmap-cache key, so switching it by drag speed made every
+                # speed change a guaranteed cache miss and re-decoded the subtraction
+                # reference at the new size, synchronously on the GUI thread.
+                return latched
+            # No preview to fall back on (Subtraction on, zoomed in, preload off) — every
+            # step is a real read + decode + subtract, so keep the old speed-based
+            # downscale. _on_slider_pressed pre-warms the reference at BOTH sizes, so
+            # crossing the threshold still never decodes a reference mid-drag.
+            return latched if ips < 40 else FAST_SCRUB_MAX_SIDE
+        # Live mode, sitting on a single frame (not scrubbing / not playing): decode at
+        # native resolution so the shown frame zooms and saves crisply. Live frames arrive
+        # at only a few Hz, so one full-res decode per frame doesn't hurt responsiveness —
+        # scrubbing and playback above keep the fast downscaled path, and _prefetch_idle
+        # stays on _scrub_side.
+        if self._online_mode:
+            return FULL_RES_SIDE
         return self._scrub_side
+
+    # ============================================== WHOLE-WINDOW PREVIEW (PROXY)
+    # With live mode OFF the whole loaded time window is preloaded at
+    # PROXY_MAX_SIDE, so moving the slider repaints from memory at screen rate
+    # instead of queueing one share read + decode per position (which is what made
+    # the picture run behind the slider on long windows). The frame the user stops
+    # on is then re-rendered at native resolution by _refine_current_frame.
+    def _proxy_enabled(self) -> bool:
+        """Live mode wants the newest frame at full quality, not a preloaded
+        window — and it must not compete with the preview for share bandwidth."""
+        cb = getattr(self, "cb_preload_preview", None)
+        if cb is not None and not cb.isChecked():
+            return False
+        # Live mode only. _auto_follow used to disqualify the preview as well, but
+        # auto-follow with live mode OFF has nothing to follow — no frames arrive — while
+        # the flag can easily still be set (it is only cleared when the user drags). That
+        # combination silently disabled the entire preview layer for a browsing session.
+        if self._online_mode:
+            return False
+        # Preview frames are small grayscale and can never stand in for a subtraction
+        # render (see _proxy_usable), so sweeping the share to build them while
+        # Subtraction is on is pure cost with no payoff.
+        sub = getattr(self, "cb_subtract", None)
+        if sub is not None and sub.isChecked():
+            return False
+        return True
+
+    def _proxy_frame_bytes(self, lists: list) -> int:
+        """Bytes one decoded preview frame costs, measured rather than assumed.
+
+        Preview frames are raw grayscale at the source's bit depth (see load_proxy_gray),
+        so this is width*height of the downscaled frame times 1 or 2 bytes — and a camera
+        SMALLER than PROXY_MAX_SIDE is not downscaled at all, which is why guessing was
+        wrong by an order of magnitude either way. Uses a frame already decoded when there
+        is one; otherwise reads the image header only (no pixels) and computes the size the
+        sweep will produce."""
+        side = self._proxy_side()
+        for tr in self._proxy_tracks:
+            for arr in tr.frames.values():
+                if isinstance(arr, tuple):
+                    arr = arr[0]
+                if arr is not None and getattr(arr, "nbytes", 0):
+                    return int(arr.nbytes)
+        for items in lists:
+            if not items:
+                continue
+            try:
+                r, _buf, _ba = _open_reader(items[len(items) // 2].path)
+                sz = r.size()
+                if sz.isValid() and sz.width() > 0 and sz.height() > 0:
+                    w, h = sz.width(), sz.height()
+                    scale = max(w, h) / side
+                    if scale > 1.0:
+                        w, h = max(1, int(w / scale)), max(1, int(h / scale))
+                    # 1 byte/px unless raw uint16 storage was forced back on: a 16-bit
+                    # source is stored as 8-bit codes plus its (lo, hi) — see
+                    # load_proxy_gray — which is what makes a whole window fit.
+                    bpp = 1
+                    if not PROXY_STORE_8BIT and r.imageFormat() in (
+                            QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
+                        bpp = 2
+                    return max(1, w * h * bpp)
+            except Exception:
+                pass
+            break
+        return side * side * (1 if PROXY_STORE_8BIT else 2)   # conservative fallback
+
+    def _proxy_side(self) -> int:
+        """Decoded side of a preview frame, smaller when there are many cameras.
+
+        Justified by the app's own numbers rather than taste: at 12 cameras
+        _cam_tile_side returns max(180, 400*0.45) = 180 px during a fast drag, so a 128 px
+        preview is comparable to the real load it stands in for — while costing a ninth of
+        the RAM of a 224 px 16-bit frame, which is the difference between sampling the
+        window and holding all of it."""
+        # Count cameras directly rather than going through _proxy_item_lists, which is gated
+        # on _is_multi_cam() and so reads as 1 track whenever _cam_names has not been filled
+        # in yet — that silently kept the largest size for every camera count.
+        n = (len(self._proxy_tracks) or len(self._cam_items or [])
+             or len(self._proxy_item_lists()) or 1)
+        if n <= 4:
+            return PROXY_MAX_SIDE
+        if n <= 8:
+            return PROXY_SIDE_MANY
+        return PROXY_SIDE_MOST
+
+    def _proxy_budget_per_track(self, lists: list) -> int:
+        """How many preview frames each track may plan, from the RAM budget.
+
+        The user's ask is "load the whole time window into memory". That is exactly what
+        this does when the window fits; when it does not, the budget decides the sampling
+        density instead of a fixed count deciding it. A 12-camera hour at 3.3 Hz is ~140k
+        frames — no budget holds that at useful quality, so the honest behaviour is an even
+        sample across the whole window (coarse→fine, see _proxy_plan) rather than a
+        fully-loaded prefix and nothing after it.
+
+        Two ceilings, not one. RAM is the obvious limit, but SWEEP TIME is usually the real
+        one: a preview frame costs a whole file read off the share (setScaledSize saves
+        decode CPU, not I/O), and the sweep runs at ~100 frames/s. 27k frames is 4.5
+        minutes; 180k frames is half an hour, at any RAM figure. Planning frames that will
+        not be read for 25 minutes is not coverage, so the time budget caps the plan and the
+        window is sampled evenly instead — the same honest degradation, chosen deliberately.
+
+        And the step is SNAPPED: `step` is ceil(want/per), so being a handful of frames over
+        budget jumped it from 2 to 3 and threw away a third of the RAM. Overshooting the
+        budget by a few percent to halve the sampling gap is always the better trade."""
+        n_tracks = max(1, len(lists))
+        per_frame = self._proxy_frame_bytes(lists)
+        ram_frames = int(PROXY_RAM_BUDGET_MB * 1024 * 1024 / max(1, per_frame))
+        time_frames = int(PROXY_SWEEP_BUDGET_S * PROXY_SWEEP_FPS_EST)
+        total = max(n_tracks * 60, min(ram_frames, time_frames, PROXY_MAX_FRAMES))
+        # Never plan more than the window actually holds — a small window should be
+        # preloaded completely, not padded.
+        want = max((len(it) for it in lists), default=0)
+        per = max(60, min(total // n_tracks, want))
+        if want <= per:
+            return per
+        k = max(1, math.ceil(want / per))
+        while k > 1 and want / (k - 1) <= per * (1.0 + PROXY_STEP_SNAP_SLACK):
+            k -= 1
+        return max(60, math.ceil(want / k))
+
+    def _proxy_item_lists(self) -> list:
+        """One item list per preview track: per camera in multi-cam, else the
+        single-camera timeline."""
+        if self._is_multi_cam() and self._cam_items:
+            return self._cam_items
+        return [self.items] if self.items else []
+
+    def _proxy_start(self):
+        """(Re)build the preview for the frames currently loaded.
+
+        Incremental: already-decoded frames are kept, so a Refresh or the
+        live-cap backfill only pays for the frames it actually added."""
+        self._proxy_topup.stop()
+        self._proxy_resume.stop()
+        if not self._proxy_enabled():
+            self._proxy_cancel(drop=True)
+            return
+        lists = self._proxy_item_lists()
+        if not lists:
+            self._proxy_cancel(drop=True)
+            return
+        # Stop the running sweep but keep what it already decoded.
+        self._proxy_stop.set()
+        self._proxy_pool.clear()
+        self._proxy_stop = threading.Event()
+        self._proxy_gen += 1
+        self._proxy_inflight = 0
+        self._proxy_rr = -1
+        self._proxy_holds = 0
+        old = self._proxy_tracks if len(self._proxy_tracks) == len(lists) else []
+        budget = self._proxy_budget_per_track(lists)
+        # _proxy_side depends on the camera COUNT, and a track is reused whenever the count
+        # matches — but the count also changes the side, so a reused track can be holding
+        # frames decoded at the wrong size. They would render at the wrong scale, so drop
+        # them; the sweep re-reads at the new size.
+        side_now = self._proxy_side()
+        self._proxy_tracks = []
+        self._proxy_total = 0
+        self._proxy_done  = 0
+        for i, items in enumerate(lists):
+            tr = old[i] if old else _ProxyTrack()
+            if tr.side and tr.side != side_now:
+                tr.frames.clear()
+                tr._sorted = []
+                tr._dirty = True
+                tr._cur_gap = 0
+                self._proxy_render_cache.clear()
+            tr.side = side_now
+            tr.planned, tr.ts_gap, tr.step = _proxy_plan(items, budget)
+            tr.pos = 0
+            # The plan is recomputed for the grown item list, so indices from the
+            # previous one mean nothing. Frames are kept (keyed by ts_ns); only the
+            # "already dispatched" bookkeeping starts over.
+            tr.taken = set()
+            tr.focus_g0, tr.focus_d = -1, 0
+            tr.failed = 0
+            self._proxy_tracks.append(tr)
+            self._proxy_total += len(tr.planned)
+        # Seed the focus point BEFORE the first pump. _proxy_focus_jobs returns nothing
+        # while _proxy_cursor_ts_ns is 0, and that is only written by _set_info_for /
+        # _per_cam_display_one — i.e. by a DISPLAY, which on a freshly opened window has
+        # not happened yet. So the opening seconds of every sweep, the ones a user who
+        # opens a folder and immediately drags depends on, got no cursor-first ordering
+        # at all and filled the far end of the window instead.
+        if not self._proxy_cursor_ts_ns:
+            try:
+                if self.items and self.current_idx is not None:
+                    i = max(0, min(int(self.current_idx), len(self.items) - 1))
+                    self._proxy_cursor_ts_ns = self.items[i].ts_ns
+                elif self.items:
+                    self._proxy_cursor_ts_ns = self.items[-1].ts_ns
+            except Exception:
+                pass
+        self._proxy_pump()
+        self._proxy_update_status()
+
+    def _proxy_cancel(self, drop: bool = False):
+        """Stop building. `drop` also frees the decoded frames — used when live
+        mode takes over or a different folder is opened."""
+        self._proxy_topup.stop()
+        self._proxy_resume.stop()
+        self._proxy_stop.set()
+        self._proxy_pool.clear()
+        self._proxy_gen += 1
+        self._proxy_inflight = 0
+        self._proxy_total = 0
+        self._proxy_done  = 0
+        if drop:
+            self._proxy_tracks = []
+            self._proxy_render_cache.clear()
+        self._proxy_update_status()
+
+    def _proxy_kick(self, delay_ms: int = 600):
+        """Start the preload shortly after the caller's own display load, so the
+        first frame the user is waiting for is not queued behind the sweep."""
+        # Keep _proxy_sync_enabled's shadow accurate here rather than only in that
+        # method: live mode and auto-follow call this directly, and a shadow that drifted
+        # from reality turned the next _proxy_sync_enabled() into a silent no-op.
+        self._proxy_was_enabled = self._proxy_enabled()
+        if self._proxy_was_enabled:
+            self._proxy_topup.start(delay_ms)
+        else:
+            # Stop building but KEEP the decoded frames. This used to drop them, so
+            # ticking Subtraction (or a brief live-mode detour) threw away a sweep that
+            # had cost minutes of share reads and forced a full re-sweep afterwards.
+            # Only a genuinely new dataset drops them — those call sites pass drop=True
+            # themselves (_start_online_mode, _hard_reset_runtime).
+            self._proxy_cancel()
+
+    def _proxy_sync_enabled(self):
+        """Re-evaluate whether the preview may run, acting only when the answer actually
+        changed. Callers fire per spinbox step, and an unconditional kick would bump
+        _proxy_gen and discard every in-flight batch on each one."""
+        if self._proxy_enabled() == self._proxy_was_enabled:
+            return
+        self._proxy_kick()   # updates the shadow itself
+
+    def _proxy_schedule_topup(self):
+        """New frames arrived with live mode off (Refresh) — extend the preview,
+        debounced so a burst of arrivals restarts the sweep only once."""
+        if self._proxy_enabled() and self._proxy_tracks:
+            self._proxy_topup.start(PROXY_TOPUP_MS)
+
+    def _proxy_focus_jobs(self, tr, items, want: int) -> list:
+        """Undecoded plan frames closest to the moment the user is looking at.
+
+        The global coarse→fine order treats the whole window as equally urgent, so the
+        stretch under the slider was filled at 1/N of the sweep's rate and a drag into a
+        fresh part of the window had nothing to paint from for minutes. Frames are picked
+        outwards from the cursor on the plan's own grid, so this only re-orders the plan —
+        the same frames are read, just the useful ones first."""
+        cur_ts = self._proxy_cursor_ts_ns
+        if not cur_ts or not items or not tr.planned:
+            return []
+        step = max(1, tr.step)
+        n = len(items)
+        # Cursor → item index → nearest grid point of the plan.
+        lo, hi = 0, n - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if items[mid].ts_ns < cur_ts:
+                lo = mid + 1
+            else:
+                hi = mid
+        g0 = lo // step
+        # Keep the OLD centre while the cursor is still inside the stretch this scan has
+        # already cleared: everything in there is known to be taken, so re-centring only
+        # buys a re-walk of thousands of taken grid points — once per scrub tick, which is
+        # exactly when the GUI thread cannot afford it. Re-centre when the cursor leaves.
+        # (focus_g0 starts at -1 with focus_d 0, so the first call always centres.)
+        if abs(g0 - tr.focus_g0) > tr.focus_d:
+            tr.focus_g0, tr.focus_d = g0, 0
+        g0 = tr.focus_g0
+        jobs = []
+        d = tr.focus_d
+        scanned = 0
+        while d < PROXY_FOCUS_GRID:
+            if scanned >= PROXY_FOCUS_SCAN_MAX:
+                tr.focus_d = d      # resume here next call; the plan walk covers the rest
+                return jobs
+            scanned += 1
+            for idx in ((g0 * step,) if d == 0
+                        else ((g0 + d) * step, (g0 - d) * step)):
+                if not (0 <= idx < n) or idx in tr.taken:
+                    continue
+                ts_ns = items[idx].ts_ns
+                if ts_ns in tr.frames:
+                    continue
+                tr.taken.add(idx)
+                jobs.append((ts_ns, items[idx].path))
+                if len(jobs) >= want:
+                    tr.focus_d = d
+                    return jobs
+            d += 1
+        tr.focus_d = d
+        return jobs
+
+    def _proxy_next_batch(self):
+        """Next (track index, [(ts_ns, path), …]) batch to decode, round-robin over
+        the tracks so every camera's preview fills in at the same rate."""
+        n_tracks = len(self._proxy_tracks)
+        if n_tracks == 0:
+            return None
+        lists = self._proxy_item_lists()
+        if len(lists) != n_tracks:
+            # The camera set changed under the sweep. Just returning strands it: with
+            # nothing dispatched and nothing in flight, no path re-arms _proxy_resume, so
+            # the sweep never restarts and "Preloading preview… NN %" sticks forever.
+            self._proxy_kick(200)
+            return None
+        for _ in range(n_tracks):
+            self._proxy_rr = (self._proxy_rr + 1) % n_tracks
+            tr    = self._proxy_tracks[self._proxy_rr]
+            items = lists[self._proxy_rr]
+            if tr.pos >= len(tr.planned):
+                continue
+            # Alternate cursor-first with the global coarse→fine walk. Cursor-first alone
+            # fills the neighbourhood at FULL plan density before it ever touches the far
+            # end of the window — so a drag across the WHOLE window (which is what users
+            # do) still found nothing to paint out there. Alternating keeps a usable
+            # coarse layer growing everywhere while the stretch under the handle gets
+            # dense; whichever source is exhausted simply yields to the other.
+            # The counter must live on the TRACK. A single counter for the whole sweep
+            # advanced in lockstep with _proxy_rr — this loop returns on the first track
+            # that yields work — so with an EVEN number of cameras the parity welded
+            # itself to the camera index: half the cameras only ever got cursor-first
+            # batches and never advanced tr.pos at all. Measured on 4 cameras: cam1/cam3
+            # 21.2 paints/s and no refusals, cam0/cam2 6.9 paints/s with ~360 refusals and
+            # 200 share reads each, because their decoded frames were one dense island
+            # 988 s wide in a 7200 s window — and current_gap(), being the mean spacing of
+            # the decoded set, then reported a 3.0 s tolerance while the frames actually
+            # wanted were a median 4.2 s away. Per track: all four at 21.1, no refusals.
+            #
+            # WHILE MOVING, though, the alternation is wrong: only frames within a second
+            # or two of the handle can be painted in the next few hundred ms, so half the
+            # reads went somewhere that could not help. The coarse layer out in the rest of
+            # the window is what the IDLE sweep is for. So: strict cursor-first during a
+            # drag or playback, alternation when idle — and if the neighbourhood is already
+            # exhausted, fall through to the plan walk, which preserves the property that
+            # whichever source runs dry yields to the other (and with it the per-track
+            # parity fix above).
+            if self._proxy_is_moving():
+                jobs = self._proxy_focus_jobs(tr, items, PROXY_FOCUS_BATCH)
+                if jobs:
+                    return self._proxy_rr, jobs
+            else:
+                tr.focus_turn += 1
+                jobs = (self._proxy_focus_jobs(tr, items, PROXY_BATCH)
+                        if tr.focus_turn & 1 else [])
+            while tr.pos < len(tr.planned) and len(jobs) < PROXY_BATCH:
+                idx = tr.planned[tr.pos]
+                tr.pos += 1
+                if idx >= len(items):
+                    self._proxy_done += 1
+                    continue
+                if idx in tr.taken:
+                    continue   # dispatched by the cursor-first pass; counted on arrival
+                ts_ns = items[idx].ts_ns
+                if ts_ns in tr.frames:
+                    self._proxy_done += 1
+                    continue
+                tr.taken.add(idx)
+                jobs.append((ts_ns, items[idx].path))
+            if jobs:
+                return self._proxy_rr, jobs
+        return None
+
+    def _proxy_is_moving(self) -> bool:
+        """The user is actively moving through frames, by any of the three routes.
+
+        One predicate so _proxy_pump, _proxy_next_batch and _proxy_motion_tol cannot
+        disagree about it — they each open-coded this test, and the per-camera sliders
+        were missing from some of them."""
+        return bool(self._is_scrubbing or self._is_playing
+                    or self._per_cam_scrubbing_cam >= 0)
+
+    def _proxy_idle_grace(self):
+        """A drag / playback just ENDED — hold the full-speed sweep for a moment so the
+        frame the user landed on wins the first reads.
+
+        Called only from the interaction edges (_on_slider_released,
+        _on_per_cam_released, stop()). _proxy_pump used to set this itself on every
+        60 ms tick of an ongoing drag, which meant the deadline was never reached."""
+        self._proxy_grace_until = time.monotonic() + PROXY_IDLE_GRACE_S
+        self._proxy_resume.start(max(50, int(PROXY_IDLE_GRACE_S * 1000)))
+
+    def _proxy_pump(self):
+        if not self._proxy_tracks or self._proxy_stop.is_set():
+            return
+        # Hold the sweep whenever the user is waiting on the share: dragging, playing
+        # back, or simply with a display load still in flight. Its readers hit the SAME
+        # share as the frame under the cursor, so letting PROXY_WORKERS of them run
+        # through a drag is what made positions the preview had not reached yet take
+        # seconds to appear — and letting them run through playback is why Play looked
+        # frozen while the file names kept scrolling.
+        #
+        # Re-armed on a timer rather than only from _on_slider_released: an in-flight
+        # display load has no "released" event to resume from, so without this the sweep
+        # would stall for good the first time it was held.
+        # Dragging / playing back: yield unconditionally and for as long as it lasts, and
+        # do NOT count these holds. Counting them meant a 60 s playback left the counter
+        # at ~150, so the escape hatch below was already spent the instant playback
+        # stopped — and it fired while the frame the user landed on was still loading,
+        # queueing six fresh preview reads in front of it. Exactly backwards.
+        #
+        # Standing down COMPLETELY was wrong, though: with the sweep stopped the drag has
+        # nothing but one blocking share read per camera to paint from — the "one image a
+        # second" case — and the preview it is waiting for never gets built, because the
+        # user drags in bursts and the grace below eats what is left. Since the sweep now
+        # reads the cursor's neighbourhood first (_proxy_focus_jobs), those reads ARE the
+        # frames the drag is about to need, so a couple of them are allowed to run.
+        if self._proxy_is_moving():
+            self._proxy_holds = 0
+            # The grace is deliberately NOT refreshed here. It used to be, which made it
+            # unreachable: re-armed every 60 ms for the whole gesture, a user dragging in
+            # bursts (i.e. any user) never accumulated PROXY_IDLE_GRACE_S of quiet, so the
+            # full-speed sweep never ran and _on_slider_released's "let it run" pump found
+            # 1.5 s still on the clock and simply re-armed the wait. The grace now starts
+            # at the interaction EDGES — _on_slider_released, _on_per_cam_released, stop()
+            # — which is the "measured from the END of the interaction" it always claimed.
+            self._proxy_dispatch(PROXY_DRAG_WORKERS)
+            self._proxy_resume.start(PROXY_DRAG_MS)
+            return
+        grace_left = self._proxy_grace_until - time.monotonic()
+        if grace_left > 0:
+            self._proxy_resume.start(max(50, int(grace_left * 1000)))
+            return
+        # An in-flight display load is only advisory: this app has a history of keys
+        # stranded in _inflight (a task pulled from the pool queue never emits), and a
+        # stranded key must not mean the preview never builds again. So yielding to it is
+        # capped — after PROXY_HOLD_MAX consecutive holds the sweep proceeds anyway.
+        if self._inflight and self._proxy_holds < PROXY_HOLD_MAX:
+            self._proxy_holds += 1
+            self._proxy_resume.start(PROXY_HOLD_MS)
+            return
+        self._proxy_holds = 0
+        # One batch per worker plus a small spare, so workers do not idle from finishing a
+        # batch until the GUI thread gets round to _on_proxy_batch — but no more than that:
+        # a deep backlog is share bandwidth already committed to the sweep, and it is spent
+        # after the user grabs the slider, when the hold above can no longer help.
+        self._proxy_dispatch(PROXY_WORKERS + PROXY_QUEUE_SPARE)
+
+    def _proxy_dispatch(self, limit: int):
+        """Keep up to `limit` preview reads in flight."""
+        gen = self._proxy_gen
+        while self._proxy_inflight < limit:
+            job = self._proxy_next_batch()
+            if job is None:
+                break
+            track_i, jobs = job
+            self._proxy_inflight += 1
+            self._proxy_pool.start(_ProxyTask(gen, track_i, jobs,
+                                              self._proxy_signals, self._proxy_stop,
+                                              side=self._proxy_side()))
+
+    def _on_proxy_batch(self, gen: int, track_i: int, results: list):
+        if gen != self._proxy_gen:
+            return
+        self._proxy_inflight = max(0, self._proxy_inflight - 1)
+        if 0 <= track_i < len(self._proxy_tracks):
+            tr = self._proxy_tracks[track_i]
+            for ts_ns, arr in results:
+                self._proxy_done += 1
+                if arr is not None:
+                    tr.add(ts_ns, arr)
+                else:
+                    tr.failed += 1   # see _ProxyTrack.failed / _proxy_covered_track
+        self._proxy_update_status()
+        self._proxy_pump()
+
+    def _proxy_status_text(self) -> str:
+        if not self._proxy_total or self._proxy_done >= self._proxy_total:
+            return ""
+        pct = int(100 * self._proxy_done / self._proxy_total)
+        return f"Preloading preview… {pct} %"
+
+    def _proxy_update_status(self):
+        if hasattr(self, "lbl_meta_status"):
+            self.lbl_meta_status.setText(self._proxy_status_text())
+
+    def _proxy_covered(self) -> bool:
+        """True once the sweep has actually decoded (nearly) the whole window.
+
+        _proxy_tracks is filled by _proxy_start BEFORE a single frame is read, so
+        "tracks exist" said nothing about whether the preview can carry a drag. Every
+        caller that used _proxy_usable as "the preview will repaint this drag from
+        memory" was therefore wrong for the entire sweep: _current_decode_side kept the
+        latched 900 px instead of dropping to 320 on a fast drag, and _apply_scrub
+        applied its tight 3-load cap — while _proxy_try_paint still refused every
+        position. Worst of both worlds, and exactly the "slider is stuck" report.
+
+        Measured on the DECODED frames, not on the sweep's progress counters: those are
+        reset by every _proxy_start (Refresh, top-up) and only advance while the pump is
+        running, which it is not during a drag or playback — so a fully built preview
+        would have read as "not covered" exactly when it was needed."""
+        tracks = [t for t in self._proxy_tracks if t.planned]
+        if not tracks:
+            return False
+        # A FRACTION of the tracks, not all of them. Requiring every camera meant one
+        # camera with a handful of unreadable files (or simply the slowest share folder)
+        # held the entire viewer in the not-covered state — which latches the big scrub
+        # renders and _apply_scrub's tight load cap for every OTHER camera too. That is
+        # the worst-of-both-worlds state this gate exists to avoid, reached by the gate
+        # itself.
+        ok = sum(1 for i, t in enumerate(self._proxy_tracks) if t.planned
+                 and self._proxy_covered_track(i))
+        return ok >= max(1, int(PROXY_COVERED_TRACK_FRAC * len(tracks)))
+
+    def _proxy_covered_track(self, i: int) -> bool:
+        """Whether ONE track's preview is built. Single-cam callers want this directly
+        (there is only ever track 0), and _proxy_covered aggregates it."""
+        if not (0 <= i < len(self._proxy_tracks)):
+            return False
+        tr = self._proxy_tracks[i]
+        if not tr.planned:
+            return True
+        # The plan cursor first. tr.frames is keyed by ts_ns and never pruned, while
+        # _proxy_start recomputes tr.planned for the grown item list — and because
+        # _proxy_plan's step is ceil(n/budget), len(planned) SHRINKS each time n
+        # crosses a multiple of the budget (n=1990 → 996 planned, n=2010 → 671). So
+        # after a Refresh, frames left over from the previous plan could outnumber
+        # 98 % of the new one while the new plan was barely started: covered() said
+        # yes, _proxy_try_paint refused every one of the newly added frames, and
+        # dragging into them — which is where users go after a Refresh — landed back
+        # in the tight-cap/latched-size state this gate exists to avoid.
+        # tr.pos is reset by _proxy_start and never regresses, and _proxy_next_batch
+        # skips already-decoded entries without any I/O, so it catches up at once.
+        if tr.pos < len(tr.planned):
+            return False
+        # A fraction, not an exact count: a frame that fails to decode (a file caught
+        # mid-write, a truncated PNG) never lands in tr.frames. Those are DISCOUNTED
+        # rather than merely tolerated — with a flat 98 % a camera whose folder holds
+        # 3 % half-written files could never be covered, however long the sweep ran.
+        reachable = max(1, len(tr.planned) - tr.failed)
+        return len(tr.frames) >= PROXY_COVERED_FRAC * reachable
+
+    def _proxy_usable(self) -> bool:
+        """Preview frames are raw grayscale at PROXY_MAX_SIDE, so they cannot stand
+        in when the render depends on full-size pixels (subtraction) or when the
+        user is zoomed in and would just see a blurry crop."""
+        if not self._proxy_tracks or not self._proxy_enabled():
+            return False
+        if self.cb_subtract.isChecked():
+            return False
+        return True
+
+    def _proxy_motion_tol(self, track_i: int) -> int:
+        """How far from the asked-for moment a preview frame may be RIGHT NOW.
+
+        While the user is moving, whatever the preview already holds beats a frozen
+        picture: the alternative is one blocking share read per camera, i.e. a frame a
+        second. So the accepted distance follows the density decoded so far and tightens
+        with every pass of the sweep — the finished-plan ts_gap only applied once the
+        sweep was practically complete, which is why dragging through a window that was
+        still preloading painted nothing at all.
+
+        Standing still keeps the strict gap: there is no motion to carry, the exact
+        frame is worth waiting for, and _refine_current_frame fetches it anyway."""
+        if not self._proxy_is_moving():
+            return 0
+        if not (0 <= track_i < len(self._proxy_tracks)):
+            return 0
+        tr = self._proxy_tracks[track_i]
+        return min(tr.current_gap(),
+                   PROXY_MOTION_TOL_MAX * max(1, tr.ts_gap),
+                   int(PROXY_MOTION_TOL_MAX_S * 1e9))
+
+    def _proxy_render(self, track_i: int, ts_ns: int, arr,
+                      brighten: int, bc, gradient_id: int) -> "QPixmap | None":
+        """Apply the current render settings to one small preview array."""
+        key = ("proxy", track_i, ts_ns, brighten, bc, gradient_id)
+        pm = self._proxy_render_cache.get(key)
+        if pm is not None and not pm.isNull():
+            return pm
+        lo, hi, mx = 0.0, _FULL_SCALE_16, _FULL_SCALE_16
+        if isinstance(arr, tuple):
+            arr, lo, hi, mx = arr
+        if arr is None or arr.ndim != 2 or arr.size == 0:
+            return None
+        h, w = arr.shape
+        if arr.dtype == np.uint16:
+            # Legacy / PROXY_STORE_8BIT = False path. Same two mappings, in the same order,
+            # as load_image_scaled's 16-bit branch — so a preview paint and the refined
+            # render of the same frame cannot disagree about the tones.
+            if brighten:
+                arr8 = _stretch_arr_f(arr.astype(np.float32))
+            else:
+                arr8 = _norm16_to8_full_scale(arr)
+            img = QImage(arr8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+        elif hi > 255.0:
+            # 8-bit storage of a 16-bit source. The stored codes span p0.1..p99.9 of the
+            # real 16-bit pixels (load_proxy_gray took those percentiles in the worker), so
+            # `orig = lo + code * (hi - lo) / 255` recovers the 16-bit value to within one
+            # code. Both render modes are then a 256-entry LUT over that:
+            #   Auto ON  → the p0.5..p99.5 stretch _stretch_arr_f would have applied.
+            #   Auto OFF → the absolute full-scale mapping _norm16_to8_full_scale applies.
+            # Same two mappings, in the same order, as load_image_scaled's 16-bit branch, so
+            # a preview paint and the refined render of the same frame agree.
+            #
+            # Doing it as a LUT is also what took ~1 ms per tile per tick off the GUI
+            # thread: the percentile pass used to run on every render-cache miss, i.e. on
+            # every new position, which at 12 cameras was ~12 ms of a 33 ms budget spent
+            # recomputing a constant.
+            # Invert load_proxy_gray's two-segment ramp: 0..KNEE is lo..hi, KNEE+1..255 is
+            # hi..mx. One straight line through all 256 would put the highlight tail on the
+            # picture's scale and render every saturated pixel at the p99.9 level.
+            orig = np.empty(256, dtype=np.float32)
+            k = PROXY_KNEE_CODE
+            orig[:k + 1] = lo + np.arange(k + 1, dtype=np.float32) * ((hi - lo) / k)
+            n_tail = 255 - k
+            if mx > hi and n_tail > 0:
+                orig[k + 1:] = hi + (np.arange(1, n_tail + 1, dtype=np.float32)
+                                     * ((mx - hi) / n_tail))
+            else:
+                orig[k + 1:] = hi
+            if brighten:
+                # p0.5/p99.5 of the STORED distribution, weighted by how many pixels sit at
+                # each code — a plain percentile of 0..255 would describe the LUT, not the
+                # picture.
+                counts = np.bincount(arr.ravel(), minlength=256).astype(np.float64)
+                cum = np.cumsum(counts)
+                total = cum[-1] if cum[-1] > 0 else 1.0
+                i_lo = int(np.searchsorted(cum, 0.005 * total))
+                i_hi = int(np.searchsorted(cum, 0.995 * total))
+                s_lo, s_hi = orig[min(i_lo, 255)], orig[min(i_hi, 255)]
+                if s_hi <= s_lo:
+                    s_lo, s_hi = orig[0], orig[255]
+                if s_hi <= s_lo:
+                    lut = np.zeros(256, dtype=np.uint8)
+                else:
+                    lut = np.clip((orig - s_lo) / (s_hi - s_lo) * 255.0,
+                                  0, 255).astype(np.uint8)
+            else:
+                lut = np.clip(orig * (255.0 / _FULL_SCALE_16), 0, 255).astype(np.uint8)
+            arr8 = lut[arr]
+            img = QImage(arr8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+        else:
+            img = QImage(arr.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+            if brighten:
+                img = _apply_stretch(img)
+        img = _apply_bc(img, contrast=bc.contrast, auto_bright=bc.auto, offset=bc.offset)
+        if gradient_id >= 2:
+            img = _apply_lut(img, GRADIENTS[GRADIENT_NAMES[gradient_id]])
+        pm = QPixmap.fromImage(img)
+        if pm.isNull():
+            return None
+        self._proxy_render_cache.put(key, pm)
+        return pm
+
+    def _proxy_try_paint(self, idx: int) -> bool:
+        """Paint the preloaded preview nearest to item `idx`. True means the view
+        was updated and the caller can skip the full-size load entirely."""
+        if not self._proxy_usable() or not self.items:
+            return False
+        # Track 0 is camera 0 in multi-cam, not the merged timeline — the tiles go
+        # through _proxy_try_paint_cam instead.
+        if self._is_multi_cam():
+            return False
+        if getattr(self.img_view, "_zoom_norm", None) is not None:
+            return False
+        if not (0 <= idx < len(self.items)):
+            return False
+        # Same single tolerance as _proxy_try_paint_cam — see the comment there.
+        tr  = self._proxy_tracks[0]
+        want_ts = self.items[idx].ts_ns
+        tol = max(tr.ts_gap, self._proxy_motion_tol(0))
+        got = tr.nearest(want_ts, tol)
+        if got is None:
+            self._diag_miss += 1
+            return False
+        ts_ns, arr = got
+        pm = self._proxy_render(0, ts_ns, arr,
+                                1 if self.cb_bright.isChecked() else 0,
+                                self._bc(), self.gradient_cb.currentIndex())
+        if pm is None:
+            self._diag_miss += 1
+            return False
+        self.img_view.set_pixmap(pm)
+        self._diag_prev += 1
+        # Say which frame this actually is. _set_info_for already wrote the readouts from
+        # the REQUESTED index (it runs before every call to this method), and the preview
+        # is sampled, so without this single-cam quietly claimed a moment it was not
+        # showing — exactly the bug _cam_note_painted was added to fix for the tiles.
+        if ts_ns != want_ts:
+            self._set_info_painted(ts_ns)
+        return True
+
+    def _proxy_try_paint_cam(self, cam_i: int, cam_frame_idx: int) -> bool:
+        """Same for one multi-cam tile."""
+        if not self._proxy_usable() or cam_i >= len(self._proxy_tracks):
+            return False
+        cam_items = self._cam_items[cam_i] if cam_i < len(self._cam_items) else []
+        if not (0 <= cam_frame_idx < len(cam_items)):
+            return False
+        iv = self._multi_grid.get_img_view(cam_i)
+        if iv is None or getattr(iv, "_zoom_norm", None) is not None:
+            return False
+        # ONE tolerance, computed once and used for BOTH the accept and the verdict.
+        # These were two different numbers: nearest() accepted anything within
+        # _proxy_motion_tol (minutes, on a plan that is still coarse) and the paint was
+        # then judged against tr.ts_gap (seconds). Every substituted neighbour therefore
+        # came out "stale", so during any drag over a partly-preloaded window every tile
+        # sat red and the colour carried no information at all. `nearest` widens whatever
+        # it is given to max(ts_gap, tol) — mirror that exactly.
+        tr  = self._proxy_tracks[cam_i]
+        tol = max(tr.ts_gap, self._proxy_motion_tol(cam_i))
+        got = tr.nearest(cam_items[cam_frame_idx].ts_ns, tol)
+        if got is None:
+            self._diag_miss += 1
+            return False
+        ts_ns, arr = got
+        enh = self._cam_enhance_on(cam_i)
+        pm = self._proxy_render(
+            cam_i, ts_ns, arr,
+            (1 if self.cb_bright.isChecked() else 0) if enh else 0,
+            self._bc() if enh else _RENDER_BC_NONE,
+            self.gradient_cb.currentIndex())
+        if pm is None:
+            self._diag_miss += 1
+            return False
+        iv.set_pixmap(pm)
+        self._diag_prev += 1
+        # Label the frame that was actually painted (ts_ns), NOT the one asked for: the
+        # preview is sampled, so `nearest` legitimately returns a neighbour, and labelling
+        # it with the requested timestamp made the tile claim a moment it was not showing.
+        self._cam_note_painted(cam_i, ts_ns, tol_ns=tol, preview=True)
+        return True
+
+    def _schedule_refine(self):
+        """The view is showing a preview — queue the full-quality re-render for
+        when the user settles. Restarting the timer on every move means it only
+        fires for the frame actually stopped on, never for ones passed over."""
+        self._refine_timer.start(PROXY_REFINE_MS)
+
+    def _refine_current_frame(self):
+        """Re-render the frame the user settled on at high quality, so it is at least as
+        crisp as it would be without the preview layer.
+
+        REFINE_MAX_SIDE for plain fit-to-window viewing; native when the pixels actually
+        matter (zoomed in, or Subtraction on — see the size choice below)."""
+        if self._online_mode or self._is_playing or not self.items:
+            return
+        if self.current_idx is None or not (0 <= self.current_idx < len(self.items)):
+            return
+        # Still dragging: a native-resolution decode is ~22 MB off the share and would
+        # occupy a loader thread the frame under the cursor needs. The single-camera
+        # path had no such guard, so the moment a drag left the preloaded range (which
+        # stops _schedule_refine from being restarted) the armed timer fired mid-drag.
+        # Re-arm and refine once the user has actually settled.
+        if self._is_scrubbing or self._per_cam_scrubbing_cam >= 0:
+            self._refine_timer.start(PROXY_REFINE_MS)
+            return
+        if self._is_multi_cam():
+            # Tiles are small; their normal per-camera decode size IS the good
+            # quality here, and 12 native-res renders would cost gigabytes.
+            # Independent per-cam mode: every camera sits on its own time, so
+            # re-displaying the merged index would drag them all to one moment.
+            if self._per_cam_master_idx < 0 and self._per_cam_rows:
+                return
+            self._display_multicam_index(self.current_idx, update_slider=False)
+            return
+        idx = self.current_idx
+        # Fit-to-window viewing does not benefit from a 2560×2160 render: the view is at
+        # most ~1100 px tall on this hardware, so REFINE_MAX_SIDE already looks identical
+        # while costing a quarter of the pixels — and, more to the point, it skips a
+        # ~22 MB QPixmap.fromImage on the GUI thread after EVERY slider release, which was
+        # a visible hitch that v2.5.5 (no refine pass at all) did not have. Zoomed in the
+        # user really is looking at individual pixels, so that case stays native.
+        # Subtraction stays native too: _update_diff_stats reports pixel counts, mean and
+        # max difference for whatever render is on screen, and downscaling averages pixels
+        # — so refining at 1600 would quietly change numbers people write down.
+        zoomed = getattr(self.img_view, "_zoom_norm", None) is not None
+        side = FULL_RES_SIDE if (zoomed or self.cb_subtract.isChecked()) \
+               else REFINE_MAX_SIDE
+        brighten    = 1 if self.cb_bright.isChecked() else 0
+        gradient_id = self.gradient_cb.currentIndex()
+        bc          = self._bc()
+        ref = self._ref_arr_for(side) if self.cb_subtract.isChecked() else None
+        sub_thr, sub_off = self._sub_params(ref)
+        key = (self._ck(idx), side, brighten, gradient_id, bc,
+               id(ref) if ref is not None else None, sub_thr, sub_off)
+        cached = self.cache.get(key)
+        if cached is not None and not cached.isNull():
+            self.img_view.set_pixmap(cached)
+            self._diag_cach += 1
+            self._update_diff_stats(key)
+            return
+        self._display_req_id += 1
+        self._want_display_req[key] = self._display_epoch
+        if key not in self._inflight:
+            self._inflight.add(key)
+            self.load_pool.start(LoadTask(
+                self._gen, self._display_req_id, idx, self.items[idx].path,
+                side, brighten, gradient_id, self.load_signals,
+                bc, ref, sub_thr, sub_off, key=key))
 
     # ================================================================ SLIDER <-> TIME
     def _slider_to_time_ns(self, v):
@@ -10955,22 +15026,45 @@ class Viewer(QWidget):
         if i >= len(self.ts_list): return len(self.ts_list) - 1
         return i - 1 if (t - self.ts_list[i-1]) <= (self.ts_list[i] - t) else i
 
+    def _set_info_painted(self, ts_ns: int):
+        """Correct the single-cam timestamp readouts to the frame ACTUALLY on screen.
+
+        _set_info_for writes them from the REQUESTED index and runs before every paint,
+        so when the preview substitutes its nearest preloaded neighbour the readouts named
+        a frame that was not being shown. The "~" prefix marks it as the nearest preloaded
+        frame rather than the exact one — the single-cam counterpart of the tiles' blue
+        "~HH:MM:SS.mmm" label. Only called when the two actually differ; the settle
+        re-render (_refine_current_frame) goes back through _set_info_for and clears it.
+
+        The energy text is left as _set_info_for computed it: it belongs to the requested
+        shot, and the "~" is what says the picture may be a neighbour of it."""
+        if self._is_multi_cam():
+            return
+        txt = "~" + fmt_prague_full_from_ns(ts_ns)
+        energy_text = getattr(self, "_info_energy_text", "") or ""
+        self.lbl_prague_time.setText(
+            f"Prague: {txt}\n{energy_text}" if energy_text else f"Prague: {txt}")
+        self.lbl_date.setText(f"Date: {fmt_prague_date_from_ns(ts_ns)}")
+        self.img_view.cam_ts_text = txt
+        self.img_view.update()
+
     def _set_info_for(self, idx, axis_time_ns):
         it = self.items[idx]
+        # Every display path comes through here, so this is where the preview sweep
+        # learns which part of the window to fill first (_proxy_focus_jobs).
+        self._proxy_cursor_ts_ns = it.ts_ns
         if self._is_multi_cam() and self._cam_items:
             self.lbl_filename.setText("")   # scan progress label already shows per-cam counts
             self.lbl_index.setText(f"{idx+1} / {len(self.items)} (merged)")
-            self.lbl_meta_status.setText("")
+            self.lbl_meta_status.setText(self._proxy_status_text())
         else:
             self.lbl_filename.setText(f"File: {it.path.name}")
             self.lbl_index.setText(f"{idx+1} / {len(self.items)}")
-            # Warn when a PNG lacks imgMaxValue metadata: it is still shown (auto-normalized
-            # to its own peak), but absolute brightness is not comparable between frames.
-            # _read_img_max_value_cached caches per folder, so this is cheap.
-            if it.path.suffix.lower() == ".png" and _read_img_max_value_cached(it.path) is None:
-                self.lbl_meta_status.setText("⚠ No imgMaxValue metadata — auto-normalized")
-            else:
-                self.lbl_meta_status.setText("")
+            # No metadata warning any more: 16-bit frames are normalized on the
+            # camera's absolute full scale, which needs no tEXt tag and is always
+            # comparable between frames (see _norm16_to8_full_scale). The slot now
+            # carries the preview-preload progress, which auto-hides when done.
+            self.lbl_meta_status.setText(self._proxy_status_text())
         self.lbl_axis_time.setText(f"Axis: {fmt_hhmmss_ms_from_ns(axis_time_ns)}")
         if self._real_ts_list and idx < len(self._real_ts_list):
             real_ts = self._real_ts_list[idx]
@@ -10982,6 +15076,7 @@ class Viewer(QWidget):
                 f"Prague: {fmt_prague_full_from_ns(real_ts)}\n{energy_text}")
         else:
             self.lbl_prague_time.setText(f"Prague: {fmt_prague_full_from_ns(real_ts)}")
+        self.lbl_date.setText(f"Date: {fmt_prague_date_from_ns(real_ts)}")
         self.img_view.energy_text = energy_text
         self.img_view.update()
 
@@ -10991,6 +15086,7 @@ class Viewer(QWidget):
             self.img_view.cam_label_text = _strip_cam_name(cam_name)
             self.img_view.cam_ts_text = fmt_prague_full_from_ns(real_ts)
             self.img_view.update()
+        self._info_energy_text = energy_text
 
         # Live replay: update pointing panel to show only points up to current timestamp.
         # Skip when navigating by clicking a graph point (would just redraw what's already shown).
@@ -11008,11 +15104,21 @@ class Viewer(QWidget):
 
     # ================================================================ SCAN
     def _hard_reset_runtime(self):
-        for t in [self.play_timer, self.scrub_timer, self._prefetch_debounce]:
+        self._proxy_cancel(drop=True)
+        self._refine_timer.stop()
+        for t in [self.play_timer, self.scrub_timer, self._prefetch_debounce,
+                  self._nav_timer]:
             try:
                 if t.isActive(): t.stop()
             except: pass
         self._is_playing = False; self._is_scrubbing = False; self.pending_slider = None
+        # Keyed by camera index, and the camera set is about to change (see
+        # _build_per_cam_sliders).
+        self._nav_pending.clear(); self._nav_frame.clear(); self._nav_cursor_ts = 0
+        # Both scrub flags gate _proxy_pump and _refine_current_frame; leaving this one
+        # set would stall the preview sweep and the full-res refine with nothing able to
+        # resume either.
+        self._per_cam_scrubbing_cam = -1
         self.play_time_ns = None; self.target_idx = None
         self._display_load_key = None; self._deferred_display = None
         self._reset_motion_tracking()
@@ -11035,11 +15141,35 @@ class Viewer(QWidget):
         self.current_idx = None
         self.lbl_prague_time.setText("Prague: —"); self.lbl_axis_time.setText("Axis: —")
         self.lbl_index.setText("0 / 0")
+        self.lbl_date.setText("Date: —")
         self.cache = PixCache(CACHE_SIZE); self._display_req_id = 0
         self._inflight.clear(); self._want_display_req.clear()
         self.img_view.cam_label_text = ""
         self.img_view.cam_ts_text = ""
+        # A new scan means the old reference frame belongs to a different dataset —
+        # drop it exactly like setup_multi_cam drops the per-camera references, so the
+        # badge and the actual subtraction reference can never disagree.
+        self._ref_path = None
+        self._ref_scaled = {}
+        self._cam_diff_stats = {}
+        self.img_view.set_cam_ref_text("")
+        if hasattr(self, "lbl_ref_status"):
+            # Subtraction may still be checked from the previous dataset — keep the
+            # "no reference" warning visible instead of a blank line.
+            self._refresh_ref_warning()
+        if hasattr(self, "lbl_diff_stats"):
+            self.lbl_diff_stats.setText("")
         self.img_view.clear()
+        # Clear stale Spatial Contrast preview/overlay from whatever camera was
+        # shown before — it belongs to that old camera, not the one being scanned in.
+        if hasattr(self, '_sc_preview_lbl'):
+            self._sc_preview_lbl.hide()
+            self._sc_preview_pixmap = None
+        if hasattr(self, '_sc_exclusion_mask'):
+            self._sc_exclusion_mask = None
+            self._sc_exclusion_path = None
+        if hasattr(self, 'img_view'):
+            self.img_view.sc_topn_points_norm = None
         for w in [self.slider, self.btn_save, self.btn_save_range,
                 self.btn_play, self.btn_stop, self.btn_prev, self.btn_next, self.btn_set_a,
                 self.btn_set_b, self.btn_clear_marks, self.btn_cal_circle, self.btn_cal_square,
@@ -11092,6 +15222,7 @@ class Viewer(QWidget):
         """Show newest image found so far before the full scan finishes."""
         if gen != self._gen: return
         if self.current_idx is not None: return  # already displaying something
+        if not self._in_ts_windows(item.ts_ns): return   # outside the picked window
         # Minimal setup so we can decode and show this single item
         self.items = [item]
         self.ts_list = [item.ts_ns]
@@ -11102,11 +15233,12 @@ class Viewer(QWidget):
         max_side = self._current_decode_side()
         brighten = 1 if self.cb_bright.isChecked() else 0
         gradient_id = self.gradient_cb.currentIndex()
-        key = (0, max_side, brighten, gradient_id, self._brightness_offset, None, 0)
-        self._want_display_req[key] = req_id
+        bc = self._bc()
+        key = (0, max_side, brighten, gradient_id, bc, None, 0, 0)
+        self._want_display_req[key] = self._display_epoch
         self._inflight.add(key)
         task = LoadTask(gen, req_id, 0, item.path, max_side, brighten, gradient_id,
-                        self.load_signals, self._brightness_offset)
+                        self.load_signals, bc, key=key)
         self.load_pool.start(task)
 
     def _on_scan_status(self, gen, text):
@@ -11122,6 +15254,22 @@ class Viewer(QWidget):
         self._scan_task = None; self.prog.setVisible(False)
         self.lbl_scan_progress.setText(""); self.btn_cancel_scan.setVisible(False)
         self.lbl_filename.setText("File: scan cancelled.")
+
+    def _in_ts_windows(self, ts_ns: int) -> bool:
+        """True when the frame belongs to the picked time window(s). Always True
+        when no window is set (single-folder / file-list loads)."""
+        wins = self._ts_windows
+        if not wins:
+            return True
+        return any(s <= ts_ns < e for s, e in wins)
+
+    def _filter_to_ts_windows(self, items: list) -> list:
+        """Drop frames outside the picked windows. Archive folders are hourly, so
+        a minute-precise From/To (and a per-day selection) can only be honoured
+        here, on the scanned items."""
+        if not self._ts_windows:
+            return items
+        return [it for it in items if self._in_ts_windows(it.ts_ns)]
 
     def _choose_axis(self, folder_axis, ts_min, ts_max):
         if folder_axis is not None:
@@ -11148,7 +15296,7 @@ class Viewer(QWidget):
         if gen != self._gen: return
         self._scan_task = None; self.prog.setVisible(False)
         self.lbl_scan_progress.setText(""); self.btn_cancel_scan.setVisible(False)
-        self.items = items
+        self.items = self._filter_to_ts_windows(items)
         if not self.items:
             self.lbl_filename.setText("File: no images found."); self.tickbar.set_axis(0, 0); return
         self.ts_list = [it.ts_ns for it in self.items]
@@ -11169,7 +15317,7 @@ class Viewer(QWidget):
             self.axis_min_ns, self.axis_max_ns = self._choose_axis(folder_axis, ts_min, ts_max)
             # Discrete mode: pokud snímků je málo a osa je příliš velká (různé dny),
             # přepni na index-based osu kde každý snímek má stejnou vzdálenost
-            if self._discrete_mode and n <= 200:
+            if self._discrete_mode and n <= TICKBAR_DISCRETE_MAX:
                 self.axis_min_ns = ts_min
                 self.axis_max_ns = ts_max
                 self.tickbar.discrete_ticks = self.ts_list[:]
@@ -11191,6 +15339,7 @@ class Viewer(QWidget):
         self.btn_pointing_live.setEnabled(True)
         self._sc_set_enabled(True)
         self._btn_auto_follow.setEnabled(True)
+        self._refresh_live_btn_style()
         self.btn_set_ref.setEnabled(True)
         self._update_range_ui(); self._sync_overlay_checkboxes_from_iv(self.img_view); self.img_view.update()
         pending_online = getattr(self, '_pending_online_mode', False)
@@ -11231,10 +15380,93 @@ class Viewer(QWidget):
                 last_idx = len(self.items) - 1
                 self._display_exact_index(last_idx, self.items[last_idx].ts_ns, update_slider=True)
 
+        # A different camera was just scanned in — if Spatial Contrast had a
+        # result showing, refresh it now so it reflects the new camera instead
+        # of lingering with the previous one's numbers/preview.
+        if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
+                and hasattr(self, '_run_spatial_contrast')):
+            self._run_spatial_contrast()
+
+        # Preload the whole window at preview quality (no-op in live mode).
+        self._proxy_kick()
+
+    def _overlay_base_pixmap(self) -> "QPixmap | None":
+        """Native-resolution render of the current single-cam frame, for the overlay-save
+        paths.
+
+        They used to paint onto `img_view._pix` — whatever happened to be on screen. That
+        is the scrub render (900 px), the settled refine (REFINE_MAX_SIDE), or, worst
+        case, a 224 px preview frame, so the exported *_overlay / *_annotated PNG silently
+        inherited the viewing resolution. All overlay geometry is normalised, so it draws
+        identically at any size; only the output resolution changes. Falls back to what is
+        on screen if the re-read fails, so saving never breaks."""
+        on_screen = self.img_view._pix
+        if self.current_idx is None or not self.items:
+            return on_screen.copy() if on_screen is not None and not on_screen.isNull() else None
+        idx = self.current_idx
+        if not (0 <= idx < len(self.items)):
+            return on_screen.copy() if on_screen is not None and not on_screen.isNull() else None
+        brighten = 1 if self.cb_bright.isChecked() else 0
+        ref = self._ref_arr_for(FULL_RES_SIDE) if self.cb_subtract.isChecked() else None
+        sub_thr, sub_off = self._sub_params(ref)
+        key = (self._ck(idx), FULL_RES_SIDE, brighten, self.gradient_cb.currentIndex(), self._bc(),
+               id(ref) if ref is not None else None, sub_thr, sub_off)
+        cached = self.cache.get(key)
+        if cached is not None and not cached.isNull():
+            return cached.copy()
+        bc = self._bc()
+        try:
+            # Same argument order LoadTask.run uses, so the export matches the render.
+            img = load_image_scaled(
+                self.items[idx].path, FULL_RES_SIDE, bool(brighten),
+                self.gradient_cb.currentIndex(), bc.offset, ref, sub_thr,
+                bc.contrast, bc.auto, sub_off)
+            if img is not None and not img.isNull():
+                pm = QPixmap.fromImage(img)
+                if not pm.isNull():
+                    return pm
+        except Exception:
+            pass
+        return on_screen.copy() if on_screen is not None and not on_screen.isNull() else None
+
+    def _prewarm_drag_references(self):
+        """Decode the subtraction reference(s) for every size the drag can request, at
+        press time, so no scrub tick ever blocks on a share read for a reference.
+
+        Multi-cam gets the same treatment as single-cam: its tiles subtract against
+        _cam_ref_arr_for at the per-camera display size, which was stalling the tick
+        exactly the same way."""
+        if not self.cb_subtract.isChecked():
+            return
+        if self._is_multi_cam():
+            # Every size _cam_tile_side can pick during the drag, for every camera.
+            n_cams = len(self._cam_items)
+            for side in self._cam_tile_sides(n_cams):
+                for cam_i in range(n_cams):
+                    self._cam_ref_arr_for(cam_i, side)
+            return
+        # Both sizes _current_decode_side can return for a single-cam drag.
+        self._ref_arr_for(self._drag_side)
+        self._ref_arr_for(FAST_SCRUB_MAX_SIDE)
+
     # ================================================================ SLIDER HANDLERS
     def _on_slider_pressed(self):
         self._is_scrubbing = True; self._prefetch_debounce.stop(); self._reset_motion_tracking()
+        # Drop what idle prefetch left queued, BEFORE stop() starts the load for the frame
+        # the drag begins on. _prefetch_idle can leave up to 22 keys in _inflight, and they
+        # count against _apply_scrub's cap, so the opening second of a drag could hit the
+        # cap on every tick and paint nothing — while the labels and the axis cursor kept
+        # advancing. _on_slider_released already clears these the same way.
+        self.load_pool.clear(); self._inflight.clear(); self._want_display_req.clear()
+        # Latch the decode size for the whole drag (see _current_decode_side) BEFORE
+        # stop(), which redisplays the current frame and would otherwise read the
+        # previous drag's latched size.
+        self._drag_side = self._scrub_side
         if self._is_playing: self.stop()
+        # Decode the subtraction reference(s) for every size the drag can ask for now:
+        # _ref_arr_for caches per max_side and decodes off the share synchronously, so a
+        # size that first appeared mid-drag stalled the 33 ms scrub tick on a network read.
+        self._prewarm_drag_references()
         self.pending_slider = self.slider.value()
         if not self.scrub_timer.isActive(): self.scrub_timer.start()
 
@@ -11244,12 +15476,28 @@ class Viewer(QWidget):
             return
         t = self._slider_to_time_ns(v)
         idx = self._time_to_nearest_index(t)
-        snapped = self._time_to_slider_value(self.items[idx].ts_ns)
+        ts = self.items[idx].ts_ns
+        snapped = self._time_to_slider_value(ts)
         if snapped != v:
             self.slider.blockSignals(True)
             self.slider.setValue(snapped)
             self.slider.blockSignals(False)
         self.pending_slider = snapped
+        # The axis cursor belongs to the SLIDER, not to the render pipeline. It used to
+        # be moved only from _apply_scrub, which runs on the 33 ms scrub timer and
+        # returns early on `idx == current_idx` and on the in-flight cap — so the big
+        # blue timestamp lagged the handle during a drag and froze outright whenever the
+        # loader was saturated. It is also the only update path for moves that never
+        # emit sliderPressed (wheel, arrow keys, clicking the groove), which left the
+        # bubble and the picture behind entirely. Setting it here makes it track the
+        # handle, and it is set from the SNAPPED frame's own timestamp, so it always
+        # reads the same moment as the label burned into the frame.
+        self.tickbar.set_cursor(ts)
+        if not self._is_scrubbing and not self._is_playing:
+            # Wheel / keyboard / groove-click: no press, no release, so nothing else
+            # would ever render this position. Debounced so holding a key does not
+            # queue a decode per repeat.
+            self._keynav_debounce.start(60)
 
     def _apply_scrub(self):
         if self.pending_slider is None or not self.items: return
@@ -11265,37 +15513,78 @@ class Viewer(QWidget):
             self.target_idx = idx
             self.play_time_ns = self.items[idx].ts_ns
             self._set_info_for(idx, self.play_time_ns)
+            self.tickbar.set_cursor(self.play_time_ns)
             self._display_multicam_index(idx, update_slider=False)
             return
 
+        prev_idx = self.current_idx
         self.current_idx = idx
         self.target_idx = idx
         self.play_time_ns = self.items[idx].ts_ns
         self._set_info_for(idx, self.play_time_ns)
+        self.tickbar.set_cursor(self.play_time_ns)
         self._pv_trigger_fetch()
 
-        max_side = FAST_SCRUB_MAX_SIDE if self._last_motion_ips >= 40 else self._scrub_side
+        max_side = self._current_decode_side()
         brighten = 1 if self.cb_bright.isChecked() else 0
         gradient_id = self.gradient_cb.currentIndex()
         subtract = self.cb_subtract.isChecked()
-        ref = self._ref_image if (subtract and self._ref_image is not None) else None
-        sub_thr = self.sub_threshold_sb.value() if (ref is not None) else 0
-        key = (idx, max_side, brighten, gradient_id, self._brightness_offset, id(ref) if ref is not None else None, sub_thr)
+        ref = self._ref_arr_for(max_side) if subtract else None
+        sub_thr, sub_off = self._sub_params(ref)
+        bc = self._bc()
+        key = (self._ck(idx), max_side, brighten, gradient_id, bc, id(ref) if ref is not None else None, sub_thr, sub_off)
 
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self.img_view.set_pixmap(cached)
+            self._diag_cach += 1
+            self._update_diff_stats(key)
+            return
+
+        # Live mode off: the whole window is preloaded at PROXY_MAX_SIDE, so repaint
+        # from memory and never touch the share while the slider is moving. The
+        # frame stopped on is re-rendered at native resolution by the refine timer.
+        if self._proxy_try_paint(idx):
+            self._schedule_refine()
+            return
+
+        # No preview for this position yet — fall back to a real load, but keep only a
+        # few decodes in flight: a fast drag over a long window would otherwise queue
+        # thousands of LoadTasks and the picture would run far behind the slider.
+        #
+        # The cap must match what the drag can fall back on. With the preview covering
+        # the window, 3 is right — the picture comes from memory anyway and these loads
+        # are just quality. WITHOUT it every position needs a real share read, and 3 (the
+        # old unconditional value) was permanently saturated on a slow share, so every
+        # tick returned here and the picture froze for the whole drag. load_pool has 8
+        # threads; let the drag use them, as v2.5.5 did with no cap at all.
+        # Zoom belongs in this test: _proxy_try_paint refuses every zoomed position, so
+        # "usable and covered" alone applied the tight cap to a drag that had no preview
+        # to fall back on — the worst-of-both-worlds state this gate exists to avoid.
+        # _current_decode_side already tests zoom the same way.
+        zoomed = getattr(self.img_view, "_zoom_norm", None) is not None
+        # Track 0: _apply_scrub returns above for multi-cam, so this is the single-cam
+        # timeline's own preview and nothing else's.
+        cap = 3 if (self._proxy_usable() and self._proxy_covered_track(0) and not zoomed) else 8
+        if len(self._inflight) >= cap and key not in self._inflight:
+            # Rewind current_idx so the NEXT 33 ms tick retries this position. Simply
+            # returning here — as this used to — left current_idx already advanced, so
+            # every following tick was swallowed by the `idx == self.current_idx` check
+            # above and no request for this frame was ever registered: the picture froze
+            # until the drag ended. That was the multi-second "stuck slider" whenever a
+            # drag entered a range the preview had not reached yet.
+            self.current_idx = prev_idx
             return
 
         self._display_req_id += 1
-        self._want_display_req[key] = self._display_req_id
+        self._want_display_req[key] = self._display_epoch
 
         if key not in self._inflight:
             self._inflight.add(key)
             self.load_pool.start(LoadTask(
                 self._gen, self._display_req_id, idx,
                 self.items[idx].path, max_side, brighten, gradient_id,
-                self.load_signals, self._brightness_offset, ref, sub_thr))
+                self.load_signals, bc, ref, sub_thr, sub_off, key=key))
 
     def _on_slider_released(self):
         if self.scrub_timer.isActive(): self.scrub_timer.stop()
@@ -11307,12 +15596,29 @@ class Viewer(QWidget):
         t = self._slider_to_time_ns(self.slider.value())
         idx = self._time_to_nearest_index(t)
         self._want_display_req.clear()
+        # Drop whatever the drag left queued: those decodes are for frames already
+        # scrolled past, and running them first delays the frame the user landed on.
+        # _inflight must be cleared with them — a runnable removed from the queue
+        # never emits, so its key would block that frame from ever loading again.
+        self.load_pool.clear()
+        self._inflight.clear()
+        self._display_load_key = None
+        self._deferred_display = None
         if self._is_multi_cam():
+            self._reset_cam_pipeline()
             self._display_multicam_index(idx, update_slider=False)
         else:
             self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=False)
+        # …then step up to native resolution once it is clear the user has stopped.
+        self._schedule_refine()
         self._schedule_prefetch_after_idle()
         self._reset_motion_tracking()
+        # The drag ran the sweep at PROXY_DRAG_WORKERS — let it go back to full speed,
+        # after a short grace so the frame just landed on wins the first reads. This used
+        # to be a bare _proxy_pump(), which was a no-op: the dragging branch had just
+        # re-armed a 1.5 s grace, so the pump found time still on the clock and only
+        # re-armed the wait. The grace belongs HERE, at the end of the interaction.
+        self._proxy_idle_grace()
 
     def _schedule_prefetch_after_idle(self):
         if not self._is_playing: self._prefetch_debounce.start(140)
@@ -11320,22 +15626,76 @@ class Viewer(QWidget):
     def _run_prefetch_after_idle(self):
         if not self.items or self.current_idx is None: return
         if self._is_scrubbing or self._is_playing: return
+        # Multi-cam never displays from self.cache — every tile has its own cache and reads
+        # from its own item list. Prefetching MERGED-timeline frames here therefore fired
+        # 2*PREFETCH_RADIUS_IDLE share reads after every settle whose results could not be
+        # shown by anything, competing with the tiles that were actually waiting. Measured
+        # at 40+ wasted reads per drag with 4 cameras.
+        if self._is_multi_cam(): return
         self._prefetch_idle(self.current_idx)
 
     # ================================================================ DISPLAY / LOADING
+    def _ck(self, idx: int) -> int:
+        """Absolute frame number of a self.items index — the cache-key identity.
+
+        Pixmap caches are keyed by index, but the live cap trims the oldest frames
+        (ONLINE_MAX_ITEMS), so the same index means a different frame after every
+        trim. At the cap len(self.items) stops growing and the NEWEST frame sits at
+        a fixed index forever: a plain idx key then hits the pixmap cached for the
+        previous frame and the live view freezes on it. Adding the running trim
+        count keeps every frame's key its own.
+
+        The counter only ever grows — a key issued before a restructure can never
+        be handed out again (see _merge_restored_history).
+        """
+        return idx + self._items_offset
+
+    def _cam_ck(self, cam_i: int, idx: int) -> int:
+        """_ck for a per-camera item list — each camera trims on its own clock."""
+        off = self._cam_offsets[cam_i] if cam_i < len(self._cam_offsets) else 0
+        return idx + off
+
+    def _cam_ck_idx(self, cam_i: int, ck) -> int:
+        """Inverse of _cam_ck — position in the CURRENT list, or negative/out of
+        range if that frame has since been trimmed away."""
+        if not isinstance(ck, int):
+            return -1
+        off = self._cam_offsets[cam_i] if cam_i < len(self._cam_offsets) else 0
+        return ck - off
+
+    def _bump_cam_offset(self, cam_i: int, n: int):
+        """Record that `n` frames fell off the front of camera cam_i's list."""
+        while len(self._cam_offsets) <= cam_i:
+            self._cam_offsets.append(0)
+        self._cam_offsets[cam_i] += n
+
+    def _invalidate_shared_ckeys(self, prev_len: int = 0):
+        """self.items was restructured (merge / rebuild), not just trimmed at the
+        front, so indices no longer mean what they did. Move the key space past
+        everything ever issued and drop the pixmaps those keys point at."""
+        self._items_offset += max(prev_len, len(self.items)) + 1
+        self.cache.clear()
+
+    def _invalidate_cam_ckeys(self, cam_i: int, prev_len: int = 0):
+        """_invalidate_shared_ckeys for one camera's item list."""
+        n = len(self._cam_items[cam_i]) if cam_i < len(self._cam_items) else 0
+        self._bump_cam_offset(cam_i, max(prev_len, n) + 1)
+        if cam_i < len(self._cam_caches):
+            self._cam_caches[cam_i].clear()
+
     def _load_or_cache(self, idx, max_side, brighten, req_id=0):
         gradient_id = self.gradient_cb.currentIndex()
-        brightness_offset = self._brightness_offset
+        bc = self._bc()
         subtract = self.cb_subtract.isChecked()
-        ref = self._ref_image if (subtract and self._ref_image is not None) else None
-        sub_thr = self.sub_threshold_sb.value() if (ref is not None) else 0
+        ref = self._ref_arr_for(max_side) if subtract else None
+        sub_thr, sub_off = self._sub_params(ref)
         ref_id = id(ref) if ref is not None else None
-        key = (idx, max_side, brighten, gradient_id, brightness_offset, ref_id, sub_thr)
+        key = (self._ck(idx), max_side, brighten, gradient_id, bc, ref_id, sub_thr, sub_off)
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull(): return cached
         if key not in self._inflight:
             self._inflight.add(key)
-            self.load_pool.start(LoadTask(self._gen, req_id, idx, self.items[idx].path, max_side, brighten, gradient_id, self.load_signals, brightness_offset, ref, sub_thr))
+            self.load_pool.start(LoadTask(self._gen, req_id, idx, self.items[idx].path, max_side, brighten, gradient_id, self.load_signals, bc, ref, sub_thr, sub_off, key=key))
         return None
 
     def _adaptive_index_step(self, target_idx):
@@ -11358,6 +15718,11 @@ class Viewer(QWidget):
 
     def _display_exact_index(self, idx, axis_time_ns, update_slider):
         if not (0 <= idx < len(self.items)): return
+        # Discrete navigation — the one thing that invalidates loads still in flight.
+        # Everything the user does deliberately funnels through here (slider release,
+        # Stop, arrow step, goto-timestamp, gradient / brightness change, scan finished),
+        # while scrubbing and playback deliberately do NOT bump it.
+        self._display_epoch += 1
         self.current_idx = idx; self.target_idx = idx; self.play_time_ns = axis_time_ns
         if update_slider:
             sv = self._time_to_slider_value(self.items[idx].ts_ns)
@@ -11428,19 +15793,24 @@ class Viewer(QWidget):
 
         t_ns = self.items[idx].ts_ns
         brighten_g  = 1 if self.cb_bright.isChecked() else 0
+        bc_g        = self._bc()
         gradient_id = self.gradient_cb.currentIndex()
         subtract    = self.cb_subtract.isChecked()
-        sub_thr     = self.sub_threshold_sb.value() if subtract else 0
         n_cams      = len(self._cam_items)
+        # Invariant across the loop and across this tick. Reading it once also stops two
+        # tiles from being cache-keyed at different sizes if the motion estimate moves
+        # while the loop is running.
+        max_side    = self._cam_tile_side(n_cams)
 
         for cam_i in range(n_cams):
             cam_items = self._cam_items[cam_i]
             if not cam_items:
                 continue
 
-            # Auto-stretch / brightness only on the selected camera(s)
+            # Auto-stretch / brightness / contrast only on the selected camera(s)
             enh      = self._cam_enhance_on(cam_i)
             brighten = brighten_g if enh else 0
+            bc       = bc_g if enh else _RENDER_BC_NONE
 
             # Find latest frame in this camera with ts_ns <= t_ns
             cam_ts = self._cam_ts[cam_i] if (hasattr(self, '_cam_ts') and cam_i < len(self._cam_ts)) else None
@@ -11455,104 +15825,404 @@ class Viewer(QWidget):
             if hasattr(self, '_cam_current_idx') and cam_i < len(self._cam_current_idx):
                 self._cam_current_idx[cam_i] = cam_idx
 
-            # Per-camera reference
-            ref = self._cam_ref_images[cam_i] if (subtract and cam_i < len(self._cam_ref_images)) else None
+            # Per-camera reference decoded at this display size (see _ref_arr_for)
+            ref = self._cam_ref_arr_for(cam_i, max_side) if subtract else None
             ref_id = id(ref) if ref is not None else None
-            effective_sub_thr = sub_thr if ref is not None else 0
+            effective_sub_thr, effective_sub_off = self._sub_params(ref)
 
-            if n_cams >= 3:
-                max_side = 400
-            elif n_cams == 2:
-                max_side = 500
-            else:
-                max_side = self._scrub_side
-
-            boff = self._brightness_offset if enh else 0
             cache = self._cam_caches[cam_i]
-            key = (cam_idx, max_side, brighten, gradient_id, boff, ref_id, effective_sub_thr)
+            ck = self._cam_ck(cam_i, cam_idx)
+            key = (ck, max_side, brighten, gradient_id, bc, ref_id,
+                   effective_sub_thr, effective_sub_off)
+            self._cam_set_shown_key(cam_i, key)
+            self._cam_note_target(cam_i, it.ts_ns)
             cached = cache.get(key)
             if cached is not None and not cached.isNull():
                 iv = self._multi_grid.get_img_view(cam_i)
                 if iv:
                     iv.set_pixmap(cached)
-                self._multi_grid.set_cam_timestamp(cam_i, fmt_hhmmss_ms_from_ns(it.ts_ns))
+                    self._diag_cach += 1
+                self._cam_note_painted(cam_i, it.ts_ns)
+                self._collect_cam_diff_stats(cam_i, key)   # label flushed after the loop
+                if cam_i < len(self._cam_want):
+                    self._cam_want[cam_i] = None   # we're current; drop any stale pending load
                 continue
 
-            pool = self._cam_pools[cam_i]
-            sig  = self._cam_signals[cam_i]
-            self._display_req_id += 1
-            pool.start(LoadTask(
-                self._gen, self._display_req_id, cam_idx,
-                it.path, max_side, brighten, gradient_id, sig, boff, ref, effective_sub_thr))
+            # Repaint this tile from the preloaded preview instead of queueing a share read
+            # per camera per position, then let the refine timer bring every tile up to
+            # tile resolution once the user settles.
+            #
+            # This used to be gated on `_is_scrubbing or _is_playing`, so arrow-stepping and
+            # any single seek fell straight through to N share reads — one per camera, every
+            # keypress. That is why the arrows behaved exactly like the slider used to:
+            # some tiles updated, others lagged. Off-live navigation is navigation however
+            # it is driven, so the preview serves all of it.
+            if self._proxy_try_paint_cam(cam_i, cam_idx):
+                if cam_i < len(self._cam_want):
+                    self._cam_want[cam_i] = None
+                self._schedule_refine()
+                continue
+
+            # Coalesced load: like _per_cam_display_one, remember only the LATEST wanted
+            # frame per camera, and let _start_cam_load decide whether there is room for it
+            # (see _cam_inflight_depth). Without the coalescing a fast scrub would flood the
+            # pool with a growing backlog of LoadTasks and the shown frame would lag further
+            # and further behind the slider; without the depth the camera could only ever
+            # have one read outstanding, which is the ~7 frames/s ceiling.
+            if cam_i < len(self._cam_want):
+                self._cam_want[cam_i] = (cam_idx, it.path, max_side, brighten,
+                                         gradient_id, ref, effective_sub_thr, bc,
+                                         effective_sub_off, ck)
+                self._start_cam_load(cam_i)
+
+        # One label build for the whole pass, not one per camera (see
+        # _collect_cam_diff_stats).
+        self._flush_cam_diff_stats()
+        # Re-colour the timestamp labels straight away. A tile that got a new target but no
+        # frame produces no paint, so without this its label would keep the colour from its
+        # last successful paint until the 600 ms dot tick came round.
+        self._cam_refresh_stale_marks()
 
     def _on_cam_loaded(
         self, cam_i: int,
         gen: int, req_id: int, idx: int,
         max_side: int, brighten: int, gradient_id: int,
-        brightness_offset: int, img: QImage
+        bc: _RenderBC, img: QImage, key=None
     ):
         """Callback pro načtený snímek jedné kamery v multi-cam módu."""
-        # Release the busy flag on EVERY path (incl. stale gen / null image) so the
-        # coalescing pipeline never deadlocks, then pull the next pending frame.
-        if cam_i < len(self._cam_busy):
-            self._cam_busy[cam_i] = False
+        # Release this load's in-flight slot on EVERY path (incl. stale gen / null image) so
+        # the coalescing pipeline never deadlocks, then pull the next pending frame.
+        #
+        # pop by req_id, never a bare decrement: this load may already have been released by
+        # _reset_cam_pipeline or _cam_load_watchdog while it was still running, or dropped
+        # from the queue by _cam_pool.clear() on a camera-set change. Then its id is gone
+        # and this is a no-op — it must not free a slot it no longer owns.
+        if cam_i < len(getattr(self, '_cam_inflight_at', [])):
+            self._cam_inflight_at[cam_i].pop(req_id, None)
         if gen != self._gen or img.isNull():
             self._start_cam_load(cam_i)
             return
-        # Reconstruct cache key using current per-camera ref (image already has subtraction baked in)
-        subtract = self.cb_subtract.isChecked()
-        ref = self._cam_ref_images[cam_i] if (subtract and cam_i < len(self._cam_ref_images)) else None
-        ref_id = id(ref) if ref is not None else None
-        sub_thr = self.sub_threshold_sb.value() if ref is not None else 0
-        key = (idx, max_side, brighten, gradient_id, brightness_offset, ref_id, sub_thr)
+        # Use the key the launcher computed (echoed back by LoadTask). Recomputing it from
+        # live UI state cached the pixmap under the wrong key whenever the per-camera
+        # reference/subtraction changed mid-load.
+        if key is None:
+            subtract = self.cb_subtract.isChecked()
+            ref = self._cam_ref_arr_for(cam_i, max_side) if subtract else None
+            ref_id = id(ref) if ref is not None else None
+            sub_thr, sub_off = self._sub_params(ref)
+            key = (self._cam_ck(cam_i, idx), max_side, brighten, gradient_id, bc, ref_id, sub_thr, sub_off)
         pix = QPixmap.fromImage(img)
         if cam_i < len(self._cam_caches):
             self._cam_caches[cam_i].put(key, pix)
-        # Don't paint a frame that is already older than the latest target — avoids the
-        # view flashing backwards while it catches up to live.
-        cur = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else idx
-        if idx >= cur:
+
+        # Only the render this tile is still waiting for may reach the screen.
+        # A render started with older params (Offset, Diff threshold, gradient,
+        # brightness) can finish AFTER the fresh one — the per-camera pool runs two
+        # threads, so both are in flight at once. Painting it put the tile back to
+        # the old look, and because _start_cam_load had already consumed _cam_want
+        # nothing re-rendered it: the tile kept the old settings until the next
+        # frame arrived. Across many cameras the winner of that race was random,
+        # which is why raising Offset appeared to affect only one camera.
+        want_key = (self._cam_shown_key[cam_i]
+                    if cam_i < len(getattr(self, '_cam_shown_key', [])) else None)
+        # key[0] identifies the FRAME; key[1:] are the render params. Only a PARAM
+        # mismatch is the race this guard exists for. Comparing the whole key made
+        # live mode paint nothing at all: at live frame rates a newer frame nearly
+        # always arrives while the current one is decoding, so every finished decode
+        # was rejected here, the relaunch was rejected in turn, and the tile stayed
+        # empty except for the rare load that landed in a gap between arrivals.
+        if want_key is not None and key[1:] != want_key[1:]:
+            cached = (self._cam_caches[cam_i].get(want_key)
+                      if cam_i < len(self._cam_caches) else None)
+            if cached is not None and not cached.isNull():
+                iv = self._multi_grid.get_img_view(cam_i)
+                if iv:
+                    iv.set_pixmap(cached)
+                    self._diag_cach += 1
+                # want_key[0] is the frame this render belongs to, as an absolute
+                # number (_cam_ck) — convert it back to a position in the current,
+                # possibly trimmed list. This path used to paint without touching the
+                # label or the shown-timestamp bookkeeping, so the tile could converge
+                # on the right picture while still advertising an older frame — and the
+                # refresh dot counted it as "not displaying".
+                _wi = self._cam_ck_idx(cam_i, want_key[0])
+                if (cam_i < len(self._cam_items)
+                        and isinstance(_wi, int) and 0 <= _wi < len(self._cam_items[cam_i])):
+                    self._cam_note_painted(cam_i, self._cam_items[cam_i][_wi].ts_ns)
+                self._update_cam_diff_stats(cam_i, want_key)
+                self._start_cam_load(cam_i)
+                return
+            # The wanted render is neither cached nor pending (_cam_want was
+            # consumed by the launch of the render that just finished) — re-derive
+            # it from live UI state so the tile always converges on the settings
+            # actually shown in the panel.
+            self._start_cam_load(cam_i)
+            if self._cam_inflight_count(cam_i) < self._cam_inflight_depth():
+                self._redraw_cam_in_place(cam_i)
+            return
+
+        self._update_cam_diff_stats(cam_i, key)
+        # Don't paint a frame that is already older than what the tile is showing —
+        # avoids the view flashing backwards while it catches up to live.
+        #
+        # The reference for "older" differs by mode. Following live, the newest frame
+        # keeps moving while this one decodes, so comparing against the latest REQUEST
+        # (_cam_current_idx) rejected every catch-up frame and the tile never updated;
+        # compare against the frame ON SCREEN instead, which is monotonic without
+        # discarding anything.
+        ts_new = None
+        if cam_i < len(self._cam_items) and 0 <= idx < len(self._cam_items[cam_i]):
+            ts_new = self._cam_items[cam_i][idx].ts_ns
+        following_live = bool(self._online_mode and getattr(self, "_auto_follow", False))
+        is_wanted = True
+        if following_live:
+            shown_ts = (self._cam_shown_ts_ns[cam_i]
+                        if cam_i < len(self._cam_shown_ts_ns) else 0)
+            may_paint = (ts_new is None or shown_ts == 0 or ts_new >= shown_ts)
+        else:
+            # "Is this still the frame the tile wants?", NOT "is its index >= the last
+            # REQUEST?". The old test was `idx >= self._cam_current_idx[cam_i]`, and
+            # _cam_current_idx is written at REQUEST time — so during a drag the request
+            # always runs ahead of a ~145 ms load and nearly every finished decode was paid
+            # for and then thrown on the floor. Dragging BACKWARDS was worse: the correct
+            # frame has a lower index, so it was rejected outright until a relaunch
+            # happened to catch up.
+            #
+            # key[1:] == want_key[1:] is already guaranteed here (the param-race guard
+            # above returned otherwise), so key[0] == want_key[0] means this IS the render
+            # the tile is waiting for.
+            want_ck = want_key[0] if want_key is not None else None
+            is_wanted = (want_ck is None or key[0] == want_ck)
+            if is_wanted:
+                may_paint = True
+            elif self._navigating():
+                # A position the user has already passed. Paint it anyway when it lies
+                # BETWEEN what is on screen and where the handle now is: with a depth cap
+                # above 1, several consecutive positions decode at once and they do not
+                # finish in order, so this is what makes the tile animate THROUGH the drag
+                # instead of jumping from start to end. The interval test — rather than a
+                # plain >= — is what stops it from ever moving the tile AWAY from the
+                # target, in either direction of travel.
+                shown  = (self._cam_shown_ts_ns[cam_i]
+                          if cam_i < len(self._cam_shown_ts_ns) else 0)
+                target = (self._cam_target_ts_ns[cam_i]
+                          if cam_i < len(self._cam_target_ts_ns) else 0)
+                may_paint = bool(ts_new is not None and shown and target
+                                 and min(shown, target) <= ts_new <= max(shown, target))
+            else:
+                # Parked: a decode left over from a finished drag must not overwrite the
+                # frame the user landed on.
+                may_paint = False
+        if may_paint:
             iv = self._multi_grid.get_img_view(cam_i)
             if iv:
                 iv.set_pixmap(pix)
-            if (cam_i < len(self._cam_items) and idx < len(self._cam_items[cam_i])):
-                ts = self._cam_items[cam_i][idx].ts_ns
-                self._multi_grid.set_cam_timestamp(cam_i, fmt_hhmmss_ms_from_ns(ts))
-        # Track per-camera last update for refresh dot
-        while len(self._cam_last_update_ts) <= cam_i:
-            self._cam_last_update_ts.append(0.0)
-        self._cam_last_update_ts[cam_i] = time.monotonic()
+                self._diag_load += 1
+            if ts_new is not None:
+                # Trailing the newest arrival by a frame or two is how a live view
+                # catches up, not a fault — without a tolerance the tile would be
+                # marked stale (red label + red dot) permanently while updating fine.
+                self._cam_note_painted(
+                    cam_i, ts_new, LIVE_PAINT_TOL_NS if following_live else 0)
+                # One slider pair for many cameras → follow the selected (master) one.
+                # Only for the frame actually asked for: the intermediate paints above are
+                # frames flying past, and letting them drive the sliders made the
+                # Brightness/Contrast controls jitter for the whole drag.
+                if is_wanted and cam_i == getattr(self, "_per_cam_master_idx", 0):
+                    self._refresh_auto_bc_sliders(self._cam_items[cam_i][idx].path)
+        # NOTE: the refresh dot is deliberately NOT bumped here. A finished image
+        # load only means a decode completed — it also fires when the user drags
+        # the slider over old frames, so bumping here lit the dot green with no
+        # new data at all. Arrival is recorded where frames are appended
+        # (_online_poll_multi / _on_dir_watch_new_file).
         # Load the most recent frame that arrived while this one was loading.
         self._start_cam_load(cam_i)
 
+    def _note_cam_frames(self, cam_idx: int):
+        """Record that camera cam_idx just received NEW frame(s). Only real frame
+        arrivals may drive the refresh dot — see CAM_DOT_FRESH_S."""
+        if cam_idx < 0:
+            return
+        while len(self._cam_last_update_ts) <= cam_idx:
+            self._cam_last_update_ts.append(0.0)
+        self._cam_last_update_ts[cam_idx] = time.monotonic()
+
+    def _note_cam_shown(self, cam_idx: int, ts_ns: int):
+        """Record that camera cam_idx just PAINTED the frame with this timestamp.
+        Only a changed timestamp counts as a display update — repainting the same
+        frame (resize, contrast change, re-decode) must not keep the dot green."""
+        if cam_idx < 0:
+            return
+        while len(self._cam_shown_ts_ns) <= cam_idx:
+            self._cam_shown_ts_ns.append(0)
+        while len(self._cam_shown_mono) <= cam_idx:
+            self._cam_shown_mono.append(0.0)
+        if ts_ns != self._cam_shown_ts_ns[cam_idx]:
+            self._cam_shown_ts_ns[cam_idx] = ts_ns
+            self._cam_shown_mono[cam_idx]  = time.monotonic()
+
+    # ---- the ONE truth about each tile -------------------------------------------
+    def _cam_note_target(self, cam_idx: int, ts_ns: int):
+        """The frame the slider / playback is asking this tile for. Recorded at REQUEST
+        time; nothing about the screen changes here."""
+        if cam_idx < 0:
+            return
+        while len(self._cam_target_ts_ns) <= cam_idx:
+            self._cam_target_ts_ns.append(0)
+        self._cam_target_ts_ns[cam_idx] = ts_ns
+
+    def _cam_note_painted(self, cam_idx: int, ts_ns: int, tol_ns: int = 0,
+                          preview: bool = False):
+        """Called from EVERY path that actually puts a pixmap on tile cam_idx, and from
+        nowhere else. Updates the tile's timestamp label to the frame ON SCREEN and marks
+        it stale when that is not (near enough to) the frame the slider asked for.
+
+        Previously the label was written at request time (in _per_cam_display_one, before
+        the load was even queued), so during a drag every tile's timestamp marched along
+        with the handle while the pictures sat still — "the timestamp keeps going but
+        nothing is shown". Now the label can only move when a frame really lands.
+
+        `tol_ns` is how far the painted frame may legitimately be from the target, and it
+        MUST be the same number the paint path used to accept the frame. It was not: the
+        preview accepted a neighbour within _proxy_motion_tol (up to minutes on a coarse
+        plan) and then reported tr.ts_gap (seconds), so every preview paint in between was
+        judged stale and every tile sat red permanently.
+
+        `preview` says the frame came out of the sampled RAM preview rather than being the
+        exact one requested, which is the designed behaviour and gets its own (blue, "~")
+        label state — distinct from both "exact" and "behind"."""
+        if cam_idx < 0:
+            return
+        self._note_cam_shown(cam_idx, ts_ns)
+        while len(self._cam_paint_tol_ns) <= cam_idx:
+            self._cam_paint_tol_ns.append(0)
+        self._cam_paint_tol_ns[cam_idx] = max(0, int(tol_ns))
+        while len(self._cam_paint_preview) <= cam_idx:
+            self._cam_paint_preview.append(False)
+        stale = self._cam_is_stale(cam_idx)
+        # Only call it approximate when it really differs from the target: a preview paint
+        # of the exact frame (which is every paint once the window is fully preloaded) is
+        # exact, and tildeing it would put the marker on permanently — the same mistake in
+        # a different colour.
+        target = (self._cam_target_ts_ns[cam_idx]
+                  if cam_idx < len(self._cam_target_ts_ns) else 0)
+        approx = bool(preview and target and ts_ns != target and not stale)
+        self._cam_paint_preview[cam_idx] = approx
+        if self._bench is not None:
+            self._bench.append((time.perf_counter(), cam_idx, target, ts_ns,
+                                2 if stale else (1 if approx else 0)))
+        self._multi_grid.set_cam_timestamp(
+            cam_idx, fmt_hhmmss_ms_from_ns(ts_ns), stale=stale, approx=approx)
+
+    def _cam_is_stale(self, cam_idx: int) -> bool:
+        """True when this tile is NOT showing the frame it was last asked for."""
+        shown  = (self._cam_shown_ts_ns[cam_idx]
+                  if cam_idx < len(self._cam_shown_ts_ns) else 0)
+        target = (self._cam_target_ts_ns[cam_idx]
+                  if cam_idx < len(self._cam_target_ts_ns) else 0)
+        tol    = (self._cam_paint_tol_ns[cam_idx]
+                  if cam_idx < len(self._cam_paint_tol_ns) else 0)
+        if not target or not shown:
+            return False
+        return abs(shown - target) > tol
+
+    def _cam_stale_lag_s(self, cam_idx: int) -> float:
+        """How far behind the requested moment this tile is, in seconds."""
+        shown  = (self._cam_shown_ts_ns[cam_idx]
+                  if cam_idx < len(self._cam_shown_ts_ns) else 0)
+        target = (self._cam_target_ts_ns[cam_idx]
+                  if cam_idx < len(self._cam_target_ts_ns) else 0)
+        if not target or not shown:
+            return 0.0
+        return abs(target - shown) / 1e9
+
+    def _cam_refresh_stale_marks(self):
+        """Re-colour every tile's timestamp label against the current targets, without
+        changing the text. A tile that never gets its frame would otherwise keep the colour
+        from its last successful paint and go on looking current."""
+        if not self._is_multi_cam() or self._multi_grid is None:
+            return
+        for i in range(self._multi_grid.cam_count()):
+            shown = self._cam_shown_ts_ns[i] if i < len(self._cam_shown_ts_ns) else 0
+            if not shown:
+                continue
+            # set_cam_stale, not set_cam_timestamp: the text is already correct here (this
+            # method exists only to re-judge the colour), and formatting it again for every
+            # tile on every call was pure waste — set_timestamp discarded it anyway.
+            approx = (self._cam_paint_preview[i]
+                      if i < len(self._cam_paint_preview) else False)
+            self._multi_grid.set_cam_stale(
+                i, self._cam_is_stale(i), approx=approx)
+
     def _on_cam_dot_blink(self):
-        """Aktualizuje blikající refresh doty u každé kamery."""
+        """Aktualizuje blikající refresh doty u každé kamery.
+
+        Green requires BOTH halves of "the image is updating": new frames landed
+        within CAM_DOT_FRESH_S *and* the tile actually painted a new frame in that
+        window. Frames-but-no-paint (hung load, coalescing stuck behind a slow SMB
+        read) is exactly the case that used to blink green over a frozen picture,
+        so it is red now. With auto-follow off the tile is frozen on purpose, so
+        arrival alone is enough. Grey = live mode off."""
+        self._cam_load_watchdog()
         self._cam_dot_blink_state = not self._cam_dot_blink_state
         now = time.monotonic()
-        master_i = getattr(self, "_per_cam_master_idx", 0)
+        master_i  = getattr(self, "_per_cam_master_idx", 0)
+        following = bool(getattr(self, "_auto_follow", True))
+        # Keep the timestamp colours honest on the same tick: a tile that simply never
+        # receives its frame produces no paint, so nothing else would ever re-evaluate it.
+        self._cam_refresh_stale_marks()
         for i, cv in enumerate(self._multi_grid._cam_views):
-            last = self._cam_last_update_ts[i] if i < len(self._cam_last_update_ts) else 0.0
-            if last > 0 and now - last < 5.0:
-                cv.pulse_refresh_dot(self._cam_dot_blink_state, is_main=(i == master_i))
-            else:
+            if not self._online_mode:
                 cv.dim_refresh_dot()
+                continue
+            last = self._cam_last_update_ts[i] if i < len(self._cam_last_update_ts) else 0.0
+            age  = (now - last) if last > 0 else None
+            shown = self._cam_shown_mono[i] if i < len(self._cam_shown_mono) else 0.0
+            shown_age = (now - shown) if shown > 0 else None
+            arriving   = age is not None and age < CAM_DOT_FRESH_S
+            displaying = shown_age is not None and shown_age < CAM_DOT_FRESH_S
+            # The decisive test, and the one the user asked for: is this tile showing the
+            # frame it was asked for? "Frames are arriving" and "something repainted
+            # recently" can both be true while the picture sits on an older moment than
+            # the slider — which is precisely when the dot used to blink green over a
+            # visibly stuck tile.
+            behind = self._cam_is_stale(i)
+            if not arriving:
+                tip = ("STALE: no new frame received" +
+                       (f" for {age:.1f} s" if age is not None else " at all"))
+            elif behind:
+                tip = (f"STALE: showing a frame {self._cam_stale_lag_s(i):.1f} s away from "
+                       f"the requested moment — this tile is behind")
+            elif not displaying and following:
+                tip = (f"STALE: frames arriving ({age:.1f} s ago) but the tile is "
+                       f"not repainting" +
+                       (f" ({shown_age:.1f} s)" if shown_age is not None else ""))
+            else:
+                tip = f"Receiving frames — last new frame {age:.1f} s ago"
+            cv.pulse_refresh_dot(
+                self._cam_dot_blink_state,
+                is_main=(i == master_i),
+                fresh=(arriving and not behind and (displaying or not following)),
+                tip=tip,
+            )
 
     def _request_display_target(self, idx, axis_time_ns, update_slider):
         max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0
         gradient_id = self.gradient_cb.currentIndex()
         subtract = self.cb_subtract.isChecked()
-        ref = self._ref_image if (subtract and self._ref_image is not None) else None
-        sub_thr = self.sub_threshold_sb.value() if (ref is not None) else 0
-        key = (idx, max_side, brighten, gradient_id, self._brightness_offset, id(ref) if ref is not None else None, sub_thr)
+        ref = self._ref_arr_for(max_side) if subtract else None
+        sub_thr, sub_off = self._sub_params(ref)
+        key = (self._ck(idx), max_side, brighten, gradient_id, self._bc(), id(ref) if ref is not None else None, sub_thr, sub_off)
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self._display_req_id += 1; self.current_idx = idx
             self.img_view.set_pixmap(cached)
+            self._update_diff_stats(key)
             self.btn_cal_circle.setEnabled(True); self.btn_cal_square.setEnabled(True); return
         if self._display_load_key is not None and self._display_load_key != key:
             self._deferred_display = (idx, axis_time_ns, update_slider); return
         self._display_req_id += 1; req_id = self._display_req_id
-        self._want_display_req[key] = req_id; self._display_load_key = key
+        self._want_display_req[key] = self._display_epoch; self._display_load_key = key
         pm = self._load_or_cache(idx, max_side, brighten, req_id)
         if pm is not None:
             self.current_idx = idx; self.img_view.set_pixmap(pm)
@@ -11573,13 +16243,14 @@ class Viewer(QWidget):
         max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0
         gradient_id = self.gradient_cb.currentIndex()
         subtract = self.cb_subtract.isChecked()
-        ref = self._ref_image if (subtract and self._ref_image is not None) else None
-        sub_thr = self.sub_threshold_sb.value() if (ref is not None) else 0
-        key = (idx, max_side, brighten, gradient_id, self._brightness_offset, id(ref) if ref is not None else None, sub_thr)
-        self._want_display_req[key] = req_id
+        ref = self._ref_arr_for(max_side) if subtract else None
+        sub_thr, sub_off = self._sub_params(ref)
+        key = (self._ck(idx), max_side, brighten, gradient_id, self._bc(), id(ref) if ref is not None else None, sub_thr, sub_off)
+        self._want_display_req[key] = self._display_epoch
         pm = self._load_or_cache(idx, max_side, brighten, req_id)
         if pm is not None and self.target_idx == idx and req_id == self._display_req_id:
             self.current_idx = idx; self.img_view.set_pixmap(pm)
+            self._update_diff_stats(key)
             self.btn_cal_circle.setEnabled(True); self.btn_cal_square.setEnabled(True)
 
     def _prefetch_idle(self, idx):
@@ -11596,12 +16267,17 @@ class Viewer(QWidget):
         for j in range(idx + 1, min(len(self.items), idx + 1 + ahead)):
             self._load_or_cache(j, max_side, brighten)
 
-    def _on_loaded(self, gen, req_id, idx, max_side, brighten, gradient_id, brightness_offset, img):
+    def _on_loaded(self, gen, req_id, idx, max_side, brighten, gradient_id, bc, img, key=None):
         if gen != self._gen: return
-        subtract = self.cb_subtract.isChecked()
-        ref = self._ref_image if (subtract and self._ref_image is not None) else None
-        sub_thr = self.sub_threshold_sb.value() if (ref is not None) else 0
-        key = (idx, max_side, brighten, gradient_id, brightness_offset, id(ref) if ref is not None else None, sub_thr)
+        # Use the EXACT key the launcher registered in _inflight / _want_display_req /
+        # _display_load_key. Recomputing it from live UI state (as this used to) drifted
+        # from the launch key on any mid-flight reference/subtract/gradient change, which
+        # is what made the slider, arrows and subtraction toggle silently stop working.
+        if key is None:
+            subtract = self.cb_subtract.isChecked()
+            ref = self._ref_arr_for(max_side) if subtract else None
+            sub_thr, sub_off = self._sub_params(ref)
+            key = (self._ck(idx), max_side, brighten, gradient_id, bc, id(ref) if ref is not None else None, sub_thr, sub_off)
         self._inflight.discard(key)
         if img.isNull():
             if self._display_load_key == key: self._display_load_key = None; self._drain_deferred_display()
@@ -11611,10 +16287,38 @@ class Viewer(QWidget):
             if self._display_load_key == key: self._display_load_key = None; self._drain_deferred_display()
             return
         self.cache.put(key, pm)
-        want_req = self._want_display_req.pop(key, None)
-        if want_req is not None:
-            self.current_idx = idx
+        want_epoch = self._want_display_req.pop(key, None)
+        # Late arrivals: which ones still deserve the screen?
+        #
+        # Frame identity is the WRONG test. Both a drag and playback move on every 33 ms
+        # tick, so on a share slower than that EVERY load lands for a frame that is no
+        # longer the target. Testing `idx != target_idx` therefore suppressed all of them
+        # and the picture froze solid — 0 repaints in 5 s of playback, 0 % of scrub ticks
+        # repainting on the paths with no preview to fall back on (range search, preview
+        # off, zoomed in, mid-sweep). That is the very symptom this guard exists to cure,
+        # just moved elsewhere; v2.5.5 painted whatever arrived, and a slightly stale
+        # picture that MOVES is what makes a slider feel alive.
+        #
+        # The real distinction is the interaction, not the frame: a load belongs to the
+        # display epoch that asked for it. Within one epoch (a whole drag, a whole
+        # playback run) late frames paint. A discrete navigation bumps the epoch, so a
+        # want left over from a view the user has left — e.g. frame 599 at 900 px, later
+        # satisfied by an idle prefetch of the same key — is dropped instead of yanking
+        # the view back to it.
+        if want_epoch is not None and want_epoch != self._display_epoch:
+            want_epoch = None
+        if want_epoch is not None:
+            # current_idx doubles as the drag / playback cursor (_autoplay_step steps from
+            # it, _apply_scrub compares against it), so a late frame must not move it:
+            # rewinding it made playback crawl back over frames it had already passed.
+            # The deliberate display paths set current_idx themselves before requesting.
+            if not (self._is_playing or self._is_scrubbing):
+                self.current_idx = idx
             self.img_view.set_pixmap(pm)
+            self._diag_load += 1
+            self._update_diff_stats(key)
+            if idx < len(self.items):
+                self._refresh_auto_bc_sliders(self.items[idx].path)
             self.btn_cal_circle.setEnabled(True); self.btn_cal_square.setEnabled(True)
             # Pokud auto-follow, ujistíme se že slider je na správné pozici
             if self._auto_follow and self._online_mode and self.items and idx < len(self.items):
@@ -11625,8 +16329,23 @@ class Viewer(QWidget):
         if self._display_load_key == key: self._display_load_key = None; self._drain_deferred_display()
 
     # ================================================================ AUTOPLAY
+    def _play_tick_ms(self) -> int:
+        """Playback tick. Twice as fast when the RAM preview is carrying the frames, so the
+        same wall-clock speed needs half the stride and skips half as many frames (see
+        PLAY_TICK_MS_PREVIEW). A share read cannot keep up with either rate, so when the
+        preview is not available there is nothing to gain from the faster tick."""
+        try:
+            if self._proxy_usable() and self._proxy_covered():
+                return PLAY_TICK_MS_PREVIEW
+        except Exception:
+            pass
+        return PLAY_TICK_MS
+
     def play(self):
         in_per_cam = self._is_multi_cam() and bool(self._per_cam_rows)
+        # Set BEFORE start(): the interval of a running QTimer only takes effect on the
+        # next fire, and _autoplay_step reads it back to size its own stride.
+        self.play_timer.setInterval(self._play_tick_ms())
         if in_per_cam:
             master = self._per_cam_master_idx
             if master < 0 or master >= len(self._cam_ts) or not self._cam_ts[master]:
@@ -11655,7 +16374,13 @@ class Viewer(QWidget):
         in_per_cam = self._is_multi_cam() and bool(self._per_cam_rows)
         if not in_per_cam and self.items and self.current_idx is not None:
             self._display_exact_index(self.current_idx, self.items[self.current_idx].ts_ns, True)
+        # Playback paints at PLAY_MAX_SIDE / from the preview layer — bring the frame
+        # it stopped on up to native resolution.
+        self._schedule_refine()
         self._schedule_prefetch_after_idle(); self._reset_motion_tracking()
+        # Playback ran the sweep at PROXY_DRAG_WORKERS — back to full speed, after a short
+        # grace so the frame it stopped on wins the first reads (see _proxy_idle_grace).
+        self._proxy_idle_grace()
 
     def _autoplay_step(self):
         if not self._is_playing: return
@@ -11667,7 +16392,10 @@ class Viewer(QWidget):
             cam_ts = self._cam_ts[master]
             n = len(cam_ts)
             pct = self._current_play_pct_per_s()
-            self._play_frame_acc += (pct / 100.0) * n * (PLAY_TICK_MS / 1000.0)
+            # The REAL tick, not the nominal constant: _play_tick_ms doubles the rate when
+            # the preview is carrying the frames, and reading PLAY_TICK_MS regardless would
+            # then advance twice as fast as the % asks for.
+            self._play_frame_acc += (pct / 100.0) * n * (self.play_timer.interval() / 1000.0)
             if self._play_frame_acc < 1.0:
                 return
             skip = min(int(self._play_frame_acc), 50)
@@ -11681,8 +16409,12 @@ class Viewer(QWidget):
             row = self._per_cam_rows[master]
             sv = self._per_cam_ts_to_slider(master, new_ts)
             row.set_value(sv)
-            self._per_cam_display_one(master, new_ts)
-            self._per_cam_sync_slaves(master, new_ts)
+            # Through the navigation tick, like every other per-camera move. Calling
+            # _per_cam_display_one + _per_cam_sync_slaves directly here meant N full display
+            # passes per playback tick, each with its own stale-mark and diff-stats pass —
+            # the same O(cameras^2) label work that made the drag crawl. It also means a
+            # tick that overruns coalesces instead of queueing.
+            self._nav_request(master, new_ts, new_frame)
             if at_end:
                 self.stop()
             return
@@ -11692,7 +16424,7 @@ class Viewer(QWidget):
         n = len(self.items)
         pct = self._current_play_pct_per_s()
 
-        self._play_frame_acc += (pct / 100.0) * n * (PLAY_TICK_MS / 1000.0)
+        self._play_frame_acc += (pct / 100.0) * n * (self.play_timer.interval() / 1000.0)
         if self._play_frame_acc < 1.0:
             return
 
@@ -11720,29 +16452,47 @@ class Viewer(QWidget):
         sv = self._time_to_slider_value(self.items[new_idx].ts_ns)
         self.slider.blockSignals(True); self.slider.setValue(sv); self.slider.blockSignals(False)
         self._set_info_for(new_idx, self.play_time_ns)
+        # Move the time-axis cursor with the frame. Only _display_exact_index used to do
+        # this, which is never on the playback path — so the axis cursor sat frozen at
+        # wherever playback started and there was no visible progress on the timeline.
+        self.tickbar.set_cursor(self.play_time_ns)
 
         max_side = PLAY_MAX_SIDE_FAST
         brighten = 1 if self.cb_bright.isChecked() else 0
         gradient_id = self.gradient_cb.currentIndex()
         subtract = self.cb_subtract.isChecked()
-        ref = self._ref_image if (subtract and self._ref_image is not None) else None
-        sub_thr = self.sub_threshold_sb.value() if (ref is not None) else 0
-        key = (new_idx, max_side, brighten, gradient_id, self._brightness_offset, id(ref) if ref is not None else None, sub_thr)
+        ref = self._ref_arr_for(max_side) if subtract else None
+        sub_thr, sub_off = self._sub_params(ref)
+        bc = self._bc()
+        # _ck(new_idx), not the raw index: every other render-key site uses the absolute,
+        # trim-proof frame number, and this one did not. Identical while _items_offset is 0,
+        # but after any live-mode trim playback would read and write pixmaps under keys that
+        # name a different frame than the rest of the app — losing every cross-path cache
+        # hit and, worse, capable of showing a cached frame that is not the one asked for.
+        key = (self._ck(new_idx), max_side, brighten, gradient_id, bc,
+               id(ref) if ref is not None else None, sub_thr, sub_off)
 
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self.img_view.set_pixmap(cached)
+            self._diag_cach += 1
+            self._update_diff_stats(key)
+            return
+
+        # Preloaded preview → playback runs at the timer's rate instead of the
+        # share's. stop() then refines the frame it ended on.
+        if self._proxy_try_paint(new_idx):
             return
 
         self._display_req_id += 1
-        self._want_display_req[key] = self._display_req_id
+        self._want_display_req[key] = self._display_epoch
         if key not in self._inflight:
             if len(self._inflight) < 6:
                 self._inflight.add(key)
                 self.load_pool.start(LoadTask(
                     self._gen, self._display_req_id, new_idx,
                     self.items[new_idx].path, max_side, brighten, gradient_id,
-                    self.load_signals, self._brightness_offset, ref))
+                    self.load_signals, bc, ref, sub_thr, sub_off, key=key))
 
     # ================================================================ STEP FRAME
     def step_frame(self, delta_idx):
@@ -11759,6 +16509,7 @@ class Viewer(QWidget):
             self._display_multicam_index(j, update_slider=True)
         else:
             self._display_exact_index(j, self.items[j].ts_ns, update_slider=True)
+        self._schedule_refine()
         self._schedule_prefetch_after_idle()
 
     def keyPressEvent(self, event):
@@ -12558,6 +17309,7 @@ class Viewer(QWidget):
         threshold = self._sc_threshold_sb.value()
 
         self._sc_task_running = True
+        self._sc_task_gen = self._gen   # tag task with current scan/camera generation
         self._sc_set_enabled(False)
         self._sc_status_lbl.setText("Measuring…")
 
@@ -12568,6 +17320,8 @@ class Viewer(QWidget):
         self.scan_pool.start(task)
 
     def _on_sc_preview(self, pm: "QPixmap"):
+        if self._sc_task_gen != self._gen:
+            return   # camera/scan changed while this task was running — discard stale preview
         self._sc_preview_pixmap = pm
         self._sc_preview_lbl.show()
         self._sc_preview_lbl.set_full_pixmap(pm)
@@ -12579,8 +17333,12 @@ class Viewer(QWidget):
     def _on_sc_finished(self, result: dict):
         self._sc_task_running = False
         self._sc_set_enabled(True)
+        # Camera/scan changed while this task was running (e.g. user picked a
+        # different camera mid-measurement) — its result belongs to the camera
+        # that's no longer showing, so discard it and re-measure the current one.
+        stale = (self._sc_task_gen != self._gen)
         # If Measure was clicked (or threshold moved) while task was running, re-run now
-        if getattr(self, '_sc_pending', False):
+        if getattr(self, '_sc_pending', False) or stale:
             self._sc_pending = False
             self._run_spatial_contrast()
             return
@@ -12772,17 +17530,69 @@ class Viewer(QWidget):
 
     def _pv_text_for_ts(self, ts_ns: "int | None") -> str:
         """Per-image PV burn-in text: archiver values at THIS frame's own timestamp,
-        falling back to the live snapshot if a per-timestamp lookup yields nothing."""
+        falling back to the live snapshot if a per-timestamp lookup yields nothing.
+
+        May hit the network — call it from a worker thread, or pre-resolve the
+        whole batch with _pv_prefetch_texts() before a GUI-thread render loop."""
+        if not self.cb_save_overlay.isChecked():
+            return ""
         text = pv_text_for_ts(ts_ns, list(self._pv_enabled))
         return text or self._pv_text()
 
+    def _pv_prefetch_texts(self, ts_values: "list[int]") -> "dict[int, str]":
+        """Resolve the PV burn-in text for every timestamp in ts_values on a worker
+        thread and return {ts_ns: text}.
+
+        The GUI-thread render loops (multi-cam save current / save range) used to
+        call _pv_text_for_ts() per frame, so a cold cache meant HTTP requests on the
+        main thread — the window froze. Doing it here keeps the archiver off the GUI
+        thread entirely and guarantees identical text for identical timestamps."""
+        if not (self._pv_enabled and self.cb_save_overlay.isChecked()):
+            return {}
+        names = list(self._pv_enabled)
+        chans = [PV_CHANNEL_MAP[n] for n in names if n in PV_CHANNEL_MAP]
+        uniq = sorted({int(t) for t in ts_values if t})
+        if not (chans and uniq):
+            return {}
+        out: "dict[int, str]" = {}
+        done = threading.Event()
+
+        def _work():
+            try:
+                pv_warm_days(chans, uniq)
+                for t in uniq:
+                    out[t] = pv_text_for_ts(t, names)
+            except Exception:
+                pass
+            finally:
+                done.set()
+
+        threading.Thread(target=_work, daemon=True).start()
+        from PySide6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog("Loading PV values…", "", 0, 0, self)
+        dlg.setWindowTitle("PV values")
+        dlg.setCancelButton(None)
+        dlg.setMinimumDuration(300)      # no flash when everything is cached
+        while not done.wait(0.05):
+            QApplication.processEvents()
+        dlg.close()
+        return out
+
     def _pv_save_append_bar(self, pix: "QPixmap", dst: "str | Path",
-                            ts_ns: "int | None" = None) -> bool:
+                            ts_ns: "int | None" = None,
+                            pv_text: "str | None" = None,
+                            extra_text: str = "") -> bool:
         """Save pix to dst with a PV-values bar appended below the image (PIL).
         When ts_ns is given the bar shows the values present at that frame's own
-        timestamp; the font is scaled to the image width and wrapped so it stays
-        readable. Returns True on success; falls back to a plain save on any error."""
-        pv_text = self._pv_text_for_ts(ts_ns) if ts_ns is not None else self._pv_text()
+        timestamp; pass pv_text to reuse an already-resolved string (see
+        _pv_prefetch_texts) instead of looking it up again. extra_text is prepended
+        as a further bar entry (e.g. the Shot Finder energy line). The font is
+        scaled to the image width and wrapped so it stays readable. Returns True on
+        success; falls back to a plain save on any error."""
+        if pv_text is None:
+            pv_text = self._pv_text_for_ts(ts_ns) if ts_ns is not None else self._pv_text()
+        if extra_text:
+            pv_text = "  |  ".join(t for t in (extra_text, pv_text) if t)
         dst = str(dst)
         if not pv_text:
             return bool(pix.save(dst))
@@ -12848,7 +17658,8 @@ class Viewer(QWidget):
             overlay_params=overlay_params,
             energy_map=dict(self._sf_energy_map),
             # Per-image PV lookup (each frame gets the values at its own timestamp).
-            pv_channels={n: PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP},
+            pv_channels=({n: PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP}
+                         if self.cb_save_overlay.isChecked() else {}),
             pv_units=dict(PV_UNITS),
         )
         task.save_txt = self.cb_save_metadata_txt.isChecked()
@@ -12879,8 +17690,12 @@ class Viewer(QWidget):
         if not dst: return
         self._last_save_dir = Path(dst).parent
 
-        # Vezmi aktuální pixmapu a nakresli overlay
-        pix = self.img_view._pix.copy()
+        # Overlay is drawn on a NATIVE render, not on the viewing pixmap — see
+        # _overlay_base_pixmap.
+        pix = self._overlay_base_pixmap()
+        if pix is None or pix.isNull():
+            QMessageBox.information(self, "Save with overlay",
+                "No image displayed."); return
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = pix.width(), pix.height()
@@ -12923,38 +17738,14 @@ class Viewer(QWidget):
         painter.end()
 
         energy_text = self._sf_energy_map.get(it.path.name, "")
-        # Combine energy_text + PV text into one bar
-        _bar_lines = [t for t in [energy_text, self._pv_text()] if t]
-        _combined_bar = "\n".join(_bar_lines)
-        if _combined_bar:
-            try:
-                from PIL import Image as _PilImg, ImageDraw as _PilDraw, ImageFont as _PilFont
-                import tempfile as _tf
-                with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _tmp:
-                    _tmp_path = Path(_tmp.name)
-                pix.save(str(_tmp_path))
-                _img = _PilImg.open(_tmp_path)
-                _n_lines = len(_bar_lines)
-                _bar_h = 26 * _n_lines
-                _new = _PilImg.new("RGB", (_img.width, _img.height + _bar_h), (255, 255, 255))
-                _new.paste(_img.convert("RGB"), (0, 0))
-                _draw = _PilDraw.Draw(_new)
-                try:
-                    _font = _PilFont.truetype("DejaVuSans.ttf", 14)
-                except Exception:
-                    _font = _PilFont.load_default()
-                for _li, _line in enumerate(_bar_lines):
-                    _draw.text((8, _img.height + 4 + _li * 22), _line, fill=(0, 0, 0), font=_font)
-                _new.save(dst)
-                _tmp_path.unlink(missing_ok=True)
-            except Exception:
-                if not pix.save(dst):
-                    QMessageBox.critical(self, "Save failed", f"Could not save to {dst}")
-                    return
-        else:
-            if not pix.save(dst):
-                QMessageBox.critical(self, "Save failed", f"Could not save to {dst}")
-                return
+        # PV values for THIS frame's own timestamp (not the live snapshot), rendered
+        # by the shared bar routine so the font/wrapping match every other save path.
+        _pv_texts = self._pv_prefetch_texts([it.ts_ns])
+        _pv_text = _pv_texts.get(it.ts_ns, "")
+        if not self._pv_save_append_bar(pix, dst, it.ts_ns, pv_text=_pv_text,
+                                        extra_text=energy_text):
+            QMessageBox.critical(self, "Save failed", f"Could not save to {dst}")
+            return
         _energy_str_ov = self._sf_energy_map.get(it.path.name, "")
         _copy_metadata_into_png_bg(it.path, Path(dst),
                                    save_txt=self.cb_save_metadata_txt.isChecked(),
@@ -12979,11 +17770,17 @@ class Viewer(QWidget):
 
     def _render_cam_frame(self, it, iv, cam_name: str, out_dir: Path,
                           gradient_id: int, brighten: bool,
-                          save_metadata_txt: bool = False) -> str | None:
-        """Render and save one camera frame into out_dir. Returns error string or None."""
+                          save_metadata_txt: bool = False,
+                          pv_texts: "dict[int, str] | None" = None) -> str | None:
+        """Render and save one camera frame into out_dir. Returns error string or None.
+
+        pv_texts is the pre-resolved {ts_ns: bar text} map from _pv_prefetch_texts;
+        pass it whenever this runs on the GUI thread so no archiver request can
+        happen here."""
         has_shapes = iv is not None and (iv.show_cross or iv.show_circle or iv.show_square)
         is_recoloured = (gradient_id != GRADIENT_ID_DEFAULT) or brighten
-        pv_text = self._pv_text_for_ts(it.ts_ns)
+        pv_text = (pv_texts.get(it.ts_ns, "") if pv_texts is not None
+                   else self._pv_text_for_ts(it.ts_ns))
         has_bar = bool(pv_text)
         stem = Path(self._dst_name_with_prague_time(it)).stem
         need_view = has_shapes or is_recoloured or has_bar
@@ -13046,14 +17843,14 @@ class Viewer(QWidget):
                 painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(sx, sy, sw, sh)
             painter.end()
-            if not self._pv_save_append_bar(pix, dst, it.ts_ns):
+            if not self._pv_save_append_bar(pix, dst, it.ts_ns, pv_text=pv_text):
                 return f"Could not save {dst.name}"
         else:
             img = load_image_scaled(it.path, SCRUB_MAX_SIDE, brighten, gradient_id)
             if img.isNull():
                 return f"Could not load {it.path.name}"
             pix_plain = QPixmap.fromImage(img)
-            if not self._pv_save_append_bar(pix_plain, dst, it.ts_ns):
+            if not self._pv_save_append_bar(pix_plain, dst, it.ts_ns, pv_text=pv_text):
                 return f"Could not save {dst.name}"
         _copy_metadata_into_png_bg(it.path, dst, save_txt=save_metadata_txt)
         return None
@@ -13082,11 +17879,12 @@ class Viewer(QWidget):
         gradient_id = self.gradient_cb.currentIndex()
         brighten = self.cb_bright.isChecked()
         save_txt = self.cb_save_metadata_txt.isChecked()
+        pv_texts = self._pv_prefetch_texts([it.ts_ns for _, it, _, _ in frames])
         errors = []
         saved = []
         for cam_i, it, iv, cam_name in frames:
             err = self._render_cam_frame(it, iv, cam_name, out_path, gradient_id, brighten,
-                                         save_metadata_txt=save_txt)
+                                         save_metadata_txt=save_txt, pv_texts=pv_texts)
             if err:
                 errors.append(f"{cam_name}: {err}")
             else:
@@ -13125,23 +17923,11 @@ class Viewer(QWidget):
             import numpy as _np
             pil = _PilImg.open(str(it.path))
             if pil.mode in ("I", "I;16"):
-                arr_f = _np.array(pil, dtype=_np.float32)
-            elif pil.mode in ("RGB", "RGBA"):
-                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
+                # Same absolute full-scale normalization as the viewer, so Workshop
+                # gets exactly the intensities that are on screen.
+                arr8 = _norm16_to8_full_scale(_np.array(pil))
             else:
-                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
-
-            img_max_val = _read_img_max_value(it.path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-                arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
-            elif arr_px_max > 0:
-                # No imgMaxValue metadata: per-frame max normalization so the image
-                # sent to Workshop is not black (see load_image_scaled).
-                arr8 = _np.clip(arr_f / arr_px_max * 255.0, 0, 255).astype(_np.uint8)
-            else:
-                arr8 = _np.zeros(arr_f.shape, dtype=_np.uint8)
+                arr8 = _np.array(pil.convert("L"), dtype=_np.uint8)
 
             ts_str = fmt_prague_full_from_ns(it.ts_ns) if it.ts_ns else ""
             label = f"{cam_name}  {ts_str}".strip()
@@ -13153,7 +17939,7 @@ class Viewer(QWidget):
         if self._is_multi_cam():
             self._save_multicam_current(); return
         if self.current_idx is None or not self.items: return
-        n_around = self.save_around_n_sb.value()
+        n_around = self.save_around_n_sb.value() if self.cb_save_around.isChecked() else 0
         if n_around > 0:
             self.save_around_current(); return
         it = self.items[self.current_idx]
@@ -13206,12 +17992,15 @@ class Viewer(QWidget):
         # Also save annotate version alongside original if any overlay is active
         if has_overlay:
             dst_p = Path(dst)
-            _has_bar = bool(self.img_view.energy_text) or bool(self._pv_text())
+            # Values for THIS frame's timestamp, resolved off the GUI thread — the
+            # same text decides the "_annotated" suffix and gets burned in.
+            _pv_ann_text = self._pv_prefetch_texts([it.ts_ns]).get(it.ts_ns, "")
+            _has_bar = bool(_energy_str) or bool(_pv_ann_text)
             _ann_sfx = "_annotated" if _has_bar else ""
             ann_dst = dst_p.parent / f"{dst_p.stem}{_ann_sfx}.png"
-            # render overlay onto current pixmap
-            if self.img_view._pix is not None and not self.img_view._pix.isNull():
-                pix = self.img_view._pix.copy()
+            # Native render, not the viewing pixmap — see _overlay_base_pixmap.
+            pix = self._overlay_base_pixmap()
+            if pix is not None and not pix.isNull():
                 painter = QPainter(pix)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 w, h = pix.width(), pix.height()
@@ -13241,7 +18030,8 @@ class Viewer(QWidget):
                     painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
                     painter.drawRect(sx, sy, sw, sh)
                 painter.end()
-                self._pv_save_append_bar(pix, ann_dst, it.ts_ns)
+                self._pv_save_append_bar(pix, ann_dst, it.ts_ns,
+                                         pv_text=_pv_ann_text, extra_text=_energy_str)
                 _copy_metadata_into_png_bg(it.path, ann_dst, save_txt=save_txt, extra_meta=_extra_meta)
 
         msg = f"Saved.\nPrague Time: {fmt_prague_full_from_ns(it.ts_ns)}"
@@ -13283,9 +18073,9 @@ class Viewer(QWidget):
             QMessageBox.information(self, "Save range", "No frames inside From..To."); return
 
         # Warm the PV archiver caches in parallel, in the background, while the user
-        # picks the output folder — so the per-frame loop doesn't stall on HTTP (the
-        # main reason save range felt frozen). Never blocks the UI thread.
-        if self._pv_enabled and jobs:
+        # picks the output folder — so the per-frame resolve below is already served
+        # from cache. Never blocks the UI thread.
+        if self._pv_enabled and jobs and self.cb_save_overlay.isChecked():
             _pv_chs = [PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP]
             if _pv_chs:
                 import threading as _thr
@@ -13310,6 +18100,9 @@ class Viewer(QWidget):
 
         # The render path uses QPixmap (not safe off the main thread), so the loop
         # stays here — but a modal, cancelable progress dialog keeps the UI alive.
+        # Every PV value is resolved BEFORE the loop (on a worker thread), so the
+        # loop itself never touches the archiver.
+        pv_texts = self._pv_prefetch_texts([it.ts_ns for it, _ in jobs])
         from PySide6.QtWidgets import QProgressDialog
         prog = QProgressDialog("Saving frames…", "Cancel", 0, len(jobs), self)
         prog.setWindowTitle("Save range")
@@ -13320,7 +18113,7 @@ class Viewer(QWidget):
             if prog.wasCanceled():
                 break
             err = self._render_cam_frame(it, None, cam_name, out_path, gradient_id, brighten,
-                                         save_metadata_txt=save_txt)
+                                         save_metadata_txt=save_txt, pv_texts=pv_texts)
             if err is None:
                 saved_total += 1
             prog.setValue(idx)
@@ -13346,7 +18139,7 @@ class Viewer(QWidget):
 
         # Pre-warm CPVA cache (in parallel) while the user picks the output folder,
         # so the background save starts without stalling on HTTP requests.
-        if self._pv_enabled:
+        if self._pv_enabled and self.cb_save_overlay.isChecked():
             _pv_chs = [PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP]
             _ts_vals = [it.ts_ns for it in self.items[i0:i1_excl]]
             if _pv_chs and _ts_vals:
@@ -13398,7 +18191,8 @@ class Viewer(QWidget):
             brighten=self.cb_bright.isChecked(),
             overlay_params=overlay_params,
             energy_map=dict(self._sf_energy_map),
-            pv_channels={n: PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP},
+            pv_channels=({n: PV_CHANNEL_MAP[n] for n in self._pv_enabled if n in PV_CHANNEL_MAP}
+                         if self.cb_save_overlay.isChecked() else {}),
             pv_units=dict(PV_UNITS),
         )
         task.save_txt = self.cb_save_metadata_txt.isChecked()

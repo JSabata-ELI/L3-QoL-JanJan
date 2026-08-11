@@ -1,23 +1,23 @@
-Spectra – SPIDER Spectrometer Analysis Tool
+Spectra – Spectrometer Analysis Tool
 ============================================
 
-A PySide6 desktop application for analysing SPIDER spectrometer data from the
-CPVA archive or in real time.  Run it with:
+A PySide6 desktop application for analysing spectrometer data (SPIDER by
+default) from the CPVA archive or in real time.  Run it with:
 
     python sp_t.py
 
 
 OVERVIEW
 --------
-Spectra has two operating modes that are switched with the radio buttons at the
-top of the window:
+Everything is controlled from the sidebar on the left.  Two modes, switched in
+the "Mode" box:
 
-  Archive mode  – Load spectral waveforms for a chosen day from the CPVA
-                  archive, pick time regions on the graph, compute averages,
-                  and compare or export them.
+  Archive mode  – Load a day from the CPVA archive, mark time regions in the
+                  search graph, average the spectra inside them, compare and
+                  export them.
 
-  Live mode     – Stream the most recent shots in real time and display a
-                  rolling average of the last N spectra.
+  Live mode     – Poll the newest shots every 3 s and show a rolling average
+                  of the last N spectra.
 
 
 DEPENDENCIES
@@ -27,100 +27,129 @@ DEPENDENCIES
 
 QUICK START – ARCHIVE MODE
 --------------------------
-1. Select "Archive" at the top.
-2. Click the date button (defaults to today) and choose the day you want.
-3. Click "Load day" – the time axis populates with shots from that day.
-4. Switch to "Select" mode (radio button in the toolbar) and drag a region
-   on the graph to mark a time interval.  Repeat for more regions.
-5. Click "Analyse" to compute the average spectrum for every marked region.
-6. Adjust the averaging method (Mean / Median / Trimmed mean / Sigma-clip)
-   and hit "Analyse" again if needed.
-7. Use the colour controls to colour regions by selection order or by
-   dispersion values (GDD / TOD).
-8. Export the results with "Export CSV" or "Save image".
+1. Click "Load day…" and pick a day.  Plain click toggles a day, Ctrl+click
+   adds the whole range from your previous click (multi-day is allowed).
+2. The top graph shows the search signal (SBW4 energy by default) for that
+   day.  Click a row in the PV table to plot a different signal.
+3. Enable "Select" in the top toolbar and drag over the graph to mark a time
+   region.  Repeat for as many regions as you need.
+4. Click "Analyze".  Every not-yet-analysed region is fetched and averaged in
+   the background; the progress bar tracks it.
+5. Switch the averaging method, normalisation, colouring, smoothing or the
+   variation band at any time — no refetch is needed, all methods are computed
+   up front.
+6. Export with "Export results".
 
 
 QUICK START – LIVE MODE
 -----------------------
-1. Select "Live" at the top.
-2. Set "Last N shots" to how many recent spectra to average.
-3. Click "Start" – the graph updates automatically as new shots arrive.
-4. Click "Stop" to freeze the display.
+1. Click "Live" in the Mode box.
+2. Set "Average last N".
+3. Click "Start Live".  The last 10 minutes are preloaded, then the newest
+   shots are polled every 3 s.  The graph is only redrawn when a new shot
+   actually arrives, so the UI stays smooth.
+4. "Stop Live" freezes the display.  The buffer keeps up to 2000 spectra.
 
 
-PV CONFIGURATION
-----------------
-The tool reads two waveform PVs for the spectrometer:
+SEARCH PVs AND PRESETS
+----------------------
+The "Search data by" box holds the list of signals you can search in:
 
-  X axis (wavelength)  – L3-SBDP-SPIDER:SpecDomain_Int_X
-  Y axis (intensity)   – L3-SBDP-SPIDER:SpecDomain_Int_Y
+  - The table lists them as Label | Channel.  Click a row to plot it,
+    double-click the label to rename it.
+  - "+ Add PV…" opens a channel browser (the full CPVA channel list is loaded
+    once and then filtered locally).  The inline search field above the table
+    does the same thing faster.
+  - "✕ Remove" removes the selected PV.
+  - Presets: pick one from the combo box, or use + / ✎ / 🗑 next to it to
+    create, rename and delete presets.  "Edit…" opens the full preset editor.
 
-These can be changed in the "PV settings" panel.  Use the search field to
-look up available channels in the CPVA archive.  You can save frequently used
-PV sets as named presets (Presets → Save / Load).
-
-The dispersion-order PVs (GDD, TOD, FOD) used for region colouring are fixed
-constants defined at the top of sp_t.py.
-
-
-AVERAGING METHODS
------------------
-  Mean           – Simple arithmetic average of all spectra in the region.
-  Median         – Median per wavelength bin (robust to outliers).
-  Trimmed mean   – Discards a configurable fraction of extreme values before
-                   averaging.
-  Sigma-clip     – Iteratively removes samples that deviate by more than N σ
-                   from the current mean, then averages the remainder.
-
-The trimming fraction and sigma threshold are set in the controls next to the
-method selector.
+The dispersion-order PVs (GDD, TOD, FOD) used for region colouring and for the
+details block are fixed constants at the top of sp_t.py.
 
 
-INDIVIDUAL SPECTRA OVERLAY
----------------------------
-Tick "Show individual" to overlay raw spectra under the averaged curve.  A
-"Subsample" control limits how many individual spectra are drawn when the
-region contains many shots (keeps the display responsive).
+SPECTRUM PV AND THE WAVELENGTH AXIS
+-----------------------------------
+"Change…" in the active card picks the intensity (Y) waveform.
+
+  - A channel ending in _X or _Y is treated as one half of a pair, so the
+    wavelength axis is taken from the matching _X channel automatically.
+  - Any other waveform (e.g. …:FundY) usually has no _X twin, so the tool
+    asks how to build the wavelength axis:
+        * copy it from another PV
+        * copy it from a PV and apply a linear transform  x' = a·x + b
+        * load it from a CSV / text file
+        * use the plain sample index (0, 1, 2 …)
+
+The resolved pair is always shown under the card as "→ X: … / Y: …".
 
 
-AXIS AND LAYOUT
+DISPLAY OPTIONS
 ---------------
-  - Click the axis-label fields to rename axes.
-  - Type values into the limit fields (X min/max, Y min/max) and press Enter
-    to fix the view; leave blank to use automatic limits.
-  - Drag the subplot-adjust toolbar button to change margins; the new layout
-    is saved automatically.
+  Average        – Mean / Median / Trimmed mean 10% / Sigma-clipped mean
+                   (the trim fraction 10 % and the 3σ threshold are fixed).
+  Colour by      – Selection order, or GDD / TOD value (adds a colorbar).
+  Normalize      – None / Peak / Area.
+  Variation band – ±1σ or the 10–90 percentile band around the average.
+  Smooth         – moving average with an adjustable window.
+  Show search graph – hides or shows the upper graph.
+  Spectrum range [nm] – From / To, plus "Auto-fit range to data on Analyze".
+
+Per region (in the region list): eye icon = show/hide, expand = details with
+energy, GDD/TOD/FOD and the spectral metrics (peak wavelength, peak intensity,
+centroid, FWHM, RMS bandwidth, area), and a switch to overlay the individual
+spectra of that region (capped at 400 traces).
+
+"Compare regions" plots the difference (A − B) or ratio (A ÷ B) of two
+analysed regions as an extra curve.
+
+
+GRAPH INTERACTION
+-----------------
+  - Both graphs have a crosshair with floating X/Y value labels.
+  - Pan/zoom is remembered across redraws; "Home" resets it.
+  - "Select" and Pan/Zoom are mutually exclusive — turning on Pan or Zoom
+    switches Select off.
+  - Right-click inside a graph for: Axis limits…, Axis labels…, major /
+    minor grid, Y scale linear / logarithmic, Reset view.
+  - Subplot margins changed in the toolbar's Subplots dialog are saved.
 
 
 EXPORT
 ------
-CSV export writes one file per region.  The file contains:
+"Export results" writes a CSV of the data and/or a graph image (PNG, PDF,
+SVG).  One CSV holds everything:
 
-  - A header line with the region metadata (date, time range, method, etc.)
-  - Two columns: Wavelength and Intensity
-  - Decimal separator:  period  (compatible with the lab Excel locale)
-  - Column separator:   semicolon  (set by a "sep=;" line at the top so
-    Excel opens the file correctly without an import wizard)
-
-Image export supports PNG, PDF, and SVG.
+  - "# Spectrum details" — one row per region: date, time range, number of
+    spectra, method, SBW4 energy, GDD/TOD/FOD and all spectral metrics.
+  - a blank line
+  - "# Curve data" — a wavelength column, then the averaged curve + std for
+    every region, one column per live shot, and the comparison curve if it is
+    enabled.
+  - Decimal separator: period.  Column separator: semicolon, announced by a
+    "sep=;" first line so Excel opens the file without an import wizard.
 
 
 CONFIGURATION FILES
 -------------------
-User settings (presets, saved PV lists, window layout) are stored in:
+User settings are stored in  %APPDATA%\ELI_Spectra\ :
 
-  %APPDATA%\ELI_Spectra\
+  search_pvs.json       current search-PV list
+  search_presets.json   named presets
+  spec_pvs.json         spectrum Y channel + wavelength-axis configuration
+  layout.json           splitter sizes + subplot margins
 
-Deleting or renaming that folder resets the application to its defaults.
+Deleting that folder resets the application to its defaults.
 
 
 ARCHITECTURE NOTE
 -----------------
-The entire application is a single file (sp_t.py, ~3 000 lines).  The main
-class is SpectraWidget (QWidget); it can be embedded in a parent application
-or run standalone via the __main__ block at the bottom.
+The whole application is a single file (sp_t.py).  The main class is
+SpectraWidget (QWidget); it can be embedded in a parent application (it exposes
+cancel_scan() for a global "Stop All") or run standalone via the __main__ block
+at the bottom.
 
-For a detailed description of every class, method, and internal data structure
+For a detailed description of every class, method and internal data structure
 see STRUCTURE.md in the same folder.
 
 

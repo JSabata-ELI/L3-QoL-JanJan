@@ -1,13 +1,14 @@
 ---
 name: Image Tools structure map
-description: Line-by-line class/function map of all files in Image Tools — read this before editing to avoid re-reading ~23 000 lines.
+description: Line-by-line class/function map of all files in Image Tools — read this before editing to avoid re-reading ~29 000 lines.
 ---
 
 Image Tools — PySide6 multi-tab image viewer
-Files (verified 2026-06-19): `main.py` (255 L) | `if_t.py` (6624 L) | `is_t.py` (11238 L) | `sf_t.py` (2682 L) | `wk_t.py` (1283 L)
-Orphan: `sp_t.py` (1072 L) — NOT imported by main.py; stray copy of the Spectra program, not part of this app.
+Files (verified 2026-08-05): `main.py` (256 L) | `if_t.py` (8241 L) | `is_t.py` (15818 L) |
+`sf_t.py` (3251 L) | `wk_t.py` (1283 L) | `cpva_client.py` (788 L)
 
-Line numbers below are approximate anchors — they drift as the files change. Re-grep the symbol name if an offset looks wrong.
+Line numbers are approximate anchors — they drift as the files change. Re-grep the
+symbol name if an offset looks wrong.
 
 ---
 
@@ -15,228 +16,300 @@ Line numbers below are approximate anchors — they drift as the files change. R
 
 | Line | Name | What it does |
 |------|------|-------------|
-| L6  | frozen `sys.path` fixup | strips user site-packages, prepends `_internal`, writes debug_syspath/debug_pil txt |
-| L28 | `_VER_RE` | regex `v#.#.#` extracted from exe name |
-| L30 | `_detect_version()` / `APP_VERSION` / `APP_TITLE` | version string from exe/file name |
-| L46 | `build_main_window(folder_arg)` | loads if/is/sf/wk via importlib (`if`/`is` are keywords), builds `QTabWidget` (4 tabs), wires inter-tab refs, Stop-All button in status bar |
-| L55 | `_load_module(name, filename)` | importlib loader, frozen-aware base dir |
-| L187 | `_open_folder_in_slider(viewer, tabs, folder)` | switch to Slider tab + load folder |
-| L195 | `main()` | argparse, AppUserModelID, Fusion style + global QSS, `showMaximized` |
+| L6 | frozen `sys.path` fixup | strips user site-packages, prepends `_internal` |
+| L28 | `_VER_RE` | `v#.#.#` extracted from the exe name |
+| L30 | `_detect_version()` / `APP_VERSION` / `APP_TITLE` | version string |
+| L46 | `build_main_window(folder_arg)` | loads if/is/sf/wk via importlib (`if`/`is` are keywords), builds the 4-tab `QTabWidget`, wires inter-tab refs, Stop-All button in the status bar |
+| L188 | `_open_folder_in_slider(viewer, tabs, folder)` | switch to the Slider tab + load a folder |
+| L196 | `main()` | argparse, AppUserModelID, Fusion style + global QSS, `showMaximized` |
 
-**Inter-tab wiring (L123-138):** finder/shot_finder get `_slider_ref`, `_tab_widget`; all tabs get `_workshop_ref` + `_workshop_tab_idx`. Slider auto-starts online mode on first activation of tab index 1 (L177).
+**Inter-tab wiring:** finder / shot_finder get `_slider_ref` and `_tab_widget`; every
+tab gets `_workshop_ref` + `_workshop_tab_idx`. The Slider auto-starts live mode on
+the first activation of tab index 1.
 
 ---
 
-## if_t.py — Image Finder tab (6624 L)
+## cpva_client.py — shared archiver client (788 L)
+
+| Line | Name | Purpose |
+|------|------|---------|
+| L76 | `CpvaError` | |
+| L100/158 | `_request_json` / `_close_quiet` | one pooled HTTPS connection, SSL verification off |
+| L168/180/196/208 | `fetch_samples` / `parse_samples` / `fetch_values` / `fetch_channels` | raw REST |
+| L224 | `best_shot_ns` | strongest shot in a window (`SHOT_CHANNEL`) |
+| L244-270 | `date_key_for_ns`, `_parse_date_key`, `prev_date_key`, `next_date_key`, `day_bounds_ns`, `today_key` | day keys |
+| L276/286/302 | `DayResult`, `_Entry`, `_InFlight` | cache types; concurrent callers share one fetch |
+| L319/323 | `_entry_result` / `_merge_tail` | today's entry is refreshed with a TTL and merged |
+| **L342** | `get_day(channel, date_key)` | the day cache |
+| L433/440/457/470 | `_finish_inflight`, `warm_days`, `peek_day`, `invalidate` | |
+| L486/500/510 | `nearest_sample`, `_match_score`, `nearest_sample_ex` | nearest sample, preference direction |
+| L559/565 | `LookupResult`, `format_lookup` | tri-state: value (incl. genuine 0) / `n/a` / `ERR` |
+| L611/618/632 | `_last_at_or_before`, `invalidate_lookback`, `_value_before_day` | look-back cache keyed by "last sample before the START of a day" — a key fully determined by its query |
+| L675 | `value_at_or_before` | step PVs (waveplate `RawPos`) are archived only on change |
+| **L724** | `lookup_near(channel, ts_ns)` | the entry point every tab uses: energy = ±30 s window, step PVs = `value_at_or_before` |
+
+---
+
+## if_t.py — Image Finder tab (8241 L)
 
 ### Key constants
 | Line | Name | Note |
 |------|------|------|
-| L50 | `_IS_LAB` | hostname OPR1/2/3, VIS01/02 → lab |
-| L53 | `IMAGES_ROOT_BASE` | `//users-L3.tier0.lcs.local` |
-| L55 | `RAMPING_CANDIDATES` | Lab `//hapls-share…/2026_alldata`, Office `Z:\…` |
-| L66 | `MAX_SCAN_FILES` = 2000 | cap on stat() per folder (silent truncation, see review) |
-| L68 | `MIN_FULL_FILES` = 1 | **unused** |
-| L73 | `IMAGE_EXTS` | png/jpg/jpeg/tif/tiff/bmp |
-| L74 | `CAM_33HZ` | set of 33 Hz camera numbers |
-| L82 | `ENERGY_CSV_ROOT` / L86 `ENERGY_CSV_NAME_FMT` | `dataof%Y%b_%d` |
-| L90/96/102 | `ENERGY_COLUMNS_AVAILABLE` / `_DEFAULT` (`[]`) / `_DISPLAY` | column picker data |
-| L118 | `ENERGY_MATCH_TOL_S` = 2.0 | image↔PV match tolerance |
-| L121 | `CPVA_BASE_URL` / L122 `CPVA_HTTP_TIMEOUT`=10 | archiver REST |
-| L125 | `CPVA_SHOT_CHANNEL` / L126 `CPVA_SBW4_CHANNEL` | best-shot channels |
-| L129 | `CPVA_CHANNEL_MAP` | col → channel |
-| L149-151 | `_cpva_conn_lock` / `_cpva_conn` / `_CPVA_HOST` | **single** serialized persistent HTTPS conn |
-| L404/417 | `GRADIENTS` / `GRADIENT_NAMES` | LUT palettes |
+| L47/51 | `_detect_is_lab` / `_IS_LAB` | hostname → lab |
+| L54 | `IMAGES_ROOT_BASE` | `//users-L3.tier0.lcs.local` |
+| L56/60 | `RAMPING_CANDIDATES` / `DEFAULT_RAMPING_SOURCE` | Lab / Office ramping CSV |
+| L63-67 | `DEFAULT_WINDOW`, `DEFAULT_SAMPLE_STEP`, `DEFAULT_SAMPLE_NEAR`, `DEFAULT_TOL_KB`, `MAX_SCAN_FILES` = 2000 | selection + scan caps |
+| L69 | `MIN_FULL_FILES` | **unused** |
+| L70-72 | `ACT_MAX_GAP_S`, `MIN_SEG_ROWS`, `MIN_SEG_DURATION_S` | ramping segments |
+| L74/75 | `IMAGE_EXTS`, `CAM_33HZ` | |
+| L83/87 | `ENERGY_CSV_ROOT`, `ENERGY_CSV_NAME_FMT` | `dataof%Y%b_%d` |
+| L91/97/(display) | `ENERGY_COLUMNS_AVAILABLE` / `_DEFAULT` (`[]`) / `_DISPLAY` | column picker |
+| L123/127 | `ENERGY_MATCH_TOL_S` = 120 / `ENERGY_MATCH_TOL_API_S` = 30 | CSV vs API tolerance |
+| L130-135 | `CPVA_BASE_URL`, `CPVA_HTTP_TIMEOUT` = 10, `CPVA_SHOT_CHANNEL`, `CPVA_SBW4_CHANNEL` | |
+| L347-350 | `ENERGY_BAR_HEIGHT_PX`, `_FONT_SIZE_PT`, `_BG_COLOR`, `_TEXT_COLOR` | annotation bar |
+| L402/415 | `GRADIENTS` / `GRADIENT_NAMES` | LUT palettes |
+| L474/477 | `EMPTY_IMG_MAX_THRESHOLD`, `EMPTY_IMG_CONTRAST_MIN` | empty-frame detection |
 
 ### Module-level helpers
 | Line | Function | Purpose |
 |------|----------|---------|
-| L140 | `_cpva_ssl_ctx` | SSL ctx, verification off |
-| L154 | `_cpva_fetch_samples` | archiver GET, reuse conn, 1 retry |
-| L188 | `_cpva_best_shot_ns` | highest-energy sample ns in window |
-| L221 | `_cam_totalpower_channel` | folder → `:TotalPower` channel |
-| L234 | `_cpva_active_windows_ns` | merged active windows from TotalPower |
-| L445 | `_read_img_max_value` | imgMaxValue from PNG tEXt (12th-chunk heuristic — fragile) |
-| L593-642 | `is_valid_image_file` / `extract_display_label` / `extract_folder_number` / `extract_ns_from_stem` / `convert_timestamp` | filename helpers |
-| L644 | `_energy_csv_path` / L663 `_load_energy_csv` | daily CSV → `[_EnergyRow]` |
-| L713 | `_energy_api_for_day` | CPVA per-col (ThreadPool) + CSV fallback |
-| L843 | `_find_energy_match` | bisect nearest CSV row in tol |
-| L874 | `_find_closest_per_col_value` | per-col nearest within tol |
-| L918 | `_format_energy_value` | unit format (sbw4 ×0.749, J→mJ) |
-| L953 | `_annotate_image_with_energy` / L1104 `_write_annotated_with_text` / L1508 `_write_annotated_from_pil` | white-bar annotation (3 near-dup font/wrap routines) |
-| L5155 | `_section_label` | small-caps label |
-| **L5160** | `def _NoScrollCalendar()` | ⚠️ **shadows** the class at L539 — see KNOWN ISSUES |
-| L6605 | `main` | standalone entry |
+| L137/161 | `_import_cpva_client` / `_get_slider_module` | lazy, frozen-aware imports |
+| L179/186 | `_cpva_fetch_samples` / `_cpva_best_shot_ns` | archiver |
+| L219/232 | `_cam_totalpower_channel` / `_cpva_active_windows_ns` | merged beam-active windows |
+| L373-390 | `_make_lut` / `_make_binary_lut` / `_make_stepped_lut` | LUTs |
+| L426/431 | `_app_dir` / `load_readme_text` | |
+| L443/480 | `_read_img_max_value` / `_image_is_nonempty` | `imgMaxValue`, contrast fallback |
+| L641/666 | `_style_calendar` / `_make_mpl_toolbar` | house calendar QSS; toolbar built so the dark palette does not tint the icons away |
+| L789 | `_make_multiselect_calendar` | multi-select calendar factory |
+| L902/909 | `_hsep` / `_group_label` | |
+| L918-955 | `is_valid_image_file`, `extract_display_label`, `extract_folder_number`, `extract_ns_from_stem`, `convert_timestamp`, `build_new_name` | filename helpers |
+| L969/988 | `_energy_csv_path` / `_load_energy_csv` | daily CSV → `[_EnergyRow]` |
+| L1038 | `_energy_api_for_day` | CPVA per column (thread pool) + CSV fallback |
+| L1160/1191/1234 | `_find_energy_match` / `_find_closest_per_col_value` / `_build_per_col_from_rows` | matching |
+| L1265/1272 | `_format_energy_diff_s` / `_format_energy_value` | ± offset, units (sbw4 ×0.749, J→mJ) |
+| L1307/1447/1864 | `_annotate_image_with_energy` / `_write_annotated_with_text` / `_write_annotated_from_pil` | white-bar annotation (3 near-duplicate font/wrap routines) |
+| L6093 | `_section_label` | small-caps label |
+| L8222 | `main` | standalone entry |
 
 ### Classes
 | Line | Class | Base | Purpose |
 |------|-------|------|---------|
-| L475 | `_WeekendDelegate` | QStyledItemDelegate | red weekends |
-| L510 | `_CalBorderDelegate` | _WeekendDelegate | + From/To border |
-| **L539** | `_NoScrollCalendar` (class) | QCalendarWidget | wheel-block — **DEAD, shadowed by func L5160** |
-| L571 | `_NoScrollComboBox` | QComboBox | ignore wheel |
-| L654 | `_EnergyRow` | (slots) | one CSV row (ts_dt, values) |
-| L1161 | `_ThumbView` | QWidget | thumbnail + circle/square/cross overlay |
-| L1615-1697 | `_EnergyLoadSignals`/`_EnergyLoadTask`/`EnergyColumnDialog`/`_LoadSignals`/`_CollectSignals`/`_CompareSignals`/`_AutoHourSignals`/`_LogSignals`/`_PreviewSignals` | signals + column dialog |
-| **L1702** | `ImageFinderWidget` | QWidget | main widget |
-| L4830 | `_MultiDaySetupDialog` | QDialog | range/camera/hour picker |
-| L5168 | `MultiDayPreviewWindow` | QWidget | results grid, palette/overlay/save/try-again |
+| L514/549/578 | `_WeekendDelegate` / `_CalBorderDelegate` / `_NoScrollCalendar` | QStyledItemDelegate / QCalendarWidget | red weekends, From/To border, wheel block |
+| L713 | `_MultiSelectDelegate` | | multi-select painting |
+| L896 | `_NoScrollComboBox` | QComboBox | ignore wheel |
+| L979 | `_EnergyRow` | (slots) | one row (`ts_dt`, `values`) |
+| L1504 | `_ThumbView` | QWidget | thumbnail + circle/square/cross overlay; `overlay_changing` / `overlay_edited`, `key`, `native_size` |
+| L1971-2057 | `_EnergyLoadSignals` / `_EnergyLoadTask` / `EnergyColumnDialog` / `_LoadSignals` / `_CollectSignals` / `_CompareSignals` / `_AutoHourSignals` / `_LogSignals` / `_PreviewSignals` / `_TryAgainSignals` | signals + column dialog |
+| **L2064** | `ImageFinderWidget` | QWidget | the tab |
+| L5768 | `_MultiDaySetupDialog` | QDialog | range / camera / hour picker (weekday default Mon–Fri) |
+| L6108/6190 | `_PVBrowseDialog` / `PVRegionSearchDialog` | QDialog | browse channels; find time regions where the chosen PVs satisfy conditions (`_PV_REGION_COLORS` at L6104) |
+| **L6592** | `MultiDayPreviewWindow` | QWidget | result grid: palette / overlay / save / search-again |
 
 ### `ImageFinderWidget` key methods
 | Line | Method | Purpose |
 |------|--------|---------|
-| L1711 | `__init__` | `_load_gen=0`, energy caches, pools |
-| L1782/1790/1798 | `_set_busy` / `_log` / `_log_safe` | `_log_safe` = thread-safe via signal |
-| L1806 | `_schedule_autoload` | debounced load_folders |
-| L1815 | `_build_ui` | full UI |
-| L2239-2317 | `_preview_*` | inline row preview (gen-checked at L2307) |
-| L2490/2497 | `_auto_select_today` / `_on_calendar_selected` | day selection |
-| L2525 | `_pick_energy_columns` | column dialog |
-| L2535 | `_get_energy_rows_for_dt` | cached API→CSV |
-| L2563 | `_lookup_energy_for_files` | per-file match (7-tuple) |
-| L2815 | `_get_ramping_for_day_cached` | ramping CSV, 1 s thread timeout |
-| L2883 | `_pick_best_block_real_hour` | segment-based auto-hour |
-| L2974 | `_apply_auto_hour_for_selected_day` | default hour + bg refine |
-| L3043 | `_build_datetime` / L3057 `_build_target_path` | UI → UTC folder path (`max(year,2025)`) |
-| L3082 | `load_folders` | scan all 24 hours (12 threads), fill table |
-| L3177 | `_on_load_done` | gen-checked table fill |
-| L3358 | `_nearest_file_for_ns` | probe ns offsets via exists(), scandir fallback |
-| L3447 | `_find_image_for_day_cam` | TotalPower→file, blind-scan fallback |
-| L3703 | `_on_multiday_search` | multi-day search |
-| L3841 | `_get_csv_best_hour_for_day` | count-based best hour (**likely dead**) |
-| L3924 | `_get_items_cached` | scandir + sampled stat, `_namecache` |
-| L4002 | `select_images_from_folder` | size/segment selection (params window/tol_kb/sample_* **ignored**) |
-| L4130/4343 | `_collect_primary_files_now` / `_async` | parallel collect (24 threads) |
-| L4189 | `_select_by_totalpower` | energy-anchored pick |
-| L4383/4447 | `view_primary_files` / `save_primary_files_as` | View / Save |
-| L4673/4655/4714 | `_compare_memory` / `_align_images` / `_show_compare_window` | A/B diff |
+| L2073 | `__init__` | `_load_gen = 0`, energy caches, pools |
+| L2144/2152/2160 | `_set_busy` / `_log` / `_log_safe` | `_log_safe` = thread-safe via signal |
+| L2168 | `_schedule_autoload` | debounced `load_folders` |
+| L2177 | `_build_ui` | full UI |
+| L2546-2607 | `_get_original`, `_get_qty`, `_set_check_visual`, `_on_cell_*`, `_toggle_row/_all`, `_refresh_master_checkbox` | camera table |
+| L2615-2739 | `_preview_load_from_row`, `_preview_set_files`, `_preview_prev/next`, `_on_preview_ready`, `_paint_pv_bar`, `_preview_show` | inline row preview |
+| L2818-2922 | `_capture_selection_state`, `_refresh_selected_table`, `_fit_table_width`, `_apply_search`, `sort_subfolders_by_label/camnum`, `_reorder_table_rows` | selection + sorting |
+| L2931-3012 | `_apply_day_selection`, `_effective_days`, `_on_calendar_clicked`, `_auto_select_today` | day selection (multi-day aware) |
+| L3020-3041 | `_on_hour_change`, `_on_labtime_toggle`, `_on_gradient_changed`, `_pick_energy_columns` | |
+| L3051 | `_get_energy_rows_for_dt` | cached API → CSV |
+| L3107/3156/3203 | `_lookup_energy_for_files` / `_pv_values_for_ns` / `_format_pv_state` | per-file match, per-column lookup, tri-state format |
+| L3211-3289 | `_energy_parts_for_path`, `_energy_entry_for_path`, `_on_pv_preview_toggle`, `_refresh_energy_info(_single)`, `_on_nav_mode_changed`, `_energy_nav_prev/next` | energy info panel + shot navigation |
+| L3363-3483 | `_ensure_ramping_root`, `_parse_timestamp`, `_read_ramping_csv_rows`, `_get_ramping_for_day_cached` (1 s thread timeout), `_pick_best_block_real_hour` | ramping-based auto hour |
+| L3574/3609 | `_apply_auto_hour_for_selected_day` / `_apply_auto_hour_ui` | hour 14 immediately + background refine, reload only if it changed |
+| L3642/3656 | `_build_datetime` / `_build_target_path` | UI → UTC folder path |
+| **L3680** | `load_folders` | scan all 24 hours in a pool, fill the table |
+| L3766-3787 | `_on_load_not_found` / `_on_load_error` / `_on_load_done` | gen-checked table fill |
+| L3854-3882 | `open_in_slider`, `_open_first_in_slider`, `open_folder_in_explorer` | |
+| L3944-4057 | `_blocking_call`, `_nearest_file_for_ns`, `_frame_nearest_ns` | probe ns offsets via `exists()`, scandir fallback |
+| L4117/4213 | `_find_image_for_regions` / `_find_image_for_day_cam` | PV-region hit → frame; TotalPower → frame with blind-scan fallback |
+| L4522/4536 | `_energy_rows_for_day_cached` / `_open_pv_region_search` | |
+| L4559 | `_run_multiday_search` | multi-day search |
+| L4717 | `_get_csv_best_hour_for_day` | count-based best hour (**likely dead**) |
+| L4801/4863 | `_get_items_cached` (scandir + sampled stat, `_namecache`) / `_any_image_from_folder` | |
+| L4879 | `select_images_from_folder` | size / segment selection (several params **ignored**) |
+| L4954-4984 | `_cleanup_view_temp`, `_apply_gradient_to_image`, `_make_view_copy_with_readable_name` | |
+| L5009/5222 | `_collect_primary_files_now` / `_async` | parallel collect |
+| L5068 | `_select_by_totalpower` | energy-anchored pick; recomputes the correct hour folder once `best_shot_ns` is known |
+| L5276/5361 | `view_primary_files` / `save_primary_files_as` | View / Save |
+| L5334 | `_run_energy_lookup_async` | background energy lookup (`_sig` captured locally) |
+| L5494-5593 | `show_info`, `_save_to_memory`, `_send_to_workshop`, `_do_save_to_memory_slot`, `_clear_slot`, `_clear_memory`, `_align_images` | |
+| L5611/5652 | `_compare_memory` / `_show_compare_window` | A/B diff |
+
+### `MultiDayPreviewWindow` key methods
+| Line | Method | Purpose |
+|------|--------|---------|
+| L6631/6816 | `_build_ui` / `_make_scroll_tab` | grid + Day/Camera tabs |
+| L6862-6924 | `_load_raw`, `_apply_display_effects`, `_render_thumb`, `_render_popup` | render chain |
+| L6937-6994 | `_on_palette_changed`, `_on_brightness_changed`, `_on_auto_bright_toggled`, `_on_preview_toggled`, `_rotate_all`, `_on_circle/square/cross_toggled` | display + overlay switches |
+| L7017-7093 | `_pick_shape_color`, `_apply_colors_to_views`, `_clear_all_overlays`, **`_mirror_overlay_from`** (mirrors an overlay edit to every selected thumb, centre-preserving), `_tv_overlay_state` | |
+| L7106-7190 | `_display_state`, `_push_undo`, `_undo_last`, `_apply_display_state`, `_reset_display` | undo of display state |
+| L7244-7294 | `_active_draw_mode`, `_update_all_draw_modes`, `_native_size_for`, `_refresh_all_thumbs` | |
+| L7294/7444 | `_make_thumb_cell` / `_search_by_time` | one cell; re-search by time |
+| L7516-7580 | `_show_popup` / `_hide_popup` / `hideEvent` / `closeEvent` / `_pv_text_for_path` | |
+| L7618/7646 | `_populate_day_tab` / `_populate_cam_tab` | |
+| L7658-7894 | `_open_save_dialog`, `_bake_overlay_to_pil`, `_save_selected`, `_save_all`, `_items_for_keys`, `_paths_for_keys`, `_save_items`, `_save_paths` | saving |
+| **L7900-8004** | `_try_again_selected` / `_try_again_single` / `_try_again_candidates` / `_try_again_run` | background re-search: energy-anchored candidates (`_select_by_totalpower` + size fallback), empty-frame validation, cancel, per-cell attempt log |
+| L8115-8183 | `_pick_image_single`, `_clear_grid`, `_rebuild_grids`, `_update_thumb_result` | |
 
 ---
 
-## is_t.py — Image Slider tab (11238 L)
+## is_t.py — Image Slider tab (15818 L)
 
 ### Key constants
 | Line | Name | Note |
 |------|------|------|
-| L46-63 | `IMG_EXT`, `SLIDER_MAX`=1e6, `SCRUB_*`/`PLAY_*` sides, `CACHE_SIZE`=320, `PREFETCH_*`, `ONLINE_MAX_ITEMS`=50000 | operational tuning |
-| L72-89 | `CPVA_BASE_URL`/`CPVA_HTTP_TIMEOUT`=8, `PV_CHANNEL_MAP`, `PV_UNITS` | PV archiver |
-| L101-214 | `_pv_day_cache`(+lock,TTL) / `_pv_before_cache`(+lock) | day & look-back PV caches |
-| L477-492 | `GRADIENTS`/`GRADIENT_NAMES`, `GRADIENT_ID_DEFAULT`=0/`_GRAYSCALE`=1 | palettes |
-| L498-512 | `CIRCLE_*` calib, `DEFAULT_OPEN_DIR/ROOT`, `DEFAULT_SAVE_DIR` | calib + paths |
-| L624 | `ONLINE_ACTIVE_FOLDER_COUNT`=2 | live-poll hour folders |
-| L1124-1136 | `_k32`, `_FILE_*`, `_DIRWATCH_AVAILABLE` | Win32 ReadDirectoryChangesW |
+| L49-90 | `IMG_EXT`, `TZ_PRAGUE`, `SLIDER_MAX`, `SCRUB_*`, `PLAY_MAX_SIDE_*`, `FULL_RES_SIDE`, `CACHE_SIZE` = 320, `NATIVE_CACHE_KEEP` = 4, `PROXY_*`, `PREFETCH_*`, `TICK_STEP_MINUTES`, `PLAY_TICK_MS`, `AXIS_TOLERANCE_S`, `SAVE_RANGE_WARN_COUNT`, `ONLINE_MAX_ITEMS` = 3600 | operational tuning |
+| L109/110 | `CPVA_BASE_URL`, `CPVA_HTTP_TIMEOUT` = 8 | archiver |
+| L159 | `_PV_TODAY_CACHE_TTL` = 1.5 | today's PV cache |
+| L467-469 | `GRADIENT_NAMES`, `GRADIENT_ID_DEFAULT` = 0, `GRADIENT_ID_GRAYSCALE` = 1 | palettes |
+| L472-485 | `ONE_HOUR_NS`, `CIRCLE_*` | circle calibration |
+| L487-494 | `DEFAULT_OPEN_DIR/ROOT`, `DEFAULT_SAVE_DIR`, `IMAGES_ROOT_BASE` | paths |
+| L501/504 | `_REF_STATUS_STYLE`, `_REF_WARN_STYLE`, `_CHECKBOX_STYLE` | QSS |
+| L630-664 | `ONLINE_ACTIVE_FOLDER_COUNT` = 2, `ONLINE_POLL_MIN/MAX_INTERVAL_S` (0.5/5), `ONLINE_POLL_BACKOFF`, `ONLINE_WATCHER_POLL_INTERVAL_S` = 3, `CAM_LOAD_WATCHDOG_S`, `CAM_PIPELINE_GRACE_S`, `WATCHER_SUSPECT_STRIKES` = 2, `WATCHER_RESTART_COOLDOWN_S` = 30, `CAM_DOT_FRESH_S` | live mode |
+| L1023 | `_RenderBC` / `_RENDER_BC_NONE` | render params tuple (offset, contrast, auto) |
 
 ### Module-level helpers
 | Line | Function | Purpose |
 |------|----------|---------|
-| L92-254 | `_pv_ssl_ctx`/`_pv_date_key`/`_pv_load_day`/`_pv_query_range`/`_pv_value_at_or_before`/`_pv_last_known`/`_format_pv_value` | PV fetch + cache |
-| L259 | `pv_text_for_ts` / L281 `pv_warm_days` | PV burn-in string + parallel pre-warm |
-| L319 | `render_pv_bar_below` | white PV text bar under PIL image |
-| L402/435 | `_copy_metadata_into_png` (+`_bg`) | embed source metadata |
-| L447-465 | `_make_lut`/`_make_binary_lut`/`_make_stepped_lut` | LUTs |
-| L529-563 | `parse_unix_ns_from_name`, `_dt_from_sec`(lru), `_dt_from_ns`, `fmt_*`, `prague_stamp_for_filename` | ts parse/format |
-| L741/760 | `_autostretch_gray` / `_apply_brightness_offset` | contrast/brightness |
-| L776 | `load_image_scaled` | **core** decode/scale/gradient/subtract pipeline |
-| L889 | `_apply_lut` | RGB LUT onto Grayscale8 |
-| L3389 | `_fit_circle_kasa` | Kåsa circle fit |
+| L137 | `_import_cpva_client` | lazy import |
+| L162-237 | `_pv_date_key`, `_pv_prev_date_key`, `_pv_last_known_ex` (delegates to `cpva.lookup_near`), `_pv_decorate`, `_pv_last_known`, `_format_pv_value`, `pv_text_for_ts` | PV value at a frame's timestamp |
+| L265/283/296 | `pv_warm_days` / `_pv_bar_font` / `render_pv_bar_below` | pre-warm; white PV bar under a PIL image |
+| L379-421 | `_copy_metadata_into_png(_bg)` / `_save_png_metadata_txt` | metadata passthrough |
+| L424-442 | `_make_lut` / `_make_binary_lut` / `_make_stepped_lut` | LUTs |
+| L496 | `container_root_for_year` | archive root per year |
+| L514/519 | `Item` (frozen dataclass) / `parse_unix_ns_from_name` | |
+| L529-567 | `_dt_from_sec` (lru), `_dt_from_ns`, `fmt_hhmm_from_ns`, `fmt_hhmmss_ms_from_ns`, `fmt_prague_full_from_ns`, `prague_stamp_for_filename`, `replace_unix_ns_with_prague_in_filename` | ts parse/format |
+| L567-587 | `_strip_cam_name`, `_cam_short_label`, `_cam_aspect_hint` | camera names |
+| L590-617 | `floor_to_hour`, `axis_from_hour_folder_exact`, `axis_from_any_folder`, `folder_hour_from_prague_hour` | axis from a folder |
+| L670-777 | `_cam_folder_time_key`, `active_scan_folders`, `poll_scan_folders`, `_is_dir_quiet`, `_dir_access_error`, `_camera_folder_problem`, `_probe_hour_folder` | folder probing + diagnosis |
+| L814/858 | `_read_image_max_sample` / `_read_tiff_max_sample` | real max sample |
+| **L887** | `_norm16_to8_full_scale` | 16-bit → 8-bit on `value/65535` (camera-absolute); replaced the `MaxValue`-tEXt × `/4095` scaling that rendered 6–9 bit diode cams near-black |
+| L894 | `_gain_to_contrast_slider` | auto gain → Contrast slider value |
+| L904-993 | `_stretch_arr_f`, `_autostretch_gray`, `_apply_brightness_offset`, `_apply_contrast`, `_apply_auto_brightness` | brightness = offset, contrast = gain; each reports what it applied |
+| L1036/1047 | `_auto_bc_put` / `_auto_bc_get` | side channel that parks the greyed-out Auto sliders |
+| L1062-1075 | `_diff_stats_put` / `_get`, `_apply_reference_diff` | subtraction + stats |
+| **L1123** | `load_image_scaled` | core decode / scale / brightness-contrast / subtract / palette pipeline |
+| L1206/1225 | `_apply_lut` / `PixCache` | |
+| L1265-1335 | `load_proxy_gray`, `_proxy_plan` (coarse → fine sampling), `_ProxyTrack` | preview layer |
+| L3328 | `_make_multiselect_calendar` | house-style calendar (the Qt grid-shift paint bug is fixed in `_date_for_index`) |
+| L3453-3522 | `_seg_fields`, `hour_end_hm`, **`seg_bounds_ns`** (To = EXCLUSIVE end), `utc_hour_cells_for_window`, `hour_dirs_for_windows`, **`cameras_for_windows`** (union over every window + status) | window model |
+| L4144-4266 | `_cam_type_key`, `_load/_save_pdxm1_grid_configs`, `_PDXM1_REVERSED_TYPES`, `get_pdxm1_grid_config`, `_draw_outlined_text` | diode grid overlay config |
+| L4784 | `compute_justified_layout` | gallery packing that maximises total image area; each tile reserves `top_px` for its label bar so no letterbox shows |
+| L5780 | `_fit_circle_kasa` | Kåsa circle fit |
+| L7486/7490 | `_hsep` / `_group_label` | |
 
 ### QRunnable workers + Signals
 | Signals (L) | Worker (L) | run() purpose |
 |------|--------|---------------|
-| `_PvSignals` 927 | (Viewer fetch) | `result(gen, dict)` |
-| `LoaderSignals` 930 | `LoadTask` 933 | decode one image (run 942) |
-| `ScanSignals` 950 | `ScanTask` 957 | scan folders → items (run 966; whole body wrapped in `except: pass` L1005) |
-| `RefreshScanSignals` 1014 | `RefreshScanTask` 1017 | incremental rescan (run 1025) |
-| `SaveRangeSignals` 1048 | `SaveRangeTask` 1052 | batch save A→B w/ overlay+PV (run 1131) |
-| `PointingAnalysisSignals` 1191 | `PointingAnalysisTask` 1196 | centroid per frame (run 1266) |
-| `_SCSignals` 2006 | `_SCTask` 2010 | spatial contrast (run 2040, otsu 2145) |
-| `_CamPollSignals` 5109 | `_CamPollTask` 5208 | poll one cam's folders (run 5222) |
-| `_DirWatchSignals` 5139 | `_DirWatcher`(Thread) 5143 | ReadDirectoryChangesW (run 5166) |
+| `_ProxySignals` 1376 | `_ProxyTask` 1380 | one batch of preview frames |
+| `_PvSignals` 1404 | (Viewer fetch) | PV result |
+| `LoaderSignals` 1407 | `LoadTask` 1417 | decode one image |
+| `ScanSignals` 1452 | `ScanTask` 1459 | scan folders → items (whole body wrapped in `except: pass`) |
+| `RefreshScanSignals` 1516 | `RefreshScanTask` 1519 | incremental rescan |
+| `SaveRangeSignals` 1550 | `SaveRangeTask` 1554 | batch save A→B with overlay + PV bar |
+| `PointingAnalysisSignals` 1693 | `PointingAnalysisTask` 1698 | centroid per frame |
+| `_SCSignals` 2508 | `_SCTask` 2512 | spatial contrast |
+| `_CamPollSignals` 7774 | `_CamPollTask` 7890 | poll one camera's folders |
+| `_DirWatchSignals` 7804 | `_DirWatcher` (Thread) 7808 | `ReadDirectoryChangesW` |
+| `_CamLoaderSignals` 5396 | (CameraPickerDialog) | camera list |
 
 ### Widget / dialog classes
 | Line | Class | Purpose |
 |------|-------|---------|
-| L1304/1473/1625/1795 | `_SCHistogramWidget`/`Dialog`, `_SCExclusionEditor`/`Canvas` | SC threshold + exclusion regions |
-| L2174 | `PointingPanel` | mpl scatter/hist/path + Qt interaction |
-| L2654/2685 | `WeekendDelegate`, `DatePickerDialog` | calendar + date/hour/multiday |
-| L3035 | `CameraPickerDialog` | camera selection + presets |
-| L3409 | `ImageView` | image display + overlays + zoom + calibration (paintEvent 3778) |
-| L4289/4398 | `CameraView` / `MultiCameraGrid` | 2–4 cam grid |
-| L4645 | `TickBar` | time axis / cursor / marks (paintEvent 4680) |
-| L4921/4936 | `_DirItem` / `LazyDirModel`, L5031 `FolderPickerDialog` | lazy folder tree |
-| L4929 | `_LazyDirModel` | **dead stub (`pass`)** |
-| L5300 | `_CamSliderRow` | per-cam master radio + slider |
-| L5372 | `_PvOverlayPanel` | floating draggable PV panel |
+| L1806/1975 | `_SCHistogramWidget` / `_SCHistogramDialog` | SC histogram + threshold |
+| L2127/2297 | `_SCExclusionEditor` / `_SCExclusionCanvas` | SC exclusion regions |
+| L2418/2432 | `_SCValueLabel` / `_SCPreviewLabel` | SC readout + preview |
+| L2676 | `PointingPanel` | mpl scatter / hist / path + Qt interaction |
+| L3185/3230 | `WeekendDelegate` / `_MultiSelectDelegate` | calendar painting |
+| **L3579** | `DatePickerDialog` | one house-style calendar + minute-resolution From/To + two multi-day modes; opens in **Now** mode (today, `hh:00`–`hh+1:00`), `_apply_now_window` shared by button and checkbox, `_on_times_changed` prevents an empty window, multi-day presets `_MULTIDAY_FROM`–`_MULTIDAY_TO` (07:00–21:00) |
+| L4102 | `_DayTimeDialog` | per-day window override (⚙ column, kept in `_day_overrides`, marked `*`) |
+| L4170/4305/4545 | `Pdxm1GridConfig` / `_GridPreviewWidget` / `Pdxm1GridConfigDialog` | diode grid overlay; line positions are absolute image fractions, so each line is independent; PD cameras of one type share a config |
+| L4773/4780/4846/5262 | `CamLayoutEntry` / `CamLayoutConfig` / `_LayoutCanvasWidget` / `LayoutConfigDialog` | multi-cam layout editor (free layout + justified rows) |
+| **L5399** | `CameraPickerDialog` | camera selection + presets; list = union over every window of the pick |
+| L5761 | `PopupBelowComboBox` | popup always opens below |
+| **L5800** | `ImageView` | image display, overlays, zoom, calibration, `cam_ref_text` green `Ref:` badge |
+| L6795/6936/6961/7003 | `CameraView` / `_FreeLayoutContainer` / `_JustifiedRowsContainer` / `MultiCameraGrid` | camera tile + the two layout backends + grid |
+| L7219 | `TickBar` | time axis, cursor, A/B marks, date labels |
+| L7495 | `CollapsibleSection` | sidebar sections (accent stripe + ▾/▸), state persisted via `_load/_save_ui_state` |
+| L7586-7696 | `_DirItem` / `_LazyDirModel` (**dead stub**, `pass`) / `LazyDirModel` / `FolderPickerDialog` | lazy folder tree |
+| L8004/8076 | `_CamSliderRow` / `_PvOverlayPanel` | per-cam slider row; floating PV panel |
 
-### `Viewer` (L5477, QWidget) — main tab, method groups
+### `Viewer` (L8181, QWidget) — method groups
 | Group | Methods (anchor L) |
 |-------|--------------------|
-| init/UI | `__init__` 5478, `_build_ui` 5616, `resizeEvent` 6433 |
-| overlays | `_on_reset_zoom` 6448, `_toggle_draw_mode` 6471, `_remove_all_overlays` 6490, `_apply_overlay_settings` 6596, calibrate circle/cross/square 8524/8535/8546 |
-| PV | `_open_pv_config` 6618, `_pv_trigger_fetch` 6663, `_pv_on_result` 6754, `_pv_update_overlay` 6761 |
-| multi-cam | `_is_multi_cam` 6894, `_switch_to_multi/single_view` 6947/6954, `_build_per_cam_sliders` 6967, `_setup_multi_cam` 7228 |
-| online | `_on_auto_follow_toggled` 7283, dir-watchers 7307/7320/7328/7338, `_start/_stop_online_mode` 7410/7437, `_online_poll`/`_single_bg`/`_multi` 7472/7487/7642, timeline 7756/7790 |
-| open/scan | `open_folder` 7841, `_start_multi_cam_scan` 7931, `open_by_date` 8113, `auto_start_online` 8253, `open_folder_path` 8266, `open_file_list` 8274, `refresh_folder` 8347, `_start_scan` 8848, `_choose_axis` 8904 |
-| brightness/subtract | `_on_brightness_slider_changed` 8558, `_load_raw_arr` 8578, `_set_reference_frame` 8591, `_on_subtract_changed` 8654, `_on_gradient_changed` 8678 |
-| slider↔time | `_slider_to_time_ns` 8729, `_time_to_nearest_index` 8749, `_set_info_for` 8755 |
-| display/load | `_load_or_cache` 9104, `_display_exact_index` 9137, `_display_multicam_at_time/_index` 9148/9171, `_on_cam_loaded` 9262, `_request_pixmap` 9345, prefetch 9358/9365, `_on_loaded` 9372 |
-| playback | `play` 9401, `stop` 9424, `_autoplay_step` 9433, `step_frame` 9521, `keyPressEvent` 9537 |
-| focus/watcher | `_toggle_focus_mode` 9572, `_toggle_watcher_mode` 9659, `eventFilter` 9705 |
-| timestamps | `_save_current_timestamp` 9823, `_goto_saved_timestamp` 9847 |
-| pointing | `run_pointing_analysis` 9881, `_on_pointing_finished` 9961, `_save_pointing_plot` 10067 |
-| spatial contrast | `_run_sc_auto_threshold` 10144, `_open_sc_histogram` 10170, `_open_sc_exclusion_editor` 10218, `_run_spatial_contrast` 10294, `_update_sc_topn_overlay` 10394 |
-| marks/save | `set_mark_a/b` 10469/10475, `save_around_current` 10557, `save_current_with_overlay` 10617, `_render_cam_frame` 10734, `_send_to_workshop` 10853, `save_current` 10900, `save_range` 11080 |
+| init / UI | `__init__` 8182, `_load_ui_state` 8392, `_save_ui_state` 8400, `_diag_log` 8408, `_on_section_toggled` 8475, `_set_all_sections` 8479, `_build_ui` 8486, `resizeEvent` 9447, `_set_busy` 9453 |
+| overlays | `_on_reset_zoom` 9462, `_toggle_draw_mode` 9485, `_remove_all_overlays` 9504, `_open_overlay_settings` 9526, `_apply_overlay_settings` 9610, calibrate circle/cross/square 12318/12329/12340, `_sync_overlay_checkboxes_from_iv` 12290, `_on_overlay_changed` 12303 |
+| PV | `_open_pv_config` 9632, `_pv_rebuild_table` 9658, `_pv_trigger_fetch` 9684, `_pv_trigger_fetch_now` 9744, `_pv_force_refresh` 9808, `_pv_on_result` 9826, `_pv_update_overlay` 9842, `_open_pv_overlay_settings` 9884, `_pv_text` 9966 |
+| multi-cam | `_is_multi_cam` 9984, `_on_multicam_selected` 10029, `_switch_to_multi/single_view` 10087/10094, `_build_per_cam_sliders` 10107, per-cam slider handlers 10176-10286, `_start_cam_load` 10372, `_reset_cam_pipeline` 10400, `_cam_load_watchdog` 10437, `_per_cam_sync_slaves` 10455, `_per_cam_step` 10487, `_live_advance_cam` 10506, `_setup_multi_cam` 10533 |
+| live mode | `_on_auto_follow_toggled` 10637, `_ensure_dir_watcher` 10676, `_watcher_strike` 10699, `_stop/_prune_dir_watchers` 10724/10732, `_on_dir_watch_new_file` 10742, `_start/_stop_online_mode` 10829/10866, `_restore_full_history` 10916, `_merge_restored_history` 10989, `_online_poll` 11051, `_merge_single_new_items` 11087, `_online_poll_single_bg` 11146, `_online_poll_multi` 11283, `_rebuild_shared_items_from_cams` 11438, `_extend_shared_timeline_from_cams` 11472 |
+| open / scan | `open_folder` 11531, `_start_multi_cam_scan` 11633, `_on_multi_scan_all_done` 11746, `open_by_date` 11841, `_reload_with_last_cameras` 11913, `auto_start_online` 11983, `open_folder_path` 12001, `receive_external_folder` 12010, `open_file_list` 12067, `refresh_folder` 12141, `_refresh_multi_cam` 12158, `_start_scan` 13220, `cancel_scan` 13249, `_choose_axis` 13305, `_in_ts_windows` / `_filter_to_ts_windows` 13289/13297, `_on_scan_finished` 13326 |
+| brightness / subtract | `_bc` 12405, `_refresh_auto_bc_sliders` 12414, brightness/contrast handlers 12435-12468, `_load_raw_arr` 12476, `_ref_arr_for` 12495, `_cam_ref_arr_for` 12508, `_set_reference_frame` 12520, `_set_ref_status` 12632, `_refresh_ref_warning` 12637, `_on_subtract_changed` 12649, `_update_diff_stats` 12373, `_on_gradient_changed` 12700 |
+| preview layer | `_proxy_enabled` 12769, `_proxy_start` 12792, `_proxy_cancel` 12826, `_proxy_kick` 12841, `_proxy_next_batch` 12855, `_proxy_pump` 12886, `_on_proxy_batch` 12905, `_proxy_update_status` 12924, `_proxy_render` 12938, `_proxy_try_paint(_cam)` 12965/12990, `_schedule_refine` 13017, `_refine_current_frame` 13023 |
+| slider ↔ time | `_slider_to_time_ns` 13070, `_slider_to_index` 13074, `_index_to_slider_value` 13079, `_time_to_slider_value` 13084, `_time_to_nearest_index` 13090, `_set_info_for` 13096 |
+| display / load | `_on_slider_pressed/changed/released` 13425/13439/13523, `_apply_scrub` 13452, `_load_or_cache` 13562, `_display_index` 13587, `_display_exact_index` 13595, `_display_multicam_at_time/_index` 13606/13629, `_on_cam_loaded` 13745, `_request_display_target` 13889, `_request_pixmap` 13922, prefetch 13936/13943, `_on_loaded` 13950 |
+| playback | `play` 13993, `stop` 14016, `_autoplay_step` 14028, `_play_show` 14082, `step_frame` 14123, `keyPressEvent` 14140, `_adaptive_stride` 12733, `_current_decode_side` 12743 |
+| focus / watcher | `_win32_set_title_bar` 14156, `_toggle_focus_mode` 14175 (F11), `_toggle_watcher_mode` 14262 (Ctrl+F11, edge-to-edge), `eventFilter` 14308 |
+| timestamps | `_save_current_timestamp` 14426, `_goto_saved_timestamp` 14450, `_clear_timestamps` 14478 |
+| pointing | `run_pointing_analysis` 14484, `_on_pointing_finished` 14564, live replay 14606-14681, `_save_pointing_plot` 14681, `_toggle_pointing_select` 14718, `_on_pointing_region_deleted` 14731, `_on_pointing_point_clicked` 15057 |
+| spatial contrast | `_run_sc_auto_threshold` 14766, `_open_sc_histogram` 14792, `_open_sc_exclusion_editor` 14840, `_run_spatial_contrast` 14916, `_on_sc_finished` 14958, `_update_sc_topn_overlay` 15023 |
+| marks / save | `set_mark_a/b` 15098/15104, `_apply_marks_to_tickbar` 15114, `_pv_text_for_ts` 15156, `_pv_prefetch_texts` 15167, `_pv_save_append_bar` 15206, `save_around_current` 15238, `save_current_with_overlay` 15299, `_render_cam_frame` 15392, `_save_multicam_current` 15479, `_send_to_workshop` 15518, `save_current` 15559, `_save_multicam_range` 15663, `save_range` 15746, save progress 15826-15870 |
 
 ---
 
-## sf_t.py — Shot Finder tab (2682 L)
+## sf_t.py — Shot Finder tab (3251 L)
 
 ### Key constants
 | Line | Name | Note |
 |------|------|------|
-| L81-92 | `SF_GRADIENTS` | LUT dict |
-| L105-117 | `IMAGES_ROOT_OPTIONS`, `ENERGY_CSV_ROOT_OPTIONS`, `ENERGY_CSV_NAME_FMT` | Lab/Office roots |
-| L119 | `EXTRA_COL_MATCH_TOL_S` = 5.0 | closest-value tol for extra cols |
-| L122-134 | `CPVA_BASE_URL`/`CPVA_HTTP_TIMEOUT`=15, `CPVA_CHANNEL_MAP` | archiver |
-| L136 | `PV_COLUMNS` | col → `"… [J]"` label |
-| L146 | `MJ_COLUMNS` = {Back_Ref, pap1} | shown ×1000 mJ |
-| L148-149 | `SBW4_TRANSMISSION`=0.749, `SBW4_WARNING_THRESHOLD_J`=0.5 | |
+| L95-104 | `_CHECKBOX_STYLE`, `_PV_NAME_FONT_PX`, `_CHECKBOX_STYLE_SM` | QSS |
+| L107-130 | `IMAGES_ROOT_OPTIONS`, `_images_root_for_year`, `ENERGY_CSV_ROOT_OPTIONS`, `ENERGY_CSV_NAME_FMT` | Lab / Office roots |
+| L134/138 | `EXTRA_COL_MATCH_TOL_S` = 30, `IMG_MATCH_TOL_NS` = 30 s | tolerances |
+| L159/160 | `CPVA_BASE_URL`, `CPVA_HTTP_TIMEOUT` = 15 | archiver |
+| L195/200 | `MJ_COLUMNS` = {Back_Ref, pap1}, `_CAM_CHANNEL_RE` | |
+| L202/203 | `SBW4_TRANSMISSION` = 0.749, `SBW4_WARNING_THRESHOLD_J` = 0.5 | |
 
 ### Module-level helpers
 | Line | Function | Purpose |
 |------|----------|---------|
-| L153 | `_read_img_max_value` | imgMaxValue (12th-chunk heuristic) |
-| L182/189 | `_cpva_ssl_ctx` / `_cpva_fetch_samples` | archiver GET → (list, url) |
-| L203 | `_load_csv_for_day` | daily CSV → merged + per-col |
-| L261 | `_load_api_for_day` | CPVA per-col (ThreadPool) + CSV fallback, merge by `_ns` |
-| L366 | `_find_closest_col_value` | bisect closest within tol |
-| L391 | `_find_best_match` | min \|val−target\|; ⚠️ **re-divides sbw4 by 0.749** (double-scale, see KNOWN ISSUES) |
-| L408 | `_folder_hour_from_prague` | Prague→UTC folder hour (hardcoded −1 when no zoneinfo → DST bug) |
-| L417 | `_find_hour_folder` | probe `root/Y/M/D/h` offsets [0,−1,1,−2,2] |
-| L432 | `_find_image_for_ts` | scan folder, closest ns (docstring says 5 s, code uses 10 s) |
-| L483 | `_format_value` | per-col format |
+| L53-70 | `_make_lut_sf` / `_make_binary_lut_sf` / `_make_stepped_lut_sf` | LUTs |
+| L141/168 | `_import_cpva_client` / `_get_slider_module` | lazy imports |
+| L207 | `_read_img_max_value` | `imgMaxValue` |
+| L236/244 | `_cpva_fetch_samples` / `_cpva_fetch_channels` | archiver |
+| L250 | `_load_csv_for_day` | daily CSV → merged + per-col |
+| **L308** | `_load_api_for_day` | per-column API + CSV fallback → `(merged, per_col, col_meta)`; does **not** fall back to CSV on an API *error* (source mixing caused the waveplate 500k/0 alternation) |
+| L412/421 | `_find_closest_col_value` / `_lookup_col_value` | closest within tolerance; tri-state via `cpva.lookup_near` |
+| L479-501 | `_format_value_state` / `_format_diff` / `_find_best_match` | |
+| L520/529/544 | `_folder_hour_from_prague` / `_find_hour_folder` / `_find_image_for_ts` | Prague → UTC folder hour, probe offsets, closest frame |
+| L595 | `_format_value` | per-column format |
 
 ### Classes & key methods
 | Line | Class / method | Purpose |
 |------|---------------|---------|
-| L497-509 | `_SearchSignals`/`_CamLoadSignals`/`_PreviewSignals` | signals |
-| L513/530/557 | `_WeekendDelegate`/`_NoScrollCalendar`/`_NoScrollComboBox` | calendar/combo |
-| L583 | `_DayResult` | result container, computes `ts_ns` |
-| L609 | `_PreviewWidget` | centered painter |
-| L646 | `_TimeWindowDialog` | start/end date+hour |
-| **L786** | `ShotFinderWidget` | main tab |
-| L921 | `_build_ui` | full UI |
-| L1203 | `_setup_calendar` | **dup of `_make_cal`, likely unused** |
-| L1268 | `_rebuild_criteria_rows` | per-PV target/tol rows |
-| L1370 | `_on_selection_changed` | row → find image + energy + preview thread |
-| L1436 | `_load_and_show_preview` | bg load/normalize/LUT → QImage |
-| L1517 | `_load_cameras` | bg, ThreadPool scans 24 hours (no cancel token) |
-| L1649 | `_start_search` | build criteria, worker per-day API/CSV + match (no cancel token) |
-| L1843 | `_on_day_result` | populate row (does network IO on main thread) |
-| L1958 | `_on_table_double_clicked` | all in-tol shots dialog |
-| L2222 | `_open_in_slider` | copy 1 img/day to temp → slider |
-| L2360 | `_save_results` | save annotated PNGs (main-thread encode) |
-| L2614 | `_send_to_workshop` | array → Workshop |
+| L613-628 | `_SearchSignals` / `_CamLoadSignals` / `_PreviewSignals` / `_ChannelSignals` | signals |
+| L633/650/677 | `_WeekendDelegate` / `_NoScrollCalendar` / `_NoScrollComboBox` | calendar / combo |
+| L703 | `_DayResult` | result container; persists `search_cols`, `extra_cols`, `criteria_csv`, `cam`, `col_meta`, `img_path`, computes `ts_ns` |
+| L744/781 | `_PreviewWidget` / `_TimeWindowDialog` | centred painter; start/end date+hour |
+| **L921** | `ShotFinderWidget` | the tab |
+| L1063 | `_build_ui` | full UI |
+| L1342 | `_setup_calendar` | **duplicate of the calendar factory** |
+| L1402-1541 | `_rebuild_pv_suggestions`, `_fetch_channel_list`, `_on_channels_loaded`, `_make_pv_dropdown`, `_split_query`, `_tokens_in_order`, `_rank_pv_match`, `_populate_pv_dropdown` | searchable channel dropdown (typed words must appear in order) |
+| L1600-1669 | `_on_pv_search_changed`, `_on_pv_dropdown_clicked`, `_best_pv_match`, `_on_pv_search_return`, `_register_col`, `_add_pv_col`, `_remove_pv_col`, `_make_remove_btn` | add / remove a PV column |
+| L1680/1695 | `_sync_pv_cfg_from_rows` / `_rebuild_pv_rows` | one row per picked PV: ticked = filter (target/tol), unticked = show only |
+| L1787-1816 | `_filter_cols`, `_show_cols`, `_get_criteria`, `_update_date_info`, `_build_energy_text` | |
+| L1833/1889 | `_on_selection_changed` / `_load_and_show_preview` | row → image + PV values + preview thread |
+| L1953-1973 | `_open_time_window`, `_selected_days`, `_load_cameras` | camera scan over all 24 hours (no cancel token) |
+| L2033-2109 | `_on_cam_search_changed`, `_on_cam_dropdown_clicked`, `_on_cam_selected_clicked`, `_on_cam_remove` | camera picker |
+| **L2109** | `_start_search` | per-day worker: API/CSV + match; resolves the matched image path |
+| L2360 | `_on_day_result` | populate a row (still does network IO on the main thread) |
+| L2504/2529 | `_on_table_cell_clicked` (Folder cell → `explorer /select,<image>`) / `_on_table_double_clicked` (all in-tolerance shots) | |
+| L2795-2948 | `_on_search_done`, `_open_in_slider`, `_save_results` | copy to temp → slider; annotated PNGs (main-thread encode) |
+| L3183 | `_send_to_workshop` | array → Workshop |
 
 ---
 
@@ -245,42 +318,121 @@ Line numbers below are approximate anchors — they drift as the files change. R
 ### Constants & helpers
 | Line | Name | Purpose |
 |------|------|---------|
-| L35-62 | `_wk_make_lut`/`_make_binary_lut`/`_make_stepped_lut` | LUT builders |
-| L64 | `WK_GRADIENTS` | name → LUT (Grayscale=None …) |
+| L35-52 | `_wk_make_lut` / `_wk_make_binary_lut` / `_wk_make_stepped_lut` | LUT builders |
+| (below) | `WK_GRADIENTS` | name → LUT (Grayscale = None …) |
 | L81/92/101 | `_np_to_qimage` / `_qimage_to_np` / `_arr_to_pil` | conversions |
-| L107 | `_TZ_PRAGUE` | ⚠️ **hardcoded +2h** (wrong in winter, CET=+1) |
+| L107 | `_TZ_PRAGUE` | ⚠️ **hardcoded +2 h** (wrong in winter, CET = +1) |
 | L111 | `_build_save_stem` | `{cam}_{YYYY-MM-DD_HH-MM-SS-mmm}` |
 | L162 | `_SLOT_UNDO_LIMIT` = 30 | |
 | L202 | `_bresenham` | integer line points |
+| L646-657 | `_TOOL_BTN_STYLE`, `_BTN_STYLE`, `_DANGER_STYLE` | QSS |
+| L1273/1279 | `_group_label` / `_separator` | |
 
 ### Classes
 | Line | Class | Members |
 |------|-------|---------|
-| L164 | `_WorkshopSlot` (dataclass) | `source_arr`/`current_arr`/`undo_stack`/`redo_stack`/`source_path`; `push_undo` 173, `undo` 179, `redo` 186, `reset_to_source` 193 |
-| L224 | `WorkshopCanvas(QWidget)` | TOOL_* 228-235; `set_slot` 269, `_rebuild_qimage` 274, `fit_to_view` 315, `paintEvent` 348, mouse 404/440/464, `_paint_brush` 525, `_paint_eraser` 538, `_paint_line` 563, `_paint_rect` 576, `_commit_text` 598, `_do_crop` 631 |
-| L664 | `WorkshopWidget(QWidget)` | `_build_ui` 678, `receive_image` 928 (⚠️ forces uint8), `_activate_slot` 969, `_undo` 1059, `_redo` 1067 (⚠️ **not wired to UI**), `_on_bc_changed` 1086, `_apply_bright_contrast` 1121, `_auto_bright_contrast` 1139, `_on_palette_changed` 1158, `_do_diff` 1204, `_save` 1230 |
+| L165 | `_WorkshopSlot` (dataclass) | `source_arr` / `current_arr` / `undo_stack` / `redo_stack` / `source_path`; `push_undo`, `undo`, `redo`, `reset_to_source` |
+| L224 | `WorkshopCanvas(QWidget)` | `TOOL_*`; `set_slot`, `_rebuild_qimage`, `fit_to_view`, `paintEvent`, mouse handlers, `_paint_brush/_eraser/_line/_rect`, `_commit_text`, `_do_crop` |
+| L664 | `WorkshopWidget(QWidget)` | `_build_ui`, `receive_image` (⚠️ forces uint8 → 16-bit input truncated), `_activate_slot`, `_undo`, `_redo` (⚠️ **not wired to any button/shortcut**), `_on_bc_changed`, `_apply_bright_contrast`, `_auto_bright_contrast`, `_on_palette_changed`, `_do_diff`, `_save` |
 
 ---
 
 ## Shared conventions
-- Timezone: `ZoneInfo("Europe/Prague")` (is_t/if_t/sf_t); wk_t hardcodes +2h (bug).
-- CPVA archiver `https://10.78.0.57:8443/api/1.0/cpva`, SSL verification disabled.
-- Filename timestamps: UTC nanoseconds (19-digit), parsed by `extract_ns_from_stem`/`parse_unix_ns_from_name`.
-- Network roots: UNC `//users-L3.tier0.lcs.local` (Lab) or `Z:\` (Office).
+- Timezone `ZoneInfo("Europe/Prague")` in is_t / if_t / sf_t; wk_t hardcodes +2 h (bug).
+- All archiver access goes through `cpva_client` (SSL verification disabled).
+- Filename timestamps: UTC nanoseconds (19 digits).
+- Network roots: UNC `//users-L3.tier0.lcs.local` (Lab) or `Z:\` (Office); the archive
+  tree itself is UTC.
 - Checkboxes: `_CHECKBOX_STYLE` — QSS on `::indicator` only.
-- Background threads must log via `_log_safe`/signal, never touch widgets directly.
+- Background threads log via `_log_safe` / a signal, never touch widgets directly.
+- matplotlib toolbars are created with `_make_mpl_toolbar` so the dark palette does not
+  tint the icons into invisibility.
+- Brightness = additive offset, contrast = multiplicative gain — never swapped, and an
+  Auto checkbox always parks its (greyed-out) slider on the computed value.
 
 ## CHANGES 2026-07-15 (13-item fix batch)
-- **cpva_client.py**: new shared helpers — `LookupResult` (tri-state: ok/not_found/stale/error), `value_at_or_before` (progressive look-back, cached, `network_ok` flag), `lookup_near`, `nearest_sample_ex`, `FORWARD_CHANNELS`, `PV_TEXT_ERROR`/`PV_TEXT_NOT_FOUND`, `format_lookup`.
-- **Tri-state PV display everywhere**: real value (incl. genuine 0) / "n/a" (no sample) / "ERR" (fetch failed, retryable). sf_t `_lookup_col_value`+`_format_value_state`; if_t `_pv_values_for_ns`+`_format_pv_state`; is_t `_fetch_one`/`pv_text_for_ts`.
-- **sf_t**: `_load_api_for_day` returns `(merged, per_col, col_meta)` and no longer silently falls back to CSV on API *error* (source-mixing caused waveplate 500k/0 alternation); slow PVs (waveplate) use look-back. `_DayResult` persists `search_cols/extra_cols/criteria_csv/cam/col_meta/img_path`; the double-click dialog, previews, save and open-in-slider read search-time state from `dr` (not live UI). Value column is one combined line ("a: x | b: y"); hardcoded 5 s tolerances unified to `EXTRA_COL_MATCH_TOL_S`. Search worker resolves the matched image path; Folder cell click = `explorer /select,<image>`.
-- **if_t**: multi-day weekday default Mon–Fri (`_MultiDaySetupDialog`); preview/save PV text uses per-column lookup via `_pv_values_for_ns` (merged-row bug fixed); annotation bar + thumb labels show PV values ONLY (no date/time/palette); `_image_is_nonempty` (imgMaxValue first, pixel-contrast fallback); Try-again rewritten: background `_try_again_run` worker, energy-anchored candidates (`_try_again_candidates` → `_select_by_totalpower` + size fallback), empty-frame validation, cancel button, per-cell attempt log; `_ThumbView` gained `overlay_changing/overlay_edited` signals + `key`/`native_size`; `_mirror_overlay_from` live-mirrors overlays to all selected thumbs with center-preserving scaling.
-- **is_t**: PV overlay uses true trailing debounce (400 ms, 0.7 s max-wait) + single-flight/dirty re-trigger (no more frozen stale values); single-cam label strip abuts the image exactly; pointing "Select & Delete" → persistent "Delete mode" (selector re-armed in `_draw()`, button stays checked); online mode: DirWatchers also in single-cam, `ONLINE_WATCHER_POLL_INTERVAL_S` 10→3 s, watcher silent-death detection (`_watcher_strike`, 2 strikes → recreate after 30 s cooldown), dead watcher entries replaced in `_ensure_dir_watcher`, single-cam merge extracted to `_merge_single_new_items`, `_start_scan` clears stale multi-cam state.
+- **cpva_client.py**: new shared helpers — `LookupResult` (tri-state), `value_at_or_before`,
+  `lookup_near`, `nearest_sample_ex`, `format_lookup`.
+- **Tri-state PV display everywhere**: real value (incl. genuine 0) / `n/a` / `ERR`.
+- **sf_t**: `_load_api_for_day` returns `col_meta` and no longer falls back to CSV on an
+  API error; `_DayResult` persists its search-time state; combined value column;
+  tolerances unified to `EXTRA_COL_MATCH_TOL_S`; Folder cell click = `explorer /select`.
+- **if_t**: multi-day weekday default Mon–Fri; per-column PV lookup for preview/save;
+  annotation bar shows PV values only; `_image_is_nonempty`; Try-again rewritten as a
+  background worker; `_ThumbView` overlay signals + `_mirror_overlay_from`.
+- **is_t**: PV overlay uses a trailing debounce (400 ms, 0.7 s max wait) + single-flight;
+  pointing "Delete mode"; live mode gained DirWatchers in single-cam, a 3 s watcher poll,
+  silent-death detection (`_watcher_strike`) and a stale-state reset in `_start_scan`.
 
-## KNOWN ISSUES (review 2026-06-19, verified in source)
-- ✅ FIXED — **if_t**: removed redundant `def _NoScrollCalendar()` that shadowed the wheel-block class L539.
-- ✅ FIXED — **if_t L4710**: `_compare_memory` except branch now emits `_compare_sig.error`.
-- ✅ FIXED — **sf_t L391 `_find_best_match`**: removed the second `/0.749` (caller already passes target_csv).
-- **wk_t L936**: 16-bit input truncated to uint8 (no scaling); `_redo` (L1067) unreachable — no UI/shortcut.
-- Main-thread network IO / PNG encoding in if_t & sf_t save / try-again / open-in-slider paths → UI freeze on slow shares.
-- Duplicated logic: overlay-draw (is_t, 4 copies), camera-scan worker (3 copies), annotation font/wrap (if_t, 3 copies).
+## CHANGES 2026-08-04 (PV values + time window)
+- **cpva_client**: step-PV lookup fixed. `STEP_CHANNELS` (waveplate `RawPos`) are archived
+  only on change, so `lookup_near` returns `value_at_or_before`, which bisects the day of
+  the timestamp (+ 2 previous days) EXACTLY at ts. The old look-back cache was keyed by
+  (channel, day-of-ts) while storing the value at one arbitrary ts, so the first frame of
+  a day pinned its value for every other frame. New: `peek_day`, `invalidate_lookback`.
+- **is_t**: `_pv_last_known_ex` delegates to `cpva.lookup_near`; the private duplicates are gone.
+- **is_t `DatePickerDialog`** rebuilt: minute resolution, one house-style calendar
+  (`_make_multiselect_calendar`, Qt grid-shift paint bug fixed in `_date_for_index`), two
+  mutually exclusive multi-day modes.
+- **is_t folder enumeration** goes through `utc_hour_cells_for_window` /
+  `hour_dirs_for_windows`: the archive tree is UTC, so Prague 00:30 resolves to the
+  PREVIOUS day's 22/23 folder.
+- **is_t frame filter**: `Viewer._ts_windows` + `_filter_to_ts_windows` enforce
+  minute-precise, per-day windows; live mode keeps the last window's end open.
+
+## CHANGES 2026-08-05 (time window + camera union + ref badge)
+- **`seg_bounds_ns`**: To is the **EXCLUSIVE** end — 12:00–13:00 is exactly one hour and
+  enumerates only the 12 h folder. `hour_end_hm()` builds that end; a To of 23:59 still
+  means "to midnight" (a `QTimeEdit` cannot show 24:00).
+- **`DatePickerDialog`** opens in **Now** mode (today, `hh:00`–`hh+1:00`); From/To can no
+  longer collide; both multi-day modes preset every day to 07:00–21:00 with per-day ⚙
+  overrides in `_day_overrides`.
+- **`cameras_for_windows(windows)`** returns the union over every day/segment plus a
+  status; the three copies of the camera-scan worker all call it, so one empty day or
+  hour can no longer produce an empty camera list.
+- **Single-cam reference badge**: `ImageView.cam_ref_text` / `set_cam_ref_text()` draw the
+  green `Ref: <timestamp>` strip — the 1-camera counterpart of `CameraView.set_ref_status()`.
+
+## CHANGES since 2026-08-05 (current working tree)
+- **is_t multi-cam layout**: `compute_justified_layout` + `LayoutConfigDialog` /
+  `_LayoutCanvasWidget` / `CamLayoutConfig`. Two containers back the grid —
+  `_JustifiedRowsContainer` (gallery rows sized to maximise image area, each tile
+  reserving its label bar so no grey letterbox shows) and `_FreeLayoutContainer`
+  (user-placed tiles as fractions of the canvas).
+- **is_t diode grid overlay**: `Pdxm1GridConfig` + `Pdxm1GridConfigDialog` +
+  `_GridPreviewWidget`. Line positions are absolute image fractions (so each line moves
+  independently), configs are keyed by camera *type* (`_cam_type_key`: PD1M1, PD2M2 …)
+  and persisted; `_PDXM1_REVERSED_TYPES` flips column order where needed.
+- **is_t render params** are one `_RenderBC(offset, contrast, auto)` tuple through the
+  whole pipeline; `_apply_contrast` / `_apply_auto_brightness` joined
+  `_apply_brightness_offset`, and `_refresh_auto_bc_sliders` parks the greyed-out Auto
+  sliders on the applied values.
+- **is_t reference diff** reports statistics (`_apply_reference_diff` + `_diff_stats_*`,
+  `_update_diff_stats` / `_update_cam_diff_stats`) and warns when the reference no longer
+  matches the loaded set (`_refresh_ref_warning`).
+- **is_t sidebar** is built from `CollapsibleSection`s whose expanded state is persisted
+  (`_load_ui_state` / `_save_ui_state`); `_diag_log` writes `image_tools_diag.log`.
+- **is_t**: `receive_external_folder` accepts a folder plus an energy map from the other
+  tabs; `_probe_hour_folder` / `_camera_folder_problem` / `_dir_access_error` give real
+  reasons instead of an empty camera list.
+- **if_t**: `PVRegionSearchDialog` + `_PVBrowseDialog` + `_find_image_for_regions` — pick
+  PVs and conditions, get the time regions of a day that satisfy them, then the frame
+  nearest each region. `_make_mpl_toolbar` keeps the toolbar icons visible under the dark
+  palette.
+- **sf_t**: PVs are added from a searchable archiver channel dropdown
+  (`_fetch_channel_list`, `_rank_pv_match`, `_tokens_in_order`); `IMG_MATCH_TOL_NS` bounds
+  how far a frame may sit from the matched shot; `EXTRA_COL_MATCH_TOL_S` is 30 s.
+
+## KNOWN ISSUES (verified in source 2026-08-05)
+- **wk_t**: `receive_image` forces uint8 without scaling → 16-bit input is truncated;
+  `_redo` (L1067) is unreachable (no button, no shortcut); `_TZ_PRAGUE` hardcoded +2 h.
+- Main-thread network IO / PNG encoding in if_t & sf_t save / try-again / open-in-slider
+  paths → UI freeze on a slow share.
+- No directory-listing cache: `if_t.load_folders` and `sf_t._load_cameras` rescan all 24
+  hour folders on every change of hour / source / date.
+- No cancel/generation token on the sf_t search and camera-load workers → a stale run can
+  overwrite the table.
+- Dead code: if_t `MIN_FULL_FILES`, `_range_gen`, `_get_csv_best_hour_for_day`, ignored
+  `select_images_from_folder` params, 3 near-duplicate annotation routines; is_t
+  `_LazyDirModel` stub; sf_t `_setup_calendar`.
+- Frequent `except Exception: pass` hides real errors (notably `ScanTask.run`).

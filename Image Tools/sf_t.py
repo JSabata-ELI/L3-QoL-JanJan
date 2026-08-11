@@ -100,7 +100,8 @@ QCheckBox::indicator:hover { border: 2px solid #2d7dff; background: #f4f8ff; }
 QCheckBox::indicator:checked { border: 2px solid #2d7dff; background: #2d7dff; }
 """
 
-_CHECKBOX_STYLE_SM = _CHECKBOX_STYLE + "QCheckBox { font-size: 10px; }"
+_PV_NAME_FONT_PX = 10          # keep in sync with _CHECKBOX_STYLE_SM's font-size
+_CHECKBOX_STYLE_SM = _CHECKBOX_STYLE + f"QCheckBox {{ font-size: {_PV_NAME_FONT_PX}px; }}"
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 IMAGES_ROOT_OPTIONS = {
@@ -108,6 +109,17 @@ IMAGES_ROOT_OPTIONS = {
     "Office": Path(r"\\users-L3.tier0.lcs.local\cpva-image-2026"),
 }
 IMAGES_ROOT = IMAGES_ROOT_OPTIONS["Lab"]   # default; overridden by UI combo
+
+
+def _images_root_for_year(images_root: Path, year: int) -> Path:
+    """Return the images root with its share pointing at the given year.
+
+    Each year lives in its own share (cpva-image-<year>). The Lab/Office root
+    only fixes the host + slash style, so swap just the year in the share name
+    (Path.parent cannot be used: on a UNC path the share is part of the anchor).
+    """
+    swapped, n = _re.subn(r"cpva-image-\d{4}", f"cpva-image-{year}", str(images_root), count=1)
+    return Path(swapped) if n else images_root / f"cpva-image-{year}"
 
 ENERGY_CSV_ROOT_OPTIONS = {
     "Lab":    r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata",
@@ -124,6 +136,19 @@ EXTRA_COL_MATCH_TOL_S = 30.0
 # Widened from 10 s — per-day clock drift between archiver and camera filenames
 # could exceed 10 s and blank the preview.
 IMG_MATCH_TOL_NS = 30_000_000_000
+
+_CAM_IMG_MARK_RE = _re.compile(r"[-_]+IMG(?=$|[-_])", _re.IGNORECASE)
+_CAM_CONTAINER_RE = _re.compile(r"^C\d{2}[-_]", _re.IGNORECASE)
+
+def _clean_cam_for_filename(cam: str) -> str:
+    """Camera token as it should appear in a saved file name:
+    'C03-040-PFM13NF-_-IMG' -> '040-PFM13NF'.
+
+    The '-IMG' marker and the leading container code carry no information for the
+    person looking at the file. Cameras without a 'Cxx-' prefix keep whatever
+    they have."""
+    s = _CAM_IMG_MARK_RE.sub("", cam).strip("-_")
+    return _CAM_CONTAINER_RE.sub("", s, count=1).strip("-_")
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
 def _import_cpva_client():
@@ -181,6 +206,11 @@ PV_COLUMNS: dict[str, str] = {
 }
 
 MJ_COLUMNS = {"Back_Ref", "pap1"}
+
+# Camera channels (C03-013-PFM1NF:Exposure, …) are ~40 % of the archiver's "**"
+# listing. They are matched last in the PV search so a query like "pcm" cannot
+# be filled up entirely by camera channels before a single energy PV shows up.
+_CAM_CHANNEL_RE = _re.compile(r"^C\d{2}-\d{2,3}-")
 
 SBW4_TRANSMISSION        = 0.749
 SBW4_WARNING_THRESHOLD_J = 0.5
@@ -512,7 +542,7 @@ def _folder_hour_from_prague(prague_hour: int, ref_date: date) -> int:
 def _find_hour_folder(day: date, hour_utc: int,
                       images_root: "Path | None" = None) -> Path | None:
     root = images_root if images_root is not None else IMAGES_ROOT
-    base = root / str(day.year) / str(day.month) / str(day.day)
+    base = _images_root_for_year(root, day.year) / str(day.year) / str(day.month) / str(day.day)
     for delta in [0, -1, 1, -2, 2]:
         h = (hour_utc + delta) % 24
         candidate = base / str(h)
@@ -918,8 +948,8 @@ class ShotFinderWidget(QWidget):
 
         self._images_root: Path = IMAGES_ROOT_OPTIONS["Lab"]
         self._energy_csv_root: str = ENERGY_CSV_ROOT_OPTIONS["Lab"]
-        self._criteria: list[dict] = []
-        self._criteria_rows: list[dict] = []
+        self._pv_cfg: list[dict] = []
+        self._pv_rows: list[dict] = []
 
         _now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
         self._tw_start: datetime = _now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -939,10 +969,16 @@ class ShotFinderWidget(QWidget):
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        if hasattr(self, "_cam_dropdown"):
-            self._cam_dropdown.hide()
-        if hasattr(self, "_cam_search"):
-            self._cam_search.clear()
+        # Floating Tool-window dropdowns stay on top of every other tab unless
+        # they are explicitly hidden with the widget.
+        for name in ("_cam_dropdown", "_pv_dropdown"):
+            dd = getattr(self, name, None)
+            if dd is not None:
+                dd.hide()
+        for name in ("_cam_search", "_pv_search"):
+            le = getattr(self, name, None)
+            if le is not None:
+                le.clear()
 
     def _cleanup_temp(self):
         if self._temp_dir:
@@ -1086,45 +1122,35 @@ class ShotFinderWidget(QWidget):
         ll.addWidget(_hsep())
 
         # ── PV search state ───────────────────────────────────────────────
-        # Ordered lists of selected columns (preset key or raw channel name).
-        self._criteria_cols: list[str] = []   # PVs to search by
-        self._extra_cols_sel: list[str] = []  # PVs to also show
+        # ONE ordered list of picked PVs. Each entry carries its own "filter"
+        # flag: checked = the search filters on it (target ± tolerance),
+        # unchecked = its value is only displayed on the results/images.
+        self._pv_cfg: list[dict] = []             # [{col, target, tol, filter}]
+        self._pv_rows: list[dict] = []            # widgets, parallel to _pv_cfg
         self._custom_labels: dict[str, str] = {}  # custom col → display label
         self._all_pv_channels: list[str] = []     # fetched archiver channels
+        self._chan_loading = False
         self._pv_suggestions: list[tuple[str, str]] = []  # (display, col_key)
         self._rebuild_pv_suggestions()
 
-        # PV search — search criteria
-        ll.addWidget(_group_label("Search criteria"))
+        # PV selection — one search box for every PV, presets and archiver alike
+        ll.addWidget(_group_label("PVs"))
         self._pv_search = QLineEdit()
         self._pv_search.setPlaceholderText("search PV to add… (e.g. SBW4, Energy)")
+        self._pv_search.setToolTip(
+            "Add any archiver PV. Tick a PV to search by it (target ± tolerance);\n"
+            "leave it unticked to only show its value in the results and on the images.")
         self._pv_search.textEdited.connect(self._on_pv_search_changed)
         self._pv_search.returnPressed.connect(self._on_pv_search_return)
         ll.addWidget(self._pv_search)
         self._pv_dropdown = self._make_pv_dropdown(self._on_pv_dropdown_clicked)
 
-        # Criteria container — dynamic rows, one per selected search PV
-        self._criteria: list[dict] = []  # [{col, target, tol}, ...]
-        self._criteria_container = QWidget()
-        self._criteria_container_layout = QVBoxLayout(self._criteria_container)
-        self._criteria_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._criteria_container_layout.setSpacing(2)
-        ll.addWidget(self._criteria_container)
-
-        # PV search — also show
-        ll.addWidget(QLabel("Also show:"))
-        self._extra_search = QLineEdit()
-        self._extra_search.setPlaceholderText("search PV to also show…")
-        self._extra_search.textEdited.connect(self._on_extra_search_changed)
-        self._extra_search.returnPressed.connect(self._on_extra_search_return)
-        ll.addWidget(self._extra_search)
-        self._extra_dropdown = self._make_pv_dropdown(self._on_extra_dropdown_clicked)
-
-        self._extra_container = QWidget()
-        self._extra_container_layout = QVBoxLayout(self._extra_container)
-        self._extra_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._extra_container_layout.setSpacing(2)
-        ll.addWidget(self._extra_container)
+        # One dynamic row per picked PV
+        self._pv_container = QWidget()
+        self._pv_container_layout = QVBoxLayout(self._pv_container)
+        self._pv_container_layout.setContentsMargins(0, 0, 0, 0)
+        self._pv_container_layout.setSpacing(2)
+        ll.addWidget(self._pv_container)
 
         # Hidden legacy spinboxes — kept so existing code that references them still works
         self._target_sb = QDoubleSpinBox()
@@ -1219,11 +1245,12 @@ class ShotFinderWidget(QWidget):
         ll.addWidget(self._prog)
 
         # Open in Slider — hned pod Search
-        self._btn_open_slider = QPushButton("▶  Open in Image Slider")
+        self._btn_open_slider = QPushButton("➤  Send to Image Slider")
         self._btn_open_slider.setEnabled(False)
         self._btn_open_slider.setVisible(False)
         self._btn_open_slider.setToolTip(
-            "Copy one matched image per day to temp folder and open in Slider.")
+            "Send the matched images (selected rows, or all when nothing is selected)\n"
+            "to the Image Slider — whatever the Slider currently shows is replaced.")
         self._btn_open_slider.clicked.connect(self._open_in_slider)
         ll.addWidget(self._btn_open_slider)
 
@@ -1319,9 +1346,8 @@ class ShotFinderWidget(QWidget):
         root_layout.addWidget(self._preview_widget, 1)
 
         # Init
-        self._criteria_cols = ["sbw4"]       # default search PV
-        self._rebuild_criteria_rows()
-        self._rebuild_extra_rows()
+        self._pv_cfg = [{"col": "sbw4", "target": 10.0, "tol": 0.0, "filter": True}]
+        self._rebuild_pv_rows()
         self._update_date_info()
         QTimer.singleShot(300, self._load_cameras)
         QTimer.singleShot(400, self._fetch_channel_list)
@@ -1403,8 +1429,9 @@ class ShotFinderWidget(QWidget):
         self._pv_suggestions = sugg
 
     def _fetch_channel_list(self):
-        if self._all_pv_channels:
+        if self._all_pv_channels or self._chan_loading:
             return
+        self._chan_loading = True
         sig = self._chan_sig = _ChannelSignals()
         sig.loaded.connect(self._on_channels_loaded)
 
@@ -1420,10 +1447,15 @@ class ShotFinderWidget(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_channels_loaded(self, chans: list):
+        self._chan_loading = False
         self._all_pv_channels = list(chans)
         self._rebuild_pv_suggestions()
         if chans:
             self._log(f"PV channels available: {len(chans)}")
+            # A query typed while the list was downloading matched presets only;
+            # redo it now that all channels are known.
+            if self._pv_search.text().strip():
+                self._on_pv_search_changed(self._pv_search.text())
         else:
             self._log(f"PV channel list unavailable ({self._chan_err or 'empty'}); "
                       "presets + free-typed channels still work.")
@@ -1448,25 +1480,129 @@ class ShotFinderWidget(QWidget):
             "QTableWidget::item:selected { background: #2d7dff; color: #fff; }")
         return dd
 
+    _PV_DROPDOWN_MAX = 200
+
+    @staticmethod
+    def _split_query(text: str) -> "list[str]":
+        """Query text → lowercase tokens. Spaces, commas and '*' all separate,
+        so "023 l3", "023,l3" and "*023**l3*" are the same query: every token
+        must appear somewhere in the name (implicit wildcards between them)."""
+        return [t for t in _re.split(r"[\s,;*]+", text.strip().lower()) if t]
+
+    @staticmethod
+    def _tokens_in_order(hay: str, tokens: "list[str]") -> bool:
+        """True when every token occurs in `hay` in the order typed."""
+        pos = 0
+        for t in tokens:
+            i = hay.find(t, pos)
+            if i < 0:
+                return False
+            pos = i + len(t)
+        return True
+
+    @classmethod
+    def _rank_pv_match(cls, disp: str, key: str, q) -> "int | None":
+        """Sort weight of one suggestion against query `q` (lower = better), or
+        None when it doesn't match at all. `q` may be raw text or a token list
+        from _split_query.
+
+        Multi-token queries are AND-matched: "023 l3" keeps only names holding
+        both "023" and "l3" anywhere, i.e. what "*023*l3*" would mean — without
+        having to type the stars. Tokens found in the typed order rank above the
+        same tokens scrambled, so nothing is hidden by guessing the order wrong.
+
+        Ranking exists because the archiver's "**" listing is ~9700 channels, of
+        which ~3700 are camera channels (C03-013-PFM1NF:Gain …). Taking the first
+        N raw substring hits therefore returned nothing but cameras for queries
+        like "pcm" — the PV the user was after was hit #150. Field-name and
+        prefix hits now win, and camera channels sink below everything else.
+        """
+        tokens = q if isinstance(q, (list, tuple)) else cls._split_query(q)
+        if not tokens:
+            return None
+        d, k = disp.lower(), key.lower()
+        field = k.rsplit(":", 1)[-1]
+        worst = 0
+        total = 0
+        for t in tokens:
+            if t in (d, k):
+                s = 0
+            elif field == t:
+                s = 1
+            elif field.startswith(t) or k.startswith(t) or d.startswith(t):
+                s = 2
+            elif t in field:
+                s = 3
+            elif t in d or t in k:
+                s = 4
+            else:
+                return None          # AND semantics: one missing token = no hit
+            worst = max(worst, s)
+            total += s
+        # Weakest token decides the tier; the sum only breaks ties, so a name
+        # that matches every token well beats one that barely matches any.
+        score = worst * 10 + min(total, 9)
+        if len(tokens) > 1 and not (cls._tokens_in_order(k, tokens)
+                                    or cls._tokens_in_order(d, tokens)):
+            score += 5
+        if _CAM_CHANNEL_RE.match(key):
+            # Relative order is preserved when EVERY hit is a camera, so an
+            # explicitly camera-targeted query is unaffected.
+            score += 100
+        return score
+
     def _populate_pv_dropdown(self, text, dropdown, anchor, exclude):
-        q = text.strip().lower()
+        tokens = self._split_query(text)
         dropdown.hide()
         dropdown.setRowCount(0)
-        if not q:
+        if not tokens:
             return
-        matches = [(disp, key) for disp, key in self._pv_suggestions
-                   if key not in exclude and (q in disp.lower() or q in key.lower())]
-        if not matches:
+        # The startup fetch may have failed or may still be in flight — retry so
+        # the search isn't stuck on presets for the rest of the session.
+        if not self._all_pv_channels:
+            self._fetch_channel_list()
+        scored = []
+        for i, (disp, key) in enumerate(self._pv_suggestions):
+            if key in exclude:
+                continue
+            s = self._rank_pv_match(disp, key, tokens)
+            if s is not None:
+                scored.append((s, i, disp, key))
+        if not scored:
+            if self._chan_loading:
+                # Without this the box looks empty-and-final while the ~9700
+                # channel list is still downloading; _on_channels_loaded re-runs
+                # the query when it lands.
+                dropdown.insertRow(0)
+                hint = QTableWidgetItem("loading PV list…")
+                hint.setForeground(QColor("#777"))
+                dropdown.setItem(0, 0, hint)
+                row_h = max(22, dropdown.verticalHeader().defaultSectionSize())
+                pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+                dropdown.setGeometry(pos.x(), pos.y(),
+                                     max(300, anchor.width() + 20), row_h + 6)
+                dropdown.show()
+                dropdown.raise_()
+                QTimer.singleShot(0, anchor.setFocus)
             return
-        for disp, key in matches[:40]:
+        scored.sort(key=lambda t: (t[0], t[1]))
+        shown = scored[:self._PV_DROPDOWN_MAX]
+        for _s, _i, disp, key in shown:
             r = dropdown.rowCount()
             dropdown.insertRow(r)
             it = QTableWidgetItem(disp)
             it.setData(Qt.ItemDataRole.UserRole, key)
             dropdown.setItem(r, 0, it)
-        n_rows = min(len(matches), 40)
+        if len(scored) > len(shown):
+            r = dropdown.rowCount()
+            dropdown.insertRow(r)
+            # No UserRole → _on_pv_dropdown_clicked ignores this hint row.
+            more = QTableWidgetItem(
+                f"… {len(scored) - len(shown)} more matches — refine the search")
+            more.setForeground(QColor("#777"))
+            dropdown.setItem(r, 0, more)
         row_h = max(22, dropdown.verticalHeader().defaultSectionSize())
-        popup_h = min(n_rows * row_h + 6, 360)
+        popup_h = min(dropdown.rowCount() * row_h + 6, 360)
         popup_w = max(300, anchor.width() + 20)
         pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
         dropdown.setGeometry(pos.x(), pos.y(), popup_w, popup_h)
@@ -1476,43 +1612,50 @@ class ShotFinderWidget(QWidget):
 
     def _on_pv_search_changed(self, text: str):
         self._populate_pv_dropdown(text, self._pv_dropdown, self._pv_search,
-                                   set(self._criteria_cols))
-
-    def _on_extra_search_changed(self, text: str):
-        self._populate_pv_dropdown(text, self._extra_dropdown, self._extra_search,
-                                   set(self._extra_cols_sel))
+                                   {c["col"] for c in self._pv_cfg})
 
     def _on_pv_dropdown_clicked(self, index):
         it = self._pv_dropdown.item(index.row(), 0)
         if it is None:
             return
-        key = it.data(Qt.ItemDataRole.UserRole) or it.text()
+        key = it.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return          # the "… N more matches" hint row
         self._pv_dropdown.hide()
         self._pv_search.clear()
-        self._add_criteria_col(key)
+        self._add_pv_col(key)
 
-    def _on_extra_dropdown_clicked(self, index):
-        it = self._extra_dropdown.item(index.row(), 0)
-        if it is None:
-            return
-        key = it.data(Qt.ItemDataRole.UserRole) or it.text()
-        self._extra_dropdown.hide()
-        self._extra_search.clear()
-        self._add_extra_col(key)
+    def _best_pv_match(self, tokens) -> "str | None":
+        """Channel key of the top-ranked suggestion for `tokens`, or None."""
+        exclude = {c["col"] for c in self._pv_cfg}
+        best = None
+        for i, (disp, key) in enumerate(self._pv_suggestions):
+            if key in exclude:
+                continue
+            s = self._rank_pv_match(disp, key, tokens)
+            if s is not None and (best is None or (s, i) < best[0]):
+                best = ((s, i), key)
+        return best[1] if best else None
 
     def _on_pv_search_return(self):
         txt = self._pv_search.text().strip()
-        if txt:
-            self._pv_dropdown.hide()
-            self._pv_search.clear()
-            self._add_criteria_col(txt)
-
-    def _on_extra_search_return(self):
-        txt = self._extra_search.text().strip()
-        if txt:
-            self._extra_dropdown.hide()
-            self._extra_search.clear()
-            self._add_extra_col(txt)
+        if not txt:
+            return
+        tokens = self._split_query(txt)
+        if not tokens:
+            return
+        # A single bare word is still taken literally, so a channel that is not
+        # in the fetched list can be typed in by hand. "023 l3" / "*023*l3*" is a
+        # query though — Enter takes its best match instead of registering a PV
+        # by that name, which could never return data.
+        if len(tokens) != 1 or tokens[0] != txt.lower():
+            hit = self._best_pv_match(tokens)
+            if hit is None:
+                return
+            txt = hit
+        self._pv_dropdown.hide()
+        self._pv_search.clear()
+        self._add_pv_col(txt)
 
     def _register_col(self, col: str) -> str:
         col = (col or "").strip()
@@ -1520,137 +1663,155 @@ class ShotFinderWidget(QWidget):
             self._custom_labels[col] = col   # arbitrary channel; label == name
         return col
 
-    def _add_criteria_col(self, col: str):
+    def _add_pv_col(self, col: str, filter_by: bool = True):
+        """Add a PV to the list. New PVs are filter PVs by default — that is what
+        the search box is normally used for; untick the row to only show it."""
         col = self._register_col(col)
-        if not col or col in self._criteria_cols:
+        if not col or any(c["col"] == col for c in self._pv_cfg):
             return
-        self._criteria_cols.append(col)
-        self._rebuild_criteria_rows()
+        self._sync_pv_cfg_from_rows()
+        self._pv_cfg.append({"col": col, "target": 10.0, "tol": 0.0,
+                             "filter": bool(filter_by)})
+        self._rebuild_pv_rows()
 
-    def _remove_criteria_col(self, col: str):
-        if col in self._criteria_cols:
-            self._criteria_cols.remove(col)
-            self._rebuild_criteria_rows()
-
-    def _add_extra_col(self, col: str):
-        col = self._register_col(col)
-        if not col or col in self._extra_cols_sel:
-            return
-        self._extra_cols_sel.append(col)
-        self._rebuild_extra_rows()
-
-    def _remove_extra_col(self, col: str):
-        if col in self._extra_cols_sel:
-            self._extra_cols_sel.remove(col)
-            self._rebuild_extra_rows()
+    def _remove_pv_col(self, col: str):
+        self._sync_pv_cfg_from_rows()
+        self._pv_cfg = [c for c in self._pv_cfg if c["col"] != col]
+        self._rebuild_pv_rows()
 
     def _make_remove_btn(self, slot) -> QPushButton:
         btn = QPushButton("✕")
-        btn.setFixedSize(20, 20)
+        btn.setFixedSize(26, 26)
         btn.setToolTip("Remove")
         btn.setStyleSheet(
-            "QPushButton { color: #cc0000; font-weight: 700; border: none; }"
+            "QPushButton { color: #cc0000; font-weight: 700; font-size: 15px; "
+            "border: none; padding: 0; }"
             "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
         btn.clicked.connect(slot)
         return btn
 
-    def _rebuild_criteria_rows(self):
-        """Rebuild the dynamic criteria rows to match self._criteria_cols."""
-        # Sync current spinbox values before destroying widgets
-        existing: dict = {d["col"]: d.copy() for d in self._criteria}
-        for r in getattr(self, "_criteria_rows", []):
-            existing[r["col"]] = {
-                "col":    r["col"],
-                "target": r["target_sb"].value(),
-                "tol":    r["tol_sb"].value(),
-            }
+    def _sync_pv_cfg_from_rows(self):
+        """Copy live widget values back into _pv_cfg (the single source of truth)."""
+        for r in getattr(self, "_pv_rows", []):
+            cfg = r["cfg"]
+            cfg["target"] = r["target_sb"].value()
+            cfg["tol"]    = r["tol_sb"].value()
+            cfg["filter"] = r["chk"].isChecked()
 
-        while self._criteria_container_layout.count():
-            item = self._criteria_container_layout.takeAt(0)
+    # Text budget for the PV name inside one row, in px: with the target/tol
+    # spinboxes shown the name gets what is left of the 280 px panel; unticked
+    # rows hide them and the name may run wide. Longer names are elided in the
+    # middle — the full archiver name stays in the tooltip.
+    _PV_NAME_W_FILTER = 68
+    _PV_NAME_W_SHOW   = 186
+
+    def _rebuild_pv_rows(self):
+        """Rebuild one single-line row per entry in self._pv_cfg:
+
+            [✓] PV NAME   T:<target> ±<tol> <unit>  ✕
+
+        The tick marks a PV the search filters on; unticked hides the target/tol
+        spinboxes (the name then gets their space) and the PV is only reported in
+        the results table + image caption."""
+        from PySide6.QtGui import QFontMetrics
+
+        while self._pv_container_layout.count():
+            item = self._pv_container_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
-        self._criteria_rows: list[dict] = []
-        for col in self._criteria_cols:
-            prev = existing.get(col, {})
-            prev_target = prev.get("target", 10.0)
-            prev_tol    = prev.get("tol", 0.0)
-
+        self._pv_rows = []
+        for cfg in self._pv_cfg:
+            col = cfg["col"]
             row_w = QWidget()
             row_l = QHBoxLayout(row_w)
             row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(3)
+            row_l.setSpacing(2)
 
-            lbl = QLabel(f"{self._col_short(col)}:")
-            lbl.setStyleSheet("font-size: 10px; font-weight: 600;")
-            lbl.setFixedWidth(64)
-            lbl.setToolTip(self._col_label(col))
-            row_l.addWidget(lbl)
+            chk = QCheckBox()
+            chk.setStyleSheet(_CHECKBOX_STYLE_SM)
+            chk.setChecked(bool(cfg["filter"]))
+            full_label = self._col_label(col)
+            short_label = self._col_short(col)
+            # Elide against the font the checkbox is actually PAINTED with:
+            # _CHECKBOX_STYLE_SM sets font-size:10px, and a stylesheet font wins
+            # over the widget font, so QFontMetrics(chk.font()) measured a larger
+            # font than the label renders in and cut names far shorter than needed.
+            name_font = chk.font()
+            name_font.setPixelSize(_PV_NAME_FONT_PX)
+            fm = QFontMetrics(name_font)
+            chk.setToolTip(
+                f"{full_label}\n"
+                "Ticked: search filters on this PV (target ± tolerance).\n"
+                "Unticked: value is only shown in the results and on the images.")
+            row_l.addWidget(chk)
+            row_l.addStretch(1)
 
-            row_l.addWidget(QLabel("T:"))
+            tgt_w = QWidget()
+            tgt_l = QHBoxLayout(tgt_w)
+            tgt_l.setContentsMargins(0, 0, 0, 0)
+            tgt_l.setSpacing(2)
+            t_lbl = QLabel("T:")
+            t_lbl.setStyleSheet("font-size: 10px;")
+            tgt_l.addWidget(t_lbl)
             t_sb = QDoubleSpinBox()
             t_sb.setRange(-1e9, 1e9)
             t_sb.setDecimals(3)
-            t_sb.setValue(prev_target)
-            t_sb.setFixedWidth(72)
-            row_l.addWidget(t_sb)
-
-            row_l.addWidget(QLabel("±"))
+            t_sb.setValue(cfg.get("target", 10.0))
+            t_sb.setFixedWidth(56)
+            t_sb.setToolTip(f"Target value for {full_label}")
+            tgt_l.addWidget(t_sb)
+            pm_lbl = QLabel("±")
+            pm_lbl.setStyleSheet("font-size: 10px;")
+            tgt_l.addWidget(pm_lbl)
             tol_sb = QDoubleSpinBox()
             tol_sb.setRange(0.0, 1e9)
             tol_sb.setDecimals(3)
-            tol_sb.setValue(prev_tol)
-            tol_sb.setFixedWidth(60)
-            row_l.addWidget(tol_sb)
-
-            row_l.addWidget(QLabel(self._col_unit(col)))
-            row_l.addStretch(1)
+            tol_sb.setValue(cfg.get("tol", 0.0))
+            tol_sb.setFixedWidth(50)
+            tol_sb.setToolTip(f"Tolerance around the target for {full_label}")
+            tgt_l.addWidget(tol_sb)
+            unit = self._col_unit(col)
+            if unit:
+                u_lbl = QLabel(unit)
+                u_lbl.setStyleSheet("font-size: 10px;")
+                tgt_l.addWidget(u_lbl)
+            row_l.addWidget(tgt_w)
             row_l.addWidget(self._make_remove_btn(
-                lambda _=False, c=col: self._remove_criteria_col(c)))
+                lambda _=False, c=col: self._remove_pv_col(c)))
 
-            self._criteria_container_layout.addWidget(row_w)
-            self._criteria_rows.append({"col": col, "target_sb": t_sb, "tol_sb": tol_sb})
+            def _apply_filter_state(checked, _cfg=cfg, _tw=tgt_w, _chk=chk,
+                                    _fm=fm, _txt=short_label):
+                _cfg["filter"] = bool(checked)
+                _tw.setVisible(bool(checked))
+                budget = (self._PV_NAME_W_FILTER if checked
+                          else self._PV_NAME_W_SHOW)
+                _chk.setText(_fm.elidedText(
+                    _txt, Qt.TextElideMode.ElideMiddle, budget))
 
-        # Update self._criteria from current rows
-        self._criteria = [
-            {"col": r["col"], "target": r["target_sb"].value(), "tol": r["tol_sb"].value()}
-            for r in self._criteria_rows
-        ]
+            chk.toggled.connect(_apply_filter_state)
+            _apply_filter_state(chk.isChecked())
 
-    def _rebuild_extra_rows(self):
-        """Rebuild the 'also show' rows to match self._extra_cols_sel."""
-        while self._extra_container_layout.count():
-            item = self._extra_container_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        for col in self._extra_cols_sel:
-            row_w = QWidget()
-            row_l = QHBoxLayout(row_w)
-            row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(3)
-            lbl = QLabel(self._col_short(col))
-            lbl.setStyleSheet("font-size: 10px;")
-            lbl.setToolTip(self._col_label(col))
-            row_l.addWidget(lbl)
-            row_l.addStretch(1)
-            row_l.addWidget(self._make_remove_btn(
-                lambda _=False, c=col: self._remove_extra_col(c)))
-            self._extra_container_layout.addWidget(row_w)
+            self._pv_container_layout.addWidget(row_w)
+            self._pv_rows.append({"cfg": cfg, "col": col, "chk": chk,
+                                  "target_sb": t_sb, "tol_sb": tol_sb})
+
+    def _filter_cols(self) -> "list[str]":
+        """PVs the search filters on (ticked), in pick order."""
+        self._sync_pv_cfg_from_rows()
+        return [c["col"] for c in self._pv_cfg if c["filter"]]
+
+    def _show_cols(self) -> "list[str]":
+        """PVs that are only displayed (unticked), in pick order."""
+        self._sync_pv_cfg_from_rows()
+        return [c["col"] for c in self._pv_cfg if not c["filter"]]
 
     def _get_criteria(self) -> "list[dict]":
-        """Read current spinbox values and return list of {col, target, tol} dicts."""
-        result = []
-        if not hasattr(self, "_criteria_rows"):
-            return result
-        for r in self._criteria_rows:
-            result.append({
-                "col":    r["col"],
-                "target": r["target_sb"].value(),
-                "tol":    r["tol_sb"].value(),
-            })
-        return result
+        """Current filter criteria as [{col, target, tol}, …]."""
+        self._sync_pv_cfg_from_rows()
+        return [{"col": c["col"], "target": c["target"], "tol": c["tol"]}
+                for c in self._pv_cfg if c["filter"]]
 
     def _update_date_info(self):
         days = self._selected_days()
@@ -1683,9 +1844,10 @@ class ShotFinderWidget(QWidget):
         return "  |  ".join(parts)
 
     def _on_selection_changed(self):
-        has_sel = bool(self._table.selectedItems())
+        # Sending works with no selection too (then it sends every result), so the
+        # button must not go dead the moment the selection is cleared.
         self._btn_open_slider.setEnabled(
-            has_sel and self._slider_ref is not None and self._tab_widget is not None
+            self._slider_ref is not None and self._tab_widget is not None
             and bool(self._day_results))
 
         # Preview při kliknutí na řádek
@@ -1833,7 +1995,7 @@ class ShotFinderWidget(QWidget):
         def worker():
             seen: set[str] = set()
             cameras: list[str] = []
-            base = images_root / str(day.year) / str(day.month) / str(day.day)
+            base = _images_root_for_year(images_root, day.year) / str(day.year) / str(day.month) / str(day.day)
 
             def _scan_hour(h: int) -> list[str]:
                 hour_dir = base / str(h)
@@ -1882,14 +2044,18 @@ class ShotFinderWidget(QWidget):
         self._cam_status_lbl.setText(f"{n} cameras available." if n else "No cameras found.")
 
     def _on_cam_search_changed(self, text: str):
-        """textEdited — volá se jen při skutečném psaní, ne programaticky."""
-        q = text.strip().lower()
+        """textEdited — volá se jen při skutečném psaní, ne programaticky.
+
+        Cameras are matched against the archiver's image folder names for the
+        selected day (self._all_cameras), NOT against the PV channel list. Same
+        multi-token rule as the PV box: "023 nf" needs both parts, any order."""
+        tokens = self._split_query(text)
         self._cam_dropdown.hide()
         self._cam_dropdown.setRowCount(0)
-        if not q or not self._all_cameras:
+        if not tokens or not self._all_cameras:
             return
         matches = [(num, name) for num, name in self._all_cameras
-                   if q in name.lower() or q in num.lower()]
+                   if all(t in name.lower() or t in num.lower() for t in tokens)]
         if not matches:
             return
         for num, name in matches[:30]:
@@ -1962,20 +2128,17 @@ class ShotFinderWidget(QWidget):
             QMessageBox.warning(self, "Date range", "From date must be ≤ To date.")
             return
 
-        # Read multi-criteria from dynamic UI rows
+        # Read the ticked (filter) PVs from the unified PV list
         criteria = self._get_criteria()
         if not criteria:
-            # Fallback: use selected search cols with legacy spinbox values
-            search_cols_fb = list(self._criteria_cols) or ["sbw4"]
-            criteria = []
-            for sc in search_cols_fb:
-                t_ui = self._target_sb.value()
-                tol_ui = self._tol_sb.value()
-                criteria.append({"col": sc, "target": t_ui, "tol": tol_ui})
+            QMessageBox.warning(self, "No search PV",
+                "Tick at least one PV to search by.\n\n"
+                "Unticked PVs are only displayed — they are not filtered on.")
+            return
 
         search_cols = [c["col"] for c in criteria]
         col = search_cols[0]  # primary column
-        extra_cols = [c for c in self._extra_cols_sel if c not in search_cols]
+        extra_cols = [c for c in self._show_cols() if c not in search_cols]
 
         # Convert UI-unit criteria to CSV units for each column
         def _to_csv_units(c_col, c_val):
@@ -2594,27 +2757,26 @@ class ShotFinderWidget(QWidget):
                 img = _find_image_for_ts(cam_folder, dt_obj,
                                          ts_ns_override=row.get("_ns"))
                 if img:
-                    files.append(img)
+                    files.append((img, row))
 
             if not files:
                 QMessageBox.warning(dlg, "No images", "No matching images found.")
                 return
 
-            if self._temp_dir is not None:
-                try:
-                    shutil.rmtree(self._temp_dir, ignore_errors=True)
-                except Exception:
-                    pass
+            prev_temp_dir = self._temp_dir
             self._temp_dir = tempfile.mkdtemp(prefix="SF_slider_")
             temp_path = Path(self._temp_dir)
 
             copied = 0
-            for src in files:
+            energy_map: dict[str, str] = {}
+            for src, row in files:
                 try:
                     dst = temp_path / src.name
                     if dst.exists():
                         dst = temp_path / f"{src.stem}_{copied}{src.suffix}"
                     shutil.copy2(src, dst)
+                    energy_map[dst.name] = self._build_energy_text(
+                        dr, row, row.get("_ns"))
                     copied += 1
                 except Exception as e:
                     self._log(f"Copy error: {e}")
@@ -2627,7 +2789,18 @@ class ShotFinderWidget(QWidget):
             if self._tab_widget:
                 self._tab_widget.setCurrentIndex(1)
             if self._slider_ref:
-                self._slider_ref.open_folder_path(temp_path)
+                recv = getattr(self._slider_ref, "receive_external_folder", None)
+                if callable(recv):
+                    recv(temp_path, energy_map=energy_map, discrete=True,
+                         cam_name=cam)
+                else:
+                    self._slider_ref._sf_energy_map = energy_map
+                    self._slider_ref.open_folder_path(temp_path)
+            if prev_temp_dir:
+                try:
+                    shutil.rmtree(prev_temp_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
         btn_open.clicked.connect(open_selected)
         dlg.exec()
@@ -2639,8 +2812,10 @@ class ShotFinderWidget(QWidget):
         n = self._table.rowCount()
         self._result_lbl.setText(f"Results: {n} day(s) matched")
         self._log(f"Search done — {n} results")
-        if n > 0 and self._slider_ref is not None:
-            self._btn_open_slider.setEnabled(True)
+        # _set_busy(False) re-enables every control, so the send button must be
+        # re-evaluated: nothing to send when the search found nothing.
+        self._btn_open_slider.setEnabled(n > 0 and self._slider_ref is not None
+                                         and self._tab_widget is not None)
         if n > 0:
             self._btn_save_results.setEnabled(True)
             self._btn_send_workshop.setEnabled(True)
@@ -2657,11 +2832,10 @@ class ShotFinderWidget(QWidget):
         if not self._day_results:
             return
 
+        # The camera picked at SEARCH time (dr.cam) is what the results belong to;
+        # self._active_cam is only a fallback for results that carry none. Sending
+        # must not fail just because the camera list was edited after the search.
         cam = self._active_cam
-        if not cam:
-            QMessageBox.warning(self, "No camera selected",
-                "Please select a camera first.")
-            return
 
         # Jeden soubor za každý den
         files_to_copy: list[Path] = []
@@ -2687,6 +2861,9 @@ class ShotFinderWidget(QWidget):
                 continue
 
             dr_cam = dr.cam or cam
+            if not dr_cam:
+                self._log(f"{dr.day}: no camera for this result, skipping")
+                continue
             cam_folder = dr.hour_folder / dr_cam
             if not cam_folder.exists():
                 try:
@@ -2719,12 +2896,10 @@ class ShotFinderWidget(QWidget):
                 "Make sure the camera is correct and the data exists.")
             return
 
-        # Kopíruj do temp složky
-        if self._temp_dir is not None:
-            try:
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            except Exception:
-                pass
+        # Fresh temp folder per send. The PREVIOUS one is deleted only after the
+        # Slider has been pointed at the new one (below) — deleting it up front
+        # yanked the files out from under a Slider still showing the last send.
+        prev_temp_dir = self._temp_dir
         self._temp_dir = tempfile.mkdtemp(prefix="SF_slider_")
         temp_path = Path(self._temp_dir)
 
@@ -2757,20 +2932,31 @@ class ShotFinderWidget(QWidget):
             best_ns = dr.best_row.get("_ns")
             energy_map[dst.name] = self._build_energy_text(dr, dr.best_row, best_ns)
 
+        # Hand over through receive_external_folder: it clears whatever the Slider
+        # was set to (multi-cam grid, live mode, subtraction reference, focus mode,
+        # a previous energy map) so the images always land. Falls back to the plain
+        # entry point when running against an older is_t.py.
+        send_cam = next((dr.cam for dr in results_to_open if dr.cam), cam)
         self._tab_widget.setCurrentIndex(1)
-        self._slider_ref._discrete_mode = True
-        self._slider_ref.open_folder_path(temp_path)
-
-        # Předej energy map AFTER open_folder_path — reset se už stalo
-        from PySide6.QtCore import QTimer
-        def _set_map():
+        recv = getattr(self._slider_ref, "receive_external_folder", None)
+        if callable(recv):
+            ok = recv(temp_path, energy_map=energy_map, discrete=True,
+                      cam_name=send_cam)
+            if not ok:
+                QMessageBox.warning(self, "Image Slider",
+                    f"Slider refused the folder:\n{temp_path}")
+                return
+        else:
+            self._slider_ref._discrete_mode = True
             self._slider_ref._sf_energy_map = energy_map
-            # Obnov zobrazení aktuálního snímku s energií
-            if self._slider_ref.current_idx is not None and self._slider_ref.items:
-                idx = self._slider_ref.current_idx
-                self._slider_ref._set_info_for(idx, self._slider_ref.items[idx].ts_ns)
-                self._slider_ref.img_view.update()
-        QTimer.singleShot(500, _set_map)
+            self._slider_ref.open_folder_path(temp_path)
+        self._log(f"Sent {copied} image(s) to Image Slider")
+
+        if prev_temp_dir:
+            try:
+                shutil.rmtree(prev_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     def _save_results(self):
         if not self._day_results:
@@ -2841,7 +3027,7 @@ class ShotFinderWidget(QWidget):
             # Název souboru: camera_label + Prague timestamp + PV value
             val_str = _format_value(dr.col, dr.best_row.get(dr.col, "")).replace(" ", "").replace("/", "-")
             short = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-            _cam_label = _re.sub(r"[-_]+-IMG$", "", cam, flags=_re.IGNORECASE).rstrip("-_")
+            _cam_label = _clean_cam_for_filename(cam)
             _ns_best = dr.best_row.get("_ns")
             if _ns_best is not None and PRAGUE is not None:
                 _ts_sec = _ns_best // 1_000_000_000

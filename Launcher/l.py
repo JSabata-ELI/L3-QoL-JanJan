@@ -66,6 +66,15 @@ ARCHIVE_EXE_RE = re.compile(
     re.IGNORECASE
 )
 
+# Normalized archived exe — Dev Tools strips the "__YYYYMMDD_HHMMSS" suffix off
+# files inside vX.Y.Z/ folders so a snapshot is runnable as-is. An optional
+# " (2)" dedup suffix may trail the version.
+#   "Image Tools v2.5.4.exe", "Image Tools v2.4.0 (2).exe"
+ARCHIVE_EXE_PLAIN_RE = re.compile(
+    r"^.+\s+v(\d+)\.(\d+)\.(\d+)(?:\s+\(\d+\))?\.exe$",
+    re.IGNORECASE
+)
+
 TIMESTAMPED_EXE_RE = re.compile(
     r"^.+\s+v\d+\.\d+\.\d+__\d{8}_\d{6}\.exe$",
     re.IGNORECASE
@@ -74,56 +83,78 @@ TIMESTAMPED_EXE_RE = re.compile(
 _ARCHIVE_VER_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)__(\d{8})_(\d{6})", re.IGNORECASE)
 _ARCHIVE_LABEL_RE = re.compile(r"(v\d+\.\d+\.\d+)__(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
 _VER_ANYWHERE_RE = re.compile(r"(v\d+\.\d+\.\d+)", re.IGNORECASE)
+_VER_NUM_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)", re.IGNORECASE)
 
-def _archive_exe_version(p: Path) -> tuple:
+def _archive_exe_version(p: Path, folder_ver: tuple | None = None) -> tuple:
+    """Sort key (maj, min, patch, date, time). Timestamped names keep full
+    granularity; normalized names fall back to the version folder / filename
+    with a (0, 0) timestamp so they still sort by version."""
     m = _ARCHIVE_VER_RE.search(p.stem)
     if m:
         return tuple(map(int, m.groups()))
-    return (0, 0, 0, 0, 0)
+    base = folder_ver
+    if base is None:
+        vm = _VER_NUM_RE.search(p.stem)
+        base = tuple(map(int, vm.groups())) if vm else (0, 0, 0)
+    return base + (0, 0)
 
-def _archive_exe_label(p: Path) -> str:
+def _archive_exe_label(p: Path, folder_ver: tuple | None = None) -> str:
     m = _ARCHIVE_LABEL_RE.search(p.stem)
     if m:
         ver = m.group(1)
         date = f"{m.group(2)}-{m.group(3)}-{m.group(4)}"
         time_ = f"{m.group(5)}:{m.group(6)}:{m.group(7)}"
         return f"{ver}  ({date}  {time_})"
+    # Normalized name (no timestamp) — label from the version folder or filename.
+    if folder_ver:
+        return _ver_str(folder_ver)
+    vm = _VER_NUM_RE.search(p.stem)
+    if vm:
+        return "v" + ".".join(vm.groups())
     return p.stem
 
 def _find_versioned_py(version_dir: Path, exe_path: Path) -> Path | None:
     """Najde hlavní .py soubor pro danou verzi (stejný název jako exe, nebo první nalezený s verzí)."""
-    py_stem = exe_path.stem  # e.g. "Image Tools v1.2.1__20260511_125840"
+    py_stem = exe_path.stem  # e.g. "Image Tools v1.2.1__20260511_125840" or "Image Tools v2.5.4"
     candidate = version_dir / (py_stem + ".py")
     if candidate.exists():
         return candidate
-    # Fallback: first .py file in the folder with version in name
+    # Fallback: first .py file in the folder with version in name (timestamped or normalized)
     for f in version_dir.glob("*.py"):
-        if ARCHIVE_EXE_RE.match(f.name.replace(".py", ".exe")):
+        exe_like = f.name[:-3] + ".exe"
+        if ARCHIVE_EXE_RE.match(exe_like) or ARCHIVE_EXE_PLAIN_RE.match(exe_like):
             return f
     return None
 
 
 def scan_archive_versions(program_dir: Path) -> list[dict]:
     """Vrátí seznam archivních verzí seřazených od nejnovější.
-    Podporuje novou strukturu archive/vX.Y.Z/*.exe i starou plochou archive/*.exe."""
+    Podporuje novou strukturu archive/vX.Y.Z/*.exe (s timestampou i normalizovanou
+    bez timestampy) i starou plochou archive/*.exe."""
     archive_dir = program_dir / "archive"
     if not archive_dir.exists():
         return []
 
     entries = []
 
-    # Nová struktura: archive/vX.Y.Z/*.exe
+    # Nová struktura: archive/vX.Y.Z/*.exe — jeden záznam na složku verze.
     for version_subdir in archive_dir.iterdir():
         if not version_subdir.is_dir():
             continue
-        for exe in version_subdir.glob("*.exe"):
-            if ARCHIVE_EXE_RE.match(exe.name):
-                py_path = _find_versioned_py(version_subdir, exe)
-                entries.append({
-                    "exe_path": exe,
-                    "py_path": py_path,
-                    "label": _archive_exe_label(exe),
-                })
+        folder_ver = parse_version(version_subdir.name)  # (maj, min, patch) | None
+        # Prefer the canonical name over " (2)" dedup copies.
+        exes = sorted(version_subdir.glob("*.exe"),
+                      key=lambda p: (" (" in p.stem, p.name.lower()))
+        for exe in exes:
+            if not (ARCHIVE_EXE_RE.match(exe.name) or ARCHIVE_EXE_PLAIN_RE.match(exe.name)):
+                continue
+            entries.append({
+                "exe_path": exe,
+                "py_path": _find_versioned_py(version_subdir, exe),
+                "label": _archive_exe_label(exe, folder_ver),
+                "_ver": _archive_exe_version(exe, folder_ver),
+            })
+            break  # one exe per version folder
 
     # Stará flat struktura: archive/*.exe (zpětná kompatibilita)
     for exe in archive_dir.glob("*.exe"):
@@ -132,9 +163,12 @@ def scan_archive_versions(program_dir: Path) -> list[dict]:
                 "exe_path": exe,
                 "py_path": None,
                 "label": _archive_exe_label(exe),
+                "_ver": _archive_exe_version(exe),
             })
 
-    entries.sort(key=lambda e: _archive_exe_version(e["exe_path"]), reverse=True)
+    entries.sort(key=lambda e: e["_ver"], reverse=True)
+    for e in entries:
+        e.pop("_ver", None)
     return entries
 
 README_PREFIX = "readme_"  # case-insensitive

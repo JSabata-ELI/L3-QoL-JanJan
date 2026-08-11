@@ -786,14 +786,19 @@ class BuilderUI(ttk.Frame):
         icon_path = p.resolve() / "icon.ico"
         icon_args = ["--icon", str(icon_path)] if icon_path.exists() else []
 
-        extra_py_files = [x.resolve() for x in p.glob("*.py") if x.name != main_path.name]
+        # Test scripts are dev-only — nothing imports them at runtime, so keep them
+        # out of the bundle.
+        extra_py_files = [
+            x.resolve() for x in p.glob("*.py")
+            if x.name != main_path.name and not x.name.startswith("test_")
+        ]
 
         build_cfg = load_json(p / "build_config.json", {})
         extra_collect_all: list[str]     = list(build_cfg.get("collect_all", []))
         extra_collect_bins: list[str]    = build_cfg.get("collect_binaries", [])
         extra_hidden_imports: list[str]  = build_cfg.get("hidden_imports", [])
         extra_copy_metadata: list[str]   = build_cfg.get("copy_metadata", [])
-        extra_exclude_modules: list[str] = build_cfg.get("exclude_modules", [])
+        extra_exclude_modules: list[str] = list(build_cfg.get("exclude_modules", []))
         # Extra data files to copy into the version folder after build
         extra_data_files: list[str] = build_cfg.get("extra_files", [])
 
@@ -817,6 +822,26 @@ class BuilderUI(ttk.Frame):
         for _imp, _pkg in _AUTO_COLLECT.items():
             if _imp in _detected and _pkg not in extra_collect_all:
                 extra_collect_all.append(_pkg)
+
+        # --collect-all also drags in the packages' own test suites. Those cannot be
+        # imported without pytest / test data, so PyInstaller only prints warnings and
+        # skips them — but when they *are* importable they bloat the dist. Exclude them
+        # explicitly. Note: only the ".tests" packages, never ".testing"/"._testing",
+        # which are public helpers some libraries use at runtime.
+        _TEST_SUBMODULES = {
+            "numpy":      ["numpy.tests", "numpy.f2py.tests", "numpy.random.tests",
+                           "numpy.linalg.tests", "numpy.fft.tests", "numpy.ma.tests",
+                           "numpy.lib.tests", "numpy.core.tests", "numpy.typing.tests"],
+            "scipy":      ["scipy.tests"],
+            "sklearn":    ["sklearn.tests"],
+            "cv2":        [],
+            "matplotlib": ["matplotlib.tests"],
+            "pandas":     ["pandas.tests"],
+        }
+        for _pkg in extra_collect_all:
+            for _mod in _TEST_SUBMODULES.get(_pkg, []):
+                if _mod not in extra_exclude_modules:
+                    extra_exclude_modules.append(_mod)
 
         args = [
             "py", "-m", "PyInstaller",

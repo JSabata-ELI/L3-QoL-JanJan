@@ -106,6 +106,19 @@ def _arr_to_pil(arr: np.ndarray) -> _PilImg.Image:
 
 _TZ_PRAGUE = timezone(timedelta(hours=2))
 _NS_RE = re.compile(r"(\d{19})")
+_CAM_IMG_MARK_RE = re.compile(r"[-_]+IMG(?=$|[-_])", re.IGNORECASE)
+_CAM_CONTAINER_RE = re.compile(r"^C\d{2}[-_]", re.IGNORECASE)
+
+
+def _clean_cam_for_filename(cam: str) -> str:
+    """Camera token as it should appear in a saved file name:
+    'C03-040-PFM13NF-_-IMG' -> '040-PFM13NF'.
+
+    The '-IMG' marker and the leading container code carry no information for the
+    person looking at the file. Cameras without a 'Cxx-' prefix keep whatever
+    they have."""
+    s = _CAM_IMG_MARK_RE.sub("", cam).strip("-_")
+    return _CAM_CONTAINER_RE.sub("", s, count=1).strip("-_")
 
 
 def _build_save_stem(slot) -> str:
@@ -116,7 +129,7 @@ def _build_save_stem(slot) -> str:
     # Try to extract from source_path (has ns timestamp in filename)
     if slot.source_path is not None:
         p = slot.source_path
-        cam_label = re.sub(r"[-_]+IMG$", "", p.parent.name, flags=re.IGNORECASE).rstrip("-_")
+        cam_label = _clean_cam_for_filename(p.parent.name)
         m = _NS_RE.search(p.stem)
         if m:
             ns = int(m.group(1))
@@ -143,7 +156,7 @@ def _build_save_stem(slot) -> str:
             # cam name is everything before " |" or before double-space
             m_cam = re.match(r"^([\w\-]+)", label.strip())
             if m_cam:
-                cam_label = re.sub(r"[-_]+IMG$", "", m_cam.group(1), flags=re.IGNORECASE).rstrip("-_")
+                cam_label = _clean_cam_for_filename(m_cam.group(1))
 
     if not ts_dt:
         ts_dt = datetime.now(tz=_TZ_PRAGUE)

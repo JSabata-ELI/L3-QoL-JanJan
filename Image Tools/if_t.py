@@ -1,4 +1,4 @@
-# if_t.py — Image Finder (PySide6 port)
+﻿# if_t.py — Image Finder (PySide6 port)
 
 import bisect
 import csv
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QLineEdit, QMainWindow, QStyledItemDelegate,
     QDialogButtonBox, QSizePolicy, QSplitter, QTabWidget, QProgressBar,
     QButtonGroup, QSpinBox, QToolButton, QMenu, QStyle,
+    QListWidget, QListWidgetItem, QGroupBox,
 )
 
 try:
@@ -605,6 +606,89 @@ class _NoScrollCalendar(QCalendarWidget):
         return super().eventFilter(obj, event)
 
 
+# ── STANDARD CALENDAR LOOK ────────────────────────────────────────────────────
+# The house style for every QCalendarWidget in this app. Without it a calendar
+# inherits the app's dark stylesheet and comes out with a red/brown background
+# and unreadable cells. Rules: Monday first, white day cells, Sat/Sun in red,
+# and day-name header + week-number column on a slightly darker GRAY band.
+_STD_CAL_STYLE = """
+QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
+QCalendarWidget QAbstractItemView {
+    background: #fcfcfc; color: #111;
+    selection-background-color: #2d7dff; selection-color: #fff;
+    alternate-background-color: #f0f0f0; gridline-color: #d0d0d0; }
+QCalendarWidget QTableView {
+    background: #fcfcfc;
+    selection-background-color: #2d7dff; selection-color: #fff;
+    gridline-color: #d0d0d0; outline: 0; }
+QCalendarWidget QHeaderView { background: #e8e8e8; }
+QCalendarWidget QHeaderView::section {
+    background: #e8e8e8; color: #222;
+    font-weight: bold; font-size: 10pt;
+    padding: 3px 0px; border: none; border-bottom: 1px solid #bbb; }
+QCalendarWidget QToolButton {
+    background: #efefef; border: 1px solid #c8c8c8;
+    padding: 4px 8px; border-radius: 4px; color: #111;
+    font-size: 10pt; font-weight: bold; }
+QCalendarWidget QSpinBox, QCalendarWidget QComboBox {
+    background: #fff; border: 1px solid #c8c8c8;
+    padding: 2px 6px; color: #111; font-size: 10pt; font-weight: bold; }
+QCalendarWidget QWidget#qt_calendar_navigationbar { background: #e4e4e4; }
+QCalendarWidget QAbstractItemView:enabled { color: #111; }
+"""
+
+
+def _style_calendar(cal: QCalendarWidget) -> None:
+    """Apply the house calendar look to `cal`: Monday first, gray header band,
+    white readable cells, weekends (Sat/Sun) in red. Use on every calendar so
+    none of them inherit the app's dark stylesheet."""
+    cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
+    cal.setGridVisible(True)
+
+    hf = QTextCharFormat()
+    hf.setForeground(QColor("#222"))
+    hf.setFontWeight(QFont.Weight.Bold)
+    cal.setHeaderTextFormat(hf)
+
+    wf = QTextCharFormat()
+    wf.setForeground(QColor("#111"))
+    for day in (Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
+                Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday):
+        cal.setWeekdayTextFormat(day, wf)
+    wf_we = QTextCharFormat()
+    wf_we.setForeground(QColor("#cc0000"))
+    for day in (Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday):
+        cal.setWeekdayTextFormat(day, wf_we)
+
+    cal.setStyleSheet(_STD_CAL_STYLE)
+
+
+def _make_mpl_toolbar(nav_cls, canvas, parent=None):
+    """Build a matplotlib NavigationToolbar with visible icons.
+
+    matplotlib tints the toolbar icons *at construction* and only when the
+    palette background is dark — recolouring them to the (light) foreground,
+    which under the app's dark palette makes the icons invisible. It never
+    re-tints afterwards, so the palette must be right before the toolbar is
+    created. We give it a light-palette host parent → tinting is skipped and
+    the original black icons survive → then paint a light toolbar background."""
+    host = QWidget(parent)
+    hp = host.palette()
+    hp.setColor(QPalette.ColorRole.Window, QColor("#f0f0f0"))
+    hp.setColor(QPalette.ColorRole.Button, QColor("#f0f0f0"))
+    hp.setColor(QPalette.ColorRole.WindowText, QColor("#202020"))
+    hp.setColor(QPalette.ColorRole.ButtonText, QColor("#202020"))
+    host.setPalette(hp)
+
+    toolbar = nav_cls(canvas, host)
+    toolbar.setStyleSheet(
+        "QToolBar { background: #f0f0f0; border: none; spacing: 1px; }"
+        "QToolButton { background: transparent; padding: 3px; }"
+        "QToolButton:hover { background: #d6d6d6; border-radius: 3px; }"
+        "QLabel { color: #202020; }")
+    return toolbar
+
+
 # ── MULTI-SELECT CALENDAR (ported from Spectra/sp_t.py) ───────────────────────
 _MS_CAL_STYLE = """
 QCalendarWidget QWidget { background: #ffffff; color: #111; }
@@ -639,13 +723,31 @@ class _MultiSelectDelegate(QStyledItemDelegate):
         self._cal = cal
         self._selected_keys: set = set()   # (year, month, day) tuples
 
+    def _first_cell(self) -> "tuple[int, int]":
+        """Row/column of the first *day* cell. Qt drops the header row when
+        NoHorizontalHeader is set and the week-number column when
+        NoVerticalHeader is set, so the day grid does not always start at (1,1).
+        Reading the actual header formats keeps the mapping correct regardless."""
+        first_row = 1
+        if (self._cal.horizontalHeaderFormat()
+                == QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader):
+            first_row = 0
+        first_col = 1
+        if (self._cal.verticalHeaderFormat()
+                == QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader):
+            first_col = 0
+        return first_row, first_col
+
     def _date_for_index(self, index) -> "QDate | None":
-        if index.row() == 0:
-            return None
+        first_row, first_col = self._first_cell()
+        if index.row() < first_row or index.column() < first_col:
+            return None   # header row / week-number column
         year, month = self._cal.yearShown(), self._cal.monthShown()
         first = QDate(year, month, 1)
         start = first.addDays(-(first.dayOfWeek() - 1))   # Monday of first displayed week
-        return start.addDays((index.row() - 1) * 7 + index.column())
+        weeks = index.row() - first_row
+        dow   = index.column() - first_col                # 0=Mon … 6=Sun
+        return start.addDays(weeks * 7 + dow)
 
     def set_selected(self, dates: "list[QDate]"):
         self._selected_keys = {(d.year(), d.month(), d.day()) for d in dates}
@@ -660,11 +762,11 @@ class _MultiSelectDelegate(QStyledItemDelegate):
             option.state = option.state & ~QStyle.StateFlag.State_Selected
 
     def paint(self, painter, option, index):
-        is_weekend = index.column() in (5, 6)   # Mon=0 … Sat=5, Sun=6
         d = self._date_for_index(index)
         if d is None:
             super().paint(painter, option, index)
             return
+        is_weekend = d.dayOfWeek() in (6, 7)     # 6=Sat, 7=Sun
         is_sel = (d.year(), d.month(), d.day()) in self._selected_keys
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         if is_sel:
@@ -850,16 +952,28 @@ def convert_timestamp(ns: int, use_prague_time: bool) -> str:
     ms = (ns % 1_000_000_000) // 1_000_000
     return dt.strftime("%Y-%m-%d_%H-%M-%S-") + f"{ms:03d}"
 
+_CAM_IMG_MARK_RE = re.compile(r"[-_]+IMG(?=$|[-_])", re.IGNORECASE)
+_CAM_CONTAINER_RE = re.compile(r"^C\d{2}[-_]", re.IGNORECASE)
+
+def clean_cam_for_filename(cam: str) -> str:
+    """Camera token as it should appear in a saved file name:
+    'C03-040-PFM13NF-_-IMG' -> '040-PFM13NF'.
+
+    The '-IMG' marker and the leading container code carry no information for the
+    person looking at the file. Cameras without a 'Cxx-' prefix keep whatever
+    they have."""
+    s = _CAM_IMG_MARK_RE.sub("", cam).strip("-_")
+    return _CAM_CONTAINER_RE.sub("", s, count=1).strip("-_")
+
 def build_new_name(stem: str, use_prague_time: bool):
-    # Normalize separators: cam_-_timestamp or cam-_-timestamp → cam_timestamp
-    stem_clean = re.sub(r"[-_]+-IMG$", "", stem, flags=re.IGNORECASE)
-    stem_clean = re.sub(r"_-_|_-|-_", "_", stem_clean)
-    if FINAL_RE.search(stem_clean): return None, "already_converted"
-    m = SOURCE_RE.search(stem_clean)
+    # cam token + trailing ns timestamp → "<clean cam>_<timestamp>"
+    if FINAL_RE.search(stem): return None, "already_converted"
+    m = SOURCE_RE.search(stem)
     if not m: return None, "no_trailing_number"
     ns = int(m.group(1))
+    cam = clean_cam_for_filename(stem[:m.start(1)])
     time_str = convert_timestamp(ns, use_prague_time)
-    return stem_clean[:m.start(1)] + time_str, None
+    return (f"{cam}_{time_str}" if cam else time_str), None
 
 
 # ── ENERGY CSV ENGINE ────────────────────────────────────────────────────────
@@ -2134,6 +2248,14 @@ class ImageFinderWidget(QWidget):
         hour_row.addWidget(self._status_dot)
         ll.addLayout(hour_row)
 
+        # PV Search — sits directly under the day/hour pickers it works with.
+        self._btn_pv_search = QPushButton("🎯 PV Search…")
+        self._btn_pv_search.setToolTip(
+            "Plot a PV for a day, drag to mark time regions, and pull camera "
+            "frames from the peak of each region.")
+        self._btn_pv_search.clicked.connect(self._open_pv_region_search)
+        ll.addWidget(self._btn_pv_search)
+
         # Weekday gate for Ctrl+drag range selection. Only weekdays checked here
         # are added when Ctrl+clicking a range; a plain click still selects ANY
         # day (incl. weekends). Sat/Sun off by default so ranges skip weekends.
@@ -3370,6 +3492,79 @@ class ImageFinderWidget(QWidget):
 
     _DEFAULT_HOUR = 14
 
+    # PVs consulted for the start-up hour, in priority order: the first one that shows a
+    # real signal that day decides. They are alternatives, not a committee — sbw4 sits flat
+    # for whole days (median -0.108, never above zero on 05. and 06.08.2026), and on those
+    # days the choice simply falls through to ptm1, then to the waveplate.
+    _AUTOHOUR_PVS = ("sbw4", "ptm1", "waveplate")
+    # Energy channels read a small NEGATIVE offset when idle (sbw4 -0.108, ptm1 -1.69) and
+    # the archiver logs ~4000 such samples an hour around the clock, so sample count says
+    # nothing. A shot puts real joules on them, and energy cannot be negative — so "> 0" is
+    # the signal test, and it needs no tuning. Measured over 31.07-07.08.2026: sbw4 never
+    # once rose above zero (max -0.091, i.e. the channel is currently dead), ptm1 reached
+    # 18.4 / 13.2 / 109.6 J on 06. / 05. / 04.08 and stayed idle on 31.07 and 07.08.
+    #
+    # Using a threshold relative to the day's own span instead — which is right for a
+    # position — made a dead channel look busy: sbw4's idle jitter then registered
+    # "activity" in all 24 hours and picked 02:00 on 05.08.
+    _AUTOHOUR_ENERGY_PVS = ("sbw4", "ptm1", "pcm2", "pcm4", "pap1", "Back_Ref")
+    # The waveplate is a POSITION, where zero means nothing. There the signal is movement
+    # away from the day's resting position.
+    _AUTOHOUR_ACTIVE_FRAC = 0.25
+
+    def _pv_hour_activity(self, day, pv_key) -> dict:
+        """{hour: number of samples where this one PV is genuinely active}, or {} if the
+        channel is flat / missing / unreadable for that day."""
+        channel = CPVA_CHANNEL_MAP.get(pv_key)
+        if not channel:
+            return {}
+        try:
+            res = cpva.get_day(channel, day.isoformat())
+            samples = getattr(res, "samples", None) or []
+        except Exception:
+            return {}
+        vals, per_hour = [], {}
+        for ts_ns, v in samples:
+            if v is None:
+                continue
+            v = float(v)
+            vals.append(v)
+            hr = datetime.fromtimestamp(ts_ns / 1e9, PRAGUE).hour if PRAGUE                 else datetime.fromtimestamp(ts_ns / 1e9).hour
+            per_hour.setdefault(hr, []).append(v)
+        if not vals:
+            return {}
+        if pv_key in self._AUTOHOUR_ENERGY_PVS:
+            cut = 0.0                               # energy: anything positive is a shot
+        else:
+            vals.sort()
+            base = vals[len(vals) // 2]             # this channel's resting position today
+            span = vals[-1] - base
+            if span <= 0:
+                return {}                           # never moved -> no signal
+            cut = base + span * self._AUTOHOUR_ACTIVE_FRAC
+        active = {hr: sum(1 for x in hv if x > cut) for hr, hv in per_hour.items()}
+        return {hr: n for hr, n in active.items() if n}
+
+    def _pick_hour_from_pv(self, day):
+        """Start-up hour from the PV signal: first PV in _AUTOHOUR_PVS that has any signal
+        that day wins, and within it the hour holding the most of it.
+
+        Returns (datetime, message), or (None, message) when none of the PVs shows
+        anything — in which case the caller keeps the default hour."""
+        for pv_key in self._AUTOHOUR_PVS:
+            act = self._pv_hour_activity(day, pv_key)
+            if not act:
+                continue
+            hr = max(act, key=act.get)
+            ranked = ", ".join(f"{h:02d}:00={n}"
+                               for h, n in sorted(act.items(), key=lambda kv: -kv[1])[:5])
+            return (datetime(day.year, day.month, day.day, hr),
+                    f"AUTO-HOUR: {pv_key} -> {hr:02d}:00 "
+                    f"({act[hr]} active samples; top hours: {ranked})")
+        tried = ", ".join(self._AUTOHOUR_PVS)
+        return None, (f"AUTO-HOUR: no signal on {tried} for {day} — keeping the default "
+                      f"hour {self._DEFAULT_HOUR:02d}:00")
+
     def _pick_best_block_real_hour(self, day):
         rows = self._get_ramping_for_day_cached(day)
         if not rows:
@@ -3482,7 +3677,15 @@ class ImageFinderWidget(QWidget):
 
         def worker():
             try:
-                hr_dt, msg = self._pick_best_block_real_hour(day)
+                # PV signal first. The RAMPING CSV that used to drive this has not been
+                # written since 26.05.2026 (newest file on both the lab and office shares
+                # is dataof2026May_26.csv), so for every recent day it returned no rows and
+                # the hour fell back to a hard-coded 14:00 — which on 06.08 was the
+                # THINNEST hour of the day, 4540 frames against 11985 at 13:00.
+                hr_dt, msg = self._pick_hour_from_pv(day)
+                if hr_dt is None:
+                    self._auto_hour_sig.log_msg.emit(msg)
+                    hr_dt, msg = self._pick_best_block_real_hour(day)
                 if hr_dt is None:
                     self._auto_hour_sig.log_msg.emit(msg)
                     return
@@ -3545,9 +3748,8 @@ class ImageFinderWidget(QWidget):
 
     def _build_target_path(self, dt: datetime) -> Path:
         year = dt.year
-        # Container share name uses max(year, 2025) — years before 2025 are stored inside cpva-image-2025
-        container_year = max(year, 2025)
-        root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{container_year}"
+        # Each year lives in its own share: cpva-image-<year> (e.g. 2024 -> cpva-image-2024).
+        root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{year}"
         return root / str(year) / str(dt.month) / str(dt.day) / str(dt.hour)
 
     def _log_selected_datetime_preview(self):
@@ -3624,8 +3826,8 @@ class ImageFinderWidget(QWidget):
                     return True, entries
 
                 for (yy, mm, dd) in eff_days:
-                    container_year = max(yy, 2025)
-                    root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{container_year}"
+                    # Each year lives in its own share: cpva-image-<year>.
+                    root = Path(IMAGES_ROOT_BASE) / f"cpva-image-{yy}"
                     day_dir = root / str(yy) / str(mm) / str(dd)
                     with ThreadPoolExecutor(max_workers=12) as _hex:
                         _futs = [_hex.submit(_scan_hour, day_dir, h) for h in range(24)]
@@ -3658,8 +3860,16 @@ class ImageFinderWidget(QWidget):
         if not self.isVisible():
             return
         self._log(f"Target folder not found: {target_path}")
-        QMessageBox.warning(self, "Not found", f"Folder does not exist:\n{target_path}")
+        resp = QMessageBox.question(
+            self, "Not found",
+            f"Folder does not exist:\n{target_path}\n\n"
+            "Search by PV region instead? (Plot a PV, mark time regions, and "
+            "pull frames from the peak of each region.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
         self._refresh_selected_table()
+        if resp == QMessageBox.StandardButton.Yes:
+            self._open_pv_region_search()
 
     def _on_load_error(self, err: str):
         if not self.isVisible():
@@ -3936,6 +4146,162 @@ class ImageFinderWidget(QWidget):
             return None
         _, best_name = min(candidates, key=lambda x: abs(x[0] - target_ns))
         return cam_folder / best_name
+
+    def _frame_nearest_ns(self, year: int, month: int, day_n: int,
+                          cam_name: str, use_lab: bool, target_ns: int,
+                          cancelled: "threading.Event | None" = None,
+                          log=None) -> "tuple[Path | None, int | None]":
+        """Camera frame nearest target_ns (UTC ns) for (day, cam), tz-aware.
+
+        Mirrors the try_timestamp closure inside _find_image_for_day_cam so both
+        the automatic and the PV-region search paths share one code path.
+        Returns (path, real_hour) or (None, None) if nothing suitable exists.
+        """
+        def _log(m):
+            if log:
+                log(m)
+
+        def is_cancelled() -> bool:
+            return cancelled is not None and cancelled.is_set()
+
+        if is_cancelled():
+            return None, None
+
+        dt_utc = datetime.fromtimestamp(target_ns / 1e9, tz=timezone.utc)
+        if not use_lab and PRAGUE is not None:
+            real_h = dt_utc.astimezone(PRAGUE).hour
+        else:
+            real_h = dt_utc.hour
+
+        # real hour → folder (archiver/UTC) hour
+        if use_lab or PRAGUE is None:
+            folder_h = real_h
+        else:
+            dt_p = datetime(year, month, day_n, real_h, tzinfo=PRAGUE)
+            folder_h = real_h - int(dt_p.utcoffset().total_seconds() / 3600)
+        if not (0 <= folder_h <= 23):
+            return None, None   # maps outside this day's folders
+
+        dt_eff = datetime(year, month, day_n, folder_h)
+        cam_folder = self._build_target_path(dt_eff) / cam_name
+        _log(f"scan folder h={folder_h:02d}  {cam_folder}")
+
+        if cancelled is not None:
+            exists = self._blocking_call(lambda cf=cam_folder: cf.exists(), cancelled)
+        else:
+            exists = cam_folder.exists()
+        if is_cancelled():
+            return None, None
+        if not exists:
+            _log("  folder does not exist")
+            return None, None
+
+        if cancelled is not None:
+            p = self._blocking_call(
+                lambda cf=cam_folder: self._nearest_file_for_ns(cf, target_ns),
+                cancelled)
+        else:
+            p = self._nearest_file_for_ns(cam_folder, target_ns)
+        if is_cancelled():
+            return None, None
+        _log(f"  → {p.name if p else 'nothing'}")
+        return (p, real_h) if p else (None, None)
+
+    def _find_image_for_regions(
+        self,
+        day,                       # datetime.date
+        cam_name: str,
+        use_lab: bool,
+        regions_for_day: "list[tuple[int, int]]",
+        primary_channel: str,
+        cancelled: "threading.Event | None" = None,
+        log_fn=None,
+    ) -> "tuple[Path | None, int | None, dict, str]":
+        """PV-region driven image lookup.
+
+        For each (t_start_ns, t_end_ns) region on `day`, take the timestamp of the
+        PEAK value of primary_channel inside the region as the target time, and
+        return the camera frame nearest that time. If the PV has no samples in a
+        region, the region midpoint is used instead.
+
+        Returns (path, real_hour, meta, status) with the SAME shape as
+        _find_image_for_day_cam so MultiDayPreviewWindow is reused unchanged.
+        """
+        def log(msg: str):
+            if log_fn:
+                log_fn(f"  {msg}")
+
+        def is_cancelled() -> bool:
+            return cancelled is not None and cancelled.is_set()
+
+        _no_meta: dict = {"ptm1": None, "sbw4": None}
+        if is_cancelled():
+            return None, None, _no_meta, "cancelled"
+
+        year, month, day_n = day.year, day.month, day.day
+
+        for (t_start_ns, t_end_ns) in regions_for_day:
+            if is_cancelled():
+                return None, None, _no_meta, "cancelled"
+
+            # ── Peak of the primary PV inside the region ──────────────────────
+            samples = None
+            try:
+                if cancelled is not None:
+                    samples = self._blocking_call(
+                        lambda ch=primary_channel, s=t_start_ns, e=t_end_ns:
+                            _cpva_fetch_samples(ch, s, e, timeout=3.0),
+                        cancelled)
+                else:
+                    samples = _cpva_fetch_samples(primary_channel,
+                                                  t_start_ns, t_end_ns, timeout=3.0)
+            except Exception as _e:
+                log(f"PV fetch error: {_e}")
+            if is_cancelled():
+                return None, None, _no_meta, "cancelled"
+
+            target_ns: "int | None" = None
+            peak_val: "float | None" = None
+            if isinstance(samples, list):
+                for s in samples:
+                    t_ns = s.get("time")
+                    if t_ns is None:
+                        continue
+                    val = s.get("value")
+                    if isinstance(val, list):
+                        val = val[0] if len(val) == 1 else None
+                    try:
+                        fv = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if peak_val is None or fv > peak_val:
+                        peak_val = fv
+                        target_ns = int(t_ns)
+
+            if target_ns is None:
+                target_ns = (t_start_ns + t_end_ns) // 2
+                log("region: no PV samples — using midpoint")
+            else:
+                dt_tgt = datetime.fromtimestamp(target_ns / 1e9, tz=timezone.utc)
+                if PRAGUE and not use_lab:
+                    dt_tgt = dt_tgt.astimezone(PRAGUE)
+                log(f"region peak: {dt_tgt.strftime('%H:%M:%S')}  value={peak_val:.4g}")
+
+            p, real_h = self._frame_nearest_ns(year, month, day_n, cam_name,
+                                               use_lab, target_ns, cancelled, log)
+            if is_cancelled():
+                return None, None, _no_meta, "cancelled"
+            if p is not None:
+                meta = dict(_no_meta)
+                if peak_val is not None:
+                    if primary_channel == CPVA_SBW4_CHANNEL:
+                        meta["sbw4"] = peak_val
+                    elif primary_channel == CPVA_SHOT_CHANNEL:
+                        meta["ptm1"] = peak_val
+                    meta["pv_peak"] = peak_val
+                return p, real_h, meta, "found"
+
+        return None, None, _no_meta, "not_found"
 
     def _find_image_for_day_cam(
         self,
@@ -4260,12 +4626,40 @@ class ImageFinderWidget(QWidget):
                 cache[key] = []
         return cache[key]
 
+    def _open_pv_region_search(self, prefill_qdate: "QDate | None" = None):
+        """Open the PV Region Search dialog (proactive button or fail-path popup).
+        On accept, run the region-driven multi-day search."""
+        cams = self._checked_cameras()
+        if not cams:
+            QMessageBox.information(
+                self, "PV Region Search",
+                "Check at least one camera in the table first."); return
+        qd = prefill_qdate or self._cal.selectedDate()
+        try:
+            dlg = PVRegionSearchDialog(cams, qd, self._lab_time_cb.isChecked(), self)
+        except Exception as e:
+            import traceback
+            self._log(f"PV Region Search error: {e}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "PV Region Search", f"Could not open dialog:\n{e}")
+            return
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cfg = dlg.get_config()
+        self._log(f"VIEW (PV region): {len(cfg['cameras'])} cams × "
+                  f"{len(cfg['days'])} day(s), {sum(len(v) for v in cfg['regions'].values())} region(s)")
+        self._run_multiday_search(cfg)
+
     def _run_multiday_search(self, cfg: dict):
         """Run the multi-day image search for the given config and surface the
         results in the inline preview + MultiDayPreviewWindow.
 
         cfg = {cameras: [(folder_name, label, folder)], days: [date,…],
                start_hour: int, max_hour: int, use_lab_time: bool}
+
+        Optional PV-region mode: if cfg["regions"] is a non-empty dict
+        {date: [(t_start_ns, t_end_ns), …]} the search pulls one frame per camera
+        from the PEAK of cfg["primary_channel"] inside those regions instead of
+        the automatic TotalPower/random-hour selection.
         """
         if not cfg["cameras"]:
             QMessageBox.information(self, "Multi-day search", "Select at least one camera."); return
@@ -4275,6 +4669,9 @@ class ImageFinderWidget(QWidget):
         use_lab         = cfg["use_lab_time"]
         start_hour_real = cfg["start_hour"]
         max_hour_real   = cfg["max_hour"]
+        regions_by_day  = cfg.get("regions") or {}
+        primary_channel = cfg.get("primary_channel")
+        region_mode     = bool(regions_by_day) and bool(primary_channel)
 
         # Launch search in background
         cancel_evt = threading.Event()
@@ -4327,9 +4724,16 @@ class ImageFinderWidget(QWidget):
                         break
                     emit_log(f"[search] {day.strftime('%d.%m.%Y')}  {cam_label}")
                     t0 = time.perf_counter()
-                    found_path, found_hour, meta, status = self._find_image_for_day_cam(
-                        day, cam_name, use_lab, start_hour_real, max_hour_real,
-                        cancelled=cancel_evt, log_fn=emit_log)
+                    if region_mode:
+                        regions_for_day = regions_by_day.get(day) \
+                            or regions_by_day.get(day.isoformat()) or []
+                        found_path, found_hour, meta, status = self._find_image_for_regions(
+                            day, cam_name, use_lab, regions_for_day, primary_channel,
+                            cancelled=cancel_evt, log_fn=emit_log)
+                    else:
+                        found_path, found_hour, meta, status = self._find_image_for_day_cam(
+                            day, cam_name, use_lab, start_hour_real, max_hour_real,
+                            cancelled=cancel_evt, log_fn=emit_log)
                     elapsed = time.perf_counter() - t0
                     # Always record an entry — path=None for inactive/not_found so user can retry
                     results[cam_name].append((day, found_hour, found_path, meta, status))
@@ -4362,9 +4766,24 @@ class ImageFinderWidget(QWidget):
             results = data["_final"]
             total_found = sum(1 for v in results.values()
                               for _, _, p, _, _ in v if p is not None)
-            total_entries = sum(len(v) for v in results.values())
-            if total_entries == 0:
-                QMessageBox.information(self, "Multi-day search", "No images found.")
+            if total_found == 0:
+                # Nothing matched. Offer the PV-region fallback (unless this WAS
+                # already a PV-region search, to avoid looping).
+                if not region_mode:
+                    resp = QMessageBox.question(
+                        self, "Multi-day search",
+                        "No images found by the automatic search.\n\n"
+                        "Search by PV region instead? (Plot a PV, mark time "
+                        "regions, and pull frames from the peak of each region.)",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes)
+                    if resp == QMessageBox.StandardButton.Yes:
+                        first_day = cfg["days"][0] if cfg["days"] else None
+                        qd = (QDate(first_day.year, first_day.month, first_day.day)
+                              if first_day else None)
+                        self._open_pv_region_search(qd)
+                else:
+                    QMessageBox.information(self, "PV Region Search", "No images found in the marked regions.")
                 return
             # Send all found images to inline preview panel
             found_paths = sorted(
@@ -5768,6 +6187,499 @@ def _section_label(text: str) -> QLabel:
     lbl = QLabel(text.upper())
     lbl.setStyleSheet("font-size:10px;color:#888;font-weight:700;letter-spacing:1px;")
     return lbl
+
+# ── PV-REGION SEARCH ──────────────────────────────────────────────────────────
+# Reverse of cpva.CHANNEL_MAP: full archiver channel → short preset label.
+_PV_PRESET_LABELS: dict[str, str] = {ch: name.upper()
+                                     for name, ch in CPVA_CHANNEL_MAP.items()}
+# Cache of every archiver channel name (populated once by the Browse dialog).
+_PV_CHANNEL_CACHE: "list[str] | None" = None
+_PV_REGION_COLORS = ["#C62828", "#2E7D32", "#EF6C00", "#6A1B9A",
+                     "#00838F", "#AD1457", "#1565C0", "#37474F"]
+
+
+class _PVBrowseDialog(QDialog):
+    """Filterable list of every archiver channel (live discovery via
+    cpva.fetch_channels('**')). Returns the selected channel names."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Browse PVs")
+        self.resize(460, 520)
+        lay = QVBoxLayout(self)
+
+        self._filter = QLineEdit()
+        self._filter.setPlaceholderText("Type to filter channels…")
+        self._filter.textChanged.connect(self._apply_filter)
+        lay.addWidget(self._filter)
+
+        self._list = QListWidget()
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._list.itemDoubleClicked.connect(lambda *_: self.accept())
+        lay.addWidget(self._list, 1)
+
+        self._status = QLabel("Loading channels…")
+        self._status.setStyleSheet("color:#666;font-size:10px;")
+        lay.addWidget(self._status)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        class _Sig(QObject):
+            done = Signal(object)
+        self._sig = _Sig()
+        self._sig.done.connect(self._on_channels)
+
+        self._all: list[str] = []
+        if _PV_CHANNEL_CACHE is not None:
+            self._on_channels(_PV_CHANNEL_CACHE)
+        else:
+            threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _load_worker(self):
+        global _PV_CHANNEL_CACHE
+        try:
+            chans = cpva.fetch_channels("**")
+        except Exception as e:
+            try:
+                self._sig.done.emit(e)
+            except RuntimeError:
+                pass
+            return
+        _PV_CHANNEL_CACHE = sorted(chans)
+        try:
+            self._sig.done.emit(_PV_CHANNEL_CACHE)
+        except RuntimeError:
+            pass
+
+    def _on_channels(self, payload):
+        if isinstance(payload, Exception):
+            self._status.setText(f"Failed to load channels: {payload}")
+            return
+        self._all = list(payload)
+        self._apply_filter(self._filter.text())
+
+    def _apply_filter(self, text: str):
+        text = (text or "").strip().lower()
+        self._list.clear()
+        shown = 0
+        for ch in self._all:
+            if text and text not in ch.lower():
+                continue
+            self._list.addItem(QListWidgetItem(ch))
+            shown += 1
+            if shown >= 500:
+                break
+        self._status.setText(f"{shown} shown / {len(self._all)} channels"
+                             + ("  (capped at 500 — refine filter)" if shown >= 500 else ""))
+
+    def selected_channels(self) -> list[str]:
+        return [it.text() for it in self._list.selectedItems()]
+
+
+class PVRegionSearchDialog(QDialog):
+    """Manual image search: plot one or more PV time-series for a day, drag to
+    mark time regions, then pull one camera frame per region from the PEAK of the
+    primary PV inside each region.  Modelled on the Spectra tab in the CSS Logger.
+    """
+
+    def __init__(self, cams: list, initial_qdate: QDate, use_lab: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PV Region Search")
+        self.resize(1040, 660)
+        self._cams = cams
+        self._use_lab = use_lab
+        self._regions: list[dict] = []      # {id, t_start_ns, t_end_ns, color, day}
+        self._region_seq = 0
+        self._series: dict[str, list] = {}  # channel → [(t_ns, value), …] for current day
+        self._load_gen = 0
+        self._span = None
+
+        # Lazy matplotlib import (keeps module import time low).
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import (
+            FigureCanvasQTAgg as FigureCanvas, NavigationToolbar2QT)
+        from matplotlib.widgets import SpanSelector
+        import matplotlib.dates as mdates
+        self._Figure, self._FigureCanvas = Figure, FigureCanvas
+        self._NavToolbar, self._SpanSelector = NavigationToolbar2QT, SpanSelector
+        self._mdates = mdates
+
+        class _Sig(QObject):
+            done = Signal(object)
+        self._sig = _Sig()
+        self._sig.done.connect(self._on_series_loaded)
+
+        self._build_ui(initial_qdate)
+        self._seed_default_pvs()
+        self._reload_day()
+
+    # ── UI ──────────────────────────────────────────────────────────────────
+    def _build_ui(self, initial_qdate: QDate):
+        root = QHBoxLayout(self)
+        root.setSpacing(8)
+
+        # ── Left sidebar ──────────────────────────────────────────────────
+        side = QVBoxLayout()
+        side.setSpacing(6)
+
+        # Day navigation
+        side.addWidget(_section_label("Day"))
+        self._cal = _NoScrollCalendar()
+        self._cal.setSelectedDate(initial_qdate)
+        self._cal.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.ISOWeekNumbers)
+        _style_calendar(self._cal)            # house look: gray header, red weekends
+        self._cal.setMaximumHeight(210)
+        self._cal.clicked.connect(lambda *_: self._reload_day())
+        side.addWidget(self._cal)
+
+        nav = QHBoxLayout()
+        btn_prev = QPushButton("‹ Prev day")
+        btn_prev.clicked.connect(lambda: self._step_day(-1))
+        btn_next = QPushButton("Next day ›")
+        btn_next.clicked.connect(lambda: self._step_day(+1))
+        nav.addWidget(btn_prev); nav.addWidget(btn_next)
+        side.addLayout(nav)
+        self._lbl_tz = QLabel("Lab time" if self._use_lab else "Prague time")
+        self._lbl_tz.setStyleSheet("color:#888;font-size:10px;")
+        side.addWidget(self._lbl_tz)
+
+        # PV list
+        side.addWidget(_section_label("PVs to plot"))
+        self._pv_list = QListWidget()
+        self._pv_list.setMaximumHeight(150)
+        self._pv_list.itemChanged.connect(self._on_pv_checks_changed)
+        side.addWidget(self._pv_list)
+        pv_btns = QHBoxLayout()
+        btn_browse = QPushButton("Browse…")
+        btn_browse.setToolTip("Search all archiver channels")
+        btn_browse.clicked.connect(self._browse_pvs)
+        btn_remove = QPushButton("Remove")
+        btn_remove.clicked.connect(self._remove_selected_pv)
+        pv_btns.addWidget(btn_browse); pv_btns.addWidget(btn_remove)
+        side.addLayout(pv_btns)
+
+        prim_row = QHBoxLayout()
+        prim_row.addWidget(QLabel("Primary (peak):"))
+        self._primary_cb = QComboBox()
+        self._primary_cb.setToolTip("PV whose peak inside a region defines the target time")
+        prim_row.addWidget(self._primary_cb, 1)
+        side.addLayout(prim_row)
+
+        # Regions
+        side.addWidget(_section_label("Regions"))
+        reg_scroll = QScrollArea()
+        reg_scroll.setWidgetResizable(True)
+        reg_scroll.setMaximumHeight(150)
+        self._regions_host = QWidget()
+        self._regions_lay = QVBoxLayout(self._regions_host)
+        self._regions_lay.setContentsMargins(0, 0, 0, 0)
+        self._regions_lay.setSpacing(2)
+        reg_scroll.setWidget(self._regions_host)
+        side.addWidget(reg_scroll)
+        btn_clear = QPushButton("Clear all regions")
+        btn_clear.clicked.connect(self._clear_regions)
+        side.addWidget(btn_clear)
+
+        side.addStretch()
+        self._status = QLabel("Ready.")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet("color:#555;font-size:10px;")
+        side.addWidget(self._status)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        self._btn_search = bb.addButton("🎯 Search these regions",
+                                        QDialogButtonBox.ButtonRole.AcceptRole)
+        self._btn_search.clicked.connect(self._on_accept)
+        bb.rejected.connect(self.reject)
+        side.addWidget(bb)
+
+        side_w = QWidget(); side_w.setLayout(side); side_w.setFixedWidth(300)
+        root.addWidget(side_w)
+
+        # ── Right: plot ───────────────────────────────────────────────────
+        right = QVBoxLayout()
+        self._fig = self._Figure(figsize=(6, 4), tight_layout=True)
+        self._canvas = self._FigureCanvas(self._fig)
+        self._ax = self._fig.add_subplot(111)
+        self._toolbar = _make_mpl_toolbar(self._NavToolbar, self._canvas, self)
+        right.addWidget(self._toolbar)
+        right.addWidget(self._canvas, 1)
+        hint = QLabel("Drag on the graph to mark a time region, then click Search.")
+        hint.setStyleSheet("color:#666;font-size:11px;")
+        right.addWidget(hint)
+        right_w = QWidget(); right_w.setLayout(right)
+        root.addWidget(right_w, 1)
+
+        self._rebuild_regions_ui()
+
+    def _seed_default_pvs(self):
+        # Presets from CHANNEL_MAP; SBW4 pre-checked as the default primary.
+        self._pv_list.blockSignals(True)
+        for name, ch in CPVA_CHANNEL_MAP.items():
+            it = QListWidgetItem(name.upper())
+            it.setData(Qt.ItemDataRole.UserRole, ch)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked if ch == CPVA_SBW4_CHANNEL
+                             else Qt.CheckState.Unchecked)
+            self._pv_list.addItem(it)
+        self._pv_list.blockSignals(False)
+        self._refresh_primary_combo()
+
+    # ── PV list handling ──────────────────────────────────────────────────
+    def _checked_channels(self) -> list:
+        out = []
+        for i in range(self._pv_list.count()):
+            it = self._pv_list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                out.append((it.text(), it.data(Qt.ItemDataRole.UserRole)))
+        return out
+
+    def _refresh_primary_combo(self):
+        prev = self._primary_cb.currentData()
+        self._primary_cb.blockSignals(True)
+        self._primary_cb.clear()
+        for label, ch in self._checked_channels():
+            self._primary_cb.addItem(label, ch)
+        # keep previous primary if still checked, else default to first
+        idx = self._primary_cb.findData(prev)
+        if idx >= 0:
+            self._primary_cb.setCurrentIndex(idx)
+        self._primary_cb.blockSignals(False)
+
+    def _on_pv_checks_changed(self, *_):
+        self._refresh_primary_combo()
+        self._reload_day()
+
+    def _browse_pvs(self):
+        dlg = _PVBrowseDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        existing = {self._pv_list.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(self._pv_list.count())}
+        self._pv_list.blockSignals(True)
+        for ch in dlg.selected_channels():
+            if ch in existing:
+                continue
+            it = QListWidgetItem(_PV_PRESET_LABELS.get(ch, ch))
+            it.setData(Qt.ItemDataRole.UserRole, ch)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked)
+            self._pv_list.addItem(it)
+        self._pv_list.blockSignals(False)
+        self._refresh_primary_combo()
+        self._reload_day()
+
+    def _remove_selected_pv(self):
+        for it in self._pv_list.selectedItems():
+            self._pv_list.takeItem(self._pv_list.row(it))
+        self._refresh_primary_combo()
+        self._reload_day()
+
+    # ── Day handling ──────────────────────────────────────────────────────
+    def _step_day(self, delta: int):
+        self._cal.setSelectedDate(self._cal.selectedDate().addDays(delta))
+        self._reload_day()
+
+    def _day_bounds_ns(self) -> "tuple[int, int]":
+        qd = self._cal.selectedDate()
+        tz = timezone.utc if (self._use_lab or PRAGUE is None) else PRAGUE
+        t0 = datetime(qd.year(), qd.month(), qd.day(), 0, 0, 0, tzinfo=tz)
+        t1 = datetime(qd.year(), qd.month(), qd.day(), 23, 59, 59, tzinfo=tz)
+        return int(t0.timestamp() * 1e9), int(t1.timestamp() * 1e9)
+
+    def _ns_to_num(self, t_ns: int):
+        dt = datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+        if not self._use_lab and PRAGUE is not None:
+            dt = dt.astimezone(PRAGUE)
+        return self._mdates.date2num(dt)
+
+    def _reload_day(self):
+        channels = [ch for _, ch in self._checked_channels()]
+        start_ns, end_ns = self._day_bounds_ns()
+        self._load_gen += 1
+        gen = self._load_gen
+        qd = self._cal.selectedDate()
+        self._status.setText(f"Loading {qd.toString('dd.MM.yyyy')} — {len(channels)} PV(s)…")
+        if not channels:
+            self._series = {}
+            self._redraw()
+            self._status.setText("No PV selected — check at least one PV to plot.")
+            return
+
+        def worker():
+            out: dict[str, list] = {}
+            err = None
+            for ch in channels:
+                try:
+                    out[ch] = cpva.fetch_values(ch, start_ns, end_ns, timeout=8.0)
+                except Exception as e:
+                    err = e
+                    out[ch] = []
+            try:
+                self._sig.done.emit({"gen": gen, "series": out, "err": err})
+            except RuntimeError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_series_loaded(self, data: dict):
+        if data.get("gen") != self._load_gen:
+            return   # a newer request superseded this one
+        self._series = data.get("series") or {}
+        self._redraw()
+        n = sum(len(v) for v in self._series.values())
+        err = data.get("err")
+        if err is not None and n == 0:
+            self._status.setText(f"Archiver error: {err}")
+        else:
+            self._status.setText(f"Loaded {n} samples.  Drag to mark a region.")
+
+    # ── Plot ────────────────────────────────────────────────────────────────
+    def _redraw(self):
+        ax = self._ax
+        ax.clear()
+        label_by_ch = {ch: lbl for lbl, ch in self._checked_channels()}
+        any_data = False
+        for i, (ch, series) in enumerate(self._series.items()):
+            if not series:
+                continue
+            any_data = True
+            times = [self._ns_to_num(t) for t, _ in series]
+            vals = np.array([v for _, v in series], dtype=float)
+            vmax = np.nanmax(np.abs(vals)) if vals.size else 0.0
+            norm = vals / vmax if vmax > 0 else vals
+            ax.plot(times, norm, "-", lw=1.0, alpha=0.85, marker=".", ms=2,
+                    label=label_by_ch.get(ch, ch))
+        start_ns, end_ns = self._day_bounds_ns()
+        ax.set_xlim(self._ns_to_num(start_ns), self._ns_to_num(end_ns))
+        ax.xaxis.set_major_formatter(self._mdates.DateFormatter(
+            "%H:%M", tz=(None if (self._use_lab or PRAGUE is None) else PRAGUE)))
+        ax.set_xlabel("Time")
+        ax.set_ylabel("PV value (normalized per PV)")
+        ax.grid(True, alpha=0.25)
+        if any_data:
+            ax.legend(loc="upper right", fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "No PV data for this day",
+                    ha="center", va="center", transform=ax.transAxes, color="#999")
+        self._paint_region_spans()
+        self._fig.autofmt_xdate(rotation=30)
+        self._canvas.draw_idle()
+        self._install_span()
+
+    def _paint_region_spans(self):
+        cur = self._cal.selectedDate()
+        cur_day = datetime(cur.year(), cur.month(), cur.day()).date()
+        for r in self._regions:
+            if r["day"] != cur_day:
+                continue
+            self._ax.axvspan(self._ns_to_num(r["t_start_ns"]),
+                             self._ns_to_num(r["t_end_ns"]),
+                             alpha=0.25, color=r["color"], zorder=0)
+
+    def _install_span(self):
+        if self._span is not None:
+            try:
+                self._span.set_active(False)
+            except Exception:
+                pass
+        self._span = self._SpanSelector(
+            self._ax, self._on_span, "horizontal", useblit=False,
+            props=dict(alpha=0.20, facecolor="#90CAF9"), interactive=False)
+
+    def _on_span(self, xmin: float, xmax: float):
+        if xmax - xmin < 1e-9:
+            return
+        try:
+            t_start = int(self._mdates.num2date(xmin).timestamp() * 1e9)
+            t_end = int(self._mdates.num2date(xmax).timestamp() * 1e9)
+        except Exception:
+            return
+        cur = self._cal.selectedDate()
+        cur_day = datetime(cur.year(), cur.month(), cur.day()).date()
+        rid = self._region_seq
+        self._region_seq += 1
+        color = _PV_REGION_COLORS[rid % len(_PV_REGION_COLORS)]
+        self._regions.append({"id": rid, "t_start_ns": t_start, "t_end_ns": t_end,
+                              "color": color, "day": cur_day})
+        self._ax.axvspan(xmin, xmax, alpha=0.25, color=color, zorder=0)
+        self._canvas.draw_idle()
+        self._rebuild_regions_ui()
+
+    # ── Regions UI ──────────────────────────────────────────────────────────
+    def _fmt_region(self, r: dict) -> str:
+        def hms(ns):
+            dt = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
+            if not self._use_lab and PRAGUE is not None:
+                dt = dt.astimezone(PRAGUE)
+            return dt.strftime("%H:%M:%S")
+        return f"{r['day'].strftime('%d.%m')}  {hms(r['t_start_ns'])}–{hms(r['t_end_ns'])}"
+
+    def _rebuild_regions_ui(self):
+        while self._regions_lay.count():
+            item = self._regions_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if not self._regions:
+            empty = QLabel("Drag on the graph\nto add a region.")
+            empty.setStyleSheet("color:#999;font-size:11px;")
+            self._regions_lay.addWidget(empty)
+            return
+        for r in self._regions:
+            row = QHBoxLayout()
+            dot = QLabel("■"); dot.setStyleSheet(f"color:{r['color']};")
+            lbl = QLabel(self._fmt_region(r))
+            lbl.setStyleSheet("font-size:11px;")
+            btn = QToolButton(); btn.setText("✕")
+            btn.setToolTip("Delete region")
+            btn.clicked.connect(lambda _=False, rid=r["id"]: self._delete_region(rid))
+            row.addWidget(dot); row.addWidget(lbl, 1); row.addWidget(btn)
+            w = QWidget(); w.setLayout(row)
+            self._regions_lay.addWidget(w)
+
+    def _delete_region(self, rid: int):
+        self._regions = [r for r in self._regions if r["id"] != rid]
+        self._redraw()
+        self._rebuild_regions_ui()
+
+    def _clear_regions(self):
+        self._regions = []
+        self._redraw()
+        self._rebuild_regions_ui()
+
+    # ── Accept ────────────────────────────────────────────────────────────
+    def _on_accept(self):
+        if not self._regions:
+            QMessageBox.information(self, "PV Region Search",
+                                    "Mark at least one region on the graph."); return
+        if self._primary_cb.currentData() is None:
+            QMessageBox.information(self, "PV Region Search",
+                                    "Check at least one PV and pick a primary PV."); return
+        if not self._cams:
+            QMessageBox.information(self, "PV Region Search",
+                                    "No cameras selected — check cameras in the table first."); return
+        self.accept()
+
+    def get_config(self) -> dict:
+        regions_by_day: dict = {}
+        for r in self._regions:
+            regions_by_day.setdefault(r["day"], []).append(
+                (r["t_start_ns"], r["t_end_ns"]))
+        return {
+            "cameras":         self._cams,
+            "days":            sorted(regions_by_day.keys()),
+            "regions":         regions_by_day,
+            "primary_channel": self._primary_cb.currentData(),
+            "start_hour":      0,
+            "max_hour":        23,
+            "use_lab_time":    self._use_lab,
+        }
+
 
 # ── MULTI-DAY PREVIEW WINDOW ──────────────────────────────────────────────────
 class MultiDayPreviewWindow(QWidget):

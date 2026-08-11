@@ -1,0 +1,9 @@
+{
+  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe; hidden_imports are forced into the bundle.",
+  "extra_files": [
+    "notify_provision.dat"
+  ],
+  "hidden_imports": [
+    "win32crypt"
+  ]
+}

@@ -33,6 +33,7 @@ import math
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from datetime import datetime, timedelta, timezone
@@ -66,12 +67,13 @@ matplotlib.rcParams["figure.facecolor"] = "white"
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.widgets import SpanSelector, RectangleSelector
 
 # ── Non-UI helpers from cpva_core ──────────────────────────────────────────
 from cpva_core import (
     TZ_PRAGUE, now_ns, dt_to_ns, ns_to_local_str, _fmt_cursor_value,
-    parse_user_datetime, shorten_pv_name, _matches_wildcard,
+    parse_user_datetime, shorten_pv_name, make_pv_query_matcher,
     cpva_fetch_samples, cpva_fetch_samples_chunked, cpva_decode_value,
     cpva_fetch_channels, _chunk_is_night, safe_divide,
     load_config, save_config, load_presets, save_presets,
@@ -172,6 +174,110 @@ _GRAPH_COLORS = [
     "#D81B60", "#6D4C41", "#546E7A", "#039BE5", "#7CB342",
 ]
 
+# ── Graph appearance / performance options ─────────────────────────────────
+# Everything the user can tune from the "Graph settings" dialog (Graph tab).
+# Stored under config["graph_opts"]; every key here is also the default, so an
+# older config file simply picks the defaults up for keys it does not have.
+# Distances are in PIXELS at the figure's 96 dpi unless noted otherwise.
+_GRAPH_OPTS_DEFAULTS = {
+    # Fonts (pt)
+    "font_size":        11,     # Y-axis titles + X label (mirrors the Font spin)
+    "tick_font_delta":  -1,     # tick-number size = font_size + this
+    "cursor_font_delta": 0,     # cursor readout size = font_size + this
+    # Left axis columns
+    "axis_gap_px":       6,     # whitespace between a title and the axis left of it
+    "label_pad_px":      5,     # gap between a title and its OWN tick numbers
+    "outer_margin_px":   8,     # whitespace left of the outermost title
+    "show_axis_titles":  True,
+    "y_ticks_max":       6,     # upper bound on major Y ticks per axis
+    # Minor Y ticks are decoration, but matplotlib builds a full Tick object
+    # (2 lines + 2 texts) for every one of them — with a dozen stacked axes that
+    # is ~400 objects and by far the largest single cost of a redraw, so they are
+    # off by default and can be switched back on in Graph settings.
+    "y_minor_ticks":     False,
+    # Plot rectangle (figure fractions)
+    "margin_right":      0.015,
+    "margin_top":        0.97,
+    "margin_bottom":     0.12,
+    "band_pad_frac":     0.12,  # gap inside each PV band (fraction of band height)
+    # Cursor / performance
+    "cursor_value_boxes": True,  # per-PV value box at the crosshair
+    "cursor_boxes_max":   20,    # boxes are dropped above this many visible PVs
+    "line_markers":       True,  # dots on short traces
+}
+
+# ── Custom-PV expression variables ─────────────────────────────────────────
+# Channel letters (A, B, … AA) used as variables in custom-PV expressions.
+# The lookarounds keep the tokens away from anything that only *looks* like a
+# letter: the E in 1E5, and the lowercase safe names (math, abs, min, max,
+# round) exposed to eval. True/False/None are not all-caps, so they are safe.
+_CPV_VAR_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Z]+(?![A-Za-z0-9_])")
+
+# Letter → PV mapping that the pre-"bindings" custom_pvs.json entries were
+# written against (the startup / "Operation" PV order). Used once, by
+# _migrate_custom_pv_bindings, to give those entries explicit bindings — kept
+# as a literal so the migration cannot be corrupted by whichever preset
+# happens to be loaded at the time. New entries always store their own.
+_CPV_LEGACY_LETTERS = {
+    "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+    "B": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+    "C": "L3-PFWP6-MTR03-1:RawPos",
+    "D": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
+    "E": "L3-PM03-023:Energy",
+    "F": "L3-PM03-025:Energy",
+    "G": "L3-VCS-LN36:OPEN",
+    "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+}
+
+
+def _cpv_vars(expr: str) -> list:
+    """Ordered unique channel-letter variables appearing in ``expr``."""
+    out = []
+    for m in _CPV_VAR_RE.finditer(expr or ""):
+        if m.group(0) not in out:
+            out.append(m.group(0))
+    return out
+
+
+def _cpv_rewrite(expr: str, letter_map: dict) -> str:
+    """Rename the channel letters in ``expr`` via ``letter_map`` (old -> new).
+
+    Tokens missing from the map are left untouched, so this is safe to run in
+    either direction (stored letters -> currently displayed letters and back).
+    """
+    if not expr or not letter_map:
+        return expr or ""
+    return _CPV_VAR_RE.sub(lambda m: letter_map.get(m.group(0), m.group(0)), expr)
+
+
+def _cpv_to_display(entry: dict, letter_by_pv: dict):
+    """Rewrite a stored expression into the letters that are valid right now.
+
+    Returns ``(expr_text, unbound)``; ``unbound`` lists the letters carrying no
+    binding (entries saved before bindings existed), which stay positional.
+    """
+    expr     = entry.get("expr", "") or ""
+    bindings = entry.get("bindings") or {}
+    lmap = {}
+    for letter, pv in bindings.items():
+        cur = letter_by_pv.get(pv)
+        if cur:
+            lmap[letter] = cur
+    unbound = [v for v in _cpv_vars(expr) if v not in bindings]
+    return _cpv_rewrite(expr, lmap), unbound
+
+
+def _cpv_from_display(expr_text: str, pv_by_letter: dict):
+    """Canonicalise an expression typed in the dialog into ``(expr, bindings)``:
+    the letters stay as written, and each one records the PV it stands for."""
+    expr = (expr_text or "").strip()
+    bindings = {}
+    for letter in _cpv_vars(expr):
+        pv = pv_by_letter.get(letter)
+        if pv:
+            bindings[letter] = pv
+    return expr, bindings
+
 # ── Signal helpers ─────────────────────────────────────────────────────────
 
 class _LoadSig(QObject):
@@ -227,11 +333,12 @@ class _WeekendDelegate(QStyledItemDelegate):
         self._selected_keys: set = set()
 
     def _date_for_index(self, index):
+        """Return the QDate for a model cell, or None for the hidden header row (row 0)."""
         if index.row() == 0:
             return None
         year, month = self._cal.yearShown(), self._cal.monthShown()
         first = QDate(year, month, 1)
-        start = first.addDays(-(first.dayOfWeek() - 1))
+        start = first.addDays(-(first.dayOfWeek() - 1))   # Monday of first displayed week
         return start.addDays((index.row() - 1) * 7 + index.column())
 
     def set_selected(self, dates):
@@ -464,10 +571,41 @@ class DatePickerDialog(QDialog):
 # this fall back to 1 hour. 366 days keeps year-long relative windows working.
 _LIVE_MAX_SPAN_S = 86400 * 366
 
+# …but a *live* window is also re-merged, re-filtered and re-drawn continuously,
+# and the config remembers the last From/To, so a multi-day historical window
+# silently became the live window on the next start (the saved window grows by a
+# day every day it is used). Clamp what Live inherits; the user can still load
+# any span historically. See _live_span_from_window.
+_LIVE_MAX_INIT_SPAN_S = 12 * 3600
+
+# How far back a single live tick may ask for data. _live_last_ts only advances
+# when new samples actually arrive, so on a quiet archiver it stays pinned to the
+# last real sample and the range [last_sample → now] grows without bound — every
+# 300 ms tick then re-downloaded the whole live window again, split into 1-hour
+# chunks per PV (a 49 h window × 8 PVs ≈ 250 HTTPS requests per tick, forever,
+# in 16 threads fighting the GUI for the GIL). Capping the look-back at one
+# chunk keeps a tick at exactly one request per PV whatever the window is.
+_LIVE_TICK_LOOKBACK_NS = int(120e9)          # 2 min ≤ CHUNK_SIZE_NS (1 h)
+
+# When a tick brings nothing, the cursor is still moved to (now − this), so the
+# next tick asks for a small slice instead of re-asking for everything since the
+# last sample. The overlap is what covers archiver ingestion lag.
+_LIVE_TICK_OVERLAP_NS = int(30e9)
+
 # Rebuilding the whole QTableWidget on every live tick gets visibly laggy once
 # the row count grows large, so only the most recent rows are ever rendered.
 # Export/graph/XY-plot always use the full, untruncated _table_rows.
 _MAX_TABLE_ROWS = 5000
+
+# Table cell colours per alarm severity; anything else keeps the default palette
+# colour. Kept as strings, not QColor: a QColor living in a module global is
+# destroyed after the QApplication is gone, which crashes the interpreter on exit
+# (0xC0000005). The QColor is built only when a cell's severity actually changes.
+_TABLE_SEVERITY_FG = {
+    "MINOR":   "#FFA000",
+    "MAJOR":   "#C62828",
+    "INVALID": "#C62828",
+}
 
 # The live tick polls every 300 ms (see _schedule_live_tick), but re-merging +
 # re-filtering + re-plotting the WHOLE accumulated history (which only grows
@@ -476,6 +614,89 @@ _MAX_TABLE_ROWS = 5000
 # thread never gets an idle moment and the app appears frozen. New samples are
 # still appended every tick; the expensive rebuild is throttled to this cadence.
 _LIVE_REBUILD_MIN_INTERVAL_NS = int(1.0 * 1e9)
+
+# ── ns timestamps → matplotlib date numbers ────────────────────────────────
+# Building one datetime per sample (and letting matplotlib convert it) used to
+# dominate every replot and every live refresh: 15 PVs × 2000 points meant 30k
+# datetime objects a second. A matplotlib date number is just "days since the
+# epoch", so the whole conversion is one numpy division.
+_NS_PER_DAY = 86_400_000_000_000.0
+_MPL_EPOCH_NUM: float | None = None
+
+
+def _mpl_epoch_num() -> float:
+    """Date number of 1970-01-01 UTC for matplotlib's configured epoch."""
+    global _MPL_EPOCH_NUM
+    if _MPL_EPOCH_NUM is None:
+        _MPL_EPOCH_NUM = float(mdates.date2num(datetime(1970, 1, 1, tzinfo=timezone.utc)))
+    return _MPL_EPOCH_NUM
+
+
+def _pairs_to_ns_arrays(pairs):
+    """(ts_ns, value) pairs → (ns timestamps, values) float64 arrays.
+    None values become NaN so a gap stays a gap."""
+    if not pairs:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    ts   = np.asarray([p[0] for p in pairs], dtype=np.float64)
+    vals = np.asarray([(p[1] if isinstance(p[1], (int, float)) else float("nan"))
+                       for p in pairs], dtype=np.float64)
+    return ts, vals
+
+
+def _samples_to_ns_arrays(samples):
+    """(ts_ns, value, units) triples → (ns timestamps, values) float64 arrays.
+
+    Fast path: np.fromiter reads the two columns in a single pass with no
+    intermediate Python lists — this runs over every sample of every PV on every
+    live refresh. A non-numeric value makes numpy raise, and only then is the
+    filtering slow path used."""
+    n = len(samples)
+    if not n:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+    try:
+        ts   = np.fromiter((s[0] for s in samples), dtype=np.float64, count=n)
+        vals = np.fromiter((s[1] for s in samples), dtype=np.float64, count=n)
+    except (TypeError, ValueError):
+        return _pairs_to_ns_arrays([(t, v) for t, v, _ in samples
+                                    if isinstance(v, (int, float))])
+    return ts, vals
+
+
+def _ns_to_num(ts_arr):
+    """ns timestamps → matplotlib date numbers."""
+    return _mpl_epoch_num() + ts_arr / _NS_PER_DAY
+
+
+def _downsample_arrays_mean(ts, vals, target: int):
+    """Bin (ns timestamps, values) arrays into ~`target` equal-time bins and
+    average — keeps the trace shape while cutting the point count. Empty bins are
+    dropped, so the result can be shorter than `target`; arrays already at or
+    under the target are returned untouched."""
+    n = ts.size
+    if target <= 0 or n <= target:
+        return ts, vals
+    t0   = ts[0]
+    rel  = ts - t0                      # keeps the sums small → full precision
+    span = rel[-1]
+    if not (span > 0):
+        return ts, vals
+    idx  = np.minimum((rel / (span / target)).astype(np.int64), target - 1)
+    cnt  = np.bincount(idx, minlength=target)
+    keep = cnt > 0
+    c    = cnt[keep].astype(np.float64)
+    sum_t = np.bincount(idx, weights=rel,  minlength=target)[keep]
+    sum_v = np.bincount(idx, weights=vals, minlength=target)[keep]
+    return t0 + sum_t / c, sum_v / c
+
+
+def _moving_avg_np(vals, w: int):
+    """Trailing moving average of a float array, same length as the input.
+    NaNs only affect the windows they fall into (a cumsum-based version would
+    smear a single NaN across the whole rest of the trace)."""
+    if w <= 1 or vals.size < w:
+        return vals
+    ext = np.concatenate((vals[:w - 1][::-1], vals))
+    return np.convolve(ext, np.full(w, 1.0 / w), mode="valid")
 
 
 class TimeWindowDialog(QDialog):
@@ -728,9 +949,11 @@ class PVBrowserDialog(QDialog):
 
     def _build_ui(self):
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Search for a CPVA channel (type part of the name):"))
+        lay.addWidget(QLabel(
+            "Search for a CPVA channel — several words match in order, "
+            "like *word1*word2*:"))
         self._edit = QLineEdit()
-        self._edit.setPlaceholderText("e.g. HAPLS-ENER or L3-SPFE or Energy")
+        self._edit.setPlaceholderText("e.g. 023 l3   or   L3-SPFE   or   Energy")
         self._edit.textEdited.connect(self._filter)
         lay.addWidget(self._edit)
         self._lbl_status = QLabel("Loading channels from CPVA…")
@@ -774,16 +997,23 @@ class PVBrowserDialog(QDialog):
             if channels else "CPVA returned no channels.")
         self._filter(self._edit.text())
 
+    _MAX_SHOWN = 500
+
     def _filter(self, text: str):
         self._lst.clear()
-        q = text.strip().lower()
-        shown = 0
-        for ch in self._all_channels:
-            if not q or q in ch.lower():
-                self._lst.addItem(ch)
-                shown += 1
-                if shown >= 500:
-                    break
+        match = make_pv_query_matcher(text)
+        hits = [ch for ch in self._all_channels if match(ch)]
+        for ch in hits[:self._MAX_SHOWN]:
+            self._lst.addItem(ch)
+        if not text.strip():
+            self._lbl_status.setText(
+                f"{len(self._all_channels)} channels loaded. Type to filter."
+                if self._all_channels else "CPVA returned no channels.")
+        elif len(hits) > self._MAX_SHOWN:
+            self._lbl_status.setText(
+                f"{len(hits)} matches — showing the first {self._MAX_SHOWN}.")
+        else:
+            self._lbl_status.setText(f"{len(hits)} matches.")
 
     def _on_add(self):
         items = self._lst.selectedItems()
@@ -908,7 +1138,7 @@ class CSSLoggerWidget(QWidget):
     def _maybe_autostart_live(self):
         if self._live_mode:
             return
-        pvs = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs = self._real_pv_names()
         if pvs:
             self._toggle_live_mode()
 
@@ -916,6 +1146,13 @@ class CSSLoggerWidget(QWidget):
 
     def _init_state(self):
         self.config = load_config()
+        # Graph appearance / performance options (see _GRAPH_OPTS_DEFAULTS).
+        # Unknown keys from an older/newer config are ignored, missing ones
+        # fall back to the default.
+        self._graph_opts = dict(_GRAPH_OPTS_DEFAULTS)
+        for k, v in (self.config.get("graph_opts") or {}).items():
+            if k in self._graph_opts:
+                self._graph_opts[k] = v
         self._samples_by_pv: dict = {}
         self._table_rows:    list = []
         self._pv_order:      list = []
@@ -925,10 +1162,10 @@ class CSSLoggerWidget(QWidget):
         self._presets:           list = load_presets()
         self._condition_presets: list = load_condition_presets()
         self._custom_pvs:        list = load_custom_pvs()
-        self._compile_custom_pvs()
+        self._cpv_diag:          list = []    # problems from the last compute
+        self._cpv_last_diag           = None  # last set logged (anti-spam)
         self._repository_overlays = []
         self._repository_artists  = []
-        self._custom_pv_counter   = 1
         self._mpl_canvas  = None
         self._mpl_figure  = None
         self._graph_axes  = []
@@ -936,6 +1173,7 @@ class CSSLoggerWidget(QWidget):
         self._graph_pvs:   list = []
         self._graph_raw:   list = []
         self._graph_raw_np: list = []
+        self._pairs_cache  = None   # (token, {pv: [(ts_ns, value), …]}) for replots
         self._graph_spine_xpos: list = []
         self._span_selector  = None
         self._zoom_selector  = None
@@ -944,10 +1182,13 @@ class CSSLoggerWidget(QWidget):
         self._crosshair_hlines = []
         self._crosshair_texts  = []
         self._x_cursor_ann     = None
+        self._y_cursor_ann     = None
+        self._y_cursor_ann_ax  = None
         self._crosshair_cid    = None
         self._blit_bg          = None
         self._mouse_pending    = False
         self._mouse_last_event = None
+        self._cursor_frame_ms  = 16.0   # adaptive crosshair frame budget
         self._cursor_active    = False
         self._in_cursor_redraw = False
         self._xy_canvas = None
@@ -973,8 +1214,15 @@ class CSSLoggerWidget(QWidget):
         self._live_last_ts  = None
         self._live_window_span = None
         self._live_last_rebuild_ns = 0
+        self._live_rebuild_cost_ns = 0   # measured cost of one live refresh
         self._live_autoscroll  = True
         self._live_programmatic_scroll = False
+        # Cancel token for background fetches. Every fetch worker captures the
+        # epoch it was started in and its pool aborts as soon as the epoch moves,
+        # because stopping a QTimer cannot stop an already-running ThreadPool:
+        # "Stop Live" used to leave hundreds of queued requests running, so the
+        # app kept stuttering for a long while after it claimed to be idle.
+        self._live_epoch = 0
         self._live_timer = QTimer(self)
         self._live_timer.setSingleShot(True)
         self._live_timer.timeout.connect(self._live_tick)
@@ -988,6 +1236,12 @@ class CSSLoggerWidget(QWidget):
         self._cursor_tbl_timer = QTimer(self)
         self._cursor_tbl_timer.setSingleShot(True)
         self._cursor_tbl_timer.timeout.connect(self._flush_cursor_table)
+        # Coalesced replot: rebuilding the whole figure is expensive, so rapid
+        # axis-table edits (ticking Show, editing Y min/max, …) are collapsed into
+        # a single redraw once the user stops clicking, keeping the UI responsive.
+        self._replot_timer = QTimer(self)
+        self._replot_timer.setSingleShot(True)
+        self._replot_timer.timeout.connect(self._plot_graph)
         self._ramping_repository = load_ramping_repository()
         self._data_repository: list = []
         self._ref_lines: list      = []
@@ -1009,6 +1263,7 @@ class CSSLoggerWidget(QWidget):
                                "ymin", "ymax", "auto_scale", "width", "smooth", "grid",
                                "blank")
         self._axis_last_clicked_row = -1
+        self._axis_row_pv: list = []     # table row → PV name (None for divider rows)
         self._graph_popup = None       # floating graph window (F11 / Ctrl+F11)
         self._load_data_repository()
 
@@ -1233,10 +1488,15 @@ class CSSLoggerWidget(QWidget):
         b_ref  = QPushButton("Reference lines"); b_ref.clicked.connect(self._open_ref_lines_dialog); ctrl.addWidget(b_ref)
         b_cond = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
         b_cpv  = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
+        b_gset = QPushButton("Graph settings")
+        b_gset.setToolTip("Fonts, axis-column spacing, plot margins, cursor readouts")
+        b_gset.clicked.connect(self._open_graph_settings_dialog); ctrl.addWidget(b_gset)
 
         ctrl.addWidget(QLabel("Font:"))
         self._font_size_spin = QSpinBox()
-        self._font_size_spin.setRange(5, 24); self._font_size_spin.setValue(11); self._font_size_spin.setFixedWidth(48)
+        self._font_size_spin.setRange(5, 24)
+        self._font_size_spin.setValue(int(self._graph_opts.get("font_size", 11)))
+        self._font_size_spin.setFixedWidth(48)
         self._font_size_spin.valueChanged.connect(self._apply_font_size)
         ctrl.addWidget(self._font_size_spin)
         ctrl.addWidget(QLabel("pt"))
@@ -1334,10 +1594,7 @@ class CSSLoggerWidget(QWidget):
         h = QLabel("Axis settings")
         h.setStyleSheet("font-weight:700;color:#1565C0;")
         hdr.addWidget(h)
-        b_apply = QPushButton("Apply changes")
-        b_apply.clicked.connect(self._apply_axis_settings)
         hdr.addStretch()
-        hdr.addWidget(b_apply)
         lay.addLayout(hdr)
 
         _COLS   = list(self._axis_tv_cols)
@@ -1393,6 +1650,8 @@ class CSSLoggerWidget(QWidget):
         self._axis_tv.cellDoubleClicked.connect(self._on_axis_tv_double_click)
         # Second click on an already-selected row clears the highlight (toggle).
         self._axis_tv.clicked.connect(self._on_axis_tv_clicked)
+        # Auto-apply: any edit takes effect immediately (no Apply button).
+        self._axis_tv.itemChanged.connect(self._on_axis_item_changed)
         lay.addWidget(self._axis_tv)
 
     # ── XY tab ─────────────────────────────────────────────────────────────
@@ -1581,12 +1840,25 @@ class CSSLoggerWidget(QWidget):
             for pv in self.config.get("pv_list", []):
                 self._pv_list.addItem(pv)
 
+        self._migrate_custom_pv_bindings()  # pre-bindings entries -> explicit PVs
+        self._sync_pv_list_customs()   # show defined custom PVs alongside the real ones
         self._update_pv_count()
         self._refresh_time_labels()
 
     def _refresh_time_labels(self):
-        self._lbl_tw_from.setText("From: " + self._dt_from.strftime("%Y-%m-%d  %H:%M"))
-        self._lbl_tw_to.setText(  "To:   " + self._dt_to.strftime("%Y-%m-%d  %H:%M"))
+        if self._live_mode and self._live_window_span:
+            # Live plots a window that rolls with "now", and it is not always the
+            # From/To it was started from (a too-wide window is clamped — see
+            # _live_span_from_window), so show the span that is really on screen
+            # instead of two timestamps that would both be wrong a minute later.
+            hours = self._live_window_span.total_seconds() / 3600.0
+            span = f"{hours:.0f} h" if hours >= 1 else \
+                   f"{self._live_window_span.total_seconds():.0f} s"
+            self._lbl_tw_from.setText(f"From: now − {span}")
+            self._lbl_tw_to.setText(  "To:   now")
+        else:
+            self._lbl_tw_from.setText("From: " + self._dt_from.strftime("%Y-%m-%d  %H:%M"))
+            self._lbl_tw_to.setText(  "To:   " + self._dt_to.strftime("%Y-%m-%d  %H:%M"))
         if self._live_mode:
             self._lbl_tw_live.setText("Live: ON")
             self._lbl_tw_live.setStyleSheet("color:#2E7D32;font-size:11px;font-weight:700;")
@@ -1596,8 +1868,7 @@ class CSSLoggerWidget(QWidget):
 
     # ── Graph plotting ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _band_ylim(idx, n, dmin, dmax, autoscale):
+    def _band_ylim(self, idx, n, dmin, dmax, autoscale):
         """Y-limits that place a PV's data range [dmin, dmax] into its vertical
         band of the shared plot. Band ``idx`` (0 = top) of ``n`` occupies the
         fraction [f_bot, f_top] of the axes height; an Autoscale'd PV uses the
@@ -1610,7 +1881,9 @@ class CSSLoggerWidget(QWidget):
             f_bot, f_top = 0.02, 0.98
         else:
             band_h = 1.0 / max(n, 1)
-            margin = 0.12 * band_h                 # gap so traces don't touch band edges
+            pad_f  = min(0.45, max(0.0, float(
+                self._graph_opts.get("band_pad_frac", 0.12))))
+            margin = pad_f * band_h                # gap so traces don't touch band edges
             f_top  = 1.0 - idx * band_h - margin
             f_bot  = 1.0 - (idx + 1) * band_h + margin
         denom = (f_top - f_bot) or 1.0
@@ -1619,9 +1892,18 @@ class CSSLoggerWidget(QWidget):
         hi = dmax + (1.0 - f_top) / denom * span
         return lo, hi
 
+    def _schedule_replot(self, delay_ms: int = 150):
+        """Request a graph redraw, coalescing bursts of rapid edits into one.
+        Restarting the single-shot timer on each call means a redraw only fires
+        once the user pauses, so clicking many controls in a row no longer queues
+        one expensive full rebuild per click."""
+        self._replot_timer.start(delay_ms)
+
     def _plot_graph(self):
         """Safe wrapper: a plotting failure must never crash the app or leave a
         stale graph — clear the canvas and show a message instead."""
+        # A direct plot supersedes any pending coalesced one.
+        self._replot_timer.stop()
         try:
             self._plot_graph_impl()
         except Exception:
@@ -1691,26 +1973,87 @@ class CSSLoggerWidget(QWidget):
         fig = Figure(figsize=(_cw / _dpi, _ch / _dpi), dpi=_dpi)
         n   = len(pvs_for_axes)
 
+        _opts = self._graph_opts
         try:
             _fsize = max(5, self._font_size_spin.value())
         except Exception:
-            _fsize = 7
+            _fsize = max(5, int(_opts.get("font_size", 11)))
 
         # ── Single banded graph: ONE plot rectangle, one left Y axis per PV.
         # Each PV occupies its own vertical band (see _band_ylim); a PV with
         # Autoscale ticked spans the full graph height instead. Grid / zoom / pan
         # act on the whole graph at once.
         _fig_w_px = _cw
-        _axis_px  = _fsize * 1.9 + 25   # room for one left axis column (label + ticks + gap)
-        STEP_fig  = max(0.020, _axis_px / _fig_w_px)
+        _PX_PER_PT   = _dpi / 72.0
+        _show_titles = bool(_opts.get("show_axis_titles", True))
+        # Whitespace each per-PV column reserves BETWEEN its rotated title and the
+        # axis to its left, and between the title and its own tick numbers. Both
+        # are user-tunable (Graph settings) because the "right" spacing depends on
+        # the font size and how many PVs share the width.
+        _GAP_PX      = max(0.0, float(_opts.get("axis_gap_px", 6)))
+        _MIN_PAD_PX  = max(0.0, float(_opts.get("label_pad_px", 5)))
+        _ticksize    = max(5, _fsize + int(_opts.get("tick_font_delta", -1)))
+        _ticklen_px  = 3.5 * _PX_PER_PT          # rcParams ytick.major.size
+        _tickpad_px  = 2 * _PX_PER_PT            # tick_params(pad=2) below
+        _ticknum_px  = _ticksize * _PX_PER_PT    # rotated number ≈ one glyph high
+        _title_px    = (_fsize * _PX_PER_PT) if _show_titles else 0.0
+        _pad_px      = _MIN_PAD_PX if _show_titles else 0.0
+        # Geometry of one column, right → left, all in px:
+        #   spine │ tick │ pad │ ⟨number⟩ │ label_pad │ ⟨title⟩ │ gap │ next spine
+        # The rotated tick numbers are anchor-centred on their tick mark, i.e. on
+        # (spine − ticklen − tickpad), so they may stick out slightly PAST their
+        # own spine into the column to the right; whatever they overhang has to be
+        # added on top of the requested gap.
+        _num_x0_off   = _ticklen_px + _tickpad_px + _ticknum_px * 0.5   # numbers' left edge
+        _num_overhang = max(0.0, _ticknum_px * 0.5 - _ticklen_px - _tickpad_px)
+        _axis_px      = (_num_x0_off + _pad_px + _title_px
+                         + _GAP_PX + _num_overhang)
+        STEP_fig      = max(0.010, _axis_px / _fig_w_px)
+        # Offset (px, leftwards from its own spine) of the title's ANCHOR. A y
+        # label is rotated 90° about its anchor with the default rotation mode, so
+        # the anchor ends up on the title's RIGHT edge — placing it explicitly
+        # (set_label_coords below) instead of via labelpad is what makes the gaps
+        # predictable: labelpad is measured from matplotlib's own tick-label bbox,
+        # which is centred on the spine and therefore wider than the space
+        # actually free — that mismatch was the extra whitespace between a title
+        # and the axis to its left.
+        _title_off_px = _num_x0_off + _pad_px
+        _col_need_px  = _title_off_px + _title_px      # spine → title's left edge
 
-        BASE_L = 0.04; BASE_R = 0.015
+        # Y tick numbers are rotated 90°, so each one stacks VERTICALLY (its
+        # footprint height ≈ the text length, not the glyph height). Forcing 6 of
+        # them per axis makes the numbers overprint each other on a short plot or
+        # when many bands share the height. Budget the major-tick count from the
+        # actual plot height and a ~7-glyph label extent so they always clear.
+        _TOP    = min(1.0, max(0.5, float(_opts.get("margin_top", 0.97))))
+        _BOTTOM = min(_TOP - 0.05, max(0.02, float(_opts.get("margin_bottom", 0.12))))
+        _plot_h_px    = max(1.0, _ch * (_TOP - _BOTTOM))
+        _ylbl_ext_px  = 7 * 0.6 * _ticksize * _PX_PER_PT   # ≈ "−1.234M" rotated
+        _tick_cap     = max(2, int(_opts.get("y_ticks_max", 6)))
+        _n_yticks     = max(2, min(_tick_cap, int(_plot_h_px / (_ylbl_ext_px * 1.3))))
+
+        # Space left of the OUTERMOST column: exactly what its own title needs
+        # plus a small margin (a fixed 4 % of the figure used to leave a wide
+        # unused band there and stole plot width).
+        BASE_R = max(0.0, min(0.3, float(_opts.get("margin_right", 0.015))))
+        BASE_L = max(0.005, (_col_need_px
+                             + max(0.0, float(_opts.get("outer_margin_px", 8)))) / _fig_w_px)
         left_margin  = min(0.60, BASE_L + (n - 1) * STEP_fig)
         right_margin = 1.0 - BASE_R
-        fig.subplots_adjust(left=left_margin, right=right_margin, top=0.97, bottom=0.12)
+        fig.subplots_adjust(left=left_margin, right=right_margin, top=_TOP, bottom=_BOTTOM)
 
         axes_width = max(0.05, right_margin - left_margin)
-        STEP_ax    = STEP_fig / axes_width
+        _axes_px_w = max(1.0, axes_width * _fig_w_px)   # plot rect width in px
+        # Distribute the stacked left-axis columns EVENLY across the actual (possibly
+        # capped) left margin. When many PVs hit the 0.60 cap, the old fixed STEP_fig
+        # pushed the leftmost columns off the canvas so they piled up and their
+        # numbers overlapped; deriving the step from the real available width keeps
+        # every column on-canvas and evenly spaced. Uncapped, this equals the old
+        # value, so the normal-case layout is unchanged.
+        if n > 1:
+            STEP_ax = ((left_margin - BASE_L) / (n - 1)) / axes_width
+        else:
+            STEP_ax = STEP_fig / axes_width
 
         axes = [fig.add_subplot(111)]
         for _ in range(1, n):
@@ -1720,42 +2063,65 @@ class CSSLoggerWidget(QWidget):
         # column, last PV nearest the plot) so reading the axes left-to-right
         # matches the top-to-bottom order of the traces and the table.
         self._graph_spine_xpos = []
+        xfrac_of = []
         for i, ax in enumerate(axes):
             ax.yaxis.set_label_position("left"); ax.yaxis.tick_left()
             xfrac = -(n - 1 - i) * STEP_ax
+            xfrac_of.append(xfrac)
             ax.spines["left"].set_position(("axes", xfrac))
             if i > 0:
                 ax.spines["right"].set_visible(False)  # twins must not draw over the plot
             self._graph_spine_xpos.append((xfrac, "left"))
         ax_x = axes[0]
         self._graph_x_ax = ax_x
+        # Traces are plotted as raw date NUMBERS (see _pairs_to_arrays), so the
+        # date unit converter is registered explicitly here — otherwise the first
+        # set_xlim(datetime) would have nothing to convert with. The locators and
+        # formatters set further down replace the defaults this installs.
+        ax_x.xaxis.axis_date(tz=timezone.utc)
 
-        def _moving_avg(vals, w):
-            if w <= 1 or len(vals) < w: return vals
-            padded = vals[:w-1][::-1] + vals
-            return [sum(padded[j:j+w]) / w for j in range(len(vals))]
+        # Collect every PV's samples in ONE pass over the (possibly 100k-row)
+        # table instead of re-scanning the whole table once per PV — with a dozen
+        # PVs that scan was the bulk of a replot. The result is cached against the
+        # table's identity, so a replot triggered by an appearance change (font,
+        # spacing, Y limits, Show) reuses it instead of walking the table again.
+        _rows  = self._table_rows
+        _token = (len(_rows), _rows[-1][0] if _rows else 0, tuple(pvs_for_axes))
+        _cached = getattr(self, "_pairs_cache", None)
+        if _cached is not None and _cached[0] == _token:
+            _pairs_by_pv = _cached[1]
+        else:
+            _pairs_by_pv = {pv: [] for pv in pvs_for_axes}
+            for ts_ns, row_dict in _rows:
+                for pv, entry in row_dict.items():
+                    lst = _pairs_by_pv.get(pv)
+                    if lst is None:
+                        continue
+                    value = entry[0]
+                    if isinstance(value, (int, float)):
+                        lst.append((ts_ns, value))
+            self._pairs_cache = (_token, _pairs_by_pv)
 
-        all_times = []
+        _tmin_num = _tmax_num = None
+        _n_times  = 0
+        _markers  = bool(_opts.get("line_markers", True))
         self._graph_lines = []; self._graph_pvs = list(pvs_for_axes); self._graph_raw = []
 
+        avg_target = self._avg_target_points()
         for i, (pv, ax) in enumerate(zip(pvs_for_axes, axes)):
-            pairs = []
-            for ts_ns, row_dict in self._table_rows:
-                if pv not in row_dict: continue
-                value, _ = row_dict[pv]
-                if isinstance(value, (int, float)):
-                    pairs.append((ts_ns, value))
+            # Everything from here on is numpy: binning and the window edges over
+            # 100k+ samples per PV in Python lists was a large part of a replot.
+            ts_a, values = _pairs_to_ns_arrays(_pairs_by_pv.get(pv, []))
 
             # Downsample: time-binned mean to the user's target (keeps the trace
             # shape while cutting point count). 0 = off → only a hard safety cap.
-            avg_target = self._avg_target_points()
             if avg_target > 0:
-                pairs = self._downsample_pairs_mean(pairs, avg_target)
+                ts_a, values = _downsample_arrays_mean(ts_a, values, avg_target)
             else:
                 MAX_PTS = 25000
-                if len(pairs) > MAX_PTS:
-                    step = max(1, len(pairs) // MAX_PTS)
-                    pairs = pairs[::step]
+                if ts_a.size > MAX_PTS:
+                    step = max(1, ts_a.size // MAX_PTS)
+                    ts_a = ts_a[::step]; values = values[::step]
 
             # Carry-forward / hold (like CS Studio): fill gaps at the window
             # edges so the trace spans the whole window instead of breaking off.
@@ -1764,18 +2130,25 @@ class CSSLoggerWidget(QWidget):
             if _use_window:
                 pre = self._pre_window_vals.get(pv)
                 pre_val = pre[1] if (pre and isinstance(pre[1], (int, float))) else None
-                if not pairs:
+                if not ts_a.size:
                     if pre_val is not None:
-                        pairs = [(_win_start_ns, pre_val), (_win_end_ns, pre_val)]
+                        ts_a   = np.array([_win_start_ns, _win_end_ns], dtype=np.float64)
+                        values = np.array([pre_val, pre_val], dtype=np.float64)
                 else:
-                    if pre_val is not None and pairs[0][0] > _win_start_ns:
-                        pairs.insert(0, (_win_start_ns, pre_val))
-                    if pairs[-1][0] < _win_end_ns:
-                        pairs.append((_win_end_ns, pairs[-1][1]))
+                    if pre_val is not None and ts_a[0] > _win_start_ns:
+                        ts_a   = np.concatenate(([_win_start_ns], ts_a))
+                        values = np.concatenate(([pre_val], values))
+                    if ts_a[-1] < _win_end_ns:
+                        ts_a   = np.concatenate((ts_a, [_win_end_ns]))
+                        values = np.concatenate((values, values[-1:]))
 
-            times  = [datetime.fromtimestamp(ts / 1e9, tz=timezone.utc) for ts, v in pairs]
-            values = [float("nan") if v is None else v for ts, v in pairs]
-            all_times.extend(times)
+            # X in matplotlib date numbers (plain floats) — no datetime objects.
+            times_num = _ns_to_num(ts_a)
+            if times_num.size:
+                t_lo = float(times_num[0]); t_hi = float(times_num[-1])
+                _tmin_num = t_lo if _tmin_num is None else min(_tmin_num, t_lo)
+                _tmax_num = t_hi if _tmax_num is None else max(_tmax_num, t_hi)
+                _n_times += times_num.size
 
             pv_setting = self._pv_settings.get(pv, self._get_pv_default_settings(pv, i))
             line_color = pv_setting.get("color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
@@ -1785,50 +2158,63 @@ class CSSLoggerWidget(QWidget):
             visible    = pv_setting.get("show", True)
             eff_smooth = pv_smooth if pv_smooth is not None else 1
 
-            times_num = mdates.date2num(times)
             self._graph_raw.append((times_num, values))
 
-            if eff_smooth > 1 and len(values) >= eff_smooth:
+            if eff_smooth > 1 and values.size >= eff_smooth:
                 lw_raw = (line_width * 0.5) if line_width is not None else 0.8
-                raw_line, = ax.plot(times, values, color=line_color, linewidth=lw_raw,
+                raw_line, = ax.plot(times_num, values, color=line_color, linewidth=lw_raw,
                                     alpha=0.3, drawstyle="steps-post", zorder=1)
                 raw_line.set_visible(visible)
-                smoothed = _moving_avg(values, eff_smooth)
+                smoothed = _moving_avg_np(values, eff_smooth)
                 lw_sm = line_width if line_width is not None else 1.8
-                sm_line, = ax.plot(times, smoothed, color=line_color, linewidth=lw_sm,
+                sm_line, = ax.plot(times_num, smoothed, color=line_color, linewidth=lw_sm,
                                    drawstyle="steps-post",
                                    label=f"{disp_name} (avg {eff_smooth})", zorder=2)
                 sm_line.set_visible(visible)
                 self._graph_lines.append([raw_line, sm_line])
             else:
                 lw = line_width if line_width is not None else 1.2
-                line, = ax.plot(times, values, color=line_color, linewidth=lw,
-                                marker="." if len(times) < 200 else None, markersize=3,
+                line, = ax.plot(times_num, values, color=line_color, linewidth=lw,
+                                marker="." if (_markers and times_num.size < 200) else None,
+                                markersize=3,
                                 drawstyle="steps-post", label=disp_name, zorder=2)
                 line.set_visible(visible)
                 self._graph_lines.append([line])
 
             # Rotated (vertical) Y label + tick numbers, one narrow column per PV.
-            ax.set_ylabel(disp_name, color=line_color, fontsize=_fsize, rotation=90, labelpad=1)
-            ax.tick_params(axis="y", labelcolor=line_color, labelsize=max(5, _fsize - 1),
+            # The title is pinned EXPLICITLY at a known pixel offset left of its
+            # own spine (set_label_coords, axes fractions) rather than through
+            # labelpad: labelpad is measured from the rendered tick-label bbox, so
+            # it could not be reconciled with the column budget above and left a
+            # visible extra gap towards the neighbouring axis.
+            if _show_titles:
+                ax.set_ylabel(disp_name, color=line_color, fontsize=_fsize, rotation=90)
+                ax.yaxis.set_label_coords(xfrac_of[i] - _title_off_px / _axes_px_w, 0.5)
+            else:
+                ax.set_ylabel("")
+            ax.tick_params(axis="y", labelcolor=line_color, labelsize=_ticksize,
                            pad=2, labelrotation=90)
-            from matplotlib.ticker import AutoMinorLocator, MaxNLocator
-            ax.yaxis.set_major_locator(MaxNLocator(6))
-            ax.yaxis.set_minor_locator(AutoMinorLocator(5))
-            ax.tick_params(axis="y", which="minor", length=3, labelsize=0)
-            # No floating "1e6" multiplier — show plain tick numbers instead.
-            try:
-                ax.ticklabel_format(axis="y", style="plain", useOffset=False)
-            except Exception:
-                pass
+            from matplotlib.ticker import AutoMinorLocator, MaxNLocator, EngFormatter
+            ax.yaxis.set_major_locator(MaxNLocator(_n_yticks))
+            # Minor ticks are pure decoration here and every one of them is another
+            # artist to lay out and draw — with a dozen stacked axes that adds up,
+            # so they can be switched off in Graph settings.
+            if _opts.get("y_minor_ticks", True):
+                ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+                ax.tick_params(axis="y", which="minor", length=3, labelsize=0)
+            else:
+                from matplotlib.ticker import NullLocator
+                ax.yaxis.set_minor_locator(NullLocator())
+            # SI-prefix ticks (k, M, µ, ...) instead of a floating "1e6" multiplier
+            # or long plain numbers — keeps the narrow per-PV column readable.
+            ax.yaxis.set_major_formatter(EngFormatter(sep=""))
 
             # Position this PV's data into its vertical band (or full height if
             # Autoscale is on). Manual Y min/max override the data range that is
             # mapped into the band.
             ymin_pv = pv_setting.get("ymin"); ymax_pv = pv_setting.get("ymax")
-            vals_clean = [v for v in values if v == v]   # drop NaNs
-            if vals_clean:
-                dmin, dmax = min(vals_clean), max(vals_clean)
+            if values.size and not np.all(np.isnan(values)):
+                dmin = float(np.nanmin(values)); dmax = float(np.nanmax(values))
             else:
                 dmin, dmax = 0.0, 1.0
             autosc  = pv_setting.get("auto_scale", False)
@@ -1849,11 +2235,13 @@ class CSSLoggerWidget(QWidget):
 
         # X-axis (the single shared bottom axis, axes[0])
         ax0 = ax_x
-        if all_times and len(all_times) > 1:
-            t_min, t_max = min(all_times), max(all_times)
+        if _n_times > 1 and _tmax_num is not None and _tmax_num > _tmin_num:
+            t_min = mdates.num2date(_tmin_num, tz=timezone.utc)
+            t_max = mdates.num2date(_tmax_num, tz=timezone.utc)
             total_seconds = (t_max - t_min).total_seconds()
         else:
-            t_min = t_max = (all_times[0] if all_times else datetime.now(tz=timezone.utc))
+            t_min = t_max = (mdates.num2date(_tmin_num, tz=timezone.utc)
+                             if _tmin_num is not None else datetime.now(tz=timezone.utc))
             total_seconds = 0
 
         using_window = self._dt_to > self._dt_from
@@ -1868,40 +2256,8 @@ class CSSLoggerWidget(QWidget):
         t_max_local = t_max.astimezone(TZ_PRAGUE) if total_seconds > 0 else t_min_local
         same_day    = t_min_local.date() == t_max_local.date()
 
-        def _make_x_ticks(t_lo, t_hi):
-            span_s = (t_hi - t_lo).total_seconds()
-            _STEPS = [5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800]
-            step_s = _STEPS[-1]
-            for s in _STEPS:
-                if span_s / s <= 8: step_s = s; break
-            import math
-            epoch    = datetime(t_lo.year, t_lo.month, t_lo.day, tzinfo=t_lo.tzinfo)
-            offset_s = (t_lo - epoch).total_seconds()
-            first_s  = math.ceil((offset_s + step_s * 0.25) / step_s) * step_s
-            ticks_dt = []
-            cur_s    = first_s
-            while True:
-                dt_tick = epoch + timedelta(seconds=cur_s)
-                if dt_tick >= t_hi - timedelta(seconds=step_s * 0.25): break
-                ticks_dt.append(dt_tick); cur_s += step_s
-            majors = ([mdates.date2num(t_lo)]
-                      + [mdates.date2num(d) for d in ticks_dt]
-                      + [mdates.date2num(t_hi)])
-            # Minor ticks: subdivide the regular major step by 5. Built here as a
-            # fixed list so matplotlib never infers spacing from the irregular
-            # endpoint ticks (which would blow past Locator.MAXTICKS).
-            minor_step = step_s / 5.0
-            minors = []
-            m_s = first_s - step_s
-            while True:
-                dt_m = epoch + timedelta(seconds=m_s)
-                if dt_m > t_hi: break
-                if dt_m >= t_lo: minors.append(mdates.date2num(dt_m))
-                m_s += minor_step
-            return majors, minors
-
         if total_seconds > 0:
-            _ticks, _minor_ticks = _make_x_ticks(
+            _ticks, _minor_ticks = self._compute_x_ticks(
                 t_min.astimezone(TZ_PRAGUE), t_max.astimezone(TZ_PRAGUE))
         else:
             _ticks, _minor_ticks = [], []
@@ -1955,47 +2311,98 @@ class CSSLoggerWidget(QWidget):
         # Centre the rotated Y-tick numbers exactly on their tick. rotation_mode
         # "anchor" applies ha/va AFTER the 90° rotation, so ha="center"/va="center"
         # pins the label's middle to the tick (default alignment left it hanging
-        # to one side). Re-run on every draw so a resize/re-tick can't undo it.
+        # to one side). Text.update_from does not carry rotation_mode over, so a
+        # tick label matplotlib creates later would lose it — hence the re-run on
+        # every draw.
+        #
+        # It walks the ALREADY CREATED Tick objects (yaxis.majorTicks) instead of
+        # get_yticklabels(): the latter re-runs the locators and instantiates the
+        # whole minor-tick pool, which cost well over a second per redraw with a
+        # dozen stacked axes and made the graph feel frozen. Minor labels are
+        # drawn at labelsize 0, so they need no alignment at all.
         def _center_y_ticklabels(_evt=None):
             for _ax in axes:
-                for _lbl in _ax.get_yticklabels(which="both"):
+                _ticks = getattr(_ax.yaxis, "majorTicks", None)
+                if _ticks is None:                     # matplotlib internals moved
+                    _ticks = _ax.yaxis.get_major_ticks()
+                for _tk in _ticks:
+                    _lbl = _tk.label1
+                    if getattr(_lbl, "_cpva_anchored", False):
+                        continue
                     _lbl.set_rotation(90)
                     _lbl.set_rotation_mode("anchor")
                     _lbl.set_horizontalalignment("center")
                     _lbl.set_verticalalignment("center")
+                    _lbl._cpva_anchored = True
         _center_y_ticklabels()
         canvas.mpl_connect("draw_event", _center_y_ticklabels)
 
-        # Crosshair
-        self._crosshair_vlines = []; self._crosshair_hlines = []; self._crosshair_texts = []
-        self._x_cursor_ann = None
+        # Crosshair. All axes share one plot rectangle, so per-axis cursor lines
+        # would land on exactly the same pixels — ONE vertical + ONE horizontal
+        # line is drawn instead (this used to be 2 artists per PV, all redrawn on
+        # every mouse-move frame). The vertical line spans the axes height, the
+        # horizontal one the axes width, both in blended coords so they need no
+        # per-axis data conversion.
+        self._crosshair_texts = []
+        self._x_cursor_ann = None; self._y_cursor_ann = None; self._y_cursor_ann_ax = None
         from matplotlib.transforms import blended_transform_factory as _btf
+        _cur_fs = max(5, _fsize + int(_opts.get("cursor_font_delta", 0)))
+        # animated=True keeps these out of the normal draw() so the blit
+        # background stays clean — otherwise each redraw bakes in a ghost.
+        _vl = Line2D([0, 0], [0, 1], color="#888", linewidth=0.8, linestyle="--",
+                     transform=ax_x.get_xaxis_transform(), visible=False,
+                     animated=True, zorder=9)
+        _hl = Line2D([0, 1], [0, 0], color="#888", linewidth=0.8, linestyle="--",
+                     transform=ax_x.transAxes, visible=False, animated=True, zorder=9)
+        ax_x.add_line(_vl); ax_x.add_line(_hl)
+        _vl.set_clip_on(False); _hl.set_clip_on(False)
+        self._crosshair_vlines = [_vl]
+        self._crosshair_hlines = [_hl]
+
+        # Per-PV value box at the crosshair. Each one is a rounded text box, i.e.
+        # a path plus a text layout on every hover frame — with many PVs that is
+        # the single most expensive part of the crosshair, so it can be turned off
+        # (and is dropped automatically above cursor_boxes_max PVs).
+        _want_boxes = (bool(_opts.get("cursor_value_boxes", True))
+                       and n <= max(1, int(_opts.get("cursor_boxes_max", 20))))
         for ax_i, ax in enumerate(axes):
-            # animated=True keeps these out of the normal draw() so the blit
-            # background stays clean — otherwise each redraw bakes in a ghost.
-            vl = ax.axvline(color="#888", linewidth=0.8, linestyle="--",
-                            visible=False, animated=True)
-            hl = ax.axhline(color="#888", linewidth=0.8, linestyle="--",
-                            visible=False, animated=True)
-            self._crosshair_vlines.append(vl)
-            self._crosshair_hlines.append(hl)
+            if not _want_boxes:
+                self._crosshair_texts.append(None)
+                continue
             pv_c  = pvs_for_axes[ax_i] if ax_i < len(pvs_for_axes) else None
             p_col = self._pv_settings.get(pv_c, {}).get("color", "#555") if pv_c else "#555"
-            sf, ss = (self._graph_spine_xpos[ax_i] if ax_i < len(self._graph_spine_xpos) else (0.0, "left"))
-            ha_s  = "left" if ss == "right" else "right"
-            blend = _btf(ax.transAxes, ax.transData)
-            ann   = ax.text(sf, 0, "", ha=ha_s, va="center", fontsize=_fsize,
-                            color=p_col, zorder=10, visible=False, transform=blend,
+            # Value label sits AT the crosshair intersection (vertical cursor line
+            # × this PV's trace): both coords are data coords and X is set to the
+            # cursor X each frame. ha="left" keeps the box just right of the line.
+            ann   = ax.text(0, 0, "", ha="left", va="center", fontsize=_cur_fs,
+                            color=p_col, zorder=10, visible=False, transform=ax.transData,
                             clip_on=False, animated=True,
                             bbox=dict(boxstyle="round,pad=0.15", fc="white",
                                       ec=p_col, alpha=0.85, linewidth=0.6))
             self._crosshair_texts.append(ann)
 
         self._x_cursor_ann = ax_x.text(
-            0, -0.01, "", ha="center", va="top", fontsize=_fsize,
+            0, -0.01, "", ha="center", va="top", fontsize=_cur_fs,
             color="#333", zorder=10, visible=False, animated=True,
             transform=ax_x.get_xaxis_transform(), clip_on=False,
             bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#888", alpha=0.9, linewidth=0.6))
+
+        # Y-axis cursor readout: a white, always-legible box where the horizontal
+        # cursor line meets the Y axis NEAREST the plot (its spine sits at the plot's
+        # left edge → x-fraction closest to 0). Shows the raw cursor Y in that axis.
+        self._y_cursor_ann = None; self._y_cursor_ann_ax = None
+        if self._graph_spine_xpos:
+            _ny_i  = max(range(len(self._graph_spine_xpos)),
+                         key=lambda k: self._graph_spine_xpos[k][0])
+            _ny_ax = axes[_ny_i]
+            _ny_xf = self._graph_spine_xpos[_ny_i][0]
+            self._y_cursor_ann_ax = _ny_ax
+            self._y_cursor_ann = _ny_ax.text(
+                _ny_xf, 0, "", ha="left", va="center", fontsize=_cur_fs,
+                color="#333", zorder=11, visible=False, animated=True,
+                transform=_btf(_ny_ax.transAxes, _ny_ax.transData), clip_on=False,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#888",
+                          alpha=1.0, linewidth=0.6))
 
         self._graph_raw_np = [
             (np.asarray(t, dtype=float), np.asarray(v, dtype=float))
@@ -2025,37 +2432,70 @@ class CSSLoggerWidget(QWidget):
         if self._mpl_canvas is None or not self._graph_lines:
             return
 
-        def _moving_avg(vals, w):
-            if w <= 1 or len(vals) < w: return vals
-            padded = vals[:w-1][::-1] + vals
-            return [sum(padded[j:j+w]) / w for j in range(len(vals))]
+        # Carry-forward window edges (CS-Studio style): hold each PV's last value
+        # flat out to "now", and show a PV with no in-window data at its last-known
+        # value across the whole window instead of dropping the trace.
+        now_utc   = datetime.now().astimezone(timezone.utc)
+        span      = self._live_window_span
+        win_start = (now_utc - span) if (span and span.total_seconds() > 0) else None
+        win_start_ns = dt_to_ns(win_start) if win_start is not None else None
+        now_ns_      = dt_to_ns(now_utc)
+        avg_target   = self._avg_target_points()
 
-        all_times = []
+        t_lo_num = t_hi_num = None
         new_raw   = []
         for i, (pv, ax, pv_lines) in enumerate(zip(self._graph_pvs, self._graph_axes, self._graph_lines)):
-            samples = self._samples_by_pv.get(pv, [])
-            times   = [datetime.fromtimestamp(ts / 1e9, tz=timezone.utc)
-                       for ts, v, _ in samples if isinstance(v, (int, float))]
-            values  = [v for _, v, _ in samples if isinstance(v, (int, float))]
-            if not times:
-                new_raw.append(self._graph_raw[i] if i < len(self._graph_raw) else ([], []))
-                continue
-            all_times.extend(times)
-            times_num = mdates.date2num(times)
+            ts_a, values = _samples_to_ns_arrays(self._samples_by_pv.get(pv, []))
+            # Downsample (in numpy) BEFORE anything else. The live fast path used
+            # to push EVERY raw sample to matplotlib on every ~1 s refresh with no
+            # cap, so a 100k+ point window rebuilt 100k datetimes and redrew 100k
+            # vertices per PV per tick — the source of the judder. Binning to the
+            # same target the full replot uses keeps each refresh light.
+            if avg_target > 0:
+                ts_a, values = _downsample_arrays_mean(ts_a, values, avg_target)
+            elif ts_a.size > 25000:
+                step = max(1, ts_a.size // 25000)
+                ts_a = ts_a[::step]; values = values[::step]
+            pre     = self._pre_window_vals.get(pv)
+            pre_val = pre[1] if (pre and isinstance(pre[1], (int, float))) else None
+            if not ts_a.size:
+                # No data in the window: draw the last-known value flat across it.
+                if pre_val is not None and win_start_ns is not None:
+                    ts_a   = np.array([win_start_ns, now_ns_], dtype=np.float64)
+                    values = np.array([pre_val, pre_val], dtype=np.float64)
+                else:
+                    new_raw.append(self._graph_raw[i] if i < len(self._graph_raw)
+                                   else (np.empty(0), np.empty(0)))
+                    continue
+            else:
+                # Extend to the window edges so the trace spans start → now.
+                if win_start_ns is not None and pre_val is not None and ts_a[0] > win_start_ns:
+                    ts_a   = np.concatenate(([win_start_ns], ts_a))
+                    values = np.concatenate(([pre_val], values))
+                if ts_a[-1] < now_ns_:
+                    ts_a   = np.concatenate((ts_a, [now_ns_]))
+                    values = np.concatenate((values, values[-1:]))
+            # Arithmetic ns → date-number conversion (no datetime objects, see
+            # _ns_to_num): this runs for every PV on every live refresh.
+            times_num = _ns_to_num(ts_a)
+            if times_num.size:
+                _lo = float(times_num[0]); _hi = float(times_num[-1])
+                t_lo_num = _lo if t_lo_num is None else min(t_lo_num, _lo)
+                t_hi_num = _hi if t_hi_num is None else max(t_hi_num, _hi)
             new_raw.append((times_num, values))
             pv_setting = self._pv_settings.get(pv, {})
             pv_smooth  = pv_setting.get("smooth", None)
             eff_smooth = pv_smooth if pv_smooth is not None else 1
             if len(pv_lines) == 2:
-                pv_lines[0].set_xdata(times); pv_lines[0].set_ydata(values)
-                sm = _moving_avg(values, eff_smooth) if eff_smooth > 1 and len(values) >= eff_smooth else values
-                pv_lines[1].set_xdata(times); pv_lines[1].set_ydata(sm)
+                pv_lines[0].set_data(times_num, values)
+                sm = (_moving_avg_np(values, eff_smooth)
+                      if eff_smooth > 1 and values.size >= eff_smooth else values)
+                pv_lines[1].set_data(times_num, sm)
             elif pv_lines:
-                pv_lines[0].set_xdata(times); pv_lines[0].set_ydata(values)
+                pv_lines[0].set_data(times_num, values)
             # Re-apply this PV's band (or full height if Autoscale on).
-            vals_clean = [v for v in values if v == v]
-            if vals_clean:
-                dmin, dmax = min(vals_clean), max(vals_clean)
+            if values.size and not np.all(np.isnan(values)):
+                dmin = float(np.nanmin(values)); dmax = float(np.nanmax(values))
                 autosc = pv_setting.get("auto_scale", False)
                 if not autosc:
                     ymin_pv = pv_setting.get("ymin"); ymax_pv = pv_setting.get("ymax")
@@ -2065,29 +2505,42 @@ class CSSLoggerWidget(QWidget):
                 ax.set_ylim(lo, hi)
 
         self._graph_raw = new_raw
-        if all_times and len(all_times) > 1 and self._graph_axes:
+        if self._graph_axes:
             ax0 = self._graph_axes[0]
-            from matplotlib.ticker import FuncFormatter as _FF
-            t_min, t_max = min(all_times), max(all_times)
-            total_s = (t_max - t_min).total_seconds()
-            t_min_l = t_min.astimezone(TZ_PRAGUE) if total_s > 0 else datetime.now(TZ_PRAGUE)
-            t_max_l = t_max.astimezone(TZ_PRAGUE) if total_s > 0 else t_min_l
-            same_d  = t_min_l.date() == t_max_l.date()
+            from matplotlib.ticker import FuncFormatter as _FF, FixedLocator as _FL
+            live_span = self._live_window_span
+            # Auto-scrolling live window: re-derive the X range AND rebuild its
+            # ticks for "now" on every refresh. Previously only xlim scrolled while
+            # the FixedLocator tick positions stayed frozen at the initial window —
+            # once "now" moved past them the axis showed no timestamps at all (the
+            # reported blank time axis). When zoomed in, leave the user's view be.
+            if live_span and live_span.total_seconds() > 0 and not self._zoom_history:
+                x_lo, x_hi = now_utc - live_span, now_utc
+                ax0.set_xlim(x_lo, x_hi)
+                lo_l = x_lo.astimezone(TZ_PRAGUE); hi_l = x_hi.astimezone(TZ_PRAGUE)
+            elif t_hi_num is not None and t_hi_num > t_lo_num:
+                lo_l = mdates.num2date(t_lo_num, tz=TZ_PRAGUE)
+                hi_l = mdates.num2date(t_hi_num, tz=TZ_PRAGUE)
+            else:
+                lo_l = hi_l = None
 
-            def _fmt_x_live(x, _p):
-                try:
-                    dt = mdates.num2date(x, tz=TZ_PRAGUE)
-                except Exception:
-                    return ""
-                if same_d: return dt.strftime("%H:%M:%S")
-                return dt.strftime("%m-%d\n00:00") if (dt.hour == 0 and dt.minute == 0) else dt.strftime("%H:%M")
+            if lo_l is not None and (hi_l - lo_l).total_seconds() > 0:
+                same_d = lo_l.date() == hi_l.date()
+                majors, minors = self._compute_x_ticks(lo_l, hi_l)
+                if majors:
+                    ax0.xaxis.set_major_locator(_FL(majors))
+                if minors:
+                    ax0.xaxis.set_minor_locator(_FL(minors))
 
-            ax0.xaxis.set_major_formatter(_FF(_fmt_x_live))
-            if not self._zoom_history:
-                span = self._live_window_span
-                if span and span.total_seconds() > 0:
-                    now_utc = datetime.now().astimezone(timezone.utc)
-                    ax0.set_xlim(now_utc - span, now_utc)
+                def _fmt_x_live(x, _p, _same=same_d):
+                    try:
+                        dt = mdates.num2date(x, tz=TZ_PRAGUE)
+                    except Exception:
+                        return ""
+                    if _same: return dt.strftime("%H:%M:%S")
+                    return (dt.strftime("%m-%d\n00:00")
+                            if (dt.hour == 0 and dt.minute == 0) else dt.strftime("%H:%M:%S"))
+                ax0.xaxis.set_major_formatter(_FF(_fmt_x_live))
 
         # Keep the crosshair snap data in sync, and force a fresh blit background
         # on the next draw so the cursor boxes never ghost over stale pixels.
@@ -2104,6 +2557,7 @@ class CSSLoggerWidget(QWidget):
         for ann in self._crosshair_texts:
             if ann is not None: ann.set_visible(False)
         if self._x_cursor_ann is not None: self._x_cursor_ann.set_visible(False)
+        if getattr(self, "_y_cursor_ann", None) is not None: self._y_cursor_ann.set_visible(False)
         self._blit_bg = self._mpl_canvas.copy_from_bbox(self._mpl_figure.bbox)
         # A stray full redraw (matplotlib schedules one when artists go stale,
         # e.g. while the mouse sits still) repaints without the animated
@@ -2129,17 +2583,29 @@ class CSSLoggerWidget(QWidget):
         self._mouse_last_event = event
         if not self._mouse_pending:
             self._mouse_pending = True
-            QTimer.singleShot(16, self._process_mouse_move)
+            # Adaptive throttle: a crosshair frame with a dozen PVs (each with its
+            # own value box) can take longer than a fixed 16 ms budget, and then
+            # every finished frame is immediately followed by the next queued one —
+            # the GUI thread never idles and the whole app feels stuck. Waiting
+            # roughly as long as the last frame actually took keeps the cursor
+            # responsive while leaving time for everything else.
+            QTimer.singleShot(int(self._cursor_frame_ms), self._process_mouse_move)
 
     def _process_mouse_move(self):
         # Never let a hover-frame render escape as an exception: a replot/resize
         # can tear the figure down between the queued move and this call,
         # leaving detached artists (matplotlib then raises 'NoneType has no
         # attribute dpi' while drawing a Text). It's harmless — just swallow it.
+        _t0 = time.perf_counter()
         try:
             self._process_mouse_move_impl()
         except Exception:
             self._mouse_pending = False
+        # Feed the measured frame time back into the throttle (see
+        # _on_graph_mouse_move), smoothed so one slow frame can't jam the cursor.
+        _ms = (time.perf_counter() - _t0) * 1000.0
+        self._cursor_frame_ms = min(80.0, max(
+            16.0, 0.7 * self._cursor_frame_ms + 0.3 * _ms * 1.2))
 
     def _process_mouse_move_impl(self):
         self._mouse_pending = False
@@ -2164,19 +2630,26 @@ class CSSLoggerWidget(QWidget):
 
         if bg is not None: canvas.restore_region(bg)
 
+        # One vertical + one horizontal cursor line for the whole plot (all axes
+        # share the rectangle). The horizontal one lives in axes coordinates, so
+        # the mouse Y only has to be converted once.
         for vl in self._crosshair_vlines:
             vl.set_xdata([x_f, x_f]); vl.set_visible(True)
             if bg is not None: vl.axes.draw_artist(vl)
-
-        for ax_i, (ax, hl) in enumerate(zip(self._graph_axes, self._crosshair_hlines)):
-            pv = self._graph_pvs[ax_i] if ax_i < len(self._graph_pvs) else None
+        _ax0 = self._graph_axes[0] if self._graph_axes else None
+        if _ax0 is not None:
             try:
-                y_mouse = float(ax.transData.inverted().transform((disp_x, disp_y))[1])
+                y_frac = float(_ax0.transAxes.inverted().transform((disp_x, disp_y))[1])
             except Exception:
-                hl.set_visible(False); continue
-            hl.set_ydata([y_mouse, y_mouse]); hl.set_visible(True)
-            if bg is not None: ax.draw_artist(hl)
+                y_frac = None
+            for hl in self._crosshair_hlines:
+                if y_frac is None:
+                    hl.set_visible(False); continue
+                hl.set_ydata([y_frac, y_frac]); hl.set_visible(True)
+                if bg is not None: hl.axes.draw_artist(hl)
 
+        for ax_i, ax in enumerate(self._graph_axes):
+            pv = self._graph_pvs[ax_i] if ax_i < len(self._graph_pvs) else None
             snap_val = None
             if raw_np and ax_i < len(raw_np):
                 arr, vals = raw_np[ax_i]
@@ -2198,16 +2671,19 @@ class CSSLoggerWidget(QWidget):
             if ax_i < len(self._crosshair_texts):
                 ann = self._crosshair_texts[ax_i]
                 if ann is not None:
-                    sf_info = (self._graph_spine_xpos[ax_i]
-                               if ax_i < len(self._graph_spine_xpos) else (0.0, "left"))
-                    xfrac, side = sf_info
-                    # Show/position this label at the PV's own value at the
-                    # hovered X (snap_val), not at the mouse's raw Y position —
-                    # the latter is arbitrary and unrelated to the PV's data.
+                    # Anchor the label at the crosshair intersection: X on the
+                    # vertical cursor line (x_f), Y at the PV's own value at the
+                    # hovered X (snap_val) — not the arbitrary raw mouse Y.
                     has_data = snap_val is not None
                     val_str = _fmt_cursor_value(snap_val) if has_data else "—"
-                    txt = f" {val_str}" if side == "right" else f"{val_str} "
-                    y_ann = snap_val if has_data else y_mouse
+                    txt = f" {val_str}"
+                    if has_data:
+                        y_ann = snap_val
+                    else:
+                        # No sample under the cursor: park the box on the mouse
+                        # row (y_frac is the mouse Y in axes fractions).
+                        _ylo, _yhi = ax.get_ylim()
+                        y_ann = _ylo + (_yhi - _ylo) * (y_frac if y_frac is not None else 0.5)
                     # Stagger every other axis label onto a second row, with
                     # enough vertical padding that the two rows' boxes clear
                     # each other (box height ≈ font size + bbox padding).
@@ -2219,7 +2695,7 @@ class CSSLoggerWidget(QWidget):
                             if h_px > 0: y_ann += (yhi - ylo) / h_px * pad_px
                         except Exception:
                             pass
-                    ann.set_position((xfrac, y_ann)); ann.set_text(txt); ann.set_visible(True)
+                    ann.set_position((x_f, y_ann)); ann.set_text(txt); ann.set_visible(True)
                     if bg is not None: ax.draw_artist(ann)
 
         if self._x_cursor_ann is not None:
@@ -2232,6 +2708,18 @@ class CSSLoggerWidget(QWidget):
                 self._lbl_graph_info.setText(dt_cursor.strftime("%Y-%m-%d %H:%M:%S"))
             except Exception:
                 dt_cursor = None
+
+        if self._y_cursor_ann is not None and self._y_cursor_ann_ax is not None:
+            try:
+                yax   = self._y_cursor_ann_ax
+                y_cur = float(yax.transData.inverted().transform((disp_x, disp_y))[1])
+                xf    = self._y_cursor_ann.get_position()[0]
+                self._y_cursor_ann.set_position((xf, y_cur))
+                self._y_cursor_ann.set_text(f" {_fmt_cursor_value(y_cur)}")
+                self._y_cursor_ann.set_visible(True)
+                if bg is not None: yax.draw_artist(self._y_cursor_ann)
+            except Exception:
+                pass
 
         self._cursor_active = True
         if bg is not None: canvas.blit(self._mpl_figure.bbox)
@@ -2248,14 +2736,20 @@ class CSSLoggerWidget(QWidget):
             val_idx = list(self._axis_tv_cols).index("cursor_val")
         except ValueError:
             return
-        for row in range(self._axis_tv.rowCount()):
-            pv_item = self._axis_tv.item(row, 1)
-            if not pv_item:
-                continue
-            cv = self._pv_settings.get(pv_item.text(), {}).get("cursor_val", "")
-            item = self._axis_tv.item(row, val_idx)
-            if item:
-                item.setText(cv)
+        # These programmatic updates must not trip the auto-apply itemChanged
+        # handler (it would replot on every 120 ms cursor tick).
+        self._axis_tv.blockSignals(True)
+        try:
+            for row in range(self._axis_tv.rowCount()):
+                pv_item = self._axis_tv.item(row, 1)
+                if not pv_item:
+                    continue
+                cv = self._pv_settings.get(pv_item.text(), {}).get("cursor_val", "")
+                item = self._axis_tv.item(row, val_idx)
+                if item:
+                    item.setText(cv)
+        finally:
+            self._axis_tv.blockSignals(False)
 
     def _clear_graph(self):
         if self._mpl_canvas is not None:
@@ -2275,13 +2769,44 @@ class CSSLoggerWidget(QWidget):
         self._crosshair_hlines = []
         self._crosshair_texts  = []
         self._x_cursor_ann = None
+        self._y_cursor_ann = None
+        self._y_cursor_ann_ax = None
         self._blit_bg      = None
         self._cursor_active = False   # no crosshair to re-assert on next draw
         self._clear_stats()
 
     def _apply_font_size(self):
+        # The toolbar spin and the Graph-settings dialog edit the same value.
+        try:
+            self._graph_opts["font_size"] = int(self._font_size_spin.value())
+        except Exception:
+            pass
         if self._mpl_figure and self._samples_by_pv:
-            self._plot_graph()
+            self._schedule_replot()   # coalesce rapid spinner clicks into one redraw
+
+    # ── Graph settings dialog ───────────────────────────────────────────────
+
+    def _open_graph_settings_dialog(self):
+        dlg = _GraphSettingsDialog(self._graph_opts, self)
+        dlg.applied.connect(self._apply_graph_opts)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._apply_graph_opts(dlg.result_opts)
+        elif dlg.applied_once:
+            # Cancel must undo anything a live "Apply" already painted.
+            self._apply_graph_opts(dlg.original_opts)
+
+    def _apply_graph_opts(self, opts: dict):
+        if all(self._graph_opts.get(k) == v for k, v in opts.items()):
+            return                                  # nothing to repaint
+        self._graph_opts.update(opts)
+        self.config["graph_opts"] = dict(self._graph_opts)
+        fs = int(self._graph_opts.get("font_size", 11))
+        if self._font_size_spin.value() != fs:
+            self._font_size_spin.blockSignals(True)
+            self._font_size_spin.setValue(fs)
+            self._font_size_spin.blockSignals(False)
+        if self._samples_by_pv:
+            self._schedule_replot(60)
 
     # ── Span / zoom handlers ────────────────────────────────────────────────
 
@@ -2476,8 +3001,8 @@ class CSSLoggerWidget(QWidget):
         sc_ctrl_f11.activated.connect(lambda: self._graph_popout(windowed=False))
 
     def _graph_popout(self, windowed: bool):
-        """Show the Graph tab in its own window. F11 → fullscreen, Ctrl+F11 →
-        resizable window. Pressing the same shortcut again docks it back."""
+        """Show the Graph tab in its own window. F11 → resizable window,
+        Ctrl+F11 → fullscreen. Pressing the same shortcut again docks it back."""
         # Ignore the app-wide shortcut when the user is on another tool's tab and
         # nothing is popped out yet.
         if self._graph_popup is None and not self.isVisible():
@@ -2547,53 +3072,59 @@ class CSSLoggerWidget(QWidget):
     def _on_avg_target_changed(self, _val):
         self.config["avg_target_points"] = self._avg_target_points()
         if self._samples_by_pv:
-            self._plot_graph()
+            self._schedule_replot()   # coalesce rapid spinner clicks into one redraw
 
     @staticmethod
-    def _downsample_pairs_mean(pairs, target):
-        """Bin (ts_ns, value) pairs into ~`target` equal-time bins and average.
-
-        Values are assumed numeric (callers pre-filter). One linear pass; empty
-        bins are simply skipped, so the result may hold fewer than `target`
-        points. Returns pairs unchanged when already at/under target.
+    def _compute_x_ticks(t_lo, t_hi):
+        """Major + minor X-tick positions (matplotlib date numbers) for the local
+        time window [t_lo, t_hi]. The endpoints are always ticked; interior majors
+        land on a 'nice' step chosen so ≤ ~8 fit. Shared by the full replot and the
+        live fast path so a scrolling live window keeps FRESH ticks — otherwise the
+        initial FixedLocator ticks scroll out of view and the time axis goes blank.
         """
-        n = len(pairs)
-        if target <= 0 or n <= target:
-            return pairs
-        t0 = pairs[0][0]
-        t1 = pairs[-1][0]
-        span = t1 - t0
-        if span <= 0:
-            return pairs
-        bin_w = span / target
-        last_bin = target - 1
-        out = []
-        cur_bin = -1
-        acc_t = 0.0
-        acc_v = 0.0
-        cnt = 0
-        for ts, v in pairs:
-            b = min(last_bin, int((ts - t0) / bin_w))
-            if b != cur_bin:
-                if cnt:
-                    out.append((int(acc_t / cnt), acc_v / cnt))
-                acc_t = 0.0
-                acc_v = 0.0
-                cnt = 0
-                cur_bin = b
-            acc_t += ts
-            acc_v += v
-            cnt += 1
-        if cnt:
-            out.append((int(acc_t / cnt), acc_v / cnt))
-        return out
+        span_s = (t_hi - t_lo).total_seconds()
+        _STEPS = [5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800]
+        step_s = _STEPS[-1]
+        for s in _STEPS:
+            if span_s / s <= 8: step_s = s; break
+        epoch    = datetime(t_lo.year, t_lo.month, t_lo.day, tzinfo=t_lo.tzinfo)
+        offset_s = (t_lo - epoch).total_seconds()
+        first_s  = math.ceil((offset_s + step_s * 0.25) / step_s) * step_s
+        ticks_dt = []
+        cur_s    = first_s
+        while True:
+            dt_tick = epoch + timedelta(seconds=cur_s)
+            if dt_tick >= t_hi - timedelta(seconds=step_s * 0.25): break
+            ticks_dt.append(dt_tick); cur_s += step_s
+        majors = ([mdates.date2num(t_lo)]
+                  + [mdates.date2num(d) for d in ticks_dt]
+                  + [mdates.date2num(t_hi)])
+        # Minor ticks: subdivide the major step by 5, as a fixed list so matplotlib
+        # never infers spacing from the irregular endpoint ticks (that would blow
+        # past Locator.MAXTICKS).
+        minor_step = step_s / 5.0
+        minors = []
+        m_s = first_s - step_s
+        while True:
+            dt_m = epoch + timedelta(seconds=m_s)
+            if dt_m > t_hi: break
+            if dt_m >= t_lo: minors.append(mdates.date2num(dt_m))
+            m_s += minor_step
+        return majors, minors
+
+    # (Time-binned averaging lives in the module-level _downsample_arrays_mean:
+    # every caller feeds matplotlib, so the whole path stays in numpy arrays.)
 
     # ── Load data ───────────────────────────────────────────────────────────
 
     def _on_load_clicked(self):
-        pvs = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs = self._real_pv_names()
         if not pvs:
             QMessageBox.warning(self, "No PVs", "Add at least one PV to the list."); return
+        # A manual load freezes the view in the past: stop live first so its
+        # auto-scrolling window doesn't fight the historical data being shown.
+        if self._live_mode:
+            self._stop_live("Live stopped — showing loaded window.")
         self._btn_load.setEnabled(False)
         self._lbl_status.setText("Loading…")
         self._progress_bar.setValue(0)
@@ -2616,7 +3147,7 @@ class CSSLoggerWidget(QWidget):
             try:
                 from cpva_core import (cpva_fetch_many_chunked,
                                        cpva_fetch_many_optimized, cpva_decode_value,
-                                       cpva_fetch_last_before)
+                                       cpva_fetch_last_before_many)
                 samples_by_pv   = {}
                 pv_order        = []
                 errors          = []
@@ -2667,17 +3198,19 @@ class CSSLoggerWidget(QWidget):
                 # PV has no data or its first sample sits after start_ns, so the
                 # trace can start at the window edge instead of jumping in later.
                 sig.progress.emit("Filling gaps at window start…")
+                need_lookback = []
                 for pv in pvs:
-                    samples = samples_by_pv.get(pv, [])
-                    first_ts = min((t for t, _, _ in samples), default=None)
+                    first_ts = min((t for t, _, _ in samples_by_pv.get(pv, [])),
+                                   default=None)
                     if first_ts is None or first_ts > start_ns:
-                        last_s = cpva_fetch_last_before(pv, start_ns)
-                        if last_s:
-                            last_ts = last_s.get("time")
-                            if last_ts:
-                                pre_window_vals[pv] = (
-                                    int(last_ts), cpva_decode_value(last_s),
-                                    (last_s.get("metaData") or {}).get("units", "") or "")
+                        need_lookback.append(pv)
+                last_map = cpva_fetch_last_before_many(need_lookback, start_ns)
+                for pv, last_s in last_map.items():
+                    last_ts = last_s.get("time")
+                    if last_ts:
+                        pre_window_vals[pv] = (
+                            int(last_ts), cpva_decode_value(last_s),
+                            (last_s.get("metaData") or {}).get("units", "") or "")
                 sig.pct.emit(100)
                 print(f"[CSS Logger] Emitting done: {len(pv_order)} PVs, errors={errors}")
                 sig.done.emit((samples_by_pv, pv_order, errors, start_ns, end_ns, pre_window_vals))
@@ -2727,6 +3260,23 @@ class CSSLoggerWidget(QWidget):
         for pv in samples_by_pv:
             samples_by_pv[pv].sort(key=lambda s: s[0])
 
+        # Seed the pre-window value from the last fetched sample BEFORE the window
+        # start, so the trace begins held at the left edge instead of "in the
+        # middle". The archiver sometimes returns an anchor/decimated sample at or
+        # before start_ns; the explicit lookback then skips that PV (first_ts <=
+        # start) and the trim below would discard the sample, leaving no seed.
+        # Reuse it here (no extra HTTP) whenever a numeric seed isn't already set.
+        for pv, samples in samples_by_pv.items():
+            cur = self._pre_window_vals.get(pv)
+            if cur is not None and isinstance(cur[1], (int, float)):
+                continue
+            for ts, v, u in reversed(samples):
+                if ts >= start_ns:
+                    continue
+                if isinstance(v, (int, float)):
+                    self._pre_window_vals[pv] = (ts, v, u)
+                    break
+
         # Trim to requested window
         graph_samples: dict = {}
         for pv, samples in samples_by_pv.items():
@@ -2758,10 +3308,9 @@ class CSSLoggerWidget(QWidget):
         rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
         self._table_rows = self._apply_conditions_to_rows(rows)
 
-        # Build default pv_settings if not set
-        for i, pv in enumerate(self._pv_order):
-            if pv not in self._pv_settings:
-                self._pv_settings[pv] = self._get_pv_default_settings(pv, i)
+        # Build default pv_settings if not set, and keep auto-colors distinct
+        # for whatever PVs are currently displayed (see _resync_pv_colors).
+        self._resync_pv_colors()
 
         self._plot_graph()
         self._refresh_axis_settings_tv()   # always show PV list, even with 0 samples
@@ -2819,32 +3368,35 @@ class CSSLoggerWidget(QWidget):
 
     # ── Live mode ───────────────────────────────────────────────────────────
 
+    def _live_span_from_window(self) -> timedelta:
+        """The rolling span Live should use for the current From/To window.
+
+        Live keeps the whole span merged, filtered and plotted at all times, so
+        an unreasonably wide window is not just slow to load — it makes every
+        refresh expensive for the rest of the session. A window that is too
+        short, absent or wider than `_LIVE_MAX_INIT_SPAN_S` is clamped, and the
+        clamp is logged so it never looks like Live simply ignored the window.
+        """
+        window_diff = (self._dt_to - self._dt_from).total_seconds()
+        if not (60 <= window_diff <= _LIVE_MAX_SPAN_S):
+            return timedelta(hours=1)
+        if window_diff > _LIVE_MAX_INIT_SPAN_S:
+            self._log(f"Live window {window_diff/3600:.1f} h is wider than the "
+                      f"{_LIVE_MAX_INIT_SPAN_S/3600:.0f} h live limit — "
+                      f"using {_LIVE_MAX_INIT_SPAN_S/3600:.0f} h "
+                      f"(LOAD DATA still loads the full window).")
+            return timedelta(seconds=_LIVE_MAX_INIT_SPAN_S)
+        return timedelta(seconds=window_diff)
+
     def _toggle_live_mode(self):
         if self._live_mode:
-            self._live_mode = False
-            self._live_timer.stop()
-            self._countdown_timer.stop()
-            self._btn_live.setText("⏵ Live")
-            self._btn_live.setStyleSheet("")
-            # Stopping live must immediately free the LOAD DATA button, even if
-            # the initial live fetch is still running (its callback bails out
-            # once _live_mode is False and would otherwise leave LOAD disabled).
-            self._btn_load.setEnabled(True)
-            self._progress_bar.hide()
-            self._plot_window_ns = None
-            self._refresh_time_labels()
-            self._lbl_status.setText("Live mode stopped.")
+            self._stop_live()
         else:
-            pvs = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+            pvs = self._real_pv_names()
             if not pvs:
                 QMessageBox.warning(self, "No PVs", "Add PVs before starting live mode."); return
             self._live_mode = True
-            # Use the user's time window if it makes sense, else last hour
-            window_diff = (self._dt_to - self._dt_from).total_seconds()
-            if 60 <= window_diff <= _LIVE_MAX_SPAN_S:
-                self._live_window_span = timedelta(seconds=window_diff)
-            else:
-                self._live_window_span = timedelta(hours=1)
+            self._live_window_span = self._live_span_from_window()
             self._btn_live.setText("⏹ Stop Live")
             self._btn_live.setStyleSheet(
                 "QPushButton{background:#F57F17;color:white;font-weight:700;border-radius:3px;padding:5px;}")
@@ -2853,15 +3405,42 @@ class CSSLoggerWidget(QWidget):
             self._btn_load.setEnabled(False)
             self._live_last_ts = None
             self._live_last_rebuild_ns = 0
+            self._live_init_retries = 0      # fresh retry budget for this session
             self._live_initial_load()
+
+    def _stop_live(self, status="Live mode stopped."):
+        """Stop live polling and restore the idle UI. Safe to call when not live
+        (used by the Live toggle and by LOAD DATA so a manual load freezes the
+        view instead of fighting the auto-scrolling live window)."""
+        self._live_mode = False
+        # Abandon whatever is in flight, not just the next tick: a running fetch
+        # pool ignores the timers entirely and would keep the GUI stuttering.
+        self._live_epoch += 1
+        self._live_timer.stop()
+        self._countdown_timer.stop()
+        self._btn_live.setText("⏵ Live")
+        self._btn_live.setStyleSheet("")
+        # Free the LOAD DATA button even if the initial live fetch is still
+        # running (its callback bails once _live_mode is False).
+        self._btn_load.setEnabled(True)
+        self._progress_bar.hide()
+        self._plot_window_ns = None
+        self._refresh_time_labels()
+        self._lbl_status.setText(status)
 
     def _live_initial_load(self):
         now_utc = datetime.now().astimezone(timezone.utc)
         t_from  = now_utc - self._live_window_span
         start_ns = dt_to_ns(t_from)
         end_ns   = dt_to_ns(now_utc)
-        pvs      = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs      = self._real_pv_names()
         avg_target = self._avg_target_points()   # read on UI thread
+        # This starts a fresh live session, so anything still fetching for the
+        # previous one (a preset switch or a new time window restarts the load) is
+        # now stale and must abort instead of competing for the GIL.
+        self._live_epoch += 1
+        epoch = self._live_epoch
+        cancel = lambda: self._live_epoch != epoch
         self._live_init_sig = _LoadSig()
         sig = self._live_init_sig
         sig.done.connect(self._after_live_initial_load)
@@ -2875,7 +3454,7 @@ class CSSLoggerWidget(QWidget):
             try:
                 from cpva_core import (cpva_fetch_many_chunked,
                                        cpva_fetch_many_optimized, cpva_decode_value,
-                                       cpva_fetch_last_before)
+                                       cpva_fetch_last_before_many)
                 samples_by_pv = {}
                 pv_order = []
                 pre_window_vals = {}
@@ -2890,7 +3469,8 @@ class CSSLoggerWidget(QWidget):
 
                     sig.progress.emit(f"Live init: fetching {len(pvs)} PVs (optimized)…")
                     raw_by_pv, _errs = cpva_fetch_many_optimized(
-                        pvs, start_ns, end_ns, avg_target, progress_fn=_report)
+                        pvs, start_ns, end_ns, avg_target, progress_fn=_report,
+                        cancel_fn=cancel)
                 else:
                     # Raw: all PVs' 1-hour chunks in one shared pool.
                     def _report(done, total_chunks):
@@ -2901,7 +3481,11 @@ class CSSLoggerWidget(QWidget):
 
                     sig.progress.emit(f"Live init: fetching {len(pvs)} PVs (raw)…")
                     raw_by_pv, _errs = cpva_fetch_many_chunked(
-                        pvs, start_ns, end_ns, progress_fn=_report)
+                        pvs, start_ns, end_ns, progress_fn=_report,
+                        cancel_fn=cancel)
+
+                if cancel():
+                    return                      # session ended while fetching
 
                 for pv in pvs:
                     samples = []
@@ -2917,18 +3501,24 @@ class CSSLoggerWidget(QWidget):
                 # Carry-forward: hold the last known value so a PV without a fresh
                 # sample still draws a line instead of leaving the graph empty.
                 sig.progress.emit("Live init: filling gaps…")
+                need_lookback = []
                 for pv in pvs:
-                    samples = samples_by_pv.get(pv, [])
-                    first_ts = min((t for t, _, _ in samples), default=None)
+                    first_ts = min((t for t, _, _ in samples_by_pv.get(pv, [])),
+                                   default=None)
                     if first_ts is None or first_ts > start_ns:
-                        try:
-                            last_s = cpva_fetch_last_before(pv, start_ns)
-                        except Exception:
-                            last_s = None
-                        if last_s and last_s.get("time"):
-                            pre_window_vals[pv] = (
-                                int(last_s["time"]), cpva_decode_value(last_s),
-                                (last_s.get("metaData") or {}).get("units", "") or "")
+                        need_lookback.append(pv)
+                try:
+                    last_map = cpva_fetch_last_before_many(need_lookback, start_ns,
+                                                           cancel_fn=cancel)
+                except Exception:
+                    last_map = {}
+                if cancel():
+                    return
+                for pv, last_s in last_map.items():
+                    if last_s and last_s.get("time"):
+                        pre_window_vals[pv] = (
+                            int(last_s["time"]), cpva_decode_value(last_s),
+                            (last_s.get("metaData") or {}).get("units", "") or "")
                 sig.pct.emit(100)
                 sig.done.emit((samples_by_pv, pv_order, [], start_ns, end_ns, pre_window_vals))
             except Exception as exc:
@@ -2937,23 +3527,27 @@ class CSSLoggerWidget(QWidget):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_live_init_error(self, e: str):
-        """Live initial load failed — stop live cleanly so the UI isn't stuck."""
+        """Live initial load failed — retry a couple of times before giving up so
+        a transient archiver hiccup doesn't make Live look like it needs a manual
+        LOAD DATA first."""
         self._log(f"Live initial load error: {e}")
-        self._live_mode = False
-        self._live_timer.stop()
-        self._countdown_timer.stop()
-        self._btn_live.setText("⏵ Live")
-        self._btn_live.setStyleSheet("")
-        self._btn_load.setEnabled(True)
-        self._progress_bar.hide()
-        self._refresh_time_labels()
-        self._lbl_status.setText("Live init failed — see Log tab.")
+        if not self._live_mode:
+            self._progress_bar.hide(); return
+        retries = getattr(self, "_live_init_retries", 0)
+        if retries < 2:
+            self._live_init_retries = retries + 1
+            self._lbl_status.setText(f"Live init failed — retrying "
+                                     f"({self._live_init_retries}/2)…")
+            QTimer.singleShot(1500, self._live_initial_load)
+            return
+        self._stop_live("Live init failed after retries — check archiver, see Log tab.")
 
     def _after_live_initial_load(self, result):
         if not self._live_mode:
             self._progress_bar.hide(); return
         self._btn_load.setEnabled(True)
         self._progress_bar.hide()
+        self._live_init_retries = 0          # success clears the retry budget
         try:
             if len(result) == 6:
                 samples_by_pv, pv_order, _, start_ns, end_ns, pre_window_vals = result
@@ -2965,6 +3559,20 @@ class CSSLoggerWidget(QWidget):
             # clobbering the user's chosen From/To) so the held line spans it.
             self._plot_window_ns = (start_ns, end_ns)
             self._samples_by_pv = samples_by_pv
+            # Same pre-window seed safety net as the historical load path: if the
+            # fetch already holds a sample before the window start, use it as the
+            # held value so Live doesn't start the trace mid-window.
+            for pv, samples in samples_by_pv.items():
+                cur = self._pre_window_vals.get(pv)
+                if cur is not None and isinstance(cur[1], (int, float)):
+                    continue
+                best = None
+                for ts, v, u in samples:
+                    if ts < start_ns and isinstance(v, (int, float)):
+                        if best is None or ts > best[0]:
+                            best = (ts, v, u)
+                if best is not None:
+                    self._pre_window_vals[pv] = best
             self._pv_order      = pv_order
             self._base_pv_order = list(pv_order)
             self._numeric_pvs = {
@@ -2978,9 +3586,7 @@ class CSSLoggerWidget(QWidget):
             self._rebuild_custom_pvs()          # add + compute derived channels
             rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
             self._table_rows = self._apply_conditions_to_rows(rows)
-            for i, pv in enumerate(self._pv_order):
-                if pv not in self._pv_settings:
-                    self._pv_settings[pv] = self._get_pv_default_settings(pv, i)
+            self._resync_pv_colors()
             # Find latest ts for incremental fetch
             max_ts = 0
             for samples in samples_by_pv.values():
@@ -2999,18 +3605,21 @@ class CSSLoggerWidget(QWidget):
 
     def _live_tick(self):
         if not self._live_mode: return
-        pvs = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs = self._real_pv_names()
         if not pvs:
             self._toggle_live_mode(); return
-        start_ns = self._live_last_ts if self._live_last_ts else (now_ns() - int(60e9))
-        # Never look back further than the visible window (bounds the query while
-        # the archiver is idle), but always re-query from the last KNOWN sample
-        # forward so ingestion lag doesn't make us skip newly-archived points.
-        if self._live_window_span:
-            min_start = now_ns() - int(self._live_window_span.total_seconds() * 1e9)
-            if start_ns < min_start:
-                start_ns = min_start
         end_ns   = now_ns()
+        start_ns = self._live_last_ts if self._live_last_ts else (end_ns - int(60e9))
+        # Re-query from the last KNOWN sample forward so ingestion lag doesn't
+        # make us skip newly-archived points — but never look back further than
+        # _LIVE_TICK_LOOKBACK_NS. Without that cap the range is unbounded on a
+        # quiet archiver (see the constant), and one tick fans out into dozens of
+        # 1-hour chunks per PV every 300 ms.
+        min_start = end_ns - _LIVE_TICK_LOOKBACK_NS
+        if start_ns < min_start:
+            start_ns = min_start
+        epoch  = self._live_epoch
+        cancel = lambda: self._live_epoch != epoch
         self._inc_sig = _IncSig()
         sig = self._inc_sig
         sig.done.connect(self._on_incremental_finished)
@@ -3025,7 +3634,10 @@ class CSSLoggerWidget(QWidget):
                 # one HTTP request after another — with many PVs the sequential
                 # loop made each tick take (n_pvs × latency), so 12 PVs updated
                 # only ~every 3 s. This matches how CS Studio stays responsive.
-                raw_by_pv, fetch_errs = cpva_fetch_many_chunked(pvs, start_ns, end_ns)
+                raw_by_pv, fetch_errs = cpva_fetch_many_chunked(
+                    pvs, start_ns, end_ns, cancel_fn=cancel)
+                if cancel():
+                    return                  # Live was stopped mid-tick
                 for pv in pvs:
                     if pv in fetch_errs:
                         errors.append(f"{shorten_pv_name(pv)}: {fetch_errs[pv]}")
@@ -3061,9 +3673,22 @@ class CSSLoggerWidget(QWidget):
             # a second. New samples are still appended below on every tick;
             # only the expensive rebuild/redraw is deferred.
             now = now_ns()
-            refresh_due = (now - self._live_last_rebuild_ns) >= _LIVE_REBUILD_MIN_INTERVAL_NS
+            # Adaptive cadence: with many PVs one rebuild+redraw can take a
+            # sizeable fraction of a second, and firing it again every second
+            # leaves the GUI thread almost no idle time (the app feels stuck even
+            # though it is working). Keep at least ~3× the measured cost between
+            # rebuilds, so the graph stays live but the UI keeps breathing.
+            _interval_ns = max(_LIVE_REBUILD_MIN_INTERVAL_NS,
+                               3 * getattr(self, "_live_rebuild_cost_ns", 0))
+            refresh_due = (now - self._live_last_rebuild_ns) >= _interval_ns
+            _rebuild_t0 = time.perf_counter()
             if refresh_due:
                 self._live_last_rebuild_ns = now
+                # Advance the carry-forward / plot window so a full replot (and the
+                # held "last value" line) tracks "now" instead of the initial load.
+                if self._live_window_span:
+                    span_ns = int(self._live_window_span.total_seconds() * 1e9)
+                    self._plot_window_ns = (now - span_ns, now)
 
             if added_count > 0:
                 # Advance the cursor to the newest sample we actually received —
@@ -3102,8 +3727,15 @@ class CSSLoggerWidget(QWidget):
                     self._lbl_status.setText(
                         f"Live +{added_count} pts  |  ⚠ {len(errors)} fetch errors")
             else:
-                # No new points — show that polling is alive and why nothing moved
-                # so an idle archiver isn't mistaken for a frozen app.
+                # Nothing arrived: still move the cursor forward (minus the
+                # ingestion-lag overlap), otherwise it stays pinned to the last
+                # real sample and every following tick asks for an ever-wider
+                # range — the reason a quiet archiver used to bring the app to
+                # its knees instead of costing nothing.
+                self._live_last_ts = max(self._live_last_ts or 0,
+                                         end_ns - _LIVE_TICK_OVERLAP_NS)
+                # Show that polling is alive and why nothing moved, so an idle
+                # archiver isn't mistaken for a frozen app.
                 last_ns = max((s[-1][0] for s in self._samples_by_pv.values() if s),
                               default=0)
                 last_str = ns_to_local_str(last_ns)[:19] if last_ns else "—"
@@ -3142,6 +3774,11 @@ class CSSLoggerWidget(QWidget):
                     self._plot_graph()
                 else:
                     self._update_graph_data()
+                # Cost of this whole refresh (table + graph); paces the next one.
+                # The canvas repaint itself happens later via draw_idle, so add a
+                # rough allowance for it rather than under-counting the work.
+                self._live_rebuild_cost_ns = int(
+                    (time.perf_counter() - _rebuild_t0) * 1.6e9)
         except Exception:
             # A failed incremental update must NOT kill the live loop or crash
             # the Qt timer callback — log and keep polling.
@@ -3172,6 +3809,10 @@ class CSSLoggerWidget(QWidget):
 
     def _apply_conditions_to_rows(self, rows=None):
         """Filter rows by active conditions. Returns filtered list."""
+        # Every rebuild of _table_rows goes through here, and the row dicts
+        # themselves can be recomputed in place (custom PVs), so this is the one
+        # place that must drop the graph's per-PV sample cache.
+        self._pairs_cache = None
         if rows is None:
             rows = self._table_rows_unfiltered
         if not self._conditions:
@@ -3314,13 +3955,16 @@ class CSSLoggerWidget(QWidget):
             s = chr(65 + r) + s
         return s
 
-    def _channel_letters(self) -> list:
+    def _channel_letters(self, names=None) -> list:
         """Ordered ``[(letter, name, display_name)]`` for every channel currently
-        in ``_pv_order`` (real PVs first, then custom channels). These letters are
-        the variables used in custom-PV expressions (e.g. ``B/D``)."""
+        in ``_pv_order`` (real PVs first, then custom channels), or for ``names``
+        if given. These letters are the variables the user types in custom-PV
+        expressions (e.g. ``B/D``) — they are positional and therefore change
+        whenever the PV list does, which is why each formula stores its own
+        letter -> PV bindings."""
         custom_names = {d.get("name", "") for d in self._custom_pvs}
         out = []
-        for i, pv in enumerate(self._pv_order):
+        for i, pv in enumerate(self._pv_order if names is None else names):
             if pv in custom_names:
                 disp = pv
             else:
@@ -3328,41 +3972,134 @@ class CSSLoggerWidget(QWidget):
             out.append((self._col_letter(i), pv, disp))
         return out
 
+    def _cpv_dialog_channels(self) -> list:
+        """Channel rows for the custom-PV dialog:
+        ``[(letter, pv_name, display_name, loaded)]`` — every currently loaded
+        channel, followed by every PV a formula is bound to that is *not* loaded
+        right now. The unloaded ones still get a letter so expressions stay
+        readable; the dialog marks them and spells out their PV name."""
+        loaded = self._channel_letters()
+        if not loaded:
+            # Before the first load ``_pv_order`` is still empty — letter the
+            # sidebar list instead, so the dialog matches what the user sees.
+            loaded = self._channel_letters(
+                self._real_pv_names()
+                + [d.get("name", "") for d in self._custom_pvs if d.get("name")])
+        rows = [(lt, pv, disp, True) for lt, pv, disp in loaded]
+        seen = {pv for _lt, pv, _d in loaded}
+        for d in self._custom_pvs:
+            for pv in (d.get("bindings") or {}).values():
+                if pv and pv not in seen:
+                    seen.add(pv)
+                    rows.append((self._col_letter(len(rows)), pv,
+                                 shorten_pv_name(pv), False))
+        return rows
+
+    def _migrate_custom_pv_bindings(self):
+        """One-time upgrade of custom_pvs.json entries saved before bindings
+        existed: their letters are interpreted through _CPV_LEGACY_LETTERS (the
+        PV order they were written against) and stored explicitly, so they keep
+        their meaning from now on no matter how the PV list is reordered."""
+        migrated = []
+        for d in self._custom_pvs:
+            if d.get("bindings") or not d.get("name") or not d.get("expr"):
+                continue
+            b = {lt: _CPV_LEGACY_LETTERS[lt] for lt in _cpv_vars(d["expr"])
+                 if lt in _CPV_LEGACY_LETTERS}
+            if not b:
+                continue
+            d["bindings"] = b
+            migrated.append((d["name"], b))
+        if not migrated:
+            return
+        save_custom_pvs(self._custom_pvs)
+        self._log("Custom PV letters bound to PV names (from the legacy channel order):")
+        for name, b in migrated:
+            self._log("    {}: {}".format(
+                name, ", ".join(f"{lt} = {pv}" for lt, pv in b.items())))
+
     def _compute_custom_pvs_in_rows(self, rows):
-        """Evaluate every custom PV expression for each row, using the channel
-        letters as variables. Customs are computed in definition order so a later
-        custom can reference an earlier one by its letter."""
-        defs = [(d.get("name", ""), d.get("expr", "")) for d in self._custom_pvs
-                if d.get("name") and d.get("expr")]
+        """Evaluate every custom PV for each row.
+
+        Each formula resolves its variables through its own ``bindings``
+        (letter -> PV name), so its values follow the PVs even after the list is
+        reordered or another preset is loaded. A letter with no binding falls
+        back to the old positional lookup. Customs are computed in definition
+        order, so a later custom can read an earlier one — its binding simply
+        names that custom channel. Problems are collected in ``_cpv_diag``
+        instead of being swallowed."""
+        defs = [d for d in self._custom_pvs if d.get("name") and d.get("expr")]
+        self._cpv_diag = []
         if not defs:
             return
         SAFE = {"__builtins__": {}, "abs": abs, "min": min,
                 "max": max, "round": round, "math": math}
-        letters = self._channel_letters()
-        name_to_letter = {name: letter for letter, name, _ in letters}
-        compiled = {}
-        for name, expr in defs:
-            try:
-                compiled[name] = compile(expr, "<cpv>", "eval")
-            except Exception:
-                compiled[name] = None
-        for _ts_ns, row_dict in rows:
-            ns = {}
-            for letter, name, _ in letters:
-                v = row_dict.get(name, (None,))[0]
-                ns[letter] = v if isinstance(v, (int, float)) else None
-            for name, _expr in defs:
-                code = compiled.get(name)
-                if code is None:
+        positional = {lt: pv for lt, pv, _ in self._channel_letters()}
+        loaded     = set(self._pv_order)
+        plan   = []                    # (name, code, [(letter, source_pv)])
+        broken = set()                 # names already reported as not computable
+        for d in defs:
+            name, expr = d["name"], d["expr"]
+            bindings   = d.get("bindings") or {}
+            srcs, missing, unknown = [], [], []
+            for letter in _cpv_vars(expr):
+                pv = bindings.get(letter) or positional.get(letter)
+                if not pv:
+                    unknown.append(letter)
                     continue
-                try:
-                    result = eval(code, SAFE, ns)
-                except Exception:
-                    result = None
+                srcs.append((letter, pv))
+                if pv not in loaded:
+                    missing.append(f"{letter} = {pv}")
+            if missing:
+                self._cpv_diag.append(
+                    f"Custom PV '{name}': not computed — "
+                    f"{', '.join(missing)} not in the loaded PV list.")
+            if unknown:
+                self._cpv_diag.append(
+                    f"Custom PV '{name}': not computed — "
+                    f"{', '.join(unknown)} is not a known channel.")
+            try:
+                code = compile(expr, "<cpv>", "eval")
+            except Exception as exc:
+                code = None
+                self._cpv_diag.append(
+                    f"Custom PV '{name}': invalid expression — {exc}")
+            if missing or unknown or code is None:
+                broken.add(name)
+            plan.append((name, code, srcs))
+        errs = {}                      # name -> [row count, first exception]
+        for _ts_ns, row_dict in rows:
+            for name, code, srcs in plan:
+                result = None
+                if code is not None:
+                    ns = {}
+                    for letter, pv in srcs:
+                        v = row_dict.get(pv, (None,))[0]
+                        ns[letter] = v if isinstance(v, (int, float)) else None
+                    try:
+                        result = eval(code, SAFE, ns)
+                    except Exception as exc:
+                        e = errs.setdefault(name, [0, type(exc).__name__])
+                        e[0] += 1
                 row_dict[name] = (result, "")
-                lt = name_to_letter.get(name)
-                if lt is not None:
-                    ns[lt] = result if isinstance(result, (int, float)) else None
+        for name, (cnt, first) in errs.items():
+            # A formula with a missing source fails on every row by definition —
+            # it was already reported above, don't repeat it as a row count.
+            if name not in broken:
+                self._cpv_diag.append(
+                    f"Custom PV '{name}': {cnt} of {len(rows)} rows could not be "
+                    f"evaluated ({first}).")
+
+    def _emit_custom_pv_diag(self):
+        """Log what the last compute found wrong — once. This runs on every live
+        refresh, so an unchanged set of messages is not logged again."""
+        msgs = list(getattr(self, "_cpv_diag", []) or [])
+        sig  = "\n".join(msgs)
+        if sig == getattr(self, "_cpv_last_diag", None):
+            return
+        self._cpv_last_diag = sig
+        for m in msgs:
+            self._log(m)
 
     def _rebuild_custom_pvs(self):
         """Refresh the custom channels: re-sync ``_pv_order`` to base PVs + the
@@ -3388,6 +4125,7 @@ class CSSLoggerWidget(QWidget):
                 self._numeric_pvs.discard(name)
 
         self._compute_custom_pvs_in_rows(self._table_rows_unfiltered)
+        self._emit_custom_pv_diag()
 
         for d in self._custom_pvs:
             name = d.get("name", "")
@@ -3406,19 +4144,42 @@ class CSSLoggerWidget(QWidget):
     # ── Save runtime state ────────────────────────────────────────────────────
 
     def _save_runtime_state(self):
-        self.config["pv_list"] = [
-            self._pv_list.item(i).text()
-            for i in range(self._pv_list.count())
-        ]
+        self.config["pv_list"] = self._real_pv_names()
         self.config["conditions"]      = copy(self._conditions)
         self.config["master_pv"]       = self._get_master_pv()
         self.config["master_multiple"] = self._get_master_multiple()
         self.config["avg_target_points"] = self._avg_target_points()
+        self.config["graph_opts"]        = dict(self._graph_opts)
         self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
         self.config["time_to"]   = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
         save_config(self.config)
 
     # ── Table population ────────────────────────────────────────────────────
+
+    def _set_table_cell(self, row: int, col: int, text: str, severity: str):
+        """Write one cell, reusing the QTableWidgetItem that is already there.
+
+        A live refresh rewrites the whole visible slice, and allocating a fresh
+        item per cell (5000 rows × ~10 columns) was the most expensive thing on
+        the UI thread during a live session. Reusing the item — and touching
+        text / colour only when they actually change — keeps the same output for
+        a fraction of the cost. The severity is cached on the item itself so the
+        colour can be reset when a cell stops being alarming.
+        """
+        item = self._table_widget.item(row, col)
+        if item is None:
+            item = QTableWidgetItem(text)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self._table_widget.setItem(row, col, item)
+        elif item.text() != text:
+            item.setText(text)
+        if item.data(Qt.ItemDataRole.UserRole) != severity:
+            item.setData(Qt.ItemDataRole.UserRole, severity)
+            colour = _TABLE_SEVERITY_FG.get(severity)
+            if colour is None:
+                item.setData(Qt.ItemDataRole.ForegroundRole, None)
+            else:
+                item.setForeground(QColor(colour))
 
     def _populate_table(self):
         self._table_display_offset = 0
@@ -3426,6 +4187,7 @@ class CSSLoggerWidget(QWidget):
             self._table_widget.setRowCount(0)
             self._table_widget.setColumnCount(1)
             self._table_widget.setHorizontalHeaderLabels(["Timestamp"])
+            self._table_cols_cache = ["Timestamp"]
             self._lbl_table_info.setText("No rows.")
             return
 
@@ -3434,24 +4196,22 @@ class CSSLoggerWidget(QWidget):
         shown_rows = self._table_rows[-_MAX_TABLE_ROWS:]
         self._table_display_offset = len(self._table_rows) - len(shown_rows)
         self._table_widget.setUpdatesEnabled(False)
-        self._table_widget.setColumnCount(len(cols))
-        self._table_widget.setHorizontalHeaderLabels(cols)
+        # Only rebuild the grid when the columns really changed — dropping the
+        # rows is what forces every item to be re-created, so a PV set that
+        # stayed the same keeps its items (see _set_table_cell).
+        if getattr(self, "_table_cols_cache", None) != cols:
+            self._table_widget.setRowCount(0)
+            self._table_widget.setColumnCount(len(cols))
+            self._table_widget.setHorizontalHeaderLabels(cols)
+            self._table_cols_cache = list(cols)
         self._table_widget.setRowCount(len(shown_rows))
 
         for row_i, (ts, row_dict) in enumerate(shown_rows):
-            ts_item = QTableWidgetItem(ns_to_local_str(ts))
-            ts_item.setFlags(ts_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            self._table_widget.setItem(row_i, 0, ts_item)
+            self._set_table_cell(row_i, 0, ns_to_local_str(ts), "")
             for col_j, pv in enumerate(pvs, 1):
                 val_raw, severity = row_dict.get(pv, (None, ""))
-                txt = self._format_value(val_raw)
-                item = QTableWidgetItem(txt)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if severity in ("MINOR",):
-                    item.setForeground(QColor("#FFA000"))
-                elif severity in ("MAJOR", "INVALID"):
-                    item.setForeground(QColor("#C62828"))
-                self._table_widget.setItem(row_i, col_j, item)
+                self._set_table_cell(row_i, col_j,
+                                     self._format_value(val_raw), severity)
 
         self._table_widget.setUpdatesEnabled(True)
         if len(shown_rows) < len(self._table_rows):
@@ -3514,40 +4274,68 @@ class CSSLoggerWidget(QWidget):
     # ── Axis settings table ─────────────────────────────────────────────────
 
     def _refresh_axis_settings_tv(self):
-        pvs = self._pv_order
-        self._axis_tv.setRowCount(len(pvs))
+        # Group rows under "Original PV" / "Custom PV" divider rows when custom
+        # (derived) PVs exist, so derived channels are clearly separated from real
+        # ones. self._axis_row_pv maps each table row → PV name (None for a
+        # divider row) so the rest of the code never assumes row == _pv_order idx.
+        custom_names = {d.get("name", "") for d in self._custom_pvs}
+        originals = [pv for pv in self._pv_order if pv not in custom_names]
+        customs   = [pv for pv in self._pv_order if pv in custom_names]
+        plan = []                       # ("header", label) | ("pv", pv)
+        if customs:
+            plan.append(("header", "Original PV"))
+            plan += [("pv", pv) for pv in originals]
+            plan.append(("header", "Custom PV"))
+            plan += [("pv", pv) for pv in customs]
+        else:
+            plan += [("pv", pv) for pv in originals]
+        self._axis_row_pv = [payload if kind == "pv" else None
+                             for kind, payload in plan]
+
         _COL = list(self._axis_tv_cols)
-        for row_i, pv in enumerate(pvs):
-            s = self._pv_settings.get(pv, self._get_pv_default_settings(pv, row_i))
-            for col_j, col_name in enumerate(_COL):
-                val = s.get(col_name, "")
-                if col_name == "blank":
-                    item = QTableWidgetItem("")
-                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)   # non-editable spacer
-                    self._axis_tv.setItem(row_i, col_j, item)
-                elif col_name == "show":
-                    chk = QTableWidgetItem()
-                    chk.setCheckState(Qt.CheckState.Checked if val else Qt.CheckState.Unchecked)
-                    self._axis_tv.setItem(row_i, col_j, chk)
-                elif col_name == "color":
-                    item = QTableWidgetItem("")
-                    color_hex = s.get("color", _GRAPH_COLORS[row_i % len(_GRAPH_COLORS)])
-                    item.setData(Qt.ItemDataRole.UserRole, color_hex)
-                    self._axis_tv.setItem(row_i, col_j, item)
-                elif col_name == "auto_scale":
-                    chk = QTableWidgetItem()
-                    chk.setCheckState(Qt.CheckState.Checked if val else Qt.CheckState.Unchecked)
-                    self._axis_tv.setItem(row_i, col_j, chk)
-                elif col_name == "grid":
-                    chk = QTableWidgetItem()
-                    chk.setCheckState(Qt.CheckState.Checked if val else Qt.CheckState.Unchecked)
-                    self._axis_tv.setItem(row_i, col_j, chk)
-                else:
-                    txt = "" if val is None else str(val)
-                    item = QTableWidgetItem(txt)
-                    if col_name in ("pv", "cursor_val"):
-                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    self._axis_tv.setItem(row_i, col_j, item)
+        ncol = len(_COL)
+        # Rebuilding fires itemChanged for every setItem/setCheckState — block it
+        # so the auto-apply handler doesn't run mid-rebuild.
+        self._axis_tv.blockSignals(True)
+        try:
+            self._axis_tv.clearSpans()
+            self._axis_tv.setRowCount(len(plan))
+            for row_i, (kind, payload) in enumerate(plan):
+                if kind == "header":
+                    hdr = QTableWidgetItem(f"  {payload}")
+                    fnt = hdr.font(); fnt.setBold(True); hdr.setFont(fnt)
+                    hdr.setBackground(QColor("#E3F2FD"))
+                    hdr.setForeground(QColor("#0D47A1"))
+                    hdr.setFlags(Qt.ItemFlag.ItemIsEnabled)   # not selectable/editable
+                    self._axis_tv.setItem(row_i, 0, hdr)
+                    self._axis_tv.setSpan(row_i, 0, 1, ncol)
+                    continue
+                pv  = payload
+                idx = self._pv_order.index(pv)
+                s = self._pv_settings.get(pv, self._get_pv_default_settings(pv, idx))
+                for col_j, col_name in enumerate(_COL):
+                    val = s.get(col_name, "")
+                    if col_name == "blank":
+                        item = QTableWidgetItem("")
+                        item.setFlags(Qt.ItemFlag.ItemIsEnabled)   # non-editable spacer
+                        self._axis_tv.setItem(row_i, col_j, item)
+                    elif col_name in ("show", "auto_scale", "grid"):
+                        chk = QTableWidgetItem()
+                        chk.setCheckState(Qt.CheckState.Checked if val else Qt.CheckState.Unchecked)
+                        self._axis_tv.setItem(row_i, col_j, chk)
+                    elif col_name == "color":
+                        item = QTableWidgetItem("")
+                        color_hex = s.get("color", _GRAPH_COLORS[idx % len(_GRAPH_COLORS)])
+                        item.setData(Qt.ItemDataRole.UserRole, color_hex)
+                        self._axis_tv.setItem(row_i, col_j, item)
+                    else:
+                        txt = "" if val is None else str(val)
+                        item = QTableWidgetItem(txt)
+                        if col_name in ("pv", "cursor_val"):
+                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        self._axis_tv.setItem(row_i, col_j, item)
+        finally:
+            self._axis_tv.blockSignals(False)
 
     def _on_axis_tv_double_click(self, row, col):
         col_name = list(self._axis_tv_cols)[col] if col < len(self._axis_tv_cols) else ""
@@ -3571,21 +4359,44 @@ class CSSLoggerWidget(QWidget):
             self._axis_last_clicked_row = row
 
     def _on_axis_color_changed(self, row, color_hex):
-        if row < len(self._pv_order):
-            pv = self._pv_order[row]
-            if pv not in self._pv_settings:
-                self._pv_settings[pv] = self._get_pv_default_settings(pv, row)
-            self._pv_settings[pv]["color"] = color_hex
-            # Update graph line immediately
-            if row < len(self._graph_lines) and self._graph_lines[row]:
-                for ln in self._graph_lines[row]:
+        row_pv = getattr(self, "_axis_row_pv", [])
+        pv = row_pv[row] if 0 <= row < len(row_pv) else None
+        if not pv:
+            return                       # divider/header row
+        if pv not in self._pv_settings:
+            idx = self._pv_order.index(pv) if pv in self._pv_order else 0
+            self._pv_settings[pv] = self._get_pv_default_settings(pv, idx)
+        self._pv_settings[pv]["color"]      = color_hex
+        self._pv_settings[pv]["color_auto"] = False
+        # Update the graph immediately. Graph artists are indexed by *plotted*
+        # PVs (hidden ones are skipped), so map PV → line index by name rather
+        # than reusing the table row (which now also contains divider rows).
+        if pv in self._graph_pvs:
+            gi = self._graph_pvs.index(pv)
+            if gi < len(self._graph_lines) and self._graph_lines[gi]:
+                for ln in self._graph_lines[gi]:
                     ln.set_color(color_hex)
-                if row < len(self._graph_axes):
-                    ax = self._graph_axes[row]
+                if gi < len(self._graph_axes):
+                    ax = self._graph_axes[gi]
                     ax.yaxis.label.set_color(color_hex)
                     ax.tick_params(axis="y", labelcolor=color_hex)
                 if self._mpl_canvas:
                     self._mpl_canvas.draw_idle()
+
+    def _on_axis_item_changed(self, item):
+        # Auto-apply: any edit in the axis table takes effect at once so the graph
+        # never drifts out of sync with the table. Colour is handled live by the
+        # swatch delegate (_on_axis_color_changed); cursor_val is a derived display
+        # column written by the crosshair — skip both to avoid a redundant replot.
+        row_pv = getattr(self, "_axis_row_pv", [])
+        row = item.row()
+        if row >= len(row_pv) or row_pv[row] is None:
+            return                       # divider/header row
+        col_name = (list(self._axis_tv_cols)[item.column()]
+                    if item.column() < len(self._axis_tv_cols) else "")
+        if col_name in ("color", "cursor_val"):
+            return
+        self._apply_axis_settings()
 
     @staticmethod
     def _safe_float(txt, fallback=None):
@@ -3600,10 +4411,11 @@ class CSSLoggerWidget(QWidget):
 
     def _apply_axis_settings(self):
         _COL = list(self._axis_tv_cols)
+        row_pv = getattr(self, "_axis_row_pv", [])
         for row_i in range(self._axis_tv.rowCount()):
-            pv_item = self._axis_tv.item(row_i, 1)
-            if not pv_item: continue
-            pv = pv_item.text()
+            pv = row_pv[row_i] if row_i < len(row_pv) else None
+            if not pv:                       # divider/header row
+                continue
             s  = self._pv_settings.setdefault(pv, {})
             for col_j, col_name in enumerate(_COL):
                 if col_name == "blank": continue
@@ -3624,7 +4436,7 @@ class CSSLoggerWidget(QWidget):
                     s[col_name] = int(txt) if txt.isdigit() else 1
                 else:
                     s[col_name] = item.text().strip()
-        self._plot_graph()
+        self._schedule_replot()
 
     def _get_pv_default_settings(self, pv, idx):
         return {
@@ -3632,6 +4444,7 @@ class CSSLoggerWidget(QWidget):
             "pv":           pv,
             "display_name": shorten_pv_name(pv),
             "color":        _GRAPH_COLORS[idx % len(_GRAPH_COLORS)],
+            "color_auto":   True,   # False once the user hand-picks a color
             "cursor_val":   "",
             "side":         "left",
             "ymin":         None,
@@ -3641,6 +4454,21 @@ class CSSLoggerWidget(QWidget):
             "smooth":       1,
             "grid":         idx == 0,
         }
+
+    def _resync_pv_colors(self):
+        """Re-assign palette colors by current display position so that two
+        adjacent PVs never end up with the same color. A PV keeps its old
+        color slot only if that color was picked by hand (color_auto is
+        False); colors are otherwise recycled from ``_GRAPH_COLORS`` in the
+        order the PVs currently appear, so this must run whenever
+        ``self._pv_order`` changes (PVs added/removed/reordered)."""
+        for i, pv in enumerate(self._pv_order):
+            s = self._pv_settings.get(pv)
+            if s is None:
+                s = self._get_pv_default_settings(pv, i)
+                self._pv_settings[pv] = s
+            if s.get("color_auto", True):
+                s["color"] = _GRAPH_COLORS[i % len(_GRAPH_COLORS)]
 
     # ── XY plot ─────────────────────────────────────────────────────────────
 
@@ -3902,6 +4730,7 @@ class CSSLoggerWidget(QWidget):
         self._pv_list.clear()
         for pv in p.get("pvs", []):
             self._pv_list.addItem(pv)
+        self._sync_pv_list_customs()   # keep custom rows pinned at the bottom
         self._update_pv_count()
         dt_from = parse_user_datetime(p.get("time_from", ""))
         dt_to   = parse_user_datetime(p.get("time_to",   ""))
@@ -3913,12 +4742,26 @@ class CSSLoggerWidget(QWidget):
             self._master_multiple_edit.setText(str(p["master_multiple"]))
         self._refresh_time_labels()
         self._log(f"Preset '{p['name']}' loaded.")
+        # Reflect the new PV set in the graph immediately, honouring the current
+        # mode: restart the live window, or reload the historical window — so the
+        # user no longer has to press LOAD DATA after switching presets.
+        if self._live_mode:
+            self._live_timer.stop()
+            self._countdown_timer.stop()
+            self._live_window_span = self._live_span_from_window()
+            self._live_last_ts = None
+            self._live_init_retries = 0
+            self._zoom_history.clear()
+            self._lbl_status.setText("Live: reloading preset…")
+            self._live_initial_load()
+        else:
+            self._on_load_clicked()
 
     def _save_preset(self):
         idx = self._preset_combo.currentIndex()
         if idx < 0:
             self._save_preset_as(); return
-        pvs  = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs  = self._real_pv_names()
         name = self._presets[idx].get("name", "?")
         self._presets[idx] = {
             "name": name, "pvs": pvs,
@@ -3931,7 +4774,7 @@ class CSSLoggerWidget(QWidget):
     def _save_preset_as(self):
         name, ok = QInputDialog.getText(self, "Save preset", "Preset name:")
         if not ok or not name.strip(): return
-        pvs  = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs  = self._real_pv_names()
         self._presets.append({
             "name": name.strip(), "pvs": pvs,
             "time_from": self._dt_from.strftime("%Y-%m-%d %H:%M"),
@@ -3959,13 +4802,25 @@ class CSSLoggerWidget(QWidget):
     def _open_pv_browser(self):
         dlg = PVBrowserDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            added = False
             for pv in dlg.selected_pvs:
                 # avoid duplicates
-                existing = [self._pv_list.item(i).text()
-                            for i in range(self._pv_list.count())]
-                if pv not in existing:
+                if pv not in self._real_pv_names():
                     self._pv_list.addItem(pv)
+                    added = True
+            self._sync_pv_list_customs()   # keep custom rows pinned at the bottom
             self._update_pv_count()
+            if added and self._live_mode:
+                # A PV added mid-session has no history yet. The live tick only
+                # fetches from the last-seen timestamp forward, so the new PV used
+                # to stay blank until Live was stopped and LOAD DATA pressed. Re-run
+                # the live initial load so it is fetched over the whole window right
+                # away (all PVs load concurrently in one pool, so this is quick).
+                self._live_timer.stop()
+                self._countdown_timer.stop()
+                self._live_last_ts = None
+                self._lbl_status.setText("Live: loading added PV…")
+                self._live_initial_load()
 
     def _remove_selected_pvs(self):
         for item in reversed(self._pv_list.selectedItems()):
@@ -3976,15 +4831,73 @@ class CSSLoggerWidget(QWidget):
         ans = QMessageBox.question(self, "Clear PVs", "Remove all PVs from list?")
         if ans == QMessageBox.StandardButton.Yes:
             self._pv_list.clear()
+            self._sync_pv_list_customs()   # keep custom PVs on show after a clear
             self._update_pv_count()
 
     def _on_pv_double_click(self, item):
+        if item.data(Qt.ItemDataRole.UserRole):
+            return                         # custom/divider row — not editable here
         pv, ok = QInputDialog.getText(self, "Edit PV", "PV name:", text=item.text())
         if ok and pv.strip():
             item.setText(pv.strip())
 
+    def _real_pv_names(self):
+        """The real archiver PVs queued for fetching — the only ones sent to the
+        archiver, saved into presets, or counted. Custom (derived) PVs are shown
+        in the list too but tagged (UserRole set), so they are skipped here."""
+        return [self._pv_list.item(i).text()
+                for i in range(self._pv_list.count())
+                if not self._pv_list.item(i).data(Qt.ItemDataRole.UserRole)]
+
+    def _sync_pv_list_customs(self):
+        """Mirror the defined custom PVs into the PV LIST (above LOAD DATA) as
+        read-only, visually distinct rows so they sit alongside the real PVs.
+        Source of truth stays ``self._custom_pvs``; these rows are tagged and
+        excluded from every fetch/save path via :meth:`_real_pv_names`."""
+        # Remove any previously-injected divider/custom rows (idempotent).
+        for i in range(self._pv_list.count() - 1, -1, -1):
+            if self._pv_list.item(i).data(Qt.ItemDataRole.UserRole):
+                self._pv_list.takeItem(i)
+        channels = self._cpv_dialog_channels()
+        for d in getattr(self, "_custom_pvs", []) or []:
+            name = d.get("name", "")
+            if not name:
+                continue
+            it = QListWidgetItem(f"ƒ  {name}")           # ƒ marks a derived PV
+            it.setData(Qt.ItemDataRole.UserRole, "custom")
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)            # visible, not selectable/editable
+            it.setForeground(QColor("#5C6BC0"))
+            fnt = it.font(); fnt.setItalic(True); it.setFont(fnt)
+            it.setBackground(QColor("#EEF1FB"))
+            it.setToolTip(self._custom_pv_tooltip(d, channels))
+            self._pv_list.addItem(it)
+
+    @staticmethod
+    def _custom_pv_tooltip(entry: dict, channels: list) -> str:
+        """``name = expr`` in the letters valid right now, followed by the PV
+        behind every letter — so the formula stays readable after the PV list has
+        been reordered or a preset swapped. ``channels`` comes from
+        :meth:`_cpv_dialog_channels`."""
+        name = entry.get("name", "")
+        if not entry.get("expr"):
+            return name
+        pv_by_letter = {lt: pv for lt, pv, _d, _ld in channels}
+        letter_by_pv = {pv: lt for lt, pv, _d, _ld in channels}
+        loaded_by_pv = {pv: ld for _lt, pv, _d, ld in channels}
+        expr, _unbound = _cpv_to_display(entry, letter_by_pv)
+        lines = [f"{name} = {expr}"]
+        for letter in _cpv_vars(expr):
+            pv = pv_by_letter.get(letter)
+            if not pv:
+                lines.append(f"    {letter} = ?  (no such channel)")
+            elif not loaded_by_pv.get(pv, True):
+                lines.append(f"    {letter} = {pv}   (not loaded)")
+            else:
+                lines.append(f"    {letter} = {pv}")
+        return "\n".join(lines)
+
     def _update_pv_count(self):
-        n = self._pv_list.count()
+        n = len(self._real_pv_names())
         self._lbl_pv_count.setText(f"{n} PV{'s' if n != 1 else ''}")
 
     # ── Time window dialog ───────────────────────────────────────────────────
@@ -4000,10 +4913,7 @@ class CSSLoggerWidget(QWidget):
                 # effect and data is re-fetched immediately.
                 self._live_timer.stop()
                 self._countdown_timer.stop()
-                window_diff = (self._dt_to - self._dt_from).total_seconds()
-                self._live_window_span = (timedelta(seconds=window_diff)
-                                          if 60 <= window_diff <= _LIVE_MAX_SPAN_S
-                                          else timedelta(hours=1))
+                self._live_window_span = self._live_span_from_window()
                 self._live_last_ts = None
                 self._zoom_history.clear()
                 self._lbl_status.setText("Live: reloading window…")
@@ -4015,7 +4925,7 @@ class CSSLoggerWidget(QWidget):
     # ── Conditions dialog ────────────────────────────────────────────────────
 
     def _open_conditions_dialog(self):
-        pvs = [self._pv_list.item(i).text() for i in range(self._pv_list.count())]
+        pvs = self._real_pv_names()
         dlg = _ConditionsDialog(self._conditions, pvs, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._conditions = dlg.result_conditions
@@ -4035,11 +4945,13 @@ class CSSLoggerWidget(QWidget):
     # ── Custom PV dialog ─────────────────────────────────────────────────────
 
     def _open_custom_pv_dialog(self):
-        dlg = _CustomPVDialog(self._custom_pvs, self._channel_letters(), self)
+        dlg = _CustomPVDialog(self._custom_pvs, self._cpv_dialog_channels(), self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._custom_pvs = dlg.result_pvs
             save_custom_pvs(self._custom_pvs)
-            self._compile_custom_pvs()
+            self._sync_pv_list_customs()   # reflect new/removed customs in the PV LIST
+            self._update_pv_count()
+            self._cpv_last_diag = None     # report problems for the new set again
             if self._table_rows_unfiltered:
                 # Recompute customs and re-run the filter pipeline so the new
                 # channels appear with real values everywhere (graph + table).
@@ -4050,14 +4962,6 @@ class CSSLoggerWidget(QWidget):
                 self._refresh_axis_settings_tv()
                 self._populate_table()
                 self._refresh_xy_choices()
-
-    def _compile_custom_pvs(self):
-        self._custom_pv_exprs = {}
-        for entry in self._custom_pvs:
-            name = entry.get("name", "")
-            expr = entry.get("expr", "")
-            if name and expr:
-                self._custom_pv_exprs[name] = expr
 
     # ── CSV Export ───────────────────────────────────────────────────────────
 
@@ -4287,43 +5191,236 @@ class _RefLinesDialog(QDialog):
         self.accept()
 
 
+# ── Graph settings dialog ────────────────────────────────────────────────────
+
+class _GraphSettingsDialog(QDialog):
+    """Fonts, axis-column spacing, plot margins and cursor options for the
+    banded Graph tab. Apply repaints the live graph without closing, Cancel
+    restores whatever was in effect when the dialog opened."""
+
+    applied = Signal(dict)
+
+    # Edge gaps are shown as percentages of the figure, which is how a user
+    # thinks about them; the stored values are matplotlib subplot fractions
+    # (margin_top is the TOP of the plot rect, hence 100 − gap).
+    def __init__(self, opts: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Graph settings")
+        self.original_opts = dict(opts)
+        self.result_opts   = dict(opts)
+        self.applied_once  = False      # was a live Apply already painted?
+
+        lay  = QVBoxLayout(self)
+        cols = QHBoxLayout(); lay.addLayout(cols)
+        left = QVBoxLayout(); right = QVBoxLayout()
+        cols.addLayout(left); cols.addLayout(right)
+
+        def _spin(vmin, vmax, val, suffix="", step=1, tip=""):
+            w = QSpinBox(); w.setRange(vmin, vmax); w.setValue(int(round(val)))
+            w.setSingleStep(step); w.setFixedWidth(80)
+            if suffix: w.setSuffix(" " + suffix)
+            if tip: w.setToolTip(tip)
+            return w
+
+        def _pct(vmin, vmax, frac, tip=""):
+            """Percent-of-figure spin box for a stored 0–1 fraction."""
+            w = QDoubleSpinBox(); w.setRange(vmin, vmax); w.setDecimals(1)
+            w.setSingleStep(0.5); w.setSuffix(" %"); w.setFixedWidth(80)
+            w.setValue(round(frac * 100.0, 1))
+            if tip: w.setToolTip(tip)
+            return w
+
+        def _check(val, tip=""):
+            w = QCheckBox(); w.setChecked(bool(val))
+            if tip: w.setToolTip(tip)
+            return w
+
+        def _group(title, rows, box_lay):
+            gb = QGroupBox(title)
+            g  = QGridLayout(gb); g.setVerticalSpacing(4)
+            for r, (text, widget) in enumerate(rows):
+                g.addWidget(QLabel(text), r, 0)
+                g.addWidget(widget, r, 1)
+            g.setColumnStretch(0, 1)
+            box_lay.addWidget(gb)
+
+        o = opts
+        self.w_font   = _spin(5, 24, o.get("font_size", 11), "pt")
+        self.w_tickd  = _spin(-6, 6, o.get("tick_font_delta", -1), "pt",
+                              tip="Tick-number size relative to the axis-title size")
+        self.w_curd   = _spin(-6, 6, o.get("cursor_font_delta", 0), "pt",
+                              tip="Cursor readout size relative to the axis-title size")
+        _group("Fonts", [("Axis titles", self.w_font),
+                         ("Tick numbers", self.w_tickd),
+                         ("Cursor readouts", self.w_curd)], left)
+
+        self.w_titles = _check(o.get("show_axis_titles", True),
+                               "Rotated PV name next to each Y axis")
+        self.w_gap    = _spin(0, 60, o.get("axis_gap_px", 4), "px",
+                              tip="Whitespace between an axis title and the axis "
+                                  "to its left — this is the gap that made the "
+                                  "columns wide")
+        self.w_pad    = _spin(0, 40, o.get("label_pad_px", 4), "px",
+                              tip="Gap between an axis title and its own tick numbers")
+        self.w_outer  = _spin(0, 80, o.get("outer_margin_px", 6), "px",
+                              tip="Whitespace left of the outermost axis title")
+        self.w_yticks = _spin(2, 12, o.get("y_ticks_max", 6),
+                              tip="Upper bound; fewer are used if they would overlap")
+        self.w_minor  = _check(o.get("y_minor_ticks", True),
+                               "Small unlabelled ticks between the major ones. "
+                               "Turning them off speeds up drawing with many PVs.")
+        _group("Y axis columns", [("Show axis titles", self.w_titles),
+                                  ("Gap to next axis", self.w_gap),
+                                  ("Title ↔ numbers", self.w_pad),
+                                  ("Outer margin", self.w_outer),
+                                  ("Max Y ticks", self.w_yticks),
+                                  ("Minor ticks", self.w_minor)], left)
+
+        self.w_mright = _pct(0, 30, float(o.get("margin_right", 0.015)))
+        self.w_mtop   = _pct(0, 40, 1.0 - float(o.get("margin_top", 0.97)))
+        self.w_mbot   = _pct(2, 40, float(o.get("margin_bottom", 0.12)),
+                             tip="Must stay tall enough for the time axis labels")
+        self.w_band   = _pct(0, 45, float(o.get("band_pad_frac", 0.12)),
+                             tip="Empty space kept above and below each PV's trace "
+                                 "inside its own band")
+        _group("Plot margins", [("Right gap", self.w_mright),
+                                ("Top gap", self.w_mtop),
+                                ("Bottom gap", self.w_mbot),
+                                ("Gap inside band", self.w_band)], right)
+
+        self.w_boxes  = _check(o.get("cursor_value_boxes", True),
+                               "Value box per PV at the crosshair. The most "
+                               "expensive part of hovering with many PVs.")
+        self.w_bmax   = _spin(1, 64, o.get("cursor_boxes_max", 20),
+                              tip="Above this many PVs the value boxes are dropped "
+                                  "automatically")
+        self.w_marks  = _check(o.get("line_markers", True),
+                               "Dots on traces with fewer than 200 points")
+        _group("Cursor & performance", [("Value boxes at cursor", self.w_boxes),
+                                        ("…up to this many PVs", self.w_bmax),
+                                        ("Point markers", self.w_marks)], right)
+        right.addStretch()
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                | QDialogButtonBox.StandardButton.Cancel
+                                | QDialogButtonBox.StandardButton.Apply
+                                | QDialogButtonBox.StandardButton.RestoreDefaults)
+        btns.accepted.connect(self._accept)
+        btns.rejected.connect(self.reject)
+        btns.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(
+            self._emit_apply)
+        btns.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
+            self._restore_defaults)
+        lay.addWidget(btns)
+
+    def _emit_apply(self):
+        self.applied_once = True
+        self.applied.emit(self._collect())
+
+    def _collect(self) -> dict:
+        return {
+            "font_size":          self.w_font.value(),
+            "tick_font_delta":    self.w_tickd.value(),
+            "cursor_font_delta":  self.w_curd.value(),
+            "show_axis_titles":   self.w_titles.isChecked(),
+            "axis_gap_px":        self.w_gap.value(),
+            "label_pad_px":       self.w_pad.value(),
+            "outer_margin_px":    self.w_outer.value(),
+            "y_ticks_max":        self.w_yticks.value(),
+            "y_minor_ticks":      self.w_minor.isChecked(),
+            "margin_right":       round(self.w_mright.value() / 100.0, 5),
+            "margin_top":         round(1.0 - self.w_mtop.value() / 100.0, 5),
+            "margin_bottom":      round(self.w_mbot.value() / 100.0, 5),
+            "band_pad_frac":      round(self.w_band.value() / 100.0, 5),
+            "cursor_value_boxes": self.w_boxes.isChecked(),
+            "cursor_boxes_max":   self.w_bmax.value(),
+            "line_markers":       self.w_marks.isChecked(),
+        }
+
+    def _restore_defaults(self):
+        d = _GRAPH_OPTS_DEFAULTS
+        self.w_font.setValue(d["font_size"])
+        self.w_tickd.setValue(d["tick_font_delta"])
+        self.w_curd.setValue(d["cursor_font_delta"])
+        self.w_titles.setChecked(d["show_axis_titles"])
+        self.w_gap.setValue(d["axis_gap_px"])
+        self.w_pad.setValue(d["label_pad_px"])
+        self.w_outer.setValue(d["outer_margin_px"])
+        self.w_yticks.setValue(d["y_ticks_max"])
+        self.w_minor.setChecked(d["y_minor_ticks"])
+        self.w_mright.setValue(round(d["margin_right"] * 100, 1))
+        self.w_mtop.setValue(round((1.0 - d["margin_top"]) * 100, 1))
+        self.w_mbot.setValue(round(d["margin_bottom"] * 100, 1))
+        self.w_band.setValue(round(d["band_pad_frac"] * 100, 1))
+        self.w_boxes.setChecked(d["cursor_value_boxes"])
+        self.w_bmax.setValue(d["cursor_boxes_max"])
+        self.w_marks.setChecked(d["line_markers"])
+        self._emit_apply()
+
+    def _accept(self):
+        self.result_opts = self._collect()
+        self.accept()
+
+
 # ── Custom PV Dialog ─────────────────────────────────────────────────────────
 
 class _CustomPVDialog(QDialog):
-    def __init__(self, custom_pvs, channel_letters=None, parent=None):
+    """Editor for the derived channels.
+
+    ``channels`` is ``[(letter, pv_name, display_name, loaded)]`` — the channels
+    the letters currently stand for, including the PVs a formula is bound to but
+    that are not loaded right now. Expressions are shown in *current* letters
+    (rewritten from each entry's stored bindings) and are canonicalised back on
+    OK, so a formula keeps its PVs across preset switches and list edits.
+    """
+
+    def __init__(self, custom_pvs, channels=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom PVs (derived channels)")
-        self.resize(820, 580)
+        self.resize(820, 620)
         self._rows: list = []
         self.result_pvs: list = []
+
+        channels = list(channels or [])
+        self._pv_by_letter = {lt: pv for lt, pv, _d, _ld in channels}
+        self._letter_by_pv = {pv: lt for lt, pv, _d, _ld in channels}
+        self._loaded_by_pv = {pv: ld for _lt, pv, _d, ld in channels}
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel(
             "Define new virtual PVs as Python expressions.\n"
-            "Use the letters below as variables (e.g. B/D, A*0.749)."))
+            "Use the letters below as variables (e.g. B/D, A*0.749). Each formula "
+            "remembers the PV behind every letter, so the letters are re-assigned "
+            "to follow the PVs whenever the list order changes."))
 
-        # ── Reference table: which letter is which channel ──────────────────
-        channel_letters = channel_letters or []
+        # ── Reference table: which letter is which PV ────────────────────────
         ref_box = QGroupBox("Available channels")
         ref_lay = QVBoxLayout(ref_box)
-        if channel_letters:
-            ref_tbl = QTableWidget(len(channel_letters), 2)
-            ref_tbl.setHorizontalHeaderLabels(["Var", "Channel"])
+        if channels:
+            ref_tbl = QTableWidget(len(channels), 4)
+            ref_tbl.setHorizontalHeaderLabels(["Var", "Channel", "PV name", "State"])
             ref_tbl.verticalHeader().setVisible(False)
             ref_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             ref_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-            ref_tbl.setMaximumHeight(150)
-            for r, (letter, _name, disp) in enumerate(channel_letters):
+            ref_tbl.setMaximumHeight(200)
+            for r, (letter, pv, disp, loaded) in enumerate(channels):
                 it_l = QTableWidgetItem(letter)
                 it_l.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                ref_tbl.setItem(r, 0, it_l)
-                ref_tbl.setItem(r, 1, QTableWidgetItem(disp))
+                cells = [it_l, QTableWidgetItem(disp), QTableWidgetItem(pv),
+                         QTableWidgetItem("loaded" if loaded else "not loaded")]
+                for c, it in enumerate(cells):
+                    if not loaded:
+                        # Text only — the row must stay readable on the light
+                        # table background.
+                        it.setForeground(QColor("#B71C1C"))
+                    ref_tbl.setItem(r, c, it)
             ref_tbl.setColumnWidth(0, 50)
+            ref_tbl.setColumnWidth(3, 80)
             ref_tbl.horizontalHeader().setSectionResizeMode(
-                1, QHeaderView.ResizeMode.Stretch)
+                2, QHeaderView.ResizeMode.Stretch)
             ref_lay.addWidget(ref_tbl)
         else:
-            hint = QLabel("Load data first to see the PV letters.")
+            hint = QLabel("No PVs in the list yet — add some to get channel letters.")
             hint.setStyleSheet("color:#777;")
             ref_lay.addWidget(hint)
         lay.addWidget(ref_box)
@@ -4355,27 +5452,80 @@ class _CustomPVDialog(QDialog):
         rl    = QHBoxLayout(row_w); rl.setContentsMargins(0,0,0,0)
         name_e = QLineEdit(existing.get("name","") if existing else "")
         name_e.setMinimumWidth(220); name_e.setPlaceholderText("Name")
-        expr_e = QLineEdit(existing.get("expr","") if existing else "")
+        # Stored letters -> the letters valid right now.
+        expr_txt = ""
+        if existing:
+            expr_txt, _unbound = _cpv_to_display(existing, self._letter_by_pv)
+        expr_e = QLineEdit(expr_txt)
         expr_e.setMinimumWidth(260); expr_e.setPlaceholderText("Expression (Python)")
+        warn = QLabel("⚠"); warn.setFixedWidth(18)
+        warn.setStyleSheet("color:#B71C1C;font-weight:700;")
         b_del = QPushButton("✕"); b_del.setFixedWidth(26)
         b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;border-radius:3px;}")
         b_del.clicked.connect(lambda: self._remove_row(row_w, rec))
-        rl.addWidget(name_e); rl.addWidget(expr_e); rl.addWidget(b_del)
-        rec = {"widget": row_w, "name": name_e, "expr": expr_e}
+        rl.addWidget(name_e); rl.addWidget(expr_e); rl.addWidget(warn); rl.addWidget(b_del)
+        rec = {"widget": row_w, "name": name_e, "expr": expr_e, "warn": warn}
         self._rows.append(rec)
+        expr_e.textChanged.connect(lambda _t, r=rec: self._refresh_row_state(r))
+        self._refresh_row_state(rec)
         self._inner_lay.insertWidget(self._inner_lay.count() - 1, row_w)
+
+    def _refresh_row_state(self, rec):
+        """Spell out what each letter in the row means, and flag the row when a
+        letter has no channel or its PV is not loaded."""
+        lines, bad = [], False
+        for letter in _cpv_vars(rec["expr"].text()):
+            pv = self._pv_by_letter.get(letter)
+            if not pv:
+                lines.append(f"{letter} = ?  (no such channel)")
+                bad = True
+            elif not self._loaded_by_pv.get(pv, True):
+                lines.append(f"{letter} = {pv}   (not loaded)")
+                bad = True
+            else:
+                lines.append(f"{letter} = {pv}")
+        rec["expr"].setToolTip("\n".join(lines))
+        rec["warn"].setVisible(bad)
+        rec["warn"].setToolTip("\n".join(lines) if bad else "")
 
     def _remove_row(self, row_w, rec):
         self._rows.remove(rec)
         row_w.deleteLater()
 
     def _accept(self):
-        self.result_pvs = [
-            {"name": r["name"].text().strip(), "expr": r["expr"].text().strip()}
-            for r in self._rows
-            if r["name"].text().strip() and r["expr"].text().strip()
-        ]
+        out = []
+        for r in self._rows:
+            name = r["name"].text().strip()
+            expr, bindings = _cpv_from_display(r["expr"].text(), self._pv_by_letter)
+            if name and expr:
+                out.append({"name": name, "expr": expr, "bindings": bindings})
+        self.result_pvs = out
         self.accept()
+
+
+# ── Icon helpers ─────────────────────────────────────────────────────────────
+
+def _icon_file():
+    """Locate icon.ico next to the exe (frozen) or the script. _HERE points at
+    the source folder, which in a frozen build is not where icon.ico lives."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(pathlib.Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(pathlib.Path(meipass) / "icon.ico")
+    cands.append(_HERE / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
+# Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
+# here. Measured on Win11: with the window icon and the window-class icon
+# deliberately set to two different images, the taskbar draws the *window*
+# icon, so Qt's setWindowIcon is already sufficient. The real bug was that
+# _HERE is not frozen-aware, so the frozen build never found icon.ico at all.
 
 
 # ── Combined main window ─────────────────────────────────────────────────────
@@ -4383,7 +5533,10 @@ class _CustomPVDialog(QDialog):
 class CPVASuiteWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CPVA Suite  —  CSS Logger + Spectra")
+        self.setWindowTitle("CSS Logger")
+        icon_path = _icon_file()
+        if icon_path:
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1600, 950)
         self._build_ui()
         self._restore_geometry()
@@ -4456,7 +5609,15 @@ class CPVASuiteWindow(QMainWindow):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def _run():
+    try:
+        import ctypes as _ct
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.CSSLogger")
+    except Exception:
+        pass
     app = QApplication.instance() or QApplication(sys.argv)
+    _ico = _icon_file()
+    if _ico:
+        app.setWindowIcon(QIcon(str(_ico)))   # taskbar + alt-tab
     app.setStyle("Fusion")
     app.setStyleSheet(_APP_STYLESHEET)
     pal = QPalette()

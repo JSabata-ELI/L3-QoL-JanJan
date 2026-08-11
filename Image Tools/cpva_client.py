@@ -39,6 +39,21 @@ CPVA_HOST       = CPVA_BASE_URL.split("://", 1)[1].split("/")[0]   # "10.78.0.57
 CPVA_BASE_PATH  = "/" + CPVA_BASE_URL.split("://", 1)[1].split("/", 1)[1]
 DEFAULT_TIMEOUT = 10.0
 
+# A whole-day query for a busy channel returns 30k–100k samples and measured
+# 0.3–7.4 s server-side, so the per-call timeout (tuned for small queries) is far
+# too tight for it — it used to turn healthy days into "error". Full-day fetches
+# therefore get their own floor; incremental tail fetches keep the caller's value.
+FULL_DAY_TIMEOUT = 25.0
+
+# After a failed (channel, day) fetch, don't hammer the archiver: an "error" is
+# never cached as data, so without this every lookup re-ran a whole-day query and
+# paid the full timeout again.
+ERROR_BACKOFF_S = 10.0
+
+# Today's tail fetch re-reads this much already-cached time so a sample archived
+# late (with a timestamp before the newest one we hold) is still picked up.
+TAIL_OVERLAP_NS = 5 * 1_000_000_000
+
 # Canonical column/PV-name → archiver channel. Keys are the names used by the
 # Image Finder / Shot Finder energy columns; the Slider uses capitalized display
 # names locally and maps them onto the same channels.
@@ -262,11 +277,21 @@ class DayResult(NamedTuple):
     samples: "list[tuple[int, float]]"   # sorted (t_ns, value)
     status:  str                         # "ok" | "empty" | "stale" | "error"
     age_s:   float                       # since last successful fetch (inf for "error")
+    # Timestamps of `samples`, precomputed once per fetch. Bisecting a day used to
+    # rebuild this list on EVERY lookup (8 ms per call on a 140k-sample span).
+    # Optional/last so older positional constructions keep working.
+    ts_list: "list[int]" = ()
 
 
 class _Entry(NamedTuple):
     samples: "list[tuple[int, float]]"
+    ts_list: "list[int]"
     fetched_mono: float
+    # True when the fetch happened while the day was still running, so the day may
+    # have grown since. Without this a day first read at 15:00 stayed cached as an
+    # immutable "past day" once midnight passed, and every shot archived after that
+    # first read read back as "no data" for the rest of the session.
+    partial: bool = False
 
 
 _DAY_CACHE_MAX = 64
@@ -287,6 +312,32 @@ class _InFlight:
 # Single-flight: (channel, date_key) → in-progress fetch record.
 _inflight: "dict[tuple[str, str], _InFlight]" = {}
 
+# (channel, date_key) → monotonic time until which a failed fetch is not retried.
+_error_until: "dict[tuple[str, str], float]" = {}
+
+
+def _entry_result(ent: "_Entry", status: str, age: float) -> DayResult:
+    return DayResult(ent.samples, status, age, ent.ts_list)
+
+
+def _merge_tail(old: "list[tuple[int, float]]", old_ts: "list[int]",
+                tail: "list[tuple[int, float]]") -> "list[tuple[int, float]]":
+    """Append newly archived samples from an overlapping tail query, skipping the
+    ones already held. Sorted output; only re-sorts when a late write lands before
+    the newest cached sample."""
+    if not tail:
+        return old
+    if not old:
+        return sorted(tail, key=lambda x: x[0])
+    start = bisect_left(old_ts, tail[0][0])
+    existing = set(old_ts[start:])
+    add = [s for s in tail if s[0] not in existing]
+    if not add:
+        return old
+    if add[0][0] < old_ts[-1]:
+        return sorted(old + add, key=lambda x: x[0])
+    return old + add
+
 
 def get_day(channel: str, date_key: str, *,
             today_ttl: float = 3.0,
@@ -296,11 +347,14 @@ def get_day(channel: str, date_key: str, *,
     Status semantics:
       "ok"    — fresh (or immutable past-day) data, possibly re-served from cache.
       "empty" — the archiver answered and there are genuinely no samples.
-      "stale" — this fetch FAILED but an older successful result exists; its
-                samples are returned so the UI can keep showing data, flagged.
-      "error" — fetch failed and nothing is cached. NEVER cached itself: the
-                next call retries.
-    Past days are immutable → cached without TTL. Today honours today_ttl.
+      "stale" — this fetch FAILED (or is being backed off) but an older successful
+                result exists; its samples are returned so the UI can keep showing
+                data, flagged.
+      "error" — fetch failed and nothing is cached. Not cached as data, but the
+                same (channel, day) is not retried for ERROR_BACKOFF_S.
+    Past days are immutable → cached without TTL. Today honours today_ttl and is
+    refreshed with an INCREMENTAL tail query (only the time after the newest
+    cached sample), not by re-downloading the whole day.
     """
     key = (channel, date_key)
     is_today = (date_key == today_key())
@@ -311,8 +365,17 @@ def get_day(channel: str, date_key: str, *,
             if ent is not None:
                 _day_cache.move_to_end(key)
                 age = time.monotonic() - ent.fetched_mono
-                if not is_today or age < today_ttl:
-                    return DayResult(ent.samples, "ok" if ent.samples else "empty", age)
+                # Today: honour the TTL. A finished day: serve forever, unless it
+                # was read while it was still running (then top it up once).
+                if (age < today_ttl) if is_today else (not ent.partial):
+                    return _entry_result(ent, "ok" if ent.samples else "empty", age)
+            blocked_until = _error_until.get(key, 0.0)
+            if blocked_until > time.monotonic():
+                # A recent fetch of this day failed — don't pay the timeout again.
+                if ent is not None:
+                    return _entry_result(ent, "stale",
+                                         time.monotonic() - ent.fetched_mono)
+                return DayResult([], "error", float("inf"), ())
             fl = _inflight.get(key)
             if fl is None:
                 fl = _InFlight()
@@ -326,28 +389,43 @@ def get_day(channel: str, date_key: str, *,
         # Fetcher still running (wait timed out) or died without a result —
         # loop back to re-check the cache / in-flight state.
 
+    day_start, day_end = day_bounds_ns(date_key)
     try:
-        samples = fetch_values(channel, *day_bounds_ns(date_key), timeout=timeout)
+        if ent is not None and ent.samples:
+            # Incremental refresh of today: ask only for what we cannot have yet.
+            # try_value_suffix stays off — an empty tail is the NORMAL answer here
+            # and must not cost a second request every time.
+            tail = fetch_values(channel,
+                                max(day_start, ent.ts_list[-1] - TAIL_OVERLAP_NS),
+                                day_end, timeout=timeout, try_value_suffix=False)
+            samples = _merge_tail(ent.samples, ent.ts_list, tail)
+        else:
+            samples = fetch_values(channel, day_start, day_end,
+                                   timeout=max(timeout, FULL_DAY_TIMEOUT))
     except CpvaError:
         with _day_cache_lock:
+            _error_until[key] = time.monotonic() + ERROR_BACKOFF_S
             ent = _day_cache.get(key)
             if ent is not None:
-                res = DayResult(ent.samples, "stale", time.monotonic() - ent.fetched_mono)
+                res = _entry_result(ent, "stale", time.monotonic() - ent.fetched_mono)
             else:
-                res = DayResult([], "error", float("inf"))
+                res = DayResult([], "error", float("inf"), ())
             _finish_inflight(key, res)
         return res
     except BaseException:
         with _day_cache_lock:
-            _finish_inflight(key, DayResult([], "error", float("inf")))
+            _finish_inflight(key, DayResult([], "error", float("inf"), ()))
         raise
 
+    ts_list = [s[0] for s in samples]
+    partial = int(time.time() * 1e9) <= day_end     # the day had not ended yet
     with _day_cache_lock:
-        _day_cache[key] = _Entry(samples, time.monotonic())
+        _error_until.pop(key, None)
+        _day_cache[key] = ent = _Entry(samples, ts_list, time.monotonic(), partial)
         _day_cache.move_to_end(key)
         while len(_day_cache) > _DAY_CACHE_MAX:
             _day_cache.popitem(last=False)
-        res = DayResult(samples, "ok" if samples else "empty", 0.0)
+        res = _entry_result(ent, "ok" if samples else "empty", 0.0)
         _finish_inflight(key, res)
     return res
 
@@ -376,13 +454,31 @@ def warm_days(channels: "Iterable[str]", date_keys: "Iterable[str]",
         pass
 
 
+def peek_day(channel: str, date_key: str) -> "DayResult | None":
+    """Cached samples for one day WITHOUT touching the network. None = cache miss.
+    Today's TTL is ignored (the point is to never block a UI thread)."""
+    key = (channel, date_key)
+    with _day_cache_lock:
+        ent = _day_cache.get(key)
+        if ent is None:
+            return None
+        _day_cache.move_to_end(key)
+        return _entry_result(ent, "ok" if ent.samples else "empty",
+                             time.monotonic() - ent.fetched_mono)
+
+
 def invalidate(channel: "str | None" = None, date_key: "str | None" = None) -> None:
-    """Drop cached days matching the given channel and/or date_key (None = any)."""
+    """Drop cached days matching the given channel and/or date_key (None = any).
+    Also clears the error backoff, so an explicit refresh always retries now."""
     with _day_cache_lock:
         for key in [k for k in _day_cache
                     if (channel is None or k[0] == channel)
                     and (date_key is None or k[1] == date_key)]:
             del _day_cache[key]
+        for key in [k for k in _error_until
+                    if (channel is None or k[0] == channel)
+                    and (date_key is None or k[1] == date_key)]:
+            del _error_until[key]
 
 
 # ── generic matcher ───────────────────────────────────────────────────────────
@@ -391,32 +487,53 @@ def nearest_sample(samples: "list[tuple[int, float]]", ts_ns: int,
                    *, window_ns: int, prefer: str = "before") -> "float | None":
     """Value of the sample nearest ts_ns within ±window_ns, or None.
 
+    prefer="nearest": the sample closest in time wins, whichever side it is on.
     prefer="before": last sample ≤ ts_ns wins; a later sample within the window
-    is the fallback (energy detectors fire just before the image).
-    prefer="after": mirrored (waveplate motor settles after the trigger).
+    is the fallback.
+    prefer="after": mirrored.
     samples must be sorted by t_ns.
     """
     s = nearest_sample_ex(samples, ts_ns, window_ns=window_ns, prefer=prefer)
     return None if s is None else s[1]
 
 
+def _match_score(dt_ns: int, prefer: str) -> "tuple[int, int]":
+    """Ranking key for a candidate sample offset (sample_ts - ts_ns); lower wins.
+    Used both inside one day and to pick between days."""
+    if prefer == "before":
+        return (0 if dt_ns <= 0 else 1, abs(dt_ns))
+    if prefer == "after":
+        return (0 if dt_ns >= 0 else 1, abs(dt_ns))
+    return (0, abs(dt_ns))          # "nearest"
+
+
 def nearest_sample_ex(samples: "list[tuple[int, float]]", ts_ns: int,
-                      *, window_ns: int, prefer: str = "before"
+                      *, window_ns: int, prefer: str = "before",
+                      ts_list: "list[int] | None" = None
                       ) -> "tuple[int, float] | None":
-    """Like nearest_sample but returns the full (t_ns, value) sample."""
+    """Like nearest_sample but returns the full (t_ns, value) sample.
+
+    ts_list is the precomputed timestamp column of `samples` (see DayResult.ts_list).
+    Pass it whenever it is available — building it here costs O(n) per call and
+    dwarfs the bisect itself on a day-sized list."""
     if not samples:
         return None
-    ts_list = [s[0] for s in samples]
+    if not ts_list or len(ts_list) != len(samples):
+        ts_list = [s[0] for s in samples]
     idx_b = bisect_right(ts_list, ts_ns) - 1
     idx_f = bisect_left(ts_list, ts_ns)
-    before = samples[idx_b] if idx_b >= 0 and (ts_ns - samples[idx_b][0]) <= window_ns else None
-    after = samples[idx_f] if idx_f < len(samples) and (samples[idx_f][0] - ts_ns) <= window_ns else None
-    first, second = (before, after) if prefer == "before" else (after, before)
-    if first is not None:
-        return first
-    if second is not None:
-        return second
-    return None
+    best = None
+    best_score = None
+    for idx in (idx_b, idx_f):
+        if not (0 <= idx < len(samples)):
+            continue
+        dt = samples[idx][0] - ts_ns
+        if abs(dt) > window_ns:
+            continue
+        score = _match_score(dt, prefer)
+        if best_score is None or score < best_score:
+            best, best_score = samples[idx], score
+    return best
 
 
 # ── high-level value lookup (shared tri-state contract) ───────────────────────
@@ -425,10 +542,18 @@ def nearest_sample_ex(samples: "list[tuple[int, float]]", ts_ns: int,
 #   status "not_found"          → lookup succeeded, no sample matches → "n/a".
 #   status "error"              → fetch failed (retryable, never cached) → "ERR".
 #   status "stale"              → value from an older successful fetch → value + " (old)".
+#   matched sample further from the image than PV_EXACT_MATCH_NS → prefix "~":
+#                                 the pairing to this exact shot is not certain.
 
 PV_TEXT_ERROR = "ERR"
 PV_TEXT_NOT_FOUND = "n/a"
 PV_TEXT_STALE_SUFFIX = " (old)"
+PV_TEXT_APPROX_PREFIX = "~"
+
+# At 3.3 Hz (0.3 s between shots) a sample further than half that from the image
+# can no longer be attributed to this shot with certainty — measured offsets are
+# p50 0.025 s / p90 0.30 s, so the tail genuinely overlaps the neighbouring shot.
+PV_EXACT_MATCH_NS = 150_000_000
 
 
 class LookupResult(NamedTuple):
@@ -450,34 +575,67 @@ def format_lookup(res: "LookupResult", num_fmt) -> str:
     return txt
 
 
-# Channels matched by looking FORWARD from the image timestamp: the waveplate
-# motor settles AFTER the shot command, so the stable position is recorded
-# slightly after the image. Everything else (energy detectors) fires just
-# before the image → prefer "before".
-FORWARD_CHANNELS: frozenset = frozenset({"L3-PFWP6-MTR03-1:RawPos"})
+# Channels whose archiver record is a STEP function: a sample is written only
+# when the value CHANGES (motor position setpoints/readbacks). At any instant
+# the true value is therefore the last sample at or before that instant, however
+# old it is — matching them against a ±window is wrong, because between two
+# moves there is no nearby sample at all.
+STEP_CHANNELS: frozenset = frozenset({"L3-PFWP6-MTR03-1:RawPos"})
+# Backwards-compatible alias (older call sites read FORWARD_CHANNELS).
+FORWARD_CHANNELS: frozenset = STEP_CHANNELS
 
 # Progressively widening look-back windows (days). Stop at the first that has
 # data, so a slow PV that last changed a month (or more) ago is still resolved
 # in 1–4 queries.
 LOOKBACK_WINDOWS_DAYS = (2, 8, 32, 120, 400)
 
-# Cache of "last sample at or before this day" per (channel, date_key) — a whole
-# save range of older images reuses one wide look-back query instead of N.
+# Prague days consulted through the shared day cache (day-of-ts included) before
+# falling back to one wide, day-aligned look-back query.
+_STEP_DAY_WALK = 3
+
+# Cache of "last sample strictly BEFORE the start of this Prague day" per
+# (channel, date_key). The key fully determines the query, so a whole save range
+# reuses one wide look-back instead of N — WITHOUT one image's moment leaking
+# onto every other image of the same day. (The old cache was keyed by the day of
+# an arbitrary ts and stored the value at THAT ts, so the first lookup of a day
+# pinned its value for every later frame — a waveplate held at 350k would report
+# an unrelated earlier position.)
 _before_cache: "OrderedDict[tuple[str, str], tuple[float, int] | None]" = OrderedDict()
 _before_lock = threading.Lock()
 _BEFORE_CACHE_MAX = 256
+# Same purpose as _error_until, for the look-back queries (a failure here costs up
+# to len(LOOKBACK_WINDOWS_DAYS) timeouts, so retrying it per frame is expensive).
+_before_error_until: "dict[tuple[str, str], float]" = {}
 
 
-def value_at_or_before(channel: str, ts_ns: int, *,
-                       lookback_days: "tuple[int, ...]" = LOOKBACK_WINDOWS_DAYS,
-                       timeout: float = DEFAULT_TIMEOUT,
-                       network_ok: bool = True) -> LookupResult:
-    """Last sample at or before ts_ns, searching progressively further back in
-    time (covers PVs whose last change was days/weeks/months earlier). Cached
-    per (channel, Prague day); fetch failures are NEVER cached — the next call
-    retries. network_ok=False serves only cache hits (for UI-thread callers):
-    a miss returns "not_found" without touching the network."""
-    ck = (channel, date_key_for_ns(ts_ns))
+def _last_at_or_before(samples: "list[tuple[int, float]]", ts_ns: int
+                       ) -> "tuple[int, float] | None":
+    """Last (t_ns, value) with t_ns <= ts_ns, or None. samples must be sorted."""
+    idx = bisect_right(samples, (ts_ns, float("inf"))) - 1
+    return samples[idx] if idx >= 0 else None
+
+
+def invalidate_lookback(channel: "str | None" = None,
+                        date_key: "str | None" = None) -> None:
+    """Drop cached day-boundary look-back anchors (None = any)."""
+    with _before_lock:
+        for key in [k for k in _before_cache
+                    if (channel is None or k[0] == channel)
+                    and (date_key is None or k[1] == date_key)]:
+            del _before_cache[key]
+        for key in [k for k in _before_error_until
+                    if (channel is None or k[0] == channel)
+                    and (date_key is None or k[1] == date_key)]:
+            del _before_error_until[key]
+
+
+def _value_before_day(channel: str, date_key: str, *,
+                      lookback_days: "tuple[int, ...]",
+                      timeout: float,
+                      network_ok: bool) -> LookupResult:
+    """Last sample strictly before the start of the Prague day date_key.
+    Cached per (channel, date_key); fetch failures are NEVER cached."""
+    ck = (channel, date_key)
     with _before_lock:
         if ck in _before_cache:
             hit = _before_cache[ck]
@@ -485,20 +643,26 @@ def value_at_or_before(channel: str, ts_ns: int, *,
             if hit is None:
                 return LookupResult(None, None, "not_found")
             return LookupResult(hit[0], hit[1], "ok")
+        if _before_error_until.get(ck, 0.0) > time.monotonic():
+            return LookupResult(None, None, "error")
     if not network_ok:
         return LookupResult(None, None, "not_found")
+    end_ns = day_bounds_ns(date_key)[0] - 1
     found: "tuple[float, int] | None" = None
     try:
         for d in lookback_days:
-            samples = fetch_values(channel, ts_ns - d * DAY_NS, ts_ns,
+            samples = fetch_values(channel, end_ns - d * DAY_NS, end_ns,
                                    timeout=timeout, try_value_suffix=False)
             if samples:
-                t_ns, val = samples[-1]   # query end is ts_ns → all samples ≤ ts_ns
+                t_ns, val = samples[-1]   # query end is end_ns → all samples ≤ end_ns
                 found = (val, t_ns)
                 break
     except CpvaError:
+        with _before_lock:
+            _before_error_until[ck] = time.monotonic() + ERROR_BACKOFF_S
         return LookupResult(None, None, "error")
     with _before_lock:
+        _before_error_until.pop(ck, None)
         _before_cache[ck] = found
         _before_cache.move_to_end(ck)
         while len(_before_cache) > _BEFORE_CACHE_MAX:
@@ -508,39 +672,113 @@ def value_at_or_before(channel: str, ts_ns: int, *,
     return LookupResult(found[0], found[1], "ok")
 
 
+def value_at_or_before(channel: str, ts_ns: int, *,
+                       lookback_days: "tuple[int, ...]" = LOOKBACK_WINDOWS_DAYS,
+                       timeout: float = DEFAULT_TIMEOUT,
+                       today_ttl: float = 3.0,
+                       network_ok: bool = True) -> LookupResult:
+    """Last sample at or before ts_ns — the true value of a step PV at ts_ns.
+
+    The day of ts_ns and the two days before it are read from the shared day
+    cache and bisected EXACTLY at ts_ns, so every frame of a day gets its own
+    value. Only when those days hold nothing does one wide, day-aligned
+    look-back query run (cached per day boundary, see _value_before_day) — that
+    covers PVs whose last change was weeks earlier.
+
+    A failed fetch returns status "error" instead of a value from further back:
+    an unverifiable day must not silently show an older position.
+    network_ok=False serves cache hits only (for UI-thread callers); days that
+    are not cached are reported as "stale" rather than dropped, so a value is
+    still shown — flagged as possibly out of date."""
+    ts_ns = int(ts_ns)
+    dk = date_key_for_ns(ts_ns)
+    status = "ok"
+    for _i in range(_STEP_DAY_WALK):
+        if network_ok:
+            res = get_day(channel, dk, today_ttl=today_ttl, timeout=timeout)
+        else:
+            res = peek_day(channel, dk)
+            if res is None:
+                # Cache-only mode and this day was never loaded — anything found
+                # further back may already be superseded.
+                status = "stale"
+                res = DayResult([], "empty", float("inf"))
+        if res.status == "error":
+            return LookupResult(None, None, "error")
+        if res.status == "stale":
+            status = "stale"
+        hit = _last_at_or_before(res.samples, ts_ns)
+        if hit is not None:
+            return LookupResult(hit[1], hit[0], status)
+        if _i < _STEP_DAY_WALK - 1:
+            dk = prev_date_key(dk)
+    # dk is now the EARLIEST day consulted — anchor the wide query at its start
+    # so no day is skipped between the walk and the look-back.
+    back = _value_before_day(channel, dk, lookback_days=lookback_days,
+                             timeout=timeout, network_ok=network_ok)
+    if back.value is not None and status == "stale":
+        return LookupResult(back.value, back.ts_ns, "stale")
+    return back
+
+
 def lookup_near(channel: str, ts_ns: int, *,
                 window_ns: int = 30 * 1_000_000_000,
                 prefer: "str | None" = None,
                 fallback_before: bool = False,
                 today_ttl: float = 3.0,
                 timeout: float = DEFAULT_TIMEOUT) -> LookupResult:
-    """Sample nearest ts_ns within ±window_ns, consulting the previous/current/
-    next Prague day caches (handles midnight boundaries).
+    """Sample nearest ts_ns within ±window_ns.
 
-    prefer=None picks "after" for FORWARD_CHANNELS, "before" otherwise.
+    STEP_CHANNELS bypass the window entirely: their value is only archived on
+    change, so the correct reading at ts_ns is the last sample at or before it
+    (value_at_or_before), and a "nearest within 30 s" match would either miss
+    (long hold between moves) or jump early to the NEXT position.
+
+    prefer defaults to "nearest" — the sample closest in time to the image. For a
+    per-shot detector "before" is WRONG as a tie-break: the archiver writes a
+    shot's sample up to ~0.3 s AFTER the image timestamp, so "last sample ≤ ts"
+    systematically returns the PREVIOUS shot (measured: 43 % of frames at 3.3 Hz).
+    Each day is bisected through its own cached index; the neighbouring days are
+    consulted only when ts_ns is within window_ns of midnight, so a sub-second
+    window costs one day fetch instead of three.
+
     fallback_before=True chains to value_at_or_before() when nothing is inside
-    the window — the slow-PV (waveplate) look-back. Fast channels should leave
-    it False so a value from a different session hours away is never shown.
+    the window. Fast channels should leave it False so a value from a different
+    session hours away is never shown.
     """
+    if channel in STEP_CHANNELS:
+        return value_at_or_before(channel, ts_ns, today_ttl=today_ttl,
+                                  timeout=timeout)
     if prefer is None:
-        prefer = "after" if channel in FORWARD_CHANNELS else "before"
+        prefer = "nearest"
     date_key = date_key_for_ns(ts_ns)
-    candidates: "list[tuple[int, float]]" = []
+    day_start, day_end = day_bounds_ns(date_key)
+    date_keys = [date_key]
+    if ts_ns - day_start < window_ns:
+        date_keys.insert(0, prev_date_key(date_key))
+    if day_end - ts_ns < window_ns:
+        date_keys.append(next_date_key(date_key))
+    hit = None
+    hit_score = None
     status = "ok"
-    for dk in (prev_date_key(date_key), date_key, next_date_key(date_key)):
+    for dk in date_keys:
         res = get_day(channel, dk, today_ttl=today_ttl, timeout=timeout)
-        if res.samples:
-            candidates.extend(res.samples)
         if res.status == "error":
             status = "error"
         elif res.status == "stale" and status != "error":
             status = "stale"
-    candidates.sort(key=lambda x: x[0])
-    hit = nearest_sample_ex(candidates, ts_ns, window_ns=window_ns, prefer=prefer)
+        cand = nearest_sample_ex(res.samples, ts_ns, window_ns=window_ns,
+                                 prefer=prefer, ts_list=res.ts_list)
+        if cand is None:
+            continue
+        score = _match_score(cand[0] - ts_ns, prefer)
+        if hit_score is None or score < hit_score:
+            hit, hit_score = cand, score
     if hit is not None:
         return LookupResult(hit[1], hit[0], status if status != "ok" else "ok")
-    if fallback_before or channel in FORWARD_CHANNELS:
-        back = value_at_or_before(channel, ts_ns, timeout=timeout)
+    if fallback_before:
+        back = value_at_or_before(channel, ts_ns, today_ttl=today_ttl,
+                                  timeout=timeout)
         if back.status == "error" and status == "error":
             return back
         if back.value is not None:

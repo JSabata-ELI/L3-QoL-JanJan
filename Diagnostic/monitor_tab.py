@@ -20,6 +20,8 @@ from __future__ import annotations
 import copy
 import json
 import re
+import socket
+import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -36,18 +38,21 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPlainTextEdit,
-    QProgressBar, QProgressDialog, QPushButton, QScrollArea, QSpinBox,
-    QSplitter, QTableView, QTableWidget, QTableWidgetItem, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton,
+    QScrollArea, QSpinBox, QSplitter, QTableView, QTableWidget,
+    QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import cpva_api as api
+import shared_pvs
 from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
-    NotificationHub, Thresholds, Trend, classify_trend, describe_reason,
+    NotificationHub, Thresholds, Trend, _raw_severity, classify_trend,
+    describe_reason,
 )
+import notify_provision
 from secrets_util import encrypt_secret
 
 # ---------------------------------------------------------------------------
@@ -164,6 +169,9 @@ WARN_COLOR = "#cc6600"
 ALARM_COLOR = "#cc2200"
 NODATA_COLOR = "#9e9e9e"
 BADDATA_COLOR = "#8e24aa"  # out-of-range sensor error (distinct from grey no-data)
+# Monitoring stopped: values keep coming in, but nothing is evaluated or sent.
+# The State cell keeps its real reading and gets this background instead.
+STOPPED_COLOR = "#7f0000"
 
 _BTN_PRIMARY = (
     "QPushButton { background:#1565C0; color:white; font-weight:700; "
@@ -272,7 +280,51 @@ DEFAULT_SETTINGS = {
     "webex_commands_enabled": True,
     "webex_command_poll_s": 5,   # <5 s tends to trip Webex HTTP 429 rate limits
     "webex_command_allowlist": [],   # sender emails allowed; empty = anyone in room
+    # shared PV list: the list itself, and the shared part of these settings,
+    # live on the scratch share (see shared_pvs.py) so every copy of the app
+    # monitors the same PVs with the same limits and pacing. These four keys are
+    # LOCAL-ONLY (they are what points this PC at the share in the first place)
+    # — see SHARE_LOCAL_ONLY_KEYS / shared_settings_subset.
+    "shared_pv_list_enabled": True,
+    "shared_pv_list_path": "",          # blank = autodetect; folder or full .json
+    "shared_pv_list_timeout_s": 3.0,    # max seconds startup may spend on the share
+    "_shared_pv_root_cache": "",        # written by the app: last root that worked
 }
+
+# Settings that must never leave this PC: they are what resolves the share, so
+# publishing them would point every other copy at whichever leg this PC used.
+SHARE_LOCAL_ONLY_KEYS = (
+    "shared_pv_list_enabled", "shared_pv_list_path", "shared_pv_list_timeout_s",
+    "_shared_pv_root_cache",
+)
+
+
+def shared_settings_subset(settings: dict) -> dict:
+    """The part of `settings` that travels over the share.
+
+    Everything the Settings dialog configures — poll pacing, debounce/settle,
+    re-notify and trend behaviour, learn and valid-range defaults, watchdog,
+    graph and alert-plot windows — minus:
+
+      * SHARE_LOCAL_ONLY_KEYS (per-PC plumbing),
+      * the notification channels, which come from the build
+        (notify_provision) and whose secrets are per-account DPAPI blobs that
+        would be useless — and unwelcome — on a scratch share.
+
+    Unknown keys are dropped, so a hand-edited or stale shared file can never
+    inject settings this version does not know.
+    """
+    skip = set(SHARE_LOCAL_ONLY_KEYS) | set(notify_provision.PROVISIONED_KEYS)
+    return {k: v for k, v in settings.items()
+            if k in DEFAULT_SETTINGS and k not in skip}
+
+
+# Trailing debounce for publishing to the share. persist() fires on every single
+# checkbox click, and an SMB write costs tens to hundreds of ms, so writing
+# per-call would stutter the most-used interaction in the tab and republish the
+# whole list dozens of times. Coalescing needs no changes at persist()'s many
+# call sites.
+SHARED_WRITE_DEBOUNCE_MS = 2000
 
 
 def load_config() -> dict:
@@ -282,11 +334,18 @@ def load_config() -> dict:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             data.update(loaded)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - a bad config must not block launch
+            # Not fatal, but no longer invisible: this path silently yields an
+            # empty PV list, which used to be indistinguishable from "nothing
+            # configured yet".
+            print(f"[monitor config] load failed, using defaults: {e}")
     settings = dict(DEFAULT_SETTINGS)
     settings.update(data.get("settings") or {})
     _migrate_settings(settings)
+    # Channels baked into the build win over whatever this PC has locally, so
+    # every copy alerts through the same accounts with no per-PC setup (and the
+    # local file never has to carry the credentials). See notify_provision.
+    settings.update(notify_provision.load())
     data["settings"] = settings
     data.setdefault("pvs", [])
     return data
@@ -310,11 +369,116 @@ def _migrate_settings(settings: dict) -> None:
 
 
 def save_config(data: dict) -> None:
+    # Never write provisioned channel settings to disk: they are supplied by the
+    # build and would otherwise be sitting in a plain JSON next to the exe (and
+    # would shadow a later rebuild's values).
+    prov = notify_provision.load()
+    if prov:
+        settings = {k: v for k, v in (data.get("settings") or {}).items()
+                    if k not in prov}
+        data = {**data, "settings": settings}
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # Atomic: this file is the offline fallback whose PV list can seed the
+        # share, and load_config() degrades a truncated file to an empty list.
+        shared_pvs.write_json_atomic(CONFIG_FILE, data)
     except Exception as e:  # noqa: BLE001
         print(f"[monitor config] save failed: {e}")
+
+
+@dataclass
+class PVListChoice:
+    """Outcome of deciding which PV list a session runs on.
+
+    ``shared_ok`` is the write guard. False means "this copy is NOT the
+    authority, never publish": if the shared list could not be read, writing our
+    in-memory list back would overwrite everyone else's list with whatever stale
+    copy this PC happened to have.
+
+    ``seed_needed`` is True only when the shared file is missing and we have PVs
+    to put there. Republishing an identical list at every launch would bump the
+    file's mtime for everyone and make other copies report a phantom conflict.
+
+    ``settings`` is the shared settings block that came with the list, to be laid
+    over this PC's local settings. Empty when there was nothing to read.
+    """
+    pv_dicts: list
+    shared_ok: bool
+    path: Optional[Path]
+    logs: list
+    seed_needed: bool = False
+    mtime: Optional[float] = None
+    settings: dict = field(default_factory=dict)
+
+
+def load_shared_pv_list(settings: dict, local_pvs: list) -> PVListChoice:
+    """Decide which PV list this session runs on (see PVListChoice)."""
+    logs: list[str] = []
+    res = shared_pvs.load_shared(
+        override=str(settings.get("shared_pv_list_path", "") or ""),
+        cached_root=str(settings.get("_shared_pv_root_cache", "") or ""),
+        timeout_s=float(settings.get("shared_pv_list_timeout_s", 3.0) or 3.0))
+
+    if not res.root:
+        logs.append(f"Shared PV list UNAVAILABLE — {res.detail}. Using this PC's "
+                    f"local list ({len(local_pvs)} PV(s)); changes will NOT be "
+                    f"shared this session.")
+        return PVListChoice(local_pvs, False, None, logs)
+
+    settings["_shared_pv_root_cache"] = res.root
+
+    if not res.existed:
+        if local_pvs:
+            logs.append(f"No shared PV list yet — seeding {res.path} with this "
+                        f"PC's {len(local_pvs)} PV(s).")
+            return PVListChoice(local_pvs, True, res.path, logs, seed_needed=True)
+        logs.append(f"No shared PV list yet and no local PVs — nothing to seed. "
+                    f"Will publish to {res.path} once PVs are added.")
+        return PVListChoice(local_pvs, True, res.path, logs)
+
+    if res.pvs is None:
+        logs.append(f"Shared PV list UNREADABLE — {res.detail}. Using this PC's "
+                    f"local list ({len(local_pvs)} PV(s)); it will NOT be "
+                    f"overwritten, so the shared file can be repaired by hand.")
+        return PVListChoice(local_pvs, False, res.path, logs)
+
+    shared_settings = shared_settings_subset(res.settings or {})
+    if shared_settings:
+        logs.append(f"Adopted {len(shared_settings)} shared setting(s) "
+                    f"(limits, pacing, defaults) from {res.path}.")
+
+    if not res.pvs and local_pvs:
+        # The deployed share copy writes its own empty config, so an empty
+        # shared list next to a populated local one is far more likely to be
+        # that accident than a deliberate "monitor nothing".
+        logs.append(f"Shared PV list at {res.path} is EMPTY while this PC has "
+                    f"{len(local_pvs)} PV(s) — keeping the local list and NOT "
+                    f"publishing, to avoid wiping everyone's PVs. Delete the "
+                    f"shared file if you really want to start over.")
+        return PVListChoice(local_pvs, False, res.path, logs,
+                            settings=shared_settings)
+
+    # A file written by an older version carries no settings block. Publish this
+    # PC's once, so the group has a shared baseline from then on (costs one
+    # extra write and one phantom-conflict log elsewhere, once).
+    seed = not shared_settings and bool(shared_settings_subset(settings))
+    if seed:
+        logs.append("Shared file has no settings block yet — publishing this "
+                    "PC's limits and pacing as the shared baseline.")
+    return PVListChoice(res.pvs, True, res.path, logs, mtime=res.mtime,
+                        settings=shared_settings, seed_needed=seed)
+
+
+class _SharedWriteSignals(QObject):
+    done = Signal(object)   # (ok, mtime_or_None, was_stale, error)
+
+
+def _shared_write_job(sig, path, pv_dicts, settings, host, expect_mtime):
+    try:
+        mtime, stale = shared_pvs.write_shared(
+            path, pv_dicts, settings, host, expect_mtime)
+        _safe_emit(sig.done.emit, (True, mtime, stale, ""))
+    except Exception as e:  # noqa: BLE001 - reported to the UI, never raised
+        _safe_emit(sig.done.emit, (False, None, False, str(e)))
 
 
 def _parse_recipients(text: str) -> list[str]:
@@ -479,11 +643,21 @@ class PVRuntime:
     # column: "" (nothing to send / OK), "sending", "sent", "failed".
     notify_status: str = ""
     notify_error: str = ""
+    # Severity of the latest reading taken straight from the thresholds, with no
+    # debounce/settle state behind it. Kept fresh on every poll so the table can
+    # show a truthful state while monitoring is stopped and the evaluator (which
+    # owns `alert`) is not running.
+    live_level: Optional[AlertLevel] = None
 
-    def display_level(self):
+    def display_level(self, monitoring: bool = True):
         """AlertLevel for colouring, or None for NODATA."""
         if self.current_value is None:
             return None
+        if not monitoring:
+            # Evaluator idle: `alert` is frozen at whatever it was when
+            # monitoring stopped, so report the raw severity instead.
+            return self.live_level if self.live_level is not None \
+                else self.alert.level
         return self.alert.level
 
 
@@ -929,6 +1103,9 @@ class PVTableModel(QAbstractTableModel):
         super().__init__(parent)
         self.pvs = pvs
         self.runtime = runtime
+        # Mirrors MonitorWidget._monitoring; only affects how the State cell is
+        # rendered (values are polled either way).
+        self.monitoring = False
         self._display: list[tuple] = []
         # Collapsed rows: ("g", group) hides a group's contents, ("s", (group,
         # subgroup)) hides one subgroup's PVs. In-memory only (not persisted).
@@ -1106,6 +1283,10 @@ class PVTableModel(QAbstractTableModel):
                 return "Click to show/hide this PV in the graph."
             if col == COL_ALARM_STATUS:
                 return _alarm_status_tooltip(pv, rt)
+            if col == COL_STATE and pv.enabled and not self.monitoring:
+                return ("Monitoring is stopped — values are still read and "
+                        "shown, but nothing is evaluated against the limits "
+                        "and no alerts are sent.")
             tip = pv.name
             if pv.gate_pvs:
                 tip += "\nDepends on: " + ", ".join(pv.gate_pvs)
@@ -1121,17 +1302,22 @@ class PVTableModel(QAbstractTableModel):
                 tip += f"\nLast error: {rt.last_error}"
             return tip
 
-        level = rt.display_level() if rt else None
+        level = rt.display_level(self.monitoring) if rt else None
         bad = bool(rt and rt.bad_data and level is None and pv.enabled)
+        # Reading is live but nothing is watching it — flag that in the cell.
+        stopped = not self.monitoring and pv.enabled
 
         if role == Qt.BackgroundRole and col == COL_STATE:
             if bad:
                 return QColor(BADDATA_COLOR)
             if level is None:
                 return QColor(NODATA_COLOR)
+            if stopped:
+                return QColor(STOPPED_COLOR)
             return _STATE_BG[level]
         if role == Qt.ForegroundRole and col == COL_STATE:
-            if level in (AlertLevel.WARNING, AlertLevel.ALARM) or level is None:
+            if level in (AlertLevel.WARNING, AlertLevel.ALARM) or level is None \
+                    or stopped:
                 return QColor("white")
             return QColor(SUCCESS)
 
@@ -1170,10 +1356,13 @@ class PVTableModel(QAbstractTableModel):
                 if not pv.enabled:
                     return "off"
                 if bad:
-                    return "bad data"
-                if level is None:
-                    return "no data"
-                return level.label.lower()
+                    text = "bad data"
+                elif level is None:
+                    text = "no data"
+                else:
+                    text = level.label.lower()
+                # Stopped: the reading is real, but no one is evaluating it.
+                return f"⏸ {text}" if stopped else text
             if col == COL_ALARM_STATUS:
                 return _alarm_status_text(pv, rt)
             if col == DEP_COL:
@@ -2527,9 +2716,15 @@ class SettingsDialog(QDialog):
     def __init__(self, parent: "MonitorWidget"):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(620, 860)
+        # Wide enough for the widest group, so nothing needs horizontal
+        # scrolling to be read or clicked (at 620 the form was ~300 px wider
+        # than its viewport and the rightmost buttons were unreachable).
+        self.resize(960, 860)
         self._win = parent
         s = parent.settings
+        # Channel settings supplied by the build (see notify_provision): they are
+        # in `s` and in use, but this dialog must neither show nor save them.
+        self._prov = notify_provision.load()
 
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
@@ -2717,6 +2912,15 @@ class SettingsDialog(QDialog):
         lay.addWidget(webex)
         self._update_webex_fields(self.webex_mode.currentText())
 
+        # Provisioned build: keep the groups alive (their widgets back _save and
+        # the test buttons) but take them off screen and show a summary instead.
+        if self._prov:
+            for w in (self.teams_en, self.email_en, self.webex_en):
+                w.setVisible(False)
+            for grp in (teams, email, webex):
+                grp.setVisible(False)
+            lay.insertWidget(1, self._build_provisioned_box())
+
         # --- Monitoring ----------------------------------------------------
         form_grp = QGroupBox("Monitoring")
         form_grp.setStyleSheet(_GROUP_STYLE)
@@ -2857,6 +3061,77 @@ class SettingsDialog(QDialog):
         self.autostart.setChecked(bool(s["start_monitoring_on_launch"]))
         form.addRow("", self.autostart)
         lay.addWidget(form_grp)
+
+        # --- Shared PV list -------------------------------------------------
+        shg = QGroupBox("Shared PV list and settings (network share)")
+        shg.setStyleSheet(_GROUP_STYLE)
+        shl = QFormLayout(shg)
+
+        self.shared_en = QCheckBox("Keep the PV list and settings on the network share")
+        self.shared_en.setStyleSheet(_CHK_STYLE)
+        self.shared_en.setToolTip(
+            "When on, every copy of Diagnostika reads the same PV list — with its "
+            "limits, rules and valid ranges — plus the shared settings (poll "
+            "pacing, debounce, defaults, watchdog, graph windows) from the scratch "
+            "Software share at startup, and publishes changes back to it. Nothing "
+            "has to be set up twice.\n\n"
+            "Not shared: the share location and timeout below (per-PC), and the "
+            "notification channels, which come from the build itself. "
+            "Off = use only this PC's local list and settings.")
+        self.shared_en.setChecked(bool(s.get("shared_pv_list_enabled", True)))
+        shl.addRow("", self.shared_en)
+
+        win = self._win
+        in_use = win.shared_file if win.shared_ok else None
+
+        prow = QHBoxLayout()
+        self.shared_path = QLineEdit(s.get("shared_pv_list_path", ""))
+        # The resolved path goes in the placeholder rather than a label: a UNC
+        # path is one unbreakable token, so a word-wrapped label reports its full
+        # width as its size hint and forces the whole dialog wider than its
+        # viewport (which pushed Browse… off-screen). A placeholder does not
+        # affect the field's size hint.
+        self.shared_path.setPlaceholderText(
+            f"autodetected: {in_use}" if in_use
+            else "blank = autodetect the scratch share")
+        self.shared_path.setToolTip(
+            "Folder (or full .json path) holding the shared PV list. Leave blank "
+            "to autodetect the scratch Software share. Set it only if "
+            "autodetection picks the wrong host. Takes effect after a restart."
+            + (f"\n\nCurrently in use: {in_use}" if in_use else ""))
+        prow.addWidget(self.shared_path, 1)
+        shared_browse = QPushButton("Browse…")
+        shared_browse.setStyleSheet(SECONDARY_STYLE)
+        shared_browse.setToolTip("Pick the folder that holds the shared PV list.")
+        shared_browse.clicked.connect(self._browse_shared_path)
+        prow.addWidget(shared_browse)
+        shl.addRow("Location", prow)
+
+        self.shared_timeout = _NoWheelDoubleSpinBox()
+        self.shared_timeout.setRange(0.5, 30.0)
+        self.shared_timeout.setDecimals(1)
+        self.shared_timeout.setSingleStep(0.5)
+        self.shared_timeout.setToolTip(
+            "How long startup may spend reaching the share before falling back "
+            "to this PC's local list. An unreachable network host can take ~48 s "
+            "to time out on its own, so this cap is what keeps launch quick. "
+            "Raise it if the share is reachable but slow.")
+        self.shared_timeout.setValue(
+            float(s.get("shared_pv_list_timeout_s", 3.0)))
+        shl.addRow("Startup timeout (s)", self.shared_timeout)
+
+        # Only warn about the abnormal case. When sharing is active the
+        # placeholder above already names the file in use, so a confirmation
+        # line here would just be noise.
+        if win.settings.get("shared_pv_list_enabled", True) and not win.shared_ok:
+            warn = QLabel("Read-only this session — the shared list could not be "
+                          "read at startup, so PV changes stay on this PC. "
+                          "See the Log tab for the reason.")
+            warn.setWordWrap(True)
+            warn.setStyleSheet(f"color:{WARN_COLOR}; font-weight:600;")
+            shl.addRow("", warn)
+        lay.addWidget(shg)
+
         lay.addStretch(1)
 
         self.test_status = QLabel("")
@@ -2868,6 +3143,43 @@ class SettingsDialog(QDialog):
         bb.accepted.connect(self._save)
         bb.rejected.connect(self.reject)
         outer.addWidget(bb)
+
+    def _build_provisioned_box(self) -> QGroupBox:
+        """Read-only stand-in for the Teams / Email / Webex sections when the
+        channels come baked into the build."""
+        box = QGroupBox("Notification channels (built into this version)")
+        box.setStyleSheet(_GROUP_STYLE)
+        v = QVBoxLayout(box)
+        head = QLabel("Alert channels and their credentials ship with this "
+                      "build, so they cannot be read or changed here. To change "
+                      "them, edit them in a source run, re-bake "
+                      "(python notify_provision.py bake) and rebuild.")
+        head.setWordWrap(True)
+        v.addWidget(head)
+        for line in notify_provision.describe(self._prov):
+            lbl = QLabel("• " + line)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("font-weight:600;")
+            v.addWidget(lbl)
+        row = QHBoxLayout()
+        for text, slot in (("Send test to Teams", self._test_teams),
+                           ("Send test email", self._test_email),
+                           ("Send test to Webex", self._test_webex)):
+            b = QPushButton(text)
+            b.setStyleSheet(_BTN_PRIMARY)
+            b.setToolTip("Send a test message now with the built-in settings, "
+                         "to confirm this PC can reach the service.")
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        v.addLayout(row)
+        return box
+
+    def _browse_shared_path(self):
+        start = self.shared_path.text().strip()
+        d = QFileDialog.getExistingDirectory(
+            self, "Select the folder holding the shared PV list", start)
+        if d:
+            self.shared_path.setText(str(Path(d)))
 
     def _update_webex_fields(self, mode: str):
         is_bot = (mode == "bot")
@@ -2913,29 +3225,33 @@ class SettingsDialog(QDialog):
 
     def _save(self):
         s = self._win.settings
-        # channels
-        s["teams_enabled"] = self.teams_en.isChecked()
-        s["email_enabled"] = self.email_en.isChecked()
-        s["webex_enabled"] = self.webex_en.isChecked()
         s["alert_plot_hours"] = self.plot_hours.value()
-        # teams
-        s["teams_webhook_url"] = self.webhook.text().strip()
-        # email
-        s["smtp_host"] = self.smtp_host.text().strip()
-        s["smtp_port"] = self.smtp_port.value()
-        s["smtp_security"] = self.smtp_sec.currentText()
-        s["smtp_user"] = self.smtp_user.text().strip()
-        s["smtp_password"] = encrypt_secret(self.smtp_pass.text())
-        s["email_from"] = self.email_from.text().strip()
-        s["email_contacts"] = self.email_contacts.rows()
-        # webex
-        s["webex_mode"] = self.webex_mode.currentText()
-        s["webex_webhook_url"] = self.webex_url.text().strip()
-        s["webex_bot_token"] = encrypt_secret(self.webex_token.text().strip())
-        s["webex_rooms"] = self.webex_rooms.rows()
-        s["webex_commands_enabled"] = self.webex_cmds.isChecked()
-        s["webex_command_poll_s"] = self.webex_cmd_poll.value()
-        s["webex_command_allowlist"] = _parse_recipients(self.webex_allow.text())
+        # Channels: skipped entirely when they are provisioned by the build —
+        # re-saving them would DPAPI-encrypt the baked secrets for this account
+        # only and break every other PC running the same build.
+        if not self._prov:
+            # channels
+            s["teams_enabled"] = self.teams_en.isChecked()
+            s["email_enabled"] = self.email_en.isChecked()
+            s["webex_enabled"] = self.webex_en.isChecked()
+            # teams
+            s["teams_webhook_url"] = self.webhook.text().strip()
+            # email
+            s["smtp_host"] = self.smtp_host.text().strip()
+            s["smtp_port"] = self.smtp_port.value()
+            s["smtp_security"] = self.smtp_sec.currentText()
+            s["smtp_user"] = self.smtp_user.text().strip()
+            s["smtp_password"] = encrypt_secret(self.smtp_pass.text())
+            s["email_from"] = self.email_from.text().strip()
+            s["email_contacts"] = self.email_contacts.rows()
+            # webex
+            s["webex_mode"] = self.webex_mode.currentText()
+            s["webex_webhook_url"] = self.webex_url.text().strip()
+            s["webex_bot_token"] = encrypt_secret(self.webex_token.text().strip())
+            s["webex_rooms"] = self.webex_rooms.rows()
+            s["webex_commands_enabled"] = self.webex_cmds.isChecked()
+            s["webex_command_poll_s"] = self.webex_cmd_poll.value()
+            s["webex_command_allowlist"] = _parse_recipients(self.webex_allow.text())
         # monitoring
         s["poll_interval_s"] = self.poll.value()
         s["poll_max_workers"] = self.poll_workers.value()
@@ -2954,6 +3270,10 @@ class SettingsDialog(QDialog):
         s["valid_min_default"] = self.valid_min.value()
         s["valid_max_default"] = self.valid_max.value()
         s["start_monitoring_on_launch"] = self.autostart.isChecked()
+        # shared PV list
+        s["shared_pv_list_enabled"] = self.shared_en.isChecked()
+        s["shared_pv_list_path"] = self.shared_path.text().strip()
+        s["shared_pv_list_timeout_s"] = float(self.shared_timeout.value())
         self.accept()
 
 
@@ -3182,7 +3502,10 @@ class GraphPanel(QWidget):
         # moving the mouse never re-renders the whole figure.
         self._cross: list = []
         self._extra_axes: list = []   # twin y-axes, one per extra unit
-        self._snap_np = None    # (times_num, values, label) for single-PV snap
+        # Per-plotted-series snap cache for the cursor value box, rebuilt every
+        # redraw: [(times_num_np, values_np, color, display_name), ...].
+        self._snap_series: list = []
+        self._readout_texts: list = []   # cursor box: time header + one line/PV
         self._units = ""
         self._blit_bg = None
         self._mouse_ev = None
@@ -3358,6 +3681,12 @@ class GraphPanel(QWidget):
         ys = [v for _, v in pts]
         ax.plot(xs, ys, drawstyle="steps-post", color=color,
                 label=pv.display_name, linewidth=1.6)
+        # Cache the plotted (thinned) series so the cursor value box can snap to
+        # each PV's value at the hovered time — reuses the exact drawn data and
+        # its curve colour for both the single-PV and All-PVs views.
+        self._snap_series.append(
+            (np.asarray(mdates.date2num(xs), dtype=float),
+             np.asarray(ys, dtype=float), color, pv.display_name))
         if with_thresholds:
             for val, ls, lw in ((pv.warn_low, "--", 1.0), (pv.warn_high, "--", 1.0),
                                 (pv.alarm_low, "-.", 1.6), (pv.alarm_high, "-.", 1.6)):
@@ -3388,6 +3717,9 @@ class GraphPanel(QWidget):
     # Units that count as temperature — kept on the familiar left axis.
     _TEMP_UNIT_KEYS = ("degc", "°c", "c", "k", "degf")
 
+    # Outward spacing (points) between consecutive right-hand (twin) axes.
+    _EXTRA_AXIS_SPACING = 55
+
     @classmethod
     def _axis_label(cls, unit: str) -> str:
         return cls._UNIT_LABELS.get(cls._unit_key(unit),
@@ -3397,6 +3729,7 @@ class GraphPanel(QWidget):
         for a in self._extra_axes:
             a.remove()
         self._extra_axes = []
+        self._snap_series = []
         self.ax.clear()
         sel = self.combo.currentData()
         win_min = float(self._win.settings["graph_window_minutes"])
@@ -3421,17 +3754,26 @@ class GraphPanel(QWidget):
                     units_order.append(k)
                     unit_text[k] = self._pv_units(p)
             # Temperature owns the left (main) axis regardless of PV order;
-            # other units (pressure, flow, …) go to twin axes on the right.
-            units_order.sort(
-                key=lambda k: 0 if k in self._TEMP_UNIT_KEYS else 1)
+            # real units (pressure, flow, …) go to twin axes on the right, and
+            # the generic unit-less "value" axis is pushed outermost of all.
+            def _axis_rank(k):
+                if k in self._TEMP_UNIT_KEYS:
+                    return 0
+                return 2 if k == "" else 1
+            units_order.sort(key=_axis_rank)
             ax_of_unit = {}
+            extra_i = 0
             for j, k in enumerate(units_order):
                 if j == 0:
                     ax_of_unit[k] = self.ax
                 else:
                     tw = self.ax.twinx()
-                    if j >= 2:   # push 3rd+ axis outward so labels don't overlap
-                        tw.spines["right"].set_position(("outward", 48 * (j - 1)))
+                    # Step every right axis outward by its own index so two or
+                    # more of them (e.g. pressure + value) never render on top
+                    # of each other; the first sits at the axes edge (offset 0).
+                    tw.spines["right"].set_position(
+                        ("outward", self._EXTRA_AXIS_SPACING * extra_i))
+                    extra_i += 1
                     self._extra_axes.append(tw)
                     ax_of_unit[k] = tw
             for i, p in enumerate(plottable):
@@ -3489,53 +3831,50 @@ class GraphPanel(QWidget):
             lbl.set_rotation(0)
             lbl.set_ha("center")
         self.fig.tight_layout()
+        # tight_layout() doesn't reserve room for a spine shifted outward with
+        # set_position(("outward", …)), so extra right axes get clipped/crammed
+        # against each other. Carve enough right margin for every twin's offset
+        # plus its tick labels.
+        n_extra = len(self._extra_axes)
+        if n_extra:
+            fig_w_px = self.fig.get_size_inches()[0] * self.fig.dpi
+            needed_px = self._EXTRA_AXIS_SPACING * (n_extra - 1) + 70
+            right_frac = max(0.5, min(0.95, 1.0 - needed_px / max(fig_w_px, 1)))
+            self.fig.subplots_adjust(right=right_frac)
 
-        # Cache the plotted samples for the crosshair's nearest-point snap
-        # (single-PV view only; the data line is the first one plotted).
-        self._snap_np = None
-        if pv is not None and self.ax.get_lines():
-            ln = self.ax.get_lines()[0]
-            xd = ln.get_xdata()
-            if len(xd):
-                self._snap_np = (np.asarray(mdates.date2num(xd), dtype=float),
-                                 np.asarray(ln.get_ydata(), dtype=float),
-                                 pv.display_name)
         self._make_cursor_artists()
         self._blit_bg = None
         self.canvas.draw_idle()
 
     # --- crosshair cursor ------------------------------------------------
+    _READOUT_LINE_PTS = 14   # vertical step (points) between value-box lines
+
     def _make_cursor_artists(self):
-        # Park the (hidden) crosshair lines mid-view: axvline/axhline take
-        # part in autoscale even when invisible, so the default x=0 would
-        # drag a date axis all the way back to 1970 (and y=0 pull the y range
-        # down to zero).
+        # Park the (hidden) vertical line mid-view: axvline takes part in
+        # autoscale even when invisible, so the default x=0 would drag a date
+        # axis all the way back to 1970.
         x_mid = sum(self.ax.get_xlim()) / 2
         y_mid = sum(self.ax.get_ylim()) / 2
         vl = self.ax.axvline(x_mid, color="#888", linewidth=0.8, linestyle="--",
                              visible=False, animated=True)
-        hl = self.ax.axhline(y_mid, color="#888", linewidth=0.8, linestyle="--",
-                             visible=False, animated=True)
-        txt = self.ax.annotate(
-            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
-            fontsize=8, color="#111", visible=False, animated=True, zorder=10,
-            bbox=dict(boxstyle="round,pad=0.3", fc="#ffffe0", ec="#888",
-                      alpha=0.9, linewidth=0.6))
-        # Exact readouts pinned to the axes (CSS-studio style): the time on
-        # the X axis under the cursor, the value on the Y axis beside it.
-        _axis_bbox = dict(boxstyle="round,pad=0.25", fc="#ffffe0", ec="#888",
-                          alpha=0.95, linewidth=0.6)
-        xlab = self.ax.annotate(
-            "", xy=(x_mid, 0), xycoords=("data", "axes fraction"),
-            xytext=(0, -6), textcoords="offset points",
-            ha="center", va="top", fontsize=8, color="#111",
-            visible=False, animated=True, zorder=10, bbox=_axis_bbox)
-        ylab = self.ax.annotate(
-            "", xy=(0, y_mid), xycoords=("axes fraction", "data"),
-            xytext=(-8, 0), textcoords="offset points",
-            ha="right", va="center", fontsize=8, color="#111",
-            visible=False, animated=True, zorder=10, bbox=_axis_bbox)
-        self._cross = [vl, hl, txt, xlab, ylab]
+        # Value box floating near the cursor: a neutral time header followed by
+        # one line per plotted PV, each coloured to its curve. Kept as separate
+        # Text artists (one colour each) stacked tightly so they read as a
+        # single box; each carries a white square bbox so it stays legible over
+        # any trace/grid. Rebuilt every redraw because _snap_series just changed.
+        self._readout_texts = []
+        specs = [("#111", True)]   # (colour, is_header)
+        specs += [(color, False) for (_a, _v, color, _lbl) in self._snap_series]
+        for color, is_header in specs:
+            ann = self.ax.annotate(
+                "", xy=(x_mid, y_mid), xytext=(12, 12),
+                textcoords="offset points", fontsize=8, color=color,
+                ha="left", va="top", visible=False, animated=True, zorder=10,
+                fontweight="bold" if is_header else "normal",
+                bbox=dict(boxstyle="square,pad=0.35", fc="#ffffff",
+                          ec="#888", alpha=0.92, linewidth=0.6))
+            self._readout_texts.append(ann)
+        self._cross = [vl] + self._readout_texts
 
     def _on_draw(self, *_):
         # Fresh blit background: hide the animated overlay so it isn't baked in.
@@ -3577,11 +3916,11 @@ class GraphPanel(QWidget):
             self.canvas.restore_region(self._blit_bg)
             self.canvas.blit(self.fig.bbox)
 
-    def _snap_value(self, x_f: float):
-        """(label, value) of the plotted sample nearest to time x_f, or None."""
-        if self._snap_np is None:
+    @staticmethod
+    def _snap_at(arr, vals, x_f: float):
+        """Value of the sample nearest to time x_f, or None for an empty series."""
+        if arr is None or len(arr) == 0:
             return None
-        arr, vals, label = self._snap_np
         pos = int(np.searchsorted(arr, x_f))
         if pos <= 0:
             idx = 0
@@ -3589,43 +3928,50 @@ class GraphPanel(QWidget):
             idx = len(arr) - 1
         else:
             idx = pos if (arr[pos] - x_f) < (x_f - arr[pos - 1]) else pos - 1
-        return label, float(vals[idx])
+        return float(vals[idx])
 
     def _draw_cursor(self, ev):
         # Work from pixel coordinates against the main axis: with twin y-axes
         # present, ev.inaxes/ev.ydata belong to the topmost twin, not self.ax.
         if (self._blit_bg is None or ev.x is None or ev.y is None
-                or not self.ax.bbox.contains(ev.x, ev.y)):
+                or not self.ax.bbox.contains(ev.x, ev.y)
+                or not self._readout_texts):
             self._hide_cursor()
             return
         x, y = self.ax.transData.inverted().transform((ev.x, ev.y))
         x, y = float(x), float(y)
-        vl, hl, txt, xlab, ylab = self._cross
+        vl = self._cross[0]
         vl.set_xdata([x, x])
-        hl.set_ydata([y, y])
         try:
             t_str = mdates.num2date(x, tz=api.TZ_PRAGUE).strftime("%H:%M:%S")
         except Exception:
             t_str = ""
-        u = f" {self._units}" if self._units else ""
-        xlab.xy = (x, 0)
-        xlab.set_text(t_str)
-        ylab.xy = (0, y)
-        ylab.set_text(f"{y:.4g}")
-        lines = [t_str, f"y = {y:.4g}{u}"]
-        snap = self._snap_value(x)
-        if snap is not None:
-            lines.append(f"{snap[0]} = {snap[1]:.4g}{u}")
-        txt.set_text("\n".join(lines))
-        txt.xy = (x, y)
-        # Keep the box inside the axes: flip it near the right/top edges.
+        # Header = time under the cursor; the rest = each PV's snapped value.
+        self._readout_texts[0].set_text(t_str)
+        for i, (arr, vals, _color, label) in enumerate(self._snap_series):
+            v = self._snap_at(arr, vals, x)
+            self._readout_texts[i + 1].set_text(
+                f"{label} = {v:.4g}" if v is not None else f"{label} = –")
+
+        # Stack the lines into one box just off the cursor, flipped near the
+        # right/top edges so it always stays inside the axes.
+        lh = self._READOUT_LINE_PTS
+        n = len(self._readout_texts)
         xlo, xhi = self.ax.get_xlim()
         ylo, yhi = self.ax.get_ylim()
         right = x > (xlo + xhi) / 2
-        top = y > (ylo + yhi) / 2
-        txt.set_position((-12 if right else 12, -16 if top else 12))
-        txt.set_horizontalalignment("right" if right else "left")
-        txt.set_verticalalignment("top" if top else "bottom")
+        top = y > (yhi + ylo) / 2
+        dx = -12 if right else 12
+        ha = "right" if right else "left"
+        # Below the cursor when it's in the upper half, above it otherwise, so
+        # the whole stack clears the nearest horizontal edge.
+        top_dy = -12 if top else 12 + lh * n
+        for i, ann in enumerate(self._readout_texts):
+            ann.xy = (x, y)
+            ann.set_ha(ha)
+            ann.set_va("top")
+            ann.set_position((dx, top_dy - i * lh))
+
         for a in self._cross:
             a.set_visible(True)
         self.canvas.restore_region(self._blit_bg)
@@ -3738,7 +4084,41 @@ class MonitorWidget(QWidget):
 
         cfg = load_config()
         self.settings = cfg["settings"]
-        self.pvs: list[PVConfig] = [PVConfig.from_dict(d) for d in cfg["pvs"]]
+
+        # --- shared PV list ------------------------------------------------
+        # Resolved here, before _init_runtime() and PVTableModel(self.pvs, …),
+        # so __init__ stays linear: no async list swap can race the optional
+        # start-monitoring-on-launch below.
+        self._shared_backed_up = False
+        self._shared_write_fails = 0
+        self._shared_timer = QTimer(self)
+        self._shared_timer.setSingleShot(True)
+        self._shared_timer.timeout.connect(self._flush_shared_write)
+        self._shared_sig = _SharedWriteSignals()
+        self._shared_sig.done.connect(self._on_shared_write_done)
+
+        if self.settings.get("shared_pv_list_enabled", True):
+            choice = load_shared_pv_list(self.settings, cfg["pvs"])
+        else:
+            choice = PVListChoice(
+                cfg["pvs"], False, None,
+                ["Shared PV list is switched off in Settings — using this PC's "
+                 "local list only."])
+        self.shared_ok = choice.shared_ok        # write guard, see _schedule_shared_write
+        self.shared_file: Optional[Path] = choice.path
+        self._shared_mtime = choice.mtime
+        self._shared_dirty = choice.seed_needed
+        self._shared_log = choice.logs   # _log() needs self.log from _build_ui
+
+        # Precedence, lowest to highest: DEFAULT_SETTINGS -> this PC's config ->
+        # the share -> the build's channels. The share carries the group's
+        # limits and pacing so they survive a fresh PC; the build's channels
+        # must stay on top (they are the only usable credentials).
+        if choice.settings:
+            self.settings.update(choice.settings)
+            self.settings.update(notify_provision.load())
+
+        self.pvs: list[PVConfig] = [PVConfig.from_dict(d) for d in choice.pv_dicts]
         self.runtime: dict[str, PVRuntime] = {}
         self._all_channels: list[str] = []
         # Per-PV "Depends on" dropdowns (recreated on every model reset).
@@ -3777,9 +4157,18 @@ class MonitorWidget(QWidget):
         self._build_ui()
         self._prefetch_channels()
         self._start_cmd_listener()
+        # Publish only a genuine seed (first run against a share with no list
+        # yet). Republishing an unchanged list on every launch would bump the
+        # mtime for everyone and trip a phantom conflict warning elsewhere.
+        if self._shared_dirty:
+            self._schedule_shared_write()
 
         if self.settings.get("start_monitoring_on_launch"):
             self.toggle_monitoring(True)
+        # Reading PVs is independent of the monitoring switch, so the poll loop
+        # runs from launch (after the autostart above, which does its own first
+        # poll, so the launch never fires two overlapping passes).
+        self._start_polling()
 
     # --- setup ---------------------------------------------------------
     def _eval_config(self) -> EvalConfig:
@@ -3810,9 +4199,10 @@ class MonitorWidget(QWidget):
         self.btn_monitor = _btn("▶ Start monitoring")
         self.btn_monitor.setCheckable(True)
         self.btn_monitor.setToolTip(
-            "Start/stop the monitoring loop. While running, every PV is polled "
-            "at the configured interval, evaluated against its thresholds, and "
-            "alerts are sent on committed state changes.")
+            "Arm/disarm alerting. PVs are polled and displayed at the "
+            "configured interval either way; while armed, each reading is also "
+            "evaluated against its thresholds and alerts are sent on committed "
+            "state changes.")
         self.btn_monitor.clicked.connect(self.toggle_monitoring)
         btn_row.addWidget(self.btn_monitor)
         btn_row.addSpacing(8)
@@ -3917,7 +4307,16 @@ class MonitorWidget(QWidget):
         self.timer.timeout.connect(self._start_poll)
 
         self._update_status()
-        self._log(f"Loaded {len(self.pvs)} PV(s). Config: {CONFIG_FILE}")
+        for line in self._shared_log:
+            self._log(line)
+        self._shared_log.clear()
+        if self.shared_ok and self.shared_file:
+            self._log(f"Loaded {len(self.pvs)} PV(s) — SHARED list: "
+                      f"{self.shared_file}")
+        else:
+            self._log(f"Loaded {len(self.pvs)} PV(s) — LOCAL list: {CONFIG_FILE}. "
+                      f"PV changes will NOT be shared this session.")
+        self._log(f"Local settings: {CONFIG_FILE}")
 
     # --- helpers -------------------------------------------------------
     def _log(self, msg: str):
@@ -3935,23 +4334,90 @@ class MonitorWidget(QWidget):
         return ", ".join(chans) if chans else "no channels"
 
     def _update_status(self):
-        state = "MONITORING" if self._monitoring else "stopped"
+        state = "MONITORING" if self._monitoring else "stopped (reading only)"
+        # The share state stays visible, not just logged once at launch: while
+        # it reads LOCAL ONLY every PV edit is silently kept off the share.
+        if not self.settings.get("shared_pv_list_enabled", True):
+            share = "local list"
+        elif self.shared_ok:
+            share = "shared"
+        else:
+            share = "LOCAL ONLY (not sharing)"
         self._status_lbl.setText(
             f"{state}  ·  {len(self.pvs)} PV(s)  ·  every "
-            f"{self.settings['poll_interval_s']}s  ·  {self._channel_summary()}")
+            f"{self.settings['poll_interval_s']}s  ·  {self._channel_summary()}"
+            f"  ·  {share}")
 
     def persist(self):
+        """Save locally (always, instant) and publish to the share (debounced)."""
         save_config({
             "version": 1,
             "settings": self.settings,
             "pvs": [pv.to_dict() for pv in self.pvs],
         })
+        self._schedule_shared_write()
+
+    # --- shared PV list publishing --------------------------------------
+    def _schedule_shared_write(self):
+        """Mark the shared list dirty and (re)arm the trailing debounce."""
+        if not (self.shared_ok and self.shared_file):
+            return          # THE WRITE GUARD — see load_shared_pv_list
+        self._shared_dirty = True
+        self._shared_timer.start(SHARED_WRITE_DEBOUNCE_MS)
+
+    def _flush_shared_write(self, blocking: bool = False):
+        """Publish the current list to the share on a background thread."""
+        if not (self.shared_ok and self.shared_file and self._shared_dirty):
+            return
+        # Snapshot on the UI thread so the worker never walks a list that the
+        # user is editing underneath it.
+        payload = [pv.to_dict() for pv in self.pvs]
+        settings = shared_settings_subset(self.settings)
+        path, expect = self.shared_file, self._shared_mtime
+        self._shared_dirty = False
+        if not self._shared_backed_up:
+            shared_pvs.backup_once(path)
+            self._shared_backed_up = True
+        t = threading.Thread(
+            target=_shared_write_job, daemon=True, name="shared-pv-write",
+            args=(self._shared_sig, path, payload, settings,
+                  socket.gethostname(), expect))
+        t.start()
+        if blocking:
+            # Bounded, and the thread is a daemon: a share that has gone away
+            # cannot hold the app open.
+            t.join(5.0)
+
+    def _on_shared_write_done(self, result):
+        ok, mtime, was_stale, err = result
+        if ok:
+            self._shared_mtime = mtime
+            self._shared_write_fails = 0
+            if was_stale:
+                self._log("Shared PV list had been changed by another PC since "
+                          "this copy read it — your version won (last writer "
+                          "wins). The previous version is in "
+                          f"{shared_pvs.BACKUP_FILENAME}.")
+            return
+        self._shared_dirty = True       # retry on the next change
+        self._shared_write_fails += 1
+        self._log(f"Could not publish the shared PV list: {err}")
+        if self._shared_write_fails >= 3:
+            # Typically a permissions problem or a vanished share; stop retrying
+            # rather than logging this every couple of seconds.
+            self.shared_ok = False
+            self._shared_dirty = False
+            self._log("Giving up on the shared PV list for this session — PV "
+                      "changes stay local. Check the share and restart.")
+            self._update_status()
 
     def shutdown(self):
         """Called by the main window on close; state is also saved per-change."""
         self.timer.stop()
         self._stop_cmd_listener()
         self.persist()
+        self._shared_timer.stop()       # don't let the debounce race the close
+        self._flush_shared_write(blocking=True)
 
     def _apply_group_spans(self):
         """Make each (sub)group-header row span the table width from the name
@@ -4464,8 +4930,13 @@ class MonitorWidget(QWidget):
         return json.dumps({k: self.settings.get(k) for k in self._CMD_KEYS},
                           sort_keys=True, default=str)
 
+    def _share_settings_snapshot(self) -> tuple:
+        return (str(self.settings.get("shared_pv_list_path", "")),
+                bool(self.settings.get("shared_pv_list_enabled", True)))
+
     def open_settings(self):
         before = self._cmd_settings_snapshot()
+        share_before = self._share_settings_snapshot()
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.Accepted:
             self.hub = NotificationHub.from_settings(self.settings)
@@ -4474,35 +4945,71 @@ class MonitorWidget(QWidget):
             for rt in self.runtime.values():
                 if rt.history.maxlen != ml:
                     rt.history = deque(rt.history, maxlen=ml)
-            if self._monitoring:
-                self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
+            self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
             # Only restart the Webex command listener when its own settings
             # changed (or it isn't running) — a needless restart re-primes and
             # briefly drops commands for no reason.
             if self._cmd_settings_snapshot() != before or self._cmd_timer is None:
                 self._start_cmd_listener()
             self.persist()
+            if self._share_settings_snapshot() != share_before:
+                # Re-pointing must not publish this copy's in-memory list into a
+                # file it has never read — that is exactly the clobber the write
+                # guard exists to prevent. Swapping self.pvs live would also race
+                # the runtime/model/graph while a poll may be mid-pass, so the
+                # new location is picked up on the next launch.
+                self.settings["_shared_pv_root_cache"] = ""
+                self._shared_timer.stop()
+                self._shared_dirty = False
+                self.shared_ok = False
+                self._log("Shared PV list location changed. Restart Diagnostika "
+                          "to load from the new location — until then this copy "
+                          "will not publish any PV-list changes.")
             self._update_status()
             self._log("Settings saved.")
 
     # --- monitoring loop ----------------------------------------------
+    def _start_polling(self):
+        """Start the always-on poll loop.
+
+        Polling is not part of the monitoring switch: the table and the graph
+        show live values whether or not alerting is armed. Only threshold
+        evaluation, alert dispatch and the data watchdog follow the switch.
+        """
+        self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
+        self.timer.start()
+        if not self._monitoring:      # armed launches already did both
+            self._backfill_history()
+            self._start_poll()
+
     def toggle_monitoring(self, on: bool):
         # Any explicit start/stop cancels a pending timed auto-resume.
         self._cancel_resume()
         self._monitoring = on
+        self.model.monitoring = on
         self.btn_monitor.setChecked(on)
         self.btn_monitor.setText("⏹ Stop monitoring" if on else "▶ Start monitoring")
         self.btn_monitor.setStyleSheet(STOP_BUTTON_STYLE if on else BUTTON_STYLE)
+        # Polling itself never stops (see _start_polling): the table keeps
+        # showing live values either way. This switch only controls threshold
+        # evaluation and alert dispatch.
         if on:
-            self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
-            self.timer.start()
-            self._log("Monitoring started.")
+            self._log("Monitoring started — thresholds are now evaluated and "
+                      "alerts will be sent.")
             self._backfill_history()
             self._start_poll()
         else:
-            self.timer.stop()
-            self._poll_gen += 1            # discard any in-flight result
-            self._log("Monitoring stopped.")
+            # Drop any half-finished alert episode so a later start doesn't
+            # resume from a state that was never re-evaluated meanwhile.
+            for rt in self.runtime.values():
+                rt.alert = AlertState()
+                rt.notify_status = ""
+                rt.notify_error = ""
+            self._watchdog_fail_streak = 0
+            self._watchdog_bad = False
+            self._log("Monitoring stopped — values keep updating, but no "
+                      "thresholds are evaluated and no alerts are sent.")
+        self.model.refresh_all()
         self._update_status()
 
     def _cancel_resume(self):
@@ -4662,6 +5169,13 @@ class MonitorWidget(QWidget):
             rt.active_profile = self._match_profile(pv)
             thr = (pv.profile_thresholds(rt.active_profile)
                    if rt.active_profile is not None else pv.thresholds())
+            # Plain severity of this reading, kept up to date even while
+            # monitoring is off so the State column stays truthful.
+            rt.live_level = (_raw_severity(val, thr)
+                             if val is not None and thr.is_active() else
+                             AlertLevel.OK if val is not None else None)
+            if not self._monitoring:
+                continue
             if pv.enabled and thr.is_active():
                 scale, worsening = self._trend_cooldown_scale(rt, thr, now)
                 note = self.evaluator.evaluate(rt.alert, val, thr, now,
@@ -4682,7 +5196,8 @@ class MonitorWidget(QWidget):
         """Alert once when every monitored PV stops getting data (fetch errors
         across the board — an archiver/network outage), and once more when it
         recovers. Distinct from a single PV's own no-data/threshold alerts."""
-        if not self.settings.get("data_watchdog_enabled", True) or not self.pvs:
+        if not self._monitoring or not self.pvs \
+                or not self.settings.get("data_watchdog_enabled", True):
             return
 
         def _is_conn_failure(res) -> bool:
@@ -5135,8 +5650,8 @@ class MonitorWidget(QWidget):
             "- `/alarms` — only PVs currently in warning/alarm\n"
             "- `/list` — list configured PVs\n"
             "- `/plot <pv>` — send current plot of a PV\n"
-            "- `/start` — monitoring on\n"
-            "- `/stop [hours]` — monitoring off; with hours, auto-resume later "
+            "- `/start` — alerting on (PVs are read either way)\n"
+            "- `/stop [hours]` — alerting off; with hours, auto-resume later "
             "(e.g. `/stop 10`)\n"
             "- `/enable <pv>` `/disable <pv>` — alerting per PV\n"
             "- `/datawatchdog on|off` — toggle the 'no data at all' alert "
@@ -5165,12 +5680,14 @@ class MonitorWidget(QWidget):
                 state = "off"
             elif bad:
                 state = "bad data"
-            elif rt and rt.display_level() is not None:
-                state = rt.display_level().label.lower()
+            elif rt and rt.display_level(self._monitoring) is not None:
+                state = rt.display_level(self._monitoring).label.lower()
+                if not self._monitoring:
+                    state += ", not monitored"
             else:
                 state = "no data"
             lines.append(f"- **{p.display_name}**: {val} {units} [{state}]")
-        mon = "MONITORING" if self._monitoring else "stopped"
+        mon = "MONITORING" if self._monitoring else "stopped (reading only)"
         return f"**Status ({mon}):**\n" + "\n".join(lines)
 
     def _cmd_alarms(self) -> str:
@@ -5179,7 +5696,7 @@ class MonitorWidget(QWidget):
             if not p.enabled:
                 continue
             rt = self.runtime.get(p.name)
-            level = rt.display_level() if rt else None
+            level = rt.display_level(self._monitoring) if rt else None
             if level not in (AlertLevel.WARNING, AlertLevel.ALARM):
                 continue
             val = _fmt(rt.current_value) if rt else "–"

@@ -2188,19 +2188,19 @@ class SpectraWidget(QWidget):
 
         return w
 
-    def _install_cursor(self, canvas, fig, ax, x_is_time: bool):
-        """Blitted crosshair with Y-axis and X-axis floating annotations inside the graph."""
-        import matplotlib.dates as _mdates
+    def _install_bot_cursor_artists(self):
+        """(Re)create the spectra-plot crosshair + floating value labels.
+
+        Called after every ax.clear() on the spectra plot (in _redraw_spectra and
+        _draw_bot_empty), since clear() detaches the old artists from the figure.
+        Drawing a detached Text raises 'NoneType has no attribute dpi', so the
+        cursor code always reads the live artists from self._bot_cursor_artists."""
         from matplotlib.transforms import blended_transform_factory as _btf
-
-        _state = {"bg": None, "pending": False, "last_event": None}
-
-        # Crosshair lines
+        ax = self._ax_bot
         vline = ax.axvline(color="#888", linewidth=0.8, linestyle="--", visible=False)
         hline = ax.axhline(color="#888", linewidth=0.8, linestyle="--", visible=False)
-
         # Y-value annotation — floats along left axis edge
-        _y_ann = ax.text(
+        y_ann = ax.text(
             0.0, 0.5, "",
             transform=_btf(ax.transAxes, ax.transData),
             ha="right", va="center", fontsize=9,
@@ -2209,7 +2209,7 @@ class SpectraWidget(QWidget):
                       ec="#1565C0", alpha=0.88, linewidth=0.7),
         )
         # X-value annotation — floats along bottom axis edge
-        _x_ann = ax.text(
+        x_ann = ax.text(
             0.5, 0.0, "",
             transform=_btf(ax.transData, ax.transAxes),
             ha="center", va="top", fontsize=9,
@@ -2217,10 +2217,30 @@ class SpectraWidget(QWidget):
             bbox=dict(boxstyle="round,pad=0.2", fc="white",
                       ec="#888", alpha=0.88, linewidth=0.7),
         )
+        self._bot_cursor_artists = {"vline": vline, "hline": hline,
+                                    "y_ann": y_ann, "x_ann": x_ann}
+
+    def _install_cursor(self, canvas, fig, ax, x_is_time: bool):
+        """Blitted crosshair with Y-axis and X-axis floating annotations inside the graph.
+
+        Artists live in self._bot_cursor_artists and are recreated after each
+        ax.clear(); the callbacks below always read them fresh so a queued redraw
+        never touches an orphaned artist."""
+        import matplotlib.dates as _mdates
+
+        _state = {"bg": None, "pending": False, "last_event": None}
+        self._install_bot_cursor_artists()
+
+        def _artists():
+            ca = getattr(self, "_bot_cursor_artists", None)
+            return [ca["vline"], ca["hline"], ca["y_ann"], ca["x_ann"]] if ca else []
+
+        def _hide_all():
+            for a in _artists():
+                a.set_visible(False)
 
         def _on_draw(_evt):
-            for a in (_y_ann, _x_ann): a.set_visible(False)
-            vline.set_visible(False); hline.set_visible(False)
+            _hide_all()
             _state["bg"] = canvas.copy_from_bbox(fig.bbox)
 
         def _fmt_y(y):
@@ -2243,8 +2263,9 @@ class SpectraWidget(QWidget):
             _state["pending"] = False
             evt = _state["last_event"]
             bg  = _state["bg"]
+            ca  = getattr(self, "_bot_cursor_artists", None)
 
-            if evt is None or evt.inaxes is None:
+            if evt is None or evt.inaxes is None or not ca:
                 if bg:
                     canvas.restore_region(bg)
                     canvas.blit(fig.bbox)
@@ -2254,21 +2275,22 @@ class SpectraWidget(QWidget):
             if x is None or y is None:
                 return
 
-            vline.set_xdata([x, x]); vline.set_visible(True)
-            hline.set_ydata([y, y]); hline.set_visible(True)
+            ca["vline"].set_xdata([x, x]); ca["vline"].set_visible(True)
+            ca["hline"].set_ydata([y, y]); ca["hline"].set_visible(True)
 
-            _y_ann.set_position((0.0, y))
-            _y_ann.set_text(f" {_fmt_y(y)} ")
-            _y_ann.set_visible(True)
+            ca["y_ann"].set_position((0.0, y))
+            ca["y_ann"].set_text(f" {_fmt_y(y)} ")
+            ca["y_ann"].set_visible(True)
 
-            _x_ann.set_position((x, 0.0))
-            _x_ann.set_text(f" {_fmt_x(x)} ")
-            _x_ann.set_visible(True)
+            ca["x_ann"].set_position((x, 0.0))
+            ca["x_ann"].set_text(f" {_fmt_x(x)} ")
+            ca["x_ann"].set_visible(True)
 
             if bg:
                 canvas.restore_region(bg)
-                for artist in (vline, hline, _y_ann, _x_ann):
-                    ax.draw_artist(artist)
+                for artist in _artists():
+                    if artist.get_visible() and artist.axes is not None:
+                        artist.axes.draw_artist(artist)
                 canvas.blit(fig.bbox)
             else:
                 canvas.draw_idle()
@@ -2281,8 +2303,7 @@ class SpectraWidget(QWidget):
                 QTimer.singleShot(16, _process)
 
         def _on_leave(_evt):
-            for a in (_y_ann, _x_ann): a.set_visible(False)
-            vline.set_visible(False); hline.set_visible(False)
+            _hide_all()
             if _state["bg"]:
                 canvas.restore_region(_state["bg"])
                 canvas.blit(fig.bbox)
@@ -3731,6 +3752,7 @@ class SpectraWidget(QWidget):
                 ha="center", va="center", color="#aaa", fontsize=11)
         ax.set_xticks([])
         ax.set_yticks([])
+        self._install_bot_cursor_artists()
         self._canvas_bot.draw_idle()
 
     # ── Display-option helpers ─────────────────────────────────────────────
@@ -4054,6 +4076,9 @@ class SpectraWidget(QWidget):
                 )
                 self._colorbar_bot.set_label(self._colorbar_info["label"], fontsize=9)
                 self._colorbar_bot.ax.tick_params(labelsize=8)
+            # ax.clear() above detached the crosshair artists — recreate them so a
+            # queued cursor redraw doesn't draw an orphaned Text (NoneType .dpi crash).
+            self._install_bot_cursor_artists()
         else:
             self._draw_bot_empty()
 
@@ -4234,13 +4259,18 @@ class SpectraWidget(QWidget):
         for t, arr in wfs:
             self._live_buf.append((t, arr))
         self._live_last_ns = now_ns
-        # Once, on the first real live data: fit From/To to this X axis so a custom
-        # wavelength axis outside the default 700–900 nm is not masked to nothing.
-        if (not self._live_autofit_done and self._live_buf
-                and self._chk_autofit.isChecked()):
-            self._auto_fit_live_range()
-            self._live_autofit_done = True
-        self._redraw_spectra()
+        # Redrawing the whole figure (ax.clear + re-plot up to MAX_INDIVIDUAL_LINES
+        # traces + a full draw_idle) is expensive, and most ticks bring no new
+        # shots — the poll just advances the clock. Skip the redraw on those ticks
+        # so the GUI stays smooth; only rebuild when new spectra actually arrived.
+        if wfs:
+            # Once, on the first real live data: fit From/To to this X axis so a custom
+            # wavelength axis outside the default 700–900 nm is not masked to nothing.
+            if (not self._live_autofit_done and self._live_buf
+                    and self._chk_autofit.isChecked()):
+                self._auto_fit_live_range()
+                self._live_autofit_done = True
+            self._redraw_spectra()
         n_avg = min(self._sb_live_n.value(), len(self._live_buf))
         self._set_status(
             f"Live: {len(self._live_buf)} spectra buffered, "

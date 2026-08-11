@@ -133,6 +133,14 @@ def write_version_to_txt(program_name: str, version: str):
 INTERNAL_BUILDER_DIST = _internal_builder_dist()
 VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 _VERSION_LOOSE_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+# Archived-style exe name, e.g. "Image Tools v2.5.2__20260526_090829.exe"
+TIMESTAMPED_EXE_RE = re.compile(r"^.+__\d{8}_\d{6}\.exe$", re.IGNORECASE)
+
+
+def _exe_version(p: Path) -> tuple[int, int, int]:
+    """Version tuple parsed from an exe filename, for sorting; (0,0,0) if none."""
+    m = VERSION_RE.search(p.stem)
+    return tuple(map(int, m.groups())) if m else (0, 0, 0)
 README_PREFIX = "ReadMe_"
 README_NAME = "ReadMe.txt"
 
@@ -480,6 +488,190 @@ def _fix_archive_dir(archive_dir: Path, log_fn=None):
 
     if changed and log_fn:
         log_fn(f"[{program_name}]   archive OK")
+
+
+def _reunite_unknown_helpers(archive_dir: Path, log_fn=None):
+    """Move helper .py files stranded in archive/unknown/ back into their version folders.
+
+    Helper modules (if_t.py, is_t.py, …) carry no version in their filename, so the
+    deploy step used to drop every old copy into unknown/ (as 'if_t.py', 'if_t (2).py', …).
+    Each copy was logged in unknown/archive_log.txt with the timestamp of the deploy that
+    archived it; the matching version folder carries that same timestamp in its own
+    archive_log.txt. We rebuild that link and move each copy back — keeping the ORIGINAL
+    importable name so the version folder becomes a self-contained, runnable snapshot.
+
+    The Nth physical copy of a name (unique_path order: base, ' (2)', ' (3)', …) matches
+    the Nth timestamp for that name in chronological order.
+    """
+    from collections import defaultdict as _dd
+    unk = archive_dir / "unknown"
+    unk_log = unk / "archive_log.txt"
+    if not unk.is_dir() or not unk_log.exists():
+        return
+    program_name = archive_dir.parent.name
+
+    def _log(m):
+        if log_fn:
+            log_fn(f"[{program_name}] {m}")
+
+    _TS_RE = re.compile(r"\d{8}_\d{6}")
+
+    # timestamp -> version folder (from every vX.Y.Z/archive_log.txt); drop ambiguous ones
+    ts_to_ver: dict[str, Path] = {}
+    ambiguous: set[str] = set()
+    for vdir in archive_dir.iterdir():
+        if not vdir.is_dir() or vdir.name == "unknown":
+            continue
+        vlog = vdir / "archive_log.txt"
+        if not vlog.exists():
+            continue
+        try:
+            for line in vlog.read_text(encoding="utf-8").splitlines():
+                ts = line.split("|", 1)[0].strip()
+                if not _TS_RE.fullmatch(ts):
+                    continue
+                if ts in ts_to_ver and ts_to_ver[ts] != vdir:
+                    ambiguous.add(ts)
+                else:
+                    ts_to_ver[ts] = vdir
+        except Exception:
+            continue
+    if not ts_to_ver:
+        return
+
+    # unknown/archive_log.txt -> per-filename chronological timestamp list
+    per_name_ts: dict[str, list[str]] = _dd(list)
+    try:
+        for line in unk_log.read_text(encoding="utf-8").splitlines():
+            parts = line.split("|", 1)
+            if len(parts) != 2:
+                continue
+            ts, fname = parts[0].strip(), parts[1].strip()
+            if _TS_RE.fullmatch(ts) and fname:
+                per_name_ts[fname].append(ts)
+    except Exception:
+        return
+
+    moved = skipped = 0
+    for fname, ts_list in per_name_ts.items():
+        ts_list = sorted(ts_list)  # chronological == unique_path assignment order
+        stem, suf = Path(fname).stem, Path(fname).suffix
+        phys = [unk / (fname if i == 1 else f"{stem} ({i}){suf}")
+                for i in range(1, len(ts_list) + 1)]
+        existing = [p for p in phys if p.exists()]
+        if len(existing) != len(ts_list):
+            _log(f"unknown: '{fname}' — {len(existing)} file(s) vs {len(ts_list)} log entries, skipping (ambiguous)")
+            skipped += len(existing)
+            continue
+        for src, ts in zip(phys, ts_list):
+            if ts in ambiguous or ts not in ts_to_ver:
+                skipped += 1
+                continue
+            dst_dir = ts_to_ver[ts]
+            dst = dst_dir / fname
+            if dst.exists():
+                _log(f"unknown: {src.name} -> {dst_dir.name}/ SKIP (exists)")
+                skipped += 1
+                continue
+            ok, why = _try_move(src, dst)
+            if ok:
+                moved += 1
+            else:
+                _log(f"unknown: {src.name} -> {dst_dir.name}/ SKIP ({why})")
+                skipped += 1
+
+    if moved:
+        _log(f"unknown: reunited {moved} helper file(s) with their version folders"
+             + (f" ({skipped} skipped)" if skipped else ""))
+
+    # tidy up: if no .py copies remain, drop the (now stale) unknown folder + its log
+    try:
+        if not any(p.suffix.lower() == ".py" for p in unk.iterdir()):
+            unk_log.unlink(missing_ok=True)
+            unk.rmdir()
+            _log("unknown: emptied and removed")
+    except Exception:
+        pass
+
+
+_DUP_SUFFIX_RE = re.compile(r"^(.*?) \((\d+)\)$")
+_TS_SUFFIX_RE  = re.compile(r"^(.*?)__\d{8}_\d{6}$")
+
+
+def _canonical_stem(stem: str) -> str:
+    """Strip a '__YYYYMMDD_HHMMSS' timestamp and/or a ' (N)' dedup suffix off a
+    filename stem, yielding the name the file should live under:
+        'if_t__20260401_134341'      -> 'if_t'
+        'Image Tools v2.5.4 (2)'     -> 'Image Tools v2.5.4'
+        'Image Tools v2.5.4__2026..' -> 'Image Tools v2.5.4'
+    """
+    m = _TS_SUFFIX_RE.match(stem)
+    if m:
+        stem = m.group(1)
+    m = _DUP_SUFFIX_RE.match(stem)
+    if m:
+        stem = m.group(1)
+    return stem
+
+
+def _dup_index(stem: str) -> int:
+    m = _DUP_SUFFIX_RE.match(stem)
+    return int(m.group(2)) if m else 0
+
+
+def _normalize_version_folder_names(archive_dir: Path, log_fn=None):
+    """Make every vX.Y.Z/ folder a clean, runnable snapshot.
+
+    Timestamps are gone by design (Dev Tools no longer keeps them in the archive);
+    the version lives in the filename ('Image Tools v2.5.4.exe') and in the folder
+    name, which is what the Launcher now reads.
+
+    Per version folder, files are grouped by their canonical name (timestamp and
+    ' (N)' dedup suffix stripped). For each group the best copy is kept and renamed
+    to the canonical name; redundant copies ('… (2).exe', stray timestamped twins)
+    are deleted. Helper modules (if_t.py, …) keep their importable names so
+    'import if_t' still resolves inside the folder.
+    """
+    from collections import defaultdict as _dd
+    program_name = archive_dir.parent.name
+    renamed = removed = 0
+
+    for vdir in archive_dir.iterdir():
+        if not vdir.is_dir() or vdir.name == "unknown":
+            continue
+
+        groups: dict[str, list[Path]] = _dd(list)
+        for f in vdir.iterdir():
+            if not f.is_file() or f.suffix.lower() in (".txt", ".log"):
+                continue
+            groups[_canonical_stem(f.stem) + f.suffix].append(f)
+
+        for canon, files in groups.items():
+            canon_path = vdir / canon
+            # Keep the base copy: no ' (N)' suffix first, then the canonical
+            # (non-timestamped) name, then lowest index — deterministic, size-agnostic.
+            keeper = min(files, key=lambda p: (_dup_index(p.stem),
+                                               0 if p.name == canon else 1,
+                                               p.name.lower()))
+            for f in files:
+                if f == keeper:
+                    continue
+                try:
+                    f.unlink()
+                    removed += 1
+                    if log_fn:
+                        log_fn(f"[{program_name}]   {vdir.name}/ removed duplicate: {f.name}")
+                except Exception as e:
+                    if log_fn:
+                        log_fn(f"[{program_name}]   WARN remove {f.name}: {e}")
+
+            if keeper.name != canon and not canon_path.exists():
+                ok, _why = _try_move(keeper, canon_path)
+                if ok:
+                    renamed += 1
+
+    if log_fn and (renamed or removed):
+        log_fn(f"[{program_name}] normalized {renamed} name(s), removed {removed} duplicate(s) in version folders")
 
 
 def move_existing_exes_to_archive(target_dir: Path, keep_name: str, logs: list[str], program_name: str):
@@ -1092,69 +1284,81 @@ class DeployGUI(ttk.Frame):
         self._set_busy(True)
 
         def worker():
-            for dst_root in selected_roots:
-                if not dst_root.exists():
-                    self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
-                    continue
-
-                for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
-                    if not program_dir.is_dir():
-                        continue
-                    if program_dir.name.lower() in ("archive", "dist"):
+            try:
+                for dst_root in selected_roots:
+                    if not dst_root.exists():
+                        self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
                         continue
 
-                    program_name = program_dir.name
+                    for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
+                        if not program_dir.is_dir():
+                            continue
+                        if program_dir.name.lower() in ("archive", "dist"):
+                            continue
 
-                    # ── Archive old exes from main folder — keep only newest ─
-                    _all_exes = sorted(
-                        [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)],
-                        key=_exe_version, reverse=True,
-                    )
-                    if len(_all_exes) > 1:
-                        _keep = _all_exes[0]
-                        _logs: list[str] = []
-                        move_existing_exes_to_archive(program_dir, _keep.name, _logs, program_name)
-                        for _msg in _logs:
-                            self.after(0, self._log, _msg)
+                        program_name = program_dir.name
+                        try:
+                            # ── Archive old exes from main folder — keep only newest ─
+                            _all_exes = sorted(
+                                [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)],
+                                key=_exe_version, reverse=True,
+                            )
+                            if len(_all_exes) > 1:
+                                _keep = _all_exes[0]
+                                _logs: list[str] = []
+                                move_existing_exes_to_archive(program_dir, _keep.name, _logs, program_name)
+                                for _msg in _logs:
+                                    self.after(0, self._log, _msg)
 
-                    # ── Fix archive ──────────────────────────────────────
-                    archive_dir = program_dir / "archive"
-                    if archive_dir.exists():
-                        _fix_archive_dir(archive_dir, lambda msg: self.after(0, self._log, msg))
+                            # ── Fix archive ──────────────────────────────────────
+                            archive_dir = program_dir / "archive"
+                            if archive_dir.exists():
+                                _logfn = lambda msg: self.after(0, self._log, msg)
+                                _fix_archive_dir(archive_dir, _logfn)
+                                # Reunite helper .py files stranded in unknown/ with their
+                                # version folders, then make every snapshot runnable by
+                                # stripping timestamp suffixes off in-folder source names.
+                                _reunite_unknown_helpers(archive_dir, _logfn)
+                                _normalize_version_folder_names(archive_dir, _logfn)
 
-                    # ── Fix icons ────────────────────────────────────────
-                    dist_prog_dir = _dist_root() / program_name
-                    src_ico = None
-                    for vf in list_versions(dist_prog_dir)[:1]:
-                        cand = vf / "icon.ico"
-                        if cand.exists():
-                            src_ico = cand
-                            break
-                    if src_ico is None:
-                        cand = dist_prog_dir / "icon.ico"
-                        if cand.exists():
-                            src_ico = cand
+                            # ── Fix icons ────────────────────────────────────────
+                            dist_prog_dir = _dist_root() / program_name
+                            src_ico = None
+                            for vf in list_versions(dist_prog_dir)[:1]:
+                                cand = vf / "icon.ico"
+                                if cand.exists():
+                                    src_ico = cand
+                                    break
+                            if src_ico is None:
+                                cand = dist_prog_dir / "icon.ico"
+                                if cand.exists():
+                                    src_ico = cand
 
-                    for png_name in ("icon.png", "Icon.png", "ICON.png"):
-                        png = program_dir / png_name
-                        if png.exists():
-                            try:
-                                png.unlink()
-                                self.after(0, self._log, f"[{program_name}] Removed: {png_name}")
-                            except Exception as e:
-                                self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
+                            for png_name in ("icon.png", "Icon.png", "ICON.png"):
+                                png = program_dir / png_name
+                                if png.exists():
+                                    try:
+                                        png.unlink()
+                                        self.after(0, self._log, f"[{program_name}] Removed: {png_name}")
+                                    except Exception as e:
+                                        self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
 
-                    if src_ico is not None and src_ico.exists():
-                        dst_ico = program_dir / "icon.ico"
-                        if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
-                            try:
-                                shutil.copy2(src_ico, dst_ico)
-                                self.after(0, self._log, f"[{program_name}] icon.ico updated")
-                            except Exception as e:
-                                self.after(0, self._log, f"[{program_name}] FAILED icon.ico: {e}")
+                            if src_ico is not None and src_ico.exists():
+                                dst_ico = program_dir / "icon.ico"
+                                if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
+                                    try:
+                                        shutil.copy2(src_ico, dst_ico)
+                                        self.after(0, self._log, f"[{program_name}] icon.ico updated")
+                                    except Exception as e:
+                                        self.after(0, self._log, f"[{program_name}] FAILED icon.ico: {e}")
+                        except Exception as e:
+                            self.after(0, self._log, f"[{program_name}] ERROR (skipped): {e}")
 
-            self.after(0, self._log, "\nDone.")
-            self.after(0, self._set_busy, False)
+                self.after(0, self._log, "\nDone.")
+            except Exception as e:
+                self.after(0, self._log, f"\nFix aborted: {e}")
+            finally:
+                self.after(0, self._set_busy, False)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1376,6 +1580,18 @@ class DeployGUI(ttk.Frame):
                     except Exception as e:
                         log(f"[{program_name}] Could not remove folder {item.name}: {e}")
 
+            # Version currently deployed (being replaced) — used to group unversioned
+            # helper .py files (if_t.py, …) into the SAME archive/vX.Y.Z/ folder as the
+            # main script, instead of dumping them into archive/unknown/. Computed before
+            # the .exe is archived away, so the old .exe can serve as a fallback source.
+            _live_ver = None
+            for _cand in list(target_dir.glob(f"{program_name}*.py")) + \
+                         list(target_dir.glob(f"{program_name}*.exe")):
+                _vm = VERSION_RE.search(_cand.stem)
+                if _vm:
+                    _live_ver = _vm.group(0)
+                    break
+
             # ── Archivuj staré .exe ──────────────────────────────────
             for exe in target_dir.glob(f"{program_name}*.exe"):
                 # Extract old version from stem: "Program Name vX.Y.Z" -> "vX.Y.Z"
@@ -1403,7 +1619,9 @@ class DeployGUI(ttk.Frame):
             # ── Archivuj staré .py ───────────────────────────────────
             for pyf in target_dir.glob("*.py"):
                 _vm = VERSION_RE.search(pyf.stem)
-                old_ver_label = _vm.group(0) if _vm else "unknown"
+                # Versioned main .py -> its own version; unversioned helpers -> the
+                # live version's folder (keeps the snapshot together and runnable).
+                old_ver_label = _vm.group(0) if _vm else (_live_ver or "unknown")
                 ver_archive_dir = archive_dir / old_ver_label
                 ver_archive_dir.mkdir(parents=True, exist_ok=True)
                 dst_arch = unique_path(ver_archive_dir / pyf.name)
