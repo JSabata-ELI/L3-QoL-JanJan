@@ -1,0 +1,14 @@
+{
+  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe; hidden_imports are forced into the bundle. The reference frames MUST ship with the build: without <camera>-allgood.png a pulser dark for a whole window cannot be flagged at all, and without -warmup.png warm-up time cannot be measured. pulser_monitor.py finds them via sys._MEIPASS.",
+  "extra_files": [
+    "C03-015-PD1M1DF-16022026-allgood.png",
+    "C03-019-PD2M1DF-16022026-allgood.png",
+    "C03-023-PD3M1DF-16022026-allgood.png",
+    "C03-027-PD4M1DF-160222026-allgood.png",
+    "C03-015-PD1M1DF-140826-warmup.png",
+    "C03-019-PD2M1DF-140826-warmup.png",
+    "C03-023-PD3M1DF-140826-warmup.png",
+    "C03-027-PD4M1DF-140826-warmup.png"
+  ],
+  "hidden_imports": []
+}

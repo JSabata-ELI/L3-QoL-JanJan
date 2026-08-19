@@ -332,14 +332,43 @@ class _WeekendDelegate(QStyledItemDelegate):
         self._cal = cal
         self._selected_keys: set = set()
 
+    def _first_cell(self) -> "tuple[int, int]":
+        """Row/column of the first *day* cell. Qt drops the header row when
+        NoHorizontalHeader is set and the week-number column when
+        NoVerticalHeader is set, so the grid does not always start at (1, 1)."""
+        first_row = 1
+        if (self._cal.horizontalHeaderFormat()
+                == QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader):
+            first_row = 0
+        first_col = 1
+        if (self._cal.verticalHeaderFormat()
+                == QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader):
+            first_col = 0
+        return first_row, first_col
+
     def _date_for_index(self, index):
-        """Return the QDate for a model cell, or None for the hidden header row (row 0)."""
-        if index.row() == 0:
+        """Return the QDate for a model cell, or None for a header/week-number cell."""
+        # The model knows the real date for in-month cells — always prefer it.
+        d = index.data(Qt.ItemDataRole.UserRole)
+        if isinstance(d, QDate) and d.isValid():
+            return d
+        first_row, first_col = self._first_cell()
+        if index.row() < first_row or index.column() < first_col:
+            return None                       # header row / week-number column
+        first = QDate(self._cal.yearShown(), self._cal.monthShown(), 1)
+        if not first.isValid():
             return None
-        year, month = self._cal.yearShown(), self._cal.monthShown()
-        first = QDate(year, month, 1)
-        start = first.addDays(-(first.dayOfWeek() - 1))   # Monday of first displayed week
-        return start.addDays((index.row() - 1) * 7 + index.column())
+        # Column offset of the 1st within the first displayed week.
+        offset = (first.dayOfWeek() - self._cal.firstDayOfWeek().value) % 7
+        row = index.row() - first_row
+        # Qt shifts the whole grid one week back when the 1st sits in the very
+        # first column (QCalendarModel::dateForCell, MinimumDayOffset = 1), so
+        # row 0 then shows the PREVIOUS week. Without this the painted days are
+        # a week off (clicking one day highlighted a different one).
+        if offset < 1:
+            row -= 1
+        start = first.addDays(-offset)
+        return start.addDays(row * 7 + (index.column() - first_col))
 
     def set_selected(self, dates):
         self._selected_keys = {(d.year(), d.month(), d.day()) for d in dates}
@@ -354,11 +383,11 @@ class _WeekendDelegate(QStyledItemDelegate):
             option.state = option.state & ~QStyle.StateFlag.State_Selected
 
     def paint(self, painter, option, index):
-        is_weekend = index.column() in (5, 6)
         d = self._date_for_index(index)
         if d is None:
             super().paint(painter, option, index)
             return
+        is_weekend = d.dayOfWeek() in (6, 7)
         is_sel = (d.year(), d.month(), d.day()) in self._selected_keys
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         if is_sel:
@@ -1248,6 +1277,7 @@ class CSSLoggerWidget(QWidget):
         self._pre_window_vals: dict = {}  # pv → (ts_ns, value, units) before window start
         self._plot_window_ns = None       # explicit carry-forward window (live mode)
         self._conditions: list = copy(self.config.get("conditions", []))
+        self._cond_last_diag = None   # de-dupes the per-refresh conditions log
         self._table_rows_unfiltered: list = []
         self._numeric_pvs: set = set()
         self._master_pv: str       = self.config.get("master_pv", MASTER_RAMP_PV)
@@ -2654,15 +2684,16 @@ class CSSLoggerWidget(QWidget):
             if raw_np and ax_i < len(raw_np):
                 arr, vals = raw_np[ax_i]
                 if len(arr):
-                    # arr (times) is sorted ascending → binary search the nearest
-                    # sample instead of scanning the whole array each frame.
-                    pos = int(np.searchsorted(arr, x_f))
-                    if pos <= 0:
-                        idx = 0
-                    elif pos >= len(arr):
-                        idx = len(arr) - 1
-                    else:
-                        idx = pos if (arr[pos] - x_f) < (x_f - arr[pos - 1]) else pos - 1
+                    # The curves are drawn with drawstyle="steps-post", i.e. a
+                    # sample's value holds until the *next* sample. So report the
+                    # last sample at or before the cursor, never the nearest one:
+                    # snapping to the nearest sample would show the next value
+                    # from the midpoint of a gap onwards, while the line still
+                    # draws the previous one (a step that looks invisible until
+                    # the cursor reaches it). arr (times) is sorted ascending, so
+                    # binary-search instead of scanning every frame.
+                    pos = int(np.searchsorted(arr, x_f, side="right"))
+                    idx = pos - 1 if pos > 0 else 0
                     snap_val = float(vals[idx])
             if pv and pv in self._pv_settings:
                 self._pv_settings[pv]["cursor_val"] = (
@@ -3808,36 +3839,67 @@ class CSSLoggerWidget(QWidget):
     # ── Conditions ──────────────────────────────────────────────────────────
 
     def _apply_conditions_to_rows(self, rows=None):
-        """Filter rows by active conditions. Returns filtered list."""
+        """Filter rows by active conditions. Returns filtered list.
+
+        A row survives only if every condition PV is present and inside its
+        [min, max]. There is deliberately no "0 matched, show everything anyway"
+        fallback: an empty table IS the answer when the whole window is out of
+        range (shutter closed, laser off), and hiding that behind the full data
+        set is exactly what the Conditions button exists to prevent.
+
+        The one case that used to need that fallback — a condition on a PV that
+        carries no data in this window, which would otherwise reject every row —
+        is handled by skipping that condition and saying so in the log.
+        """
         # Every rebuild of _table_rows goes through here, and the row dicts
         # themselves can be recomputed in place (custom PVs), so this is the one
         # place that must drop the graph's per-PV sample cache.
         self._pairs_cache = None
         if rows is None:
             rows = self._table_rows_unfiltered
-        if not self._conditions:
+        if not self._conditions or not rows:
             return list(rows)
+        # Rows are built by sample-hold, so the last one carries every channel
+        # that appeared anywhere in the window — the exact set of PVs the
+        # conditions can actually judge.
+        available = set(rows[-1][1])
+        active  = [c for c in self._conditions
+                   if c.get("pv") and c["pv"] in available]
+        skipped = [c["pv"] for c in self._conditions
+                   if c.get("pv") and c["pv"] not in available]
         filtered = [
             (ts, row_dict) for ts, row_dict in rows
-            if self._row_matches_conditions(row_dict)
+            if self._row_matches_conditions(row_dict, active)
         ]
-        if not filtered and rows:
-            # Never let stale/misconfigured Conditions blank a table that
-            # otherwise has data — fall back to showing everything (matches
-            # what the graph shows) instead of silently rendering "No rows".
-            pv_list = ", ".join(c.get("pv", "?") for c in self._conditions)
-            self._log(f"Conditions matched 0/{len(rows)} rows (active PVs: "
-                      f"{pv_list}) — showing all rows instead. Check the "
-                      "Conditions dialog if this is unexpected.")
-            return list(rows)
+        self._log_conditions_diag(skipped, len(rows), len(filtered))
         return filtered
 
-    def _row_matches_conditions(self, row_dict):
+    def _log_conditions_diag(self, skipped, n_in, n_out):
+        """Report what the conditions did — once per distinct outcome, because
+        this runs on every live refresh."""
+        msgs = []
+        if skipped:
+            msgs.append("Conditions skipped (no data for these PVs in this "
+                        "window): " + ", ".join(skipped))
+        if n_out == 0 and n_in:
+            pv_list = ", ".join(c.get("pv", "?") for c in self._conditions)
+            msgs.append(f"Conditions discarded all {n_in} rows (active PVs: "
+                        f"{pv_list}) — nothing in this window is inside the "
+                        "configured ranges.")
+        sig = (tuple(skipped), n_out == 0 and bool(n_in))
+        if sig == getattr(self, "_cond_last_diag", None):
+            return
+        self._cond_last_diag = sig
+        for m in msgs:
+            self._log(m)
+
+    def _row_matches_conditions(self, row_dict, conditions=None):
         # Old cssl.py semantics: {pv, min, max}. A condition PV that is absent
         # from the row excludes the row; present values must be within [min, max].
-        if not self._conditions:
+        conds = self._conditions if conditions is None else conditions
+        if not conds:
             return True
-        for cond in self._conditions:
+        for cond in conds:
             pv = cond.get("pv")
             if not pv:
                 continue
@@ -4925,13 +4987,21 @@ class CSSLoggerWidget(QWidget):
     # ── Conditions dialog ────────────────────────────────────────────────────
 
     def _open_conditions_dialog(self):
-        pvs = self._real_pv_names()
+        # Custom channels are filtered exactly like real PVs (they are computed
+        # before the conditions run), so they belong in the dropdown too.
+        pvs = self._real_pv_names() + [d["name"] for d in self._custom_pvs
+                                       if d.get("name")]
         dlg = _ConditionsDialog(self._conditions, pvs, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._conditions = dlg.result_conditions
+            self._cond_last_diag = None     # report the new set's effect again
             rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
             self._table_rows = self._apply_conditions_to_rows(rows)
             self._populate_table()
+            # The graph draws from _table_rows as well — without this it would
+            # keep showing the rows the new conditions just discarded.
+            if self._samples_by_pv:
+                self._plot_graph()
 
     # ── Reference lines dialog ───────────────────────────────────────────────
 
@@ -5018,8 +5088,10 @@ class _ConditionsDialog(QDialog):
 
         lay = QVBoxLayout(self)
         lbl = QLabel("Rows are kept only if every condition PV is present and "
-                     "its value lies within [Min, Max]. Leave Min or Max blank "
-                     "for an open bound.")
+                     "its value lies within [Min, Max]; anything outside is "
+                     "discarded from the table, graph and export. Leave Min or "
+                     "Max blank for an open bound. A condition on a PV with no "
+                     "data in the loaded window is skipped, not applied.")
         lbl.setStyleSheet("color:#555;")
         lbl.setWordWrap(True)
         lay.addWidget(lbl)
@@ -5372,29 +5444,46 @@ class _CustomPVDialog(QDialog):
     that are not loaded right now. Expressions are shown in *current* letters
     (rewritten from each entry's stored bindings) and are canonicalised back on
     OK, so a formula keeps its PVs across preset switches and list edits.
+
+    Two tables spell the mapping out. "Available channels" is the automatic
+    letter assignment for the currently loaded list (read-only — it follows the
+    list, it is not a setting). "What each letter means" lists every letter of
+    every formula with the PV behind it and lets that PV be changed: picking a
+    different channel there swaps the letter inside the expression, so the
+    binding follows the choice.
     """
 
     def __init__(self, custom_pvs, channels=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom PVs (derived channels)")
-        self.resize(820, 620)
+        self.resize(900, 780)
         self._rows: list = []
         self.result_pvs: list = []
+        # Owned by the dialog, so a queued rebuild cannot fire on a table that
+        # has already been destroyed (Cancel while the user was still typing).
+        self._bind_timer = QTimer(self)
+        self._bind_timer.setSingleShot(True)
+        self._bind_timer.timeout.connect(self._refresh_bindings_table)
 
         channels = list(channels or [])
+        self._channels     = channels
         self._pv_by_letter = {lt: pv for lt, pv, _d, _ld in channels}
         self._letter_by_pv = {pv: lt for lt, pv, _d, _ld in channels}
         self._loaded_by_pv = {pv: ld for _lt, pv, _d, ld in channels}
+        self._disp_by_pv   = {pv: d for _lt, pv, d, _ld in channels}
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(
-            "Define new virtual PVs as Python expressions.\n"
-            "Use the letters below as variables (e.g. B/D, A*0.749). Each formula "
-            "remembers the PV behind every letter, so the letters are re-assigned "
-            "to follow the PVs whenever the list order changes."))
+        lbl = QLabel(
+            "Define new virtual PVs as Python expressions over the channel "
+            "letters (e.g. B/D, A*0.749). Every formula remembers the PV behind "
+            "each letter, so the letters are re-assigned to follow the PVs when "
+            "the loaded list changes — the same formula can read A*0.749 today "
+            "and H*0.749 tomorrow and still mean the same PV.")
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
 
         # ── Reference table: which letter is which PV ────────────────────────
-        ref_box = QGroupBox("Available channels")
+        ref_box = QGroupBox("Available channels — letters follow the loaded PV list")
         ref_lay = QVBoxLayout(ref_box)
         if channels:
             ref_tbl = QTableWidget(len(channels), 4)
@@ -5402,7 +5491,7 @@ class _CustomPVDialog(QDialog):
             ref_tbl.verticalHeader().setVisible(False)
             ref_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             ref_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-            ref_tbl.setMaximumHeight(200)
+            ref_tbl.setMaximumHeight(150)
             for r, (letter, pv, disp, loaded) in enumerate(channels):
                 it_l = QTableWidgetItem(letter)
                 it_l.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -5431,6 +5520,9 @@ class _CustomPVDialog(QDialog):
         self._inner_lay.setSpacing(4)
         self._inner_lay.addStretch()
         scroll.setWidget(inner)
+        # The formula list is what the dialog is for — the two reference tables
+        # below must not squeeze it down to a couple of visible rows.
+        scroll.setMinimumHeight(210)
         lay.addWidget(scroll, stretch=1)
 
         for cpv in custom_pvs:
@@ -5441,11 +5533,109 @@ class _CustomPVDialog(QDialog):
         ctrl.addWidget(b_add); ctrl.addStretch()
         lay.addLayout(ctrl)
 
+        # ── Bindings table: one row per letter per formula, PV editable ──────
+        bind_box = QGroupBox("What each letter means — change a PV to re-bind that letter")
+        bind_lay = QVBoxLayout(bind_box)
+        self._bind_tbl = QTableWidget(0, 4)
+        self._bind_tbl.setHorizontalHeaderLabels(
+            ["Custom PV", "Var", "Stands for (PV)", "State"])
+        self._bind_tbl.verticalHeader().setVisible(False)
+        self._bind_tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._bind_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._bind_tbl.setMinimumHeight(150)
+        self._bind_tbl.setMaximumHeight(230)
+        self._bind_tbl.setColumnWidth(0, 220)
+        self._bind_tbl.setColumnWidth(1, 46)
+        self._bind_tbl.setColumnWidth(3, 84)
+        self._bind_tbl.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        bind_lay.addWidget(self._bind_tbl)
+        lay.addWidget(bind_box)
+        self._refresh_bindings_table()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
+
+    # ── Bindings table ──────────────────────────────────────────────────────
+
+    def _queue_bindings_refresh(self):
+        """Rebuild the bindings table once the current signal has unwound.
+
+        The rebuild deletes the very combo boxes whose signal asks for it, so it
+        must not run inside the handler. Restarting the timer also collapses a
+        burst of requests (one per keystroke) into a single rebuild.
+        """
+        self._bind_timer.start(0)
+
+    def _refresh_bindings_table(self):
+        tbl = getattr(self, "_bind_tbl", None)
+        if tbl is None:      # queued from _add_row before the table was built
+            return
+        tbl.setRowCount(0)
+        # Only channels that actually have a letter can be picked — a letter is
+        # how the expression names them. Already-saved custom PVs are in here
+        # too (they are part of the channel list), so one custom PV can be built
+        # on another; one added in this dialog gets its letter after OK.
+        options = [pv for _lt, pv, _d, _ld in self._channels]
+        for rec in self._rows:
+            name = rec["name"].text().strip() or "(unnamed)"
+            for letter in _cpv_vars(rec["expr"].text()):
+                pv     = self._pv_by_letter.get(letter)
+                loaded = self._loaded_by_pv.get(pv, True) if pv else False
+                row = tbl.rowCount(); tbl.insertRow(row)
+
+                it_name = QTableWidgetItem(name)
+                it_name.setToolTip(name)       # the column elides long names
+                it_var  = QTableWidgetItem(letter)
+                it_var.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if pv is None:
+                    state = "no channel"
+                elif not loaded:
+                    state = "not loaded"
+                else:
+                    state = "loaded"
+                it_state = QTableWidgetItem(state)
+                for c, it in enumerate((it_name, it_var, None, it_state)):
+                    if it is None:
+                        continue
+                    if state != "loaded":
+                        it.setForeground(QColor("#B71C1C"))
+                    tbl.setItem(row, c, it)
+
+                cb = QComboBox()
+                cb.addItems(options)
+                if pv:
+                    if pv not in options:
+                        cb.addItem(pv)
+                    cb.setCurrentText(pv)
+                    cb.setToolTip(self._disp_by_pv.get(pv, pv))
+                else:
+                    cb.setCurrentIndex(-1)
+                # `activated` fires only on a real user pick — currentIndexChanged
+                # would also fire while the box is being filled above.
+                cb.activated.connect(
+                    lambda _i, rc=rec, lt=letter, box=cb:
+                    self._on_binding_picked(rc, lt, box.currentText()))
+                tbl.setCellWidget(row, 2, cb)
+
+    def _on_binding_picked(self, rec, letter, new_pv):
+        """Re-point one letter of one formula at ``new_pv``.
+
+        The binding is derived from the letters in the expression, so re-binding
+        *is* swapping the letter for the one the chosen channel currently has —
+        which also keeps the shown formula honest about what it reads.
+        """
+        if not new_pv:
+            return
+        new_letter = self._letter_by_pv.get(new_pv)
+        if not new_letter or new_letter == letter:
+            self._queue_bindings_refresh()
+            return
+        rec["expr"].setText(
+            _cpv_rewrite(rec["expr"].text(), {letter: new_letter}))
 
     def _add_row(self, existing=None):
         row_w = QWidget()
@@ -5467,8 +5657,13 @@ class _CustomPVDialog(QDialog):
         rec = {"widget": row_w, "name": name_e, "expr": expr_e, "warn": warn}
         self._rows.append(rec)
         expr_e.textChanged.connect(lambda _t, r=rec: self._refresh_row_state(r))
+        # The bindings table lists a row per letter per formula, so both the
+        # letters and the name column follow whatever is typed here.
+        expr_e.textChanged.connect(lambda _t: self._queue_bindings_refresh())
+        name_e.textChanged.connect(lambda _t: self._queue_bindings_refresh())
         self._refresh_row_state(rec)
         self._inner_lay.insertWidget(self._inner_lay.count() - 1, row_w)
+        self._queue_bindings_refresh()
 
     def _refresh_row_state(self, rec):
         """Spell out what each letter in the row means, and flag the row when a
@@ -5491,6 +5686,7 @@ class _CustomPVDialog(QDialog):
     def _remove_row(self, row_w, rec):
         self._rows.remove(rec)
         row_w.deleteLater()
+        self._queue_bindings_refresh()
 
     def _accept(self):
         out = []

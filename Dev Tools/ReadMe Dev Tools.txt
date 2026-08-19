@@ -52,10 +52,17 @@ BUILDER TAB
       --collect-all automatically when the sources import them,
       so their native libraries are not missing at runtime.
     - the test suites those packages drag in are excluded again.
+    - the folders images\, sounds\, assets\ and icons\ are copied
+      next to the exe whenever the program has them. Programs read
+      those at runtime (Announcer takes its alarm image from
+      images\), so they have to travel with every build.
+    - the program's ReadMe is copied next to the exe as well; the
+      Copy Manager takes it from there, so the published ReadMe
+      follows the sources.
     - the new version is written to <Scratch>\Versions.txt.
 
   Per-project extras go into build_config.json next to the
-  sources:
+  sources. extra_files may name folders as well as files:
 
       {
         "collect_all":      ["module"],
@@ -63,7 +70,7 @@ BUILDER TAB
         "hidden_imports":   ["module"],
         "copy_metadata":    ["module"],
         "exclude_modules":  ["module"],
-        "extra_files":      ["data.json"]
+        "extra_files":      ["data.json", "images"]
       }
 
 
@@ -79,7 +86,13 @@ COPY MANAGER TAB
 
       <destination>\<program>\<program> vX.Y.Z.exe
                               *.py, ReadMe, icon.ico
+                              images\, sounds\, …
                               archive\vX.Y.Z\…
+
+  Folders that came with the build (images\, sounds\) are copied
+  along with the files. Folders on the destination that the new
+  version does not bring are deleted as leftovers — except
+  _internal\ and archive\.
 
   The previous exe (and its sources) is moved into the archive
   folder first. A locked exe is skipped, not treated as an error.
@@ -126,5 +139,14 @@ GENERAL NOTES
   - build_usage.json       build history
   - copy_manager_state.ini last deployed version per program
   - Versions.txt           on Scratch, "Name = vX.Y.Z" per program
+
+  A program's ReadMe must be named ReadMe_<folder name> (any
+  extension). The deploy is forgiving and also accepts a plain
+  README.txt, but the Launcher is not: a ReadMe it cannot match is
+  invisible, so its ReadMe button opens nothing. The deploy can
+  therefore succeed while the Launcher still shows no ReadMe.
+
+  For the developer view of the code see STRUCTURE.md, and
+  dev_tools_structure.md for the line-by-line map.
 
 -----------------------------------------------------------------

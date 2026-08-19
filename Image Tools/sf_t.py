@@ -38,13 +38,14 @@ except ImportError:
 from PySide6.QtCore import Qt, QDate, QObject, Signal, QTimer, QEvent
 from PySide6.QtGui import QColor, QTextCharFormat, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QLineEdit,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QCalendarWidget,
     QMessageBox, QMainWindow, QStyledItemDelegate, QSizePolicy,
     QProgressBar, QPlainTextEdit, QRadioButton, QButtonGroup,
-    QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QGroupBox,
+    QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QGroupBox, QSlider,
+    QFileDialog,
 )
 
 # ── GRADIENTS (kopie z is_t.py) ───────────────────────────────────────────────
@@ -79,11 +80,49 @@ def _make_stepped_lut_sf(stops):
         lut[i] = color
     return lut
 
+# NI Vision "Binary", measured off the real viewer — same table and rule as in is_t.py,
+# where how it was measured is written down. 15 colours, black below the first band, one
+# colour per 1024 stored 16-bit units. No white and no grey anywhere in the cycle.
+_NI_BINARY_CYCLE_SF = [
+    (255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
+    (255,127,0), (255,0,127), (127,255,0), (127,0,255), (0,127,255), (0,255,127),
+    (255,127,127), (127,255,127), (127,127,255),
+]
+
+def _make_ni_binary_lut_sf():
+    """The NI Binary rule as a 256-entry LUT over the ABSOLUTE 8-bit scale.
+
+    This tab renders from 8-bit images, so unlike the Image Slider it cannot take the
+    exact 16-bit path: one code is 257 stored units against a 1024-unit band."""
+    table = _np_grad.array([(0, 0, 0)] + _NI_BINARY_CYCLE_SF, dtype=_np_grad.uint8)
+    band = (_np_grad.arange(256, dtype=_np_grad.int64) * 257) // 1024
+    return table[_np_grad.where(band <= 0, 0, (band - 1) % 15 + 1)]
+
+# "False Colors" (same definition as in is_t.py): dark blue → violet → purple →
+# magenta → pink → white, with the stops crowded at the bottom so faint detail gets
+# most of the colour range.
+_FALSE_COLORS_STOPS_SF = [
+    (0.00, (0,0,0)), (0.03, (25,0,70)), (0.07, (45,0,120)), (0.12, (70,0,160)),
+    (0.20, (100,0,180)), (0.30, (130,5,185)), (0.42, (160,20,180)),
+    (0.55, (190,40,175)), (0.68, (215,70,170)), (0.80, (235,105,170)),
+    (0.90, (247,150,185)), (0.96, (252,200,215)), (1.00, (255,255,255)),
+]
+
+# "Rainbow" (same definition as in is_t.py): the NI Vision palette — blue to red with
+# a prominent green middle, 0 black and 255 white.
+_RAINBOW_STOPS_SF = [
+    (0.00, (0,0,0)), (0.04, (0,0,200)), (0.14, (0,40,255)), (0.26, (0,150,255)),
+    (0.36, (0,230,180)), (0.46, (0,255,80)), (0.56, (90,255,0)), (0.66, (190,255,0)),
+    (0.76, (255,220,0)), (0.86, (255,120,0)), (0.94, (255,0,0)), (1.00, (255,255,255)),
+]
+
 SF_GRADIENTS: dict = {
     "Grayscale":       None,
     "Gradient":        _make_lut_sf([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
+    "Binary":          _make_ni_binary_lut_sf(),
+    "False Colors":    _make_lut_sf(_FALSE_COLORS_STOPS_SF),
+    "Rainbow":         _make_lut_sf(_RAINBOW_STOPS_SF),
     "Hot":             _make_lut_sf([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
-    "Binary":          _make_stepped_lut_sf([(0,(0,0,0)),(0.17,(255,0,0)),(0.33,(255,165,0)),(0.5,(255,255,0)),(0.67,(0,255,0)),(0.83,(0,200,255)),(0.92,(0,0,255)),(1,(255,255,255))]),
     "Black and White": _make_binary_lut_sf(),
     "Viridis":         _make_lut_sf([(0,(68,1,84)),(0.25,(59,82,139)),(0.5,(33,145,140)),(0.75,(94,201,98)),(1,(253,231,37))]),
     "Plasma":          _make_lut_sf([(0,(13,8,135)),(0.25,(126,3,168)),(0.5,(204,71,120)),(0.75,(248,149,64)),(1,(240,249,33))]),
@@ -91,6 +130,31 @@ SF_GRADIENTS: dict = {
     "Jet":             _make_lut_sf([(0,(0,0,128)),(0.125,(0,0,255)),(0.375,(0,255,255)),(0.625,(255,255,0)),(0.875,(255,0,0)),(1,(128,0,0))]),
     "Turbo":           _make_lut_sf([(0,(48,18,59)),(0.2,(70,131,193)),(0.4,(48,210,142)),(0.6,(194,228,59)),(0.8,(244,117,22)),(1,(122,4,3))]),
 }
+
+# Palettes mapped onto the frame's own p0.5..p99.5 window — see is_t.ADAPTIVE_PALETTES.
+ADAPTIVE_PALETTES_SF = frozenset({"False Colors"})
+# Cyclic palettes are ABSOLUTE: NI's Binary bands are fixed and do not follow the frame,
+# so no stretch may run first (see is_t.CYCLIC_PALETTES).
+CYCLIC_PALETTES_SF = frozenset({"Binary"})
+
+
+def _lut_pixels_sf(lut, arr, name: str):
+    """RGB pixels for `arr` under `lut`.
+
+    The adaptive palettes are spread over p0.5..p99.5; everything else, cyclic palettes
+    included, is the raw absolute scale."""
+    if name not in ADAPTIVE_PALETTES_SF:
+        return lut[arr]
+    s = arr if arr.size <= 250_000 else _np_grad.ravel(arr)[::(arr.size // 250_000) | 1]
+    lo = float(_np_grad.percentile(s, 0.5))
+    hi = float(_np_grad.percentile(s, 99.5))
+    if hi <= lo:
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo:
+        return lut[arr]
+    scaled = _np_grad.clip((arr.astype(_np_grad.float32) - lo) * (255.0 / (hi - lo)),
+                           0, 255).astype(_np_grad.uint8)
+    return lut[scaled]
 
 _CHECKBOX_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
@@ -169,6 +233,24 @@ def _import_cpva_client():
 
 cpva = _import_cpva_client()
 
+
+def _import_img_scale():
+    """Load the shared intensity-scale helper (sibling img_scale.py) the same way
+    as cpva_client: one instance per process, registered before exec."""
+    import importlib.util as _ilu
+    mod = _sys.modules.get("img_scale")
+    if mod is not None:
+        return mod
+    p = Path(__file__).resolve().parent / "img_scale.py"
+    spec = _ilu.spec_from_file_location("img_scale", p)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules["img_scale"] = mod     # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+img_scale = _import_img_scale()
+
 CPVA_BASE_URL     = cpva.CPVA_BASE_URL
 CPVA_HTTP_TIMEOUT = 15.0   # seconds per channel request
 
@@ -207,43 +289,52 @@ PV_COLUMNS: dict[str, str] = {
 
 MJ_COLUMNS = {"Back_Ref", "pap1"}
 
-# Camera channels (C03-013-PFM1NF:Exposure, …) are ~40 % of the archiver's "**"
-# listing. They are matched last in the PV search so a query like "pcm" cannot
-# be filled up entirely by camera channels before a single energy PV shows up.
-_CAM_CHANNEL_RE = _re.compile(r"^C\d{2}-\d{2,3}-")
+# PV-search ranking lives in cpva_client so the Shot Finder and the Image Slider
+# picker cannot drift apart (see cpva.rank_pv_match).
+_CAM_CHANNEL_RE = cpva.CAM_CHANNEL_RE
 
 SBW4_TRANSMISSION        = 0.749
 SBW4_WARNING_THRESHOLD_J = 0.5
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
-def _read_img_max_value(path: Path) -> "float | None":
-    """Read imgMaxValue from PNG tEXt metadata — physical maximum pixel value
-    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
-    Returns float or None if not found."""
-    if path.suffix.lower() != ".png":
-        return None
-    try:
-        from PIL import Image as _PilImg
-        with _PilImg.open(str(path)) as pil:
-            info = pil.info
-            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
-            if len(chunks) >= 12:
-                v = chunks[11][1]
-                try:
-                    return float(v)
-                except (ValueError, TypeError):
-                    pass
-            for k, v in chunks:
-                try:
-                    f = float(v)
-                    if 0 < f <= 65535:
-                        return f
-                except (ValueError, TypeError):
-                    pass
-    except Exception:
-        pass
-    return None
+# The `MaxValue` tEXt reader that used to live here is gone: its only callers were the
+# three render paths below, and they do not need it. It is the frame's PEAK in raw
+# counts (not the sensor's range — it reads 4095 only because a saturated 12-bit frame's
+# peak IS 4095), it identified the tag by POSITION (tEXt chunk 12, the Matlab
+# `imgMeta.OtherText{12,2}` idiom), and it cost one extra open of a file on the share
+# per rendered frame. `img_scale.read_max_value` is the name-based reader if the number
+# is ever wanted again.
+
+
+def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None):
+    """Decoded frame → uint8 for display. Every render path in this tab goes through
+    here, so the Shot Finder cannot drift from the Finder or the Slider.
+
+    Absolute unless Auto stretch is ticked — see img_scale.to_u8. `gamma` is in slider
+    units and bends the absolute curve without costing comparability. What this replaced
+    was `MaxValue * arr / arr.max()` then `/4095`: right only for 12-bit cameras,
+    near-black on the 6–11 bit diode cameras, and all-white when the tEXt chunk was
+    missing."""
+    if full_scale is None:
+        full_scale = img_scale.FULL_SCALE_16
+    return img_scale.to_u8(arr, auto, full_scale, gamma)
+
+
+def _full_scale_for_mode(mode: str, path=None, info: dict = None) -> float:
+    """Absolute range of a decoded frame, from the PIL MODE — never from arr.max(): a
+    genuinely dark 16-bit frame can hold nothing above 255 and would be brightened
+    257× by a value-based guess.
+
+    With `path` and the open image's `.info`, a 16-bit frame goes on its CAMERA's
+    reference range instead of a flat 65535 — the archiver's stretch factor is a bracket
+    of each frame's own peak, so a camera sitting on a power of two otherwise doubles and
+    halves in brightness between frames (see img_scale)."""
+    if mode not in ("I", "I;16"):
+        return 255.0
+    if path is None:
+        return img_scale.FULL_SCALE_16
+    return img_scale.full_scale_for_pil(path, info or {}, mode)
 
 
 def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
@@ -256,8 +347,9 @@ def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
 
 def _cpva_fetch_channels(pattern: str = "**",
                          timeout: float = CPVA_HTTP_TIMEOUT) -> "list[str]":
-    """Return all archiver channel names matching `pattern` (default: all)."""
-    return cpva.fetch_channels(pattern, timeout=timeout)
+    """Return all archiver channel names matching `pattern` (default: all).
+    Cached process-wide, so opening a second picker costs nothing."""
+    return cpva.fetch_channels_cached(pattern, timeout=timeout)
 
 
 def _load_csv_for_day(day: date, cols: "list[str]",
@@ -498,6 +590,28 @@ def _format_value_state(col: str, raw: str, state: str) -> str:
     return _format_value(col, raw)
 
 
+def _quantize_col(col: str, v: float) -> float:
+    """Snap a column's value onto its channel value grid, if it has one.
+
+    Only the waveplate does today (multiples of 1000). Applied BEFORE any
+    arithmetic, not just before display: a mid-move readback of 350 437 otherwise
+    produces a Δ of 437 against a target of 350 000, i.e. a difference between a
+    real setting and a position that never existed.
+
+    EVERY comparison in this tab goes through here — matching, the tolerance filter and
+    the displayed Δ alike. When the filter alone skipped it, a day could be headed
+    "✓ match, Δ 0" while the shot list behind it said "no shots within tolerance": the
+    same reading counted as 350 000 in one place and as 350 437 in the other."""
+    return _quantize_col_ex(col, v)[0]
+
+
+def _quantize_col_ex(col: str, v: float) -> "tuple[float, bool]":
+    """(snapped value, was it already on the grid). An off-grid reading is the motor
+    caught mid-travel; it is still reported as the position it was heading to, but the
+    flag lets the display mark it so it cannot be mistaken for a settled one."""
+    return cpva.quantize(CPVA_CHANNEL_MAP.get(col, col), v)
+
+
 def _format_diff(col: str, diff_csv: float) -> str:
     """Format a |value − target| difference (CSV units) in the column's UI units."""
     if col == "sbw4":
@@ -520,7 +634,7 @@ def _find_best_match(rows: list[dict], col: str, target: float) -> dict | None:
     for row in rows:
         raw = row.get(col, "")
         try:
-            val = float(raw)
+            val = _quantize_col(col, float(raw))
         except (ValueError, TypeError):
             continue
         diff = abs(val - target)
@@ -539,6 +653,21 @@ def _folder_hour_from_prague(prague_hour: int, ref_date: date) -> int:
     return (prague_hour - 1) % 24
 
 
+def _day_image_folder(day: date, images_root: "Path | None" = None) -> Path | None:
+    """The day's folder on the image share, or None when the day was never archived.
+
+    Worth its own answer: "the whole day is missing" and "that HOUR is missing" look the
+    same from _find_hour_folder, and telling an operator "no images for this day" about a
+    day that has pictures from 08:00 to 18:00 is simply wrong."""
+    root = images_root if images_root is not None else IMAGES_ROOT
+    base = (_images_root_for_year(root, day.year)
+            / str(day.year) / str(day.month) / str(day.day))
+    try:
+        return base if base.is_dir() else None
+    except Exception:
+        return None
+
+
 def _find_hour_folder(day: date, hour_utc: int,
                       images_root: "Path | None" = None) -> Path | None:
     root = images_root if images_root is not None else IMAGES_ROOT
@@ -551,6 +680,22 @@ def _find_hour_folder(day: date, hour_utc: int,
                 return candidate
         except Exception:
             pass
+    return None
+
+
+def _resolve_cam_folder(hour_folder: "Path | None", cam: str) -> Path | None:
+    """Camera sub-folder inside an hour folder, matched case-insensitively."""
+    if hour_folder is None or not cam:
+        return None
+    try:
+        cf = hour_folder / cam
+        if cf.exists() and cf.is_dir():
+            return cf
+        for sub in hour_folder.iterdir():
+            if sub.is_dir() and sub.name.lower() == cam.lower():
+                return sub
+    except Exception:
+        pass
     return None
 
 
@@ -605,6 +750,72 @@ def _find_image_for_ts(cam_folder: Path, ts_dt: datetime,
     return None
 
 
+def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None",
+                       hour_cache: dict, images_root: "Path | None" = None,
+                       day_dir: "Path | None" = None
+                       ) -> "tuple[Path | None, Path | None]":
+    """(matched image, camera folder it was looked for in) for ONE shot.
+
+    The single image resolver for this tab. A shot is looked for in the hour folder its
+    Prague time falls in AND in the neighbouring hours, because the archive rolls a frame
+    over the hour edge and because a camera is not necessarily recording every hour of
+    the day (2026-08-17 held 92 cameras, only 27 of them in every hour). The 30 s window
+    inside _find_image_for_ts is what actually decides the match — a neighbouring hour
+    can only ever contribute a frame from just across the boundary.
+
+    hour_cache maps hour → camera folder, so resolving many shots of one day does not
+    re-probe the share. Call from a worker thread: os.scandir over SMB blocks ~150 ms."""
+    if dt_obj is None or not cam:
+        return None, None
+    hour_utc = _folder_hour_from_prague(dt_obj.hour, day)
+    if day_dir is None:
+        hf = _find_hour_folder(day, hour_utc, images_root=images_root)
+        if hf is None:
+            return None, None
+        day_dir = hf.parent
+    first_folder = None
+    for delta in (0, -1, 1, -2, 2):
+        h = (hour_utc + delta) % 24
+        if h in hour_cache:
+            cam_folder = hour_cache[h]
+        else:
+            cam_folder = _resolve_cam_folder(day_dir / str(h), cam)
+            hour_cache[h] = cam_folder
+        if cam_folder is None:
+            continue
+        if first_folder is None:
+            first_folder = cam_folder
+        img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns)
+        if img is not None:
+            return img, cam_folder
+    return None, first_folder
+
+
+def _image_problem(path: "Path | None") -> "str | None":
+    """None when `path` is a picture worth offering, else why it is not.
+
+    A row that points at a file nobody can look at is the same disappointment as a row
+    that points at nothing, so an empty file and an all-zero frame count as "no image"
+    (the operator asked for this explicitly). Reads the file once, cheapest test first."""
+    if path is None:
+        return f"no image within {IMG_MATCH_TOL_NS / 1e9:.0f} s of the shot"
+    try:
+        if path.stat().st_size == 0:
+            return "image file is empty"
+    except OSError as exc:
+        return f"image file unreadable ({type(exc).__name__})"
+    try:
+        from PIL import Image as _PilImg
+        import numpy as _np
+        with _PilImg.open(str(path)) as im:
+            arr = _np.asarray(im)
+    except Exception as exc:
+        return f"image cannot be decoded ({type(exc).__name__})"
+    if arr.size == 0 or not bool(arr.max() > 0):
+        return "image is blank (all zero)"
+    return None
+
+
 def _format_value(col: str, raw: str) -> str:
     try:
         v = float(raw)
@@ -613,7 +824,13 @@ def _format_value(col: str, raw: str) -> str:
         if col == "sbw4":
             return f"{v * SBW4_TRANSMISSION:.4f} J"
         if col == "waveplate":
-            return f"{v:.0f}"
+            # Snap onto the 1000-count grid: the waveplate is only ever commanded to
+            # whole multiples of 1000, so any other reading is the motor caught
+            # mid-travel. "%.0f" alone still printed a position it was never set to.
+            # A snapped-from-off-grid value is prefixed "~": it reads as the setting it
+            # belongs to, and still admits the shot was taken while it was moving.
+            v_q, exact = _quantize_col_ex(col, v)
+            return f"{'' if exact else '~'}{v_q:.0f}"
         if col in PV_COLUMNS:          # known energy preset
             return f"{v:.4f} J"
         return f"{v:.4g}"             # arbitrary channel — raw, no unit assumption
@@ -714,7 +931,13 @@ def _group_label(text: str) -> QLabel:
 # ── RESULT DATA ───────────────────────────────────────────────────────────────
 
 class _DayResult:
-    def __init__(self, day: date, best_row: dict, col: str,
+    # status of one day in the results table:
+    #   "ok"       — a shot AND a usable picture were found
+    #   "no_data"  — the archiver gave nothing to search (outage, or no samples)
+    #   "no_image" — a shot was found but no picture goes with it
+    # Every searched day produces one of these, so a day can never quietly vanish from
+    # the table; only "ok" days can be previewed, saved or sent to the Slider.
+    def __init__(self, day: date, best_row: "dict | None", col: str,
                  actual, diff, target_csv: float, hour_folder,
                  rows_in_tol: "list | None" = None,
                  per_col: "dict | None" = None,
@@ -723,9 +946,13 @@ class _DayResult:
                  criteria_csv: "list | None" = None,
                  cam: "str | None" = None,
                  col_meta: "dict | None" = None,
-                 img_path=None):
+                 img_path=None,
+                 status: str = "ok",
+                 reason: str = ""):
         self.day          = day
-        self.best_row     = best_row
+        self.best_row     = best_row if best_row is not None else {}
+        self.status       = status
+        self.reason       = reason
         self.col          = col
         self.actual       = actual
         self.diff         = diff
@@ -743,10 +970,10 @@ class _DayResult:
         self.col_meta     = col_meta or {}
         self.img_path     = img_path   # matched image file (resolved in worker)
         # Prefer exact UTC ns from API rows; fall back to Prague-naive datetime
-        if best_row.get("_ns") is not None:
-            self.ts_ns = int(best_row["_ns"])
+        if self.best_row.get("_ns") is not None:
+            self.ts_ns = int(self.best_row["_ns"])
         else:
-            dt_obj: datetime = best_row.get("_dt")
+            dt_obj: datetime = self.best_row.get("_dt")
             if dt_obj is not None and PRAGUE is not None:
                 ts_aware = dt_obj.replace(tzinfo=PRAGUE)
                 self.ts_ns = int(ts_aware.timestamp() * 1_000_000_000)
@@ -940,7 +1167,11 @@ class ShotFinderWidget(QWidget):
         self._tab_widget = None
 
         self._search_running = False
-        self._day_results: list[_DayResult] = []
+        # Results live per camera tab — see _rebuild_result_tabs. `_day_results` and
+        # `_table` are read-only views onto whichever tab is in front.
+        self._cam_order: "list[str | None]" = [None]
+        self._cam_tables: "dict[str | None, QTableWidget]" = {}
+        self._cam_results: "dict[str | None, list[_DayResult]]" = {}
 
         self._all_cameras: list[tuple[str, str]] = []
         self._selected_cameras: list[tuple[str, str]] = []
@@ -999,7 +1230,18 @@ class ShotFinderWidget(QWidget):
         if out_img is None:
             self._preview_pixmap_orig = None
             self._preview_widget.set_pixmap(None)
+            self._scale_note_lbl.setText("")
             return
+        self._scale_note_lbl.setText(getattr(self, "_scale_note", ""))
+        # Park the greyed-out slider on what Auto gamma actually applied to this frame —
+        # a curve you cannot name is a curve you cannot reproduce.
+        g_applied = getattr(self, "_gamma_applied", None)
+        if g_applied is not None and self._cb_gamma_auto.isChecked():
+            gv = img_scale.slider_from_gamma(g_applied)
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(gv)
+            self._gamma_slider.blockSignals(False)
+            self._lbl_gamma.setText(f"Gamma {img_scale.gamma_from_slider(gv):.2f}:")
         from PySide6.QtGui import QPixmap, QPainter, QFont, QColor, QFontMetrics
         from PySide6.QtCore import QRect
         pm = QPixmap.fromImage(out_img)
@@ -1272,8 +1514,8 @@ class ShotFinderWidget(QWidget):
         grad_row.addWidget(QLabel("Gradient:"))
         self._gradient_cb = _NoScrollComboBox()
         GRADIENT_NAMES = [
-            "Grayscale", "Gradient", "Hot", "Binary", "Black and White",
-            "Viridis", "Plasma", "Inferno", "Jet", "Turbo"
+            "Grayscale", "Gradient", "Binary", "False Colors", "Rainbow", "Hot",
+            "Black and White", "Viridis", "Plasma", "Inferno", "Jet", "Turbo"
         ]
         for name in GRADIENT_NAMES:
             self._gradient_cb.addItem(name)
@@ -1284,6 +1526,69 @@ class ShotFinderWidget(QWidget):
         self._gradient_cb.currentIndexChanged.connect(self._on_gradient_changed)
         grad_row.addWidget(self._gradient_cb, 1)
         ll.addLayout(grad_row)
+
+        # Absolute scale is the default (see img_scale): one palette colour = one
+        # intensity, so frames and cameras are comparable. This switch buys legibility on
+        # the dim cameras and pays with that comparability, so it is visible and off by
+        # default instead of something the viewer does on its own.
+        self._cb_auto_stretch = QCheckBox("Auto stretch")
+        self._cb_auto_stretch.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_auto_stretch.setToolTip(
+            "OFF: absolute scale — pixel value / camera full scale. Brightness is "
+            "comparable between frames and between cameras.\n"
+            "ON: stretch each frame over its own p0.5–p99.5 window. A dim frame becomes "
+            "readable, but colours no longer mean the same intensity from frame to frame.\n"
+            "The Binary and False Colors palettes always map per frame, by design.")
+        self._cb_auto_stretch.toggled.connect(self._on_auto_stretch_toggled)
+        ll.addWidget(self._cb_auto_stretch)
+
+        # Gamma — the same control the Slider and the Finder have, so a frame looks the
+        # same in all three at the same setting. Unlike Auto stretch it keeps one colour =
+        # one intensity: the curve depends only on the pixel value (see img_scale).
+        gamma_row = QHBoxLayout()
+        self._lbl_gamma = QLabel("Gamma 1.00:")
+        self._lbl_gamma.setMinimumWidth(78)   # fixed room, or the row jitters on update
+        gamma_row.addWidget(self._lbl_gamma)
+        self._gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        self._gamma_slider.setRange(img_scale.GAMMA_SLIDER_MIN, img_scale.GAMMA_SLIDER_MAX)
+        self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
+        self._gamma_slider.setToolTip(
+            f"Display gamma {img_scale.GAMMA_MIN:.2f}–{img_scale.GAMMA_MAX:.2f}. "
+            "1.00 = linear absolute scale.\n"
+            "Below 1 lifts the dark end (0.50 is the usable working point on these "
+            "cameras); above 1 darkens.\n"
+            "Brightness stays comparable between result rows — only the shape of the "
+            "curve changes, never its dependence on the frame.")
+        self._gamma_slider.valueChanged.connect(self._on_gamma_slider_changed)
+        self._gamma_manual = img_scale.GAMMA_SLIDER_NEUTRAL
+        gamma_row.addWidget(self._gamma_slider, 1)
+        self._btn_gamma_reset = QPushButton("↺")
+        self._btn_gamma_reset.setFixedWidth(26)
+        self._btn_gamma_reset.setToolTip("Reset gamma to 1.00 (linear)")
+        self._btn_gamma_reset.clicked.connect(self._reset_gamma_slider)
+        gamma_row.addWidget(self._btn_gamma_reset)
+        self._cb_gamma_auto = QCheckBox("Auto")
+        self._cb_gamma_auto.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_gamma_auto.setToolTip(
+            "Auto gamma — the curve that lands THIS frame's median at "
+            f"{int(img_scale.AUTO_GAMMA_TARGET * 100)} % of the range.\n"
+            "Per-frame, so it overrides the slider and gives up comparability, same as "
+            "Auto stretch.")
+        self._cb_gamma_auto.toggled.connect(self._on_gamma_auto_toggled)
+        gamma_row.addWidget(self._cb_gamma_auto)
+        ll.addLayout(gamma_row)
+        # Both boxes exist now, so put the gamma row in the state they call for.
+        self._sync_gamma_enabled()
+
+        # What the displayed intensities MEAN — peak in raw counts, how much of the
+        # camera's full scale that is, the sensor depth, and which mapping produced the
+        # picture. A dark frame is then readable as "3 % of full scale" instead of as a
+        # broken render.
+        self._scale_note_lbl = QLabel("")
+        self._scale_note_lbl.setStyleSheet(
+            "font-size: 10px; color: #666; padding: 1px 0; background: transparent;")
+        self._scale_note_lbl.setWordWrap(True)
+        ll.addWidget(self._scale_note_lbl)
 
         ll.addWidget(_hsep())
 
@@ -1312,30 +1617,14 @@ class ShotFinderWidget(QWidget):
         hdr_row.addStretch(1)
         rl.addLayout(hdr_row)
 
-        # Results table — 7 sloupců
-        self._table = QTableWidget(0, 7)
-        self._table.setHorizontalHeaderLabels([
-            "Date", "Prague Time", "PV", "Value", "Δ from target", "Status", "Folder"
-        ])
-        hh = self._table.horizontalHeader()
-        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for c, mode in enumerate([
-            QHeaderView.ResizeMode.ResizeToContents,
-            QHeaderView.ResizeMode.ResizeToContents,
-            QHeaderView.ResizeMode.ResizeToContents,
-            QHeaderView.ResizeMode.ResizeToContents,
-            QHeaderView.ResizeMode.ResizeToContents,
-            QHeaderView.ResizeMode.ResizeToContents,
-            QHeaderView.ResizeMode.Stretch,
-        ]):
-            hh.setSectionResizeMode(c, mode)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setAlternatingRowColors(True)
-        self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
-        self._table.doubleClicked.connect(self._on_table_double_clicked)
-        self._table.cellClicked.connect(self._on_table_cell_clicked)
-        rl.addWidget(self._table, 1)
+        # One results tab per searched camera, each holding that camera's day rows.
+        # With a single camera the tab bar is hidden, so the common case looks exactly
+        # like the plain table it replaced.
+        self._results_tabs = QTabWidget()
+        self._results_tabs.setDocumentMode(True)
+        self._results_tabs.currentChanged.connect(self._on_result_tab_changed)
+        rl.addWidget(self._results_tabs, 1)
+        self._rebuild_result_tabs([None])
 
         root_layout.addWidget(left_scroll)
         root_layout.addWidget(rw, 1)
@@ -1351,6 +1640,83 @@ class ShotFinderWidget(QWidget):
         self._update_date_info()
         QTimer.singleShot(300, self._load_cameras)
         QTimer.singleShot(400, self._fetch_channel_list)
+
+    # ── RESULT TABS (one per searched camera) ─────────────────────────────────
+    #
+    # A search runs over every camera in "Selected cameras", and each gets its own tab
+    # holding a row per searched day. The rest of the tab works on whichever one is in
+    # front: `_table` and `_day_results` resolve to the visible tab, so preview, save,
+    # send-to-Slider and the shot dialog need no notion of tabs at all — and the row
+    # index → result index alignment they rely on stays inside one camera.
+
+    def _make_results_table(self) -> QTableWidget:
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels([
+            "Date", "Prague Time", "PV", "Value", "Δ from target", "Status", "Folder"
+        ])
+        hh = table.horizontalHeader()
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        for c, mode in enumerate([
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.Stretch,
+        ]):
+            hh.setSectionResizeMode(c, mode)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        table.doubleClicked.connect(self._on_table_double_clicked)
+        table.cellClicked.connect(self._on_table_cell_clicked)
+        return table
+
+    def _rebuild_result_tabs(self, cams: "list"):
+        """One empty tab per camera of the search about to run (None = no camera)."""
+        self._results_tabs.blockSignals(True)
+        while self._results_tabs.count():
+            w = self._results_tabs.widget(0)
+            self._results_tabs.removeTab(0)
+            w.deleteLater()
+        self._cam_tables = {}
+        self._cam_results = {}
+        self._cam_order = list(cams) if cams else [None]
+        for cam in self._cam_order:
+            table = self._make_results_table()
+            self._cam_tables[cam] = table
+            self._cam_results[cam] = []
+            label = _clean_cam_for_filename(cam) if cam else "no camera"
+            idx = self._results_tabs.addTab(table, label)
+            self._results_tabs.setTabToolTip(idx, cam or "No camera selected")
+        self._results_tabs.tabBar().setVisible(len(self._cam_order) > 1)
+        self._results_tabs.setCurrentIndex(0)
+        self._results_tabs.blockSignals(False)
+
+    def _current_cam_key(self):
+        """The camera whose tab is in front."""
+        idx = self._results_tabs.currentIndex()
+        if 0 <= idx < len(self._cam_order):
+            return self._cam_order[idx]
+        return self._cam_order[0] if self._cam_order else None
+
+    @property
+    def _table(self) -> QTableWidget:
+        return self._cam_tables[self._current_cam_key()]
+
+    @property
+    def _day_results(self) -> "list[_DayResult]":
+        return self._cam_results[self._current_cam_key()]
+
+    def _all_results(self) -> "list[_DayResult]":
+        return [dr for cam in self._cam_order for dr in self._cam_results[cam]]
+
+    def _on_result_tab_changed(self, _idx: int):
+        # Another camera, another set of rows — the preview belongs to the row that is
+        # selected HERE, and the send/save buttons to what THIS tab holds.
+        self._on_selection_changed()
 
     def _setup_calendar(self, cal: _NoScrollCalendar):
         cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
@@ -1482,74 +1848,11 @@ class ShotFinderWidget(QWidget):
 
     _PV_DROPDOWN_MAX = 200
 
-    @staticmethod
-    def _split_query(text: str) -> "list[str]":
-        """Query text → lowercase tokens. Spaces, commas and '*' all separate,
-        so "023 l3", "023,l3" and "*023**l3*" are the same query: every token
-        must appear somewhere in the name (implicit wildcards between them)."""
-        return [t for t in _re.split(r"[\s,;*]+", text.strip().lower()) if t]
-
-    @staticmethod
-    def _tokens_in_order(hay: str, tokens: "list[str]") -> bool:
-        """True when every token occurs in `hay` in the order typed."""
-        pos = 0
-        for t in tokens:
-            i = hay.find(t, pos)
-            if i < 0:
-                return False
-            pos = i + len(t)
-        return True
-
-    @classmethod
-    def _rank_pv_match(cls, disp: str, key: str, q) -> "int | None":
-        """Sort weight of one suggestion against query `q` (lower = better), or
-        None when it doesn't match at all. `q` may be raw text or a token list
-        from _split_query.
-
-        Multi-token queries are AND-matched: "023 l3" keeps only names holding
-        both "023" and "l3" anywhere, i.e. what "*023*l3*" would mean — without
-        having to type the stars. Tokens found in the typed order rank above the
-        same tokens scrambled, so nothing is hidden by guessing the order wrong.
-
-        Ranking exists because the archiver's "**" listing is ~9700 channels, of
-        which ~3700 are camera channels (C03-013-PFM1NF:Gain …). Taking the first
-        N raw substring hits therefore returned nothing but cameras for queries
-        like "pcm" — the PV the user was after was hit #150. Field-name and
-        prefix hits now win, and camera channels sink below everything else.
-        """
-        tokens = q if isinstance(q, (list, tuple)) else cls._split_query(q)
-        if not tokens:
-            return None
-        d, k = disp.lower(), key.lower()
-        field = k.rsplit(":", 1)[-1]
-        worst = 0
-        total = 0
-        for t in tokens:
-            if t in (d, k):
-                s = 0
-            elif field == t:
-                s = 1
-            elif field.startswith(t) or k.startswith(t) or d.startswith(t):
-                s = 2
-            elif t in field:
-                s = 3
-            elif t in d or t in k:
-                s = 4
-            else:
-                return None          # AND semantics: one missing token = no hit
-            worst = max(worst, s)
-            total += s
-        # Weakest token decides the tier; the sum only breaks ties, so a name
-        # that matches every token well beats one that barely matches any.
-        score = worst * 10 + min(total, 9)
-        if len(tokens) > 1 and not (cls._tokens_in_order(k, tokens)
-                                    or cls._tokens_in_order(d, tokens)):
-            score += 5
-        if _CAM_CHANNEL_RE.match(key):
-            # Relative order is preserved when EVERY hit is a camera, so an
-            # explicitly camera-targeted query is unaffected.
-            score += 100
-        return score
+    # Query parsing + ranking are shared with the Image Slider's PV picker; these
+    # stay as thin aliases so the existing call sites read unchanged.
+    _split_query     = staticmethod(cpva.split_query)
+    _tokens_in_order = staticmethod(cpva.tokens_in_order)
+    _rank_pv_match   = staticmethod(cpva.rank_pv_match)
 
     def _populate_pv_dropdown(self, text, dropdown, anchor, exclude):
         tokens = self._split_query(text)
@@ -1843,31 +2146,62 @@ class ShotFinderWidget(QWidget):
             parts.append(f"{self._col_short(sc)}: {_format_value_state(sc, raw, state)}")
         return "  |  ".join(parts)
 
-    def _on_selection_changed(self):
-        # Sending works with no selection too (then it sends every result), so the
-        # button must not go dead the moment the selection is cleared.
+    def _find_image_for_shot(self, dr, cam: str, dt_obj, ts_ns,
+                             hour_cache: dict) -> Path | None:
+        """Image belonging to ONE shot of a day result — see _find_image_in_day.
+
+        dr.hour_folder is the hour of that day's best shot only, while the shots in range
+        are spread over the whole day, so the day folder is taken from it and the hour is
+        resolved per shot. Using the SEARCH-TIME folder also means a later change of the
+        image source cannot send old rows to another share."""
+        day_dir = dr.hour_folder.parent if dr.hour_folder is not None else None
+        return _find_image_in_day(dr.day, cam, dt_obj, ts_ns, hour_cache,
+                                  images_root=self._images_root, day_dir=day_dir)[0]
+
+    def _sync_export_buttons(self):
+        """Send / save / Workshop act on the tab in front, so they follow ITS rows.
+
+        Sending works with no selection too (it then sends every row of the tab), so
+        they must not go dead the moment a selection is cleared — only when the tab
+        holds no picture at all."""
+        has_img = any(dr.status == "ok" for dr in self._day_results)
         self._btn_open_slider.setEnabled(
-            self._slider_ref is not None and self._tab_widget is not None
-            and bool(self._day_results))
+            has_img and self._slider_ref is not None and self._tab_widget is not None)
+        self._btn_save_results.setEnabled(has_img)
+        self._btn_send_workshop.setEnabled(has_img)
+        self._btn_send_workshop.setVisible(has_img)
+
+    def _on_selection_changed(self):
+        self._sync_export_buttons()
 
         # Preview při kliknutí na řádek
+        def _clear_preview():
+            # Leaving the last picture up makes a row (or a camera tab) with no image
+            # of its own look like it has one.
+            self._preview_gen += 1
+            self._current_preview_path = None
+            self._on_preview_ready(None, "", self._preview_gen)
+
         rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
         if not rows or not self._day_results:
+            _clear_preview()
             return
         r = rows[0]
         if r >= len(self._day_results):
+            _clear_preview()
             return
         dr = self._day_results[r]
         cam = dr.cam or self._active_cam
-        if not cam or dr.hour_folder is None:
-            return
         dt_obj = dr.best_row.get("_dt")
-        if dt_obj is None:
+        if dr.status != "ok" or not cam or dr.hour_folder is None or dt_obj is None:
+            _clear_preview()
             return
         ts_ns_direct = dr.best_row.get("_ns")
         self._preview_gen += 1
         gen = self._preview_gen
         gradient_name = self._gradient_cb.currentText()
+        auto = self._cb_auto_stretch.isChecked()
+        gamma = self._gamma_arg()
 
         def _resolve_and_load():
             # Folder probing + _find_image_for_ts (os.scandir over SMB) used to
@@ -1895,12 +2229,17 @@ class ShotFinderWidget(QWidget):
                 return
             energy_text = self._build_energy_text(dr, dr.best_row, ts_ns_direct)
             self._current_preview_path = img
-            self._load_and_show_preview(img, energy_text, gen, gradient_name)
+            self._load_and_show_preview(img, energy_text, gen, gradient_name, auto, gamma)
 
         threading.Thread(target=_resolve_and_load, daemon=True).start()
 
-    def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int, gradient_name: str = ""):
-        """Background thread: load and process image into QImage; QPixmap conversion on main thread."""
+    def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int,
+                               gradient_name: str = "", auto: bool = False,
+                               gamma=None):
+        """Background thread: load and process image into QImage; QPixmap conversion on main thread.
+
+        `auto` / `gamma` are passed in, not read from the widgets: this runs on a worker
+        thread."""
         if gen != self._preview_gen:
             return
         try:
@@ -1916,11 +2255,20 @@ class ShotFinderWidget(QWidget):
             else:
                 arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
 
-            img_max_val = _read_img_max_value(img_path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-            arr = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            full_scale = _full_scale_for_mode(pil.mode, img_path, pil.info)
+            arr = _render_u8(arr_f, auto, full_scale, gamma)
+            g_applied = (img_scale.auto_gamma(arr_f, full_scale)
+                         if (not auto and img_scale.is_auto_gamma(gamma)) else None)
+            self._gamma_applied = g_applied
+            # pil.info, not a second open of the same file: a share read is 130–160 ms.
+            # Branch on the MODE, not on full_scale: a 16-bit frame shown on its camera's
+            # reference range has a full_scale of its own and is not an 8-bit source.
+            self._scale_note = (
+                img_scale.meta_from_info(pil.info, arr_f).scale_note(
+                    auto, gamma, g_applied,
+                    img_scale.current_reference_bits(img_scale.camera_from_path(img_path)))
+                if pil.mode in ("I", "I;16")
+                else f"8-bit source  ·  {'auto stretch' if auto else 'absolute scale'}")
 
             w, h = arr.shape[1], arr.shape[0]
 
@@ -1934,7 +2282,7 @@ class ShotFinderWidget(QWidget):
                 lut = SF_GRADIENTS.get(gradient_name, None)
 
             if lut is not None:
-                rgb = lut[arr]
+                rgb = _lut_pixels_sf(lut, arr, gradient_name)
                 out_img = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
             else:
                 out_img = QImage(arr.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
@@ -1957,6 +2305,58 @@ class ShotFinderWidget(QWidget):
         rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
         if rows:
             self._on_selection_changed()
+
+    def _on_auto_stretch_toggled(self, on: bool):
+        self._log(f"SCALE -> {'auto stretch (per frame)' if on else 'absolute'}")
+        self._sync_gamma_enabled()
+        self._reshow_preview()
+
+    def _sync_gamma_enabled(self):
+        """Auto stretch sets both ends of the frame itself, so gamma has nothing left to
+        bend — the whole row goes dead while it is on (the render ignores it too, see
+        img_scale.to_u8). Auto gamma greys out its own slider: the same 'checkbox beats
+        slider' rule the Slider tab uses."""
+        usable = not self._cb_auto_stretch.isChecked()
+        live = usable and not self._cb_gamma_auto.isChecked()
+        self._cb_gamma_auto.setEnabled(usable)
+        self._lbl_gamma.setEnabled(usable)
+        self._gamma_slider.setEnabled(live)
+        self._btn_gamma_reset.setEnabled(live)
+
+    def _gamma_arg(self):
+        """Gamma in slider units for the render, or the AUTO sentinel. Read on the main
+        thread and passed into the loader — never read the widget from a worker."""
+        if self._cb_auto_stretch.isChecked():
+            return img_scale.GAMMA_SLIDER_NEUTRAL
+        if self._cb_gamma_auto.isChecked():
+            return img_scale.GAMMA_SLIDER_AUTO
+        return int(self._gamma_slider.value())
+
+    def _reshow_preview(self):
+        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
+        if rows:
+            self._on_selection_changed()
+
+    def _on_gamma_slider_changed(self, value: int):
+        self._gamma_manual = int(value)
+        self._lbl_gamma.setText(f"Gamma {img_scale.gamma_from_slider(value):.2f}:")
+        self._reshow_preview()
+
+    def _reset_gamma_slider(self):
+        self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
+
+    def _on_gamma_auto_toggled(self, on: bool):
+        self._log(f"GAMMA -> {'auto (per frame)' if on else 'manual'}")
+        self._sync_gamma_enabled()
+        if not on:
+            # Auto off → the user's own value, not the one Auto parked on the greyed-out
+            # slider. An Auto checkbox has to be undoable.
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(int(self._gamma_manual))
+            self._gamma_slider.blockSignals(False)
+            self._lbl_gamma.setText(
+                f"Gamma {img_scale.gamma_from_slider(self._gamma_manual):.2f}:")
+        self._reshow_preview()
 
     # ── DATE HELPERS ──────────────────────────────────────────────────────────
 
@@ -2158,15 +2558,23 @@ class ShotFinderWidget(QWidget):
                 "tol_ui":     crit["tol"],
             })
 
-        self._day_results = []
-        self._table.setRowCount(0)
+        # Every camera in the list is searched, each into its own results tab. The list
+        # is the input; _active_cam is only which of its rows is highlighted, and used
+        # to be the ONLY camera a search ever looked at.
+        cams: "list[str | None]" = [name for _num, name in self._selected_cameras]
+        if not cams:
+            cams = [self._active_cam] if self._active_cam else [None]
+        self._rebuild_result_tabs(cams)
+
         self._btn_open_slider.setEnabled(False)
         self._set_busy(True)
         self._prog.setVisible(True)
         self._prog.setRange(0, len(days))
         self._prog.setValue(0)
         self._search_running = True
-        self._result_lbl.setText(f"Searching {len(days)} days…")
+        self._result_lbl.setText(
+            f"Searching {len(days)} days…"
+            + (f" × {len(cams)} cameras" if len(cams) > 1 else ""))
 
         self._sig = _SearchSignals()
         self._sig.progress.connect(self._prog.setValue)
@@ -2174,11 +2582,27 @@ class ShotFinderWidget(QWidget):
         self._sig.done.connect(self._on_search_done)
         self._sig.log_msg.connect(self._log)
 
-        cam = self._active_cam
         images_root  = self._images_root
         csv_root     = self._energy_csv_root
 
+        # The hours of the Time window, not just its dates. They used to be collected,
+        # displayed and then thrown away, so "today 14:00 → 16:00" searched from midnight.
+        # The end is inclusive to the whole second the dialog shows (it picks :59:59),
+        # or every sample in the final second of the window would be thrown away.
+        tw_start_ns = int(self._tw_start.timestamp() * 1_000_000_000)
+        tw_end_ns   = int(self._tw_end.timestamp() * 1_000_000_000) + 999_999_999
+
         _emit_log = self._sig.log_msg.emit
+
+        def _fail_days(day, reason: str) -> None:
+            """A day that produced no searchable result still gets a row — in EVERY
+            camera tab, because the archiver data it failed on is the same for all of
+            them. Dropping such a day is what made a whole search look empty."""
+            for _cam in cams:
+                self._sig.result.emit(
+                    {"day": day, "status": "no_data", "reason": reason,
+                     "search_cols": search_cols, "extra_cols": extra_cols,
+                     "criteria_csv": criteria_csv, "cam": _cam})
 
         def worker():
             all_cols = list(search_cols) + [
@@ -2200,24 +2624,46 @@ class ShotFinderWidget(QWidget):
                     rows, per_col, col_meta = _load_api_for_day(
                         day, all_cols, log=_emit_log, csv_root=csv_root)
                     if not rows:
-                        _emit_log(f"{day}: no data (API + CSV) — see lines above for details")
-                        self._sig.result.emit(None)
+                        st = col_meta.get(search_cols[0], {}).get("status")
+                        why = ("archiver did not answer for this day"
+                               if st == "error" else "no samples archived for this PV")
+                        _emit_log(f"{day}: no data (API + CSV) — {why}")
+                        _fail_days(day, why)
                         self._sig.progress.emit(i + 1)
                         continue
 
-                    self._sig.log_msg.emit(f"{day}: {len(rows)} samples")
+                    # Clip the candidate shots to the picked hours. per_col is left whole
+                    # on purpose: it only serves value look-ups around a shot, and a PV
+                    # sampled just outside the window still describes a shot inside it.
+                    n_all = len(rows)
+                    rows = [r for r in rows
+                            if tw_start_ns <= r.get("_ns", 0) <= tw_end_ns]
+                    if not rows:
+                        why = "no samples inside the chosen hours"
+                        _emit_log(f"{day}: {n_all} samples, none in the time window")
+                        _fail_days(day, why)
+                        self._sig.progress.emit(i + 1)
+                        continue
+
+                    self._sig.log_msg.emit(
+                        f"{day}: {len(rows)} samples"
+                        + (f" (of {n_all}, rest outside the time window)"
+                           if len(rows) != n_all else ""))
 
                     primary_crit = criteria_csv[0]
                     day_col      = primary_crit["col"]
                     target_csv   = primary_crit["target_csv"]
                     day_tol_csv  = primary_crit["tol_csv"]
 
-                    # Rows in tolerance: primary col within tol, AND all other criteria match
+                    # Rows in tolerance: primary col within tol, AND all other criteria
+                    # match. Values go through _quantize_col first — the same snap the
+                    # displayed value and Δ use, or a row could be excluded here on a
+                    # number the table never shows.
                     rows_in_tol = []
                     for row in rows:
                         raw_primary = row.get(day_col, "")
                         try:
-                            v_primary = float(raw_primary)
+                            v_primary = _quantize_col(day_col, float(raw_primary))
                         except Exception:
                             continue
                         if abs(v_primary - target_csv) > day_tol_csv:
@@ -2239,7 +2685,7 @@ class ShotFinderWidget(QWidget):
                                     per_col, col_meta, sec_col, row_ns,
                                     tol_s=EXTRA_COL_MATCH_TOL_S)
                             try:
-                                v_sec = float(raw_sec)
+                                v_sec = _quantize_col(sec_col, float(raw_sec))
                             except Exception:
                                 ok = False
                                 break
@@ -2266,7 +2712,7 @@ class ShotFinderWidget(QWidget):
                                         _pc, _cm, cc, rn,
                                         tol_s=EXTRA_COL_MATCH_TOL_S)
                                 try:
-                                    v = float(raw)
+                                    v = _quantize_col(cc, float(raw))
                                     total += abs(v - ct) / max(abs(ct), 1e-9)
                                 except Exception:
                                     total += 1e6
@@ -2274,14 +2720,15 @@ class ShotFinderWidget(QWidget):
                         best = min(rows_in_tol, key=_norm_dist)
 
                     if best is None:
-                        self._sig.log_msg.emit(f"{day}: no matching column found")
-                        self._sig.result.emit(None)
+                        why = f"'{self._col_short(day_col)}' has no numeric values here"
+                        self._sig.log_msg.emit(f"{day}: {why}")
+                        _fail_days(day, why)
                         self._sig.progress.emit(i + 1)
                         continue
 
                     raw_best = best.get(day_col, "")
                     try:
-                        actual_best = float(raw_best)
+                        actual_best = _quantize_col(day_col, float(raw_best))
                     except Exception:
                         actual_best = None
 
@@ -2290,41 +2737,16 @@ class ShotFinderWidget(QWidget):
                     # Hourová složka
                     dt_obj = best.get("_dt")
                     hour_folder = None
-                    if dt_obj is not None:
+                    day_dir = _day_image_folder(day, images_root)
+                    if dt_obj is not None and day_dir is not None:
                         hour_utc = _folder_hour_from_prague(dt_obj.hour, day)
                         hour_folder = _find_hour_folder(day, hour_utc, images_root=images_root)
 
-                    # Resolve camera folder + matched image here (worker thread) —
-                    # keeps SMB probing off the UI thread and lets the Folder cell
-                    # select the exact file in Explorer.
-                    best_ns = best.get("_ns")
-                    folder_path = None
-                    img_path = None
-                    if hour_folder is not None:
-                        if cam:
-                            cam_folder = hour_folder / cam
-                            if not cam_folder.exists():
-                                try:
-                                    for sub in hour_folder.iterdir():
-                                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                                            cam_folder = sub
-                                            break
-                                except Exception:
-                                    pass
-                            try:
-                                if cam_folder.exists() and cam_folder.is_dir():
-                                    folder_path = cam_folder
-                                    if dt_obj is not None:
-                                        img_path = _find_image_for_ts(
-                                            cam_folder, dt_obj, ts_ns_override=best_ns)
-                            except Exception:
-                                pass
-                        if folder_path is None:
-                            folder_path = hour_folder
-
                     # Display values for every searched + also-show PV at the best
                     # shot — resolved HERE so the UI thread never hits the network
-                    # and the table shows exactly what the search matched on.
+                    # and the table shows exactly what the search matched on. The PVs
+                    # do not depend on the camera, so this is done once for all of them.
+                    best_ns = best.get("_ns")
                     display_vals: dict = {}
                     if best_ns is not None:
                         for cc in dict.fromkeys(search_cols + extra_cols):
@@ -2336,33 +2758,69 @@ class ShotFinderWidget(QWidget):
                                     per_col, col_meta, cc, best_ns,
                                     tol_s=EXTRA_COL_MATCH_TOL_S, log=_emit_log)
 
-                    result = {
-                        "day":          day,
-                        "best_row":     best,
-                        "rows_in_tol":  rows_in_tol,
-                        "col":          day_col,
-                        "actual":       actual_best,
-                        "diff":         diff_best,
-                        "target_csv":   target_csv,
-                        "hour_folder":  hour_folder,
-                        "folder_path":  folder_path,
-                        "img_path":     img_path,
-                        "cam":          cam,
-                        "extra_cols":   extra_cols,
-                        "search_cols":  search_cols,
-                        "per_col":      per_col,
-                        "col_meta":     col_meta,
-                        "criteria_csv": criteria_csv,
-                        "display_vals": display_vals,
-                    }
                     self._sig.log_msg.emit(
                         f"{day}: best={_format_value(day_col, raw_best)} "
                         f"in_tol={len(rows_in_tol)}")
-                    self._sig.result.emit(result)
+
+                    # One row per camera: same shot, its own picture. Resolved here on
+                    # the worker thread — SMB probing must stay off the UI thread — with
+                    # the same resolver every other place in this tab uses, so the
+                    # neighbouring hours are tried here too.
+                    for _cam in cams:
+                        folder_path = None
+                        img_path = None
+                        if not _cam:
+                            img_problem = "no camera selected"
+                        elif day_dir is None:
+                            img_problem = "no images archived for this day"
+                        else:
+                            img_path, cam_folder = _find_image_in_day(
+                                day, _cam, dt_obj, best_ns, {},
+                                images_root=images_root, day_dir=day_dir)
+                            folder_path = cam_folder
+                            if cam_folder is None:
+                                # Nothing of this camera in the shot's hour or its
+                                # neighbours — the day HAS pictures, this moment does not.
+                                img_problem = ("nothing was recorded at this time of day"
+                                               if hour_folder is None
+                                               else "this camera was not recording then")
+                            else:
+                                img_problem = _image_problem(img_path)
+                            if img_problem is not None:
+                                img_path = None
+                        if folder_path is None:
+                            folder_path = hour_folder
+                        if img_problem is not None:
+                            _emit_log(f"{day} {_cam or '(no camera)'}: {img_problem} "
+                                      f"({dt_obj.strftime('%H:%M:%S') if dt_obj else '?'})")
+
+                        self._sig.result.emit({
+                            "day":          day,
+                            "best_row":     best,
+                            "rows_in_tol":  rows_in_tol,
+                            "col":          day_col,
+                            "actual":       actual_best,
+                            "diff":         diff_best,
+                            "target_csv":   target_csv,
+                            "hour_folder":  hour_folder,
+                            "folder_path":  folder_path,
+                            "img_path":     img_path,
+                            "cam":          _cam,
+                            "extra_cols":   extra_cols,
+                            "search_cols":  search_cols,
+                            "per_col":      per_col,
+                            "col_meta":     col_meta,
+                            "criteria_csv": criteria_csv,
+                            "display_vals": display_vals,
+                            # A shot without a picture is still a result worth showing
+                            # (the values are real), it just cannot be sent on.
+                            "status":       "ok" if img_problem is None else "no_image",
+                            "reason":       img_problem or "",
+                        })
 
                 except Exception as e:
                     self._sig.log_msg.emit(f"{day}: error — {e}")
-                    self._sig.result.emit(None)
+                    _fail_days(day, f"search failed: {type(e).__name__}: {e}")
 
                 self._sig.progress.emit(i + 1)
 
@@ -2370,18 +2828,69 @@ class ShotFinderWidget(QWidget):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _tab_for(self, cam) -> "tuple[QTableWidget, list]":
+        """(table, results) of the tab a result belongs to.
+
+        Keyed by the camera the search ran with — never by which tab is in front, which
+        can be any of them while a multi-camera search is still filling them in."""
+        if cam not in self._cam_tables:
+            # A result for a camera no tab was built for should not exist; land it in
+            # the first tab rather than dropping it on the floor.
+            cam = self._cam_order[0] if self._cam_order else None
+        return self._cam_tables[cam], self._cam_results[cam]
+
+    def _add_failed_row(self, result: dict, day: date, col: str, reason: str):
+        """A red row for a day that yielded nothing searchable.
+
+        Every day of the range gets a row in every camera's tab, always. Emitting
+        nothing is what turned a search over one busy day (the archiver refuses a whole
+        day above ~110k samples) into an empty table with no explanation anywhere but
+        the Log box."""
+        criteria = result.get("criteria_csv") or []
+        pv_str = "\n".join(self._col_short(c["col"]) for c in criteria) \
+            or self._col_short(col)
+        table, results = self._tab_for(result.get("cam"))
+        dr = _DayResult(
+            day=day, best_row=None, col=col, actual=None, diff=None,
+            target_csv=0.0, hour_folder=None,
+            search_cols=result.get("search_cols"),
+            extra_cols=result.get("extra_cols"),
+            criteria_csv=criteria, cam=result.get("cam"),
+            status="no_data", reason=reason)
+        # Appended like any other result: within a tab the table row index IS the index
+        # into its result list, and every consumer of that list skips non-"ok" entries.
+        results.append(dr)
+
+        r = table.rowCount()
+        table.insertRow(r)
+        row_bg = QColor("#f8d7da")
+        for c, text in enumerate([day.strftime("%Y-%m-%d"), "—", pv_str, "—", "—",
+                                  "✕ " + reason, ""]):
+            item = QTableWidgetItem(text)
+            item.setBackground(row_bg)
+            if c == 5:
+                item.setForeground(QColor("#a11"))
+                item.setToolTip(reason)
+            table.setItem(r, c, item)
+        n_lines = max(pv_str.count("\n") + 1, 1)
+        if n_lines > 1:
+            table.setRowHeight(r, 18 * n_lines + 8)
+
     def _on_day_result(self, result):
         if result is None:
             return
 
         day: date         = result["day"]
-        best_row: dict    = result["best_row"]
-        rows_in_tol: list = result["rows_in_tol"]
-        col: str          = result["col"]
-        hour_folder       = result["hour_folder"]
-        cam               = result["cam"]
+        status: str       = result.get("status", "ok")
+        best_row: dict    = result.get("best_row") or {}
+        rows_in_tol: list = result.get("rows_in_tol") or []
+        col: str          = result.get("col") or (result.get("search_cols") or [""])[0]
+        hour_folder       = result.get("hour_folder")
+        cam               = result.get("cam")
         dt_obj: datetime = best_row.get("_dt")
-        if dt_obj is None:
+        if status == "no_data" or dt_obj is None:
+            self._add_failed_row(result, day, col,
+                                 result.get("reason") or "nothing found for this day")
             return
 
         per_col = result.get("per_col", {})
@@ -2395,8 +2904,10 @@ class ShotFinderWidget(QWidget):
             criteria_csv=result.get("criteria_csv"),
             cam=cam,
             col_meta=result.get("col_meta"),
-            img_path=result.get("img_path"))
-        self._day_results.append(dr)
+            img_path=result.get("img_path"),
+            status=status, reason=result.get("reason", ""))
+        table, results = self._tab_for(cam)
+        results.append(dr)
 
         # Folder + matched image were resolved in the worker (SMB off UI thread)
         folder_path = result.get("folder_path")
@@ -2425,7 +2936,7 @@ class ShotFinderWidget(QWidget):
             """Return (diff_in_ui_units, formatted_str)."""
             raw, state = _val_at(cc)
             try:
-                v = float(raw)
+                v = _quantize_col(cc, float(raw))
             except (ValueError, TypeError):
                 return None, (cpva.PV_TEXT_ERROR if state == "error"
                               else cpva.PV_TEXT_NOT_FOUND)
@@ -2465,7 +2976,15 @@ class ShotFinderWidget(QWidget):
         diff_str = "\n".join(diff_lines)
 
         n_tol = len(rows_in_tol)
-        if off_pvs:
+        if status == "no_image":
+            # The numbers are real, the picture is not there — red, because the point of
+            # this tab is the picture. Any PV-off note is kept, the row still explains
+            # what was matched.
+            status_str   = "✕ " + "; ".join(
+                [result.get("reason") or "no image"] + off_pvs)
+            status_color = QColor("#a11")
+            row_bg       = QColor("#f8d7da")
+        elif off_pvs:
             status_str   = "⚠ " + "; ".join(off_pvs)
             status_color = QColor("#856404")
             row_bg       = QColor("#fff3cd")
@@ -2478,8 +2997,8 @@ class ShotFinderWidget(QWidget):
             status_color = QColor("#155724")
             row_bg       = None
 
-        r = self._table.rowCount()
-        self._table.insertRow(r)
+        r = table.rowCount()
+        table.insertRow(r)
         cells = [
             day.strftime("%Y-%m-%d"),
             prague_str,
@@ -2508,11 +3027,11 @@ class ShotFinderWidget(QWidget):
                 else:
                     item.setForeground(QColor("#cc0000"))
                     item.setToolTip("Image folder not found on the share")
-            self._table.setItem(r, c, item)
+            table.setItem(r, c, item)
         # Row height scales with the number of stacked lines
         n_lines = max(len(pv_lines), len(diff_lines), 1)
         if n_lines > 1:
-            self._table.setRowHeight(r, 18 * n_lines + 8)
+            table.setRowHeight(r, 18 * n_lines + 8)
 
     def _on_table_cell_clicked(self, row: int, col: int):
         """Click the Folder cell (col 6): open Explorer with the matched image
@@ -2550,6 +3069,10 @@ class ShotFinderWidget(QWidget):
         rows_in_tol = dr.rows_in_tol
         target_csv = dr.target_csv
 
+        if dr.status == "no_data":
+            QMessageBox.information(self, "Nothing to show",
+                f"{dr.day}: {dr.reason}.")
+            return
         if not rows_in_tol:
             QMessageBox.information(self, "No shots",
                 f"No shots within tolerance for {dr.day}.")
@@ -2559,7 +3082,7 @@ class ShotFinderWidget(QWidget):
         from PySide6.QtWidgets import QDialog, QDialogButtonBox
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Shots in range — {dr.day}")
-        dlg.resize(600, 300)
+        dlg.resize(900, 760)
         lay = QVBoxLayout(dlg)
 
         lbl = QLabel(f"{len(rows_in_tol)} shot(s) in range on {dr.day}:")
@@ -2607,7 +3130,8 @@ class ShotFinderWidget(QWidget):
                 tbl.setItem(r2, c_idx, QTableWidgetItem(
                     _format_value_state(cc, raw_cc, state_cc)))
                 try:
-                    diff_str = _format_diff(cc, abs(float(raw_cc) - cr["target_csv"]))
+                    diff_str = _format_diff(
+                        cc, abs(_quantize_col(cc, float(raw_cc)) - cr["target_csv"]))
                 except (ValueError, TypeError):
                     diff_str = (cpva.PV_TEXT_ERROR if state_cc == "error"
                                 else cpva.PV_TEXT_NOT_FOUND)
@@ -2621,25 +3145,40 @@ class ShotFinderWidget(QWidget):
 
         lay.addWidget(tbl, 1)
 
-        cam_folder_ref = [None]
-        # Zjisti cam_folder pro preview — camera captured at search time
+        # The dialog is modal and sits over the panel, so the picked shot has to be
+        # shown here — the caption bar is baked into the pixmap by the loader, same
+        # as in the panel preview.
+        dlg_preview = _PreviewWidget()
+        dlg_preview.setMinimumHeight(300)
+        lay.addWidget(dlg_preview, 2)
+
+        # Camera captured at search time; hour folders resolved per shot on demand
         cam = dr.cam or self._active_cam
-        if cam and dr.hour_folder is not None:
-            cf = dr.hour_folder / cam
-            if not cf.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cf = sub
-                            break
-                except Exception:
-                    pass
-            if cf.exists():
-                cam_folder_ref[0] = cf
+        hour_cache: dict = {}
+
+        def _mirror_preview(out_img, energy_text, gen):
+            # Connected after _on_preview_ready, so the finished pixmap (image +
+            # caption) is already built by the time this runs.
+            if gen != self._preview_gen:
+                return
+            try:
+                dlg_preview.set_pixmap(self._preview_pixmap_orig)
+            except RuntimeError:      # dialog already gone
+                pass
+
+        self._preview_sig.show.connect(_mirror_preview)
+
+        def _drop_mirror(*_a):
+            try:
+                self._preview_sig.show.disconnect(_mirror_preview)
+            except (RuntimeError, TypeError):
+                pass
+
+        dlg.finished.connect(_drop_mirror)
 
         def _on_dlg_row_selected():
             sel = tbl.selectedIndexes()
-            if not sel or cam_folder_ref[0] is None:
+            if not sel:
                 return
             i = sel[0].row()
             if i >= len(rows_in_tol):
@@ -2648,17 +3187,30 @@ class ShotFinderWidget(QWidget):
             dt_obj2 = row.get("_dt")
             if dt_obj2 is None:
                 return
-            img2 = _find_image_for_ts(cam_folder_ref[0], dt_obj2,
-                                       ts_ns_override=row.get("_ns"))
-            if img2:
-                # Full multi-PV caption (search + also-show), same as main table
-                energy2 = self._build_energy_text(dr, row, row.get("_ns"))
-                _gen2 = self._preview_gen + 1
-                self._preview_gen = _gen2
-                _gname2 = self._gradient_cb.currentText()
-                threading.Thread(
-                    target=lambda p=img2, e=energy2, g=_gen2, gn=_gname2: self._load_and_show_preview(p, e, g, gn),
-                    daemon=True).start()
+            # Full multi-PV caption (search + also-show), same as main table
+            energy2 = self._build_energy_text(dr, row, row.get("_ns"))
+            self._preview_gen += 1
+            gen2 = self._preview_gen
+            gname2 = self._gradient_cb.currentText()
+            auto2 = self._cb_auto_stretch.isChecked()
+            gam2 = self._gamma_arg()
+            ns2 = row.get("_ns")
+
+            def _resolve_and_load(dt2=dt_obj2, ns=ns2, e=energy2, g=gen2,
+                                  gn=gname2, a=auto2, gm=gam2):
+                img2 = self._find_image_for_shot(dr, cam, dt2, ns, hour_cache)
+                if g != self._preview_gen:
+                    return
+                if img2 is None:
+                    self._preview_sig.log_msg.emit(
+                        f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s for "
+                        f"{dt2:%Y-%m-%d %H:%M:%S} ({cam or 'no camera'})")
+                    self._preview_sig.show.emit(None, "", g)
+                    return
+                self._current_preview_path = img2
+                self._load_and_show_preview(img2, e, g, gn, a, gm)
+
+            threading.Thread(target=_resolve_and_load, daemon=True).start()
 
         tbl.selectionModel().selectionChanged.connect(_on_dlg_row_selected)
 
@@ -2686,7 +3238,7 @@ class ShotFinderWidget(QWidget):
             i = sel[0].row()
             if i >= len(rows_in_tol):
                 return
-            if cam_folder_ref[0] is None:
+            if not cam:
                 QMessageBox.warning(dlg, "No camera", "Složka kamery není dostupná.")
                 return
             row_s = rows_in_tol[i]
@@ -2694,8 +3246,8 @@ class ShotFinderWidget(QWidget):
             if dt_obj_s is None:
                 QMessageBox.warning(dlg, "No timestamp", "Řádek nemá časové razítko.")
                 return
-            src = _find_image_for_ts(cam_folder_ref[0], dt_obj_s,
-                                      ts_ns_override=row_s.get("_ns"))
+            src = self._find_image_for_shot(dr, cam, dt_obj_s, row_s.get("_ns"),
+                                            hour_cache)
             if src is None:
                 QMessageBox.warning(dlg, "Image not found", "Obrázek nebyl nalezen.")
                 return
@@ -2724,29 +3276,8 @@ class ShotFinderWidget(QWidget):
                 idxs = sorted(set(i.row() for i in selected_rows))
                 sel_rows_in_tol = [rows_in_tol[i] for i in idxs]
 
-            cam = dr.cam or self._active_cam
             if not cam:
                 QMessageBox.warning(dlg, "No camera", "Select a camera first.")
-                return
-
-            hour_folder = dr.hour_folder
-            if hour_folder is None:
-                QMessageBox.warning(dlg, "No folder", "Hour folder not found.")
-                return
-
-            cam_folder = hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    pass
-
-            if not cam_folder.exists():
-                QMessageBox.warning(dlg, "Camera not found",
-                    f"Camera folder '{cam}' not found.")
                 return
 
             files = []
@@ -2754,8 +3285,10 @@ class ShotFinderWidget(QWidget):
                 dt_obj = row.get("_dt")
                 if dt_obj is None:
                     continue
-                img = _find_image_for_ts(cam_folder, dt_obj,
-                                         ts_ns_override=row.get("_ns"))
+                # Per-shot lookup: the shots in range span the whole day, not just
+                # the hour folder of the day's best shot.
+                img = self._find_image_for_shot(dr, cam, dt_obj, row.get("_ns"),
+                                                hour_cache)
                 if img:
                     files.append((img, row))
 
@@ -2803,23 +3336,31 @@ class ShotFinderWidget(QWidget):
                     pass
 
         btn_open.clicked.connect(open_selected)
+        # Open on the first shot instead of a blank preview area
+        if tbl.rowCount():
+            tbl.selectRow(0)
         dlg.exec()
 
     def _on_search_done(self):
         self._search_running = False
         self._set_busy(False)
         self._prog.setVisible(False)
-        n = self._table.rowCount()
-        self._result_lbl.setText(f"Results: {n} day(s) matched")
-        self._log(f"Search done — {n} results")
-        # _set_busy(False) re-enables every control, so the send button must be
-        # re-evaluated: nothing to send when the search found nothing.
-        self._btn_open_slider.setEnabled(n > 0 and self._slider_ref is not None
-                                         and self._tab_widget is not None)
-        if n > 0:
-            self._btn_save_results.setEnabled(True)
-            self._btn_send_workshop.setEnabled(True)
-            self._btn_send_workshop.setVisible(True)
+        # Counted over every camera tab, not just the visible one: a search that filled
+        # three tabs must not report only the one in front.
+        all_results = self._all_results()
+        n = len(all_results)
+        # Rows that produced a picture vs rows that are only a red explanation.
+        # Reporting the row count alone would call a table full of failures a success.
+        n_ok = sum(1 for dr in all_results if dr.status == "ok")
+        n_cams = len(self._cam_order)
+        self._result_lbl.setText(
+            f"Results: {n_ok} with an image"
+            + (f", {n - n_ok} without" if n > n_ok else "")
+            + (f"  ({n_cams} cameras)" if n_cams > 1 else ""))
+        self._log(f"Search done — {n} row(s), {n_ok} with an image")
+        # _set_busy(False) re-enables every control, so the export buttons must be
+        # re-evaluated afterwards: they act on the tab in front, not on the whole search.
+        self._sync_export_buttons()
 
     # ── OPEN IN SLIDER ────────────────────────────────────────────────────────
 
@@ -2837,8 +3378,11 @@ class ShotFinderWidget(QWidget):
         # must not fail just because the camera list was edited after the search.
         cam = self._active_cam
 
-        # Jeden soubor za každý den
-        files_to_copy: list[Path] = []
+        # One file per day, each paired with the result it came from. The pairing is
+        # carried, not recomputed from a position: indexing results_to_open by the
+        # index into this list put every caption after a skipped day on the wrong
+        # picture.
+        files_to_copy: list[tuple[Path, _DayResult]] = []
         # Použij jen vybrané řádky, nebo všechny pokud nic není vybráno
         selected_rows = sorted(set(
             idx.row() for idx in self._table.selectedIndexes()
@@ -2850,9 +3394,13 @@ class ShotFinderWidget(QWidget):
             results_to_open = self._day_results
 
         for dr in results_to_open:
+            if dr.status != "ok":
+                self._log(f"{dr.day}: {dr.reason or 'nothing found'}, skipping")
+                continue
+
             # Fast path: the search worker already resolved the matched image
             if dr.img_path is not None:
-                files_to_copy.append(Path(dr.img_path))
+                files_to_copy.append((Path(dr.img_path), dr))
                 self._log(f"{dr.day}: ✓ {Path(dr.img_path).name}")
                 continue
 
@@ -2864,28 +3412,15 @@ class ShotFinderWidget(QWidget):
             if not dr_cam:
                 self._log(f"{dr.day}: no camera for this result, skipping")
                 continue
-            cam_folder = dr.hour_folder / dr_cam
-            if not cam_folder.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == dr_cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    pass
-
-            if not cam_folder.exists():
-                self._log(f"{dr.day}: camera {dr_cam} not found")
-                continue
 
             dt_obj = dr.best_row.get("_dt")
             if dt_obj is None:
                 continue
 
-            img = _find_image_for_ts(cam_folder, dt_obj,
-                                     ts_ns_override=dr.best_row.get("_ns"))
+            img = self._find_image_for_shot(dr, dr_cam, dt_obj,
+                                            dr.best_row.get("_ns"), {})
             if img is not None:
-                files_to_copy.append(img)
+                files_to_copy.append((img, dr))
                 self._log(f"{dr.day}: ✓ {img.name}")
             else:
                 self._log(f"{dr.day}: no image near {dt_obj.strftime('%H:%M:%S')}")
@@ -2903,15 +3438,19 @@ class ShotFinderWidget(QWidget):
         self._temp_dir = tempfile.mkdtemp(prefix="SF_slider_")
         temp_path = Path(self._temp_dir)
 
+        # Sestav energy map — filename -> text pro zobrazení v slideru.
+        # PVs come from the result the file actually came from (dr), never from a
+        # position in some other list, and never from the live left panel.
         copied = 0
-        copied_files: list[tuple[Path, Path, int]] = []  # (src, dst, dr_index)
-        for i, src in enumerate(files_to_copy):
+        energy_map: dict[str, str] = {}
+        for src, dr in files_to_copy:
             try:
                 dst = temp_path / src.name
                 if dst.exists():
                     dst = temp_path / f"{src.stem}_{copied}{src.suffix}"
                 shutil.copy2(src, dst)
-                copied_files.append((src, dst, i))
+                energy_map[dst.name] = self._build_energy_text(
+                    dr, dr.best_row, dr.best_row.get("_ns"))
                 copied += 1
             except Exception as e:
                 self._log(f"Copy error {src.name}: {e}")
@@ -2922,21 +3461,11 @@ class ShotFinderWidget(QWidget):
 
         self._log(f"Copied {copied} images → {self._temp_dir}")
 
-        # Sestav energy map — filename -> text pro zobrazení v slideru.
-        # PVs come from each result's search-time state (dr), not the live panel.
-        energy_map: dict[str, str] = {}
-        for src, dst, i in copied_files:
-            if i >= len(results_to_open):
-                continue
-            dr = results_to_open[i]
-            best_ns = dr.best_row.get("_ns")
-            energy_map[dst.name] = self._build_energy_text(dr, dr.best_row, best_ns)
-
         # Hand over through receive_external_folder: it clears whatever the Slider
         # was set to (multi-cam grid, live mode, subtraction reference, focus mode,
         # a previous energy map) so the images always land. Falls back to the plain
         # entry point when running against an older is_t.py.
-        send_cam = next((dr.cam for dr in results_to_open if dr.cam), cam)
+        send_cam = next((dr.cam for _src, dr in files_to_copy if dr.cam), cam)
         self._tab_widget.setCurrentIndex(1)
         recv = getattr(self._slider_ref, "receive_external_folder", None)
         if callable(recv):
@@ -2962,13 +3491,16 @@ class ShotFinderWidget(QWidget):
         if not self._day_results:
             return
 
-        cam = self._active_cam
-        if not cam:
-            QMessageBox.warning(self, "No camera selected",
-                "Please select a camera first.")
+        # The camera these rows were SEARCHED with (this tab's), not whichever row of
+        # the camera list happens to be highlighted now: saving used to refuse outright
+        # once the camera was removed from the list, and to name the files after a
+        # different camera than the one in the picture as soon as another was clicked.
+        cam = self._current_cam_key() or self._active_cam
+        if not any(dr.status == "ok" for dr in self._day_results):
+            QMessageBox.warning(self, "Nothing to save",
+                "No row in this tab has an image.")
             return
 
-        from PySide6.QtWidgets import QFileDialog
         initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
         out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", initial_dir)
         if not out_dir:
@@ -2988,6 +3520,10 @@ class ShotFinderWidget(QWidget):
         copied = 0
         errors = 0
         for dr in results_to_save:
+            if dr.status != "ok":
+                self._log(f"{dr.day}: {dr.reason or 'nothing found'}, skipping")
+                errors += 1
+                continue
             dt_obj = dr.best_row.get("_dt")
             if dt_obj is None:
                 errors += 1
@@ -3002,23 +3538,12 @@ class ShotFinderWidget(QWidget):
                     continue
 
                 dr_cam = dr.cam or cam
-                cam_folder = dr.hour_folder / dr_cam
-                if not cam_folder.exists():
-                    try:
-                        for sub in dr.hour_folder.iterdir():
-                            if sub.is_dir() and sub.name.lower() == dr_cam.lower():
-                                cam_folder = sub
-                                break
-                    except Exception:
-                        pass
-
-                if not cam_folder.exists():
-                    self._log(f"{dr.day}: camera {dr_cam} not found")
+                if not dr_cam:
+                    self._log(f"{dr.day}: no camera for this result, skipping")
                     errors += 1
                     continue
-
-                img = _find_image_for_ts(cam_folder, dt_obj,
-                                         ts_ns_override=dr.best_row.get("_ns"))
+                img = self._find_image_for_shot(dr, dr_cam, dt_obj,
+                                                dr.best_row.get("_ns"), {})
             if img is None:
                 self._log(f"{dr.day}: no image near {dt_obj.strftime('%H:%M:%S')}")
                 errors += 1
@@ -3027,7 +3552,8 @@ class ShotFinderWidget(QWidget):
             # Název souboru: camera_label + Prague timestamp + PV value
             val_str = _format_value(dr.col, dr.best_row.get(dr.col, "")).replace(" ", "").replace("/", "-")
             short = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-            _cam_label = _clean_cam_for_filename(cam)
+            # The camera of THIS row — the picture came from it.
+            _cam_label = _clean_cam_for_filename(dr.cam or cam or "")
             _ns_best = dr.best_row.get("_ns")
             if _ns_best is not None and PRAGUE is not None:
                 _ts_sec = _ns_best // 1_000_000_000
@@ -3052,7 +3578,8 @@ class ShotFinderWidget(QWidget):
                 from PySide6.QtGui import QImage
                 from PySide6.QtCore import QSize
 
-                # Load via PIL to preserve 16-bit and apply imgMaxValue normalization
+                # Load via PIL to preserve 16 bits, then render on the same scale as the
+                # preview — a saved frame must look like what was on screen.
                 try:
                     _pil_raw = _PilImg.open(str(img))
                     if _pil_raw.mode in ("I", "I;16"):
@@ -3061,11 +3588,10 @@ class ShotFinderWidget(QWidget):
                         _arr_f = _np.array(_pil_raw.convert("L"), dtype=_np.float32)
                     else:
                         _arr_f = _np.array(_pil_raw.convert("L"), dtype=_np.float32)
-                    _img_max_val = _read_img_max_value(img)
-                    _arr_px_max = float(_arr_f.max())
-                    if _img_max_val is not None and _arr_px_max > 0:
-                        _arr_f = _img_max_val * _arr_f / _arr_px_max
-                    arr = _np.clip(_arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+                    arr = _render_u8(_arr_f, self._cb_auto_stretch.isChecked(),
+                                     _full_scale_for_mode(_pil_raw.mode, img,
+                                                          _pil_raw.info),
+                                     self._gamma_arg())
                     w, h = arr.shape[1], arr.shape[0]
                 except Exception:
                     shutil.copy2(img, dst)
@@ -3089,7 +3615,7 @@ class ShotFinderWidget(QWidget):
                     lut = SF_GRADIENTS.get(grad_name, None)
 
                 if lut is not None:
-                    rgb = lut[arr]
+                    rgb = _lut_pixels_sf(lut, arr, grad_name)
                     pil_img = _PilImg.fromarray(rgb, mode="RGB")
                 else:
                     pil_img = _PilImg.fromarray(arr).convert("RGB")
@@ -3213,11 +3739,9 @@ class ShotFinderWidget(QWidget):
             else:
                 arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
 
-            img_max_val = _read_img_max_value(img_path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            arr8 = _render_u8(arr_f, self._cb_auto_stretch.isChecked(),
+                              _full_scale_for_mode(pil.mode, img_path, pil.info),
+                              self._gamma_arg())
 
             cam_name = _re.sub(r"[-_]+IMG$", "", img_path.parent.name, flags=_re.IGNORECASE).rstrip("-_")
             label = f"{cam_name}  |  {img_path.name}"

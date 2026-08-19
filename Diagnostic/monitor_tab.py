@@ -50,8 +50,9 @@ import shared_pvs
 from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
     NotificationHub, Thresholds, Trend, _raw_severity, classify_trend,
-    describe_reason,
+    describe_reason, detect_frozen, fmt_duration,
 )
+import bot_commands
 import notify_provision
 from secrets_util import encrypt_secret
 
@@ -172,6 +173,10 @@ BADDATA_COLOR = "#8e24aa"  # out-of-range sensor error (distinct from grey no-da
 # Monitoring stopped: values keep coming in, but nothing is evaluated or sent.
 # The State cell keeps its real reading and gets this background instead.
 STOPPED_COLOR = "#7f0000"
+# The PV keeps delivering the exact same reading (or its newest sample stopped
+# advancing): data arrives, but it is not live. Own colour so a frozen PV can't
+# be confused with a healthy steady one, with grey no-data or purple bad-data.
+FROZEN_COLOR = "#00695c"
 
 _BTN_PRIMARY = (
     "QPushButton { background:#1565C0; color:white; font-weight:700; "
@@ -228,7 +233,7 @@ DEFAULT_SETTINGS = {
     "renotify_cooldown_minutes": 30,
     "recovery_notify": True,
     "debounce_count": 2,
-    "settle_minutes": 5.0,
+    "settle_minutes": 7.0,
     "stable_seconds": 120,
     # Trend-adaptive reminders: for an already-alarming PV, speed up / slow down
     # the re-notify reminders based on its recent value trend (worsening ->
@@ -245,6 +250,16 @@ DEFAULT_SETTINGS = {
     # single PV's own no-data), and once more when data flow resumes.
     "data_watchdog_enabled": True,
     "data_watchdog_fail_polls": 2,
+    # Frozen-value check ("not updating"): a PV that keeps returning the exact
+    # same reading for this long is no longer live, even though the archiver
+    # still answers — a dead sensor or stuck IOC. Reported in the State column
+    # and, with frozen_alert_enabled, once per episode over the alert channels.
+    # frozen_min_points guards against sparse data: the unchanged run must be
+    # carried by at least this many samples before it counts.
+    "frozen_check_enabled": True,
+    "frozen_after_minutes": 120,
+    "frozen_min_points": 5,
+    "frozen_alert_enabled": True,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
@@ -254,6 +269,13 @@ DEFAULT_SETTINGS = {
     "valid_min_default": None,
     "valid_max_default": 80.0,
     "graph_window_minutes": 60,
+    # Graph legend placement, set from the graph's right-click menu. Local-only
+    # (a per-user view preference, see SHARE_LOCAL_ONLY_KEYS): "best" lets
+    # matplotlib pick the emptiest corner, a fixed corner name pins it there,
+    # "outside" parks it beside the plot, "off" hides it, and "custom" uses
+    # graph_legend_anchor — the (x, y) in axes fractions the user dragged it to.
+    "graph_legend_loc": "best",
+    "graph_legend_anchor": [],
     "start_monitoring_on_launch": False,
     # alert graph
     "alert_plot_hours": 12,
@@ -291,11 +313,13 @@ DEFAULT_SETTINGS = {
     "_shared_pv_root_cache": "",        # written by the app: last root that worked
 }
 
-# Settings that must never leave this PC: they are what resolves the share, so
-# publishing them would point every other copy at whichever leg this PC used.
+# Settings that must never leave this PC: the share plumbing (publishing it
+# would point every other copy at whichever leg this PC used), plus purely
+# personal view preferences that would otherwise reshuffle everyone's graph.
 SHARE_LOCAL_ONLY_KEYS = (
     "shared_pv_list_enabled", "shared_pv_list_path", "shared_pv_list_timeout_s",
     "_shared_pv_root_cache",
+    "graph_legend_loc", "graph_legend_anchor",
 )
 
 
@@ -522,6 +546,10 @@ class PVConfig:
     # None on a side = fall back to the global valid_*_default setting.
     valid_min: Optional[float] = None
     valid_max: Optional[float] = None
+    # Take part in the frozen-value ("not updating") check. Off for PVs that
+    # legitimately hold one value for hours — switch positions, setpoints,
+    # enable flags — which would otherwise be reported as stuck for ever.
+    frozen_check: bool = True
     learned_at: Optional[str] = None
     learn_stats: Optional[dict] = None
 
@@ -579,6 +607,7 @@ class PVConfig:
             "gate_pvs": list(self.gate_pvs),
             "profiles": [dict(p) for p in self.profiles],
             "valid_min": self.valid_min, "valid_max": self.valid_max,
+            "frozen_check": self.frozen_check,
             "learned_at": self.learned_at, "learn_stats": self.learn_stats,
         }
 
@@ -595,6 +624,7 @@ class PVConfig:
             alarm_low=d.get("alarm_low"), alarm_high=d.get("alarm_high"),
             gate_pvs=gate_pvs, profiles=profiles,
             valid_min=d.get("valid_min"), valid_max=d.get("valid_max"),
+            frozen_check=bool(d.get("frozen_check", True)),
             learned_at=d.get("learned_at"), learn_stats=d.get("learn_stats"),
         )
 
@@ -648,6 +678,21 @@ class PVRuntime:
     # show a truthful state while monitoring is stopped and the evaluator (which
     # owns `alert`) is not running.
     live_level: Optional[AlertLevel] = None
+    # Timestamp of the newest archive sample actually seen at the last poll
+    # (0 = the window held nothing). last_update_ns falls back to "now" so the
+    # Updated column always shows something; this one never does, so the
+    # freshness checks below use it.
+    data_ts_ns: int = 0
+    # Frozen-value check (see alerting.detect_frozen): data keeps arriving but
+    # the reading never changes, or the newest sample itself stopped advancing.
+    # Either way the value on screen is not live.
+    frozen: bool = False
+    frozen_since_ns: int = 0
+    frozen_span_s: float = 0.0
+    frozen_bounded: bool = False
+    frozen_reason: str = ""
+    # One notification per freeze episode (and one when it clears).
+    frozen_notified: bool = False
 
     def display_level(self, monitoring: bool = True):
         """AlertLevel for colouring, or None for NODATA."""
@@ -746,9 +791,12 @@ class _PollWorker(QRunnable):
                            f"[{_fmt(lo)}..{_fmt(hi)}]")
                 else:
                     err = ""
-                return (val, units, last_ts or end, err, rejected, raw_val)
+                # last_ts is reported raw (0 = the window held no sample): the
+                # caller needs to tell "the archiver has nothing newer" from
+                # "we asked just now", which a fallback to `end` would hide.
+                return (val, units, last_ts, err, rejected, raw_val)
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
-                return (None, "", end, str(e), 0, None)
+                return (None, "", 0, str(e), 0, None)
 
         # Archiver responses can take seconds each; fetching sequentially made
         # a full pass slower than the poll interval, so results were always
@@ -1032,6 +1080,28 @@ def _describe_profile(pv: "PVConfig", prof: dict) -> str:
             f"alarm {_fmt(thr.alarm_low)}/{_fmt(thr.alarm_high)}")
 
 
+FROZEN_LABEL = "not updating"
+
+
+def _frozen_tooltip(rt: "PVRuntime") -> str:
+    """Why this PV is flagged as not updating, spelled out for the table."""
+    lines = [f"⚠ NOT UPDATING — {rt.frozen_reason}."]
+    if rt.frozen_since_ns:
+        since = api.ns_to_prague(rt.frozen_since_ns).strftime("%d.%m. %H:%M:%S")
+        if rt.frozen_bounded:
+            lines.append(f"Last real change: {since}.")
+        else:
+            lines.append(f"Already at this value at {since}, the oldest data "
+                         "kept here — the freeze may well be older.")
+    lines.append("The archiver keeps answering, but the reading behind it has "
+                 "stopped moving, so the value shown is probably not live and "
+                 "any alert about it is based on old data.")
+    lines.append("If this PV is genuinely constant for hours (a switch, a "
+                 "setpoint), untick 'Report this PV as not updating…' in "
+                 "Edit PV.")
+    return "\n".join(lines)
+
+
 def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     """One-cell summary of alert delivery for the 'Alarm status' column.
 
@@ -1283,10 +1353,27 @@ class PVTableModel(QAbstractTableModel):
                 return "Click to show/hide this PV in the graph."
             if col == COL_ALARM_STATUS:
                 return _alarm_status_tooltip(pv, rt)
-            if col == COL_STATE and pv.enabled and not self.monitoring:
-                return ("Monitoring is stopped — values are still read and "
-                        "shown, but nothing is evaluated against the limits "
-                        "and no alerts are sent.")
+            if col == COL_STATE:
+                parts = []
+                if rt is not None and rt.frozen:
+                    parts.append(_frozen_tooltip(rt))
+                if pv.enabled and not self.monitoring:
+                    parts.append("Monitoring is stopped — values are still "
+                                 "read and shown, but nothing is evaluated "
+                                 "against the limits and no alerts are sent.")
+                if parts:
+                    return "\n\n".join(parts)
+            if col == COL_UPDATED and rt is not None:
+                if rt.data_ts_ns:
+                    tip = ("Newest sample in the archive: "
+                           + api.ns_to_prague(rt.data_ts_ns)
+                           .strftime("%Y-%m-%d %H:%M:%S"))
+                else:
+                    tip = ("The archiver returned no sample at the last poll — "
+                           "this is the time of that attempt, not of any data.")
+                if rt.frozen:
+                    tip += "\n\n" + _frozen_tooltip(rt)
+                return tip
             tip = pv.name
             if pv.gate_pvs:
                 tip += "\nDepends on: " + ", ".join(pv.gate_pvs)
@@ -1298,16 +1385,23 @@ class PVTableModel(QAbstractTableModel):
                 tip += f"\nActive limits: {label}" + (" (pinned)" if pinned else "")
             if col in THR_COLS:
                 tip += "\nDouble-click to edit limits (Global + rules)."
+            if rt and rt.frozen:
+                tip += f"\n⚠ Not updating: {rt.frozen_reason}"
             if rt and rt.last_error:
                 tip += f"\nLast error: {rt.last_error}"
             return tip
 
         level = rt.display_level(self.monitoring) if rt else None
         bad = bool(rt and rt.bad_data and level is None and pv.enabled)
+        # Data arrives but is not live — outranks the level in the State cell,
+        # because a limit verdict on a frozen reading means nothing.
+        frozen = bool(rt and rt.frozen)
         # Reading is live but nothing is watching it — flag that in the cell.
         stopped = not self.monitoring and pv.enabled
 
         if role == Qt.BackgroundRole and col == COL_STATE:
+            if frozen:
+                return QColor(FROZEN_COLOR)
             if bad:
                 return QColor(BADDATA_COLOR)
             if level is None:
@@ -1317,9 +1411,15 @@ class PVTableModel(QAbstractTableModel):
             return _STATE_BG[level]
         if role == Qt.ForegroundRole and col == COL_STATE:
             if level in (AlertLevel.WARNING, AlertLevel.ALARM) or level is None \
-                    or stopped:
+                    or stopped or frozen:
                 return QColor("white")
             return QColor(SUCCESS)
+        # The value itself is real but no longer moving: italics mark it as
+        # "last known", the tooltip says since when.
+        if role == Qt.FontRole and frozen and col in (COL_VALUE, COL_UPDATED):
+            f = QFont()
+            f.setItalic(True)
+            return f
 
         # Alarm-status cell: paint red only when a send failed, so a lost alert
         # stands out; other states use plain text.
@@ -1353,9 +1453,13 @@ class PVTableModel(QAbstractTableModel):
             if col == COL_UNITS:
                 return (rt.current_units if rt and rt.current_units else pv.units) or ""
             if col == COL_STATE:
-                if not pv.enabled:
+                if frozen:
+                    # Shown for disabled PVs too: a stuck sensor is worth
+                    # seeing whether or not this PV may raise alerts.
+                    text = FROZEN_LABEL
+                elif not pv.enabled:
                     return "off"
-                if bad:
+                elif bad:
                     text = "bad data"
                 elif level is None:
                     text = "no data"
@@ -1989,6 +2093,19 @@ class PVEditDialog(QDialog):
             "never triggers a notification.")
         self.enabled_chk.setChecked(pv.enabled)
         form.addRow("", self.enabled_chk)
+        self.frozen_chk = QCheckBox(
+            "Report this PV as not updating when its value never changes")
+        self.frozen_chk.setStyleSheet(_CHK_STYLE)
+        self.frozen_chk.setToolTip(
+            "On (default): if this PV keeps returning exactly the same reading "
+            "for longer than 'Not updating after' in Settings, the State column "
+            "shows 'not updating' and an alert says the value is no longer "
+            "live. Catches a dead sensor or stuck IOC, which otherwise looks "
+            "like a perfectly steady value.\n"
+            "Turn it off for PVs that really do hold one value for hours — "
+            "switch positions, setpoints, enable flags.")
+        self.frozen_chk.setChecked(pv.frozen_check)
+        form.addRow("", self.frozen_chk)
         lay.addLayout(form)
 
         thr_box = QGroupBox("Alert limits  (Global row + conditional rules)")
@@ -2148,6 +2265,7 @@ class PVEditDialog(QDialog):
         self.thr_editor.apply_to(pv)   # default limits + gate_pvs + profiles
         pv.valid_min = self.f_valid_min.value()
         pv.valid_max = self.f_valid_max.value()
+        pv.frozen_check = self.frozen_chk.isChecked()
         if hasattr(self, "_pending_stats"):
             pv.learned_at = datetime.now(api.TZ_PRAGUE).isoformat(timespec="seconds")
             pv.learn_stats = self._pending_stats
@@ -2970,7 +3088,7 @@ class SettingsDialog(QDialog):
             "message is sent only if the Warning/Alarm is still ongoing; an "
             "excursion that recovered within the window sends nothing. "
             "0 = alert immediately. Range 0–120 min.")
-        self.settle.setValue(float(s.get("settle_minutes", 5.0)))
+        self.settle.setValue(float(s.get("settle_minutes", 7.0)))
         form.addRow("Settle wait (min, 0=off)", self.settle)
         self.stable = _NoWheelSpinBox(); self.stable.setRange(0, 3600)
         self.stable.setToolTip(
@@ -3039,6 +3157,36 @@ class SettingsDialog(QDialog):
             "Can't show more than 'History kept' holds. Range 1–10080 min.")
         self.graph_win.setValue(int(s["graph_window_minutes"]))
         form.addRow("Graph window (min)", self.graph_win)
+        self.frozen_en = QCheckBox("Flag PVs whose value never changes")
+        self.frozen_en.setStyleSheet(_CHK_STYLE)
+        self.frozen_en.setToolTip(
+            "Watch for PVs that keep answering with exactly the same reading, "
+            "or whose newest archived sample stops advancing. Such a PV is not "
+            "live even though nothing else looks wrong: its State column shows "
+            "'not updating' and any limit alert about it says the value is old. "
+            "Individual PVs can opt out in Edit PV.")
+        self.frozen_en.setChecked(bool(s.get("frozen_check_enabled", True)))
+        form.addRow("", self.frozen_en)
+        self.frozen_after = _NoWheelSpinBox(); self.frozen_after.setRange(5, 10080)
+        self.frozen_after.setToolTip(
+            "How long a reading may stay at exactly the same value before the "
+            "PV is reported as not updating. Keep it well above how long the "
+            "value can genuinely sit still — 120 min suits temperatures and "
+            "pressures. Range 5–10080 min (one week).")
+        self.frozen_after.setValue(int(s.get("frozen_after_minutes", 120)))
+        form.addRow("Not updating after (min)", self.frozen_after)
+        self.frozen_alert = QCheckBox("Send an alert when a PV stops updating")
+        self.frozen_alert.setStyleSheet(_CHK_STYLE)
+        self.frozen_alert.setToolTip(
+            "Send one notification when a PV stops updating and one when it "
+            "starts changing again (only for PVs with alerting on). When off, "
+            "it is only shown in the table. Never repeats — this is a data "
+            "fault, not a value excursion.")
+        self.frozen_alert.setChecked(bool(s.get("frozen_alert_enabled", True)))
+        form.addRow("", self.frozen_alert)
+        for w in (self.frozen_after, self.frozen_alert):
+            w.setEnabled(self.frozen_en.isChecked())
+            self.frozen_en.toggled.connect(w.setEnabled)
         self.valid_min = OptionalDoubleField("enable")
         self.valid_min.setToolTip(
             "Default sensor-error floor for every PV: readings below this are "
@@ -3267,6 +3415,9 @@ class SettingsDialog(QDialog):
         s["trend_flat_frac"] = self.trend_flat.value() / 100.0
         s["history_minutes"] = self.hist.value()
         s["graph_window_minutes"] = self.graph_win.value()
+        s["frozen_check_enabled"] = self.frozen_en.isChecked()
+        s["frozen_after_minutes"] = self.frozen_after.value()
+        s["frozen_alert_enabled"] = self.frozen_alert.isChecked()
         s["valid_min_default"] = self.valid_min.value()
         s["valid_max_default"] = self.valid_max.value()
         s["start_monitoring_on_launch"] = self.autostart.isChecked()
@@ -3352,25 +3503,28 @@ class _LightNavToolbar(NavToolbar):
         return QIcon(pm)
 
 
-def render_pv_png(pv_name: str, display_name: str, hours: float,
-                  thr: Thresholds, timeout: float,
-                  vmin=None, vmax=None) -> bytes | None:
-    """Fetch the last `hours` h from CPVA and render a value+threshold PNG.
+@dataclass
+class ChartSeries:
+    """One curve of a rendered chart: which PV, and how to sanity-filter it."""
+    pv_name: str
+    display_name: str
+    thresholds: Optional[Thresholds] = None   # drawn only on a single-curve chart
+    vmin: Optional[float] = None
+    vmax: Optional[float] = None
 
-    Worker-thread safe: builds its own Figure and uses the non-Qt Agg canvas,
-    rendering to in-memory PNG bytes (no temp file, no shared matplotlib state).
-    Readings outside [vmin, vmax] are dropped as sensor errors.
-    """
-    end = api.now_ns()
-    start = end - int(hours * 3600 * 1e9)
-    samples = api.cpva_fetch_samples_chunked(pv_name, start, end, timeout)
+
+def _fetch_series(series: ChartSeries, start_ns: int, end_ns: int,
+                  timeout: float):
+    """Fetch one PV's numeric samples for the window. Returns (xs, ys, units)."""
+    samples = api.cpva_fetch_samples_chunked(series.pv_name, start_ns, end_ns,
+                                             timeout)
     xs, ys, units = [], [], ""
     for s in samples:
         v = api.cpva_decode_value(s)
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             continue
         fv = float(v)
-        if _out_of_range(fv, vmin, vmax):
+        if _out_of_range(fv, series.vmin, series.vmax):
             continue
         t = s.get("time")
         if isinstance(t, (int, float)):
@@ -3379,19 +3533,58 @@ def render_pv_png(pv_name: str, display_name: str, hours: float,
             u = api.cpva_decode_units(s)
             if u:
                 units = u
-    if not xs:
+    return xs, ys, units
+
+
+def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
+                     timeout: float, window_label: str = "",
+                     yaxis: Optional[tuple] = None) -> bytes | None:
+    """Render one PNG with a curve per PV over [start_ns, end_ns].
+
+    Worker-thread safe: builds its own Figure and uses the non-Qt Agg canvas,
+    rendering to in-memory PNG bytes (no temp file, no shared matplotlib state).
+    Threshold lines are drawn only for a single-PV chart — on an overlay they
+    would belong to no visible curve. Returns None when no PV had any data.
+    """
+    fetched = []
+    for s in series:
+        xs, ys, units = _fetch_series(s, start_ns, end_ns, timeout)
+        if xs:
+            fetched.append((s, xs, ys, units))
+    if not fetched:
         return None
 
     fig = Figure(figsize=(8, 4), dpi=110)
     ax = fig.add_subplot(111)
-    ax.plot(xs, ys, drawstyle="steps-post", color=PRIMARY, linewidth=1.5)
-    for val, ls, lw in ((thr.warn_low, "--", 1.0), (thr.warn_high, "--", 1.0),
-                        (thr.alarm_low, "-.", 1.5), (thr.alarm_high, "-.", 1.5)):
-        if val is not None:
-            ax.axhline(val, linestyle=ls, linewidth=lw, alpha=0.7,
-                       color=ALARM_COLOR if ls == "-." else WARN_COLOR)
-    ax.set_title(f"{display_name}  (last {hours:g} h)")
-    ax.set_ylabel(units)
+    cmap = matplotlib.colormaps.get_cmap("tab10")
+    all_units = {u for _, _, _, u in fetched if u}
+    single = len(fetched) == 1
+    for i, (s, xs, ys, units) in enumerate(fetched):
+        label = s.display_name
+        if units and len(all_units) > 1:
+            label += f" [{units}]"    # mixed units: say which curve is which
+        # Same unit-family styling as the live graph: temperature solid,
+        # pressure dashed.
+        ax.plot(xs, ys, drawstyle="steps-post", linewidth=1.5,
+                linestyle=GraphPanel._unit_linestyle(units),
+                color=PRIMARY if single else cmap(i % 10), label=label)
+    if single and fetched[0][0].thresholds is not None:
+        thr = fetched[0][0].thresholds
+        for val, ls, lw in ((thr.warn_low, "--", 1.0), (thr.warn_high, "--", 1.0),
+                            (thr.alarm_low, "-.", 1.5), (thr.alarm_high, "-.", 1.5)):
+            if val is not None:
+                ax.axhline(val, linestyle=ls, linewidth=lw, alpha=0.7,
+                           color=ALARM_COLOR if ls == "-." else WARN_COLOR)
+
+    names = ", ".join(s.display_name for s, _, _, _ in fetched)
+    if len(names) > 70:
+        names = f"{len(fetched)} PVs"
+    ax.set_title(f"{names}  ({window_label})" if window_label else names)
+    ax.set_ylabel(next(iter(all_units)) if len(all_units) == 1 else "")
+    if not single:
+        ax.legend(loc="best", fontsize=8)
+    if yaxis:
+        ax.set_ylim(yaxis[0], yaxis[1])
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=api.TZ_PRAGUE))
     fig.autofmt_xdate()
@@ -3400,6 +3593,17 @@ def render_pv_png(pv_name: str, display_name: str, hours: float,
     buf = BytesIO()
     FigureCanvasAgg(fig).print_png(buf)
     return buf.getvalue()
+
+
+def render_pv_png(pv_name: str, display_name: str, hours: float,
+                  thr: Thresholds, timeout: float,
+                  vmin=None, vmax=None) -> bytes | None:
+    """Fetch the last `hours` h from CPVA and render a value+threshold PNG."""
+    end = api.now_ns()
+    start = end - int(hours * 3600 * 1e9)
+    return render_chart_png(
+        [ChartSeries(pv_name, display_name, thr, vmin, vmax)],
+        start, end, timeout, window_label=f"last {hours:g} h")
 
 
 class _AxisRangeDialog(QDialog):
@@ -3514,10 +3718,20 @@ class GraphPanel(QWidget):
         # Fixed Y range per extra (twin) axis, keyed by its index in
         # self._extra_axes. self._yaxis (above) already covers the main axis.
         self._extra_yaxis: dict[int, tuple] = {}
+        # Legend placement (right-click menu / drag), remembered across runs.
+        s = getattr(self._win, "settings", None) or {}
+        self._legend_loc = str(s.get("graph_legend_loc") or "best")
+        anchor = s.get("graph_legend_anchor")
+        self._legend_anchor = (float(anchor[0]), float(anchor[1])) \
+            if isinstance(anchor, (list, tuple)) and len(anchor) == 2 else None
+        self._legend = None       # rebuilt by every redraw()
+        self._legend_drag = False  # a left-press landed on the legend
+        self._legend_press_at = None   # legend corner (px) when that press began
         self.canvas.mpl_connect("draw_event", self._on_draw)
         self.canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
         self.canvas.mpl_connect("figure_leave_event", self._on_leave)
         self.canvas.mpl_connect("button_press_event", self._on_canvas_click)
+        self.canvas.mpl_connect("button_release_event", self._on_canvas_release)
 
     def _on_combo_changed(self, *_):
         # New selection = different data/scale; a zoom pinned on the previous
@@ -3572,16 +3786,30 @@ class GraphPanel(QWidget):
         return None
 
     def _on_canvas_click(self, event):
+        if event.button == 1:
+            # Remember a press that landed on the legend, plus where the legend
+            # sat, so the matching release can tell a drag from a plain click.
+            self._legend_drag = self._hit_legend(event)
+            self._legend_press_at = self._legend_corner() if self._legend_drag \
+                else None
+            return
         if event.button != 3:   # right-click only
             return
-        hit = self._axis_at(event)
-        if hit is None:
-            return
-        kind, ax = hit
         gui_ev = event.guiEvent
         pos = gui_ev.position().toPoint() if hasattr(gui_ev, "position") \
             else gui_ev.pos()
-        self._show_axis_menu(kind, ax, self.canvas.mapToGlobal(pos))
+        global_pos = self.canvas.mapToGlobal(pos)
+        hit = self._axis_at(event)
+        if hit is None:
+            # Right-click inside the plot itself: view options only (there is no
+            # axis to configure). Skipped while a toolbar tool is armed, where
+            # matplotlib already uses the right button (zoom out / pan).
+            mode = str(getattr(self.toolbar, "mode", "") or "")
+            if event.inaxes is not None and not mode:
+                self._show_plot_menu(global_pos)
+            return
+        kind, ax = hit
+        self._show_axis_menu(kind, ax, global_pos)
 
     def _show_axis_menu(self, kind: str, ax, global_pos):
         menu = QMenu(self)
@@ -3593,15 +3821,168 @@ class GraphPanel(QWidget):
             menu.addAction("Autoscale this Y axis",
                             lambda: self._clear_yrange(ax))
         menu.addSeparator()
+        self._add_view_actions(menu)
+        menu.exec(global_pos)
+
+    def _show_plot_menu(self, global_pos):
+        menu = QMenu(self)
+        self._add_view_actions(menu)
+        menu.exec(global_pos)
+
+    def _add_view_actions(self, menu: QMenu):
+        """Grid + legend items, shared by the axis and plot-area menus."""
+        self._add_legend_menu(menu)
         grid_action = menu.addAction("Grid lines")
         grid_action.setCheckable(True)
         grid_action.setChecked(self._grid_on)
         grid_action.toggled.connect(self._set_grid_on)
-        menu.exec(global_pos)
 
     def _set_grid_on(self, on: bool):
         self._grid_on = on
         self.redraw()
+
+    # --- legend placement -------------------------------------------------
+
+    # Menu label → placement. "best" is matplotlib's own emptiest-corner
+    # search, "outside" parks the legend beside the plot (never over data),
+    # "off" hides it; "custom" is not offered here — it comes from a drag.
+    _LEGEND_CHOICES = (
+        ("Auto (avoid data)", "best"),
+        ("Upper left", "upper left"),
+        ("Upper right", "upper right"),
+        ("Lower left", "lower left"),
+        ("Lower right", "lower right"),
+        ("Center right", "center right"),
+        ("Outside, right of plot", "outside"),
+        ("Hidden", "off"),
+    )
+
+    def _add_legend_menu(self, menu: QMenu):
+        # Parented to `menu` (rather than menu.addMenu("Legend")) so the submenu
+        # is owned on the C++ side and can't be garbage-collected before exec().
+        sub = QMenu("Legend", menu)
+        menu.addMenu(sub)
+        sub.setToolTipsVisible(True)
+        for label, loc in self._LEGEND_CHOICES:
+            act = sub.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self._legend_loc == loc)
+            act.triggered.connect(lambda _c=False, l=loc: self._set_legend_loc(l))
+        sub.addSeparator()
+        dragged = sub.addAction("Dragged position")
+        dragged.setCheckable(True)
+        dragged.setChecked(self._legend_loc == "custom")
+        dragged.setEnabled(self._legend_anchor is not None)
+        dragged.setToolTip("Drag the legend with the left mouse button to set this.")
+        dragged.triggered.connect(lambda: self._set_legend_loc("custom"))
+
+    def _set_legend_loc(self, loc: str):
+        self._legend_loc = loc
+        self._persist_legend()
+        self.redraw()
+
+    def _persist_legend(self):
+        s = getattr(self._win, "settings", None)
+        if s is None:
+            return
+        s["graph_legend_loc"] = self._legend_loc
+        s["graph_legend_anchor"] = list(self._legend_anchor) \
+            if self._legend_anchor else []
+        try:
+            self._win.persist()
+        except Exception:
+            pass    # a view preference is never worth an error dialog
+
+    def _draw_legend(self, handles, labels):
+        """Build the combined legend per the current placement; None if hidden."""
+        if not handles or self._legend_loc == "off":
+            return None
+        # Solid white frame: where the legend does land on a trace, it hides it
+        # cleanly instead of blending into unreadable mush.
+        kw = dict(fontsize=8, framealpha=1.0, facecolor="white",
+                  edgecolor="#999999")
+        if self._legend_loc == "outside":
+            # Anchored in figure coords, with room carved out below, so the
+            # outward-shifted twin axes can't push it back over the data.
+            leg = self.ax.legend(handles, labels, loc="upper right",
+                                 bbox_to_anchor=(0.995, 0.98),
+                                 bbox_transform=self.fig.transFigure, **kw)
+        elif self._legend_loc == "custom" and self._legend_anchor:
+            # borderaxespad=0 makes the anchor the drawn top-left corner exactly,
+            # so storing a dragged position and redrawing it is loss-free (the
+            # default pad would nudge the legend a little further on every drag).
+            leg = self.ax.legend(handles, labels, loc="upper left",
+                                 bbox_to_anchor=self._legend_anchor,
+                                 bbox_transform=self.ax.transAxes,
+                                 borderaxespad=0.0, **kw)
+        else:
+            loc = self._legend_loc if self._legend_loc != "custom" else "best"
+            leg = self.ax.legend(handles, labels, loc=loc, **kw)
+        # Above the traces but below the cursor value box (zorder 10), which
+        # must stay readable wherever the legend sits.
+        leg.set_zorder(9)
+        # The right margin is reserved by hand further down in redraw(); letting
+        # tight_layout() see the legend as well would fight that.
+        leg.set_in_layout(False)
+        leg.set_draggable(True, use_blit=False)
+        return leg
+
+    def _hit_legend(self, event) -> bool:
+        if self._legend is None or event.x is None:
+            return False
+        try:
+            return bool(self._legend.get_window_extent()
+                        .contains(event.x, event.y))
+        except Exception:
+            return False
+
+    def _legend_corner(self):
+        """Pixel (x, y) of the legend's top-left corner, or None."""
+        if self._legend is None:
+            return None
+        try:
+            bb = self._legend.get_window_extent()
+            return (float(bb.x0), float(bb.y1))
+        except Exception:
+            return None
+
+    def _on_canvas_release(self, event):
+        if not self._legend_drag:
+            return
+        self._legend_drag = False
+        was, now = self._legend_press_at, self._legend_corner()
+        self._legend_press_at = None
+        # A plain click on the legend must not silently switch the placement to
+        # "dragged" — only a real move (> 2 px) counts.
+        if was is None or now is None or max(abs(now[0] - was[0]),
+                                             abs(now[1] - was[1])) <= 2:
+            return
+        # Every redraw builds a fresh legend, so a dragged one only keeps its
+        # spot if we store it — as an axes fraction, which survives resizes.
+        try:
+            x, y = self.ax.transAxes.inverted().transform(now)
+        except Exception:
+            return
+        self._legend_anchor = (float(x), float(y))
+        self._legend_loc = "custom"
+        self._persist_legend()
+
+    def _reserve_legend_margin(self):
+        """Shrink the axes so an 'outside' legend sits beside the plot."""
+        renderer = self.canvas.get_renderer()
+        if renderer is None or self._legend is None:
+            return
+        try:
+            w_px = self._legend.get_window_extent(renderer).width
+        except Exception:
+            return
+        fig_w_px = max(self.fig.get_size_inches()[0] * self.fig.dpi, 1.0)
+        # The twin axes stack outward to the left of the legend, so their own
+        # reservation (see redraw()) has to be added, not replaced.
+        extra_px = (self._EXTRA_AXIS_SPACING * (len(self._extra_axes) - 1) + 70) \
+            if self._extra_axes else 0
+        right = 1.0 - (w_px + 14 + extra_px) / fig_w_px
+        self.fig.subplots_adjust(right=max(0.35, min(0.95, right)))
 
     def _prompt_xrange(self, ax):
         lo, hi = ax.get_xlim()
@@ -3680,6 +4061,7 @@ class GraphPanel(QWidget):
         xs = [api.ns_to_prague(t) for t, _ in pts]
         ys = [v for _, v in pts]
         ax.plot(xs, ys, drawstyle="steps-post", color=color,
+                linestyle=self._unit_linestyle(self._pv_units(pv)),
                 label=pv.display_name, linewidth=1.6)
         # Cache the plotted (thinned) series so the cursor value box can snap to
         # each PV's value at the hovered time — reuses the exact drawn data and
@@ -3717,8 +4099,27 @@ class GraphPanel(QWidget):
     # Units that count as temperature — kept on the familiar left axis.
     _TEMP_UNIT_KEYS = ("degc", "°c", "c", "k", "degf")
 
+    # Curve line style per unit family, so a temperature and a pressure curve
+    # stay apart even where their colours are close: temperature is drawn
+    # solid, pressure dashed. Anything else keeps the solid default.
+    _UNIT_LINESTYLES = {"pressure": (0, (5, 3))}
+
     # Outward spacing (points) between consecutive right-hand (twin) axes.
     _EXTRA_AXIS_SPACING = 55
+
+    @classmethod
+    def _unit_family(cls, unit: str) -> str:
+        """"degC" -> "temperature", "mbar" -> "pressure", … .
+
+        Read straight off the axis-label table, so a unit added there for its
+        axis caption is styled too — there is no second list to keep in sync.
+        """
+        label = cls._UNIT_LABELS.get(cls._unit_key(unit), "")
+        return label.split("[")[0].strip().lower()
+
+    @classmethod
+    def _unit_linestyle(cls, unit: str):
+        return cls._UNIT_LINESTYLES.get(cls._unit_family(unit), "-")
 
     @classmethod
     def _axis_label(cls, unit: str) -> str:
@@ -3801,8 +4202,7 @@ class GraphPanel(QWidget):
             h, l = a.get_legend_handles_labels()
             handles += h
             labels += l
-        if handles:
-            self.ax.legend(handles, labels, loc="upper left", fontsize=8)
+        self._legend = self._draw_legend(handles, labels)
         self.ax.grid(self._grid_on, alpha=0.3)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=api.TZ_PRAGUE))
 
@@ -3841,6 +4241,8 @@ class GraphPanel(QWidget):
             needed_px = self._EXTRA_AXIS_SPACING * (n_extra - 1) + 70
             right_frac = max(0.5, min(0.95, 1.0 - needed_px / max(fig_w_px, 1)))
             self.fig.subplots_adjust(right=right_frac)
+        if self._legend_loc == "outside":
+            self._reserve_legend_margin()
 
         self._make_cursor_artists()
         self._blit_bg = None
@@ -3896,8 +4298,8 @@ class GraphPanel(QWidget):
     def _process_mouse(self):
         self._mouse_pending = False
         ev = self._mouse_ev
-        if ev is None or not self._cross:
-            return
+        if ev is None or not self._cross or self._legend_drag:
+            return   # a legend drag repaints the figure; don't blit over it
         try:
             self._draw_cursor(ev)
         except Exception:
@@ -4014,6 +4416,46 @@ class _AlertWorker(QRunnable):
                 png = None
         errors = self._hub.dispatch(self._payload, png)
         _safe_emit(self._sig.done.emit, (self._tag, errors, png is not None))
+
+
+class _ChartSignals(QObject):
+    done = Signal(object)   # ({channel: error}, had_png)
+
+
+class _ChartWorker(QRunnable):
+    """Render a multi-PV chart and fan it out to every channel, off the UI
+    thread. Used by the bot's /plot, which can ask for several PVs and an
+    arbitrary time window (the alert path always renders one PV, last N h)."""
+
+    def __init__(self, sig: _ChartSignals, hub: NotificationHub,
+                 series: list[ChartSeries], start_ns: int, end_ns: int,
+                 timeout: float, title: str, window_label: str,
+                 body_md: str, yaxis=None):
+        super().__init__()
+        self._sig = sig
+        self._hub = hub
+        self._series = series
+        self._start_ns = start_ns
+        self._end_ns = end_ns
+        self._timeout = timeout
+        self._title = title
+        self._window_label = window_label
+        self._body_md = body_md
+        self._yaxis = yaxis
+
+    def run(self):
+        png = None
+        try:
+            png = render_chart_png(self._series, self._start_ns, self._end_ns,
+                                   self._timeout, self._window_label, self._yaxis)
+        except Exception:  # noqa: BLE001 - the reply must go out text-only
+            png = None
+        body = self._body_md
+        if png is None:
+            body += "\n\n_No archived data in that window — text only._"
+        text = re.sub(r"[*`_]", "", body)
+        errors = self._hub.dispatch_chart(self._title, text, body, png)
+        _safe_emit(self._sig.done.emit, (errors, png is not None))
 
 
 # ---------------------------------------------------------------------------
@@ -4177,7 +4619,7 @@ class MonitorWidget(QWidget):
             debounce_count=int(s["debounce_count"]),
             renotify_cooldown_minutes=float(s["renotify_cooldown_minutes"]),
             recovery_notify=bool(s["recovery_notify"]),
-            settle_minutes=float(s.get("settle_minutes", 5.0)),
+            settle_minutes=float(s.get("settle_minutes", 7.0)),
             stable_seconds=float(s.get("stable_seconds", 120)),
         )
 
@@ -4343,10 +4785,16 @@ class MonitorWidget(QWidget):
             share = "shared"
         else:
             share = "LOCAL ONLY (not sharing)"
+        # Data faults belong in the always-visible line, not only in the table:
+        # a PV that stopped updating is easy to scroll past.
+        n_frozen = sum(1 for pv in self.pvs
+                       if (rt := self.runtime.get(pv.name)) is not None
+                       and rt.frozen)
+        frozen = f"  ·  ⚠ {n_frozen} {FROZEN_LABEL}" if n_frozen else ""
         self._status_lbl.setText(
             f"{state}  ·  {len(self.pvs)} PV(s)  ·  every "
             f"{self.settings['poll_interval_s']}s  ·  {self._channel_summary()}"
-            f"  ·  {share}")
+            f"  ·  {share}{frozen}")
 
     def persist(self):
         """Save locally (always, instant) and publish to the share (debounced)."""
@@ -5157,6 +5605,7 @@ class MonitorWidget(QWidget):
             rt.raw_value = raw_val
             rt.current_units = units or rt.current_units
             rt.last_update_ns = last_ts or now
+            rt.data_ts_ns = last_ts
             rt.last_error = err
             rt.rejected_count = rejected
             rt.bad_data = (val is None and rejected > 0)
@@ -5166,6 +5615,9 @@ class MonitorWidget(QWidget):
                 self._log(f"{pv.display_name}: readings back within valid range.")
             if val is not None:
                 rt.history.append((rt.last_update_ns, val))
+            # Before any threshold work: decide whether this reading is still
+            # live at all, so an alert raised below can say if it is not.
+            self._update_frozen(pv, rt, now)
             rt.active_profile = self._match_profile(pv)
             thr = (pv.profile_thresholds(rt.active_profile)
                    if rt.active_profile is not None else pv.thresholds())
@@ -5188,9 +5640,127 @@ class MonitorWidget(QWidget):
                 rt.notify_status = ""      # episode over — clear the status cell
                 rt.notify_error = ""
         self._check_data_watchdog(results)
+        self._check_frozen_alerts()
         self.model.refresh_all()
         self._refresh_dep_combos()
+        self._update_status()
         self.graph.redraw()
+
+    # --- "not updating" check ------------------------------------------
+    def _frozen_check_on(self, pv: PVConfig) -> bool:
+        """Whether the frozen-value check applies to this PV (global switch
+        AND the PV's own opt-out)."""
+        return bool(self.settings.get("frozen_check_enabled", True)) \
+            and pv.frozen_check
+
+    def _sample_age_limit_s(self) -> float:
+        """How old the newest archive sample may get before the PV counts as not
+        updating. Derived from the poll pacing rather than being a setting of
+        its own: two sample windows or three poll intervals, whichever is
+        longer, and never under 5 minutes — enough slack for the archiver's
+        ~1 s publish lag and for this PC's clock running ahead of the facility.
+        """
+        return max(2.0 * float(self.settings["sample_window_s"]),
+                   3.0 * float(self.settings["poll_interval_s"]),
+                   300.0)
+
+    def _update_frozen(self, pv: PVConfig, rt: PVRuntime, now: int) -> None:
+        """Refresh this PV's 'not updating' verdict from its own history.
+
+        Two ways a PV can keep answering while its reading is dead:
+
+          * the value never changes — the archiver serves the same number over
+            and over (a stuck IOC, a dead sensor);
+          * the newest sample itself stops advancing — the archiver replies, but
+            with data that is minutes to days old.
+
+        Either one means what the table shows is not live. A PV with no reading
+        at all this pass is NOT frozen: that is the ordinary 'no data' state,
+        which the State column already reports.
+        """
+        def _clear():
+            rt.frozen = False
+            rt.frozen_reason = ""
+            rt.frozen_since_ns = 0
+            rt.frozen_span_s = 0.0
+            rt.frozen_bounded = False
+
+        if not self._frozen_check_on(pv) or rt.current_value is None:
+            _clear()
+            return
+
+        after_s = float(self.settings.get("frozen_after_minutes", 120)) * 60.0
+        info = detect_frozen(
+            rt.history, now, after_s,
+            min_points=int(self.settings.get("frozen_min_points", 5)))
+        rt.frozen_since_ns = info.since_ns
+        rt.frozen_span_s = info.span_s
+        rt.frozen_bounded = info.bounded
+
+        reasons = []
+        if info.frozen:
+            span = fmt_duration(info.span_s)
+            reasons.append(f"value unchanged for {span}"
+                           + ("" if info.bounded else " (all data kept here)"))
+        age_s = (now - rt.data_ts_ns) / 1e9 if rt.data_ts_ns else 0.0
+        if age_s > self._sample_age_limit_s():
+            reasons.append(f"newest archive sample is {fmt_duration(age_s)} old")
+        rt.frozen = bool(reasons)
+        rt.frozen_reason = ", ".join(reasons)
+
+    def _check_frozen_alerts(self):
+        """Send one alert when a PV stops updating and one when it moves again.
+
+        Deliberately outside the threshold state machine: a frozen PV is a data
+        fault, not a value excursion, so it neither debounces nor repeats.
+        """
+        for pv in self.pvs:
+            rt = self.runtime.get(pv.name)
+            if rt is None:
+                continue
+            armed = (self._monitoring and pv.enabled
+                     and self._frozen_check_on(pv)
+                     and bool(self.settings.get("frozen_alert_enabled", True)))
+            if not armed:
+                # Not armed (or no longer armed): forget the episode instead of
+                # firing a recovery for something never announced.
+                rt.frozen_notified = False
+                continue
+            if rt.frozen and not rt.frozen_notified:
+                rt.frozen_notified = True
+                self._send_frozen_alert(pv, rt, AlertLevel.WARNING)
+            elif not rt.frozen and rt.frozen_notified \
+                    and rt.current_value is not None:
+                # Only call it recovered on a live reading: losing the data
+                # altogether clears `frozen` too, and that is not good news.
+                rt.frozen_notified = False
+                self._send_frozen_alert(pv, rt, AlertLevel.OK)
+
+    def _send_frozen_alert(self, pv: PVConfig, rt: PVRuntime,
+                           level: AlertLevel):
+        value = rt.current_value if rt.current_value is not None else 0.0
+        units = (rt.current_units or pv.units) or ""
+        if level == AlertLevel.OK:
+            reason = "Value is changing again — the PV is updating."
+            prev = AlertLevel.WARNING
+        else:
+            shown = f"{_fmt(value)} {units}".strip()
+            reason = (f"PV NOT UPDATING — {rt.frozen_reason}. The reading "
+                      f"shown ({shown}) is not live, so any limit check on it "
+                      f"is meaningless.")
+            prev = AlertLevel.OK
+        self._log(f"NOT UPDATING {pv.display_name}: {reason}")
+        payload = AlertPayload(
+            level=level, prev_level=prev,
+            pv_name=pv.name, display_name=pv.display_name,
+            value=value, units=units, reason=reason,
+            timestamp_str=api.ns_to_prague_str(api.now_ns()),
+            kind="transition")
+        # Tagged apart from the PV name so the result never overwrites this
+        # PV's "Alarm status" cell, which tracks its threshold alerts.
+        self._launch_alert_worker(payload, self._active_thresholds(pv),
+                                  tag=f"frozen:{pv.name}",
+                                  valid_range=self._valid_range(pv))
 
     def _check_data_watchdog(self, results: dict):
         """Alert once when every monitored PV stops getting data (fetch errors
@@ -5284,11 +5854,16 @@ class MonitorWidget(QWidget):
     def _dispatch_alert(self, pv: PVConfig, rt: PVRuntime, note):
         self._log(f"ALERT {pv.display_name}: {note.prev_level.label}→"
                   f"{note.level.label} ({note.reason})")
+        reason = note.reason
+        if rt.frozen:
+            # The limits tripped on a reading that is no longer live — say so in
+            # the message instead of letting it read as a fresh measurement.
+            reason += f" — ⚠ but this PV is NOT UPDATING ({rt.frozen_reason})"
         payload = AlertPayload(
             level=note.level, prev_level=note.prev_level,
             pv_name=pv.name, display_name=pv.display_name,
             value=note.value, units=rt.current_units or pv.units,
-            reason=note.reason,
+            reason=reason,
             timestamp_str=api.ns_to_prague_str(rt.last_update_ns or api.now_ns()),
             kind=note.kind)
         # Tag the worker with the PV name so its result updates this PV's
@@ -5550,10 +6125,25 @@ class MonitorWidget(QWidget):
         names = ", ".join(p.display_name for p in matches[:8])
         return None, f"'{query}' is ambiguous: {names}"
 
+    def _resolve_pvs(self, items: list[str]):
+        """Resolve a comma-separated item list to PVs, keeping the order and
+        dropping duplicates. Returns (pvs, errors); 'all' means every PV."""
+        if len(items) == 1 and items[0].strip().lower() == "all":
+            return list(self.pvs), []
+        pvs, errors, seen = [], [], set()
+        for it in items:
+            pv, err = self._find_pv(it)
+            if pv is None:
+                errors.append(err)
+            elif pv.name not in seen:
+                seen.add(pv.name)
+                pvs.append(pv)
+        return pvs, errors
+
     def _handle_command(self, text: str, email: str):
-        parts = text.split()
-        cmd = parts[0].lower()
-        args = parts[1:]
+        pc = bot_commands.parse_command(text)
+        cmd = pc.cmd
+        args = pc.args.split()       # positional args (numbers, on|off)
         self._log(f"Webex cmd from {email}: {text}")
         try:
             if cmd in ("/help", "/?"):
@@ -5565,7 +6155,7 @@ class MonitorWidget(QWidget):
                     self._reply("**PVs:**\n" + "\n".join(
                         f"- {p.display_name}" for p in self.pvs))
             elif cmd == "/status":
-                self._reply(self._cmd_status())
+                self._reply(self._cmd_status(pc.items))
             elif cmd == "/alarms":
                 self._reply(self._cmd_alarms())
             elif cmd == "/start":
@@ -5591,32 +6181,31 @@ class MonitorWidget(QWidget):
                 self.persist()
                 self._reply(f"Graph window set to {mins} min.")
             elif cmd == "/yaxis":
-                if args and args[0].lower() == "auto":
+                # Accepts "/yaxis auto", "/yaxis 10 30" and "/yaxis 10-30".
+                rng = bot_commands.parse_yaxis_spec(f"y {pc.args}")
+                if rng is None:
                     self.graph.set_yaxis(None, None)
                     self._reply("Y axis: autoscale.")
                 else:
-                    lo, hi = float(args[0]), float(args[1])
-                    self.graph.set_yaxis(lo, hi)
-                    self._reply(f"Y axis set to [{lo:g}, {hi:g}].")
+                    self.graph.set_yaxis(rng[0], rng[1])
+                    self._reply(f"Y axis set to [{rng[0]:g}, {rng[1]:g}].")
             elif cmd == "/graph":
-                target = " ".join(args).strip()
-                if target.lower() in ("all", ""):
+                if not pc.items or pc.first.lower() == "all":
                     self.graph.select_pv(None)
                     self._reply("Graph: all PVs.")
+                elif len(pc.items) > 1:
+                    self._reply("⚠ The live graph shows one PV or all of them — "
+                                "name a single PV, or use `/graph all`. Several "
+                                "PVs at once work with `/plot`.")
                 else:
-                    pv, err = self._find_pv(target)
+                    pv, err = self._find_pv(pc.first)
                     if not pv:
                         self._reply(f"⚠ {err}")
                     else:
                         self.graph.select_pv(pv.name)
                         self._reply(f"Graph: {pv.display_name}.")
             elif cmd == "/plot":
-                pv, err = self._find_pv(" ".join(args))
-                if not pv:
-                    self._reply(f"⚠ {err}")
-                else:
-                    self._send_plot_for(pv, tag="cmd")
-                    self._reply(f"📈 Sending plot for {pv.display_name}…")
+                self._cmd_plot(pc)
             elif cmd == "/datawatchdog":
                 if args and args[0].lower() in ("on", "off"):
                     enabled = args[0].lower() == "on"
@@ -5629,82 +6218,168 @@ class MonitorWidget(QWidget):
                     self._reply(f"Data watchdog is {state}. "
                                 "Use `/datawatchdog on|off` to change.")
             elif cmd in ("/enable", "/disable"):
-                pv, err = self._find_pv(" ".join(args))
-                if not pv:
-                    self._reply(f"⚠ {err}")
+                pvs, errors = self._resolve_pvs(pc.items)
+                if errors or not pvs:
+                    self._reply("⚠ " + "; ".join(errors or ["missing PV name"]))
                 else:
-                    pv.enabled = (cmd == "/enable")
+                    for pv in pvs:
+                        pv.enabled = (cmd == "/enable")
                     self.model.refresh_all()
                     self.persist()
-                    self._reply(f"{pv.display_name} alerting "
-                                f"{'enabled' if pv.enabled else 'disabled'}.")
+                    state = "enabled" if cmd == "/enable" else "disabled"
+                    names = ", ".join(pv.display_name for pv in pvs)
+                    self._reply(f"Alerting {state} for {names}.")
             else:
                 self._reply(f"❓ Unknown command {cmd}. Try /help.")
+        except bot_commands.CommandError as e:
+            # Raised by the parsers with a message written for the chat.
+            self._reply(f"⚠ {e} Try /help.")
         except (IndexError, ValueError):
             self._reply(f"⚠ Bad arguments for {cmd}. Try /help.")
 
+    # --- /plot: any number of PVs, any time window ----------------------
+    def _cmd_plot(self, pc: "bot_commands.ParsedCommand"):
+        if not pc.items:
+            self._reply("⚠ Which PV? For example "
+                        "`/plot Chiller 1, Chiller 2; 7-18`. "
+                        "`/plot all` plots every PV.")
+            return
+        pvs, errors = self._resolve_pvs(pc.items)
+        if errors:
+            self._reply("⚠ " + "; ".join(errors))
+            return
+        if not pvs:
+            self._reply("No PVs configured.")
+            return
+        opts = bot_commands.parse_plot_options(pc.options, api.now_ns(),
+                                               api.TZ_PRAGUE)
+        if opts.time is not None:
+            start_ns, end_ns, label = (opts.time.start_ns, opts.time.end_ns,
+                                       opts.time.label)
+        else:
+            hours = float(self.settings.get("alert_plot_hours", 12)) or 12.0
+            end_ns = api.now_ns()
+            start_ns = end_ns - int(hours * 3600 * 1e9)
+            label = f"last {hours:g} h"
+        if not self.hub.is_any_configured():
+            self._reply("⚠ No notification channel is configured, so I have "
+                        "nowhere to send the plot.")
+            return
+
+        names = ", ".join(pv.display_name for pv in pvs)
+        short = names if len(names) <= 70 else f"{len(pvs)} PVs"
+        # Thresholds only make sense on a single curve — see render_chart_png.
+        series = [ChartSeries(pv.name, pv.display_name,
+                              self._active_thresholds(pv) if len(pvs) == 1 else None,
+                              *self._valid_range(pv))
+                  for pv in pvs]
+        body = (f"**📈 {names}**\n\n"
+                f"- **Window:** {label} (Europe/Prague)\n")
+        if opts.yaxis:
+            body += f"- **Y range:** {opts.yaxis[0]:g} … {opts.yaxis[1]:g}\n"
+        body += "\n".join(self._status_line(pv) for pv in pvs)
+        sig = _ChartSignals(self)
+        sig.done.connect(self._on_chart_result)
+        self._chart_sig = sig      # handle to the latest; the worker owns it
+        QThreadPool.globalInstance().start(_ChartWorker(
+            sig, self.hub, series, start_ns, end_ns,
+            float(self.settings["http_timeout_s"]),
+            f"Plot — {short} ({label})", label, body, opts.yaxis))
+        self._reply(f"📈 Rendering {short} — {label}…")
+
+    def _on_chart_result(self, result):
+        errors, had_png = result
+        for ch, err in errors.items():
+            self._log(f"  {ch} send failed: {err}")
+        if not errors:
+            self._log("Chart sent." if had_png
+                      else "Chart sent (no data in that window — text only).")
+
     def _cmd_help(self) -> str:
         return (
-            "**PV Monitor commands:**\n"
-            "- `/status` — all PVs + values + state\n"
-            "- `/alarms` — only PVs currently in warning/alarm\n"
-            "- `/list` — list configured PVs\n"
-            "- `/plot <pv>` — send current plot of a PV\n"
-            "- `/start` — alerting on (PVs are read either way)\n"
+            bot_commands.SYNTAX_HELP + "\n"
+            "\n"
+            "**Commands**\n"
+            "- `/status [pv, pv]` — values + state, all PVs or just those\n"
+            "- `/alarms` — only PVs currently in warning/alarm, plus any that "
+            "stopped updating\n"
+            "- `/list` — the configured PVs\n"
+            "- `/plot <pv, pv, …>[; window][; y lo-hi]` — send one graph with a "
+            "curve per PV, e.g. `/plot Chiller 1, Chiller 2; yesterday 7-18`. "
+            "`/plot all` takes every PV; a single PV also gets its limit lines.\n"
+            "- `/start` — alerting on (PVs are read and plotted either way)\n"
             "- `/stop [hours]` — alerting off; with hours, auto-resume later "
             "(e.g. `/stop 10`)\n"
-            "- `/enable <pv>` `/disable <pv>` — alerting per PV\n"
-            "- `/datawatchdog on|off` — toggle the 'no data at all' alert "
-            "(no args: show current state)\n"
-            "- `/graph <pv|all>` — set the live graph\n"
-            "- `/window <minutes>` — graph time window\n"
-            "- `/yaxis <lo> <hi>` | `/yaxis auto` — graph Y range")
+            "- `/enable <pv, pv>` `/disable <pv, pv>` — alerting per PV\n"
+            "- `/datawatchdog on|off` — the 'no data at all' alert "
+            "(no argument: show current state)\n"
+            "- `/graph <pv|all>` — what the app window itself shows\n"
+            "- `/window <minutes>` — time window of that live graph\n"
+            "- `/yaxis <lo-hi>|auto` — Y range of that live graph")
 
-    def _cmd_status(self) -> str:
+    def _status_line(self, p: PVConfig) -> str:
+        rt = self.runtime.get(p.name)
+        bad = bool(rt and rt.bad_data and rt.current_value is None and p.enabled)
+        if rt and rt.current_value is not None:
+            val = _fmt(rt.current_value)
+        elif bad and rt.raw_value is not None:
+            val = _fmt(rt.raw_value)
+        else:
+            val = "–"
+        units = (rt.current_units if rt and rt.current_units else p.units) or ""
+        if rt and rt.frozen:
+            state = f"⚠ {FROZEN_LABEL} — {rt.frozen_reason}"
+        elif not p.enabled:
+            state = "off"
+        elif bad:
+            state = "bad data"
+        elif rt and rt.display_level(self._monitoring) is not None:
+            state = rt.display_level(self._monitoring).label.lower()
+            if not self._monitoring:
+                state += ", not monitored"
+        else:
+            state = "no data"
+        return f"- **{p.display_name}**: {val} {units} [{state}]"
+
+    def _cmd_status(self, items: Optional[list[str]] = None) -> str:
         if not self.pvs:
             return "No PVs configured."
-        lines = []
-        for p in self.pvs:
-            rt = self.runtime.get(p.name)
-            bad = bool(rt and rt.bad_data and rt.current_value is None and p.enabled)
-            if rt and rt.current_value is not None:
-                val = _fmt(rt.current_value)
-            elif bad and rt.raw_value is not None:
-                val = _fmt(rt.raw_value)
-            elif rt:
-                val = "–"
-            else:
-                val = "–"
-            units = (rt.current_units if rt and rt.current_units else p.units) or ""
-            if not p.enabled:
-                state = "off"
-            elif bad:
-                state = "bad data"
-            elif rt and rt.display_level(self._monitoring) is not None:
-                state = rt.display_level(self._monitoring).label.lower()
-                if not self._monitoring:
-                    state += ", not monitored"
-            else:
-                state = "no data"
-            lines.append(f"- **{p.display_name}**: {val} {units} [{state}]")
+        pvs = self.pvs
+        if items:
+            pvs, errors = self._resolve_pvs(items)
+            if errors:
+                return "⚠ " + "; ".join(errors)
         mon = "MONITORING" if self._monitoring else "stopped (reading only)"
-        return f"**Status ({mon}):**\n" + "\n".join(lines)
+        return (f"**Status ({mon}):**\n"
+                + "\n".join(self._status_line(p) for p in pvs))
 
     def _cmd_alarms(self) -> str:
-        lines = []
+        lines, frozen = [], []
         for p in self.pvs:
             if not p.enabled:
                 continue
             rt = self.runtime.get(p.name)
+            val = _fmt(rt.current_value) if rt else "–"
+            units = (rt.current_units if rt and rt.current_units else p.units) or ""
+            # A frozen PV is listed as the data fault it is, not as whatever its
+            # dead reading happens to score against the limits.
+            if rt is not None and rt.frozen:
+                frozen.append(f"- **{p.display_name}**: {val} {units} "
+                              f"[{rt.frozen_reason}]")
+                continue
             level = rt.display_level(self._monitoring) if rt else None
             if level not in (AlertLevel.WARNING, AlertLevel.ALARM):
                 continue
-            val = _fmt(rt.current_value) if rt else "–"
-            units = (rt.current_units if rt and rt.current_units else p.units) or ""
             lines.append(f"- **{p.display_name}**: {val} {units} [{level.label.lower()}]")
-        if not lines:
+        out = []
+        if lines:
+            out.append("**Current alarms:**\n" + "\n".join(lines))
+        if frozen:
+            out.append(f"**⚠ {FROZEN_LABEL} (reading is not live):**\n"
+                       + "\n".join(frozen))
+        if not out:
             return "✅ No PVs currently in warning/alarm."
-        return "**Current alarms:**\n" + "\n".join(lines)
+        return "\n\n".join(out)
 
     # --- simulate ------------------------------------------------------
     def simulate_alert(self):

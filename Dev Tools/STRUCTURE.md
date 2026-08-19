@@ -1,6 +1,6 @@
 # Dev Tools — STRUCTURE
 
-> Verified against source: 2026-08-05 · `dev_tools.py` 86 L · `b_t.py` 1176 L · `cm_t.py` 2117 L
+> Verified against source: 2026-08-19 · `dev_tools.py` 86 L · `b_t.py` 1215 L · `cm_t.py` 2128 L
 
 ## Files
 
@@ -104,8 +104,16 @@ after every successful build (`write_version_to_txt`) and read back by
 9. Rename the exe to `<Name> v<version>.exe`, copy `icon.ico` next to it (tkinter's
    `iconbitmap` needs a real file)
 10. Copy the main `.py` + the extra sources + `build_config.json → extra_files`
-11. Clean the PyInstaller work dir in TEMP
-12. `write_version_to_txt(name, ver)` and append to `build_usage.json`
+    (folders are copied recursively, minus `__pycache__` / `Thumbs.db`)
+11. Copy the runtime asset folders `images` / `sounds` / `assets` / `icons` if the
+    project has them — automatic, no config needed. The app reads them from next to
+    the exe, and a build shipped without them fails only at runtime (Announcer's
+    alarm image lives in `images/`).
+12. Copy the project's ReadMe into the version folder. The deploy step looks for it
+    there first and otherwise falls back to the copy already on the destination — so
+    without this the published ReadMe would never be updated.
+13. Clean the PyInstaller work dir in TEMP
+14. `write_version_to_txt(name, ver)` and append to `build_usage.json`
 
 ### Per-project `build_config.json`
 ```json
@@ -115,7 +123,7 @@ after every successful build (`write_version_to_txt`) and read back by
   "hidden_imports":   ["module"],
   "copy_metadata":    ["module"],
   "exclude_modules":  ["module"],
-  "extra_files":      ["data.json"]
+  "extra_files":      ["data.json", "images"]
 }
 ```
 
@@ -188,12 +196,40 @@ from the plain `Name vX.Y.Z.exe` filename.
   the confirmation text
 
 ### `_deploy_one_program()` steps
-1. Find the exe in the version folder, the ReadMe (required), the `.py` files, the
-   icon and any extra files
+1. Find the exe in the version folder, the ReadMe, the `.py` files, the icon and
+   the extras (files **and folders**, `_internal` excluded)
 2. Per destination root: create `<dst>/<program>/`, archive the old exe/py into
    `archive/vX.Y.Z/`, copy the new exe as `<program> <version>.exe`, copy the `.py`
-   files, extras (except `_internal`), the ReadMe and the icon (a stale PNG is
-   dropped when an ICO is copied; conflicts use the `icon_decisions` answers)
+   files, the extras, the ReadMe and the icon (a stale PNG is dropped when an ICO
+   is copied; conflicts use the `icon_decisions` answers)
+3. Delete leftover folders on the destination that the new version does not bring
+   — except `_internal`, `archive`, and anything in `incoming_dirs`
+
+### ReadMe lookup order
+Five places, in this order, and the second one is the reason the order matters:
+
+1. the version folder — the Builder copies it there
+2. **the source folder in the repo** — the live ReadMe. Builds made before the
+   Builder started copying the ReadMe have none in the version folder, and
+   without this step the deploy shipped no ReadMe at all, so the Launcher card
+   showed no ReadMe button
+3. `dist/<program>/` — may still have one from an earlier deploy
+4. `<destination>/<program>/` — the copy already published there
+5. nothing found → skip with a warning
+
+`_normalize_name` ignores case, underscores, spaces, hyphens and dots, so
+`Readme Image Tools.txt` and `ReadMe_Spectra.txt` both match. Note that
+`find_readme_or_raise` here also falls back to `README.txt` / `README.md`, while
+the **Launcher** does not — a deploy can succeed while the Launcher still shows
+nothing. Always name a ReadMe `ReadMe_<folder name>`.
+
+### `incoming_dirs` — why the stale-folder cleanup needs it
+The deploy deletes destination folders the new version does not bring, so a
+mistake from an earlier deploy cannot linger. Runtime assets live in exactly such
+folders (`Announcer/images`, `Announcer/sounds`), so the set of folder names the
+new version *does* bring is collected first and excluded from that cleanup.
+Without it the assets were deleted and nothing re-created them, and the deployed
+app came up without its alarm image.
 
 ### Deploy output layout
 ```
@@ -202,6 +238,7 @@ from the plain `Name vX.Y.Z.exe` filename.
   *.py
   ReadMe_*.txt
   icon.ico
+  images/ sounds/ assets/ icons/   ← whatever the build brought along
   archive/
     vX.Y.Z/
       <program_name> vX.Y.Z.exe

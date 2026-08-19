@@ -112,7 +112,7 @@ class EvalConfig:
     # so a transient excursion can settle. After the wait, one message is sent
     # only if the PV is still in Warning/Alarm; if it recovered within the
     # window, nothing is sent. 0 = notify immediately (legacy behaviour).
-    settle_minutes: float = 5.0
+    settle_minutes: float = 7.0
     # A committed transition is only announced once the level has stayed
     # unchanged for this many seconds; each further transition restarts the
     # clock, so a value oscillating across a limit stays silent until it
@@ -142,6 +142,22 @@ def fmt_value(x: float) -> str:
     if x == 0 or abs(x) >= 0.1:
         return f"{x:.1f}"
     return f"{x:.3g}"
+
+
+def fmt_duration(seconds: float) -> str:
+    """Human-readable span for messages and table tooltips: '3 d 4 h',
+    '5 h 12 min', '45 min', '30 s'."""
+    s = int(max(0.0, seconds))
+    days, rem = divmod(s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days} d {hours} h"
+    if hours:
+        return f"{hours} h {minutes} min"
+    if minutes:
+        return f"{minutes} min"
+    return f"{s} s"
 
 
 def describe_reason(level: AlertLevel, value: float, thr: Thresholds) -> str:
@@ -234,6 +250,76 @@ def classify_trend(samples, now_ns: int, lookback_s: float,
         return Trend.FLAT
 
     return Trend.RISING if overall > 0 else Trend.FALLING
+
+
+# ---------------------------------------------------------------------------
+# Frozen-value detection (pure) — catches a PV that keeps delivering data while
+# the reading behind it has stopped moving (dead sensor, stuck IOC, a control
+# system that republishes its last value). Such a PV looks perfectly healthy:
+# samples keep arriving with fresh timestamps, the value sits inside its limits
+# (or outside them, alarming on data that is days old), and nothing else in the
+# monitor notices. Kept free of Qt/history objects so it can be unit tested:
+# the caller passes raw (timestamp, value) samples read from wherever it keeps
+# them.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FrozenInfo:
+    """Outcome of one frozen-value check.
+
+    ``bounded`` distinguishes "we saw it change at ``since_ns``" from "it was
+    already at this value at the start of the data we have", i.e. the freeze is
+    at least ``span_s`` long but may well be older.
+    """
+    frozen: bool = False
+    since_ns: int = 0        # timestamp of the oldest sample carrying the value
+    span_s: float = 0.0      # how long the value has been unchanged, up to now
+    n_points: int = 0        # samples making up that unchanged run
+    bounded: bool = False    # True = a different value precedes the run
+
+
+def _same_value(a: float, b: float, rel_tol: float, abs_tol: float) -> bool:
+    return abs(a - b) <= max(abs_tol, rel_tol * max(abs(a), abs(b)))
+
+
+def detect_frozen(samples, now_ns: int, frozen_after_s: float,
+                  min_points: int = 5, rel_tol: float = 1e-9,
+                  abs_tol: float = 0.0) -> FrozenInfo:
+    """Detect a value that has not moved for at least `frozen_after_s` seconds.
+
+    `samples` is any iterable of (timestamp_ns, value) pairs (any order); only
+    those at or before `now_ns` count. The newest sample's value is the
+    reference: the check walks back through the samples while they still carry
+    that same value (within tolerance) and measures the run's length up to
+    `now_ns`, so an ongoing freeze keeps growing between calls.
+
+    The tolerance is deliberately near-exact — the point is "literally the same
+    number over and over", not "roughly steady". A real sensor's noise always
+    moves the last digit; only a stuck one repeats it exactly.
+
+    A run counts as frozen only when it is both long enough AND carried by at
+    least `min_points` samples, so sparse data (two readings hours apart) is
+    never mistaken for a stuck sensor. `frozen_after_s` <= 0 disables the check.
+    """
+    if frozen_after_s <= 0:
+        return FrozenInfo()
+
+    pts = [(t, v) for (t, v) in samples if v is not None and t <= now_ns]
+    if not pts:
+        return FrozenInfo()
+    pts.sort(key=lambda p: p[0])
+
+    ref = pts[-1][1]
+    i = len(pts) - 1
+    while i > 0 and _same_value(pts[i - 1][1], ref, rel_tol, abs_tol):
+        i -= 1
+
+    span_s = max(0.0, (now_ns - pts[i][0]) / 1e9)
+    n_points = len(pts) - i
+    return FrozenInfo(
+        frozen=(span_s >= frozen_after_s and n_points >= max(1, min_points)),
+        since_ns=pts[i][0], span_s=span_s, n_points=n_points,
+        bounded=(i > 0))
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +588,19 @@ def build_messagecard(level: AlertLevel, prev_level: AlertLevel,
     }
 
 
+def build_textcard(title: str, text: str, color: str = "1565C0") -> dict:
+    """Build a plain title+text Teams MessageCard (used for chart replies,
+    which have no single PV/level to build a fact table from)."""
+    return {
+        "@type": "MessageCard",
+        "@context": "http://schema.org/extensions",
+        "themeColor": color,
+        "summary": title,
+        "title": title,
+        "sections": [{"text": text, "markdown": True}],
+    }
+
+
 class TeamsClient:
     """Posts cards to a Teams Incoming Webhook. Never raises into the caller."""
 
@@ -736,6 +835,54 @@ class WebexNotifier:
             self.last_error = str(e)
             return False
 
+    def post_markdown(self, markdown: str, png_bytes: bytes | None = None) -> bool:
+        """Broadcast free-form markdown (+ optional PNG) to every configured
+        room. Used for replies that are not a single-PV alert, e.g. a chart of
+        several PVs. Bot mode only; a webhook cannot carry a file."""
+        if not self.is_configured():
+            self.last_error = "Webex not fully configured"
+            return False
+        try:
+            if self.mode != "bot":
+                md = markdown
+                if png_bytes:
+                    md += "\n\n_(graph attached in the e-mail alert)_"
+                resp = requests.post(self.webhook_url, json={"markdown": md},
+                                     timeout=self.timeout, verify=True)
+                if 200 <= resp.status_code < 300:
+                    self.last_error = ""
+                    return True
+                self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                return False
+            headers = {"Authorization": f"Bearer {_resolve_secret(self.bot_token)}"}
+            errors = []
+            for room_id in self.room_ids:
+                if png_bytes:
+                    resp = requests.post(
+                        WEBEX_MESSAGES_URL, headers=headers,
+                        files={"roomId": (None, room_id),
+                               "markdown": (None, markdown),
+                               "files": ("plot.png", png_bytes, "image/png")},
+                        timeout=self.timeout)
+                else:
+                    resp = requests.post(
+                        WEBEX_MESSAGES_URL, headers=headers,
+                        json={"roomId": room_id, "markdown": markdown},
+                        timeout=self.timeout)
+                if 200 <= resp.status_code < 300:
+                    self._remember_own_message(resp)
+                else:
+                    errors.append(f"{room_id}: HTTP {resp.status_code} "
+                                  f"{resp.text[:120]}")
+            if errors:
+                self.last_error = "; ".join(errors)
+                return False
+            self.last_error = ""
+            return True
+        except Exception as e:  # noqa: BLE001 - must never propagate to UI thread
+            self.last_error = str(e)
+            return False
+
     def send_test(self) -> bool:
         payload = AlertPayload(
             level=AlertLevel.OK, prev_level=AlertLevel.OK,
@@ -908,6 +1055,28 @@ class NotificationHub:
                 errors["email"] = self.email.last_error
         if self.webex_enabled and self.webex.is_configured():
             if not self.webex.send(payload, png_bytes):
+                errors["webex"] = self.webex.last_error
+        return errors
+
+    def dispatch_chart(self, title: str, text_body: str, markdown_body: str,
+                       png_bytes: bytes | None = None) -> dict[str, str]:
+        """Send a chart (or its text fallback) to every enabled+configured
+        channel. Return {channel: error}.
+
+        Unlike ``dispatch`` this carries no PV state — it is for replies about
+        several PVs at once, where a single-PV alert card makes no sense.
+        Worker-thread safe; never raises.
+        """
+        errors: dict[str, str] = {}
+        if self.teams_enabled and self.teams.is_configured():
+            # Teams Incoming Webhooks cannot embed raw image bytes — text only.
+            if not self.teams.post(build_textcard(title, markdown_body)):
+                errors["teams"] = self.teams.last_error
+        if self.email_enabled and self.email.is_configured():
+            if not self.email.send(title, text_body, png_bytes):
+                errors["email"] = self.email.last_error
+        if self.webex_enabled and self.webex.is_configured():
+            if not self.webex.post_markdown(markdown_body, png_bytes):
                 errors["webex"] = self.webex.last_error
         return errors
 

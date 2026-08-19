@@ -16,7 +16,7 @@
       "red": 1.1
     }
   },
-  "flash_mode": "alternate",
+  "flash_mode": "image",
   "image_file": "scorpion_orig",
   "image_geometry": "176x143+2683+119"
 }

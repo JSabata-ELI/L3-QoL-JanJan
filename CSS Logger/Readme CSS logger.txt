@@ -67,18 +67,46 @@ with Autoscale on uses the full height.
 
   Clean graph / Save graph / Back (undo the last zoom)
   Reference lines   — horizontal lines at fixed values
-  Conditions        — min/max filters; rows outside are dropped
+  Conditions        — min/max filters. A row is kept only if every
+                      condition PV is present and inside its
+                      [min, max]; everything else is discarded from
+                      the table, the graph and the CSV export. If a
+                      whole window is out of range the table stays
+                      empty on purpose and the Log says how many rows
+                      were dropped. A condition on a PV that has no
+                      data in the loaded window is skipped (also
+                      logged), so it cannot reject every row on its
+                      own. Custom PVs can be used as condition PVs.
   Add custom PV     — a new signal from an expression over the
                       loaded ones (A, B, C … = channel letters).
+
                       Each formula remembers which PV every letter
                       stands for, so loading another preset or
                       removing a PV re-assigns the letters to follow
                       the PVs instead of changing what the formula
-                      means. The table at the top of the dialog
-                      lists every letter with its full PV name; a PV
-                      a formula needs but that is not loaded is
-                      listed there too, marked "not loaded" (its
+                      means. The letter you see can therefore change
+                      between sessions while the formula keeps its
+                      meaning: "compressed beta = SBW4 * 0.749" shows
+                      as A*0.749 when SBW4 is first in the list and
+                      as H*0.749 when it is eighth — same PV, same
+                      result. Only the stored PV names are permanent.
+
+                      Two tables spell that out:
+                        Available channels — the automatic letter
+                          assignment for the list as loaded now
+                          (read-only; it follows the list).
+                        What each letter means — one row per letter
+                          per formula with the PV behind it. Pick a
+                          different channel there to re-point that
+                          letter; the expression updates to the new
+                          letter so it stays honest about what it
+                          reads.
+
+                      A PV a formula needs but that is not loaded is
+                      listed in both tables, marked "not loaded" (its
                       column then stays empty and the Log says so).
+                      Its binding is kept, not silently re-pointed at
+                      whatever now holds that letter.
   Graph settings    — fonts, axis-column spacing, plot margins,
                       cursor readouts, performance switches
   Font / Avg to     — font size, and the point count the traces
@@ -155,6 +183,23 @@ GENERAL NOTES
       cpva_conditions_presets.json condition presets
       custom_pvs.json              derived PVs
   - RampingRepository/ holds local parquet data for the PV Time
-    tab and works offline.
+    tab and works offline; ramping_archive.json is its index and
+    ramping_setups.json keeps the named setups.
+  - The archiver only answers reliably for windows of about an hour,
+    so every request is split into one-hour pieces and fetched in
+    parallel. Night hours (22:00-06:00) are skipped, since nothing
+    is recorded then.
+  - For a long window the program can also ask the archiver for a
+    thinned-out version of the data (the "count" option) instead of
+    every single sample, which is what keeps a month-long load
+    usable.
+
+  For whoever works on the code:
+      STRUCTURE.md        what each part does and why
+      test_smoke.py       clicks through every button, headless,
+                          no network
+      test_live_pacing.py live mode pacing
+      test_count_param.py the archiver's count parameter
+                          (needs the real archiver)
 
 -----------------------------------------------------------------

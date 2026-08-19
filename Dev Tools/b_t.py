@@ -799,8 +799,16 @@ class BuilderUI(ttk.Frame):
         extra_hidden_imports: list[str]  = build_cfg.get("hidden_imports", [])
         extra_copy_metadata: list[str]   = build_cfg.get("copy_metadata", [])
         extra_exclude_modules: list[str] = list(build_cfg.get("exclude_modules", []))
-        # Extra data files to copy into the version folder after build
-        extra_data_files: list[str] = build_cfg.get("extra_files", [])
+        # Extra data files/folders to copy into the version folder after build
+        extra_data_files: list[str] = list(build_cfg.get("extra_files", []))
+
+        # Runtime asset folders: the app reads them from next to the exe, so they
+        # must ship with every build. Auto-included even when the project has no
+        # build_config.json — a missing asset folder is invisible until the app is
+        # run from the deployed copy (Announcer/images/scorpion_orig.png).
+        for _asset in ("images", "sounds", "assets", "icons"):
+            if (p / _asset).is_dir() and _asset not in extra_data_files:
+                extra_data_files.append(_asset)
 
         # Auto-detect packages with known DLL bundling issues and add --collect-all
         # so PyInstaller always includes all native libraries (e.g. numpy _umath_linalg).
@@ -945,17 +953,48 @@ class BuilderUI(ttk.Frame):
         except Exception as e:
             print(f"Warning: could not copy source files: {e}")
 
-        # Kopíruj extra datové soubory definované v build_config.json → extra_files
+        # Kopíruj extra datové soubory a složky (build_config.json → extra_files
+        # plus the auto-detected asset folders)
         for fname in extra_data_files:
             src = p / fname
-            if src.exists():
+            dst = verdir / src.name
+            if src.is_dir():
                 try:
-                    shutil.copy2(str(src), str(verdir / src.name))
+                    if dst.exists():
+                        shutil.rmtree(str(dst), ignore_errors=True)
+                    shutil.copytree(str(src), str(dst),
+                                    ignore=shutil.ignore_patterns("__pycache__", "Thumbs.db"))
+                    _n = sum(1 for _f in dst.rglob("*") if _f.is_file())
+                    _log(f"  extra folder: {src.name}/  ({_n} files)")
+                except Exception as e:
+                    _log(f"Warning: could not copy extra folder {fname}: {e}")
+            elif src.exists():
+                try:
+                    shutil.copy2(str(src), str(dst))
                     _log(f"  extra file: {src.name}")
                 except Exception as e:
                     _log(f"Warning: could not copy extra file {fname}: {e}")
             else:
                 _log(f"Warning: extra_file not found: {src}")
+
+        # Kopíruj ReadMe do version folder. Deploy (cm_t.py) hledá ReadMe nejdřív
+        # tady a jinak sáhne po té, co už leží na cíli — bez tohohle kroku by se
+        # zveřejněná ReadMe nikdy neaktualizovala.
+        _rm_norm = lambda s: s.lower().replace("_", "").replace(" ", "")
+        _rm_target = _rm_norm(f"ReadMe_{p.name}")
+        _readme = next((f for f in p.iterdir()
+                        if f.is_file() and _rm_norm(f.stem) == _rm_target), None)
+        if _readme is None:
+            _readme = next((p / c for c in ("ReadMe.txt", "README.md", "README.txt", "ReadMe.md")
+                            if (p / c).exists()), None)
+        if _readme is None:
+            _log(f"Warning: no ReadMe found in {p} — deploy will keep the published one")
+        else:
+            try:
+                shutil.copy2(str(_readme), str(verdir / _readme.name))
+                _log(f"  readme: {_readme.name}")
+            except Exception as e:
+                _log(f"Warning: could not copy ReadMe {_readme.name}: {e}")
 
         # Vyčisti pouze pracovní TEMP dir
         try:

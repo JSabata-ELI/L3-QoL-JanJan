@@ -4,7 +4,7 @@ description: Line-by-line map of dev_tools.py, b_t.py, cm_t.py — Builder + Cop
 ---
 
 Dev Tools — tkinter two-tab app: Builder (`b_t.py`) + Copy Manager / Deploy (`cm_t.py`)
-Files (verified 2026-08-05): `dev_tools.py` (86 L) | `b_t.py` (1176 L) | `cm_t.py` (2117 L)
+Files (verified 2026-08-19): `dev_tools.py` (86 L) | `b_t.py` (1215 L) | `cm_t.py` (2128 L)
 
 Line numbers are anchors — they drift. Re-grep the symbol if an offset looks wrong.
 
@@ -107,9 +107,17 @@ Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
 7. `py -m PyInstaller --onedir --windowed --noconfirm` + icon + `--add-data` per extra `.py`
 8. move the built app one level up into the version folder (`_internal` stays)
 9. rename exe → `<Name> v<version>.exe`, copy `icon.ico` next to it
-10. copy the main `.py`, the extra sources, and `extra_files`
-11. remove the TEMP work dir only
-12. `write_version_to_txt(name, ver)` + append to `build_usage.json`, then log the
+10. copy the main `.py`, the extra sources, and `extra_files` (folders too —
+    recursively, minus `__pycache__` / `Thumbs.db`)
+11. **auto asset folders**: `images` / `sounds` / `assets` / `icons` are copied
+    whenever the project has them, config or not. They are read from next to the
+    exe at runtime, so a build without them breaks only once it is deployed
+    (Announcer's alarm image is `images/scorpion_orig.png`)
+12. copy the project's ReadMe into the version folder — `cm_t.py` looks for it
+    there first and otherwise keeps the copy already on the destination, so
+    skipping this leaves the published ReadMe frozen forever
+13. remove the TEMP work dir only
+14. `write_version_to_txt(name, ver)` + append to `build_usage.json`, then log the
     resulting folder listing
 
 ---
@@ -170,11 +178,24 @@ Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
 | **L2021** | `_on_copy(build_summary)` | main workflow: collect conflicts → deploy each → update state + `Versions.txt` → log stats |
 
 **`_deploy_one_program()` steps**
-1. exe in the version folder, ReadMe (required), `.py` files, icon, extra files
+1. exe in the version folder, ReadMe, `.py` files, icon, extras — **files and
+   folders**, `_internal` excluded
 2. per destination root: create `<dst>/<program>/`, archive the old exe/py into
    `archive/vX.Y.Z/`, copy the new exe as `<program> <version>.exe`, copy the `.py`
-   files, the extras (except `_internal`), the ReadMe, and the icon (a stale PNG is
-   dropped when an ICO is copied; conflicts follow `icon_decisions`)
+   files, the extras, the ReadMe, and the icon (a stale PNG is dropped when an ICO
+   is copied; conflicts follow `icon_decisions`)
+3. remove leftover folders on the destination — except `_internal`, `archive`, and
+   the names in `incoming_dirs`
+
+**ReadMe lookup order** (L1493) — version folder → **source folder in the repo**
+→ `dist/<program>/` → `<destination>/<program>/` → warn and skip. Step 2 was added
+because builds predating the Builder's ReadMe copy have none in the version folder,
+and the deploy then shipped no ReadMe at all. `_on_copy_readme_only` (L1767) uses
+the same order.
+
+**`incoming_dirs`** (L1530-1548) — the folder names the new version brings. The
+stale-folder cleanup at L1581 must skip them, or an app's runtime assets
+(`Announcer/images`, `Announcer/sounds`) are deleted and nothing re-creates them.
 
 ---
 
@@ -194,6 +215,8 @@ dist/<project_name>/
     *.py                            ← extra sources (no test_*.py)
     _internal/                      ← PyInstaller libs
     icon.ico / extra_files
+    images/ sounds/ assets/ icons/  ← auto-detected asset folders
+    ReadMe_*.txt                    ← copied so the deploy can publish it
 ```
 
 ### Deploy output layout
@@ -203,6 +226,7 @@ dist/<project_name>/
   *.py
   ReadMe_*.txt
   icon.ico
+  images/ sounds/ assets/ icons/   ← whatever the build brought
   archive/
     vX.Y.Z/
       <program_name> vX.Y.Z.exe

@@ -1493,11 +1493,15 @@ class DeployGUI(ttk.Frame):
 
         # ReadMe lookup order:
         # 1. version_folder  (builder copies it there for primary dev)
-        # 2. program_dir     (dist/program_name — may have it from previous deploy)
-        # 3. scratch/program_name  (already deployed there by a previous version)
-        # 4. None — skip with warning
+        # 2. source folder   (the project folder in the repo — the live ReadMe.
+        #    Builds made before the builder started copying the ReadMe have none
+        #    in version_folder, and without this step the deploy silently shipped
+        #    no ReadMe at all, so the Launcher showed no ReadMe button.)
+        # 3. program_dir     (dist/program_name — may have it from previous deploy)
+        # 4. scratch/program_name  (already deployed there by a previous version)
+        # 5. None — skip with warning
         src_readme = None
-        _readme_search_dirs = [version_folder, program_dir]
+        _readme_search_dirs = [version_folder, _programs_root() / program_name, program_dir]
         for dst_root in destination_roots:
             _readme_search_dirs.append(dst_root / program_name)
         for _d in _readme_search_dirs:
@@ -1526,18 +1530,23 @@ class DeployGUI(ttk.Frame):
                     icon_src = cand
                     break
 
-        # Najdi všechny složky a ostatní soubory ve version_folder (kromě _internal)
+        # Najdi všechny složky a ostatní soubory ve version_folder (kromě _internal).
+        # Folders count: an app's runtime assets live in folders next to the exe
+        # (Announcer/images, Announcer/sounds) and are useless if only the exe is
+        # deployed.
         src_extras = []
         for item in version_folder.iterdir():
             if item.name == "_internal":
                 continue
-            if item == src_exe:
+            if item == src_exe or item == src_readme:
                 continue
-            if item.suffix.lower() in (".py", ".exe"):
-                continue
-            if item.is_dir():
+            if item.is_file() and item.suffix.lower() in (".py", ".exe"):
                 continue
             src_extras.append(item)
+        # Folder names the new version brings along — they must survive the
+        # stale-folder cleanup below, which would otherwise delete them and (since
+        # nothing re-created them) leave the deployed app without its assets.
+        incoming_dirs = {i.name for i in src_extras if i.is_dir()}
 
         log(f"[{program_name}] Version: {version_name}")
         log(f"[{program_name}] EXE: {src_exe.name}")
@@ -1572,7 +1581,9 @@ class DeployGUI(ttk.Frame):
 
             # ── Smaž zbytkové složky z předchozích chybných deployů ─
             for item in target_dir.iterdir():
-                if item.is_dir() and item.name not in ("_internal", "archive"):
+                if (item.is_dir()
+                        and item.name not in ("_internal", "archive")
+                        and item.name not in incoming_dirs):
                     try:
                         shutil.rmtree(item)
                         log(f"[{program_name}] Removed stale folder: {item.name}")
@@ -1756,10 +1767,10 @@ class DeployGUI(ttk.Frame):
                 for src_dir in selected_programs:
                     program_dir = dist_root / src_dir.name
                     try:
-                        # Search: version_folder → program_dir → scratch/program_name
+                        # Search: version_folder → source folder → program_dir → scratch/program_name
                         src_readme = None
                         version_folders = list_versions(program_dir)
-                        search_dirs = (version_folders[:1] if version_folders else []) + [program_dir]
+                        search_dirs = (version_folders[:1] if version_folders else []) + [src_dir, program_dir]
                         for dst_root in selected_roots:
                             search_dirs.append(dst_root / program_dir.name)
                         for _d in search_dirs:

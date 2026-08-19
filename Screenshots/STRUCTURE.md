@@ -1,6 +1,6 @@
 # Screenshots — STRUCTURE
 
-> Verified against source: 2026-08-05 · `s.py` 4569 L
+> Verified against source: 2026-08-05, re-checked 2026-08-19 (unchanged) · `s.py` 4569 L
 
 ## Files
 

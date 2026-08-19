@@ -1,53 +1,86 @@
 # Time Converter — STRUCTURE
 
-## Soubory
+> Verified against source: 2026-08-19 · `tc.py` 592 L
 
-| Soubor | Popis |
-|--------|-------|
-| `tc.py` | Jediný soubor. Celý nástroj v tkinter. |
+## Files
+
+| File | Description |
+|------|-------------|
+| `tc.py` | Single file. The whole tool (tkinter/ttk). Run with `python tc.py`. |
+| `icon.ico` | Window / taskbar icon (`set_app_icon`). |
+
+No config file — every run asks for its options.
 
 ---
 
-## tc.py
+## Purpose
 
-### Záměr
-Kopíruje soubory kamer z archívu a přejmenovává je — UNIX nanosecond timestamp v názvu souboru nahradí čitelným formátem `YYYY_MM_DD--HH_MM_SS__ffffff` (UTC nebo Praha čas).
+Copies camera files out of the archive and renames them on the way: the UNIX
+nanosecond timestamp at the end of the filename is replaced by a readable
+`YYYY_MM_DD--HH_MM_SS__ffffff`, in UTC or Prague local time.
 
-### Konstanty
-- `FINAL_RE` — regex pro soubory již v cílovém formátu (budou přeskočeny)
-- `SOURCE_RE` — regex pro detekci UNIX ns timestampu (trailing číslo v stem)
-- `PRAGUE` — `ZoneInfo("Europe/Prague")`
-- `TS_MIN_NS` / `TS_MAX_NS` — validační rozsah roku 2000–2100 v nanosekundách
+The originals are never touched — only copies are written.
 
-### Pomocné funkce (module-level)
-| Funkce | Popis |
-|--------|-------|
-| `split_stem(stem)` | Rozloží název souboru na `(prefix, raw_ts_str)`; ošetří `_-_` artefakty |
-| `convert_timestamp(ns, use_prague_time)` | UNIX ns → formátovaný string (UTC nebo Praha) |
-| `orig_ts_to_utc(orig_ts_str)` | UNIX ns string → čitelný UTC string (pro zobrazení v tabulce) |
-| `build_new_name(stem, use_prague_time)` | Sestaví nový stem; vrátí `(new_stem, None)` nebo `(None, reason)` |
+---
 
-### UI komponenty
-| Funkce | Popis |
-|--------|-------|
-| `show_intro_and_get_options(parent)` | Úvodní dialog — Prague time? + Show report? → dict nebo None (cancel) |
-| `_make_file_table(parent, rows)` | `ttk.Treeview` s 5 sloupci a barevnými tagy (copy/overwrite/skip/warn/error) |
-| `_make_dashboard(parent, counts)` | Řada barevných číselných boxů (summary statistika) |
-| `show_preview(parent, plan_rows, skip_rows)` | Preview okno před kopírováním → Proceed / Cancel |
-| `show_report(parent, done_rows, skip_rows, ...)` | Výsledkové okno po dokončení kopírování |
-| `create_progress_window(parent, total)` | Progress okno s progress barem, EMA odhadem ETA a tlačítkem Cancel |
+## Constants
 
-### Průběh (main loop)
-1. Intro dialog (timezone + report volby)
-2. Výběr souborů — `filedialog.askopenfilenames`, výchozí: síťový archív kamer
-3. Výběr cílové složky
-4. Plánování: každý soubor → `build_new_name` → copy / overwrite / skip row
-5. Preview okno (pokud show_report=True)
-6. Paralelní kopírování — `ThreadPoolExecutor(max_workers=4)` + polling progress v main thread
-7. Report dialog nebo messagebox; pak se loop vrátí na krok 1
+| Symbol | Meaning |
+|--------|---------|
+| `FINAL_RE` | `\d{4}_\d{2}_\d{2}--\d{2}_\d{2}_\d{2}__\d{6}$` — a name already in the target form. Matching files are skipped, which is what makes the tool safe to run twice over the same folder. |
+| `SOURCE_RE` | `(\d+)$` — the trailing number, taken as the nanosecond timestamp. |
+| `PRAGUE` | `ZoneInfo("Europe/Prague")`. |
+| `TS_MIN_NS` / `TS_MAX_NS` | 2000-01-01 to 2100-01-01 in nanoseconds. A trailing number outside that window is *not* a timestamp — better to skip the file than to name it something absurd. |
 
-### Závislosti
-- `tkinter` — UI
-- `pathlib`, `shutil` — práce se soubory
-- `concurrent.futures` — paralelní kopírování (max 4 workery)
-- `zoneinfo` — Praha timezone
+---
+
+## Naming logic
+
+| Function | Description |
+|----------|-------------|
+| `split_stem(stem)` | `(prefix, raw_ts_str)`. First it collapses `-_-` and `_-_` to a single `_`, which is the artefact the camera archive produces; then the trailing number is the timestamp and everything before it (minus trailing underscores) is the prefix. |
+| `convert_timestamp(ns, use_prague_time)` | ns → `%Y_%m_%d--%H_%M_%S__%f`, in Prague or UTC. |
+| `orig_ts_to_utc(orig_ts_str)` | The same rendering in UTC, for the "Orig. UTC" column. Returns `—` on anything unparsable rather than raising. |
+| `build_new_name(stem, use_prague_time)` | `(new_stem, None)` or `(None, reason)`, where reason is `already_converted`, `no_trailing_number` or `invalid_timestamp`. Every skip in the tables comes from one of those three. |
+| `_fmt_hms(seconds)` | Duration for the progress window. |
+
+---
+
+## UI pieces
+
+| Function | Description |
+|----------|-------------|
+| `show_intro_and_get_options(parent)` | The opening dialog: *Convert to local time* and *Show detailed report*, both on by default. Returns a dict, or `None` if cancelled. |
+| `_make_file_table(parent, rows, height)` | A `ttk.Treeview` of five columns with colour tags: copy / overwrite / skip / warn / error. |
+| `_make_dashboard(parent, counts)` | The row of coloured count boxes. |
+| `_plan_row`, `_skip_row`, `_done_row` | Build one table row for each of the three phases, so the columns cannot drift between the preview and the report. |
+| `show_preview(parent, plan_rows, skip_rows)` | Everything that will happen, before anything happens → Proceed / Cancel. |
+| `show_report(parent, done_rows, skip_rows, cancelled, total)` | The result. |
+| `create_progress_window(parent, total)` | Progress bar, elapsed time, an ETA smoothed over the recent rate, and Cancel. |
+| `_center_window(win, w, h)` | |
+| `set_app_icon(win, ico_path, app_id)` | Window + taskbar icon; frozen-aware. |
+
+---
+
+## Flow (`main`)
+
+1. Intro dialog — timezone and report options.
+2. `filedialog.askopenfilenames`, starting in the camera archive on the network.
+3. Choose the destination folder.
+4. Plan: every file through `build_new_name` → a copy, overwrite or skip row.
+5. Preview window (when the report option is on).
+6. Copy on a `ThreadPoolExecutor(max_workers=4)` — `copy_one(args)` per file —
+   while the main thread polls for progress. Cancel stops it between files.
+7. Report window, or a plain message box. Then back to step 1, so several batches
+   can be done in one session.
+
+---
+
+## Dependencies
+
+```
+tkinter              UI
+pathlib, shutil      the copying
+concurrent.futures   four workers
+zoneinfo             Prague time
+```

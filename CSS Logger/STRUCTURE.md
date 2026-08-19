@@ -1,6 +1,8 @@
 # CSS Logger — STRUCTURE
 
-> Verified against source: 2026-08-11 · `main.py` 5087 L · `cpva_core.py` 614 L
+> Verified against source: 2026-08-19 · `main.py` 5834 L · `sp_t.py` 1729 L ·
+> `cpva_core.py` 749 L · `test_smoke.py` 548 L · `test_live_pacing.py` 251 L ·
+> `test_count_param.py` 52 L
 
 ## Files
 
@@ -9,15 +11,19 @@
 | `main.py` | The application — PySide6 "CPVA Suite" (CSS Logger + Spectra in one window). Run with `python main.py`. |
 | `cpva_core.py` | Non-UI helpers: config/preset I/O, CPVA archiver HTTP, time / PV-name / image helpers. No GUI toolkit — shared by `main.py` and the tests. |
 | `sp_t.py` | The Spectra widget, embedded as the second tab of the suite. |
-| `test_smoke.py` | Offline smoke test — headless (`QT_QPA_PLATFORM=offscreen`), network + dialogs mocked, clicks through every button/dialog. |
+| `test_smoke.py` | Offline smoke test — headless (`QT_QPA_PLATFORM=offscreen`), network + dialogs mocked, clicks through every button/dialog; also covers custom-PV bindings (incl. the dialog's bindings table) and the Conditions filter. |
 | `test_live_pacing.py` | Offline test of live-mode pacing: window clamping, bounded tick look-back, cursor advance on an empty tick, Stop-Live cancellation, table item reuse. |
 | `test_count_param.py` | Focused test of the archiver `count` parameter handling (hits the real archiver). |
 | `cpva_explorer_config.json` | Saved settings (time range, shown channels, conditions, master PV, `graph_opts`, …). |
 | `cpva_presets.json` | Named PV-list presets. |
 | `cpva_conditions_presets.json` | Condition (min/max filter) presets. |
 | `custom_pvs.json` | Derived PVs — `{"name", "expr", "bindings"}` per entry, where `bindings` maps every channel letter in `expr` to the full PV name it stands for. |
+| `derived_pvs.json` | A second store of derived-PV definitions. |
+| `ramping_setups.json` | Named ramping setups. |
+| `ramping_archive.json` | Index of the parquet files in `RampingRepository/`. |
 | `RampingRepository/` | Local parquet data (ramping events) — works offline. |
-| `build_config.json` | Build settings for Dev Tools. |
+| `build_config.json`, `icon.ico` | Build settings for Dev Tools, and the app icon. |
+| `importtime.txt` | Captured `python -X importtime` output from a startup-cost measurement. Not read by the app. |
 
 > The old tkinter `cssl.py` is gone; its non-UI helpers live in `cpva_core.py`,
 > the UI was fully replaced by `main.py` (PySide6).
@@ -55,9 +61,18 @@ master-multiple filter, PV count, progress bar.
 `TimeWindowDialog` (absolute + relative quick picks per side),
 `DatePickerDialog` + `_make_calendar` + `_WeekendDelegate` (house calendar style,
 Monday-first, red weekends), `PVBrowserDialog` (loads the channel list once, then
-filters locally), `_ConditionsDialog`, `_RefLinesDialog`, `_CustomPVDialog`
-(expressions over channel letters A, B, C…; its top table maps every letter to a
-full PV name and marks the ones not currently loaded), `_GraphSettingsDialog`.
+filters locally), `_ConditionsDialog` (min/max per PV; custom channels are
+offered too), `_RefLinesDialog`, `_CustomPVDialog`, `_GraphSettingsDialog`.
+
+`_CustomPVDialog` holds expressions over channel letters A, B, C… plus two
+mapping tables. The top one is the automatic letter assignment for the loaded
+list (read-only). The bottom one — `_refresh_bindings_table` /
+`_on_binding_picked`, rebuilt through `_queue_bindings_refresh` on a dialog-owned
+single-shot `QTimer` — lists one row per letter per formula with an editable
+channel combo; picking another channel rewrites that letter inside the
+expression, which is what re-binds it (bindings are derived from the letters, so
+there is no separate override state to keep in sync). Letters with no channel, or
+whose PV is bound but not loaded, are marked instead of guessed.
 
 ### Appearance constants
 `_APP_STYLESHEET`, `_BTN_PRIMARY` / `_BTN_SUCCESS` / `_BTN_DANGER`, `_CHK_STYLE`
@@ -162,7 +177,7 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | stats / selection | `_on_span_select`, `_make_stat_card`, `_copy_stats_text`, `_clear_stats`, `_on_zoom_select`, `_zoom_back` |
 | graph options | `_open_graph_settings_dialog`, `_apply_graph_opts`, `_avg_target_points`, `_on_avg_target_changed` |
 | live | `_toggle_live_mode`, `_live_span_from_window`, `_live_initial_load`, `_on_live_init_error`, `_after_live_initial_load`, `_live_tick`, `_on_incremental_finished`, `_schedule_live_tick`, `_live_countdown_tick`, `_stop_live`, `_maybe_autostart_live` |
-| filtering | `_apply_conditions_to_rows`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows` |
+| filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows` |
 | custom PVs | `_col_letter`, `_channel_letters`, `_cpv_dialog_channels`, `_migrate_custom_pv_bindings`, `_compute_custom_pvs_in_rows`, `_emit_custom_pv_diag`, `_rebuild_custom_pvs`, `_custom_pv_tooltip`, `_open_custom_pv_dialog` |
 | table | `_populate_table`, `_set_table_cell`, `_format_value`, `_on_table_scroll`, `_on_table_context_menu`, `_on_table_double_click`, `_try_open_image_at_row` |
 | axis settings | `_refresh_axis_settings_tv`, `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_resync_pv_colors`, `_safe_float` |

@@ -71,7 +71,7 @@ def _icon_file() -> Path | None:
 # ── main window ───────────────────────────────────────────────────────────────
 def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     """
-    Build and return the main window.
+    Build and return the main window.že to 
     Separated from main() so it can be called from tests or other scripts.
     """
     # if.py and is.py cannot be imported with normal 'import' because

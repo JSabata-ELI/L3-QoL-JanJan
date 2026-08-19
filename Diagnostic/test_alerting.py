@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from alerting import (  # noqa: E402
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EmailNotifier,
     EvalConfig, NotificationHub, TeamsClient, Thresholds, Trend, WebexNotifier,
-    classify_trend,
+    classify_trend, detect_frozen, fmt_duration,
 )
 
 SEC = 1_000_000_000
@@ -254,6 +254,97 @@ def test_reminder_cooldown_scale_default_unchanged():
 
 
 # ---------------------------------------------------------------------------
+# Frozen-value ("not updating") detection
+# ---------------------------------------------------------------------------
+
+FROZEN_AFTER = 2 * 3600.0    # 2 h, the app's default
+
+
+def _close(a, b, tol=1.0):
+    return abs(a - b) <= tol
+
+
+def _flat(value, hours, n=60, now_ns=NOW):
+    """n samples of one constant value spread over the last `hours`."""
+    span = int(hours * 3600 * SEC)
+    start = now_ns - span
+    return [(start + int(i / (n - 1) * span), value) for i in range(n)]
+
+
+def test_frozen_constant_value_is_detected():
+    info = detect_frozen(_flat(16.3, 48), NOW, FROZEN_AFTER)
+    assert info.frozen
+    assert info.n_points == 60
+    assert _close(info.span_s, 48 * 3600)
+    # Nothing different precedes the run, so the freeze may be even older.
+    assert not info.bounded
+
+
+def test_frozen_needs_the_full_span():
+    # Same constant value, but only 30 min of it: below the 2 h limit.
+    assert not detect_frozen(_flat(16.3, 0.5), NOW, FROZEN_AFTER).frozen
+
+
+def test_frozen_measures_from_the_last_real_change():
+    moving = [(NOW - int(10 * 3600 * SEC) + i * SEC, 10.0 + i) for i in range(20)]
+    stuck = _flat(16.3, 5, n=40)
+    info = detect_frozen(moving + stuck, NOW, FROZEN_AFTER)
+    assert info.frozen and info.bounded
+    assert _close(info.span_s, 5 * 3600)
+    assert info.n_points == 40
+
+
+def test_moving_value_is_not_frozen():
+    ramp = [(NOW - int(6 * 3600 * SEC) + i * MIN, 16.0 + i * 0.01)
+            for i in range(300)]
+    assert not detect_frozen(ramp, NOW, FROZEN_AFTER).frozen
+
+
+def test_frozen_only_the_latest_value_counts():
+    # It changed 1 min ago after sitting still for hours: not frozen now.
+    samples = (_flat(16.3, 24, n=100, now_ns=NOW - 2 * MIN)
+               + [(NOW - MIN, 16.4), (NOW, 16.4)])
+    info = detect_frozen(samples, NOW, FROZEN_AFTER)
+    assert not info.frozen and info.n_points == 2
+
+
+def test_frozen_ignores_sparse_data():
+    # Two readings 24 h apart carry no evidence of a stuck sensor.
+    sparse = [(NOW - int(24 * 3600 * SEC), 16.3), (NOW, 16.3)]
+    assert not detect_frozen(sparse, NOW, FROZEN_AFTER).frozen
+    # The same span with enough samples behind it is frozen.
+    assert detect_frozen(_flat(16.3, 24, n=5), NOW, FROZEN_AFTER).frozen
+
+
+def test_frozen_averaging_rounding_still_counts_as_unchanged():
+    # Live polls store the mean of N identical samples, which can land a few
+    # float-ULPs apart; that must not read as a real change.
+    v = 16.3
+    samples = [(NOW - int(6 * 3600 * SEC) + i * MIN,
+                sum([v] * 25) / 25 if i % 2 else v) for i in range(300)]
+    assert detect_frozen(samples, NOW, FROZEN_AFTER).frozen
+
+
+def test_frozen_check_disabled_and_no_data():
+    assert not detect_frozen(_flat(16.3, 48), NOW, 0).frozen
+    assert not detect_frozen([], NOW, FROZEN_AFTER).frozen
+    assert detect_frozen([], NOW, FROZEN_AFTER).n_points == 0
+
+
+def test_frozen_ignores_future_samples():
+    future = [(NOW + int(3600 * SEC), 99.0)]
+    assert detect_frozen(_flat(16.3, 48) + future, NOW, FROZEN_AFTER).frozen
+
+
+def test_fmt_duration():
+    assert fmt_duration(45) == "45 s"
+    assert fmt_duration(90 * 60) == "1 h 30 min"
+    assert fmt_duration(20 * 60) == "20 min"
+    assert fmt_duration(50 * 3600) == "2 d 2 h"
+    assert fmt_duration(-5) == "0 s"
+
+
+# ---------------------------------------------------------------------------
 # Notifiers
 # ---------------------------------------------------------------------------
 
@@ -345,6 +436,27 @@ def test_webex_tracks_own_message_ids_to_block_feedback_loop():
     assert n.is_own_message("someone-elses-msg") is False
 
 
+def test_webex_post_markdown_uploads_png_to_every_room():
+    n = WebexNotifier(mode="bot", bot_token="tok", room_ids=["room1", "room2"])
+    resp = mock.MagicMock(status_code=200)
+    with mock.patch("alerting.requests.post", return_value=resp) as post:
+        assert n.post_markdown("**chart**", png_bytes=b"\x89PNG") is True
+    assert post.call_count == 2
+    rooms = {c.kwargs["files"]["roomId"][1] for c in post.call_args_list}
+    assert rooms == {"room1", "room2"}
+    assert all("files" in c.kwargs["files"] for c in post.call_args_list)
+
+
+def test_webex_post_markdown_webhook_has_no_file():
+    n = WebexNotifier(mode="webhook", webhook_url="https://webhook")
+    resp = mock.MagicMock(status_code=200)
+    with mock.patch("alerting.requests.post", return_value=resp) as post:
+        assert n.post_markdown("**chart**", png_bytes=b"\x89PNG") is True
+    _, kwargs = post.call_args
+    assert "files" not in kwargs
+    assert "e-mail" in kwargs["json"]["markdown"]
+
+
 def test_webex_not_configured():
     assert WebexNotifier(mode="bot").is_configured() is False
     assert WebexNotifier(mode="webhook").is_configured() is False
@@ -364,6 +476,35 @@ def test_hub_dispatch_only_enabled_and_configured():
         errors = hub.dispatch(_payload(), png_bytes=b"x")
     assert errors == {}
     assert t.called and e.called and not w.called
+
+
+def test_hub_dispatch_chart_reaches_every_channel():
+    s = {
+        "teams_enabled": True, "teams_webhook_url": "https://teams",
+        "email_enabled": True, "smtp_host": "smtp", "email_from": "a@b.c",
+        "email_recipients": ["x@y.z"], "smtp_security": "none",
+        "webex_enabled": True, "webex_mode": "bot", "webex_bot_token": "tok",
+        "webex_rooms": [{"room_id": "r", "enabled": True, "listen": True}],
+    }
+    hub = NotificationHub.from_settings(s)
+    with mock.patch.object(hub.teams, "post", return_value=True) as t, \
+         mock.patch.object(hub.email, "send", return_value=True) as e, \
+         mock.patch.object(hub.webex, "post_markdown", return_value=True) as w:
+        errors = hub.dispatch_chart("Plot — 3 PVs", "plain", "**md**", b"png")
+    assert errors == {}
+    assert t.call_args.args[0]["title"] == "Plot — 3 PVs"   # text card, not a fact table
+    assert e.call_args.args[:2] == ("Plot — 3 PVs", "plain")
+    assert w.call_args.args == ("**md**", b"png")
+
+
+def test_hub_dispatch_chart_collects_errors():
+    s = {"teams_enabled": True, "teams_webhook_url": "https://teams",
+         "email_enabled": False, "webex_enabled": False}
+    hub = NotificationHub.from_settings(s)
+    hub.teams.last_error = "HTTP 500"
+    with mock.patch.object(hub.teams, "post", return_value=False):
+        errors = hub.dispatch_chart("t", "plain", "**md**", None)
+    assert errors == {"teams": "HTTP 500"}
 
 
 def test_hub_email_uses_only_enabled_contacts():

@@ -136,4 +136,10 @@ GENERAL NOTES
   - Config: %APPDATA%\Launcher\config.json
     (paths, acknowledged versions, custom categories)
 
+  - For whoever works on the code: STRUCTURE.md.
+  - A program's ReadMe must be named ReadMe_<folder name> (any
+    extension). The Launcher builds the name it looks for from the
+    folder name, so a plain README.txt is invisible and the ReadMe
+    button on that card opens nothing.
+
 -----------------------------------------------------------------

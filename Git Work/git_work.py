@@ -16,7 +16,6 @@ This folder ("Git Work") shows up under the "Personal" tab in the Launcher.
 import html
 import json
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime
@@ -273,19 +272,25 @@ class GitJobs:
         return b
 
     def _commit_if_needed(self, msg):
+        """Commit everything if a message was given.
+
+        Returns (committed, left_uncommitted) so callers can tell the two
+        no-op cases apart: a genuinely clean tree, and changed files that
+        stayed behind because the message box was empty.
+        """
         status = self._out("status", "--porcelain")
         if not status:
             self._log("Working tree clean, nothing to commit.", "info")
-            return False
+            return False, False
         self._log("Changes to commit:", "info")
         self._log(status, "out")
         if not msg:
             self._log("No commit message -> changes stay uncommitted and will "
                       "NOT be pushed.", "hint")
-            return False
+            return False, True
         self._run("add", "-A")
         self._run("commit", "-m", msg)
-        return True
+        return True, False
 
     def _report_state(self, branch):
         """Log a plain-language summary of where we stand vs the server."""
@@ -347,7 +352,7 @@ class GitJobs:
 
     def commit_push(self, msg):
         cur = self._current()
-        committed = self._commit_if_needed(msg)
+        committed, left_uncommitted = self._commit_if_needed(msg)
         self._run("fetch", "origin", cur, check=False)
         ab = ahead_behind(self.repo, cur)
         if ab is not None:
@@ -357,6 +362,12 @@ class GitJobs:
                     f"The server has {behind} commit(s) you don't have.",
                     "Click Pull first, then Push (this keeps everyone's work).")
             if ahead == 0 and not committed:
+                if left_uncommitted:
+                    raise GitError(
+                        "Nothing was sent - your changed files are still "
+                        "uncommitted.",
+                        "Type a commit message in the box above, then click "
+                        "Commit + Push again.")
                 self._log("Nothing to push - already up to date with the server.",
                           "ok")
                 return
@@ -370,7 +381,7 @@ class GitJobs:
     def sync(self, msg):
         cur = self._current()
         self._run("fetch", "--all", "--prune", check=False)
-        self._commit_if_needed(msg)
+        _, left_uncommitted = self._commit_if_needed(msg)
         ab = ahead_behind(self.repo, cur)
         if ab and ab[1] > 0:
             self._log(f"Server has {ab[1]} new commit(s) - pulling first...", "info")
@@ -380,6 +391,11 @@ class GitJobs:
         rc, _, err = self._run("push", "-u", "origin", cur, check=False)
         if rc != 0:
             raise GitError(f"Push during Sync failed for '{cur}'.", _push_hint(err))
+        if left_uncommitted:
+            self._log(f"Sync done for what was committed, but your changed "
+                      f"files are still on this PC only - type a commit "
+                      f"message and run Sync again.", "hint")
+            return
         self._log(f"Sync done - '{cur}' matches the server.", "ok")
 
     def merge_to_main(self, msg):
@@ -390,7 +406,12 @@ class GitJobs:
                 f"branch into '{self.target}'.",
                 "Switch to your working branch first.")
         self._run("fetch", "--all", "--prune", check=False)
-        self._commit_if_needed(msg)
+        _, left_uncommitted = self._commit_if_needed(msg)
+        if left_uncommitted:
+            raise GitError(
+                "Your changed files are still uncommitted, so the merge would "
+                "publish an older state.",
+                "Type a commit message in the box above, then merge again.")
 
         rc, _, err = self._run("push", "-u", "origin", cur, check=False)
         if rc != 0:
@@ -659,8 +680,8 @@ class App(QWidget):
         self.msg_edit = QLineEdit()
         self.msg_edit.setPlaceholderText("What did you change?")
         # Start every day's message with the date, the team's convention
-        # (e.g. "15072026 konec dne"). A bare date still counts as "no
-        # message" — see _commit_message.
+        # (e.g. "15072026 konec dne"). The date on its own is a valid
+        # message - only an empty box means "just push".
         self.msg_edit.setText(self._today_prefix() + " ")
         mrow.addWidget(self.msg_edit, 1)
         self.msg_expand_btn = QPushButton("▼ More")
@@ -903,6 +924,11 @@ class App(QWidget):
             elif a:
                 parts.append(f"{a} ahead - Push")
                 color = C_WARN
+            elif info["changes"]:
+                # "up to date" next to a pile of changed files reads as a
+                # contradiction - it only ever meant "no commits waiting".
+                parts.append("committed work is up to date - these files are not "
+                             "committed yet")
             else:
                 parts.append("up to date")
         if info["branch"] in PROTECTED:
@@ -954,10 +980,11 @@ class App(QWidget):
             msg = multi
         else:
             msg = line
-        # An untouched date prefill alone (today's or a stale one from before
-        # midnight) is not a message: keep the "empty = just push what is
-        # already committed" behavior.
-        return "" if re.fullmatch(r"\d{8}", msg) else msg
+        # A bare date counts as a real message - it is what the box is
+        # prefilled with, and committing under it beats silently skipping the
+        # commit. Only a truly empty box means "just push what is already
+        # committed".
+        return msg
 
     def _on_switch(self):
         target = self._selected_branch()

@@ -1,6 +1,6 @@
 # Git Work — STRUCTURE
 
-> Verified against source: 2026-08-05 · `git_work.py` 1197 L
+> Verified against source: 2026-08-19 · `git_work.py` 1191 L
 
 ## Files
 
@@ -49,6 +49,8 @@ in plain words what to do next (usually in VS Code → Source Control).
 | `ahead_behind(repo, branch)` | commits ahead of / behind the remote |
 | `has_stash(repo)` | is there an auto-stash to restore |
 | `_push_hint(err)` / `_conflict_hint()` | turn a git error into an instruction |
+| `_icon_file()` | frozen-aware icon lookup: next to the exe → `sys._MEIPASS` → the source folder |
+| `_set_app_id()` / `main()` | AppUserModelID for the taskbar button, then build the window |
 
 ### `GitJobs` — the operations
 Constructed with `(repo, target, emit)`; every method runs on a worker thread and

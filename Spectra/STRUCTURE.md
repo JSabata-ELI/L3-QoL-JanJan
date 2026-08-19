@@ -1,13 +1,21 @@
 # Spectra — STRUCTURE
 
-> Verified against source: 2026-08-05 · `sp_t.py` 4536 L
+> Verified against source: 2026-08-05, re-checked 2026-08-19 (unchanged) · `sp_t.py` 4536 L
 
 ## Files
 
 | File | Description |
 |------|-------------|
 | `sp_t.py` | Single file. Spectrometer analysis in PySide6. |
-| `_verify_layout.py`, `*.png` | Dev-only layout screenshots / helper, not part of the app. |
+| `_verify_layout.py` | Dev-only: renders the widget headless and saves the screenshots below. Run with `python _verify_layout.py`. |
+| `ui_full.png`, `ui_sidebar.png`, `sidebar_small.png`, `top_multi.png`, `top_steps.png`, `_verify_large.png`, `_verify_small.png` | Layout screenshots from that script. Reference images only — the app never reads them. |
+
+There is no `icon.ico` and no `build_config.json` here, and that is deliberate:
+**Spectra is not built as a standalone program.** `SpectraWidget` is imported by
+`CSS Logger/main.py` (which puts `Spectra/` on `sys.path` at line 13) and shown as
+the second tab of that app, so it ships inside the CSS Logger build. `sp_t.py`
+still runs on its own for development.
+
 
 ---
 

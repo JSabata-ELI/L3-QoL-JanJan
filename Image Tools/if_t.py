@@ -132,7 +132,6 @@ CPVA_HTTP_TIMEOUT = 10.0   # seconds per request
 
 # Channel used to find the best shot (highest energy = real shot, not dark/empty)
 CPVA_SHOT_CHANNEL = "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy"
-CPVA_SBW4_CHANNEL = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
 
 def _import_cpva_client():
     """Load the shared CPVA client (sibling cpva_client.py). Reuses an
@@ -152,8 +151,29 @@ def _import_cpva_client():
 
 cpva = _import_cpva_client()
 
+
+def _import_img_scale():
+    """Load the shared intensity-scale helper (sibling img_scale.py) the same way
+    as cpva_client: one instance per process, registered before exec."""
+    import importlib.util as _ilu
+    mod = sys.modules.get("img_scale")
+    if mod is not None:
+        return mod
+    p = Path(__file__).resolve().parent / "img_scale.py"
+    spec = _ilu.spec_from_file_location("img_scale", p)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules["img_scale"] = mod     # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+img_scale = _import_img_scale()
+
 # Maps energy CSV column name → CPVA archiver channel name for API lookup
 CPVA_CHANNEL_MAP: dict[str, str] = cpva.CHANNEL_MAP
+# Was a second hard-coded literal up with CPVA_SHOT_CHANNEL and went stale when
+# SBW4 was renamed — the channel name now comes from cpva_client only.
+CPVA_SBW4_CHANNEL = cpva.SBW4_CHANNEL
 
 _SLIDER_MOD = None
 
@@ -399,12 +419,55 @@ def _make_stepped_lut(stops):
         lut[i] = color
     return lut
 
+# NI Vision "Binary", measured off the real viewer — same table and same rule as in
+# is_t.py, where how it was measured is written down. 15 colours, black below the first
+# band, one colour per 1024 stored 16-bit units.
+_NI_BINARY_CYCLE = [
+    (255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
+    (255,127,0), (255,0,127), (127,255,0), (127,0,255), (0,127,255), (0,255,127),
+    (255,127,127), (127,255,127), (127,127,255),
+]
+NI_BINARY_BAND = 1024
+_NI_BINARY_TABLE = np.array([(0, 0, 0)] + _NI_BINARY_CYCLE, dtype=np.uint8)
+
+def _make_ni_binary_lut():
+    """The NI Binary rule as a 256-entry LUT over the ABSOLUTE 8-bit scale.
+
+    This tab renders from 8-bit images, so unlike the Image Slider it cannot take the
+    exact 16-bit path: one code is 257 stored units against a 1024-unit band, so a code
+    on a band edge can land one colour out."""
+    codes = np.arange(256, dtype=np.int64) * 257
+    band = codes // NI_BINARY_BAND
+    idx = np.where(band <= 0, 0, (band - 1) % 15 + 1)
+    return _NI_BINARY_TABLE[idx]
+
+# "False Colors" (same definition as in is_t.py): dark blue → violet → purple →
+# magenta → pink → white, with the stops crowded at the bottom so faint detail gets
+# most of the colour range. One colour family on purpose — a spectrum here only
+# duplicates Gradient / Jet / Turbo.
+_FALSE_COLORS_STOPS = [
+    (0.00, (0,0,0)), (0.03, (25,0,70)), (0.07, (45,0,120)), (0.12, (70,0,160)),
+    (0.20, (100,0,180)), (0.30, (130,5,185)), (0.42, (160,20,180)),
+    (0.55, (190,40,175)), (0.68, (215,70,170)), (0.80, (235,105,170)),
+    (0.90, (247,150,185)), (0.96, (252,200,215)), (1.00, (255,255,255)),
+]
+
+# "Rainbow" (same definition as in is_t.py): the NI Vision palette — blue to red with
+# a prominent green middle, 0 black and 255 white.
+_RAINBOW_STOPS = [
+    (0.00, (0,0,0)), (0.04, (0,0,200)), (0.14, (0,40,255)), (0.26, (0,150,255)),
+    (0.36, (0,230,180)), (0.46, (0,255,80)), (0.56, (90,255,0)), (0.66, (190,255,0)),
+    (0.76, (255,220,0)), (0.86, (255,120,0)), (0.94, (255,0,0)), (1.00, (255,255,255)),
+]
+
 GRADIENTS = {
     "Default":         None,
     "Grayscale":       None,
     "Gradient":        _make_lut([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
+    "Binary":          _make_ni_binary_lut(),
+    "False Colors":    _make_lut(_FALSE_COLORS_STOPS),
+    "Rainbow":         _make_lut(_RAINBOW_STOPS),
     "Hot":             _make_lut([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
-    "Binary":          _make_stepped_lut([(0,(0,0,0)),(0.17,(255,0,0)),(0.33,(255,165,0)),(0.5,(255,255,0)),(0.67,(0,255,0)),(0.83,(0,200,255)),(0.92,(0,0,255)),(1,(255,255,255))]),
     "Black and White": _make_binary_lut(),
     "Viridis":         _make_lut([(0,(68,1,84)),(0.25,(59,82,139)),(0.5,(33,145,140)),(0.75,(94,201,98)),(1,(253,231,37))]),
     "Plasma":          _make_lut([(0,(13,8,135)),(0.25,(126,3,168)),(0.5,(204,71,120)),(0.75,(248,149,64)),(1,(240,249,33))]),
@@ -413,6 +476,36 @@ GRADIENTS = {
     "Turbo":           _make_lut([(0,(48,18,59)),(0.2,(70,131,193)),(0.4,(48,210,142)),(0.6,(194,228,59)),(0.8,(244,117,22)),(1,(122,4,3))]),
 }
 GRADIENT_NAMES = list(GRADIENTS.keys())
+
+# Palettes mapped onto the frame's own p0.5..p99.5 window instead of the absolute
+# 0..255 scale — see is_t.ADAPTIVE_PALETTES for why this one and no others.
+ADAPTIVE_PALETTES = frozenset({"False Colors"})
+# Cyclic palettes are ABSOLUTE: NI's Binary bands are fixed at 1024 stored units and do
+# not follow the frame, so no stretch may run first (see is_t.CYCLIC_PALETTES).
+CYCLIC_PALETTES = frozenset({"Binary"})
+
+
+def _palette_normalize(arr):
+    """uint8 frame → uint8 spread over its OWN p0.5..p99.5 window."""
+    a = arr if arr.size <= 250_000 else np.ravel(arr)[::(arr.size // 250_000) | 1]
+    lo = float(np.percentile(a, 0.5))
+    hi = float(np.percentile(a, 99.5))
+    if hi <= lo:
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo:
+        return arr
+    return np.clip((arr.astype(np.float32) - lo) * (255.0 / (hi - lo)),
+                   0, 255).astype(np.uint8)
+
+
+def _lut_pixels(lut, arr, name: str):
+    """RGB pixels for `arr` under `lut`.
+
+    The adaptive palettes are spread over p0.5..p99.5; everything else, cyclic palettes
+    included, is the raw absolute scale."""
+    if name in ADAPTIVE_PALETTES:
+        arr = _palette_normalize(arr)
+    return lut[arr]
 
 _CHECKBOX_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
@@ -441,31 +534,60 @@ def load_readme_text() -> str:
 
 
 def _read_img_max_value(path: Path) -> "float | None":
-    """Read imgMaxValue from PNG tEXt metadata — physical maximum pixel value
-    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
-    Returns float or None if not found."""
-    if path.suffix.lower() != ".png":
-        return None
-    try:
-        with PilImage.open(str(path)) as pil:
-            info = pil.info
-            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
-            if len(chunks) >= 12:
-                v = chunks[11][1]
-                try:
-                    return float(v)
-                except (ValueError, TypeError):
-                    pass
-            for k, v in chunks:
-                try:
-                    f = float(v)
-                    if 0 < f <= 65535:
-                        return f
-                except (ValueError, TypeError):
-                    pass
-    except Exception:
-        pass
-    return None
+    """The frame's PEAK in raw counts, from PNG tEXt metadata (`MaxValue`).
+
+    Not the sensor's range — it reads 4095 only because a saturated 12-bit frame's
+    peak IS 4095. Used here for the empty-frame test; the display scale does not need
+    it at all (see img_scale).
+
+    This used to take tEXt chunk number 12 (the Matlab `imgMeta.OtherText{12,2}`
+    idiom), i.e. it identified the tag by POSITION: correct for the files we have and
+    an arbitrary other number for anything written by a different IMAQ version, which
+    then decided "empty" for a perfectly good frame. Now looked up by name."""
+    return img_scale.read_max_value(path)
+
+
+def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None):
+    """Decoded frame → uint8 for display. Every render path in this tab goes through
+    here, so the Finder cannot drift from the Slider on what an intensity means.
+
+    Absolute unless the Auto stretch box is ticked — see img_scale.to_u8. `gamma` is in
+    slider units and bends the absolute curve without costing comparability. What this
+    replaced was `MaxValue * arr / arr.max()` followed by `/4095`, which was the right
+    answer only for 12-bit cameras: it rendered the 6–11 bit diode cameras nearly black
+    and, with the tEXt chunk missing, blew every frame out to white."""
+    if full_scale is None:
+        full_scale = img_scale.FULL_SCALE_16
+    return img_scale.to_u8(arr, auto, full_scale, gamma)
+
+
+def _scale_note(info: dict, arr, auto: bool, full_scale: float = None, gamma=None,
+                path=None, pil_mode: str = None) -> str:
+    """One line saying what the displayed intensities mean, for the label under the
+    preview. `info` is an already-open image's `.info` — never re-open the file for it,
+    a share read costs 130–160 ms.
+
+    A gamma other than 1 is named here because it moves which count a colour sits on;
+    Auto gamma is resolved from the frame so the number shown is the one applied.
+
+    "8-bit source" is decided by the PIL MODE when it is given: a 16-bit frame drawn on
+    its camera's reference range also has a full_scale of its own (see img_scale), so
+    testing the number alone would label it an 8-bit file."""
+    applied = None
+    if not auto:
+        applied = (img_scale.auto_gamma(arr, full_scale or img_scale.FULL_SCALE_16)
+                   if img_scale.is_auto_gamma(gamma) else img_scale.gamma_from_slider(gamma))
+    is_8bit = (pil_mode not in ("I", "I;16")) if pil_mode is not None else (
+        full_scale is not None and full_scale != img_scale.FULL_SCALE_16)
+    if is_8bit:
+        mode = "auto stretch" if auto else "absolute scale"
+        if applied is not None and abs(applied - img_scale.GAMMA_NEUTRAL) > 0.005:
+            mode += f"  ·  gamma {applied:.2f}"
+        return f"8-bit source  ·  {mode}"
+    return img_scale.meta_from_info(info, arr).scale_note(
+        auto, gamma, applied,
+        img_scale.current_reference_bits(img_scale.camera_from_path(path))
+        if path is not None else None)
 
 
 # Frames whose physical max pixel value is below this are considered "empty"
@@ -1307,10 +1429,13 @@ def _format_energy_value(col: str, raw_val: str) -> str:
             return f"{v_f:.3f} J"
         except Exception:
             return f"{v} J"
-    # Waveplate — plain number, no unit
+    # Waveplate — plain number, no unit, snapped onto its 1000-count grid. The
+    # waveplate is only ever commanded to whole multiples of 1000, so anything else
+    # is the motor readback caught mid-travel. int() also TRUNCATED, so a settled
+    # 349 999.6 printed as 349 999 — one count below a position that does exist.
     if col == "waveplate":
         try:
-            return f"{int(float(v))}"
+            return f"{cpva.quantize(CPVA_CHANNEL_MAP.get(col, col), float(v))[0]:.0f}"
         except Exception:
             return v
     # Fallback
@@ -1641,6 +1766,13 @@ class _ThumbView(QWidget):
         return ""
 
     # ── mouse ─────────────────────────────────────────────────────────────────
+    def _set_cross_at(self, pos: QPointF, ir):
+        """Put the cross at widget position `pos` inside image rect `ir`."""
+        self.cross_pos_norm = QPointF(
+            max(0.0, min(1.0, (pos.x() - ir.left()) / ir.width())),
+            max(0.0, min(1.0, (pos.y() - ir.top())  / ir.height())))
+        self.update()
+
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event); return
@@ -1651,10 +1783,11 @@ class _ThumbView(QWidget):
         self._did_drag = False
 
         if self._draw_mode == "cross":
-            self.cross_pos_norm = QPointF(
-                max(0.0, min(1.0, (pos.x() - ir.left()) / ir.width())),
-                max(0.0, min(1.0, (pos.y() - ir.top())  / ir.height())))
-            self.update()
+            # Press places the cross and keeps it under the cursor until release, so a
+            # click alone drops it and holding drags it (same gesture in the Slider).
+            self._drag_handle = "cross"
+            self._drag_start = pos
+            self._set_cross_at(pos, ir)
             self.overlay_edited.emit()
             return
 
@@ -1701,6 +1834,11 @@ class _ThumbView(QWidget):
         def clamp(v): return max(0.0, min(1.0, v))
         def norm(px, py):
             return clamp((px - ir.left()) / ir.width()), clamp((py - ir.top()) / ir.height())
+
+        if self._draw_mode == "cross" and self._drag_handle == "cross":
+            self._set_cross_at(pos, ir)
+            self.overlay_edited.emit()
+            return
 
         if self._draw_mode == "circle":
             if self._drag_handle == "new":
@@ -2388,6 +2526,59 @@ class ImageFinderWidget(QWidget):
         grad_row.addWidget(self._gradient_cb, 1)
         btn_grid.addLayout(grad_row, 2, 0, 1, 2)
 
+        # Absolute scale is the default (see img_scale): one palette colour = one
+        # intensity, so frames and cameras are comparable. This switch trades that away
+        # for legibility on the dim cameras, which is why it is visible and off by
+        # default rather than something the viewer does behind the operator's back.
+        self._cb_auto_stretch = QCheckBox("Auto stretch")
+        self._cb_auto_stretch.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_auto_stretch.setToolTip(
+            "OFF: absolute scale — pixel value / camera full scale. Brightness is "
+            "comparable between frames and between cameras.\n"
+            "ON: stretch each frame over its own p0.5–p99.5 window. A dim frame becomes "
+            "readable, but colours no longer mean the same intensity from frame to frame.\n"
+            "The Binary and False Colors palettes always map per frame, by design.")
+        self._cb_auto_stretch.toggled.connect(self._on_auto_stretch_toggled)
+        btn_grid.addWidget(self._cb_auto_stretch, 3, 0, 1, 2)
+
+        # Gamma — the same control the Slider has, so a frame looks the same in both tabs
+        # at the same setting. Unlike Auto stretch it keeps one colour = one intensity:
+        # the curve depends only on the pixel value (see img_scale).
+        gamma_row = QHBoxLayout()
+        self._lbl_gamma = QLabel("Gamma 1.00:")
+        self._lbl_gamma.setMinimumWidth(78)   # fixed room, or the row jitters on update
+        gamma_row.addWidget(self._lbl_gamma)
+        self._gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        self._gamma_slider.setRange(img_scale.GAMMA_SLIDER_MIN, img_scale.GAMMA_SLIDER_MAX)
+        self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
+        self._gamma_slider.setToolTip(
+            f"Display gamma {img_scale.GAMMA_MIN:.2f}–{img_scale.GAMMA_MAX:.2f}. "
+            "1.00 = linear absolute scale.\n"
+            "Below 1 lifts the dark end (0.50 is the usable working point on these "
+            "cameras); above 1 darkens.\n"
+            "Brightness stays comparable between frames — only the shape of the curve "
+            "changes, never its dependence on the frame.")
+        self._gamma_slider.valueChanged.connect(self._on_gamma_slider_changed)
+        self._gamma_manual = img_scale.GAMMA_SLIDER_NEUTRAL
+        gamma_row.addWidget(self._gamma_slider, 1)
+        self._btn_gamma_reset = QPushButton("↺")
+        self._btn_gamma_reset.setFixedWidth(26)
+        self._btn_gamma_reset.setToolTip("Reset gamma to 1.00 (linear)")
+        self._btn_gamma_reset.clicked.connect(self._reset_gamma_slider)
+        gamma_row.addWidget(self._btn_gamma_reset)
+        self._cb_gamma_auto = QCheckBox("Auto")
+        self._cb_gamma_auto.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_gamma_auto.setToolTip(
+            "Auto gamma — the curve that lands THIS frame's median at "
+            f"{int(img_scale.AUTO_GAMMA_TARGET * 100)} % of the range.\n"
+            "Per-frame, so it overrides the slider and gives up comparability, same as "
+            "Auto stretch.")
+        self._cb_gamma_auto.toggled.connect(self._on_gamma_auto_toggled)
+        gamma_row.addWidget(self._cb_gamma_auto)
+        btn_grid.addLayout(gamma_row, 4, 0, 1, 2)
+        # Both boxes exist now, so put the gamma row in the state they call for.
+        self._sync_gamma_enabled()
+
         ll.addLayout(btn_grid)
 
         ll.addWidget(_hsep())
@@ -2546,6 +2737,16 @@ class ImageFinderWidget(QWidget):
         lbl_row.addWidget(self._preview_ts_lbl, 2)
         pcl.addLayout(lbl_row, 0)
 
+        # What the displayed intensities MEAN. Without it a frame at 3 % of full scale
+        # is indistinguishable from a broken render, and a palette is decoration rather
+        # than a reading.
+        self._preview_scale_lbl = QLabel("")
+        self._preview_scale_lbl.setAlignment(Qt.AlignmentFlag.AlignRight
+                                            | Qt.AlignmentFlag.AlignVCenter)
+        self._preview_scale_lbl.setStyleSheet(
+            "font-size: 11px; color: #bbb; background: transparent; padding: 0 6px;")
+        pcl.addWidget(self._preview_scale_lbl, 0)
+
         outer.addWidget(preview_col, 1)
 
         self._log("READY. No network scan on startup.")
@@ -2697,6 +2898,17 @@ class ImageFinderWidget(QWidget):
         energy_text = getattr(self, "_preview_energy_text", "")
         if energy_text:
             pm = self._paint_pv_bar(pm, energy_text)
+        self._preview_scale_lbl.setText(getattr(self, "_preview_scale_note", ""))
+        # Park the greyed-out slider on what Auto gamma actually applied to this frame,
+        # so the number on screen is the number in the picture (same contract as the
+        # Slider tab's Auto controls).
+        g_applied = getattr(self, "_preview_gamma_applied", None)
+        if g_applied is not None and self._cb_gamma_auto.isChecked():
+            gv = img_scale.slider_from_gamma(g_applied)
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(gv)
+            self._gamma_slider.blockSignals(False)
+            self._lbl_gamma.setText(f"Gamma {img_scale.gamma_from_slider(gv):.2f}:")
         lbl = self._preview_lbl
         avail_w = max(lbl.width(),  200)
         avail_h = max(lbl.height(), 200)
@@ -2782,6 +2994,8 @@ class ImageFinderWidget(QWidget):
 
         # PV overlay text for the bar painted in _on_preview_ready (main thread).
         self._preview_energy_text = ""
+        # Cleared here so a failed load shows no note rather than the previous frame's.
+        self._preview_scale_note = ""
         if (self._cb_pv_preview.isChecked() and self._energy_selected_cols):
             entry = self._energy_entry_for_path(path)
             if entry is not None:
@@ -2792,6 +3006,10 @@ class ImageFinderWidget(QWidget):
         gen = self._preview_gen
         sig = self._preview_sig
         grad_name = self._gradient_cb.currentText()
+        # Read the widgets HERE: _load runs on a worker thread and touching a widget
+        # from one is not safe.
+        auto = self._cb_auto_stretch.isChecked()
+        gamma = self._gamma_arg()
 
         def _load():
             try:
@@ -2800,14 +3018,19 @@ class ImageFinderWidget(QWidget):
                     arr = np.array(img, dtype=np.float32)
                 else:
                     arr = np.array(img.convert("L"), dtype=np.float32)
-                img_max_val = _read_img_max_value(path)
-                arr_px_max = float(arr.max())
-                if img_max_val is not None and arr_px_max > 0:
-                    arr = img_max_val * arr / arr_px_max
-                arr8 = np.clip(arr / 4095.0 * 255.0, 0, 255).astype(np.uint8)
+                # The camera's reference range for a 16-bit frame, 255 for an 8-bit one —
+                # see img_scale.full_scale_for_pil.
+                full_scale = img_scale.full_scale_for_pil(path, img.info, img.mode)
+                arr8 = _render_u8(arr, auto, full_scale, gamma)
+                self._preview_scale_note = _scale_note(img.info, arr, auto, full_scale,
+                                                       gamma, path, img.mode)
+                self._preview_gamma_applied = (
+                    img_scale.auto_gamma(arr, full_scale)
+                    if (not auto and img_scale.is_auto_gamma(gamma)) else None)
                 lut = GRADIENTS.get(grad_name)
                 if lut is not None:
-                    pil_img = PilImage.fromarray(lut[arr8].astype(np.uint8), mode="RGB")
+                    pil_img = PilImage.fromarray(
+                        _lut_pixels(lut, arr8, grad_name).astype(np.uint8), mode="RGB")
                 else:
                     pil_img = PilImage.fromarray(arr8, "L").convert("RGB")
                 raw = bytes(pil_img.tobytes("raw", "RGB"))
@@ -3045,6 +3268,56 @@ class ImageFinderWidget(QWidget):
     def _on_gradient_changed(self, name: str):
         self._log(f"GRADIENT -> {name}")
         self._namecache.clear()
+        if self._preview_paths:
+            self._preview_show()
+
+    def _on_auto_stretch_toggled(self, on: bool):
+        self._log(f"SCALE -> {'auto stretch (per frame)' if on else 'absolute'}")
+        self._sync_gamma_enabled()
+        if self._preview_paths:
+            self._preview_show()
+
+    def _sync_gamma_enabled(self):
+        """Auto stretch sets both ends of the frame itself, so gamma has nothing left to
+        bend — the whole row goes dead while it is on (the render ignores it too, see
+        img_scale.to_u8). Auto gamma greys out its own slider, the same 'checkbox beats
+        slider' rule the Slider tab uses."""
+        usable = not self._cb_auto_stretch.isChecked()
+        live = usable and not self._cb_gamma_auto.isChecked()
+        self._cb_gamma_auto.setEnabled(usable)
+        self._lbl_gamma.setEnabled(usable)
+        self._gamma_slider.setEnabled(live)
+        self._btn_gamma_reset.setEnabled(live)
+
+    def _gamma_arg(self):
+        """Gamma in slider units for the render, or the AUTO sentinel. Read on the main
+        thread and passed into workers — never read the widget from one."""
+        if self._cb_auto_stretch.isChecked():
+            return img_scale.GAMMA_SLIDER_NEUTRAL
+        if self._cb_gamma_auto.isChecked():
+            return img_scale.GAMMA_SLIDER_AUTO
+        return int(self._gamma_slider.value())
+
+    def _on_gamma_slider_changed(self, value: int):
+        self._gamma_manual = int(value)
+        self._lbl_gamma.setText(f"Gamma {img_scale.gamma_from_slider(value):.2f}:")
+        if self._preview_paths:
+            self._preview_show()
+
+    def _reset_gamma_slider(self):
+        self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
+
+    def _on_gamma_auto_toggled(self, on: bool):
+        self._log(f"GAMMA -> {'auto (per frame)' if on else 'manual'}")
+        self._sync_gamma_enabled()
+        if not on:
+            # Auto off → the user's own value, not the one Auto parked on the greyed-out
+            # slider. An Auto checkbox has to be undoable.
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(int(self._gamma_manual))
+            self._gamma_slider.blockSignals(False)
+            self._lbl_gamma.setText(
+                f"Gamma {img_scale.gamma_from_slider(self._gamma_manual):.2f}:")
         if self._preview_paths:
             self._preview_show()
 
@@ -3413,7 +3686,11 @@ class ImageFinderWidget(QWidget):
             try:
                 dt = self._parse_timestamp(r.get(fieldmap["Timestamp"]))
                 if dt is None: continue
-                wp = int(float(r.get(fieldmap["waveplate"])))
+                # Snapped onto the 1000-count grid, not truncated — same rule as
+                # _format_energy_value. Feeds the ramping-segment analysis, which
+                # compares waveplate positions between rows.
+                wp = int(cpva.quantize(cpva.CHANNEL_MAP.get("waveplate", "waveplate"),
+                                       float(r.get(fieldmap["waveplate"])))[0])
                 sb = float(r.get(fieldmap["sbw4"]))
                 p1 = float(r.get(fieldmap["ptm1"]))
                 campon = None
@@ -5057,22 +5334,30 @@ class ImageFinderWidget(QWidget):
         except: pass
 
     def _apply_gradient_to_image(self, img: PilImage.Image, src_path: "Path | None" = None,
-                                 grad_name: "str | None" = None) -> PilImage.Image:
-        """Apply the selected gradient LUT. Pass grad_name when calling from a
-        worker thread (reading the combo box off the main thread is unsafe)."""
+                                 grad_name: "str | None" = None,
+                                 auto: "bool | None" = None,
+                                 gamma=None) -> PilImage.Image:
+        """Apply the selected gradient LUT. Pass grad_name / auto / gamma when calling
+        from a worker thread (reading a widget off the main thread is unsafe)."""
         name = grad_name if grad_name is not None else self._gradient_cb.currentText()
         lut  = GRADIENTS.get(name)
         if lut is None: return img
+        if auto is None:
+            auto = self._cb_auto_stretch.isChecked()
+        if gamma is None:
+            gamma = self._gamma_arg()
         arr = np.array(img)
         if arr.ndim == 3: arr = arr.mean(axis=2)
         arr = arr.astype(np.float32)
         self._log_safe(f"IMG range: min={arr.min():.0f} max={arr.max():.0f} dtype={img.mode} shape={arr.shape}")
-        img_max_val = _read_img_max_value(src_path) if src_path is not None else None
-        arr_px_max = float(arr.max())
-        if img_max_val is not None and arr_px_max > 0:
-            arr = img_max_val * arr / arr_px_max
-        arr = np.clip(arr / 4095.0 * 255.0, 0, 255)
-        return PilImage.fromarray(lut[arr.astype(np.uint8)].astype(np.uint8), mode="RGB")
+        # Same range the preview used, so a saved/exported frame looks like what was on
+        # screen — including a camera whose frames are bracketed differently.
+        full_scale = (img_scale.full_scale_for_pil(src_path, img.info, img.mode)
+                      if src_path is not None
+                      else (img_scale.FULL_SCALE_16 if img.mode in ("I", "I;16") else 255.0))
+        arr8 = _render_u8(arr, auto, full_scale, gamma)
+        return PilImage.fromarray(
+            _lut_pixels(lut, arr8, name).astype(np.uint8), mode="RGB")
 
     def _make_view_copy_with_readable_name(self, src: Path) -> Path:
         if self._view_temp_dir is None:
@@ -5468,6 +5753,8 @@ class ImageFinderWidget(QWidget):
             # copies used to freeze the whole UI here.
             annotate  = self._cb_annotate.isChecked()
             grad_name = self._gradient_cb.currentText()
+            auto      = self._cb_auto_stretch.isChecked()
+            gamma     = self._gamma_arg()
             sel_cols  = list(self._energy_selected_cols)
 
             self._save_as_sig = _CollectSignals()
@@ -5539,7 +5826,8 @@ class ImageFinderWidget(QWidget):
                                     tmp_path = Path(tmp.name)
                                 try:
                                     self._apply_gradient_to_image(
-                                        PilImage.open(src), grad_name=grad_name).save(tmp_path)
+                                        PilImage.open(src), src, grad_name=grad_name,
+                                        auto=auto, gamma=gamma).save(tmp_path)
                                     _annotate_image_with_energy(
                                         tmp_path, dst, match, before, after,
                                         img_ts_ns, sel_cols)
@@ -5558,7 +5846,8 @@ class ImageFinderWidget(QWidget):
                             if grad_name != "Grayscale":
                                 try:
                                     self._apply_gradient_to_image(
-                                        PilImage.open(src), src, grad_name=grad_name).save(dst)
+                                        PilImage.open(src), src, grad_name=grad_name,
+                                        auto=auto, gamma=gamma).save(dst)
                                     if _copy_meta_fn is not None:
                                         try: _copy_meta_fn(src, dst, save_txt=False)
                                         except Exception: pass
@@ -5609,21 +5898,19 @@ class ImageFinderWidget(QWidget):
         if wk is None:
             return
 
+        auto = self._cb_auto_stretch.isChecked()
+        gamma = self._gamma_arg()
+
         def _send_one(src: Path):
             from PIL import Image as _PilImg
             import numpy as _np
             pil = _PilImg.open(str(src))
             if pil.mode in ("I", "I;16"):
                 arr_f = _np.array(pil, dtype=_np.float32)
-            elif pil.mode in ("RGB", "RGBA"):
-                arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
             else:
                 arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
-            img_max_val = _read_img_max_value(src)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            full_scale = img_scale.full_scale_for_pil(src, pil.info, pil.mode)
+            arr8 = _render_u8(arr_f, auto, full_scale, gamma)
             cam_name = src.parent.name
             label = f"{cam_name}  |  {src.name}"
             wk.receive_image(arr8, label, source_path=src)
@@ -6953,6 +7240,13 @@ class MultiDayPreviewWindow(QWidget):
         self._refresh_all_thumbs()
 
     def _load_raw(self, path: Path) -> "np.ndarray | None":
+        """Frame → uint8 on the absolute scale, cached.
+
+        No auto-stretch and no gamma here: this dialog has its own `_auto_bright` toggle
+        applied later in _apply_display_effects, and the cache is shared by every setting,
+        so the cached array must be the unmodified absolute rendering. (That also means
+        the multi-day grid ignores the main tab's gamma — it is a separate window with its
+        own display controls.)"""
         if path in self._raw_cache:
             return self._raw_cache[path]
         try:
@@ -6960,15 +7254,14 @@ class MultiDayPreviewWindow(QWidget):
             img = PilImage.open(path)
             if img.mode in ("I", "I;16"):
                 arr = _np.array(img, dtype=_np.float32)
+                full_scale = img_scale.FULL_SCALE_16
             elif img.mode in ("RGB", "RGBA"):
                 arr = _np.array(img.convert("L"), dtype=_np.float32)
+                full_scale = 255.0
             else:
                 arr = _np.array(img.convert("L"), dtype=_np.float32)
-            img_max_val = _read_img_max_value(path)
-            arr_px_max = float(arr.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr = img_max_val * arr / arr_px_max
-            arr8 = _np.clip(arr / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+                full_scale = 255.0
+            arr8 = _render_u8(arr, False, full_scale)
             self._raw_cache[path] = arr8
             return arr8
         except Exception:
@@ -6989,7 +7282,7 @@ class MultiDayPreviewWindow(QWidget):
         # Palette
         lut = self._GRADIENTS.get(self._palette)
         if lut is not None:
-            rgb = lut[arr]
+            rgb = _lut_pixels(lut, arr, self._palette).astype(_np.uint8)
             img = PilImage.fromarray(rgb, "RGB")
         else:
             img = PilImage.fromarray(arr, "L").convert("RGB")

@@ -1,6 +1,6 @@
 # Launcher — STRUCTURE
 
-> Verified against source: 2026-08-05 · `l.py` 1523 L
+> Verified against source: 2026-08-05, re-checked 2026-08-19 (unchanged) · `l.py` 1523 L
 
 ## Files
 

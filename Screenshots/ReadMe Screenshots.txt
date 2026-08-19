@@ -115,4 +115,6 @@ GENERAL NOTES
   - The Diagnostics box logs every step of a run (folder
     resolution, chosen file, copy result, problems).
 
+  - For whoever works on the code: STRUCTURE.md.
+
 -----------------------------------------------------------------

@@ -401,6 +401,130 @@ def test_custom_pv_bad_expression_is_reported():
     w.close()
 
 
+def test_custom_pv_bindings_table():
+    """The dialog's bindings table names the PV behind every letter of every
+    formula, follows the loaded order, and re-binds a letter when a different
+    channel is picked."""
+    from PySide6.QtWidgets import QComboBox
+    pv1, pv2, pv3 = "L3-TEST-A:Energy", "L3-TEST-B:Energy", "L3-TEST-C:Energy"
+
+    def _chans(order, unloaded=()):
+        ch = [(app_main.CSSLoggerWidget._col_letter(i), pv, pv, True)
+              for i, pv in enumerate(order)]
+        for pv in unloaded:
+            ch.append((app_main.CSSLoggerWidget._col_letter(len(ch)), pv, pv, False))
+        return ch
+
+    def _dump(dlg):
+        t = dlg._bind_tbl
+        out = []
+        for r in range(t.rowCount()):
+            cb = t.cellWidget(r, 2)
+            out.append((t.item(r, 0).text(), t.item(r, 1).text(),
+                        cb.currentText() if isinstance(cb, QComboBox) else None,
+                        t.item(r, 3).text()))
+        return out
+
+    cpv = {"name": "Scaled", "expr": "A*0.749", "bindings": {"A": pv1}}
+
+    # One row per letter per formula.
+    dlg = app_main._CustomPVDialog(
+        [dict(cpv), {"name": "Ratio", "expr": "A/B",
+                     "bindings": {"A": pv1, "B": pv2}}],
+        _chans([pv1, pv2, pv3]))
+    dlg._refresh_bindings_table()
+    assert _dump(dlg) == [("Scaled", "A", pv1, "loaded"),
+                          ("Ratio",  "A", pv1, "loaded"),
+                          ("Ratio",  "B", pv2, "loaded")], _dump(dlg)
+
+    # Same formulas, pv1 moved to third place: letters move, PVs do not.
+    dlg2 = app_main._CustomPVDialog([dict(cpv)], _chans([pv2, pv3, pv1]))
+    dlg2._refresh_bindings_table()
+    assert dlg2._rows[0]["expr"].text() == "C*0.749"
+    assert _dump(dlg2) == [("Scaled", "C", pv1, "loaded")], _dump(dlg2)
+
+    # Picking another channel re-binds that letter, and OK stores the new PV.
+    dlg3 = app_main._CustomPVDialog([dict(cpv)], _chans([pv1, pv2, pv3]))
+    dlg3._refresh_bindings_table()
+    cb = dlg3._bind_tbl.cellWidget(0, 2)
+    assert [cb.itemText(i) for i in range(cb.count())] == [pv1, pv2, pv3]
+    cb.setCurrentText(pv3)
+    cb.activated.emit(cb.currentIndex())
+    _app.processEvents()
+    assert dlg3._rows[0]["expr"].text() == "C*0.749"
+    dlg3._accept()
+    assert dlg3.result_pvs == [{"name": "Scaled", "expr": "C*0.749",
+                                "bindings": {"C": pv3}}], dlg3.result_pvs
+
+    # A bound-but-unloaded PV is marked and survives OK unchanged.
+    dlg4 = app_main._CustomPVDialog([dict(cpv)], _chans([pv2, pv3], unloaded=[pv1]))
+    dlg4._refresh_bindings_table()
+    assert _dump(dlg4) == [("Scaled", "C", pv1, "not loaded")], _dump(dlg4)
+    dlg4._accept()
+    assert dlg4.result_pvs[0]["bindings"] == {"C": pv1}
+
+    # A letter with no channel at all is flagged rather than guessed.
+    dlg5 = app_main._CustomPVDialog([{"name": "Bad", "expr": "Z*2", "bindings": {}}],
+                                    _chans([pv1]))
+    dlg5._refresh_bindings_table()
+    assert _dump(dlg5)[0][3] == "no channel", _dump(dlg5)
+
+    # A rebuild queued while typing must not fire on a cancelled dialog.
+    import gc
+    for _ in range(10):
+        d = app_main._CustomPVDialog([dict(cpv)], _chans([pv1, pv2]))
+        d._rows[0]["expr"].setText("A*3")
+        d.reject()
+        del d
+        gc.collect()
+        _app.processEvents()
+
+
+def test_conditions_discard_out_of_range_values():
+    """The Conditions filter must actually drop out-of-range rows — including
+    when that leaves nothing — and must not let a dataless condition PV reject
+    every row on its own."""
+    _install_network_mock()
+    _install_dialog_mocks()
+    w = _new_widget()
+    pv1, pv2 = "L3-TEST-A:Energy", "L3-TEST-B:Energy"
+    w._conditions = [{"pv": pv1, "min": 1.0, "max": 10.0}]
+
+    rows = [(1, {pv1: (5.0, "J"), pv2: (0.0, "J")}),
+            (2, {pv1: (99.0, "J"), pv2: (0.0, "J")}),
+            (3, {pv1: (0.1, "J"), pv2: (0.0, "J")}),
+            (4, {pv1: (10.0, "J"), pv2: (0.0, "J")})]
+    kept = [ts for ts, _ in w._apply_conditions_to_rows(rows)]
+    assert kept == [1, 4], kept
+
+    # Everything out of range -> empty, NOT a silent fall back to all rows.
+    w._cond_last_diag = None
+    allbad = [(1, {pv1: (0.0, "J")}), (2, {pv1: (0.0, "J")})]
+    assert w._apply_conditions_to_rows(allbad) == []
+
+    # A condition on a PV with no data is skipped; the other one still filters.
+    w._cond_last_diag = None
+    w._conditions = [{"pv": "L3-TEST-NOPE:Energy", "min": 0.0, "max": 1.0},
+                     {"pv": pv1, "min": 1.0, "max": 10.0}]
+    kept = [ts for ts, _ in w._apply_conditions_to_rows(rows)]
+    assert kept == [1, 4], kept
+
+    # Non-numeric and absent values never pass a condition.
+    w._conditions = [{"pv": pv1, "min": 1.0, "max": 10.0}]
+    assert not w._row_matches_conditions({pv1: ("OPEN", "")})
+    assert not w._row_matches_conditions({pv2: (5.0, "J")})
+
+    # A custom channel can be a condition PV.
+    w._conditions = [{"pv": "Scaled", "min": 5.0, "max": 8.0}]
+    w._custom_pvs = [{"name": "Scaled", "expr": "A*0.749", "bindings": {"A": pv1}}]
+    w._pv_order = [pv1, "Scaled"]
+    crows = [(1, {pv1: (10.0, "J")}), (2, {pv1: (1.0, "J")})]
+    w._compute_custom_pvs_in_rows(crows)
+    w._cond_last_diag = None
+    assert [ts for ts, _ in w._apply_conditions_to_rows(crows)] == [1]
+    w.close()
+
+
 # ── Standalone runner ────────────────────────────────────────────────────────
 
 def _main():
