@@ -33,15 +33,71 @@ Notification channels (all are safe to call from a worker thread, never raise):
 
 from __future__ import annotations
 
+import json
 import os
 import smtplib
 from collections import deque
 from dataclasses import dataclass
 from email.message import EmailMessage
 from enum import IntEnum
+from pathlib import Path
 from typing import Optional
 
 import requests
+
+
+# ── Run status: is the app up, and is it actually tracking? ──────────────────
+# remote_launcher.py starts the app on a Webex command and then has to answer
+# "done, it is running" — so from a DIFFERENT process it must be able to see
+# both that the app came up and that monitoring armed itself. That is what this
+# little file carries.
+#
+# It lives in %APPDATA%\Diagnostic, deliberately NOT next to the program: the
+# app is started either from the source folder or from a built version under
+# C:\Dev\dist\Diagnostic\vX.Y.Z, and a status file next to the program would be
+# a different file for each of them. The watcher would then look at the wrong
+# one, decide nothing is running, and start a second copy of an app that is
+# already open.
+#
+# Qt-free and dependency-free on purpose: the watcher imports this module and
+# must stay a lightweight always-on process.
+
+def run_status_path() -> Path:
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "Diagnostic" / "run_status.json"
+
+
+def read_run_status() -> dict:
+    """The last written status, or {} when there is none / it is unreadable.
+    Never raises: a missing or half-written file only means "nothing known"."""
+    try:
+        with open(run_status_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_run_status(**fields) -> None:
+    """Merge `fields` into the status file. Merging, not overwriting, because
+    two writers share it: main.py records the PID at startup and monitor_tab
+    records the monitoring switch later — neither knows the other's fields."""
+    data = read_run_status()
+    data.update(fields)
+    try:
+        p = run_status_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def clear_run_status() -> None:
+    try:
+        run_status_path().unlink()
+    except OSError:
+        pass
 
 
 class AlertLevel(IntEnum):
@@ -761,6 +817,15 @@ class WebexNotifier:
         # Group spaces 403 unless mentionedPeople=me is set. Once we learn
         # that, keep using the filter instead of paying two requests per poll.
         self._mentioned_only = False
+        # Set the moment we learn this is a group space, i.e. that the bot can
+        # only see messages that @mention it. The caller reports it once, because
+        # "the bot ignores my commands" is otherwise indistinguishable from a
+        # broken token, and the fix (tag the bot) is not guessable.
+        self.mention_only_notice = False
+        # The bot's own name in Webex, filled in by get_me_id. Used to tell the
+        # operator exactly what to type — the name is whatever the bot was
+        # registered as, so hard-coding one in the help text would be a guess.
+        self.bot_name: str = ""
         # IDs of messages this bot itself posted — a hard backstop against the
         # bot reading back and "replying to" its own messages (personId
         # filtering in the caller can fail transiently; this cannot, since it
@@ -910,8 +975,20 @@ class WebexNotifier:
         self.last_error = (f"HTTP 429: rate limited by Webex — pausing polls "
                            f"for {self.retry_after_s:.0f}s (Retry-After)")
 
+    def mention_name(self) -> str:
+        """What the operator has to type to tag this bot, e.g. "@Diagnostics".
+
+        The real name comes from the Webex API (get_me_id) as soon as the listener
+        has run once. Before that — and in the Settings dialog, which cannot wait
+        for a network call — the documented example stands in."""
+        return f"@{self.bot_name}" if self.bot_name else "@Diagnostics"
+
     def get_me_id(self) -> Optional[str]:
-        """Return the bot's own personId (to skip its own messages). None on error."""
+        """Return the bot's own personId (to skip its own messages). None on error.
+
+        Also records the bot's own name in passing: the same request already
+        carries it, and it is what the help text needs to tell the operator what
+        to type."""
         if not self.can_listen():
             return None
         try:
@@ -919,7 +996,12 @@ class WebexNotifier:
                                 timeout=self.timeout)
             if 200 <= resp.status_code < 300:
                 self.last_error = ""
-                return resp.json().get("id")
+                data = resp.json()
+                # nickName is the short form Webex actually completes on when you
+                # type "@…"; displayName can carry a surname the tag does not need.
+                self.bot_name = (data.get("nickName")
+                                 or data.get("displayName") or "").strip()
+                return data.get("id")
             if resp.status_code == 429:
                 self._note_rate_limit(resp)
                 return None
@@ -945,6 +1027,7 @@ class WebexNotifier:
                                 params=params, timeout=self.timeout)
             if resp.status_code == 403 and not self._mentioned_only:
                 self._mentioned_only = True
+                self.mention_only_notice = True
                 resp = requests.get(
                     WEBEX_MESSAGES_URL, headers=self._bot_headers(),
                     params={**params, "mentionedPeople": "me"}, timeout=self.timeout)

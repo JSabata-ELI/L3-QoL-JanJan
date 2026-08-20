@@ -36,6 +36,42 @@ def get_app_dir() -> Path:
     return Path(__file__).parent
 
 
+def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
+    """Give the window (title bar) AND the Windows taskbar button our icon.
+
+    tkinter's iconbitmap only fixes the title bar / WM_BIG icon; the Windows 11
+    taskbar reads the *small* icon slots (ICON_SMALL/SMALL2) and the window-class
+    icon (GCLP_HICONSM), which Tk otherwise leaves as its default feather logo.
+    We force every slot from icon.ico via Win32 before the window is first shown.
+    Silently does nothing when icon.ico is not next to the exe / script.
+    """
+    import ctypes
+    if app_id:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        except Exception:
+            pass
+    try:
+        win.iconbitmap(default=ico_path)
+    except Exception:
+        pass
+    try:
+        u = ctypes.windll.user32
+        hwnd = u.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        big = u.LoadImageW(None, ico_path, 1, 0, 0, 0x10 | 0x40)  # LR_LOADFROMFILE|LR_DEFAULTSIZE
+        sm  = u.LoadImageW(None, ico_path, 1, 16, 16, 0x10)       # LR_LOADFROMFILE
+        for which, h in ((1, big), (0, sm), (2, sm)):             # ICON_BIG, ICON_SMALL, ICON_SMALL2
+            if h:
+                u.SendMessageW(hwnd, 0x0080, which, h)            # WM_SETICON
+        set_cls = getattr(u, "SetClassLongPtrW", None) or u.SetClassLongW
+        if big:
+            set_cls(hwnd, -14, big)   # GCLP_HICON
+        if sm:
+            set_cls(hwnd, -34, sm)    # GCLP_HICONSM
+    except Exception:
+        pass
+
+
 APP_DIR      = get_app_dir()
 CONFIG_FILE  = APP_DIR / "cpva_explorer_config.json"
 HISTORICAL_DATA_FILE = APP_DIR / "historical_chiller_data.xlsx"
@@ -653,7 +689,8 @@ class _StatsShim:
 class CPVAExplorerApp:
     def __init__(self, root: tk.Tk):
         self.root   = root
-        self.root.title("CPVA Explorer")
+        self.root.title("Chiller Log")
+        set_app_icon(self.root, str(APP_DIR / "icon.ico"), "ELI.ChillerLog")
         self.root.minsize(1200, 750)
         self.root.state("zoomed")
 

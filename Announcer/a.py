@@ -3,8 +3,11 @@ Screen Region Change Tracker
 Monitors a specific region on screen and alerts on change.
 """
 
+import colorsys
+import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+from collections import namedtuple
 import json
 import re
 import time
@@ -24,6 +27,14 @@ POLL_INTERVAL_MS = 500      # how often to check (ms)
 CHANGE_THRESHOLD = 2        # average pixel deviation (0-255)
 FLASH_DURATION_MS = 3000    # how long to flash after detection
 FLASH_INTERVAL_MS = 300     # flash blink speed
+RAINBOW_BLINK_STEP_DEG = 47     # hue jump per blink (a clearly different colour)
+# Moving rainbows (wave / spectrum): redrawn far more often than a blink so the
+# motion looks continuous, with the colours shifted a little on every redraw.
+GRADIENT_INTERVAL_MS = 60
+GRADIENT_STEP = 3               # colour-wheel steps (of 256) per redraw
+WAVE_BANDS = 3                  # rainbow rings between the centre and the edge
+SPECTRUM_SPAN = 0.67            # share of the wheel laid across the width
+BLUE_HUE_IDX = 171              # blue on the 0-255 wheel (left end of the spectrum)
 # "Off" half of the image blink. Not 0: Windows lets the mouse through on
 # chroma-keyed pixels only, so the silhouette must stay painted (and therefore
 # clickable) even while it is visually gone.
@@ -159,7 +170,100 @@ def _readable_pv_error(pv_name, exc):
     return f"{pv_name} — {detail}", hint
 
 
-_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry", "image_geometry", "flash_mode", "image_file"}
+_COLOR_CYCLES = ("fixed", "rainbow_blink", "rainbow_spectrum", "rainbow_wave")
+_RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry", "image_geometry", "flash_mode", "image_file",
+                         "color_cycle", "flash_interval"}
+
+
+# ----------------------------------------------------------------------
+# Keeping windows on screen
+# ----------------------------------------------------------------------
+# Thickness of a normal window's title bar and border, used only until the
+# window is on screen and can be measured for real.
+_DEFAULT_INSETS = (11, 45, 11, 11)   # left, top, right, bottom
+
+_Area = namedtuple("_Area", "x y w h primary")
+
+
+def _screen_areas():
+    """The usable part of every monitor (taskbar excluded), in the same
+    coordinates windows are positioned with.
+
+    Deliberately asked of Windows rather than taken from `screeninfo`: this
+    program does not declare itself display-scaling aware, so a monitor set to
+    150 % reports 1280x720 to us while `screeninfo` reports its real
+    1920x1080. Windows are placed in the smaller space, so the `screeninfo`
+    numbers would allow positions that are already past the right or bottom
+    edge of the screen. `screeninfo` stays in use for the screenshot region,
+    which does work in real pixels.
+    """
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                        ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HANDLE, wintypes.HDC,
+                            ctypes.POINTER(RECT), wintypes.LPARAM)
+        def _collect(hmon, hdc, rect, data):
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                r = info.rcWork
+                found.append(_Area(r.left, r.top, r.right - r.left,
+                                   r.bottom - r.top, bool(info.dwFlags & 1)))
+            return True
+
+        user32.EnumDisplayMonitors(0, None, _collect, 0)
+        if found:
+            return found
+    except Exception:
+        pass
+    try:
+        return [_Area(m.x, m.y, m.width, m.height,
+                      bool(getattr(m, "is_primary", False)))
+                for m in screeninfo.get_monitors()]
+    except Exception:
+        return []
+
+
+def _fit_rect(x, y, w, h, insets=(0, 0, 0, 0)):
+    """Nudge a window's top-left corner so the whole window — title bar and
+    border included — stays on one screen. Returns the corrected corner.
+
+    `x`/`y` are the top-left of the window's inside (what `winfo_rootx` and
+    `winfo_rooty` report); `insets` says how far the frame reaches beyond that
+    on each side. The screen chosen is the one the window already covers most
+    of, so a window on the second monitor stays there.
+    """
+    areas = _screen_areas()
+    if not areas:
+        return x, y
+    left, top, right, bottom = insets
+    fx, fy = x - left, y - top
+    fw, fh = w + left + right, h + top + bottom
+
+    def covered(area):
+        ox = max(0, min(fx + fw, area.x + area.w) - max(fx, area.x))
+        oy = max(0, min(fy + fh, area.y + area.h) - max(fy, area.y))
+        return ox * oy
+
+    area = max(areas, key=covered)
+    if covered(area) == 0:
+        area = next((a for a in areas if a.primary), areas[0])
+    # min/max order matters for a window larger than the screen: it is then
+    # pinned to the top-left corner instead of being pushed off the other side.
+    fx = min(max(fx, area.x), max(area.x, area.x + area.w - fw))
+    fy = min(max(fy, area.y), max(area.y, area.y + area.h - fh))
+    return fx + left, fy + top
 
 
 class RegionSelector(tk.Toplevel):
@@ -332,7 +436,10 @@ class ScreenTracker(tk.Tk):
         self.bind("<Button-1>", self._on_any_click)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         saved_geom = self._presets.get("window_geometry")
-        self.geometry(self._clamp_geometry(saved_geom) if saved_geom else "400x360")
+        if saved_geom:
+            self._apply_geometry(self, saved_geom)
+        else:
+            self.geometry("400x360")
         self._image_geometry = self._presets.get("image_geometry")
 
     # ------------------------------------------------------------------
@@ -398,7 +505,89 @@ class ScreenTracker(tk.Tk):
                 return p
         return None
 
-    def _make_flash_photo(self, size, *, fade=None, key=None):
+    def _image_mask(self, path, size):
+        """Binarized alpha stencil of `path` at `size`, cached by file and size.
+
+        Opening and resampling the template is far too slow to repeat for every
+        step of the continuous colour cycle, while re-tinting a cached stencil is
+        cheap. Binarizing matters too: LANCZOS anti-aliases the edges into
+        partial-alpha pixels, and compositing those blends flash<->chroma into
+        intermediate colours that the exact-match ``-transparentcolor`` cannot key
+        out (the visible fringe / non-transparent silhouette). A hard threshold
+        keeps every pixel either pure flash or pure chroma."""
+        from PIL import Image
+        try:
+            stamp = path.stat().st_mtime
+        except OSError:
+            stamp = 0
+        cache_key = (str(path), stamp, size)
+        if getattr(self, "_mask_key", None) == cache_key:
+            return self._mask
+        src = Image.open(path).convert("RGBA").resize(size, resample=Image.LANCZOS)
+        mask = src.split()[3].point(lambda a: 255 if a >= 128 else 0)
+        self._mask_key, self._mask = cache_key, mask
+        return mask
+
+    _HUE_WHEEL = None
+
+    @classmethod
+    def _hue_wheel(cls):
+        """The colour wheel as 256 fully saturated RGB triples, built once."""
+        if cls._HUE_WHEEL is None:
+            cls._HUE_WHEEL = [
+                tuple(round(c * 255) for c in colorsys.hsv_to_rgb(i / 256.0, 1.0, 1.0))
+                for i in range(256)]
+        return cls._HUE_WHEEL
+
+    def _coord_map(self, size, kind):
+        """Grey map that says which colour of the rainbow a pixel gets.
+
+        "wave" grows from 0 in the centre to 255 at the edges (rings), "spectrum"
+        from 0 on the left to 255 on the right (bands). Cached per size, because
+        every redraw of a moving rainbow reuses it."""
+        from PIL import Image
+        cache_key = (kind, size)
+        if getattr(self, "_coord_key", None) == cache_key:
+            return self._coord
+        src = (Image.radial_gradient("L") if kind == "wave"
+               else Image.linear_gradient("L").transpose(Image.ROTATE_90))
+        self._coord_key = cache_key
+        self._coord = src.resize(size, Image.BILINEAR)
+        return self._coord
+
+    def _gradient_photo(self, size, kind, phase, *, key=None, stencil=None):
+        """One frame of a moving rainbow, as a chroma-keyed PhotoImage.
+
+        "wave" runs rings out of the centre, "spectrum" lays blue-to-red across
+        the width and drifts sideways; `phase` is how far the colours have
+        travelled. `stencil` restricts the paint to the template silhouette (the
+        rest stays keyed out / see-through); without one the whole window is
+        painted, which is what the plain background-colour mode uses.
+
+        The per-pixel work is done by mapping the cached grey map through a colour
+        lookup table, so a frame costs a few milliseconds even full-screen."""
+        from PIL import Image, ImageTk
+        w, h = int(size[0]), int(size[1])
+        if w < 1 or h < 1:
+            return None
+        try:
+            coord = self._coord_map((w, h), kind)
+            wheel = self._hue_wheel()
+            if kind == "wave":
+                start, span, travel = 0.0, WAVE_BANDS * 256.0, -phase
+            else:
+                start, span, travel = BLUE_HUE_IDX, -SPECTRUM_SPAN * 256.0, phase
+            hues = [wheel[int(start + v * span / 255.0 + travel) % 256] for v in range(256)]
+            rgb = Image.merge("RGB", [coord.point([c[ch] for c in hues]) for ch in range(3)])
+            if stencil is None:
+                return ImageTk.PhotoImage(rgb)
+            base = Image.new("RGB", rgb.size, self._color_rgb(key or self._flash_key))
+            return ImageTk.PhotoImage(Image.composite(rgb, base, stencil))
+        except Exception as e:
+            self._log_message(f"Rainbow frame failed: {e}")
+            return None
+
+    def _make_flash_photo(self, size, *, fade=None, key=None, color=None):
         """Build an ImageTk.PhotoImage of the selected template scaled to `size`.
 
         The template's alpha is used as a stencil and the result is a *chroma-keyed*
@@ -408,8 +597,9 @@ class ScreenTracker(tk.Tk):
         and only the image itself takes clicks.
 
         ``fade`` (0..1) blends the fill toward chroma to produce a faint "ghost"
-        used for window alignment. Returns None if no image is selected / found or
-        the size is degenerate.
+        used for window alignment. ``color`` overrides the configured flash colour
+        (used by the rainbow cycles). Returns None if no image is selected / found
+        or the size is degenerate.
         """
         from PIL import Image
         path = self._image_path(self.image_file.get())
@@ -417,23 +607,15 @@ class ScreenTracker(tk.Tk):
         if path is None or w < 1 or h < 1:
             return None
         try:
-            src = Image.open(path).convert("RGBA")
-            src = src.resize((int(w), int(h)), resample=Image.LANCZOS)
-            alpha = src.split()[3]
-            # Binarize alpha: LANCZOS anti-aliases the edges into partial-alpha
-            # pixels; compositing those blends flash<->chroma into intermediate
-            # colours that the exact-match -transparentcolor can't key out (the
-            # magenta fringe / non-transparent silhouette). A hard threshold keeps
-            # every pixel either pure flash or pure chroma, so the key is clean.
-            alpha = alpha.point(lambda a: 255 if a >= 128 else 0)
+            alpha = self._image_mask(path, (int(w), int(h)))
             chroma = self._color_rgb(key or self._chroma)
-            flash = self._color_rgb(self.flash_color.get())
+            flash = self._color_rgb(color or self.flash_color.get())
             # flash-coloured scorpion on a chroma (transparent) background
-            base = Image.new("RGB", src.size, chroma)
-            fill = Image.new("RGB", src.size, flash)
+            base = Image.new("RGB", alpha.size, chroma)
+            fill = Image.new("RGB", alpha.size, flash)
             out = Image.composite(fill, base, alpha)
             if fade is not None:
-                ghost = Image.new("RGB", src.size, chroma)
+                ghost = Image.new("RGB", alpha.size, chroma)
                 out = Image.blend(ghost, out, max(0.0, min(1.0, fade)))
             from PIL import ImageTk as _ImageTk
             return _ImageTk.PhotoImage(out)
@@ -449,6 +631,29 @@ class ScreenTracker(tk.Tk):
         except Exception:
             return (255, 34, 34)
 
+    # Transparency key candidates for the flash window. Whatever is painted in
+    # the active key becomes see-through AND click-through, so the key must never
+    # equal the flash colour itself.
+    # Near-black, because the rainbow cycle runs through every fully saturated
+    # hue (magenta and green included) and would otherwise key itself away.
+    _FLASH_KEY = "#010203"
+    _FLASH_KEY_ALT = "#030201"
+
+    def _resolve_flash_key(self):
+        """Pick a transparency key that differs from the current flash colour.
+
+        The key is matched exactly by ``-transparentcolor``, so only an exact hit
+        is a problem: with the flash colour set to the key the whole flash
+        (background fill or image silhouette) would be keyed away — invisible and
+        letting the dismiss click fall through to the window behind it. In that
+        one case fall back to the alternate key."""
+        try:
+            if self._color_rgb(self.flash_color.get()) == self._color_rgb(self._FLASH_KEY):
+                return self._FLASH_KEY_ALT
+        except Exception:
+            pass
+        return self._FLASH_KEY
+
     def _build_ui(self):
         pad = dict(padx=10, pady=5)
 
@@ -462,7 +667,8 @@ class ScreenTracker(tk.Tk):
         # native widgets, but PIL-painted pixels must match the -transparentcolor
         # value EXACTLY, which a named/system theme colour can't guarantee. A unique
         # magenta we both paint and key on is reliably transparent / click-through.
-        self._flash_key = "#ff00ff"
+        # Resolved (not hard-coded) so it can never equal the chosen flash colour.
+        self._flash_key = self._resolve_flash_key()
 
         # Řádek 0: mon_frame vlevo, kolečko samostatně vpravo
         self._top_frame = ttk.Frame(self)
@@ -591,6 +797,19 @@ class ScreenTracker(tk.Tk):
         self._sound_files = self._load_sound_files()
         self._flash_color_btn = None  # created in popup
 
+        # Colour behaviour of the flash:
+        #   "fixed"            - blink in the picked colour
+        #   "rainbow_blink"    - blink, each flash a single different hue
+        #   "rainbow_spectrum" - blink, rainbow laid across the width and drifting
+        #   "rainbow_wave"     - no blinking, rainbow rings run out of the centre
+        self.color_cycle = tk.StringVar(value="fixed")
+        self.flash_interval = tk.DoubleVar(value=FLASH_INTERVAL_MS / 1000.0)
+        self._flash_hue = 0.0           # position in the rainbow (degrees)
+        self._flash_col = "#ff2222"     # colour of the current flash step
+        self._flash_size = (0, 0)       # image-window size of the running flash
+        self._flash_phase = 0.0         # travel of the moving rainbows
+        self._blink_toggle_at = 0.0     # next lit/unlit switch (moving rainbows)
+
         # Flash-image (template) settings
         self.flash_mode = tk.StringVar(value="color")   # "color" | "image"
         self.image_file = tk.StringVar(value="")
@@ -608,10 +827,20 @@ class ScreenTracker(tk.Tk):
             saved_mode = "image"
         if saved_mode in ("color", "image"):
             self.flash_mode.set(saved_mode)
+        saved_cycle = self._presets.get("color_cycle")
+        if saved_cycle == "rainbow_smooth":   # retired: the wave is the no-blink mode
+            saved_cycle = "rainbow_wave"
+        if saved_cycle in _COLOR_CYCLES:
+            self.color_cycle.set(saved_cycle)
+        saved_iv = self._presets.get("flash_interval")
+        if isinstance(saved_iv, (int, float)) and 0 <= saved_iv <= 3.0:
+            self.flash_interval.set(float(saved_iv))
         saved_img = self._presets.get("image_file")
         if saved_img in self._image_files:
             self.image_file.set(saved_img)
         self.flash_mode.trace_add("write", lambda *_: self._save_flash_settings())
+        self.color_cycle.trace_add("write", lambda *_: self._save_flash_settings())
+        self.flash_interval.trace_add("write", lambda *_: self._save_flash_settings())
         self.image_file.trace_add("write", lambda *_: self._save_flash_settings())
 
     # ------------------------------------------------------------------
@@ -649,6 +878,11 @@ class ScreenTracker(tk.Tk):
 
     def _save_flash_settings(self):
         self._presets["flash_mode"] = self.flash_mode.get()
+        self._presets["color_cycle"] = self.color_cycle.get()
+        try:
+            self._presets["flash_interval"] = round(self.flash_interval.get(), 2)
+        except tk.TclError:
+            pass   # half-typed value in the spinbox — keep the stored one
         self._presets["image_file"] = self.image_file.get()
         self._save_presets_file()
 
@@ -711,7 +945,7 @@ class ScreenTracker(tk.Tk):
         self._set_ui_visible(True)
         geom = preset_geom or self._presets.get("window_geometry")
         if geom:
-            self.geometry(self._clamp_geometry(geom))
+            self._apply_geometry(self, geom)
         self._image_geometry = (preset_img_geom or self._presets.get("image_geometry")
                                 or self._image_geometry)
 
@@ -744,12 +978,6 @@ class ScreenTracker(tk.Tk):
         popup.transient(self)
         self._settings_popup = popup
 
-        # Position below the Settings button
-        self.update_idletasks()
-        x = self.winfo_rootx() + 10
-        y = self.winfo_rooty() + self._top_frame.winfo_height() + 10
-        popup.geometry(f"+{x}+{y}")
-
         frame = ttk.Frame(popup, padding=8)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
@@ -769,10 +997,32 @@ class ScreenTracker(tk.Tk):
                                           relief="groove", command=self._pick_flash_color)
         self._flash_color_btn.grid(row=1, column=1, sticky="w", padx=(0,6), pady=(0,6))
 
-        ttk.Label(thr_frame, text="Flash duration (s):").grid(row=2, column=0, padx=(6,2), pady=(0,6))
+        self._COLOR_CYCLE_LABELS = {
+            "fixed":            "Picked color",
+            "rainbow_blink":    "New color each blink",
+            "rainbow_spectrum": "Spectrum blue-to-red, blinks",
+            "rainbow_wave":     "Wave from center, no blink",
+        }
+        _cyc_to_label = self._COLOR_CYCLE_LABELS
+        _label_to_cyc = {v: k for k, v in _cyc_to_label.items()}
+
+        ttk.Label(thr_frame, text="Flash colors:").grid(row=2, column=0, padx=(6,2), pady=(0,6))
+        cyc_combo = ttk.Combobox(thr_frame, state="readonly", width=28,
+                                 values=list(_cyc_to_label.values()))
+        cyc_combo.set(_cyc_to_label.get(self.color_cycle.get(), "Picked color"))
+        cyc_combo.grid(row=2, column=1, sticky="w", padx=(0,6), pady=(0,6))
+        cyc_combo.bind("<<ComboboxSelected>>",
+                       lambda e: self.color_cycle.set(_label_to_cyc.get(cyc_combo.get(), "fixed")))
+
+        ttk.Label(thr_frame, text="Blink speed (s):").grid(row=3, column=0, padx=(6,2), pady=(0,6))
+        ttk.Spinbox(thr_frame, from_=0, to=3.0, increment=0.05,
+                    textvariable=self.flash_interval,
+                    width=6, format="%.2f").grid(row=3, column=1, sticky="w", padx=(0,6), pady=(0,6))
+
+        ttk.Label(thr_frame, text="Flash duration (s):").grid(row=4, column=0, padx=(6,2), pady=(0,6))
         ttk.Spinbox(thr_frame, from_=0, to=60, increment=0.5,
                     textvariable=self.flash_duration,
-                    width=6, format="%.1f").grid(row=2, column=1, padx=(0,6), pady=(0,6))
+                    width=6, format="%.1f").grid(row=4, column=1, sticky="w", padx=(0,6), pady=(0,6))
 
         # Flash mode: full-background color, or the template image alone
         self._FLASH_MODE_LABELS = {
@@ -782,25 +1032,25 @@ class ScreenTracker(tk.Tk):
         _mode_to_label = self._FLASH_MODE_LABELS
         _label_to_mode = {v: k for k, v in _mode_to_label.items()}
 
-        ttk.Label(thr_frame, text="Flash mode:").grid(row=3, column=0, padx=(6,2), pady=(0,6))
-        mode_combo = ttk.Combobox(thr_frame, state="readonly", width=24,
+        ttk.Label(thr_frame, text="Flash mode:").grid(row=5, column=0, padx=(6,2), pady=(0,6))
+        mode_combo = ttk.Combobox(thr_frame, state="readonly", width=28,
                                   values=list(_mode_to_label.values()))
         mode_combo.set(_mode_to_label.get(self.flash_mode.get(), "Background color"))
-        mode_combo.grid(row=3, column=1, sticky="w", padx=(0,6), pady=(0,6))
+        mode_combo.grid(row=5, column=1, sticky="w", padx=(0,6), pady=(0,6))
         mode_combo.bind("<<ComboboxSelected>>",
                         lambda e: self.flash_mode.set(_label_to_mode.get(mode_combo.get(), "color")))
 
-        ttk.Label(thr_frame, text="Image:").grid(row=4, column=0, padx=(6,2), pady=(0,6))
+        ttk.Label(thr_frame, text="Image:").grid(row=6, column=0, padx=(6,2), pady=(0,6))
         img_combo = ttk.Combobox(thr_frame, textvariable=self.image_file,
-                                 state="readonly", width=24, values=self._image_files)
+                                 state="readonly", width=28, values=self._image_files)
         if self.image_file.get() in self._image_files:
             img_combo.current(self._image_files.index(self.image_file.get()))
-        img_combo.grid(row=4, column=1, sticky="w", padx=(0,6), pady=(0,6))
+        img_combo.grid(row=6, column=1, sticky="w", padx=(0,6), pady=(0,6))
 
         ttk.Label(thr_frame,
                   text="Align the image via \"Set image window\" below.",
                   foreground="gray", wraplength=220, justify="left").grid(
-            row=5, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
+            row=7, column=0, columnspan=2, padx=6, pady=(0, 6), sticky="w")
 
         # Sound
         sound_frame = ttk.LabelFrame(frame, text="Sound")
@@ -862,7 +1112,9 @@ class ScreenTracker(tk.Tk):
         # Data rows
         for i, (_channel, label, default_lo_o, _lo_r, _hi_o, _hi_r, unit) in enumerate(_PV_MONITORS):
             lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
-            inc = 0.01 if abs(default_lo_o) < 10 else 0.1
+            # One arrow click steps a tenth on every channel; hundredths were
+            # too fine to walk a limit anywhere with the arrows.
+            inc = 0.1
             fmt = "%.2f" if abs(default_lo_o) < 10 else "%.1f"
             row_idx = i + 3
             ttk.Label(pv_lim_frame, text=f"{label} ({unit})", anchor="w").grid(
@@ -871,6 +1123,12 @@ class ScreenTracker(tk.Tk):
                 ttk.Spinbox(pv_lim_frame, from_=-9999, to=9999, increment=inc,
                             textvariable=var, width=7, format=fmt).grid(
                     row=row_idx, column=_col, padx=3, pady=(2, 4))
+
+        # Below the Settings button, but pulled back if the panel would hang off
+        # the screen — it is tall, so the bottom edge is what usually would.
+        self._place_popup(popup,
+                          self.winfo_rootx() + 10,
+                          self.winfo_rooty() + self._top_frame.winfo_height() + 10)
 
         # Close when clicking on the main window background (not on popup or its dropdowns)
         self._settings_close_bind = self.bind("<Button-1>", self._on_main_click_close_settings, "+")
@@ -900,11 +1158,11 @@ class ScreenTracker(tk.Tk):
                            padx=30, pady=20)
             lbl.pack()
             w.update_idletasks()
-            ww = w.winfo_width()
-            wh = w.winfo_height()
-            cx = m.x + (m.width - ww) // 2
-            cy = m.y + (m.height - wh) // 2
-            w.geometry(f"+{cx}+{cy}")
+            ww = w.winfo_reqwidth()
+            wh = w.winfo_reqheight()
+            self._place_popup(w,
+                              m.x + (m.width - ww) // 2,
+                              m.y + (m.height - wh) // 2)
             labels.append(w)
         self.after(2500, lambda: [w.destroy() for w in labels])
 
@@ -1055,52 +1313,117 @@ class ScreenTracker(tk.Tk):
         self._align_label = tk.Label(win, bd=0, highlightthickness=0, bg=self._chroma)
         return win
 
-    def _clamp_geometry(self, geom):
-        """Keep a saved Tk geometry string on a visible monitor.
+    @staticmethod
+    def _frame_insets(win):
+        """How far a window's title bar and border reach beyond its inside.
 
-        Saved geometries store absolute ``+x+y`` coordinates, which may point
-        at a monitor that does not exist on another machine (e.g. a second
-        screen at x=2729). In that case the window would open off-screen, so
-        reposition it onto the primary monitor. Size-only or unparseable
-        strings are returned unchanged (OS decides placement)."""
+        Measured from the window itself once it is on screen, because the
+        thickness depends on the Windows theme; a borderless window has none.
+        """
+        try:
+            if win.wm_overrideredirect():
+                return (0, 0, 0, 0)
+            if not win.winfo_ismapped():
+                return _DEFAULT_INSETS
+            side = win.winfo_rootx() - win.winfo_x()
+            top = win.winfo_rooty() - win.winfo_y()
+            if not (0 <= side <= 200) or not (0 <= top <= 200):
+                return _DEFAULT_INSETS
+            return (side, top, side, side)
+        except Exception:
+            return _DEFAULT_INSETS
+
+    def _clamp_geometry(self, geom, insets=None):
+        """Correct a remembered window position so the window is fully visible.
+
+        A remembered position can point at a monitor that is not there any
+        more, or sit so close to an edge that most of the window would hang
+        off it — both open the window where it cannot be seen or dragged back.
+        A string without a position is returned unchanged (Windows then picks
+        the spot)."""
         if not geom:
             return geom
         m = re.match(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)$", geom)
         if not m:
             return geom
         gw, gh, x, y = m.groups()
-        x, y = int(x), int(y)
-        try:
-            monitors = self._monitors or screeninfo.get_monitors()
-        except Exception:
-            return geom
-        if not monitors:
-            return geom
-        w = int(gw) if gw else 400
-        h = int(gh) if gh else 360
-
-        def _on_monitor(px, py):
-            return any(mon.x <= px < mon.x + mon.width and
-                       mon.y <= py < mon.y + mon.height for mon in monitors)
-
-        # Visible if the title-bar area (top-left corner) sits on a monitor.
-        if _on_monitor(x, y) and _on_monitor(x + min(w, 60), y + min(h, 20)):
-            return geom
-
-        prim = next((mon for mon in monitors
-                     if getattr(mon, "is_primary", False)), monitors[0])
-        nx = max(prim.x, min(x, prim.x + prim.width  - w))
-        ny = max(prim.y, min(y, prim.y + prim.height - h))
+        w = int(gw) if gw else max(1, self.winfo_width())
+        h = int(gh) if gh else max(1, self.winfo_height())
+        nx, ny = _fit_rect(int(x), int(y), w, h,
+                           _DEFAULT_INSETS if insets is None else insets)
         prefix = f"{gw}x{gh}" if gw else ""
         return f"{prefix}+{nx}+{ny}"
 
+    def _apply_geometry(self, win, geom, _retry=True):
+        """Put a window back exactly where it was remembered, on screen.
+
+        Remembered positions are the top-left of the window's *inside*, which
+        is what is read back when the position is stored. Windows counts the
+        position from the *outside* of the title bar instead, so writing a
+        remembered position straight back moved the window down and to the
+        right by the height of its title bar — every save-and-reload nudged it
+        further, until it walked off the screen. Setting the position, then
+        measuring where the window actually landed and correcting the
+        difference, keeps normal and borderless windows on the same spot.
+        """
+        if not geom:
+            return
+        insets = self._frame_insets(win)
+        geom = self._clamp_geometry(geom, insets=insets)
+        m = re.match(r"(?:(\d+)x(\d+))?\+(-?\d+)\+(-?\d+)$", geom)
+        try:
+            if m is None:
+                win.geometry(geom)
+                return
+            x, y = int(m.group(3)), int(m.group(4))
+            size = f"{m.group(1)}x{m.group(2)}" if m.group(1) else ""
+            mapped = win.winfo_ismapped()
+            if mapped:
+                win.geometry(geom)
+            else:
+                # Not drawn yet, so nothing can be measured: aim by the usual
+                # title-bar thickness, which lands it right in almost every
+                # case and leaves no visible jump when corrected below.
+                win.geometry(f"{size}+{x - insets[0]}+{y - insets[1]}")
+            win.update_idletasks()
+            if mapped:
+                dx = win.winfo_rootx() - x
+                dy = win.winfo_rooty() - y
+                if (dx or dy) and abs(dx) <= 200 and abs(dy) <= 200:
+                    win.geometry(f"+{x - dx}+{y - dy}")
+            if _retry:
+                # One late check: the title bar is not always back in place the
+                # instant it is asked for (leaving HUD mode, a window that was
+                # still hidden), and until it is, there is nothing to measure.
+                win.after(120, lambda: self._apply_geometry(win, geom, False))
+        except Exception:
+            pass
+
+    def _place_popup(self, win, x, y):
+        """Show a small window at a wanted spot, pulled back onto the screen if
+        it would stick out (settings panel, preview, tooltips, dialogs).
+
+        `x`/`y` are where the inside of the window is wanted; the title bar and
+        border are added on top of that, because a position is always counted
+        from the outside of the frame and the whole frame has to fit."""
+        try:
+            win.update_idletasks()
+            left, top, right, bottom = self._frame_insets(win)
+            w = max(1, win.winfo_reqwidth()) + left + right
+            h = max(1, win.winfo_reqheight()) + top + bottom
+            nx, ny = _fit_rect(x - left, y - top, w, h)
+            win.geometry(f"+{nx}+{ny}")
+        except Exception:
+            pass
+
     def _resolve_image_geometry(self):
-        """Geometry string for the image window; fall back to the control
-        window's current geometry so behaviour matches the old single-window
-        setup until the user sets a dedicated image window."""
+        """Geometry string for the image window; fall back to where the control
+        window sits so behaviour matches the old single-window setup until the
+        user sets a dedicated image window."""
         return (self._image_geometry
                 or self._presets.get("image_geometry")
-                or self.geometry())
+                or (f"{self.winfo_width()}x{self.winfo_height()}"
+                    f"+{self.winfo_rootx()}+{self.winfo_rooty()}"))
 
     def _set_flash_alpha(self, value):
         """Fade the whole image window (1.0 = fully visible).
@@ -1133,14 +1456,22 @@ class ScreenTracker(tk.Tk):
         d = self.flash_duration.get()
         self._flash_deadline = time.time() + d if d > 0 else float("inf")
 
+        # Re-resolve the transparency key so a flash colour picked since the last
+        # flash cannot collide with it.
+        self._flash_key = self._resolve_flash_key()
+
         # Position/show the dedicated image window at its own geometry.
         win = self._ensure_image_win()
         win.overrideredirect(True)
+        win.configure(bg=self._flash_key)
         try:
             win.attributes("-transparentcolor", self._flash_key)
         except Exception:
             pass
-        win.geometry(self._clamp_geometry(self._resolve_image_geometry()))
+        # Borderless: no title bar to account for, so the remembered position
+        # can be used as it is once it has been pulled onto a visible screen.
+        win.geometry(self._clamp_geometry(self._resolve_image_geometry(),
+                                          insets=(0, 0, 0, 0)))
         win.deiconify()
         win.lift()
         win.attributes("-topmost", True)
@@ -1150,13 +1481,28 @@ class ScreenTracker(tk.Tk):
         # no usable template is available.
         mode = self.flash_mode.get()
         self._flash_photo = None
+        self._flash_size = (win.winfo_width(), win.winfo_height())
+        self._flash_hue = 0.0
+        self._flash_phase = 0.0
+        self._blink_toggle_at = 0.0
+        self._flash_col = self.flash_color.get()
         if mode == "image":
-            size = (win.winfo_width(), win.winfo_height())
+            size = self._flash_size
             self._flash_photo = self._make_flash_photo(size, key=self._flash_key)
             if self._flash_photo is None:
                 self._log_message("Flash image not set or not found — using background color.")
                 mode = "color"
         self._flash_active_mode = mode
+
+        # First frame of a moving rainbow, so the window never shows up blank.
+        if self._is_gradient_cycle():
+            photo = self._gradient_photo(
+                self._flash_size,
+                "wave" if self.color_cycle.get() == "rainbow_wave" else "spectrum",
+                0.0, key=self._flash_key,
+                stencil=self._flash_stencil() if mode == "image" else None)
+            if photo is not None:
+                self._flash_photo = photo
 
         # Overlay frame covers the whole image window — avoids widget bg gaps.
         self._set_flash_alpha(1.0)
@@ -1166,7 +1512,9 @@ class ScreenTracker(tk.Tk):
         win.bind("<Button-1>", self._on_any_click)
         self._flash_overlay.bind("<Button-1>", self._on_any_click)
 
-        if mode == "image":
+        # The image label carries the picture in image mode, and also the painted
+        # rainbow in background-colour mode (a plain colour needs no picture).
+        if self._flash_photo is not None:
             self._flash_img_label.configure(image=self._flash_photo, bg=self._flash_key)
             self._flash_img_label.bind("<Button-1>", self._on_any_click)
             self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
@@ -1188,10 +1536,46 @@ class ScreenTracker(tk.Tk):
             self._hide_image_win()
             self._set_ui_visible(True)
             return
-        self._flash_state = not self._flash_state
+        cycle = self.color_cycle.get()
         mode = getattr(self, "_flash_active_mode", "color")
-        flash_col = self.flash_color.get()
         chroma = self._flash_key   # keyed areas are see-through via -transparentcolor
+        moving = self._is_gradient_cycle()
+        now = time.time()
+
+        if moving:
+            # Redrawn on its own fast tick so the colours travel smoothly; the
+            # lit/unlit switch keeps to the configured blink speed. The wave mode
+            # never goes dark — its travelling colours are the alarm.
+            self._flash_phase += GRADIENT_STEP * self._motion_factor()
+            if cycle == "rainbow_wave" or self._is_steady():
+                self._flash_state = True
+            elif now >= self._blink_toggle_at:
+                self._flash_state = not self._flash_state
+                self._blink_toggle_at = now + self._blink_interval_ms() / 1000.0
+            kind = "wave" if cycle == "rainbow_wave" else "spectrum"
+            stencil = self._flash_stencil() if mode == "image" else None
+            photo = self._gradient_photo(self._flash_size, kind, self._flash_phase,
+                                         key=chroma, stencil=stencil)
+            if photo is not None:
+                self._flash_photo = photo
+            self._flash_overlay.configure(bg=chroma)
+            self._flash_img_label.configure(image=self._flash_photo, bg=chroma)
+            self._flash_img_label.place(x=0, y=0, relwidth=1, relheight=1)
+            self._flash_img_label.lift()
+            self._set_flash_alpha(1.0 if self._flash_state else FLASH_OFF_ALPHA)
+            self._flash_job = self.after(GRADIENT_INTERVAL_MS, self._do_flash)
+            return
+
+        self._flash_state = True if self._is_steady() else not self._flash_state
+        # One fresh hue per lit half of the blink.
+        if self._flash_state:
+            self._flash_col = self._step_flash_color()
+        flash_col = self._flash_col
+        if mode == "image" and cycle != "fixed":
+            # Re-tint the silhouette; the stencil itself is cached, so this is cheap.
+            photo = self._make_flash_photo(self._flash_size, key=chroma, color=flash_col)
+            if photo is not None:
+                self._flash_photo = photo
         if mode == "image":
             # Nothing but the image ever shows: surroundings stay transparent and
             # the colour-filled silhouette blinks on / off.
@@ -1206,9 +1590,68 @@ class ScreenTracker(tk.Tk):
             self._flash_img_label.lift()
             self._set_flash_alpha(1.0 if self._flash_state else FLASH_OFF_ALPHA)
         else:
-            color = flash_col if self._flash_state else "#440000"
+            color = flash_col if self._flash_state else self._dim_color(flash_col)
             self._flash_overlay.configure(bg=color)
-        self._flash_job = self.after(FLASH_INTERVAL_MS, self._do_flash)
+        self._flash_job = self.after(self._blink_interval_ms(), self._do_flash)
+
+    def _is_gradient_cycle(self):
+        """True for the modes that paint a moving rainbow instead of one colour."""
+        return self.color_cycle.get() in ("rainbow_wave", "rainbow_spectrum")
+
+    def _blink_interval_ms(self):
+        """Configured blink speed in milliseconds (half a blink).
+
+        Zero means "do not blink at all", which the callers handle separately, so
+        here it only sets how often the flash is refreshed."""
+        ms = self._blink_setting_ms()
+        return FLASH_INTERVAL_MS if ms == 0 else max(50, ms)
+
+    def _blink_setting_ms(self):
+        """Raw blink-speed setting in milliseconds; 0 = stay lit."""
+        try:
+            return max(0, int(round(self.flash_interval.get() * 1000)))
+        except tk.TclError:
+            return FLASH_INTERVAL_MS
+
+    def _is_steady(self):
+        """True when the blink speed is set to zero: light on, no blinking."""
+        return self._blink_setting_ms() == 0
+
+    def _motion_factor(self):
+        """How fast the moving rainbows travel, tied to the blink speed so one
+        control covers every mode."""
+        return max(0.25, min(4.0, FLASH_INTERVAL_MS / max(50, self._blink_interval_ms())))
+
+    def _flash_stencil(self):
+        """Cached silhouette of the selected template at the flash window size."""
+        path = self._image_path(self.image_file.get())
+        if path is None:
+            return None
+        try:
+            return self._image_mask(path, (int(self._flash_size[0]), int(self._flash_size[1])))
+        except Exception:
+            return None
+
+    def _step_flash_color(self):
+        """Colour of the current blink: the picked one, or the next hue along."""
+        cycle = self.color_cycle.get()
+        if cycle == "fixed":
+            return self.flash_color.get()
+        self._flash_hue = (self._flash_hue + RAINBOW_BLINK_STEP_DEG) % 360.0
+        r, g, b = colorsys.hsv_to_rgb(self._flash_hue / 360.0, 1.0, 1.0)
+        return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+    def _dim_color(self, color, factor=0.25):
+        """Darkened `color` for the unlit half of a blink.
+
+        Never returns the transparency key: that would punch a hole in the window
+        for half of every blink, and a click landing in it would fall through
+        instead of dismissing the alarm."""
+        r, g, b = self._color_rgb(color)
+        out = "#%02x%02x%02x" % (int(r * factor), int(g * factor), int(b * factor))
+        if self._color_rgb(out) == self._color_rgb(self._flash_key):
+            return "#000000"
+        return out
 
     def _play_sound(self):
         import threading
@@ -1259,7 +1702,8 @@ class ScreenTracker(tk.Tk):
             self._log_frame.grid()
             self._set_transparent(False)
         else:
-            self._geom_before_hide = self.geometry()
+            self._geom_before_hide = (f"{self.winfo_width()}x{self.winfo_height()}"
+                                      f"+{self.winfo_rootx()}+{self.winfo_rooty()}")
             self._mon_frame.pack_forget()
             self._settings_btn.pack_forget()
             self.btn_preview.pack_forget()
@@ -1277,12 +1721,19 @@ class ScreenTracker(tk.Tk):
                 self.overrideredirect(True)
                 self.attributes("-transparentcolor", self._chroma)
                 self.attributes("-topmost", True)
+                # Position only — the window has just been emptied down to the
+                # circle and must keep that small size. Without this, losing the
+                # title bar slides the circle up into the space it used to take.
+                pos = re.search(r"\+(-?\d+)\+(-?\d+)$", self._geom_before_hide or "")
+                if pos:
+                    self.update_idletasks()
+                    self._apply_geometry(self, f"+{pos.group(1)}+{pos.group(2)}")
             else:
                 self.attributes("-transparentcolor", "")
                 self.overrideredirect(False)
                 self.attributes("-topmost", True)
                 if self._geom_before_hide:
-                    self.geometry(self._geom_before_hide)
+                    self._apply_geometry(self, self._geom_before_hide)
         except Exception:
             pass
 
@@ -1346,7 +1797,7 @@ class ScreenTracker(tk.Tk):
         tk.Label(tip, text=hint, bg="#ffffe0", fg="#222222", justify="left",
                  relief="solid", bd=1, font=("Segoe UI", 9),
                  wraplength=340, padx=6, pady=4).pack()
-        tip.geometry(f"+{event.x_root + 14}+{event.y_root + 16}")
+        self._place_popup(tip, event.x_root + 14, event.y_root + 16)
         self._log_tip = tip
         self._log_tip_item = item
 
@@ -1425,12 +1876,11 @@ class ScreenTracker(tk.Tk):
         ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side="left")
         rec_win.protocol("WM_DELETE_WINDOW", on_cancel)
 
+        # Next to the control window, or wherever it still fits on that screen.
         self.update_idletasks()
-        rec_win.update_idletasks()
-        rx = self.winfo_rootx()
-        ry = self.winfo_rooty()
-        rw = self.winfo_width()
-        rec_win.geometry(f"+{rx + rw + 10}+{ry}")
+        self._place_popup(rec_win,
+                          self.winfo_rootx() + self.winfo_width() + 10,
+                          self.winfo_rooty())
 
     def _start_control_window_recording(self):
         """Record position/size of the control window (this window)."""
@@ -1448,9 +1898,8 @@ class ScreenTracker(tk.Tk):
     def _start_image_window_recording(self):
         """Record position/size of the separate image (flash) window."""
         win = self._ensure_image_win()
-        geom = self._clamp_geometry(
-            self._resolve_image_geometry()
-            or f"400x300+{self.winfo_rootx() + 40}+{self.winfo_rooty() + 40}")
+        geom = (self._resolve_image_geometry()
+                or f"400x300+{self.winfo_rootx() + 40}+{self.winfo_rooty() + 40}")
         has_image = (self.flash_mode.get() == "image"
                      and self._image_path(self.image_file.get()) is not None)
 
@@ -1464,10 +1913,14 @@ class ScreenTracker(tk.Tk):
             try: win.attributes("-alpha", 0.6)
             except Exception: pass
             win.configure(bg=self._chroma)
-            win.geometry(geom)
             win.deiconify()
             win.lift()
             win.attributes("-topmost", True)
+            # Positioned after it is shown: while it wears a title bar, the
+            # remembered position has to be corrected for that title bar, and
+            # that can only be measured on a window already on screen. Keeps
+            # the rectangle exactly where the alarm will flash.
+            self._apply_geometry(win, geom)
             if has_image:
                 self._start_align_ghost()
             else:
@@ -1504,7 +1957,10 @@ class ScreenTracker(tk.Tk):
             except Exception as e:
                 self._log_message(f"Image size read failed: {e}")
                 return
-            win.geometry(f"{iw}x{ih}")
+            # Keep the corner where it is, but pulled back if the bigger window
+            # would now reach past the edge of the screen.
+            self._apply_geometry(
+                win, f"{iw}x{ih}+{win.winfo_rootx()}+{win.winfo_rooty()}")
             win.update_idletasks()
             self._align_last_size = (0, 0)
             self._refresh_align_ghost()
@@ -1610,10 +2066,10 @@ class ScreenTracker(tk.Tk):
         lbl = tk.Label(popup, image=self._preview_photo, relief="solid", bd=1)
         lbl.pack()
         self._preview_popup_label = lbl
-        # Umísti popup nad tlačítko
-        x = self.btn_preview.winfo_rootx()
-        y = self.btn_preview.winfo_rooty() - self._preview_photo.height() - 8
-        popup.geometry(f"+{x}+{y}")
+        # Above the button, or below/beside it if there is no room above.
+        self._place_popup(
+            popup, self.btn_preview.winfo_rootx(),
+            self.btn_preview.winfo_rooty() - self._preview_photo.height() - 8)
         popup.bind("<Enter>", lambda e: None)
         self._preview_popup = popup
 

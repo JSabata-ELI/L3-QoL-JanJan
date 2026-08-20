@@ -23,7 +23,7 @@ import importlib.util
 import statistics
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent   # app dir; the harnesses sit in testing/
 
 # Paint kinds recorded by _cam_note_painted.
 KIND_EXACT, KIND_APPROX, KIND_STALE = 0, 1, 2

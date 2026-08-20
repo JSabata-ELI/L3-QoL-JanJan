@@ -18,5 +18,7 @@
   },
   "flash_mode": "image",
   "image_file": "scorpion_orig",
-  "image_geometry": "176x143+2683+119"
+  "image_geometry": "176x143+2683+119",
+  "color_cycle": "rainbow_wave",
+  "flash_interval": 0.1
 }

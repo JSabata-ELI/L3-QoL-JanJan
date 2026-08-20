@@ -13,7 +13,7 @@ no network. The share's 130-160 ms read is simulated (bench_common.install_read_
 because without it the paint lands within a millisecond of the request and a
 request-time/paint-time race cannot show up at all.
 
-  python bench_pv_live_multi.py
+  python testing/bench_pv_live_multi.py
 """
 import os
 import shutil

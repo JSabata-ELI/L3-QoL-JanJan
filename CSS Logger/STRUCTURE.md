@@ -1,8 +1,13 @@
 # CSS Logger — STRUCTURE
 
-> Verified against source: 2026-08-19 · `main.py` 5834 L · `sp_t.py` 1729 L ·
+> Verified against source: 2026-08-19 · `main.py` 6138 L · `sp_t.py` 1729 L ·
 > `cpva_core.py` 749 L · `test_smoke.py` 548 L · `test_live_pacing.py` 251 L ·
 > `test_count_param.py` 52 L
+
+User-facing documentation: `Readme CSS logger.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_CSS Logger_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
 ## Files
 
@@ -87,12 +92,25 @@ config simply picks up the defaults for keys it lacks.
 |-------|------|
 | Fonts (pt) | `font_size`, `tick_font_delta` (−1), `cursor_font_delta` |
 | Y axis columns (px) | `axis_gap_px`, `label_pad_px`, `outer_margin_px`, `show_axis_titles`, `y_ticks_max`, `y_minor_ticks` |
+| Time axis | `x_ticks_max`, `x_tick_seconds` (0 = automatic), `x_time_format` (`auto`/`hms`/`hm`) |
 | Plot rect (figure fractions) | `margin_right`, `margin_top`, `margin_bottom`, `band_pad_frac` |
 | Cursor / performance | `cursor_value_boxes`, `cursor_boxes_max`, `line_markers` |
 
 `y_minor_ticks` is **off** by default: matplotlib builds a full Tick object
 (2 lines + 2 texts) per minor tick, which with a dozen stacked axes is ~400
 objects and the single largest cost of a redraw.
+
+`label_pad_px` may be **negative**: the rotated tick numbers keep a couple of
+pixels of empty margin around their digits, so a small negative value pulls the
+axis title closer without any ink touching.
+
+### Cursor value boxes — `_place_cursor_boxes`
+Every box is anchored where the cursor line crosses its own trace. Boxes used to
+be pushed onto two alternating rows, which moved half of them away from their
+curve even with nothing in the way. Now the boxes are decluttered in pixel space:
+only boxes that would really overlap are merged into a stack, and the stack is
+spread out around the average height its members asked for. A box therefore moves
+only when it has to, and only as far as it has to.
 
 ### Custom-PV expressions — letters are positional, bindings are not
 A custom PV is a Python expression over channel letters (`Sum of Green = F+H`),
@@ -139,8 +157,13 @@ defaults or whatever was in effect when it opened.
 ### Signal + support classes
 `_LoadSig` (`done`/`error`/`progress`/`pct`), `_IncSig` (live increments),
 `_ChanSig` (channel list), `_ColorSwatchDelegate` (colour cell in the axis
-table), `_FlowLayout` (wrapping button rows), `_GraphPopupWindow` (F11 / Ctrl+F11
-floating graph window).
+table), `_CenteredCheckDelegate` (Show / Autoscale / Grid tick boxes painted in
+the middle of their column — Qt and the app stylesheet both push them to the
+left edge, so the box is drawn by hand and the click area matches it),
+`_FlowLayout` (wrapping button rows), `_GraphPopupWindow` (F11 / Ctrl+F11
+floating graph window), `_WheelGuard` + `_install_wheel_guard()` (application
+wide filter: the mouse wheel only changes a spin box / drop-down / slider that
+has been clicked into; otherwise the scroll is passed to the panel underneath).
 
 ### CSSLoggerWidget — state (`_init_state`)
 Data: `_samples_by_pv`, `_table_rows` (+ `_table_rows_unfiltered`), `_pv_order` /
@@ -180,7 +203,7 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows` |
 | custom PVs | `_col_letter`, `_channel_letters`, `_cpv_dialog_channels`, `_migrate_custom_pv_bindings`, `_compute_custom_pvs_in_rows`, `_emit_custom_pv_diag`, `_rebuild_custom_pvs`, `_custom_pv_tooltip`, `_open_custom_pv_dialog` |
 | table | `_populate_table`, `_set_table_cell`, `_format_value`, `_on_table_scroll`, `_on_table_context_menu`, `_on_table_double_click`, `_try_open_image_at_row` |
-| axis settings | `_refresh_axis_settings_tv`, `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_resync_pv_colors`, `_safe_float` |
+| axis settings | `_refresh_axis_settings_tv`, `_autosize_axis_pane` (the PV list is exactly as tall as the PVs it holds, capped so the graph keeps `_AXIS_PANE_MIN_GRAPH` px and the buttons stay on screen), `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_resync_pv_colors`, `_safe_float` |
 | XY | `_refresh_xy_choices`, `_on_xy_axis_changed`, `_plot_xy(_impl)`, `_on_xy_rect_select`, `_clean_xy`, `_clear_xy_plot`, `_xy_zoom_back` |
 | PV Time | `_plot_pv_time(_impl)`, `_draw_daily_distribution`, `_pv_time_add_condition_row`, `_pv_time_add_features`, `_clear_pv_time_plot`, `_load_data_repository` |
 | PV list / presets | `_open_pv_browser`, `_remove_selected_pvs`, `_clear_pv_list`, `_on_pv_double_click`, `_real_pv_names`, `_sync_pv_list_customs`, `_update_pv_count`, `_refresh_preset_combo`, `_load_preset`, `_save_preset`, `_save_preset_as`, `_delete_preset` |

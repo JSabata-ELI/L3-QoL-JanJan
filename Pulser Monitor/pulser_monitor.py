@@ -2126,7 +2126,7 @@ def _to_unit_scale(arr: np.ndarray, max_val: "float | None" = None) -> np.ndarra
     sensor is genuinely saturated. It looked like a range because a saturated 12-bit
     frame's peak IS 4095. Either way it is the wrong divisor.
     (Image Tools reached the same conclusion — see `Image Tools/img_scale.py`, which owns
-    this rule for every tab, and `Image Tools/test_scale_invariance.py`, which checks it
+    this rule for every tab, and `Image Tools/testing/test_scale_invariance.py`, which checks it
     against the archive.)"""
     scale = float(max_val) if (max_val and max_val > 0) else _FULL_SCALE_16
     return arr / scale

@@ -1,6 +1,11 @@
 # Spectra — STRUCTURE
 
-> Verified against source: 2026-08-05, re-checked 2026-08-19 (unchanged) · `sp_t.py` 4536 L
+> Verified against source: 2026-08-19 · `sp_t.py` 4658 L
+
+User-facing documentation: `ReadMe_Spectra.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Spectra_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
 ## Files
 
@@ -44,6 +49,7 @@ and average the last N.
 | `LIVE_HISTORY_S` | `600` s — preload when live mode starts |
 | `MAX_INDIVIDUAL_LINES` | `400` — cap when overlaying a region's individual spectra |
 | `_REGION_COLORS` | 8 default region colours |
+| `_TRACE_COLORS` | 8 colours for the search-graph PV traces — a separate palette so a curve is never drawn in a selected spectrum's colour. Assigned by `_trace_colour()` from the PV's place in the PV list and looked up on every draw, so a reload, a day with no data for one PV or any redraw can never shuffle the curve colours |
 | `_METHODS` | dropdown label → stat key: Mean, Median, Trimmed mean 10%, Sigma-clipped mean |
 
 ### Config files (`%APPDATA%\ELI_Spectra\`)
@@ -74,6 +80,13 @@ and average the last N.
 | `_fwhm(x, y)` | FWHM above baseline with linear edge interpolation |
 | `_spectral_metrics(x, y)` | `peak_wl`, `peak_int`, `centroid`, `fwhm`, `rms_bw`, `area` |
 | `_smooth(y, win)` | Moving-average smoothing |
+| `_split_query(text)` | PV search: text → lowercase tokens. Spaces, commas, semicolons and `*` all separate, so `l3 sbw4`, `l3,sbw4` and `*l3**sbw4*` are one query. |
+| `_tokens_in_order(hay, tokens)` | True when every token appears in the order typed. |
+| `_rank_pv_match(name, tokens)` | Sort weight (lower = better) or `None`. **AND semantics** — a missing token means no hit. Tiers: exact channel 0, exact field 1, prefix 2, in field 3, anywhere 4; the *weakest* token sets the tier and the sum only breaks ties. `+5` when the tokens are out of order, `+100` for a camera channel (`^C\d{2}-\d{2,3}-`), because the camera channels are a large slice of the archiver list and would otherwise bury every real hit. |
+| `_pv_search(channels, text, exclude=None)` | The ranked result list. **Empty query returns nothing** — not everything. |
+
+The four above are the same PV-search behaviour as the Image Slider picker; that
+one is the reference implementation.
 | `_load_search_presets()` / `_save_search_presets(p)` | `search_presets.json` I/O |
 | `_ns_to_dt` / `_fmt_hms` / `_fmt_date` / `_fmt_dur` | ns → Prague datetime / `HH:MM:SS` / `YYYY-MM-DD` / `Xm YYs` |
 | `_day_range_ns(qdate)` | `QDate` → whole day `(start_ns, end_ns)` in Prague tz |
@@ -103,7 +116,7 @@ CPVA calls **never** happen on the main thread.
 
 | Dialog | Purpose |
 |--------|---------|
-| `_WeekendDelegate(QStyledItemDelegate)` | Calendar cell painting: selected = blue fill, Sat/Sun = red text (detected by `index.column()`, 5 = Sat, 6 = Sun, so spill-over days work too). `initStyleOption` strips Qt's own highlight from unselected cells. |
+| `_WeekendDelegate(QStyledItemDelegate)` | Calendar cell painting: selected = blue fill, Sat/Sun = red text. The weekend test uses **the cell's real date**, never its column index. `_date_for_index` prefers the model's own `UserRole` date; when that is absent (spill-over cells) it reconstructs one, and `_first_cell()` accounts for Qt dropping the header row / week-number column. It also compensates for Qt shifting the whole grid back a week when the 1st falls in the first column — without that the painted days sat a week off and clicking one day highlighted another. `initStyleOption` strips Qt's own highlight from unselected cells. |
 | `_make_calendar(initial)` | Factory: `QCalendarWidget` (Monday-first, English locale) + custom grey nav row (◀ month▾ year ▶) + custom grey day-name header. Returns `(wrapper_frame, cal)`. |
 | `DatePickerDialog` | Day selection. Plain click = toggle a day, Ctrl+click = add the range from the last click. `selected_dates()` → `list[QDate]`. |
 | `PvSearchDialog` | Loads every CPVA channel once, then filters locally while typing. Multi-select → `added_pvs()`. |

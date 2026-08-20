@@ -1,6 +1,11 @@
 # Launcher — STRUCTURE
 
-> Verified against source: 2026-08-05, re-checked 2026-08-19 (unchanged) · `l.py` 1523 L
+> Verified against source: 2026-08-19 · `l.py` 1586 L
+
+User-facing documentation: `Readme Launcher.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Launcher_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
 ## Files
 
@@ -62,7 +67,8 @@ user move a program to another group (or reset it) and the choice is persisted.
 | `pick_exe(exes, program_name, ver_folder)` | Picks the right exe out of a folder |
 | `_build_version_list(exes, program_dir)` | Dropdown content: current exes (newest first) + `scan_archive_versions()` |
 | `scan_archive_versions(program_dir)` | Archived versions from `archive/` |
-| `find_readme_or_none(program_dir, name)` | Case/separator-insensitive ReadMe lookup (`README_PREFIX`) |
+| `find_readme_or_none(program_dir, name)` | Case/separator-insensitive ReadMe lookup (`README_PREFIX`) — the **short** doc |
+| `find_readme_full_or_none(program_dir, name)` | The **detailed** companion doc. Accepts `readme_<name>_full`, `readme_<name>_details` or `manual_<name>`, same normalisation. |
 | `find_icon_for_program(program_dir, exe)` | `icon.ico` next to the exe |
 
 ### Versions and naming
@@ -130,7 +136,61 @@ Both checks also run automatically after a scan (`_apply_programs`, delayed 200 
 - Collapsible group sections (`_rebuild_buttons`, `_build_group_content`,
   `_toggle_group`); column count adapts to width (`_calc_group_cols`)
 - Card = program button (name + version, amber + ↑ when an update is pending),
-  ReadMe, ✓ acknowledge, 📂 folder, 🔽 archived-version dropdown, right-click group menu
+  ReadMe, Details, ✓ acknowledge, 📂 folder, 🔽 archived-version dropdown,
+  right-click group menu
 - Office sources are disabled on lab machines (`_rebuild_radiobuttons`)
 - `set_app_icon(win, ico_path, app_id)` — icon + AppUserModelID so the taskbar
   shows the program icon instead of the Python feather
+
+
+---
+
+## The two-document scheme (added 2026-08-19)
+
+Every program carries two user-facing documents, and the card shows a button for
+each one that exists:
+
+| Button | File the matcher looks for | Content |
+|--------|---------------------------|---------|
+| **ReadMe** | `readme_<folder>` | Short: what it does, the principles, the main controls. |
+| **Details** | `readme_<folder>_full`, `readme_<folder>_details`, or `manual_<folder>` | Long: every control, every setting, file formats, troubleshooting. |
+
+Both go through `_norm()` (lower-case, strip `_ - . ' '`) and compare against the
+file's stem *and* full name, so the extension is irrelevant. `.txt` is used
+throughout so `os.startfile` always has a handler; `STRUCTURE.md` stays `.md`
+because it is for developers reading the repo, not for the Launcher.
+
+Row 0 of the card's sub-frame holds the doc buttons: **ReadMe** spans both columns
+when there is no Details file, otherwise the two share the row. A program with a
+Details file but no ReadMe (should not happen) shows Details spanning both.
+`open_readme()` / `open_readme_full()` both `os.startfile` and report a missing
+file in a message box rather than failing silently.
+
+### Making two buttons fit — measured, not guessed
+
+Adding Details as a second text button took a card from **250 px to 336 px**, and
+`_group_min_cell_px = 260` with `max(2, …)` then laid three of them into ~860 px of
+canvas: the third card was clipped at the window edge and a horizontal scrollbar
+appeared. Measured on this machine (vista theme, Segoe UI):
+
+| | |
+|---|---|
+| program button at `width=18` | 160 px, while `"Internal Builder"` needs only 132 px — **28 px of slack** |
+| a doc button with no explicit `width` | 69–80 px, and that is the **theme minimum**: `"ReadMe"` is 42 px of text, `"Details"` 35 px |
+
+So the width was never spent on the labels. Three changes, and the card ends at
+**268 px** — 18 px more than the original single-button card:
+
+| Change | Why |
+|--------|-----|
+| `_prog_btn_chars()` sizes the program button to the **longest label actually shown** (clamped 10…22, matching `clamp_label`), one width for every group so the cards still line up | reclaims the slack; verified no label clips — the widest needs 80 px in 108 px of inner space |
+| the doc buttons get `width=7` and their own `Doc.TButton` style with padding `(3, 2)` | an explicit width is the **only** way under the theme minimum. 56 px each, holding 42 px and 35 px of text. The font stays at 8 — legibility first |
+| `_calc_group_cols()` uses `_measured_cell_px` (the first card's real `winfo_reqwidth() + 12`) and allows **one** column | a hard-coded estimate goes stale the moment a card gains a button, and forcing two columns drew a card into space that did not exist |
+
+`_build_group_content` measures the first cell it builds, and re-flows once (guarded
+by `_cell_remeasure_done`, cleared in `_rebuild_buttons`) if the column count that
+measurement implies differs from the one already used — so a card that changes shape
+re-flows the grid by itself instead of silently overflowing.
+
+Verified by driving the real window: 2 columns at 700 px, 3 at 918 px, 4 at 1200 px,
+content within the canvas every time.

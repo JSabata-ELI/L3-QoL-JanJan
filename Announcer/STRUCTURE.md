@@ -9,7 +9,10 @@ Single-file tkinter app. Two independent jobs in one window:
 2. **PV alerts** — poll eight machine values every 500 ms and show a coloured
    badge for each one that is out of range.
 
-The user-facing description is in `ReadMe Announcer.txt`.
+User-facing documentation: `ReadMe Announcer.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Announcer_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
 ## Files
 
@@ -132,7 +135,8 @@ Both are visible at once while an alarm is up.
 | Watching | `_toggle_tracking`, `_start_tracking`, `_stop_tracking`, `_poll`, `_on_change_detected`, `_reset`, `_update_circle` |
 | Alarm | `_ensure_image_win`, `_resolve_image_geometry`, `_set_flash_alpha`, `_hide_image_win`, `_start_flash`, `_do_flash`, `_play_sound` |
 | HUD | `_set_ui_visible`, `_set_transparent` |
-| Geometry recorders | `_open_geometry_recorder`, `_start_control_window_recording`, `_start_image_window_recording`, `_clamp_geometry`, `_save_geometry` |
+| Geometry recorders | `_open_geometry_recorder`, `_start_control_window_recording`, `_start_image_window_recording`, `_save_geometry` |
+| Staying on screen | `_screen_areas`, `_fit_rect` (module level), `_frame_insets`, `_clamp_geometry`, `_apply_geometry`, `_place_popup` |
 | Alignment ghost | `_start_align_ghost`, `_on_align_configure`, `_refresh_align_ghost`, `_stop_align_ghost` |
 | Preview | `_update_preview`, `_show_preview_popup`, `_hide_preview_popup`, `_toggle_preview_popup`, `_check_hide_preview` |
 | Log | `_log_message`, `_do_log`, `_clear_log`, `_on_log_hover`, `_hide_log_tip` |
@@ -153,10 +157,43 @@ Both are visible at once while an alarm is up.
   otherwise recurse.
 - **`_poll_pvs` fetches on a worker thread** and hands the results back to
   `_update_pv_display`; a 500 ms UI loop cannot wait on HTTP.
+- **The PV half is gated on `self.tracking`.** `_poll_pvs` returns immediately when
+  tracking is off, it is kicked off by `_start_tracking`, and `_stop_tracking`
+  cancels the job and hides `_pv_frame`. So the badges exist only while the screen
+  watch runs — there is no PV-only mode. Worth stating plainly in any doc, because
+  "no setup needed" reads as "always on", which it is not.
+- **The archiver, not live PVs.** `_poll_pvs` calls the CPVA samples endpoint over
+  HTTPS with certificate verification disabled, asks for the last 60 s, and averages
+  the newest `PV_AVG_COUNT` samples. A single chiller sample crosses ±0.3 constantly;
+  the average does not.
 - **Geometry is remembered per preset or globally.** `window_geometry` /
   `image_geometry` exist both as top-level keys (global default) and inside a
   preset dict (that preset's own). `_clamp_geometry` keeps a remembered position
   on a screen that still exists.
+- **A remembered position is the top-left of the window's *inside*.** That is
+  what `winfo_rootx` / `winfo_rooty` report and what the recorders store.
+  Windows counts a position from the *outside* of the title bar, so handing a
+  remembered position straight back to `geometry()` moved the window down and
+  right by the title bar — and every save-and-reload moved it again, until it
+  walked off the screen. `_apply_geometry` sets the position, measures where
+  the window really landed, and corrects the difference; use it instead of
+  `geometry()` for anything remembered. Borderless windows (the flashing image,
+  the HUD) have no title bar, so for them the two counts are the same.
+- **Screen sizes for placement come from Windows, not `screeninfo`.** The
+  program does not declare itself display-scaling aware, so a monitor set to
+  150 % offers windows only 1280x720 of room while `screeninfo` reports its
+  real 1920x1080 — positions taken from `screeninfo` can therefore be past the
+  edge of a screen that windows can actually reach. `_screen_areas` asks
+  Windows for the usable area of each monitor (taskbar excluded), and asks
+  again every time, because taking a screenshot flips the scaling awareness of
+  the whole program and with it the numbers. `screeninfo` stays in use for the
+  watched region and the screenshots, which do work in real pixels.
+- **Every window is pulled onto a screen before it is shown.** `_fit_rect`
+  picks the screen the window already covers most of (so a window on the second
+  monitor stays there), then keeps the whole frame inside it; a window larger
+  than the screen is pinned to the top-left corner instead of being pushed off
+  the opposite edge. `_place_popup` runs it for the settings panel, the preview,
+  the log tooltips, the recorder dialogs and the monitor numbers.
 
 ---
 
@@ -165,7 +202,8 @@ Both are visible at once while an alarm is up.
 ```
 tkinter      UI
 Pillow       ImageGrab (screen capture), ImageTk (preview and alarm image)
-screeninfo   the monitor list
+screeninfo   the monitor list (real pixels — region and screenshots)
+ctypes       the usable area of each monitor as windows see it (stdlib)
 urllib       reading the PVs from the archiver (stdlib, no requests here)
 winsound     the built-in beep (stdlib, Windows only)
 ```

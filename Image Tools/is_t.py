@@ -388,6 +388,12 @@ PV_SCALE: dict[str, float] = {
     "Compressed SBW4": 0.749,
 }
 
+# Units the operator typed for a user-added PV, PV name → unit text. The archiver's
+# channel listing normally answers with bare names (see cpva.CHANNEL_UNITS), so for an
+# arbitrary PV there is no unit to be had unless somebody says what it is. Empty means
+# "fall back to pv_unit_guess, and print nothing if even that does not know".
+PV_CUSTOM_UNITS: dict[str, str] = {}
+
 # PVs the user picked with the search box in "Select PV Channels" (display name →
 # archiver channel). Display name IS the channel name — the archiver has no label
 # for an arbitrary PV, and inventing one would hide which channel is being read.
@@ -440,6 +446,103 @@ _PV_EVAL_ENV = {"__builtins__": {}, "abs": abs, "min": min, "max": max,
 # the compile is cached; the dict is keyed by the source text, which makes it
 # self-invalidating when a formula is edited.
 _PV_EXPR_CACHE: dict = {}
+
+
+# WHERE the registry lives. Not in either tab's own state file: the picker is opened
+# from the Slider AND from the Image Finder, and whichever tab saved last would
+# otherwise decide whether a PV the other one added still exists tomorrow. What stays
+# per tab is only the SELECTION (which of these PVs that tab shows, and its eye state).
+PV_REGISTRY_PATH = (Path(os.environ.get("APPDATA", Path.home()))
+                    / "ELI_ImageTools" / "pv_registry.json")
+
+
+def pv_registry_to_dict() -> dict:
+    return {"pv_custom": dict(PV_CUSTOM_CHANNELS),
+            "pv_derived": [dict(d) for d in PV_DERIVED],
+            "pv_labels": dict(PV_LABELS),
+            "pv_units": dict(PV_CUSTOM_UNITS)}
+
+
+def pv_registry_from_dict(data: dict) -> None:
+    """Load a saved registry, validating every entry.
+
+    The validation is the point of this being one function: a name that clashes with a
+    read PV, a channel that is gone, a label for a PV nothing on screen can edit — each
+    of those reads to the operator as "the programme shows the wrong number", never as a
+    bad config file."""
+    if not isinstance(data, dict):
+        return
+    _custom = data.get("pv_custom")
+    if isinstance(_custom, dict):
+        PV_CUSTOM_CHANNELS.clear()
+        for _n, _ch in _custom.items():
+            if isinstance(_ch, str) and _ch.strip() and str(_n) not in PV_CHANNEL_MAP:
+                PV_CUSTOM_CHANNELS[str(_n)] = _ch.strip()
+
+    # A formula whose name clashes with a read PV is dropped: pv_channel_for() would win
+    # over it and the formula would never be evaluated, which reads as "my formula shows
+    # the wrong number" rather than as a name clash.
+    _derived = data.get("pv_derived")
+    if isinstance(_derived, list):
+        PV_DERIVED.clear()
+        _taken = set(PV_CHANNEL_MAP) | set(PV_CUSTOM_CHANNELS)
+        for _d in _derived:
+            if not isinstance(_d, dict):
+                continue
+            _nm = str(_d.get("name") or "").strip()
+            _ex = str(_d.get("expr") or "").strip()
+            if not _nm or not _ex or _nm in _taken:
+                continue
+            _bnd = _d.get("bindings")
+            PV_DERIVED.append({
+                "name": _nm, "expr": _ex,
+                "unit": str(_d.get("unit") or ""),
+                "bindings": {str(k): str(v) for k, v in _bnd.items()}
+                            if isinstance(_bnd, dict) else {},
+            })
+            _taken.add(_nm)
+
+    # The names the operator gave the PVs. Read PVs only: a formula's name is already
+    # typed by the operator, so it has no name box in the picker and must not carry a
+    # label from a state file either — that would be a name nothing on screen can edit.
+    _labels = data.get("pv_labels")
+    if isinstance(_labels, dict):
+        PV_LABELS.clear()
+        _known = set(PV_CHANNEL_MAP) | set(PV_CUSTOM_CHANNELS)
+        for _n, _lbl in _labels.items():
+            if isinstance(_lbl, str) and _lbl.strip() and str(_n) in _known:
+                PV_LABELS[str(_n)] = _lbl.strip()
+
+    # Units typed for added PVs, and only for ones that still exist: a unit left behind
+    # by a removed channel would print itself onto whatever took its name.
+    _units = data.get("pv_units")
+    if isinstance(_units, dict):
+        PV_CUSTOM_UNITS.clear()
+        for _n, _u in _units.items():
+            if isinstance(_u, str) and _u.strip() and str(_n) in PV_CUSTOM_CHANNELS:
+                PV_CUSTOM_UNITS[str(_n)] = _u.strip()
+
+
+def pv_registry_save() -> None:
+    try:
+        PV_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PV_REGISTRY_PATH.write_text(
+            json.dumps(pv_registry_to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass            # a remembered PV list is a convenience, never a must
+
+
+def pv_registry_load(fallback: "dict | None" = None) -> None:
+    """Load the registry. `fallback` is read only when there is no registry file yet —
+    it carries the same keys out of the Slider's own state file, which is where they
+    used to live, so an existing installation keeps its PVs on the first run of this
+    version."""
+    try:
+        data = json.loads(PV_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    pv_registry_from_dict(data if isinstance(data, dict) else (fallback or {}))
 
 
 def pv_channel_for(name: str) -> "str | None":
@@ -595,15 +698,41 @@ def pv_source_channels(names: "list[str]") -> "list[str]":
     return chans
 
 
+def pv_unit_guess(channel: str) -> str:
+    """The unit a channel name itself gives away, or "" when it gives away nothing.
+
+    Deliberately tiny and deliberately not clever: only suffixes whose meaning is fixed
+    across this facility are listed. Everything else prints no unit at all rather than a
+    plausible-looking wrong one — that is why this is a fallback under both
+    cpva.CHANNEL_UNITS (what the archiver says) and PV_CUSTOM_UNITS (what the operator
+    says)."""
+    tail = (channel or "").rsplit(":", 1)[-1].lower()
+    if tail in ("energy", "energyavg"):
+        return "J"
+    if tail in ("rawpos", "pos", "position"):
+        return "counts"
+    if tail in ("temp", "temperature"):
+        return "°C"
+    if tail in ("pressure", "press"):
+        return "mbar"
+    return ""
+
+
 def pv_units_for(name: str) -> str:
-    """Units for a PV — the preset table, or the unit the user typed on a
-    derived PV (a ratio has none, a scaled energy still reads in J)."""
+    """Units for a PV, best source first: the preset table, the unit typed on a derived
+    PV (a ratio has none, a scaled energy still reads in J), the unit the operator typed
+    for a user-added PV, what the archiver itself said, and only then the name-based
+    guess."""
     if name in PV_UNITS:
         return PV_UNITS[name]
     d = pv_derived_def(name)
     if d is not None:
         return str(d.get("unit") or "")
-    return ""
+    own = PV_CUSTOM_UNITS.get(name)
+    if own:
+        return own
+    ch = pv_channel_for(name) or ""
+    return cpva.CHANNEL_UNITS.get(ch) or pv_unit_guess(ch)
 
 
 def pv_format_value(name: str, val: float) -> str:
@@ -743,20 +872,6 @@ PV_REFRESH_MIN_INTERVAL_S = 0.5
 # anything. 1.0 s is ~3 shots: longer than any healthy refresh cycle, short enough
 # that a genuinely stuck panel is still called out.
 PV_PENDING_GRACE_NS = 1_000_000_000
-
-
-def _pv_date_key(ts_ns: int) -> str:
-    """Return 'YYYY-MM-DD' in Prague time for ts_ns."""
-    from datetime import timezone as _tz
-    dt = datetime.fromtimestamp(ts_ns / 1e9, tz=_tz.utc).astimezone(TZ_PRAGUE)
-    return dt.strftime("%Y-%m-%d")
-
-
-def _pv_prev_date_key(date_key: str) -> str:
-    """Return 'YYYY-MM-DD' for the day before date_key (Prague time)."""
-    y, m, d = int(date_key[:4]), int(date_key[5:7]), int(date_key[8:10])
-    prev = datetime(y, m, d, tzinfo=TZ_PRAGUE) - timedelta(days=1)
-    return prev.strftime("%Y-%m-%d")
 
 
 # ±window (ns) used when searching for a "nearby" sample around the image
@@ -961,11 +1076,11 @@ def pv_warm_days(channels: "list[str]", ts_values: "list[int]", lookback_days: i
     already-cached days return instantly."""
     if not channels or not ts_values:
         return
-    date_keys = {_pv_date_key(t) for t in ts_values}
+    date_keys = {cpva.date_key_for_ns(t) for t in ts_values}
     earliest = min(date_keys)
     k = earliest
     for _ in range(max(0, lookback_days)):
-        k = _pv_prev_date_key(k)
+        k = cpva.prev_date_key(k)
         date_keys.add(k)
     cpva.warm_days(channels, date_keys, today_ttl=_PV_TODAY_CACHE_TTL,
                    timeout=CPVA_HTTP_TIMEOUT)
@@ -1505,15 +1620,48 @@ _TT_GAMMA = (
 
 
 def _bc_value_label(text: str, tooltip: str) -> QLabel:
-    """Read-only numeric readout for a Contrast/Brightness/Gamma row."""
+    """Read-only numeric readout for a Contrast/Brightness/Gamma row.
+
+    Two live states, because the number means two different things. Set by the user it
+    is a SETTING and is printed in full black. While the row's Auto box is ticked it is
+    a MEASUREMENT parked there by the render (see _refresh_auto_bc_sliders), and with
+    several cameras on screen it is the measurement of ONE of them — the master — while
+    every other tile is levelled from its own frame. Same number, black, read as "all
+    the cameras are on this value", which is not what it says. The `autoval` property
+    switches it to a muted grey so it reads as a readout rather than a setting."""
     lbl = QLabel(text)
     lbl.setFixedWidth(_BC_VALUE_W)
     lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     lbl.setToolTip(tooltip)
+    lbl.setProperty("autoval", False)
+    # Not the :disabled grey (#9a9a9a): this number is live and worth reading, it just
+    # is not a setting. #6a6a6a is the darkest grey that still reads as clearly muted
+    # next to #111 and keeps 4.6:1 against the panel background — one step lighter
+    # (#7c7c7c) measured 3.6:1, which is under the readable floor for text this small.
     lbl.setStyleSheet(
         "QLabel { font-weight: 700; color: #111; }"
+        'QLabel[autoval="true"] { font-weight: 600; color: #6a6a6a; font-style: italic; }'
         "QLabel:disabled { color: #9a9a9a; }")
     return lbl
+
+
+# Appended to a readout's tooltip while its Auto box is on, so the grey has an
+# explanation on hover instead of a caption taking up panel space.
+_TT_AUTO_VALUE = (
+    "\n\nAuto is on: this is the value Auto MEASURED, not a setting you made.\n"
+    "With several cameras it is the master camera's (the one with the radio button) — "
+    "every other camera is levelled from its own frame and has its own value.")
+
+
+def _bc_value_set_auto(lbl: QLabel, on: bool, base_tooltip: str) -> None:
+    """Switch one readout between "setting" (black) and "measured" (grey + note)."""
+    if bool(lbl.property("autoval")) != bool(on):
+        lbl.setProperty("autoval", bool(on))
+        # A dynamic property in a stylesheet selector only takes effect on a repolish.
+        st = lbl.style()
+        st.unpolish(lbl)
+        st.polish(lbl)
+    lbl.setToolTip(base_tooltip + _TT_AUTO_VALUE if on else base_tooltip)
 
 
 # Pin-stepping buttons (Timestamps group). Amber so they read as "marker
@@ -2071,9 +2219,9 @@ def _read_tiff_max_sample(path: Path) -> int | None:
 # ceil(log2(MaxValue+1)). So dividing by 65535 is not a stable scale: C03-081-PCW3NF
 # peaks right at 1023/1024 counts and flipped between ×64.06 and ×32.02 every few
 # seconds, which doubled and halved the picture on screen with nothing physical behind
-# it. Frames are therefore rendered against the largest bracket seen for the camera —
-# img_scale.full_scale_for_frame returns the denominator, and it is exactly 65535 for
-# every camera that does not straddle a bracket.
+# it. Frames are therefore rendered against the SENSOR's range, a constant 12 bits for
+# every camera in the archive (img_scale.SENSOR_BITS) — img_scale.full_scale_for_frame
+# returns the denominator, and it is exactly 65535 on a frame that saturates.
 #
 # The old path did `MaxValue * arr / arr.max()` and then divided by a hardcoded
 # 4095. MaxValue (PNG tEXt) is the per-frame peak in raw counts, so that expression
@@ -2096,8 +2244,8 @@ def _norm16_to8_full_scale(arr16: np.ndarray,
     pixel value, never on the frame (see the gamma note in img_scale).
 
     `full_scale` is what makes it comparable between frames of the SAME camera as well:
-    img_scale.full_scale_for_frame gives back 65535 whenever the archiver used the
-    camera's usual bracket, and twice (or four times) that for a frame it bracketed lower,
+    img_scale.full_scale_for_frame gives back 65535 whenever the archiver bracketed the
+    frame at the sensor's own depth, and twice (or four times) that for a dimmer frame,
     which is what cancels the flip. It is per frame, so it must be passed down every
     render path — never defaulted at a call site that has the frame in hand.
 
@@ -2109,11 +2257,11 @@ def _norm16_to8_full_scale(arr16: np.ndarray,
 def _gain_to_contrast_slider(gain: float) -> int:
     """Inverse of the manual contrast curve in _apply_contrast: return the slider
     value whose gain matches `gain` (1.0 → 0). Used to park the disabled Contrast
-    slider where Auto actually put it."""
-    if not (gain > 0) or not math.isfinite(gain):
-        return 0
-    c = 127.0 * 259.0 * (gain - 1.0) / (259.0 + 127.0 * gain)
-    return int(round(max(-127.0, min(127.0, c))))
+    slider where Auto actually put it.
+
+    The curve itself lives in img_scale, where the Finder and the Shot Finder read it
+    too — a slider marked +30 has to mean one gain in all three tabs."""
+    return img_scale.contrast_slider_from_gain(gain)
 
 
 def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
@@ -2204,9 +2352,9 @@ def _img_from_planes(arr: np.ndarray, is_gray: bool, w: int, h: int) -> QImage:
 
 
 def _contrast_gain(contrast: int) -> float:
-    """Slider value in [-127, 127] → multiplicative gain (0 → 1.0)."""
-    c = float(max(-127, min(127, contrast)))
-    return (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+    """Slider value in [-127, 127] → multiplicative gain (0 → 1.0). One owner:
+    img_scale, so the Finder and Shot Finder sliders apply the same curve."""
+    return img_scale.contrast_gain(contrast)
 
 
 def _bc_auto_level(arr: np.ndarray, stat: np.ndarray,
@@ -6799,6 +6947,18 @@ class CamLayoutConfig:
     entries: list = _field(default_factory=list)  # list[CamLayoutEntry]
 
 
+def _entry_rect(x: float, y: float, w: float, h: float, W: int, H: int,
+                min_w: int = 20, min_h: int = 20) -> QRect:
+    """Pixel rectangle of one layout tile. BOTH edges are rounded from their own
+    fraction — the size is the difference between the rounded edges, never the
+    rounded size added to the rounded left edge. Two tiles that share an edge in
+    the layout therefore land on exactly the same pixel, instead of the next column
+    starting two or three pixels off its neighbour."""
+    x0 = int(round(x * W)); x1 = int(round((x + w) * W))
+    y0 = int(round(y * H)); y1 = int(round((y + h) * H))
+    return QRect(x0, y0, max(min_w, x1 - x0), max(min_h, y1 - y0))
+
+
 def _justified_rows_layout(aspects: list, canvas_w: float, canvas_h: float,
                            top_px: float = 0.0) -> list:
     """Pack cameras into justified rows (gallery style) with the largest total image
@@ -6854,11 +7014,12 @@ def _justified_rows_layout(aspects: list, canvas_w: float, canvas_h: float,
     _, rows, k = best
     # The image sizes above are already maximal for this canvas, but when the packing
     # is width-limited (k clamped to 1) there is height left over — and when a row is
-    # height-limited, width. Leaving it as a dead margin around the block is what made
-    # the auto layout look like a small picture floating in a big grey rectangle, so
-    # the slack is handed to the tiles instead: every row grows by an equal share of
-    # the spare height and every tile by an equal share of its row's spare width. The
-    # block therefore covers the canvas exactly; frames keep their aspect and size.
+    # height-limited, width. That slack is handed to the TILES, split evenly within
+    # each row, so the tiles stay one seamless partition of the canvas: every tile edge
+    # is shared with its neighbour (columns line up to the pixel) and the leftover
+    # shows up as the grey area around the frame inside each window — exactly what the
+    # live grid draws. Centring each tile in its own slack instead leaves gaps that
+    # make the cameras look randomly strewn about and knock the columns out of line.
     total_h = sum((k * W / sum(r)) + L for r in rows)
     extra_row = max(0.0, H - total_h) / len(rows)
     entries, y = [], 0.0
@@ -6870,7 +7031,8 @@ def _justified_rows_layout(aspects: list, canvas_w: float, canvas_h: float,
         x = 0.0
         for ai in r:
             tile_w = ai * image_h + extra_tile
-            entries.append(CamLayoutEntry(x=x / W, y=y / H, w=tile_w / W, h=tile_h / H))
+            entries.append(CamLayoutEntry(x=x / W, y=y / H,
+                                          w=tile_w / W, h=tile_h / H))
             x += tile_w
         y += tile_h
     return entries
@@ -7054,8 +7216,8 @@ def compute_camera_layout(aspects: list, canvas_w: float, canvas_h: float,
             tiles = {}
             _place_layout_tree(node, 0.0, 0.0, bw, bh, tiles)
             # The packing is exact but only fills the canvas in one direction; the
-            # leftover is stretched into the tiles rather than left as a dead margin
-            # (frames keep their aspect, they just sit in a slightly roomier tile).
+            # leftover is shared out between the tiles (see below), so it never
+            # changes which frame size a candidate reaches — only where the tiles sit.
             sx, sy = W / bw, H / bh
             ratios, total = [], 0.0
             for i in range(n):
@@ -7074,8 +7236,17 @@ def compute_camera_layout(aspects: list, canvas_w: float, canvas_h: float,
         if best is None:
             return _justified_rows_layout(a, W, H, L)
         _, tiles, sx, sy = best
-        hit = [(tiles[i][0] * sx / W, tiles[i][1] * sy / H,
-                tiles[i][2] * sx / W, tiles[i][3] * sy / H) for i in range(n)]
+        # The packed block fills the canvas in one direction only; the slack from the
+        # other one is stretched INTO the tiles, keeping them a seamless partition of
+        # the canvas. Every tile edge is then shared with its neighbour — columns and
+        # rows line up to the pixel — and the leftover appears as the grey area around
+        # the frame inside the window, which is what the live grid draws anyway.
+        # Centring each tile in its own slack was tried instead and is what made the
+        # cameras look randomly strewn across the canvas with the columns out of line.
+        hit = []
+        for i in range(n):
+            tx, ty, tw, th = tiles[i]
+            hit.append((tx * sx / W, ty * sy / H, tw * sx / W, th * sy / H))
         if len(_LAYOUT_CACHE) > 128:
             _LAYOUT_CACHE.clear()
         _LAYOUT_CACHE[key] = hit
@@ -7114,6 +7285,13 @@ class _LayoutCanvasWidget(QWidget):
                                if canvas_aspect and canvas_aspect > 0 else None)
         self._user_edited = False   # True once a tile was dragged/resized by hand
         self._cam_names = list(cam_names)
+        # Colour belongs to the CAMERA, not to its position in the list: dragging a
+        # tile brings it to the front, which reorders _cam_names/_tiles, and an
+        # index-keyed palette then recoloured every camera on a single click.
+        self._colour_of = {
+            nm: self.TILE_COLORS[i % len(self.TILE_COLORS)]
+            for i, nm in enumerate(self._cam_names)
+        }
         # Per-tile non-image overhead (label bar + margins) in pixels — reserved at
         # the top of every tile so the previewed image area matches the live grid.
         self._label_px = max(0, int(label_px))
@@ -7184,8 +7362,9 @@ class _LayoutCanvasWidget(QWidget):
         t = self._tiles[idx]
         b = self._board()
         W, H = b.width(), b.height()
-        return QRect(b.left() + int(t[0] * W), b.top() + int(t[1] * H),
-                     max(30, int(t[2] * W)), max(20, int(t[3] * H)))
+        r = _entry_rect(t[0], t[1], t[2], t[3], W, H, min_w=30, min_h=20)
+        r.translate(b.left(), b.top())
+        return r
 
     def _image_rect_in(self, r: QRect, aspect: float) -> QRect:
         """Sub-rectangle of tile r the camera frame actually fills: below the label
@@ -7440,9 +7619,17 @@ class _LayoutCanvasWidget(QWidget):
         p = QPainter(self)
         b = self._board()
         W, H = b.width(), b.height()
-        # Everything outside the board is not part of the camera area — paint it
-        # darker so the board itself reads as the live grid's canvas.
+        # Everything outside the board is not part of the camera area. Plain dark grey
+        # read as "empty canvas the cameras fail to use", so it is hatched: the board
+        # is the whole space the live grid has, the hatched strips are outside the
+        # window and no arrangement can ever reach them.
         p.fillRect(self.rect(), QColor(0x0e, 0x0e, 0x0e))
+        if b != self.rect():
+            hp = QPen(QColor(0x2a, 0x2a, 0x2a)); hp.setWidth(1)
+            p.setPen(hp)
+            step = 14
+            for k in range(-self.height(), self.width() + self.height(), step):
+                p.drawLine(k, 0, k + self.height(), self.height())
         p.fillRect(b, QColor(0x18, 0x18, 0x18))
 
         # Subtle guide lines at common fractions
@@ -7465,7 +7652,9 @@ class _LayoutCanvasWidget(QWidget):
         font = p.font()
         for i, tile in enumerate(self._tiles):
             r = self._tile_rect(i)
-            color = self.TILE_COLORS[i % len(self.TILE_COLORS)]
+            nm = self._cam_names[i] if i < len(self._cam_names) else ""
+            color = getattr(self, '_colour_of', {}).get(
+                nm, self.TILE_COLORS[i % len(self.TILE_COLORS)])
             sel = (i == self._selected)
             L = min(self._label_px, max(0, r.height() - 1))
             # Window background = grey letterbox area (matches the grid's dark bg)
@@ -7597,6 +7786,29 @@ class LayoutConfigDialog(QDialog):
         bot.addWidget(btns)
         lay.addLayout(bot)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Shape the dialog once so the preview board covers the whole canvas widget.
+        # The board keeps the live camera area's proportions, so anything left over
+        # is hatched padding OUTSIDE the camera area — empty space the live window
+        # does not have, which reads as canvas the arrangement failed to fill.
+        if getattr(self, "_sized_to_aspect", False):
+            return
+        self._sized_to_aspect = True
+        a = getattr(self._canvas, "_canvas_aspect", None)
+        cw, ch = self._canvas.width(), self._canvas.height()
+        if not a or a <= 0 or cw < 10 or ch < 10:
+            return
+        want_h = int(round(cw / a))          # canvas height that leaves no strips
+        max_h = self.height() + 400
+        try:
+            max_h = int(self.screen().availableGeometry().height() * 0.9)
+        except Exception:
+            pass
+        new_h = max(360, min(max_h, self.height() + (want_h - ch)))
+        if new_h != self.height():
+            self.resize(self.width(), new_h)
+
     def _reset_to_default(self):
         self._from_saved = False
         self._canvas._cam_names = list(self._cam_names)
@@ -7689,6 +7901,43 @@ class LayoutConfigDialog(QDialog):
             self._LAYOUTS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+    @classmethod
+    def _write_entry(cls, key: str, value: "dict | None"):
+        try:
+            cls._LAYOUTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data: dict = {}
+            if cls._LAYOUTS_PATH.exists():
+                try:
+                    data = json.loads(cls._LAYOUTS_PATH.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            if value is None:
+                data.pop(key, None)
+            else:
+                data[key] = value
+            cls._LAYOUTS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def save_manual_entries(cls, cam_names: list, entries: list):
+        """Store a layout the user dragged in the LIVE grid, under the same key and in
+        the same shape this editor writes — so load_config_for_names finds it and the
+        editor opens on it. `auto` is False: these fractions are a real hand-made
+        arrangement, not a frozen preview of an automatic one."""
+        cls._write_entry(",".join(sorted(cam_names)), {
+            "auto":      False,
+            "tiles":     [[e.x, e.y, e.w, e.h] for e in entries],
+            "cam_order": list(cam_names),
+            "entries":   [_asdict(e) for e in entries],
+        })
+
+    @classmethod
+    def forget_saved(cls, cam_names: list):
+        """Drop the stored layout for this camera set — back to arranging them
+        automatically, for good, not just in the window that is open."""
+        cls._write_entry(",".join(sorted(cam_names)), None)
 
 
 # ---------------- CAMERA PICKER DIALOG ----------------
@@ -9223,6 +9472,17 @@ class CameraView(QWidget):
 
         self._update_border()
 
+        # Tiles are moved by their name bar and resized by their border (see
+        # _TileDragHost). The events have to be intercepted on the CHILDREN: the image
+        # widget covers everything except the header and a 3 px margin, and it has mouse
+        # handling of its own — so the border zone is taken away from it here, and
+        # everything else is left to it untouched.
+        self._tile_cursor = None
+        for w in (self.img_view, self._name_lbl, self._ts_lbl,
+                  self._refresh_dot, self._ref_lbl):
+            w.installEventFilter(self)
+        self.setMouseTracking(True)
+
     def image_overhead_px(self) -> int:
         """Vertical pixels of a tile NOT used by the image (label header + layout
         margins + spacing). The auto layout reserves this so the frame fills the
@@ -9350,8 +9610,157 @@ class CameraView(QWidget):
 
     def mousePressEvent(self, event):
         # Grid config dialog is opened by ImageView.mouseReleaseEvent on single right-click.
+        if self._tile_mouse(self, event):
+            return
         self.clicked.emit(self.cam_index)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._tile_mouse(self, event):
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._tile_mouse(self, event):
+            return
+        super().mouseReleaseEvent(event)
+
+    # ── Moving and resizing the tile itself ──────────────────────────────────
+    TILE_EDGE_PX = 9         # border zone that starts a resize drag
+    # The top border gets a narrower zone than the others: the name bar sits 3 px below
+    # it and is the handle the tile is MOVED by, so a 9 px top zone swallowed most of
+    # that handle and dragging the label resized the tile instead of moving it.
+    TILE_TOP_EDGE_PX = 4
+
+    _TILE_CURSORS = {
+        'move':         Qt.CursorShape.SizeAllCursor,
+        'left':         Qt.CursorShape.SizeHorCursor,
+        'right':        Qt.CursorShape.SizeHorCursor,
+        'top':          Qt.CursorShape.SizeVerCursor,
+        'bottom':       Qt.CursorShape.SizeVerCursor,
+        'top-left':     Qt.CursorShape.SizeFDiagCursor,
+        'bottom-right': Qt.CursorShape.SizeFDiagCursor,
+        'top-right':    Qt.CursorShape.SizeBDiagCursor,
+        'bottom-left':  Qt.CursorShape.SizeBDiagCursor,
+    }
+
+    def _layout_host(self):
+        """The container that positions this tile, if it is one that can be dragged.
+        A single camera fills the area on its own — there is nothing to arrange, and
+        letting it be shrunk would only leave the operator with a small picture and no
+        obvious way back."""
+        p = self.parentWidget()
+        if p is None or not hasattr(p, 'begin_tile_drag'):
+            return None
+        return p if len(getattr(p, '_views', ())) > 1 else None
+
+    def _header_bottom(self) -> int:
+        b = self._name_lbl.geometry().bottom()
+        if self._ref_lbl.isVisible():
+            b = max(b, self._ref_lbl.geometry().bottom())
+        return b
+
+    def _tile_drag_mode(self, pos) -> str:
+        """What a press at `pos` (tile coordinates) starts: an edge or corner name
+        within TILE_EDGE_PX of the border, 'move' on the name bar, and '' anywhere else
+        — the image area keeps its own mouse handling (cross, circle, square,
+        right-click zoom), which must not be stolen from it."""
+        e = self.TILE_EDGE_PX
+        w, h = self.width(), self.height()
+        left, right = pos.x() <= e, pos.x() >= w - e
+        top, bottom = pos.y() <= self.TILE_TOP_EDGE_PX, pos.y() >= h - e
+        if top and left:
+            return 'top-left'
+        if top and right:
+            return 'top-right'
+        if bottom and left:
+            return 'bottom-left'
+        if bottom and right:
+            return 'bottom-right'
+        if left:
+            return 'left'
+        if right:
+            return 'right'
+        if top:
+            return 'top'
+        if bottom:
+            return 'bottom'
+        if pos.y() <= self._header_bottom():
+            return 'move'
+        return ''
+
+    def _tile_cursor_for(self, obj, mode: str):
+        """Show the drag cursor on the child under the pointer. ImageView sets its own
+        cursor on every mouse move, so the hover event is consumed while the pointer is
+        in the border zone — that is the only way the resize cursor survives there."""
+        want = self._TILE_CURSORS.get(mode)
+        if want is None:
+            return False
+        obj.setCursor(want)
+        self._tile_cursor = obj
+        return True
+
+    def _clear_tile_cursor(self):
+        if self._tile_cursor is not None:
+            self._tile_cursor.unsetCursor()
+            self._tile_cursor = None
+
+    def _tile_menu(self, gpos):
+        """Right-click on the name bar: the way back from a hand-made arrangement.
+        Without it a dragged (and remembered) layout could only be undone through the
+        camera-selection dialog, which is not where it was made."""
+        grid = self.parentWidget()
+        grid = grid.parentWidget() if grid is not None else None
+        if grid is None or not hasattr(grid, 'reset_layout_to_auto'):
+            return False
+        menu = QMenu(self)
+        act = menu.addAction("Auto-arrange cameras")
+        act.setToolTip("Forget the arrangement made by dragging and let the program "
+                       "size the cameras again")
+        if menu.exec(gpos) is act:
+            grid.reset_layout_to_auto()
+        return True
+
+    def _tile_mouse(self, obj, event) -> bool:
+        """One place for the whole gesture, whichever widget the mouse landed on: the
+        tile's own 3 px frame belongs to this widget, everything inside it to a child.
+        Returns True when the event was used for moving/resizing the tile — the caller
+        must then leave it alone."""
+        t = event.type()
+        if t not in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
+                     QEvent.Type.MouseButtonRelease):
+            return False
+        host = self._layout_host()
+        if host is None:
+            return False
+        if host.tile_drag_active():
+            if t == QEvent.Type.MouseMove:
+                host.update_tile_drag(
+                    event.globalPosition().toPoint(),
+                    no_snap=bool(event.modifiers() & Qt.KeyboardModifier.AltModifier))
+                return True
+            if t == QEvent.Type.MouseButtonRelease:
+                if not host.end_tile_drag():
+                    self.clicked.emit(self.cam_index)   # never moved → a plain click
+                return True
+            return False
+        pos = self.mapFromGlobal(event.globalPosition().toPoint())
+        mode = self._tile_drag_mode(pos)
+        if t == QEvent.Type.MouseMove:
+            if not mode:
+                self._clear_tile_cursor()
+                return False
+            return self._tile_cursor_for(obj, mode)
+        if t != QEvent.Type.MouseButtonPress or not mode:
+            return False
+        if event.button() == Qt.MouseButton.RightButton:
+            return mode == 'move' and self._tile_menu(event.globalPosition().toPoint())
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        return host.begin_tile_drag(self, mode, event.globalPosition().toPoint())
+
+    def eventFilter(self, obj, event):
+        return bool(self._tile_mouse(obj, event)) or super().eventFilter(obj, event)
 
     def _open_pdxm1_grid_config(self):
         dlg = Pdxm1GridConfigDialog(self.img_view.pdxm1_cam_name, img_view=self.img_view, parent=self)
@@ -9360,13 +9769,186 @@ class CameraView(QWidget):
             self.img_view.update()
 
 
-class _FreeLayoutContainer(QWidget):
-    """Positions CameraView widgets using absolute geometry from CamLayoutEntry fractions."""
+class _TileDragHost:
+    """Moving and resizing the camera tiles with the mouse, on the running grid.
+
+    The layout editor (LayoutConfigDialog) does the same on a preview board with static
+    rectangles; this does it where the cameras are actually playing, so the arrangement
+    is judged on the real pictures. Tile geometry lives in self._manual as fractions of
+    the container, which is what makes it survive every window resize.
+
+    A container that arranges itself (see _AutoLayoutContainer) freezes its current
+    on-screen geometry into _manual the moment the first drag begins, and from then on
+    only places those fractions — otherwise the next resize would compute the
+    arrangement again and throw the hand-made one away. Clearing _manual hands the
+    tiles back to the automatic arrangement (MultiCameraGrid.reset_layout_to_auto).
+    """
+
+    SNAP_FRAC = 0.015   # an edge this close to another one is pulled onto it
+    MIN_FRAC  = 0.05    # smallest tile, as a fraction of the container
+    DEAD_PX   = 3       # movement below this is still a click, not a drag
+
+    def _tile_drag_init(self):
+        self._manual: "list | None" = None   # [[x, y, w, h] fractions] or None = arrange
+        self._tdrag: dict = {}
+
+    def _place_manual(self):
+        """Put every tile where _manual says. Both edges are rounded from their own
+        fraction (see _entry_rect), so tiles that share an edge stay on one pixel."""
+        W, H = self.width(), self.height()
+        if W < 1 or H < 1 or not self._manual:
+            return
+        for t, v in zip(self._manual, self._views):
+            v.setGeometry(_entry_rect(t[0], t[1], t[2], t[3], W, H))
+
+    def _manual_from_screen(self) -> list:
+        """Where the tiles are right now, as fractions — the starting point of a first
+        drag, so grabbing a tile never makes it jump."""
+        W = max(1, self.width())
+        H = max(1, self.height())
+        out = []
+        for v in self._views:
+            g = v.geometry()
+            out.append([g.x() / W, g.y() / H,
+                        max(0.01, g.width() / W), max(0.01, g.height() / H)])
+        return out
+
+    def manual_entries(self) -> list:
+        return [CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3]) for t in (self._manual or [])]
+
+    # ── Snapping ─────────────────────────────────────────────────────────────
+    def _snap_lines(self, skip: int) -> tuple:
+        """Positions a dragged edge is allowed to stick to: the container's borders and
+        centre, plus every edge of every other tile."""
+        xs = [0.0, 0.5, 1.0]
+        ys = [0.0, 0.5, 1.0]
+        for j, t in enumerate(self._manual):
+            if j == skip:
+                continue
+            xs += [t[0], t[0] + t[2]]
+            ys += [t[1], t[1] + t[3]]
+        return xs, ys
+
+    @staticmethod
+    def _nearest_line(val: float, lines: list, tol: float):
+        best, best_d = None, tol
+        for c in lines:
+            d = abs(val - c)
+            if d < best_d:
+                best, best_d = c, d
+        return best
+
+    def _snap_tile(self, i: int, mode: str, t: list):
+        """Pull the edges being dragged onto a neighbouring edge when they come close.
+        Without it a free drag always leaves the thin ragged gaps between tiles that
+        make an arrangement look accidental; with it neighbours butt up exactly."""
+        xs, ys = self._snap_lines(i)
+        tol, m = self.SNAP_FRAC, self.MIN_FRAC
+        if mode == 'move':
+            # Snap whichever edge is closest, then translate the whole tile onto it.
+            for val, shift in ((t[0], 0.0), (t[0] + t[2], -t[2])):
+                s = self._nearest_line(val, xs, tol)
+                if s is not None:
+                    t[0] = min(max(0.0, s + shift), max(0.0, 1.0 - t[2]))
+                    break
+            for val, shift in ((t[1], 0.0), (t[1] + t[3], -t[3])):
+                s = self._nearest_line(val, ys, tol)
+                if s is not None:
+                    t[1] = min(max(0.0, s + shift), max(0.0, 1.0 - t[3]))
+                    break
+            return
+        if 'left' in mode:
+            s = self._nearest_line(t[0], xs, tol)
+            if s is not None and t[0] + t[2] - s >= m:
+                t[2] += t[0] - s
+                t[0] = s
+        if 'right' in mode:
+            s = self._nearest_line(t[0] + t[2], xs, tol)
+            if s is not None and s - t[0] >= m:
+                t[2] = s - t[0]
+        if 'top' in mode:
+            s = self._nearest_line(t[1], ys, tol)
+            if s is not None and t[1] + t[3] - s >= m:
+                t[3] += t[1] - s
+                t[1] = s
+        if 'bottom' in mode:
+            s = self._nearest_line(t[1] + t[3], ys, tol)
+            if s is not None and s - t[1] >= m:
+                t[3] = s - t[1]
+
+    # ── Drag ─────────────────────────────────────────────────────────────────
+    def tile_drag_active(self) -> bool:
+        return bool(self._tdrag)
+
+    def begin_tile_drag(self, view, mode: str, gpos) -> bool:
+        try:
+            i = self._views.index(view)
+        except ValueError:
+            return False
+        if self._manual is None or len(self._manual) != len(self._views):
+            self._manual = self._manual_from_screen()
+        self._tdrag = {'i': i, 'mode': mode, 'gpos': gpos,
+                       'start': list(self._manual[i]), 'moved': False}
+        return True
+
+    def update_tile_drag(self, gpos, no_snap: bool = False):
+        d = self._tdrag
+        if not d:
+            return
+        W = max(1, self.width())
+        H = max(1, self.height())
+        dpx = gpos.x() - d['gpos'].x()
+        dpy = gpos.y() - d['gpos'].y()
+        if not d['moved'] and abs(dpx) < self.DEAD_PX and abs(dpy) < self.DEAD_PX:
+            return          # still a click on the label bar, which selects the camera
+        d['moved'] = True
+        dx, dy = dpx / W, dpy / H
+        x, y, w, h = d['start']
+        m = self.MIN_FRAC
+        if d['mode'] == 'move':
+            x = min(max(0.0, x + dx), max(0.0, 1.0 - w))
+            y = min(max(0.0, y + dy), max(0.0, 1.0 - h))
+        else:
+            l, r, tp, bt = x, x + w, y, y + h
+            if 'left' in d['mode']:
+                l = min(max(0.0, l + dx), r - m)
+            if 'right' in d['mode']:
+                r = max(min(1.0, r + dx), l + m)
+            if 'top' in d['mode']:
+                tp = min(max(0.0, tp + dy), bt - m)
+            if 'bottom' in d['mode']:
+                bt = max(min(1.0, bt + dy), tp + m)
+            x, y, w, h = l, tp, r - l, bt - tp
+        tile = [x, y, w, h]
+        if not no_snap:
+            self._snap_tile(d['i'], d['mode'], tile)
+        self._manual[d['i']] = tile
+        self._place_manual()
+
+    def end_tile_drag(self) -> bool:
+        """True when the tile really moved. The owner then keeps the arrangement (and
+        remembers it for this camera set); a drag that never left the dead zone is
+        reported as a plain click so the label bar still selects the camera."""
+        d = self._tdrag
+        self._tdrag = {}
+        if not d or not d.get('moved'):
+            return False
+        grid = self.parentWidget()
+        if grid is not None and hasattr(grid, 'on_tile_layout_edited'):
+            grid.on_tile_layout_edited(self.manual_entries())
+        return True
+
+
+class _FreeLayoutContainer(QWidget, _TileDragHost):
+    """Positions CameraView widgets using absolute geometry from CamLayoutEntry
+    fractions — a layout the user arranged by hand, in the editor or by dragging the
+    tiles here (see _TileDragHost)."""
 
     def __init__(self, entries: list, views: list, parent=None):
         super().__init__(parent)
-        self._entries = entries
         self._views   = views
+        self._tile_drag_init()
+        self._manual  = [[e.x, e.y, e.w, e.h] for e in entries]
         for v in views:
             v.setParent(self)
             v.show()
@@ -9377,15 +9959,10 @@ class _FreeLayoutContainer(QWidget):
         self._apply()
 
     def _apply(self):
-        W, H = self.width(), self.height()
-        if W < 1 or H < 1:
-            return
-        for e, v in zip(self._entries, self._views):
-            v.setGeometry(int(e.x * W), int(e.y * H),
-                          max(20, int(e.w * W)), max(20, int(e.h * H)))
+        self._place_manual()
 
 
-class _AutoLayoutContainer(QWidget):
+class _AutoLayoutContainer(QWidget, _TileDragHost):
     """Default auto layout: positions CameraView widgets by the searched split
     layout, recomputed responsively on every resize so each camera's frame stays as
     large as the canvas allows regardless of window proportions (see
@@ -9395,6 +9972,7 @@ class _AutoLayoutContainer(QWidget):
     def __init__(self, views: list, parent=None):
         super().__init__(parent)
         self._views = views
+        self._tile_drag_init()
         for v in views:
             v.setParent(self)
             v.show()
@@ -9434,6 +10012,11 @@ class _AutoLayoutContainer(QWidget):
             return
         if self._views[0].parentWidget() is not self:
             return   # tiles have moved to another container — not ours to lay out
+        if self._manual and len(self._manual) == len(self._views):
+            # A tile has been dragged: the arrangement is the user's now, and
+            # recomputing it here is exactly what would undo their work.
+            self._place_manual()
+            return
         top_px = self._views[0].image_overhead_px()
         entries = compute_camera_layout(
             self._aspects(), W, H, top_px,
@@ -9441,8 +10024,7 @@ class _AutoLayoutContainer(QWidget):
         if len(entries) != len(self._views):
             return
         for e, v in zip(entries, self._views):
-            v.setGeometry(int(e.x * W), int(e.y * H),
-                          max(20, int(e.w * W)), max(20, int(e.h * H)))
+            v.setGeometry(_entry_rect(e.x, e.y, e.w, e.h, W, H))
 
 
 class MultiCameraGrid(QWidget):
@@ -9579,6 +10161,32 @@ class MultiCameraGrid(QWidget):
                 h=max(0.02, cv.height() / H),
             )
         return [name_to_entry.get(n, CamLayoutEntry()) for n in cam_names]
+
+    def on_tile_layout_edited(self, entries: list):
+        """A tile was just moved or resized by hand in the live grid (_TileDragHost).
+
+        The arrangement becomes this window's layout and is stored for exactly this set
+        of cameras, in the same place and shape the layout editor uses — so it comes back
+        when the same cameras are opened again, and the editor opens on it instead of on
+        an auto arrangement. The grid is NOT rebuilt: the tiles are already where they
+        belong, and rebuilding would re-parent them out from under the mouse."""
+        self._layout_config = CamLayoutConfig(entries=list(entries))
+        names = getattr(self, '_cam_names_list', [])
+        if len(names) == len(entries):
+            LayoutConfigDialog.save_manual_entries(names, entries)
+
+    def reset_layout_to_auto(self):
+        """Throw the hand-made arrangement away — this window's and the stored one — and
+        let the program arrange the cameras again. Reached from the right-click menu on a
+        camera's name bar, and the only thing that clears a remembered layout from here."""
+        self._layout_config = None
+        names = getattr(self, '_cam_names_list', [])
+        if names:
+            LayoutConfigDialog.forget_saved(names)
+        c = self._reg_container
+        if c is not None and getattr(c, '_manual', None) is not None:
+            c._manual = None
+        self._rebuild_grid()
 
     def _rebuild_grid(self):
         # Remove all cam views and the reg container from the main grid
@@ -10867,8 +11475,32 @@ class _PvChannelListSignals(QObject):
 
 
 class PvConfigDialog(QDialog):
-    """"Select PV Channels": the presets, any archiver PV the user searches for,
-    and the formulas computed from them.
+    """"Select PV channels": what is read from the archiver, and what of it is printed
+    over the picture. Presets, any archiver PV the operator searches for or types in
+    full, and the formulas computed from them.
+
+    ONE meaning per control, which is the whole point of the layout:
+
+      * A PV is in the list  → it is READ. There is no separate tick for that any
+        more; ✕ is how a PV stops being read. The old dialog had a grid of preset tick
+        boxes on top of the same PVs' rows below, so "picked" had two owners that could
+        disagree.
+      * The **Show** column is the EYE → the value is printed over the frame and burned
+        into a saved image. The two tables ARE that split: "On the picture" and "Read,
+        not on the picture". It is the same eye as in the sidebar panel, on the same
+        state (`_pv_hidden`).
+
+    Columns: Show · Letter · PV · Displayed name · Unit · What it is · ✕
+      * **PV** is the archiver channel, because that is what a row is actually reading;
+        for a formula it is the expression.
+      * **Displayed name** is print-only (PV_LABELS). The name stays the identity
+        everywhere — selection, eye, letters, formula bindings — so naming a PV can
+        never repoint a formula or lose the channel behind it. A formula has no box
+        here: its name is already the operator's own, typed in the formula row.
+      * **Unit** is only ever shown when it can be defended: the preset table, the
+        archiver's own listing (cpva.CHANNEL_UNITS, usually empty), a fixed-meaning
+        channel suffix (pv_unit_guess), or what the operator types for an own PV.
+        Unknown stays blank rather than guessed.
 
     The search box is the same one the Shot Finder and the CSS Logger use — type
     fragments, they are AND-matched with implicit wildcards between them, so
@@ -10878,66 +11510,73 @@ class PvConfigDialog(QDialog):
     A user-added PV is keyed by its own channel name: the archiver offers no label
     for an arbitrary PV, and inventing one would hide which channel is being read.
 
-    Every PV carries a CHANNEL LETTER, shown on its tick box, and the formula rows
-    at the bottom are written in those letters (e.g. "B/D", "A*0.749"). The letters
-    are positional, so they move whenever the list changes; each formula stores the
-    PV behind every letter it uses and is re-lettered from those bindings, so an
-    add or a remove cannot silently repoint a formula at a different PV. The
-    presets come first and their order is a code constant, so A…H never move.
+    Every PV carries a CHANNEL LETTER and the formula rows at the bottom are written in
+    those letters (e.g. "B/D", "A*0.749"). The letters are positional, so they move
+    whenever the list changes; each formula stores the PV behind every letter it uses
+    and is re-lettered from those bindings, so an add or a remove cannot silently
+    repoint a formula at a different PV. The presets come first and their order is a
+    code constant, so A…H never move — and the letters are numbered over
+    `_pending_names()`, NOT over the two tables, so clicking an eye cannot move them.
     """
 
     _MAX_RESULTS = 200
     _ROW_H = 22
 
+    # Column widths, in px, shared by both tables so their columns line up even though
+    # they are two independent grids. Only the PV column stretches.
+    _W_SHOW, _W_LETTER, _W_NAME, _W_UNIT, _W_KIND, _W_DEL = 42, 20, 128, 46, 92, 22
+    _COL_TITLES = ("Show", "", "PV", "Displayed name", "Unit", "What it is", "")
+
     def __init__(self, enabled: "list[str]", custom: "dict[str, str]",
                  derived: "list[dict] | None" = None,
-                 labels: "dict[str, str] | None" = None, parent=None):
+                 labels: "dict[str, str] | None" = None,
+                 hidden: "set[str] | list[str] | None" = None,
+                 units: "dict[str, str] | None" = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select PV Channels")
-        # 780 px tall was sized for a search table twice this high and a formula area that
-        # was reserved even when empty; both are gone, so the dialog opens compact and
-        # grows only where the user actually fills it (Selected PVs, formulas).
-        self.resize(620, 620)
+        self.setWindowTitle("Select PV channels")
+        # Wider than the old 620: the picked list is a six-column table now, and the
+        # channel names it prints are long. Still grows only where the operator fills
+        # it in (the two tables and the formulas share the spare height).
+        self.resize(700, 640)
 
+        hidden = {str(n) for n in (hidden or ())}
+        # A preset is in the list exactly when it was picked. No second tick anywhere.
+        self._preset_in: "dict[str, bool]" = {n: (n in enabled) for n in PV_CHANNEL_MAP}
         self._custom: "dict[str, str]" = dict(custom)          # name → channel, ordered
-        self._custom_enabled: "dict[str, bool]" = {n: (n in enabled) for n in self._custom}
+        # The eye, per PV name: is its value printed over the frame? Everything in the
+        # list is read regardless. A formula keeps this flag on its own row record, so
+        # renaming a formula cannot drop its eye state.
+        self._shown: "dict[str, bool]" = {
+            n: (n not in hidden) for n in list(self._preset_in) + list(self._custom)}
         # name → the name the operator wants to SEE (empty / absent = use the PV name).
         # Display only: the PV name stays the key everywhere else (see PV_LABELS).
         self._labels: "dict[str, str]" = {k: v for k, v in (labels or {}).items() if v}
+        # name → unit typed for a user-added PV (see PV_CUSTOM_UNITS).
+        self._units: "dict[str, str]" = {k: v for k, v in (units or {}).items() if v}
         self._all_channels: "list[str]" = []
         self._loading = True
         self._load_err = ""
-        # Formula rows, in order: {"widget", "check", "letter", "name", "expr",
+        # Formula rows, in order: {"widget", "letter", "shown", "name", "expr",
         # "unit", "warn", "canon": (expr, bindings)}. "canon" is the stored form —
         # letters as typed plus their bindings — and is what re-lettering works from.
         self._derived_rows: list = []
+        # Rebuilt by _rebuild_picked_tables; read back by _sync_row_state BEFORE any
+        # rebuild, because a rebuild destroys them along with whatever was typed.
+        self._rows: list = []
 
         lay = QVBoxLayout(self)
 
-        lay.addWidget(QLabel("Choose which PV channels to display:"))
-        # Three columns: the presets used a column of their own and pushed
-        # everything below them off the dialog. 8 presets now take 3 rows.
-        self._checks: "dict[str, QCheckBox]" = {}
-        preset_grid = QGridLayout()
-        preset_grid.setHorizontalSpacing(10)
-        preset_grid.setVerticalSpacing(2)
-        for i, name in enumerate(PV_CHANNEL_MAP):
-            cb = QCheckBox(name)
-            cb.setChecked(name in enabled)
-            # Ticking a preset makes it appear in the Selected PVs list below, which is
-            # the one place a channel letter is written out (see _refresh_letters).
-            cb.toggled.connect(lambda _c=False: self._rebuild_custom_rows())
-            self._checks[name] = cb
-            preset_grid.addWidget(cb, i // 3, i % 3)
-        for c in range(3):
-            preset_grid.setColumnStretch(c, 1)
-        lay.addLayout(preset_grid)
-
-        lay.addWidget(self._hline())
-
-        lbl = QLabel("Own PVs")
-        lbl.setStyleSheet("font-weight: 700;")
-        lay.addWidget(lbl)
+        # ── Add a PV ──────────────────────────────────────────────────────────
+        add_head = QHBoxLayout()
+        _add_lbl = QLabel("Add a PV")
+        _add_lbl.setStyleSheet("font-weight: 700;")
+        add_head.addWidget(_add_lbl)
+        add_head.addStretch()
+        b_add_formula = QPushButton("+ Add formula")
+        b_add_formula.setToolTip("Add a PV computed from the others")
+        b_add_formula.clicked.connect(lambda: self._add_derived_row())
+        add_head.addWidget(b_add_formula)
+        lay.addLayout(add_head)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText('search any archiver PV…  (e.g. "hapls sbw4")')
@@ -10969,25 +11608,60 @@ class PvConfigDialog(QDialog):
         self._status.setWordWrap(True)
         lay.addWidget(self._status)
 
-        sel_lbl = QLabel("Selected PVs:")
-        sel_lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #333;")
-        lay.addWidget(sel_lbl)
+        # The house PVs, one click each. This replaces a grid of preset TICK boxes: a
+        # tick there meant the same thing as the preset having a row below, so the two
+        # could disagree and the operator had to know which one won.
+        pre_lbl = QLabel("Presets — click to add:")
+        pre_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        lay.addWidget(pre_lbl)
+        self._preset_buttons: "dict[str, QPushButton]" = {}
+        preset_grid = QGridLayout()
+        preset_grid.setHorizontalSpacing(4)
+        preset_grid.setVerticalSpacing(2)
+        for i, name in enumerate(PV_CHANNEL_MAP):
+            btn = QPushButton(name)
+            btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 6px; }")
+            btn.clicked.connect(lambda _=False, n=name: self._add_preset(n))
+            self._preset_buttons[name] = btn
+            preset_grid.addWidget(btn, i // 4, i % 4)
+        for c in range(4):
+            preset_grid.setColumnStretch(c, 1)
+        lay.addLayout(preset_grid)
 
-        self._custom_area = QScrollArea()
-        self._custom_area.setWidgetResizable(True)
-        self._custom_area.setFrameShape(QFrame.Shape.NoFrame)
-        self._custom_area.setMaximumHeight(150)
-        holder = QWidget()
-        self._custom_layout = QVBoxLayout(holder)
-        self._custom_layout.setContentsMargins(0, 0, 0, 0)
-        self._custom_layout.setSpacing(2)
-        self._custom_area.setWidget(holder)
-        lay.addWidget(self._custom_area)
+        lay.addWidget(self._hline())
 
-        self._no_custom_lbl = QLabel("Nothing selected yet — tick a preset above, "
-                                     "or search for a PV.")
-        self._no_custom_lbl.setStyleSheet("font-size: 10px; color: #888;")
-        lay.addWidget(self._no_custom_lbl)
+        # ── The picked PVs: two tables, split by the eye ───────────────────────
+        picked_area = QScrollArea()
+        picked_area.setWidgetResizable(True)
+        picked_area.setFrameShape(QFrame.Shape.NoFrame)
+        picked_holder = QWidget()
+        pv_lay = QVBoxLayout(picked_holder)
+        pv_lay.setContentsMargins(0, 0, 0, 0)
+        pv_lay.setSpacing(2)
+
+        self._title_on = self._table_title("")
+        pv_lay.addWidget(self._title_on)
+        self._grid_on = QGridLayout()
+        self._grid_on.setHorizontalSpacing(4)
+        self._grid_on.setVerticalSpacing(2)
+        self._prepare_grid(self._grid_on)
+        pv_lay.addLayout(self._grid_on)
+
+        self._title_off = self._table_title("")
+        pv_lay.addWidget(self._title_off)
+        self._grid_off = QGridLayout()
+        self._grid_off.setHorizontalSpacing(4)
+        self._grid_off.setVerticalSpacing(2)
+        self._prepare_grid(self._grid_off)
+        pv_lay.addLayout(self._grid_off)
+
+        self._no_pv_lbl = QLabel("No PV picked yet — click a preset above, or search "
+                                 "for one.")
+        self._no_pv_lbl.setStyleSheet("font-size: 10px; color: #888;")
+        pv_lay.addWidget(self._no_pv_lbl)
+        pv_lay.addStretch()
+        picked_area.setWidget(picked_holder)
+        lay.addWidget(picked_area, 2)
 
         lay.addWidget(self._hline())
 
@@ -11004,11 +11678,11 @@ class PvConfigDialog(QDialog):
         lay.addLayout(d_head)
 
         d_hint = QLabel(
-            "Python expression in the channel letters shown in the Selected PVs list — "
+            "Python expression in the channel letters shown in the Letter column — "
             "e.g. B/D, A*0.749, round(A-B, 2). Each formula remembers which PV every "
             "letter stands for, so the letters follow the PVs when the list changes. "
-            "A formula may use an earlier formula's letter. A source PV is read even "
-            "when it is not ticked itself.")
+            "A formula may use an earlier formula's letter. A source PV is read as soon "
+            "as it is in the list, whether it is shown on the picture or not.")
         d_hint.setWordWrap(True)
         d_hint.setStyleSheet("font-size: 10px; color: #555;")
         lay.addWidget(d_hint)
@@ -11036,14 +11710,12 @@ class PvConfigDialog(QDialog):
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
 
-        self._custom_checks: "dict[str, QCheckBox]" = {}
-        self._preset_labels: "dict[str, QLabel]" = {}
-        self._label_edits: "dict[str, QLineEdit]" = {}
-        self._rebuild_custom_rows()
         for d in (derived or []):
-            self._add_derived_row(d, enabled=(d.get("name") in enabled))
+            # A formula that exists is picked (that is what being in the list means);
+            # only whether it is PAINTED comes from the saved eye state.
+            self._add_derived_row(d, shown=(str(d.get("name") or "") not in hidden))
+        self._rebuild_picked_tables()
         self._sync_derived_visibility()
-        self._refresh_letters()
 
         self._sig = _PvChannelListSignals()
         self._sig.loaded.connect(self._on_channels_loaded)
@@ -11052,28 +11724,62 @@ class PvConfigDialog(QDialog):
         self._search.setFocus()
 
     # ── results of the picker ────────────────────────────────────────────────
-    def selected_names(self) -> "list[str]":
-        """Ticked PVs, presets first then added channels then formulas — the same
-        order pv_all_names() uses, so the panel, the overlay and the burn-in all
-        agree on it."""
-        self._sync_custom_checks()
-        out = [n for n, cb in self._checks.items() if cb.isChecked()]
-        out += [n for n in self._custom if self._custom_enabled.get(n)]
-        out += [r["name"].text().strip() for r in self._derived_rows
-                if r["check"].isChecked() and r["name"].text().strip()]
+    def _picked_entries(self) -> "list[dict]":
+        """Every picked PV in CANONICAL order — presets, added channels, formulas —
+        as {name, kind, pv, shown, rec}.
+
+        Canonical, NOT in the order the two tables happen to show them: the letters are
+        numbered over this order, so if it followed the display split every click on an
+        eye would re-letter the list and a formula would have to be re-bound."""
+        out: list = []
+        for n, ch in PV_CHANNEL_MAP.items():
+            if self._preset_in.get(n):
+                out.append({"name": n, "kind": "preset", "pv": ch, "rec": None,
+                            "shown": self._shown.get(n, True)})
+        for n, ch in self._custom.items():
+            out.append({"name": n, "kind": "own", "pv": ch, "rec": None,
+                        "shown": self._shown.get(n, True)})
+        for rec in self._derived_rows:
+            nm = rec["name"].text().strip()
+            if not nm:
+                continue            # an unnamed formula is not a PV yet
+            out.append({"name": nm, "kind": "formula",
+                        "pv": rec["expr"].text().strip(), "rec": rec,
+                        "shown": bool(rec.get("shown", True))})
         return out
 
+    def selected_names(self) -> "list[str]":
+        """Every picked PV — presets first, then added channels, then formulas, the
+        same order pv_all_names() uses, so the panel, the overlay and the burn-in all
+        agree on it. Being picked is being in the list: these are all READ."""
+        self._sync_row_state()
+        return [e["name"] for e in self._picked_entries()]
+
+    def hidden_names(self) -> "list[str]":
+        """The picked PVs whose Show is off — read and listed, but not painted over the
+        frame and not burned into a saved image. Same state as the sidebar's eye."""
+        self._sync_row_state()
+        return [e["name"] for e in self._picked_entries() if not e["shown"]]
+
     def custom_channels(self) -> "dict[str, str]":
-        """Every added PV, ticked or not — unticking one must not throw away the
-        search that found it."""
+        """Every added PV, name → channel. ✕ is what removes one, so everything here
+        is in the list."""
         return dict(self._custom)
 
     def labels(self) -> "dict[str, str]":
         """PV name → the name to show for it. Only PVs that were actually given one;
         a name equal to the PV's own name is dropped, so no label is stored for
         "renamed to itself"."""
-        self._sync_labels()
+        self._sync_row_state()
         return {n: t for n, t in self._labels.items() if t and t != n}
+
+    def custom_units(self) -> "dict[str, str]":
+        """PV name → the unit the operator typed for an added PV. Presets have their
+        own table and formulas carry their unit in the formula row, so neither appears
+        here."""
+        self._sync_row_state()
+        return {n: u for n, u in self._units.items()
+                if u and n in self._custom}
 
     def derived_defs(self) -> "list[dict]":
         """Every formula, ticked or not, in row order: {name, expr, unit,
@@ -11187,145 +11893,274 @@ class PvConfigDialog(QDialog):
         if hit:
             self._add_channel(hit)
 
-    # ── added-PV rows ────────────────────────────────────────────────────────
+    # ── adding and removing PVs ──────────────────────────────────────────────
+    def _add_preset(self, name: str):
+        """Put a house PV in the list. Already there → say so instead of doing nothing
+        visible, which reads as a dead button."""
+        self._sync_row_state()
+        if self._preset_in.get(name):
+            self._status.setText(f'"{name}" is already in the list.')
+            return
+        self._preset_in[name] = True
+        self._shown.setdefault(name, True)
+        self._status.setText(f'Added "{name}".')
+        self._rebuild_picked_tables()
+
     def _add_channel(self, channel: str):
         channel = (channel or "").strip()
         if not channel:
             return
-        self._sync_custom_checks()
+        self._sync_row_state()
         preset = next((n for n, ch in PV_CHANNEL_MAP.items() if ch == channel), None)
         if preset is not None:
-            # Already up there as a preset — tick it instead of adding a second row
-            # that would read the very same channel under a different name.
-            self._checks[preset].setChecked(True)
-            self._status.setText(f'"{channel}" is the preset {preset} — ticked above.')
-        elif channel in self._custom:
-            self._custom_enabled[channel] = True
+            # The channel a preset already reads: add THE PRESET, never a second row
+            # reading the very same channel under a different name and no unit.
+            self._search.clear()
+            self._results.setRowCount(0)
+            self._add_preset(preset)
+            self._status.setText(f'"{channel}" is the preset {preset} — added it.')
+            self._search.setFocus()
+            return
+        if channel in self._custom:
             self._status.setText(f'"{channel}" is already in the list.')
         else:
             self._custom[channel] = channel
-            self._custom_enabled[channel] = True
+            self._shown[channel] = True
             self._status.setText(f'Added "{channel}".')
         self._search.clear()
         self._results.setRowCount(0)
-        self._rebuild_custom_rows()
+        self._rebuild_picked_tables()
         self._search.setFocus()
 
-    def _remove_channel(self, name: str):
-        self._sync_custom_checks()
-        self._sync_labels()
-        self._custom.pop(name, None)
-        self._custom_enabled.pop(name, None)
+    def _remove_pv(self, ent: dict):
+        """✕ — this PV stops being read at all. The one way out of the list, so it is
+        also the only place its name, unit and eye state are dropped."""
+        self._sync_row_state()
+        if ent["kind"] == "formula":
+            if ent["rec"] is not None:
+                self._remove_derived_row(ent["rec"])
+            return                    # that already rebuilds the tables
+        name = ent["name"]
+        if ent["kind"] == "preset":
+            self._preset_in[name] = False
+        else:
+            self._custom.pop(name, None)
+        self._shown.pop(name, None)
         self._labels.pop(name, None)
-        self._rebuild_custom_rows()
+        self._units.pop(name, None)
+        self._rebuild_picked_tables()
 
-    def _sync_custom_checks(self):
-        """Read the row checkboxes back into _custom_enabled. Must run before any
-        rebuild — the widgets are destroyed by it, and their state is the truth."""
-        for n, cb in self._custom_checks.items():
-            if n not in self._custom:   # just removed — do not resurrect its flag
-                continue
-            try:
-                self._custom_enabled[n] = cb.isChecked()
-            except RuntimeError:        # widget already deleted
-                pass
+    def _remove_channel(self, name: str):
+        """Kept for the formula-row path and any caller that only knows a name."""
+        self._sync_row_state()
+        self._custom.pop(name, None)
+        self._shown.pop(name, None)
+        self._labels.pop(name, None)
+        self._units.pop(name, None)
+        self._rebuild_picked_tables()
 
-    def _sync_labels(self):
-        """Read the "shown as" boxes back into _labels. Same rule as the tick boxes:
-        a rebuild destroys the widgets, so what is typed in them has to be taken out
-        first or a preset toggle would wipe a name the operator just typed."""
-        for n, e in self._label_edits.items():
-            if n not in self._custom and n not in PV_CHANNEL_MAP:
-                continue        # just removed — do not resurrect its name
+    def _sync_row_state(self):
+        """Read the live table rows back into the dialog's own state.
+
+        MUST run before every rebuild and before every accessor: a rebuild destroys the
+        widgets, so a name or a unit that was just typed would be lost and the Show
+        state would fall back to its default. This is one method rather than the three
+        it used to be, because forgetting one of them was how a preset toggle wiped a
+        name the operator had typed a second earlier."""
+        for row in self._rows:
+            ent = row["ent"]
+            name = ent["name"]
             try:
-                txt = e.text().strip()
-            except RuntimeError:        # widget already deleted
+                shown = row["chk"].isChecked()
+            except RuntimeError:            # widget already deleted
                 continue
-            if txt:
-                self._labels[n] = txt
+            if ent["kind"] == "formula":
+                if ent["rec"] is not None:
+                    ent["rec"]["shown"] = shown
+            elif name in self._custom or name in PV_CHANNEL_MAP:
+                self._shown[name] = shown
             else:
-                self._labels.pop(n, None)
+                continue                    # removed meanwhile — do not resurrect it
+            e = row.get("name_edit")
+            if e is not None:
+                try:
+                    txt = e.text().strip()
+                except RuntimeError:
+                    txt = None
+                if txt is not None:
+                    if txt:
+                        self._labels[name] = txt
+                    else:
+                        self._labels.pop(name, None)
+            u = row.get("unit_edit")
+            if u is not None:
+                try:
+                    txt = u.text().strip()
+                except RuntimeError:
+                    txt = None
+                if txt is not None:
+                    if txt:
+                        self._units[name] = txt
+                    else:
+                        self._units.pop(name, None)
 
-    def _rebuild_custom_rows(self):
-        """Rebuild the Selected PVs list — the ticked presets first, then every added PV.
+    # ── the two picked-PV tables ─────────────────────────────────────────────
+    @staticmethod
+    def _table_title(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; "
+                          "padding: 4px 0 1px 0;")
+        return lbl
 
-        The presets are listed here as well, even though they are ticked in the grid above,
-        because this list is the ONE place a channel letter is written out: the letters used
-        to be glued onto the preset tick boxes, which put a positional letter next to a name
-        that is a code constant and made the grid read as if "A" were part of the PV's name.
-        A preset row therefore carries no tick box of its own (the grid owns that state) —
-        just its letter, its name, and ✕ to untick it."""
-        self._sync_custom_checks()
-        self._sync_labels()
-        while self._custom_layout.count():
-            item = self._custom_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None)
-                w.deleteLater()
-        self._custom_checks = {}
-        self._preset_labels: "dict[str, QLabel]" = {}
-        self._label_edits = {}
+    def _prepare_grid(self, grid: QGridLayout):
+        """Fix the column widths and stretch so the two grids line up as one table."""
+        widths = (self._W_SHOW, self._W_LETTER, 0, self._W_NAME,
+                  self._W_UNIT, self._W_KIND, self._W_DEL)
+        for c, w in enumerate(widths):
+            if w:
+                grid.setColumnMinimumWidth(c, w)
+            # Only the PV column takes the spare width — it holds the channel names,
+            # which are the one thing here that is genuinely long.
+            grid.setColumnStretch(c, 1 if c == 2 else 0)
 
-        def _name_edit(pv: str) -> QLineEdit:
-            """The box that gives this PV the name the overlay shows. Display only —
-            the PV keeps its own name as its identity, so typing here cannot move a
-            channel letter or repoint a formula."""
-            e = QLineEdit(self._labels.get(pv, ""))
-            e.setPlaceholderText("show as…")
-            e.setFixedWidth(150)
-            e.setToolTip("Name to show in the PV overlay and on saved images "
-                         "instead of the PV name. Leave empty to keep the PV name.")
-            self._label_edits[pv] = e
-            return e
-
-        def _del_button(tip: str) -> QPushButton:
-            btn = QPushButton("✕")
-            btn.setFixedSize(22, 22)
-            btn.setToolTip(tip)
-            btn.setStyleSheet(
-                "QPushButton { color: #cc0000; font-weight: 700; border: none; padding: 0; }"
-                "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
-            return btn
-
-        for name, pcb in self._checks.items():
-            if not pcb.isChecked():
+    def _grid_header(self, grid: QGridLayout):
+        for c, title in enumerate(self._COL_TITLES):
+            if not title:
                 continue
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
-            lbl = QLabel(name)                       # letter prepended by _refresh_letters
-            h.addWidget(lbl, 1)
-            h.addWidget(_name_edit(name))
-            btn = _del_button("Untick this preset")
-            # Unticking in the grid is what removes the row: one owner of the state, and
-            # the toggle already rebuilds this list.
-            btn.clicked.connect(lambda _=False, c=pcb: c.setChecked(False))
-            h.addWidget(btn)
-            self._custom_layout.addWidget(row)
-            self._preset_labels[name] = lbl
+            lbl = QLabel(title)
+            lbl.setStyleSheet("font-size: 9px; font-weight: 700; color: #666;")
+            grid.addWidget(lbl, 0, c)
 
-        for name in self._custom:
-            row = QWidget()
-            h = QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(4)
-            cb = QCheckBox(name)
-            cb.setChecked(bool(self._custom_enabled.get(name, True)))
-            cb.setToolTip(self._custom[name])
-            h.addWidget(cb, 1)
-            h.addWidget(_name_edit(name))
-            btn = _del_button("Remove this PV")
-            btn.clicked.connect(lambda _=False, n=name: self._remove_channel(n))
-            h.addWidget(btn)
-            self._custom_layout.addWidget(row)
-            self._custom_checks[name] = cb
-        self._custom_layout.addStretch()
-        has = bool(self._custom) or bool(self._preset_labels)
-        self._custom_area.setVisible(has)
-        self._no_custom_lbl.setVisible(not has)
+    def _rebuild_picked_tables(self):
+        """Rebuild both tables from the picked list: shown-on-the-picture first, then
+        the ones that are only read.
+
+        Deferred by every widget that triggers it (see _later): the Show box and the ✕
+        that cause a rebuild are themselves destroyed by it, and deleting a widget from
+        inside its own signal is how this crashes."""
+        self._sync_row_state()
+        for g in (self._grid_on, self._grid_off):
+            while g.count():
+                item = g.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+        self._rows = []
+        self._grid_header(self._grid_on)
+        self._grid_header(self._grid_off)
+
+        n_on = n_off = 0
+        for ent in self._picked_entries():
+            if ent["shown"]:
+                n_on += 1
+                self._add_table_row(self._grid_on, n_on, ent)
+            else:
+                n_off += 1
+                self._add_table_row(self._grid_off, n_off, ent)
+
+        self._title_on.setText(f"On the picture  ({n_on})")
+        self._title_off.setText(f"Read, not on the picture  ({n_off})")
+        self._title_on.setVisible(bool(n_on))
+        self._title_off.setVisible(bool(n_off))
+        self._no_pv_lbl.setVisible(not (n_on or n_off))
+        for name, btn in self._preset_buttons.items():
+            picked = bool(self._preset_in.get(name))
+            btn.setEnabled(not picked)
+            btn.setToolTip(f"{PV_CHANNEL_MAP[name]}\n"
+                           + ("Already in the list" if picked
+                              else "Click to add it to the list"))
         self._refresh_letters()
+
+    def _later(self, fn):
+        """Run fn once the signal that asked for it has been delivered."""
+        QTimer.singleShot(0, fn)
+
+    def _add_table_row(self, grid: QGridLayout, row: int, ent: dict):
+        name, kind = ent["name"], ent["kind"]
+        is_formula = kind == "formula"
+
+        chk = QCheckBox()
+        chk.setChecked(bool(ent["shown"]))
+        chk.setToolTip(
+            "Ticked: this value is printed over the picture and burned into a saved\n"
+            "image — the same eye as in the PV panel.\n"
+            "Unticked: it is still read and still listed, just not on the picture.")
+        chk.toggled.connect(lambda _c=False: self._later(self._rebuild_picked_tables))
+        grid.addWidget(chk, row, 0)
+
+        letter = QLabel("")
+        letter.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a5fb4;")
+        grid.addWidget(letter, row, 1)
+
+        pv_lbl = QLabel()
+        pv_lbl.setStyleSheet("font-size: 11px;")
+        # The PV column carries what the row actually reads: the archiver channel, or
+        # the expression for a formula. Elided in the MIDDLE — a channel's tail
+        # (":Energy") is the half that says what it is.
+        pv_text = (f"= {ent['pv']}" if is_formula else ent["pv"]) or "—"
+        pv_lbl.setText(QFontMetrics(pv_lbl.font()).elidedText(
+            pv_text, Qt.TextElideMode.ElideMiddle, 210))
+        pv_lbl.setToolTip(pv_text if not is_formula else
+                          f"Formula: {pv_text}\nEdited in the formulas below.")
+        grid.addWidget(pv_lbl, row, 2)
+
+        name_edit = None
+        if is_formula:
+            # A formula's name IS the operator's own name for it, typed in the formula
+            # row. A second box for it here would be a name that two fields own.
+            shown_as = QLabel(name)
+            shown_as.setStyleSheet("font-size: 11px; color: #333;")
+            shown_as.setToolTip("A formula is already named by you — change it in the "
+                                "formula row below.")
+            grid.addWidget(shown_as, row, 3)
+        else:
+            name_edit = QLineEdit(self._labels.get(name, ""))
+            name_edit.setPlaceholderText(name)
+            name_edit.setToolTip(
+                "Name to show in the PV panel, over the picture and on saved images.\n"
+                f"Empty = the PV's own name ({name}).")
+            grid.addWidget(name_edit, row, 3)
+
+        unit_edit = None
+        if kind == "own":
+            unit_edit = QLineEdit(self._units.get(name, ""))
+            unit_edit.setPlaceholderText(pv_unit_guess(ent["pv"]) or "?")
+            unit_edit.setToolTip(
+                "Unit printed after the value. The archiver's channel list does not "
+                "carry units, so for a PV of your own this is the only place it can "
+                "come from.\nEmpty = whatever the channel name gives away "
+                f"({pv_unit_guess(ent['pv']) or 'nothing'}).")
+            grid.addWidget(unit_edit, row, 4)
+        else:
+            u = QLabel(pv_units_for(name) or "—")
+            u.setStyleSheet("font-size: 11px; color: #555;")
+            u.setToolTip("From the preset table" if kind == "preset"
+                         else "Typed in the formula row below")
+            grid.addWidget(u, row, 4)
+
+        kind_lbl = QLabel({"preset": "preset", "own": "archiver PV",
+                           "formula": "formula"}[kind])
+        kind_lbl.setStyleSheet("font-size: 10px; color: #666;")
+        kind_lbl.setToolTip({
+            "preset": "One of the house PVs — its channel and unit are code constants.",
+            "own": "An archiver PV you added by search or by name.",
+            "formula": "Computed from other PVs, not read from the archiver.",
+        }[kind])
+        grid.addWidget(kind_lbl, row, 5)
+
+        btn = QPushButton("✕")
+        btn.setFixedSize(self._W_DEL, self._W_DEL)
+        btn.setToolTip("Remove this PV — it stops being read at all")
+        btn.setStyleSheet(
+            "QPushButton { color: #cc0000; font-weight: 700; border: none; padding: 0; }"
+            "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
+        btn.clicked.connect(lambda _=False, e=ent: self._later(
+            lambda: self._remove_pv(e)))
+        grid.addWidget(btn, row, 6)
+
+        self._rows.append({"ent": ent, "chk": chk, "letter": letter,
+                           "name_edit": name_edit, "unit_edit": unit_edit})
 
     # ── formulas ─────────────────────────────────────────────────────────────
     def _pending_names(self) -> "list[str]":
@@ -11336,14 +12171,21 @@ class PvConfigDialog(QDialog):
                 + [r["name"].text().strip() for r in self._derived_rows
                    if r["name"].text().strip()])
 
-    def _add_derived_row(self, existing: "dict | None" = None, enabled: bool = True):
+    def _add_derived_row(self, existing: "dict | None" = None, shown: bool = True):
+        """One formula. It is PICKED by existing at all — the row used to start with a
+        tick box for that, which was the same second meaning of "picked" the preset grid
+        had. Whether it is painted lives in rec["shown"] and is edited in the tables
+        above; keeping it on the record (not under its name) means renaming a formula
+        cannot drop its eye state."""
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
-        cb = QCheckBox("")
-        cb.setChecked(bool(enabled))
-        cb.setToolTip("Show this formula in the PV list")
+        letter_lbl = QLabel("—")
+        letter_lbl.setFixedWidth(20)
+        letter_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a5fb4;")
+        letter_lbl.setToolTip("Channel letter of this formula — other formulas can use "
+                              "it")
         name_e = QLineEdit((existing or {}).get("name", ""))
         name_e.setPlaceholderText("Name")
         name_e.setMinimumWidth(110)
@@ -11364,11 +12206,12 @@ class PvConfigDialog(QDialog):
         btn_del.setStyleSheet(
             "QPushButton { color: #cc0000; font-weight: 700; border: none; padding: 0; }"
             "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
-        for w in (cb, name_e, expr_e, unit_e, warn):
+        for w in (letter_lbl, name_e, expr_e, unit_e, warn):
             h.addWidget(w, 1 if w is expr_e else 0)
         h.addWidget(btn_del)
 
-        rec = {"widget": row, "check": cb, "name": name_e, "expr": expr_e,
+        rec = {"widget": row, "letter": letter_lbl, "shown": bool(shown),
+               "name": name_e, "expr": expr_e,
                "unit": unit_e, "warn": warn,
                "canon": ((existing or {}).get("expr", "") or "",
                          dict((existing or {}).get("bindings") or {}))}
@@ -11376,18 +12219,24 @@ class PvConfigDialog(QDialog):
         btn_del.clicked.connect(lambda _=False, r=rec: self._remove_derived_row(r))
         # A name change re-letters everything below it, so it goes through the
         # full refresh; an expression change only re-canonicalises its own row.
+        # The tables above print the name and the expression, so they follow too —
+        # on editingFinished, not per keystroke: a rebuild on every letter typed would
+        # fight the caret.
         name_e.textEdited.connect(lambda _t: self._refresh_letters())
+        name_e.editingFinished.connect(self._rebuild_picked_tables)
         expr_e.textEdited.connect(lambda _t, r=rec: self._on_derived_expr_edited(r))
+        expr_e.editingFinished.connect(self._rebuild_picked_tables)
+        unit_e.editingFinished.connect(self._rebuild_picked_tables)
         self._derived_layout.insertWidget(self._derived_layout.count() - 1, row)
         self._sync_derived_visibility()
-        self._refresh_letters()
+        self._rebuild_picked_tables()
 
     def _remove_derived_row(self, rec: dict):
         self._derived_rows.remove(rec)
         rec["widget"].setParent(None)
         rec["widget"].deleteLater()
         self._sync_derived_visibility()
-        self._refresh_letters()
+        self._rebuild_picked_tables()
 
     def _sync_derived_visibility(self):
         """Show the formula hint and row area only once a formula exists.
@@ -11423,29 +12272,22 @@ class PvConfigDialog(QDialog):
         pointing at whatever moved into those slots."""
         names = self._pending_names()
         self._by_name, self._by_letter = pv_letters_for(names)
-        for name, cb in self._checks.items():
-            # Preset tick boxes stay plain names — their letter is written out in the
-            # Selected PVs list (and in the tooltip), not on the tick box.
-            letter = self._by_name.get(name, "?")
-            cb.setText(name)
-            cb.setToolTip(f"{PV_CHANNEL_MAP[name]}\nChannel letter {letter}")
-        for name, lbl in getattr(self, "_preset_labels", {}).items():
-            letter = self._by_name.get(name, "?")
-            lbl.setText(f"{letter}  {name}")
-            lbl.setToolTip(f"{PV_CHANNEL_MAP.get(name, name)}\nChannel letter {letter}")
-        for name, cb in self._custom_checks.items():
-            letter = self._by_name.get(name, "?")
-            # Elided in the MIDDLE: a channel name is long enough to push the row's
-            # "show as" box and ✕ off the dialog, and its tail (":Energy") is the half
-            # that says what the PV is. The full name stays in the tooltip.
-            shown = QFontMetrics(cb.font()).elidedText(
-                f"{letter}  {name}", Qt.TextElideMode.ElideMiddle, 290)
-            cb.setText(shown)
-            cb.setToolTip(f"{self._custom.get(name, name)}\nChannel letter {letter}")
+        # The Letter column of both tables. Numbered over _pending_names(), which holds
+        # EVERY preset whether it is picked or not, so A…H are fixed and adding or
+        # removing a PV of your own cannot move them.
+        for row in self._rows:
+            letter = self._by_name.get(row["ent"]["name"], "?")
+            try:
+                row["letter"].setText(letter)
+                row["letter"].setToolTip(
+                    f"Channel letter {letter} — write it in a formula, e.g. "
+                    f"{letter}/B")
+            except RuntimeError:        # row rebuilt under us
+                continue
         for rec in self._derived_rows:
             nm = rec["name"].text().strip()
             letter = self._by_name.get(nm, "—") if nm else "—"
-            rec["check"].setText(letter)
+            rec["letter"].setText(letter)
             old_expr, old_bind = rec["canon"]
             # Carry the bindings through the re-lettering by hand instead of
             # re-reading them off the new text: a letter whose PV has been deleted
@@ -11580,6 +12422,30 @@ class PvConfigDialog(QDialog):
 # is shown through _show_long_tip instead, which sets its own display time.
 LONG_TIP_MS = 120_000
 
+# Qt hands a tooltip to the widget it belongs to, which means an UNQUALIFIED
+# "background: #1a1a1a" on an ancestor — the wrappers behind the camera area do
+# exactly that — reaches the tooltip as well and draws dark text on a dark box. Every
+# dark wrapper therefore carries this rule too, so a tooltip over the picture stays a
+# light, readable box. QToolTip beats the wrapper's rule on specificity.
+TOOLTIP_QSS = ("QToolTip { background: #ffffe1; color: #111111; "
+               "border: 1px solid #767676; padding: 4px; }")
+
+# Qt switches word wrap ON only for a tooltip whose text looks like HTML, so a plain
+# paragraph is laid out on ONE line — which is how the marker help came out as a bar
+# right across the screen. Wrapping is done here instead, so the width of a tip never
+# depends on how Qt feels about the text.
+TIP_WRAP_CHARS = 74
+
+
+def _wrap_tip_text(text: str) -> str:
+    """Break every paragraph of `text` to TIP_WRAP_CHARS, keeping blank lines."""
+    import textwrap
+    out = []
+    for line in text.split("\n"):
+        out.append("\n".join(textwrap.wrap(line, TIP_WRAP_CHARS))
+                   if line.strip() else "")
+    return "\n".join(out)
+
 
 def _show_long_tip(widget, global_pos, text: str, rect: "QRect | None" = None):
     """Show `text` as a tooltip that stays up for LONG_TIP_MS.
@@ -11590,9 +12456,111 @@ def _show_long_tip(widget, global_pos, text: str, rect: "QRect | None" = None):
     if not text:
         QToolTip.hideText()
         return
-    QToolTip.showText(global_pos, text, widget,
+    QToolTip.showText(global_pos, _wrap_tip_text(text), widget,
                       rect if rect is not None else QRect(), LONG_TIP_MS)
 
+
+class PvValueTable(QTableWidget):
+    """The PV panel's list of picked PVs: eye · PV · value.
+
+    ONE widget for every tab that reports PV values (the Image Slider and the Image
+    Finder), so two tabs reading the same registry cannot end up with two different
+    tables over it.
+
+    The host owns the numbers: refresh() takes a `value_of(name)` callback returning
+    (text, grey, tooltip). HOW a value is fetched, and how "this shot" is told apart
+    from "an older shot", is a per-tab matter; what a row looks like is not.
+
+    The eye is `_pv_hidden` in either host: the PV keeps being read and stays listed
+    here, it is only taken off the picture.
+    """
+
+    eye_clicked = Signal(str)          # PV name whose eye was clicked
+
+    ROW_H = 20
+
+    def __init__(self, parent=None):
+        super().__init__(0, 3, parent)
+        # Column 0 is the eye. It carries no title: at 24 px a word would be elided to
+        # "…", i.e. the one control in this table would be the unreadable part. The
+        # glyph plus its tooltip is the label.
+        self.setHorizontalHeaderLabels(["", "PV", "Value"])
+        # Name stretches (and elides), value sizes to its content — the other way
+        # round, a user-added PV name like "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
+        # ate the whole 275 px sidebar and pushed the VALUE out of sight.
+        # The eye column sizes to its glyph rather than to a hand-picked width: an
+        # emoji is wider than the digits around it and a fixed 24 px elided it to
+        # "…".
+        hh = self.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.verticalHeader().setVisible(False)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMaximumHeight(120)
+        self.setStyleSheet("font-size: 11px;")
+        self._names: "list[str]" = []
+        self.cellClicked.connect(self._on_cell_clicked)
+        # The value column's tooltips EXPLAIN a state ("belongs to an earlier shot",
+        # "not published yet"), and Qt takes its own tooltips away after ~10 s. They
+        # are therefore shown by hand from eventFilter — see _show_long_tip.
+        self.viewport().installEventFilter(self)
+
+    def _on_cell_clicked(self, row: int, col: int):
+        if col == 0 and 0 <= row < len(self._names):
+            self.eye_clicked.emit(self._names[row])
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QEvent.Type.ToolTip and obj is self.viewport()):
+            idx = self.indexAt(event.pos())
+            item = self.item(idx.row(), idx.column()) if idx.isValid() else None
+            _show_long_tip(self.viewport(), event.globalPos(),
+                           item.toolTip() if item is not None else "",
+                           self.visualRect(idx) if idx.isValid() else None)
+            return True
+        return super().eventFilter(obj, event)
+
+    def refresh(self, names: "list[str]", hidden: "set[str]", value_of):
+        """Repaint the whole list. `names` is the picked list in canonical order,
+        `hidden` the PVs that are off the picture, `value_of(name)` the host's
+        (text, grey, tooltip) for one row."""
+        self._names = list(names)
+        self.setRowCount(len(self._names))
+        self.setMaximumHeight(self.ROW_H * max(len(self._names), 1) + 26)
+        for i, name in enumerate(self._names):
+            shown = name not in hidden
+            # Two different glyphs, not one glyph in two colours: on this table the
+            # state has to be readable at a glance and colour alone is not.
+            eye_item = QTableWidgetItem("👁" if shown else "🚫")
+            eye_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            eye_item.setToolTip("Shown in the image overlay — click to hide it"
+                                if shown else
+                                "Hidden in the image overlay (still read, and still "
+                                "listed here) — click to show it")
+            if not shown:
+                eye_item.setForeground(QColor("#999999"))
+            name_item = QTableWidgetItem(pv_label_for(name))
+            # The name is elided when it is too long for the sidebar (a user-added
+            # PV is named after its channel), so the full one goes in the tooltip.
+            # A named PV shows the name it was given, so the tooltip is the only
+            # place the channel behind it is still written out.
+            d = pv_derived_def(name)
+            name_item.setToolTip(f"= {d.get('expr')}" if d is not None
+                                 else (pv_channel_for(name) or name))
+            if not shown:
+                name_item.setForeground(QColor("#888888"))
+            text, grey, tip = value_of(name)
+            val_item = QTableWidgetItem(text)
+            if grey:
+                val_item.setForeground(QColor("#888888"))
+            if tip:
+                val_item.setToolTip(tip)
+            self.setItem(i, 0, eye_item)
+            self.setItem(i, 1, name_item)
+            self.setItem(i, 2, val_item)
+            self.setRowHeight(i, self.ROW_H)
 
 class _PvOverlayPanel(QWidget):
     """
@@ -12117,12 +13085,13 @@ class Viewer(QWidget):
         self._diag_load = 0   # painted from a real share read
         self._diag_cach = 0   # painted from the rendered-pixmap cache (revisited frame)
         self._diag_hq   = 0   # tiles re-rendered at native res after a settle (_hq_upgrade_tiles)
-        # Per-paint ledger for bench_drag.py / bench_play.py, off unless the env var is
-        # set. The per-minute counters above aggregate across cameras and cannot answer
-        # the question the whole preview layer exists for: how far was the frame that
-        # actually got painted from the one the slider asked for. Recording it here —
-        # in the app, at the one funnel every paint goes through (_cam_note_painted) —
-        # keeps the harness measuring the shipping code instead of a copy that drifts.
+        # Per-paint ledger for testing/bench_drag.py / testing/bench_play.py, off unless
+        # the env var is set. The per-minute counters above aggregate across cameras and
+        # cannot answer the question the whole preview layer exists for: how far was the
+        # frame that actually got painted from the one the slider asked for. Recording it
+        # here — in the app, at the one funnel every paint goes through
+        # (_cam_note_painted) — keeps the harness measuring the shipping code instead of
+        # a copy that drifts.
         self._bench = [] if os.environ.get("IMAGE_TOOLS_BENCH") else None
         self._proxy_grace_until = 0.0  # monotonic deadline; no dispatch before it
         self._proxy_was_enabled = None   # last _proxy_enabled() seen by _proxy_sync_enabled
@@ -12658,52 +13627,13 @@ class Viewer(QWidget):
         self._ui_state = self._load_ui_state()
         self._sections: "dict[str, CollapsibleSection]" = {}
 
-        # Restore the user-added PVs BEFORE the selection below — pv_all_channels()
-        # has to already know them, or a restart silently drops every custom PV from
-        # the panel while keeping the presets.
-        _saved_custom = self._ui_state.get("pv_custom")
-        if isinstance(_saved_custom, dict):
-            PV_CUSTOM_CHANNELS.clear()
-            for _n, _ch in _saved_custom.items():
-                if isinstance(_ch, str) and _ch.strip() and str(_n) not in PV_CHANNEL_MAP:
-                    PV_CUSTOM_CHANNELS[str(_n)] = _ch.strip()
-
-        # Same for the formulas, and for the same reason — plus a name that clashes
-        # with a read PV is dropped: pv_channel_for() would win over it and the
-        # formula would never be evaluated, which reads as "my formula shows the
-        # wrong number" rather than as a name clash.
-        _saved_derived = self._ui_state.get("pv_derived")
-        if isinstance(_saved_derived, list):
-            PV_DERIVED.clear()
-            _taken = set(PV_CHANNEL_MAP) | set(PV_CUSTOM_CHANNELS)
-            for _d in _saved_derived:
-                if not isinstance(_d, dict):
-                    continue
-                _nm = str(_d.get("name") or "").strip()
-                _ex = str(_d.get("expr") or "").strip()
-                if not _nm or not _ex or _nm in _taken:
-                    continue
-                _bnd = _d.get("bindings")
-                PV_DERIVED.append({
-                    "name": _nm, "expr": _ex,
-                    "unit": str(_d.get("unit") or ""),
-                    "bindings": {str(k): str(v) for k, v in _bnd.items()}
-                                if isinstance(_bnd, dict) else {},
-                })
-                _taken.add(_nm)
-
-        # The names the operator gave the PVs. Kept for every PV that still exists,
-        # ticked or not: unticking a PV must not throw away the name typed for it.
-        _saved_labels = self._ui_state.get("pv_labels")
-        if isinstance(_saved_labels, dict):
-            PV_LABELS.clear()
-            # Read PVs only. A formula's name is already typed by the operator, so it
-            # has no name box in the picker and must not carry a label from a state
-            # file either — that would be a name nothing on screen can edit.
-            _known = set(PV_CHANNEL_MAP) | set(PV_CUSTOM_CHANNELS)
-            for _n, _lbl in _saved_labels.items():
-                if isinstance(_lbl, str) and _lbl.strip() and str(_n) in _known:
-                    PV_LABELS[str(_n)] = _lbl.strip()
+        # The registry — the added PVs, the formulas, the names and the units — is
+        # SHARED with the Image Finder and has its own store, so neither tab can
+        # overwrite what the other one added. It has to be loaded BEFORE the selection
+        # below: pv_all_channels() must already know an added PV, or a restart silently
+        # drops it from the panel while keeping the presets. The Slider's own state file
+        # is the fallback, since these four keys used to live in it.
+        pv_registry_load(fallback=self._ui_state)
 
         _saved_hidden = self._ui_state.get("pv_hidden")
         if isinstance(_saved_hidden, list):
@@ -13489,32 +14419,11 @@ class Viewer(QWidget):
         pv_overlay_row.addWidget(self._btn_pv_overlay_settings)
         s_pv.body_layout.addLayout(pv_overlay_row)
 
-        self._pv_table = QTableWidget(0, 3)
-        # Column 0 is the eye: every selected PV is listed here, presets included,
-        # and clicking its eye takes that PV out of the on-image overlay while the
-        # value keeps updating in this table.
-        self._pv_table.setHorizontalHeaderLabels(["", "PV", "Value"])
-        # Name stretches (and elides), value sizes to its content — the other way
-        # round, a user-added PV name like "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
-        # ate the whole 275 px sidebar and pushed the VALUE out of sight.
-        # The eye column sizes to its glyph rather than to a hand-picked width: an
-        # emoji is wider than the digits around it and a fixed 24 px elided it to
-        # "…", i.e. the one control in this table would have been unreadable.
-        self._pv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self._pv_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._pv_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._pv_table.verticalHeader().setVisible(False)
-        self._pv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._pv_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self._pv_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._pv_table.setMaximumHeight(120)
+        # Shared with the Image Finder — see PvValueTable. Clicking a PV's eye takes
+        # it out of the on-image overlay while its value keeps updating here.
+        self._pv_table = PvValueTable()
         self._pv_table.setVisible(False)
-        self._pv_table.setStyleSheet("font-size: 11px;")
-        self._pv_table.cellClicked.connect(self._pv_on_table_clicked)
-        # The value column's tooltips EXPLAIN a state ("belongs to an earlier shot",
-        # "not published yet"), and Qt takes its own tooltips away after ~10 s. They
-        # are therefore shown by hand from eventFilter — see _show_long_tip.
-        self._pv_table.viewport().installEventFilter(self)
+        self._pv_table.eye_clicked.connect(self._pv_toggle_eye)
         s_pv.body_layout.addWidget(self._pv_table)
 
         self._pv_no_pv_lbl = QLabel("No PVs selected. Click ⚙ to configure.")
@@ -13662,7 +14571,9 @@ class Viewer(QWidget):
         # Outer row container — dark background, holds camera + pointing panel
         _cam_row_widget = QWidget()
         _cam_row_widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _cam_row_widget.setStyleSheet("background: #1a1a1a;")
+        # "*" keeps the dark background reaching the children exactly as the bare
+        # declaration did; TOOLTIP_QSS takes the tooltip back out of the dark.
+        _cam_row_widget.setStyleSheet("* { background: #1a1a1a; }" + TOOLTIP_QSS)
         _cam_row_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._cam_row_widget = _cam_row_widget
 
@@ -13674,7 +14585,7 @@ class Viewer(QWidget):
         # Single-cam: image + label bar BELOW (not overlapping) the image.
         _single_wrapper = QWidget()
         _single_wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _single_wrapper.setStyleSheet("background: #1a1a1a;")
+        _single_wrapper.setStyleSheet("* { background: #1a1a1a; }" + TOOLTIP_QSS)
         _single_wrapper.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         _swl = QVBoxLayout(_single_wrapper)
         _swl.setContentsMargins(0, 0, 0, 0)
@@ -14075,7 +14986,8 @@ class Viewer(QWidget):
     # ================================================================ PV VALUES
     def _open_pv_config(self):
         dlg = PvConfigDialog(self._pv_enabled, PV_CUSTOM_CHANNELS, PV_DERIVED,
-                             PV_LABELS, parent=self)
+                             PV_LABELS, hidden=self._pv_hidden,
+                             units=PV_CUSTOM_UNITS, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         PV_CUSTOM_CHANNELS.clear()
@@ -14083,10 +14995,14 @@ class Viewer(QWidget):
         PV_DERIVED[:] = dlg.derived_defs()
         PV_LABELS.clear()
         PV_LABELS.update(dlg.labels())
+        PV_CUSTOM_UNITS.clear()
+        PV_CUSTOM_UNITS.update(dlg.custom_units())
         self._pv_enabled = dlg.selected_names()
-        # Forget the eye state of PVs that are no longer selected, or a name that
+        # The eye now has TWO editors — this dialog's Show column and the sidebar
+        # table — over one state. The dialog is authoritative on the way out.
+        # Forget the eye state of PVs that are no longer in the list, or a name that
         # comes back later would return invisible for no reason the user can see.
-        self._pv_hidden &= set(self._pv_enabled)
+        self._pv_hidden = set(dlg.hidden_names()) & set(self._pv_enabled)
         self._pv_values  = {}
         self._pv_values_ts = None
         self._pv_target_ts = None
@@ -14095,14 +15011,13 @@ class Viewer(QWidget):
         self._pv_last_good_ts = {}
         self._pv_no_sample = set()
         self._pv_awaiting = set()
-        # Persist, so the selection survives a restart (see the restore in _build_ui).
-        # The added PVs and formulas are saved even when unticked — the search that
-        # found them (or the formula that was typed) should not have to be repeated
-        # just because it is off for now.
+        # Persist. The REGISTRY (added PVs, formulas, names, units) goes to the shared
+        # store — the Image Finder edits the same one — while what stays here is this
+        # tab's own selection and eye state. An added PV or a typed formula is kept even
+        # when it is not selected: the search that found it should not have to be
+        # repeated because it is off for now.
+        pv_registry_save()
         self._ui_state["pv_enabled"] = list(self._pv_enabled)
-        self._ui_state["pv_custom"]  = dict(PV_CUSTOM_CHANNELS)
-        self._ui_state["pv_derived"] = [dict(d) for d in PV_DERIVED]
-        self._ui_state["pv_labels"]  = dict(PV_LABELS)
         self._ui_state["pv_hidden"]  = sorted(self._pv_hidden)
         self._save_ui_state()
         self._pv_rebuild_table()
@@ -14114,11 +15029,10 @@ class Viewer(QWidget):
         The sidebar table lists all of them — this is the eye filter only."""
         return [n for n in self._pv_enabled if n not in self._pv_hidden]
 
-    def _pv_on_table_clicked(self, row: int, col: int):
+    def _pv_toggle_eye(self, name: str):
         """Eye column: toggle whether this PV appears in the on-image overlay."""
-        if col != 0 or not (0 <= row < len(self._pv_enabled)):
+        if name not in self._pv_enabled:
             return
-        name = self._pv_enabled[row]
         if name in self._pv_hidden:
             self._pv_hidden.discard(name)
         else:
@@ -14134,66 +15048,42 @@ class Viewer(QWidget):
         self._pv_no_pv_lbl.setVisible(not has)
         if not has:
             return
-        self._pv_table.setRowCount(len(self._pv_enabled))
-        row_h = 20
-        self._pv_table.setMaximumHeight(row_h * len(self._pv_enabled) + 26)
-        pending = self._pv_is_pending()
-        for i, name in enumerate(self._pv_enabled):
-            shown = name not in self._pv_hidden
-            # Two different glyphs, not one glyph in two colours: on this table the
-            # state has to be readable at a glance and colour alone is not.
-            eye_item = QTableWidgetItem("👁" if shown else "🚫")
-            eye_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            eye_item.setToolTip("Shown in the image overlay — click to hide it"
-                                if shown else
-                                "Hidden in the image overlay (still read, and still "
-                                "listed here) — click to show it")
-            if not shown:
-                eye_item.setForeground(QColor("#999999"))
-            name_item = QTableWidgetItem(pv_label_for(name))
-            # The name is elided when it is too long for the sidebar (a user-added
-            # PV is named after its channel), so the full one goes in the tooltip.
-            # A named PV shows the name it was given, so the tooltip is the only
-            # place the channel behind it is still written out.
-            d = pv_derived_def(name)
-            name_item.setToolTip(f"= {d.get('expr')}" if d is not None
-                                 else (pv_channel_for(name) or name))
-            if not shown:
-                name_item.setForeground(QColor("#888888"))
-            val_item = QTableWidgetItem(self._pv_display_text(name))
-            if name in self._pv_awaiting:
-                # The frame is younger than anything the archiver has published, so
-                # this shot's own number cannot exist yet. Named separately from
-                # "no sample": the panel is waiting and WILL fill it in on its own.
-                val_item.setForeground(QColor("#888888"))
-                behind = self._pv_head_behind_s(name)
-                lag_txt = (f" (published up to {behind:.1f} s before this frame)"
-                           if behind is not None else "")
-                val_item.setToolTip(
-                    "No data yet: the archiver has not published this frame's "
-                    f"reading{lag_txt}. The panel keeps asking and the value fills "
-                    "itself in — nothing to do. If it never arrives it ends as "
-                    "\"n/a\"." + self._pv_source_frame_note(name))
-            elif pending:
-                # These numbers were fetched for another frame — say so instead of
-                # letting them read as this frame's values.
-                val_item.setForeground(QColor("#888888"))
-                val_item.setToolTip(
-                    "Reading the archiver right now — this number is still the "
-                    "previous frame's. It is replaced as soon as the answer arrives.")
-            elif self._pv_is_held(name):
-                val_item.setForeground(QColor("#888888"))
-                note = self._pv_source_frame_note(name)
-                val_item.setToolTip(
-                    ("Older shot: this frame is newer than anything the archiver has "
-                     "published, so the last fully archived shot's number is shown "
-                     "instead." + note) if note else
-                    "Older shot: no reading was archived near this frame, so the last "
-                    "value this PV reported is shown.")
-            self._pv_table.setItem(i, 0, eye_item)
-            self._pv_table.setItem(i, 1, name_item)
-            self._pv_table.setItem(i, 2, val_item)
-            self._pv_table.setRowHeight(i, row_h)
+        self._pv_table.refresh(self._pv_enabled, self._pv_hidden, self._pv_row_value)
+
+    def _pv_row_value(self, name: str) -> "tuple[str, bool, str]":
+        """(text, grey, tooltip) for one row of the PV table.
+
+        Everything here is about WHICH SHOT the number belongs to — the one thing the
+        table cannot work out for itself, and the one that used to be missed: a held
+        value sitting next to a live picture looks exactly like this frame's reading."""
+        text = self._pv_display_text(name)
+        if name in self._pv_awaiting:
+            # The frame is younger than anything the archiver has published, so
+            # this shot's own number cannot exist yet. Named separately from
+            # "no sample": the panel is waiting and WILL fill it in on its own.
+            behind = self._pv_head_behind_s(name)
+            lag_txt = (f" (published up to {behind:.1f} s before this frame)"
+                       if behind is not None else "")
+            return text, True, (
+                "No data yet: the archiver has not published this frame's "
+                f"reading{lag_txt}. The panel keeps asking and the value fills "
+                "itself in — nothing to do. If it never arrives it ends as "
+                "\"n/a\"." + self._pv_source_frame_note(name))
+        if self._pv_is_pending():
+            # These numbers were fetched for another frame — say so instead of
+            # letting them read as this frame's values.
+            return text, True, (
+                "Reading the archiver right now — this number is still the "
+                "previous frame's. It is replaced as soon as the answer arrives.")
+        if self._pv_is_held(name):
+            note = self._pv_source_frame_note(name)
+            return text, True, (
+                ("Older shot: this frame is newer than anything the archiver has "
+                 "published, so the last fully archived shot's number is shown "
+                 "instead." + note) if note else
+                "Older shot: no reading was archived near this frame, so the last "
+                "value this PV reported is shown.")
+        return text, False, ""
 
     def _pv_trigger_fetch(self):
         """Rate-limited entry with a LEADING edge: the first frame change fires the
@@ -14499,9 +15389,9 @@ class Viewer(QWidget):
                     ts_ns = cam_items[0].ts_ns
                     break
         if ts_ns is not None:
-            date_key = _pv_date_key(ts_ns)
+            date_key = cpva.date_key_for_ns(ts_ns)
             cpva.invalidate(date_key=date_key)
-            cpva.invalidate(date_key=_pv_prev_date_key(date_key))
+            cpva.invalidate(date_key=cpva.prev_date_key(date_key))
             cpva.invalidate(date_key=cpva.next_date_key(date_key))
             # Also drop the day-boundary look-back anchors, or a step PV keeps
             # reporting the value cached before the refresh.
@@ -15490,8 +16380,8 @@ class Viewer(QWidget):
         one — every time, in the same direction. Three paths asked a handle where it was and
         each therefore stepped one frame back: clicking the handle without moving it,
         releasing a drag, and a master switch, which dragged every slave one frame off the
-        master's own picture with it. Measured in bench_master_sync.py; on a 3.3 Hz camera
-        it is a visible 0.3 s jump.
+        master's own picture with it. Measured in testing/bench_master_sync.py; on a
+        3.3 Hz camera it is a visible 0.3 s jump.
 
         Answered from the HANDLE and nothing else — deliberately not from _nav_frame or
         _cam_current_idx, which are frame INDICES. Those are only meaningful against the
@@ -16709,7 +17599,8 @@ class Viewer(QWidget):
         # — at 3.3 Hz one undecodable frame sits only 0.3 s ahead of the one on screen,
         # i.e. inside the catch-up tolerance, so a source that stopped right after
         # writing a corrupt frame read as perfectly healthy (measured in
-        # bench_live_dot.py case 3). A frame caught mid-write still cannot flash the dot:
+        # testing/bench_live_dot.py case 3). A frame caught mid-write still cannot flash
+        # the dot:
         # it needs CAM_READ_FAIL_RED_N consecutive failures AND then to stay unreadable
         # for the whole CAM_UNDISPLAYED_RED_S latch, and the first successful decode
         # clears the counter through _note_cam_read_ok.
@@ -18548,6 +19439,16 @@ class Viewer(QWidget):
         self.lbl_bright_name.setEnabled(live)
         self.lbl_bright_val.setEnabled(live)
         self.lbl_gamma_val.setEnabled(gamma_usable)
+        # …and while Auto owns the number, print it as a measurement rather than as a
+        # setting (see _bc_value_label). Auto CONTRAST also drives the gamma readout:
+        # it neutralises gamma, so what stands in that box is no longer the user's curve.
+        _bc_value_set_auto(self.lbl_contrast_val, self.cb_bright.isChecked(),
+                           _TT_CONTRAST)
+        _bc_value_set_auto(self.lbl_bright_val, self.cb_bright_auto.isChecked(),
+                           _TT_BRIGHTNESS)
+        _bc_value_set_auto(self.lbl_gamma_val,
+                           self.cb_gamma_auto.isChecked() or self.cb_bright.isChecked(),
+                           _TT_GAMMA)
 
     def _bc(self) -> _RenderBC:
         """Brightness/contrast/gamma exactly as the controls stand right now."""
@@ -19612,41 +20513,7 @@ class Viewer(QWidget):
                                               self._proxy_signals, self._proxy_stop,
                                               side=self._proxy_side()))
 
-    def _check_scale_generation(self):
-        """Throw away rendered frames after a camera's reference range grew.
-
-        A pixmap is only valid for the range it was drawn against (see the BRIGHTNESS
-        note). The range grows the first time a camera turns up a frame the archiver
-        bracketed HIGHER than anything seen before — typically within the first seconds of
-        the first window ever opened on that camera, after which cam_depths.json knows the
-        answer and this never fires again. Without it, the frames rendered before that
-        moment would keep the old brightness and sit next to correctly rendered ones,
-        which is the exact flicker being fixed.
-
-        Called from the load handlers because that is where a growth can just have
-        happened — the loaders are the only thing that learns."""
-        gen = img_scale.reference_generation()
-        if gen == getattr(self, "_scale_gen", gen):
-            self._scale_gen = gen
-            return
-        self._scale_gen = gen
-        self.cache.clear()
-        self._proxy_render_cache.clear()
-        for c in getattr(self, "_cam_caches", ()) or ():
-            c.clear()
-        if not self.items or self.current_idx is None:
-            return
-        if self._is_multi_cam():
-            self._reset_cam_pipeline()
-            self._redraw_all_cams_in_place()
-            return
-        self._inflight.clear(); self._want_display_req.clear()
-        self._display_load_key = None; self._deferred_display = None
-        idx = self.current_idx
-        self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=False)
-
     def _on_proxy_batch(self, gen: int, track_i: int, results: list):
-        self._check_scale_generation()
         if gen != self._proxy_gen:
             return
         self._proxy_inflight = max(0, self._proxy_inflight - 1)
@@ -19809,11 +20676,10 @@ class Viewer(QWidget):
         if gradient_id == GRADIENT_ID_DEFAULT:
             brighten = 0
             bc = _RENDER_BC_NONE
-        # The reference generation is part of the key: a cached pixmap is only valid for
-        # the range it was drawn against, and that range grows the first time a camera
-        # shows its bigger bracket (see img_scale.reference_generation).
-        key = ("proxy", track_i, ts_ns, brighten, bc, gradient_id,
-               img_scale.reference_generation())
+        # No range term in the key: every frame is drawn against img_scale.SENSOR_BITS,
+        # which is a constant, so a cached pixmap can never have been drawn against a
+        # different one.
+        key = ("proxy", track_i, ts_ns, brighten, bc, gradient_id)
         pm = self._proxy_render_cache.get(key)
         if pm is not None and not pm.isNull():
             return pm
@@ -20133,7 +20999,8 @@ class Viewer(QWidget):
             # here: re-displaying the merged index would drag every camera to one moment.
             if self._per_cam_master_idx < 0 and self._per_cam_rows:
                 return
-            self._display_multicam_index(self.current_idx, update_slider=False)
+            self._display_multicam_index(self.current_idx, update_slider=False,
+                                         from_refine=True)
             return
         idx = self.current_idx
         # Fit-to-window viewing does not benefit from a 2560×2160 render: the view is at
@@ -21037,8 +21904,18 @@ class Viewer(QWidget):
         self._set_info_for(idx, self.play_time_ns)
         self._display_multicam_index(idx, update_slider=False)
 
-    def _display_multicam_index(self, idx: int, update_slider: bool = False):
-        """Display each camera's latest frame with ts_ns <= merged timeline ts at idx."""
+    def _display_multicam_index(self, idx: int, update_slider: bool = False,
+                                from_refine: bool = False):
+        """Display each camera's latest frame with ts_ns <= merged timeline ts at idx.
+
+        `from_refine` marks the call made BY the settle pass (_refine_current_frame) rather
+        than by a navigation. It stops the tiles from re-arming that same pass: a preview
+        repaint normally calls _schedule_refine, so a refine that repainted from the preview
+        armed itself again 200 ms later, forever. Measured in the diag log as
+        prev≈1750/min (6 tiles x 5 Hz) with the panel standing completely still, and — the
+        reason it matters — hq=0, because _schedule_hq's 500 ms deadline was pushed out
+        every 200 ms and the native upgrade could never fire. The tiles therefore stayed at
+        preview resolution for as long as the window was open."""
         if not self._is_multi_cam() or not self._cam_items:
             return
         if not self.items:
@@ -21140,7 +22017,12 @@ class Viewer(QWidget):
             if self._proxy_try_paint_cam(cam_i, cam_idx):
                 if cam_i < len(self._cam_want):
                     self._cam_want[cam_i] = None
-                self._schedule_refine()
+                # Not when the refine pass is what called us — see `from_refine`. The
+                # HQ tier stays armed from the interaction that got us here, so the tile
+                # still gets its native render; it is only this 200 ms pass that must not
+                # restart itself.
+                if not from_refine:
+                    self._schedule_refine()
                 continue
 
             # Coalesced load: like _per_cam_display_one, remember only the LATEST wanted
@@ -21193,9 +22075,6 @@ class Viewer(QWidget):
             self._note_cam_read_fail(cam_i, idx)
             self._start_cam_load(cam_i)
             return
-        # This frame may be the one that just grew its camera's reference range; every
-        # tile rendered against the old one has to go (see _check_scale_generation).
-        self._check_scale_generation()
         _ok_items = _at(self._cam_items, cam_i, None)
         self._note_cam_read_ok(
             cam_i, _ok_items[idx].ts_ns
@@ -21406,7 +22285,8 @@ class Viewer(QWidget):
         # Remember WHICH frame failed. Any-success-clears was wrong: the single-camera
         # view idle-prefetches its neighbours, so a successful decode of an OLDER frame
         # erased the failure on the newest one and the dot went back to green over a
-        # frame it still could not show (measured — bench_live_dot.py --cams 1, case 3).
+        # frame it still could not show (measured — testing/bench_live_dot.py --cams 1,
+        # case 3).
         if ts >= _at(self._cam_read_fail_ts, cam_idx, 0):
             self._cam_read_fail_ts[cam_idx] = ts
             self._cam_read_fail[cam_idx] += 1
@@ -21510,7 +22390,8 @@ class Viewer(QWidget):
             # PREVIOUS frame. Nothing asked again afterwards (the retry in
             # _pv_arm_wait_retry compares against the same request-time frame and sees
             # nothing wrong), so the numbers stayed one shot behind the picture for as
-            # long as the operator kept shooting — measured in bench_pv_live_multi.py.
+            # long as the operator kept shooting — measured in
+            # testing/bench_pv_live_multi.py.
             # Rate-limited like every other trigger, so a drag cannot flood the
             # archiver: PV_REFRESH_MIN_INTERVAL_S still caps the whole panel.
             if self._pv_enabled and cam_idx == self._pv_cam_index():
@@ -21736,7 +22617,6 @@ class Viewer(QWidget):
 
     def _on_loaded(self, gen, req_id, idx, max_side, brighten, gradient_id, bc, img, key=None):
         if gen != self._gen: return
-        self._check_scale_generation()
         # Use the EXACT key the launcher registered in _inflight / _want_display_req /
         # _display_load_key. Recomputing it from live UI state (as this used to) drifted
         # from the launch key on any mid-flight reference/subtract/gradient change, which
@@ -22216,19 +23096,11 @@ class Viewer(QWidget):
 
     def eventFilter(self, obj, event):
         from PySide6.QtCore import QEvent
-        # PV table: show the cell's tooltip ourselves so it stays readable. Qt hides
-        # a tooltip after ~10 s and then will not show it again until the pointer has
-        # left the widget and come back — on text that explains why a number belongs
-        # to another shot, that is the tooltip vanishing mid-sentence.
-        pv_tbl = getattr(self, "_pv_table", None)
-        if (event.type() == QEvent.Type.ToolTip and pv_tbl is not None
-                and obj is pv_tbl.viewport()):
-            idx = pv_tbl.indexAt(event.pos())
-            item = pv_tbl.item(idx.row(), idx.column()) if idx.isValid() else None
-            _show_long_tip(pv_tbl.viewport(), event.globalPos(),
-                           item.toolTip() if item is not None else "",
-                           pv_tbl.visualRect(idx) if idx.isValid() else None)
-            return True
+        # The PV table shows its own long-lived tooltips (PvValueTable.eventFilter):
+        # Qt hides a tooltip after ~10 s and then will not show it again until the
+        # pointer has left the widget and come back, which on text explaining why a
+        # number belongs to another shot means it vanishes mid-sentence.
+        #
         # getattr, not attribute access: this filter is installed on widgets built
         # DURING _build_ui, so it starts receiving events before the modes below
         # exist, and a plain lookup raises out of Qt's event dispatch.

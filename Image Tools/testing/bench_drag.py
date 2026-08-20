@@ -7,10 +7,10 @@ paint guards all run exactly as they do under a mouse.
 The question it answers is the one the user actually asked: do all cameras change together
 while the slider moves, and does the picture match the handle?
 
-  python bench_drag.py                          # synthetic data, 4 cams x 600 frames
-  python bench_drag.py --cams 4 --frames 2000
-  python bench_drag.py --wait-prox 0            # drag with a COLD preview (the bad case)
-  python bench_drag.py --root "\\\\users-L3...\\2026\\08\\11\\09"   # real share folders
+  python testing/bench_drag.py                          # synthetic data, 4 cams x 600 frames
+  python testing/bench_drag.py --cams 4 --frames 2000
+  python testing/bench_drag.py --wait-prox 0            # drag with a COLD preview (the bad case)
+  python testing/bench_drag.py --root "\\\\users-L3...\\2026\\08\\11\\09"   # real share folders
 
 --wait-prox is the important knob: 0 reproduces "opened a window and dragged immediately",
 1.0 waits for the preview to finish first. Run both — the fix has to help the cold case,

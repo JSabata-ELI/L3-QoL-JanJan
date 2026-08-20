@@ -1,152 +1,107 @@
-Dev Tools — Information
-Created by Jan Moučka, ELI Laser
+﻿Dev Tools — Short information
+Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
+Detailed version: ReadMe_Dev Tools_Full.txt  ("Details" button)
+-----------------------------------------------------------------
 
-Personal tool for building and deploying the python projects in
-this repository. One window, two tabs sharing one log:
+WHAT IT DOES
 
-  Builder        — turns a project folder into an exe
-  Copy Manager   — copies the built exe to Scratch / SharePoint
+  Turns the source folders in this repository into finished Windows
+  programs, and puts those programs onto the shares where everybody
+  runs them from.
 
+  One window, two tabs sharing one log:
 
-=================================================================
-SET PATHS (both tabs)
-=================================================================
-
-  Sources root   — the repository with the .py projects
-  Dist root      — where builds are written (…/dist)
-  Scratch        — deployment target 1 (also holds Versions.txt)
-  SharePoint     — deployment target 2
-
-  Stored in %APPDATA%\DevTools\config.json. This matters when Dev
-  Tools itself runs as an exe — it can no longer guess the repo
-  location from its own path.
+    Builder        source folder  ->  a program
+    Copy Manager   a program      ->  the shares
 
 
-=================================================================
-BUILDER TAB
-=================================================================
+THE FOUR PATHS
 
-  Projects are discovered automatically: every folder under the
-  sources root that contains a .py file. Entry point is picked as
-  <folder name>.py, then main.py, then app.py.
+  Sources root   the repository with the source folders
+  Dist root      where finished builds are written
+  Scratch        the first place programs are published to
+  SharePoint     the second
 
-  Each project is grouped as Main / Side / Ignored (the grouping
-  is remembered) and shows its last built version plus the next
-  one, which is the patch bump by default and can be typed over.
-
-  Tick the projects you want, then Build. Output goes to
-
-      dist/<project>/v<version>/<project> v<version>.exe
-
-  together with a copy of the sources, icon.ico and _internal/.
-
-  After a build the tool switches to the Copy Manager tab with
-  the built projects already selected.
-
-  The build is PyInstaller --onedir --windowed. On top of that:
-    - test_*.py is never bundled (dev-only).
-    - numpy / scipy / sklearn / cv2 / matplotlib / pandas get
-      --collect-all automatically when the sources import them,
-      so their native libraries are not missing at runtime.
-    - the test suites those packages drag in are excluded again.
-    - the folders images\, sounds\, assets\ and icons\ are copied
-      next to the exe whenever the program has them. Programs read
-      those at runtime (Announcer takes its alarm image from
-      images\), so they have to travel with every build.
-    - the program's ReadMe is copied next to the exe as well; the
-      Copy Manager takes it from there, so the published ReadMe
-      follows the sources.
-    - the new version is written to <Scratch>\Versions.txt.
-
-  Per-project extras go into build_config.json next to the
-  sources. extra_files may name folders as well as files:
-
-      {
-        "collect_all":      ["module"],
-        "collect_binaries": ["module"],
-        "hidden_imports":   ["module"],
-        "copy_metadata":    ["module"],
-        "exclude_modules":  ["module"],
-        "extra_files":      ["data.json", "images"]
-      }
+  Set them once with "Set paths"; they are remembered per user. This
+  matters because Dev Tools is itself a built program and cannot work
+  out where the repository is from its own location.
 
 
-=================================================================
-COPY MANAGER TAB
-=================================================================
+BUILDER
 
-  Lists every program in the dist root with its available
-  versions and the version last deployed from this machine.
-  "Select new" ticks only the programs that have something newer.
+  Nothing has to be registered. Every folder under the sources root
+  that contains a source file is a project, and the starting file is
+  found automatically.
 
-  Copy deploys to the ticked destinations:
+  Each project shows the version it was last built as and the next
+  one, which is the last number stepped up by one and can be typed
+  over. Projects are grouped as Main, Side or Ignored, and the
+  grouping is remembered.
 
-      <destination>\<program>\<program> vX.Y.Z.exe
-                              *.py, ReadMe, icon.ico
-                              images\, sounds\, …
-                              archive\vX.Y.Z\…
+  Tick what you want and press Build. The result goes into a folder
+  named after the version, together with a copy of the sources, the
+  icon, BOTH documentation files (the short one and the detailed one),
+  and any images or sounds folder the program needs at run time.
 
-  Folders that came with the build (images\, sounds\) are copied
-  along with the files. Folders on the destination that the new
-  version does not bring are deleted as leftovers — except
-  _internal\ and archive\.
+  When a build finishes it switches to the Copy Manager with those
+  projects already ticked.
 
-  The previous exe (and its sources) is moved into the archive
-  folder first. A locked exe is skipped, not treated as an error.
-  If the icon changed, a dialog shows the old and the new one
-  side by side before anything is overwritten.
-
-  Other buttons:
-    ReadMe only     — refresh just the ReadMe files
-    Fix             — repair the archive folders (see below)
-    Build internal  — build the internal-libs builder
-    Deploy internal — push _internal/ into the selected programs
+  A project can also declare helper programs — small programs that
+  live in the same folder but are started on their own. Those appear
+  as an extra line under the project, and each one builds into its
+  own folder with its own version, and with its own ReadMe and
+  Details buttons like any other program. Click the project —
+  anywhere on its line, or its tick box, or Details — and its helpers
+  open; the little arrow in front of the name closes them again.
+  Opening and closing never changes what is ticked.
 
 
-=================================================================
-FIX — ARCHIVE LAYOUT
-=================================================================
+COPY MANAGER
 
-  The archive keeps one folder per version, and each folder is a
-  self-contained, runnable snapshot:
+  Lists every finished program with its available versions and the
+  version last published from this computer. "Select new" ticks only
+  the ones that have something newer.
 
-      archive\v2.5.4\Image Tools v2.5.4.exe
-                     if_t.py, is_t.py, …
-                     archive_log.txt
+  Copy publishes to whichever destinations you ticked. Before it
+  overwrites anything, the previous version is moved into the
+  archive, so an old version can always be run again from the
+  Launcher. A program file that is locked because somebody is running
+  it is skipped, not treated as a failure. If the icon changed, you
+  are shown the old and the new one side by side first.
 
-  No timestamps in file names — the version is in the file name
-  and in the folder name, which is what the Launcher reads.
+  The other buttons:
 
-  Fix repairs older archives:
-    - loose files in archive\ are moved into their version folder
-    - helper modules stranded in archive\unknown\ are matched
-      back to the version they were archived from (via the deploy
-      timestamps in the two archive_log.txt files) and restored
-      under their original importable name, so "import if_t"
-      still works inside the folder
-    - duplicate copies ("… (2).exe", timestamped twins) are
-      removed and the remaining file is renamed to the clean name
+    ReadMe only       refresh just the documentation files — both the
+                      short one and the detailed one
+    Fix               repair old archive folders
+    Build internal    build the shared support folder
+    Deploy internal   push that folder to the selected programs
 
 
-=================================================================
-GENERAL NOTES
-=================================================================
+THE ARCHIVE LAYOUT
 
-  - builder_settings.json  root folder + project grouping
-  - build_usage.json       build history
-  - copy_manager_state.ini last deployed version per program
-  - Versions.txt           on Scratch, "Name = vX.Y.Z" per program
+  One folder per version, and each folder is a complete, runnable
+  snapshot: the program, its sources under their real names, and a
+  log. No timestamps in the file names — the version is in the file
+  name and in the folder name, which is what the Launcher reads.
 
-  A program's ReadMe must be named ReadMe_<folder name> (any
-  extension). The deploy is forgiving and also accepts a plain
-  README.txt, but the Launcher is not: a ReadMe it cannot match is
-  invisible, so its ReadMe button opens nothing. The deploy can
-  therefore succeed while the Launcher still shows no ReadMe.
 
-  For the developer view of the code see STRUCTURE.md, and
-  dev_tools_structure.md for the line-by-line map.
+THE ONE NAMING RULE
+
+  A program's documentation must be named ReadMe_<folder name> for
+  the short version and ReadMe_<folder name>_Full for the long one.
+  Both are built into the version folder and both are published.
+
+  The publishing step here is forgiving about the short one and will
+  accept a plain README.txt; the Launcher is not, and shows nothing
+  for it. So a publish can succeed while the Launcher still has no
+  documentation to open.
+
+  And remember that the documentation only reaches a share when you
+  publish it. Writing a new ReadMe in the repository changes nothing
+  on Z: until Copy or "ReadMe only" has run.
 
 -----------------------------------------------------------------

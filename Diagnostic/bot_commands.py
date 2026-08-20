@@ -256,6 +256,29 @@ def parse_plot_options(options: list[str], now_ns: int,
 # The syntax half of /help (the command list lives with the commands)
 # ---------------------------------------------------------------------------
 
+def mention_help(bot_name: str = "") -> str:
+    """The first thing anyone needs to know in a group space: tag the bot.
+
+    Webex only lets a bot READ messages that @mention it when the space has more
+    than two people in it — the API returns 403 for anything else. So a command
+    typed without the tag is not ignored by us, it never reaches us at all, which
+    looks exactly like a broken token from the outside. `bot_name` is the bot's
+    real name once the app has asked Webex for it; the example stands in until then.
+    """
+    who = f"@{bot_name}" if bot_name else "@Diagnostics"
+    return (
+        f"**Tag me first.** In a space with other people in it, Webex only shows "
+        f"me the messages that mention me by name, so start the line with "
+        f"`{who}`:\n"
+        f"- `{who} /status`\n"
+        f"- `{who} /plot Chiller 1; yesterday 7-18`\n"
+        f"\n"
+        f"Pick the name from the list Webex offers while you type `@` — a typed-out "
+        f"name that is not a real mention does not count. In a one-to-one chat with "
+        f"me the tag is not needed."
+    )
+
+
 SYNTAX_HELP = (
     "**How to talk to me** — one line, starting with a slash. Two separators:\n"
     "- `,` separates items, so several PVs go in one command: "

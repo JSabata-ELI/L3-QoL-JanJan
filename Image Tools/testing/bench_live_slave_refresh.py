@@ -22,7 +22,7 @@ NOT move.
 
 Runs offscreen against synthetic local files — no share, no network:
 
-  python bench_live_slave_refresh.py
+  python testing/bench_live_slave_refresh.py
 """
 import shutil
 import tempfile

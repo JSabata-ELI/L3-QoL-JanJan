@@ -375,8 +375,22 @@ def fetch_values(channel: str, start_ns: int, end_ns: int,
                            try_value_suffix=try_value_suffix)[0]
 
 
+# channel → engineering unit, but ONLY when the archiver itself said so. The listing
+# usually answers with plain strings, in which case this stays empty and a UI that wants
+# a unit has to get it from somewhere it can defend (a preset table, or the operator).
+# Never guessed here: a wrong unit printed next to a number is worse than none.
+CHANNEL_UNITS: dict[str, str] = {}
+
+# Keys an archiver listing might carry the engineering unit under. EPICS calls it EGU.
+_UNIT_KEYS = ("unit", "units", "egu", "EGU", "displayUnit", "engineeringUnits")
+
+
 def fetch_channels(pattern: str = "**", *, timeout: float = DEFAULT_TIMEOUT) -> list[str]:
-    """All archiver channel names matching pattern. Raises CpvaError."""
+    """All archiver channel names matching pattern. Raises CpvaError.
+
+    Entries may come back as bare strings or as dicts; when a dict carries an
+    engineering unit it is kept in CHANNEL_UNITS as a side effect, since this is the
+    only listing the app ever asks for."""
     qs = urllib.parse.urlencode({"pattern": pattern})
     data = _request_json(f"/channels-by-pattern?{qs}", timeout)
     out: list[str] = []
@@ -388,6 +402,11 @@ def fetch_channels(pattern: str = "**", *, timeout: float = DEFAULT_TIMEOUT) -> 
                 name = d.get("channelName") or d.get("name") or d.get("channel")
                 if name:
                     out.append(str(name))
+                    for k in _UNIT_KEYS:
+                        u = d.get(k)
+                        if isinstance(u, str) and u.strip():
+                            CHANNEL_UNITS[str(name)] = u.strip()
+                            break
     return out
 
 

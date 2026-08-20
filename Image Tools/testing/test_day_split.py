@@ -18,7 +18,7 @@ Covered here (cpva_client.fetch_samples_split):
 
 Runs against a fake transport — no network, no share:
 
-  python test_day_split.py
+  python testing/test_day_split.py
 """
 import importlib.util
 import sys
@@ -34,7 +34,7 @@ def check(name: str, cond: bool, detail: str = ""):
 
 
 def load_cpva():
-    p = Path(__file__).resolve().parent / "cpva_client.py"
+    p = Path(__file__).resolve().parent.parent / "cpva_client.py"
     spec = importlib.util.spec_from_file_location("cpva_client", p)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["cpva_client"] = mod

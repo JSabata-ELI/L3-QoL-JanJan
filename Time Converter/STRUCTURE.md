@@ -2,6 +2,11 @@
 
 > Verified against source: 2026-08-19 · `tc.py` 592 L
 
+User-facing documentation: `Readme Time Converter.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Time Converter_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
+
 ## Files
 
 | File | Description |

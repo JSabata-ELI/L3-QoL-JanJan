@@ -19,6 +19,10 @@
     "history_minutes": 720,
     "data_watchdog_enabled": true,
     "data_watchdog_fail_polls": 2,
+    "frozen_check_enabled": true,
+    "frozen_after_minutes": 120,
+    "frozen_min_points": 5,
+    "frozen_alert_enabled": true,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
     "alarm_k_default": 5.0,
@@ -27,6 +31,7 @@
     "graph_window_minutes": 60,
     "graph_legend_loc": "best",
     "graph_legend_anchor": [],
+    "graph_pv_panel": true,
     "start_monitoring_on_launch": false,
     "alert_plot_hours": 12,
     "shared_pv_list_enabled": true,
@@ -65,10 +70,10 @@
               0.2
             ]
           ],
-          "warn_low": 16.2,
+          "warn_low": 15.8,
           "warn_high": 16.8,
-          "alarm_low": 16.0,
-          "alarm_high": 17.0
+          "alarm_low": 15.7,
+          "alarm_high": 17.1
         },
         {
           "label": "3,3 Hz",
@@ -90,6 +95,7 @@
       ],
       "valid_min": 0.0,
       "valid_max": 50.0,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -147,6 +153,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -204,6 +211,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -261,6 +269,7 @@
       ],
       "valid_min": 0.0,
       "valid_max": 50.0,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -296,6 +305,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": "2026-07-13T11:01:59+02:00",
       "learn_stats": {
         "center": 17.779215,
@@ -340,6 +350,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": "2026-07-13T09:17:52+02:00",
       "learn_stats": {
         "center": 20.551235,
@@ -381,6 +392,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -416,6 +428,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -451,6 +464,7 @@
       ],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -470,6 +484,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -489,6 +504,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": "2026-07-16T13:39:25+02:00",
       "learn_stats": {
         "center": 0.003447,
@@ -517,6 +533,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -536,6 +553,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -555,6 +573,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -574,6 +593,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -593,6 +613,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -612,6 +633,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -631,6 +653,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -650,6 +673,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -669,6 +693,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -688,6 +713,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -707,6 +733,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -726,6 +753,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -745,6 +773,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -764,6 +793,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -783,6 +813,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -802,6 +833,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -821,6 +853,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -840,6 +873,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -859,6 +893,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     },
@@ -878,6 +913,7 @@
       "profiles": [],
       "valid_min": null,
       "valid_max": null,
+      "frozen_check": true,
       "learned_at": null,
       "learn_stats": null
     }

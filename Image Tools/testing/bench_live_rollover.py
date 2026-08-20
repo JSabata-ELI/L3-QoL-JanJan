@@ -18,8 +18,8 @@ hour_dirs_for_windows). The app opens on the PREVIOUS UTC hour and the test then
 creates the CURRENT one — that direction is the only testable one, because
 _probe_hour_folder refuses any candidate whose hour is still in the future.
 
-  python bench_live_rollover.py            # single camera
-  python bench_live_rollover.py --cams 3   # multi-cam grid path
+  python testing/bench_live_rollover.py            # single camera
+  python testing/bench_live_rollover.py --cams 3   # multi-cam grid path
 """
 import argparse
 import shutil

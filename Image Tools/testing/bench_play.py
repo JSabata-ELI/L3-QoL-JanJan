@@ -5,9 +5,9 @@ reached the screen against how many the speed setting implies. Playback's failur
 not latency but DROPS — the file names scroll while the picture barely moves — so the
 number that matters here is shown-vs-expected, not paints/s.
 
-  python bench_play.py
-  python bench_play.py --speeds 0.25 1 5 --duration 4
-  python bench_play.py --root "\\\\users-L3...\\2026\\08\\11\\09"
+  python testing/bench_play.py
+  python testing/bench_play.py --speeds 0.25 1 5 --duration 4
+  python testing/bench_play.py --root "\\\\users-L3...\\2026\\08\\11\\09"
 """
 import argparse
 import shutil

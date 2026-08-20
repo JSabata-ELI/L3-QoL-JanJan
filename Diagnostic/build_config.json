@@ -1,9 +1,16 @@
 {
-  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe; hidden_imports are forced into the bundle.",
+  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe; hidden_imports are forced into the bundle; extra_exes are helper scripts built as their own self-contained .exe next to the app.",
   "extra_files": [
     "notify_provision.dat"
   ],
   "hidden_imports": [
     "win32crypt"
+  ],
+  "extra_exes": [
+    {
+      "script": "remote_launcher.py",
+      "name": "Diagnostic Webex listener",
+      "_why": "Runs all day in the background so '@Diagnostics /run' can open the app while it is closed. Needs to be an exe of its own: as a bare .py it only starts on a PC that has Python with requests installed. Console on purpose - the window is the only sign it is alive, and closing it is how you stop it."
+    }
   ]
 }

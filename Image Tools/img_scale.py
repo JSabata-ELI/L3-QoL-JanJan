@@ -1,4 +1,4 @@
-"""Intensity scale of archived camera frames — the ONE implementation.
+﻿"""Intensity scale of archived camera frames — the ONE implementation.
 
     HOW THE ARCHIVE STORES INTENSITY
 
@@ -21,7 +21,7 @@ It is the power-of-two BRACKET of that frame's own peak:
 
 Measured 18.08.2026 on 150 frames from six cameras (PCW3NF, PCM2NF, PTM11wNF, PTM11wFF,
 PASF1NF, PFM13NF): the bracket derived from `MaxValue` alone matches the factor recovered
-from the pixels on every single frame, 0 exceptions (`test_scale_invariance.py` asserts
+from the pixels on every single frame, 0 exceptions (`testing/test_scale_invariance.py` asserts
 this). So a camera whose peak drifts across a power of two switches factor from frame to
 frame. C03-081-PCW3NF sits exactly on 1023/1024 and alternated ×64.06 / ×32.02 every few
 seconds — in counts the frames were identical (median 68, p99.9 ≈ 685) while the stored
@@ -31,17 +31,31 @@ Consequence: `stored / 65535` is NOT a stable scale. Rendering it directly made 
 camera's picture double and halve in brightness shot to shot with nothing physical behind
 it. The invariant quantity is COUNTS, so the display maps
 
-    counts / (2**ref_bits - 1)      ref_bits = the largest bracket seen for this camera
+    counts / (2**SENSOR_BITS - 1)      SENSOR_BITS = 12, the sensor's range
 
-which is the same thing as `stored / display_full_scale(frame_bits, ref_bits)` — no pixel
+which is the same thing as `stored / display_full_scale(frame_bits)` — no pixel
 arithmetic, just a different denominator, and exactly 65535 whenever the frame's own
-bracket is already the reference (see `display_full_scale`). `ref_bits` is remembered per
-camera and only ever grows, so a picture can settle darker but can never oscillate; see
-`reference_bits`.
+bracket already IS the sensor range (see `display_full_scale`).
+
+    THE REFERENCE RANGE IS A CONSTANT, NOT SOMETHING TO LEARN
+
+This used to remember, per camera, the largest bracket it had ever shown, and render
+against that. It was wrong in both directions: a camera the app had only ever seen dim
+was rendered against its dim bracket (so the picture jumped the first time a real shot
+arrived), and one single frame with a high `MaxValue` darkened that camera permanently,
+because the remembered value only ever grew and lived in a JSON file no operator could
+see. C03-081-PCW3NF had 16 bits recorded that way and rendered at codes 0..3 out of 255 —
+black on screen while the file held a perfectly ordinary picture.
+
+There is nothing to learn. Measured 20.08.2026 over one whole day of the archive: all 88
+camera folders report `Camera type = 'Basler acA1600-20gm'` — one 12-bit model, no
+exceptions — and no frame anywhere reports a `MaxValue` above 4095, which is 2**12 - 1
+and is what saturation reads. So the denominator comes from each frame's own metadata,
+gives the same answer for every frame of every camera, and needs no state on disk.
 
     WHY NO OTHER COEFFICIENT IS NEEDED TO DISPLAY A FRAME
 
-`stored/full_scale` and `counts/(2**ref_bits-1)` are the same linear map. The factor is
+`stored/full_scale` and `counts/(2**SENSOR_BITS-1)` are the same linear map. The factor is
 needed on top of that only to print a NUMBER in counts (readout, colorbar, thresholds),
 and it is recoverable per frame as `stored_max / MaxValue` (see `derive_factor`).
 
@@ -64,11 +78,8 @@ Pure numpy/PIL — no Qt, so every tab (`if_t`, `is_t`, `sf_t`, `wk_t`) can impo
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import re
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -95,11 +106,21 @@ _MAX_VALUE_KEYS = ("MaxValue", "max_value", "imgMaxValue",
 
 _STAT_MAX_SAMPLES = 250_000
 
-# Where the learned per-camera reference brackets live. Same folder as the app's other
-# per-camera state (cam_aspects.json, cam_layouts.json, ...). Deleting the file makes
-# every camera re-learn from the frames it sees next.
-CAM_DEPTHS_PATH = (Path(os.environ.get("APPDATA", Path.home()))
-                   / "ELI_ImageTools" / "cam_depths.json")
+# The sensor range every archived frame is displayed against — the ONE number that makes
+# two frames comparable, and a constant of the archive rather than anything to discover.
+#
+# Measured 20.08.2026 across a full day: every one of the 88 camera folders carries
+# `Camera type = 'Basler acA1600-20gm'` in its PNG metadata, and the highest `MaxValue`
+# found on any camera is exactly 4095 = 2**12 - 1, reached on the frames that saturate
+# (65535 stored, ratio 16.0037, hot pixels pinned at the top). Nothing in the archive is
+# deeper, and nothing shallower: a camera that only ever reads 137 counts is a DIM 12-bit
+# camera, not an 8-bit one, and rendering it as though 137 were its maximum is the bug
+# this constant replaces (`testing/test_scale_invariance.py` re-checks both halves).
+#
+# If a deeper camera is ever added, `display_full_scale` widens to that frame's own
+# bracket on its own — a frame is never rendered against a range smaller than itself.
+SENSOR_BITS = 12
+SENSOR_FULL_SCALE_COUNTS = 2 ** SENSOR_BITS - 1     # 4095
 
 
 # ── the archiver's per-frame bracket ──────────────────────────────────────────
@@ -110,7 +131,7 @@ def bits_from_max_value(max_value: "float | None") -> "int | None":
     Derived from metadata ALONE on purpose — the downscaled preview proxy has no
     full-resolution maximum to feed `derive_factor`, and preview and refined render must
     not be allowed to pick different brackets for the same frame. `derive_factor` stays
-    the cross-check that this rule is still true (see test_scale_invariance.py).
+    the cross-check that this rule is still true (see testing/test_scale_invariance.py).
 
     None when there is no usable `MaxValue`; the caller then renders on the plain 16-bit
     full scale, exactly as before this existed."""
@@ -126,113 +147,87 @@ def bits_from_max_value(max_value: "float | None") -> "int | None":
 
 
 def display_full_scale(frame_bits: "int | None",
-                       ref_bits: "int | None") -> float:
+                       ref_bits: "int | None" = None) -> float:
     """The denominator that renders a frame as `counts / (2**ref_bits - 1)`.
 
         stored / [(2**ref_bits - 1) * SCALE_FACTORS[frame_bits]]
       = (stored / SCALE_FACTORS[frame_bits]) / (2**ref_bits - 1)
       = counts / (2**ref_bits - 1)
 
-    With `frame_bits == ref_bits` this is (2**b - 1) * 65535/(2**b - 1) = 65535 exactly, so
-    a camera that never straddles a bracket renders bit-identically to the old code. Only
-    the frames the archiver bracketed lower come out scaled — darker, never brighter,
-    because `ref_bits` is the largest bracket seen."""
-    if not frame_bits or not ref_bits:
+    `ref_bits` defaults to `SENSOR_BITS`, and every caller in the app resolves to exactly
+    that — it is passed at all only so a caller that already has the number does not have
+    to look it up twice. With `frame_bits == ref_bits` the expression is
+    (2**b - 1) * 65535/(2**b - 1) = 65535 exactly, so a frame the archiver bracketed at the
+    sensor's own depth (a saturated one) renders on the plain 16-bit scale; a frame it
+    bracketed lower — a dim one — comes out proportionally darker, which is the whole
+    point: dim IS darker.
+
+    Never smaller than the frame's own bracket. That guard is what a hypothetical deeper
+    camera would land on, and it also means the function can never brighten a frame past
+    its own peak."""
+    if not frame_bits:
         return FULL_SCALE_16
-    return (2 ** int(ref_bits) - 1) * SCALE_FACTORS[int(frame_bits)]
+    ref = max(int(ref_bits or SENSOR_BITS), int(frame_bits))
+    return (2 ** ref - 1) * SCALE_FACTORS[int(frame_bits)]
 
 
-# ── learned per-camera reference bracket ──────────────────────────────────────
-_ref_lock = threading.Lock()
-_ref_bits: "dict[str, int] | None" = None
-# Bumped every time a camera's reference grows. Anything holding a RENDERED frame
-# (a pixmap cache) has to notice, because those pixmaps were drawn against the old
-# range — see reference_generation.
-_ref_gen = 0
+def measure_counts(arr: "np.ndarray", frame_bits: "int | None",
+                   ref_bits: "int | None" = None):
+    """The camera's own counts behind a stored 16-bit frame, plus their full scale.
+
+    The archiver does not write the sensor's numbers: it stretches each frame's bracket
+    up into the 16-bit container, so a 12-bit frame's peak of 4095 is stored as 65535.
+    Anything that MEASURES has to undo that, or every reading is ~16x too big and the
+    number the operator checks against the camera does not match.
+
+        counts = stored / SCALE_FACTORS[frame_bits]
+
+    The full scale returned is the CAMERA's range, `2**ref_bits - 1` — the same reference
+    the display maps against (see `display_full_scale`), so a histogram drawn on this axis
+    lines up with the display codes instead of drifting frame to frame with whatever
+    bracket that one frame's peak happened to fall in.
+
+    Returns (counts, full_scale). Without a usable bracket the stored values are taken as
+    the counts on the plain 16-bit range — the same fallback every other path here takes.
+    """
+    if not frame_bits:
+        return arr, FULL_SCALE_16
+    bits = int(frame_bits)
+    ref = max(int(ref_bits or SENSOR_BITS), bits)
+    full_scale = float(2 ** ref - 1)
+    factor = SCALE_FACTORS[bits]
+    if bits >= MAX_BITS or factor <= 1.0:
+        return arr, full_scale
+    # Integer counts in, integer counts out: the stretch is an exact multiply, so the
+    # rounded division gives the sensor value back rather than a float approximation.
+    counts = np.rint(to_counts(arr, factor).astype(np.float64))
+    return np.clip(counts, 0, full_scale).astype(np.uint16), full_scale
 
 
-def _load_ref_bits() -> dict:
-    try:
-        data = json.loads(CAM_DEPTHS_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    out = {}
-    for cam, b in (data or {}).items():
-        try:
-            bi = int(b)
-        except (TypeError, ValueError):
-            continue
-        if MIN_BITS <= bi <= MAX_BITS:
-            out[str(cam)] = bi
-    return out
+# ── the reference bracket ─────────────────────────────────────────────────────
+def reference_bits(camera: "str | None" = None,
+                   frame_bits: "int | None" = None) -> "int | None":
+    """The bracket a frame is rendered against: the sensor's range, `SENSOR_BITS`.
 
+    The same answer for every frame and every camera, computed from the frame in hand
+    rather than remembered — which is what makes two pictures comparable at all. It
+    widens only for a frame the archiver bracketed DEEPER than the sensor range (nothing
+    in the archive does, see `SENSOR_BITS`), because no frame may be rendered against a
+    range smaller than its own peak.
 
-def _save_ref_bits(snapshot: dict) -> None:
-    try:
-        CAM_DEPTHS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CAM_DEPTHS_PATH.write_text(json.dumps(snapshot, indent=2, sort_keys=True),
-                                   encoding="utf-8")
-    except Exception:
-        pass    # a display preference is never worth failing a render over
-
-
-def reference_bits(camera: "str | None", frame_bits: "int | None") -> "int | None":
-    """The bracket this camera's frames are rendered against — the largest one seen.
-
-    Monotone by design. Growing it darkens the camera's picture once and then holds it
-    there; letting it shrink would put the flicker back, one frame at a time. So the
-    worst case is a single step down in brightness when a frame finally exceeds the
-    bracket — never an oscillation, and never an over-bright frame.
-
-    Called from the loader worker threads, hence the lock. The file is written only on the
-    handful of occasions the value actually grows."""
+    `camera` is accepted and ignored: the callers have it, and keeping it in the
+    signature says plainly that the answer does not depend on which camera it is."""
     if not frame_bits:
         return None
-    if not camera:
-        return int(frame_bits)
-    global _ref_bits, _ref_gen
-    with _ref_lock:
-        if _ref_bits is None:
-            _ref_bits = _load_ref_bits()
-        cur = _ref_bits.get(camera)
-        if cur is not None and cur >= int(frame_bits):
-            return cur
-        _ref_bits[camera] = int(frame_bits)
-        # Only a GROWTH invalidates rendered frames. Recording a camera for the first time
-        # cannot: under this lock there is exactly one first writer, so nothing has been
-        # drawn against a different range yet — and bumping there would make every camera
-        # clear the caches once on a fresh install, for nothing.
-        if cur is not None:
-            _ref_gen += 1
-        snapshot = dict(_ref_bits)
-    _save_ref_bits(snapshot)
-    return int(frame_bits)
+    return max(SENSOR_BITS, int(frame_bits))
 
 
-def current_reference_bits(camera: "str | None") -> "int | None":
-    """The reference already learned for `camera`, without learning anything new.
+def current_reference_bits(camera: "str | None" = None) -> int:
+    """The reference range, for a render path that has no frame in hand.
 
-    For render-time lookups: a stored preview frame keeps its OWN bracket, and the range
-    it is drawn against has to be whatever the camera's reference is *now* — resolving it
-    once at decode time would freeze half a window at the old value the moment a bigger
-    frame turned up."""
-    if not camera:
-        return None
-    global _ref_bits
-    with _ref_lock:
-        if _ref_bits is None:
-            _ref_bits = _load_ref_bits()
-        return _ref_bits.get(camera)
-
-
-def reference_generation() -> int:
-    """Counter that ticks whenever any camera's reference grows.
-
-    A rendered pixmap is only valid for the reference it was drawn against, so every
-    pixmap cache has to be dropped when this changes. It happens a handful of times in the
-    life of an install — the first time each camera shows its bigger bracket — and never
-    again once cam_depths.json knows the answer."""
-    return _ref_gen
+    The proxy repaint resolves the range at PAINT time rather than at decode; it stays a
+    separate call for that reason, but there is no longer anything for it to look up."""
+    return SENSOR_BITS
 
 
 def full_scale_for_frame(camera: "str | None",
@@ -240,7 +235,7 @@ def full_scale_for_frame(camera: "str | None",
     """(full_scale, frame_bits, ref_bits) for one frame — the whole chain in one call.
 
     Every render path goes through this so they cannot disagree: metadata → bracket →
-    learned reference → denominator."""
+    sensor range → denominator."""
     fb = bits_from_max_value(max_value)
     rb = reference_bits(camera, fb)
     return display_full_scale(fb, rb), fb, rb
@@ -272,8 +267,8 @@ def full_scale_for_pil(path, info: dict, mode: str) -> float:
 
     The MODE decides 8-bit vs 16-bit and must never be replaced by a look at arr.max(): a
     genuinely dark 16-bit frame can hold nothing above 255 and would be brightened 257× by
-    a value-based guess. A 16-bit frame then goes on the camera's reference range, so the
-    Finder and the Slider agree about a camera that straddles a bracket."""
+    a value-based guess. A 16-bit frame then goes on the sensor range, so the Finder and
+    the Slider agree about a camera that straddles a bracket."""
     if mode not in ("I", "I;16"):
         return 255.0
     return full_scale_for_frame(camera_from_path(path),
@@ -388,7 +383,8 @@ def to_absolute_u8(arr16: np.ndarray, full_scale: float = FULL_SCALE_16,
 
 def to_u8(arr: np.ndarray, auto: bool = False,
           full_scale: float = FULL_SCALE_16,
-          gamma: "int | float | None" = None) -> np.ndarray:
+          gamma: "int | float | None" = None,
+          out: "dict | None" = None) -> np.ndarray:
     """Frame → uint8 for display. THE decision point for what a palette colour means.
 
     Absolute (`auto=False`, the default): `value / full_scale`, the camera's own range.
@@ -408,11 +404,19 @@ def to_u8(arr: np.ndarray, auto: bool = False,
     `full_scale` is 65535 for the archive's 16-bit frames (see the module docstring) and
     255 for an 8-bit source, which is already on its own full scale. Decide it from the
     decoded image's MODE, not from `arr.max()`: a genuinely dark 16-bit frame can hold
-    nothing above 255 and would then be brightened 257×."""
+    nothing above 255 and would then be brightened 257×.
+
+    `out`, when given, receives what this render ACTUALLY applied: "gamma" on the
+    absolute path, and the equivalent "contrast"/"offset" slider pair on the auto
+    stretch. That is what lets a greyed-out Auto control show a number instead of
+    sitting at zero while the picture on screen is clearly stretched — an adjustment
+    nobody can name is an adjustment nobody can reproduce."""
     if auto:
-        return stretch_u8(arr)
+        return stretch_u8(arr, full_scale=full_scale, out=out)
     g = (auto_gamma(arr, full_scale) if is_auto_gamma(gamma)
          else gamma_from_slider(gamma))
+    if out is not None:
+        out["gamma"] = g
     return to_absolute_u8(arr, full_scale, g)
 
 
@@ -448,7 +452,9 @@ def percentile_window(arr: np.ndarray, p_low: float = 0.5,
     return lo, hi
 
 
-def stretch_u8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.ndarray:
+def stretch_u8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
+               full_scale: float = FULL_SCALE_16,
+               out: "dict | None" = None) -> np.ndarray:
     """Percentile contrast stretch → uint8. NOT comparable between frames.
 
     Take the stretch on the 16-BIT data, never on an 8-bit rendering of it: frames from
@@ -457,13 +463,103 @@ def stretch_u8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5) -> np.
     out in harsh posterised bands.
 
     Clipping a small fraction at the top means a few hot pixels cannot dominate the
-    scale and crush the rest of the frame to black."""
+    scale and crush the rest of the frame to black.
+
+    `out`, when given, receives {"contrast", "offset"}: the Contrast / Brightness
+    slider pair that reproduces this stretch, measured against the absolute-scale
+    rendering of the same frame. The stretch is (x - lo) * 255/(hi - lo) and the manual
+    pair pivots contrast on the same black level, so the equivalent setting is a gain of
+    full_scale/(hi - lo) with an offset of -lo brought into 8-bit units."""
     win = percentile_window(arr, p_low, p_high)
     if win is None:
         return np.zeros(arr.shape, dtype=np.uint8)
     lo, hi = win
+    if out is not None:
+        fs = float(full_scale) or FULL_SCALE_16
+        out["contrast"] = contrast_slider_from_gain(fs / (hi - lo))
+        out["offset"] = int(round(max(float(BRIGHTNESS_MIN), min(
+            float(BRIGHTNESS_MAX), -lo * (255.0 / fs)))))
     return np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255.0,
                    0, 255).astype(np.uint8)
+
+
+# ── manual contrast / brightness ────────────────────────────────────────────
+# The pair every tab shows as "Con:" and "Bri:". Contrast is a multiplicative GAIN,
+# brightness a plain additive OFFSET — two different operations, never each other's
+# synonym, in the code and on the label alike.
+#
+# They act on the uint8 result of the scale mapping above, which is the only place they
+# can act: the mapping decides which count a colour sits on, and these two are the
+# viewer's adjustment on top of that decision. Living here means the Slider, the Finder
+# and the Shot Finder cannot drift apart on what "Con +20" does.
+CONTRAST_MIN = -127
+CONTRAST_MAX = 127
+CONTRAST_NEUTRAL = 0
+BRIGHTNESS_MIN = -255
+BRIGHTNESS_MAX = 255
+BRIGHTNESS_NEUTRAL = 0
+# The percentiles that stand for a frame's black level and its highlight. The same pair
+# the auto stretch uses, so the manual pivot and the Auto pass agree about where black
+# is instead of each having its own idea.
+BLACK_PCT = 0.5
+HIGH_PCT = 99.5
+
+
+def contrast_gain(contrast: "int | float") -> float:
+    """Contrast slider value in [-127, +127] → multiplicative gain (0 → 1.0)."""
+    c = float(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast)))
+    return (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+
+
+def contrast_slider_from_gain(gain: float) -> int:
+    """Inverse of contrast_gain: the slider value whose gain is `gain` (1.0 → 0).
+
+    Used to park a greyed-out Contrast slider on what an Auto pass actually applied.
+    The gain tops out near 3.9× at +127 while the auto stretch of a dim frame needs 5×
+    and more, so the parked number saturates — which is why unticking Auto restores the
+    user's own value instead of keeping what was parked."""
+    if not (gain > 0) or not math.isfinite(gain):
+        return CONTRAST_NEUTRAL
+    c = 127.0 * 259.0 * (gain - 1.0) / (259.0 + 127.0 * gain)
+    return int(round(max(float(CONTRAST_MIN), min(float(CONTRAST_MAX), c))))
+
+
+def apply_bc_u8(arr8: np.ndarray, contrast: int = 0, offset: int = 0) -> np.ndarray:
+    """uint8 frame → uint8 with manual contrast and brightness applied.
+
+    Contrast pivots on the frame's own BLACK LEVEL, not on mid-grey. Mid-grey is
+    unusable on these frames: an absolute-scale frame sits around code 29, so
+    gain*(29-128)+128 drives it further DOWN and a contrast of +20 — one nudge of the
+    slider — turns the picture black. Pivoting on the black level means contrast only
+    spreads what is above the background, which is what the control is for and what
+    makes small moves small."""
+    c = int(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast or 0)))
+    off = int(max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, offset or 0)))
+    if not c and not off:
+        return arr8
+    arr = arr8.astype(np.float32)
+    if c:
+        pivot = float(np.percentile(stat_sample(arr), BLACK_PCT))
+        arr = (arr - pivot) * contrast_gain(c) + pivot
+    if off:
+        arr = arr + off
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+def render_u8(arr: np.ndarray, auto: bool = False,
+              full_scale: float = FULL_SCALE_16,
+              gamma: "int | float | None" = None,
+              contrast: int = 0, offset: int = 0,
+              out: "dict | None" = None) -> np.ndarray:
+    """Frame → uint8 for display: the WHOLE display pipeline in one call.
+
+    Scale mapping first (absolute with gamma, or the per-frame auto stretch), then the
+    manual Contrast / Brightness pair on the 8-bit result. That order is the one the
+    Slider uses, so the same four settings give the same picture in every tab.
+
+    `out` is passed through to `to_u8` — see there."""
+    arr8 = to_u8(arr, auto, full_scale, gamma, out=out)
+    return apply_bc_u8(arr8, contrast, offset)
 
 
 # ── counts / bit depth ────────────────────────────────────────────────────────
@@ -519,7 +615,22 @@ class FrameMeta:
 
     @property
     def peak_fraction(self) -> "float | None":
-        """Frame peak as a fraction of the camera's full scale (0..1)."""
+        """Frame peak as a fraction of the SENSOR's full scale, 0..1.
+
+        `max_value / 4095`, not `stored_max / 65535`. The stored maximum is the peak blown
+        up into whatever power-of-two bracket the archiver chose for that one frame, so
+        the old form reported the fraction of the BRACKET: two consecutive PCW3NF frames
+        of the same brightness read "97 % FS" and "50 % FS" purely because one was
+        bracketed at 10 bits and the next at 11. Against the sensor range both read 24 %,
+        which is also what the picture on screen shows — the number and the image finally
+        say the same thing.
+
+        `max_value` alone is enough and `bit_depth` is deliberately not required: the
+        metadata-only paths (preview proxy, Finder thumbnails) never decode a full frame,
+        so demanding a stored maximum here would drop the number from exactly the places
+        that show it most. Falls back to the stored form only with no `MaxValue` at all."""
+        if self.max_value is not None:
+            return min(1.0, self.max_value / SENSOR_FULL_SCALE_COUNTS)
         if self.stored_max is None:
             return None
         return min(1.0, self.stored_max / FULL_SCALE_16)
@@ -527,7 +638,8 @@ class FrameMeta:
     def scale_note(self, auto_stretch: bool = False,
                    gamma: "int | float | None" = None,
                    gamma_applied: "float | None" = None,
-                   ref_bits: "int | None" = None) -> str:
+                   ref_bits: "int | None" = None,
+                   contrast: int = 0, offset: int = 0) -> str:
         """One-line description of what the rendered intensities mean.
 
         The point of showing it is that a wrong scale becomes visible instead of
@@ -540,7 +652,11 @@ class FrameMeta:
 
         `ref_bits` is named whenever the frame was rendered against a bracket other than
         the one the archiver stretched it by — that halves or doubles the picture, so a
-        silent rescale would be exactly the lie this line exists to prevent."""
+        silent rescale would be exactly the lie this line exists to prevent.
+
+        `contrast` / `offset` are the manual pair. They are named for the same reason as
+        gamma: they move which count a colour sits on, so they must never be invisible
+        on a line whose whole job is to say what the intensities mean."""
         parts = []
         if self.max_value is not None:
             parts.append(f"peak {self.max_value:.0f} counts")
@@ -560,6 +676,10 @@ class FrameMeta:
             if g is not None and abs(g - GAMMA_NEUTRAL) > 0.005:
                 parts.append(f"gamma {g:.2f}"
                              + (" (auto)" if is_auto_gamma(gamma) else ""))
+        if contrast:
+            parts.append(f"contrast {int(contrast):+d}")
+        if offset:
+            parts.append(f"brightness {int(offset):+d}")
         return "  ·  ".join(parts)
 
 

@@ -13,7 +13,64 @@ import json
 from PIL import Image, ImageTk
 
 # ---------------- CONFIG ----------------
-_ONEDRIVE = Path.home() / "OneDrive - ELI Beamlines"
+def _onedrive_root() -> Path:
+    """This machine's OneDrive folder.
+
+    The name is per tenant ("OneDrive - ELI Beamlines", "OneDrive - ELI ERIC", …)
+    and a PC can have more than one of them, so a hard-coded name resolves to a
+    real but WRONG folder instead of failing visibly. Order: the environment
+    (what Windows itself says), then any OneDrive folder that actually holds the
+    sources, then the historical name so nothing regresses.
+    """
+    env = os.environ.get("ONEDRIVE") or os.environ.get("ONEDRIVECOMMERCIAL")
+    tail = Path("ELI Beamlines") / "Python" / "programy"
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    try:
+        candidates.extend(sorted(d for d in Path.home().iterdir()
+                                 if d.is_dir() and d.name.lower().startswith("onedrive")))
+    except OSError:
+        pass
+    for c in candidates:
+        if (c / tail).is_dir():
+            return c
+    return candidates[0] if candidates else Path.home() / "OneDrive - ELI Beamlines"
+
+
+_ONEDRIVE = _onedrive_root()
+
+
+def _devtools_dist_root() -> "Path | None":
+    """Where Dev Tools puts its builds, from its own config.
+
+    That file is the single source of truth for the build output (it is set in
+    Dev Tools' "Set paths" dialog and is usually outside OneDrive, so a build does
+    not churn the sync). Reading it here means a developer run of the Launcher
+    lists exactly what has been built locally, instead of nothing.
+    """
+    cfg = Path(os.environ.get("APPDATA", "~")) / "DevTools" / "config.json"
+    try:
+        root = json.loads(cfg.read_text(encoding="utf-8")).get("dist_root")
+    except Exception:
+        return None
+    if not root:
+        return None
+    p = Path(root)
+    return p if p.is_dir() else None
+
+
+def _programs_root() -> Path:
+    """The folder whose sub-folders are programs.
+
+    Program folders live in the git repository (`…/programy/L3-QoL-JanJan`), while
+    the build output stays beside it (`…/programy/dist`). Pointing the scan at
+    `programy` found Archive / Icons / Matlab and no programs, so the repo level is
+    used when it is there.
+    """
+    base = _ONEDRIVE / "ELI Beamlines" / "Python" / "programy"
+    repo = base / "L3-QoL-JanJan"
+    return repo if repo.is_dir() else base
 CONFIG_PATH = Path(os.environ.get("APPDATA", "~")) / "Launcher" / "config.json"
 
 def _load_config() -> dict:
@@ -35,7 +92,7 @@ ROOT_OPTIONS = [
     ("Lab - Scratch",      Path(r"\\hapls-share.lcs.local\scratch\Software"), False),
     ("Office - Scratch",   None,                                               True),
     ("Office - Sharepoint",None,                                               True),
-    ("Office - Programs",  _ONEDRIVE / "ELI Beamlines" / "Python" / "programy", False),
+    ("Office - Programs",  _programs_root(),                                   False),
 ]
 # Třetí hodnota = True znamená "cesta je z configu, lze nastavit přes UI"
 
@@ -250,6 +307,32 @@ def find_readme_or_none(program_dir: Path, program_name: str) -> Path | None:
     return None
 
 
+def find_readme_full_or_none(program_dir: Path, program_name: str) -> Path | None:
+    """
+    Long/detailed companion document, shown as the extra "Details" button.
+    Accepts (case / separators / extension ignored):
+      ReadMe_<ProgramName>_Full
+      ReadMe_<ProgramName>_Details
+      Manual_<ProgramName>
+    """
+    targets = {
+        _norm("readme_" + program_name + "_full"),
+        _norm("readme_" + program_name + "_details"),
+        _norm("manual_" + program_name),
+    }
+
+    try:
+        for f in program_dir.iterdir():
+            if not f.is_file():
+                continue
+            if _norm(f.stem) in targets or _norm(f.name) in targets:
+                return f
+    except Exception:
+        return None
+
+    return None
+
+
 # ---------------- GROUPING CONFIG ----------------
 # Global rules (same for ALL roots).
 # Everything else (not listed) becomes "External".
@@ -346,6 +429,7 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
     """Scan a single program directory. Returns (name, info) or None."""
     program_name = program_dir.name
     readme = find_readme_or_none(program_dir, program_name)
+    readme_full = find_readme_full_or_none(program_dir, program_name)
 
     # A) scratch layout: exe přímo ve složce programu
     exes_root = list(program_dir.glob("*.exe"))
@@ -356,6 +440,7 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
         return (program_name, {
             "exe_path": exe,
             "readme_path": readme,
+            "readme_full_path": readme_full,
             "label": program_name,
             "program_dir": program_dir,
             "icon_path": find_icon_for_program(program_dir, exe),
@@ -363,8 +448,19 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
         })
 
     # B) programy layout: ROOT\dist\<Program>\vX.Y.Z\*.exe
-    dist_dir = root / "dist" / program_name
-    vf = newest_version_folder(dist_dir)
+    # The sources sit in the repo while `dist` stays next to it, so a dist folder
+    # beside the scan root counts too — otherwise scanning the repo finds sources
+    # with no exe and reports nothing.
+    vf = None
+    _dist_candidates = [root / "dist" / program_name,
+                        root.parent / "dist" / program_name]
+    _dt_dist = _devtools_dist_root()
+    if _dt_dist is not None:
+        _dist_candidates.append(_dt_dist / program_name)
+    for dist_dir in _dist_candidates:
+        vf = newest_version_folder(dist_dir)
+        if vf:
+            break
     if not vf:
         return None
     exes_v = list(vf.glob("*.exe"))
@@ -376,6 +472,7 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
     return (program_name, {
         "exe_path": exe,
         "readme_path": readme,
+        "readme_full_path": readme_full,
         "label": program_name,
         "program_dir": program_dir,
         "icon_path": find_icon_for_program(program_dir, exe),
@@ -714,7 +811,14 @@ class Launcher(tk.Tk):
         self.option_add("*Font", "SegoeUI 10")
         # --- fixed cell sizing + dynamic columns ---
         self._group_cols = 2
-        self._group_min_cell_px = 260  # min šířka jedné "dlaždice" (uprav si)
+        # Fallback only. The real value is measured from the first card that gets
+        # built (`_measured_cell_px`): a guess here goes stale the moment the card
+        # gains a button, and a stale guess is what let two columns be drawn into
+        # the space for one.
+        self._group_min_cell_px = 280
+        self._measured_cell_px = None
+        self._cell_remeasure_done = False
+        self._doc_btn_px = None
 
         # Jemnější buttony
         # Program button style (hover effect)
@@ -752,9 +856,13 @@ class Launcher(tk.Tk):
         )
 
         self.style.configure("Info.TButton", padding=(5, 2), font=("Segoe UI", 8))
+        # The two doc buttons sit side by side, so they get tighter padding than
+        # the other small buttons. The font stays at 8 — legibility first; the
+        # width is bought back from the program button instead.
+        self.style.configure("Doc.TButton", padding=(3, 2), font=("Segoe UI", 8))
         self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         self.style.configure("TLabel", font=("Segoe UI", 10))
-        self.title("Software Launcher")
+        self.title("Launcher")
         if getattr(sys, "frozen", False):
             _base = Path(sys.executable).resolve().parent
         else:
@@ -808,9 +916,11 @@ class Launcher(tk.Tk):
         if w <= 50:
             return self._group_cols
 
-        cols = max(1, w // self._group_min_cell_px)
-        # nechceme extrém; 4 bohatě stačí
-        return max(2, min(int(cols), 4))
+        cell = self._measured_cell_px or self._group_min_cell_px
+        cols = max(1, w // max(1, cell))
+        # A one-column layout is a valid answer: forcing two drew the second card
+        # into space that was not there, so it was clipped at the window edge.
+        return max(1, min(int(cols), 4))
 
     def _build_ui(self):
         root = ttk.Frame(self, padding=10)
@@ -943,6 +1053,9 @@ class Launcher(tk.Tk):
             prompt_restore_swap_state(self, stuck)
 
     def _rebuild_buttons(self):
+        # A rebuild after a rescan may hold different (longer) names, so let the
+        # card be measured again exactly once for this layout.
+        self._cell_remeasure_done = False
         for w in self.sf.inner.winfo_children():
             w.destroy()
 
@@ -1032,12 +1145,49 @@ class Launcher(tk.Tk):
         if not any_group_shown:
             ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
 
+    def _prog_btn_chars(self) -> int:
+        """Width of the program buttons, in characters.
+
+        Sized to the longest label actually on screen rather than a fixed 18: at
+        18 the widest label ("Internal Builder") left 28 px of empty button, and
+        that slack is exactly what the second doc button needs. One width for all
+        groups, so the cards still line up.
+        """
+        longest = 0
+        for items in self._group_items.values():
+            for _name, info in items:
+                longest = max(longest, len(ui_label(info.get("label", ""))))
+        return max(10, min(longest, 22))
+
+    def _doc_btn_width_px(self) -> int:
+        """
+        Width of one doc button ("ReadMe" / "Details"), measured once.
+
+        Both halves of a card's button area get this as a minimum, so a card
+        without a "Details" button keeps the exact geometry of one that has it.
+        Without the minimum those two halves shrink to the small icon buttons
+        underneath, the lone "ReadMe" shrinks with them, and the whole card is
+        pulled narrower than its neighbours.
+        """
+        if self._doc_btn_px is None:
+            probe = ttk.Button(self, text="Details", style="Doc.TButton", width=7)
+            try:
+                probe.update_idletasks()
+                self._doc_btn_px = max(40, probe.winfo_reqwidth())
+            except Exception:
+                self._doc_btn_px = 56
+            finally:
+                probe.destroy()
+        return self._doc_btn_px
+
     def _build_group_content(self, gkey: str):
         grid = self._group_grids.get(gkey)
         group_items = self._group_items.get(gkey, [])
         if grid is None or not group_items:
             return
         cols = self._calc_group_cols()
+        prog_chars = self._prog_btn_chars()
+        first_cell = None
         for i, (name, info) in enumerate(group_items):
             r = i // cols
             c = i % cols
@@ -1074,7 +1224,7 @@ class Launcher(tk.Tk):
                 image=img,
                 compound="left",
                 style=btn_style,
-                width=18,
+                width=prog_chars,
                 command=lambda n=name: self.launch(n),
             )
             btn.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 6))
@@ -1083,17 +1233,41 @@ class Launcher(tk.Tk):
 
             sub = ttk.Frame(cell)
             sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
-            sub.grid_columnconfigure(0, weight=1)
-            sub.grid_columnconfigure(1, weight=1)
+            doc_px = self._doc_btn_width_px()
+            # +2 on the left half is the gap the two doc buttons sit apart with.
+            sub.grid_columnconfigure(0, weight=1, minsize=doc_px + 2)
+            sub.grid_columnconfigure(1, weight=1, minsize=doc_px)
             sub.grid_rowconfigure(0, weight=0)
             sub.grid_rowconfigure(1, weight=0)
 
-            if info.get("readme_path"):
-                info_btn = ttk.Button(
-                    sub, text="ReadMe", style="Info.TButton",
-                    command=lambda n=name: self.open_readme(n),
-                )
-                info_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+            has_readme = bool(info.get("readme_path"))
+            has_full = bool(info.get("readme_full_path"))
+            # width=7 is not the label length — a ttk button with no explicit
+            # width takes the theme's minimum (69-80 px here) however short its
+            # text is, and two of those is what made the card 86 px too wide.
+            # At width=7 with padding (3,2) the button is 56 px and holds
+            # "Details" (35 px) and "ReadMe" (42 px) with room to spare.
+            if has_readme or has_full:
+                if has_readme:
+                    info_btn = ttk.Button(
+                        sub, text="ReadMe", style="Doc.TButton", width=7,
+                        command=lambda n=name: self.open_readme(n),
+                    )
+                    info_btn.grid(
+                        row=0, column=0,
+                        columnspan=1 if has_full else 2,
+                        sticky="ew", pady=(0, 2), padx=(0, 2) if has_full else 0,
+                    )
+                if has_full:
+                    full_btn = ttk.Button(
+                        sub, text="Details", style="Doc.TButton", width=7,
+                        command=lambda n=name: self.open_readme_full(n),
+                    )
+                    full_btn.grid(
+                        row=0, column=1 if has_readme else 0,
+                        columnspan=1 if has_readme else 2,
+                        sticky="ew", pady=(0, 2),
+                    )
             else:
                 ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
 
@@ -1117,8 +1291,26 @@ class Launcher(tk.Tk):
             else:
                 ttk.Frame(sub, width=1).grid(row=1, column=1)
 
+            if first_cell is None:
+                first_cell = cell
+
         for c in range(cols):
             grid.grid_columnconfigure(c, weight=0, uniform="grpcols")
+
+        # How wide a card really is, including the padding it is placed with.
+        # Anything that changes a card (a new button, a longer name, a different
+        # font) then re-flows the grid by itself instead of silently overflowing.
+        if first_cell is not None and not self._cell_remeasure_done:
+            try:
+                first_cell.update_idletasks()
+                measured = first_cell.winfo_reqwidth() + 12
+            except Exception:
+                measured = None
+            if measured and measured > 50 and measured != self._measured_cell_px:
+                self._measured_cell_px = measured
+                self._cell_remeasure_done = True     # once per scan, no loop
+                if self._calc_group_cols() != cols:
+                    self.after(0, self._rebuild_buttons)
 
     def _toggle_group(self, gkey: str):
         expanded = not self._group_expanded.get(gkey, False)
@@ -1518,6 +1710,22 @@ class Launcher(tk.Tk):
             os.startfile(str(readme_path))
         except Exception as e:
             messagebox.showerror("ReadMe open failed", f"{program_name}\n\n{e}")
+
+    def open_readme_full(self, program_name: str):
+        info = self.programs.get(program_name)
+        if not info:
+            messagebox.showerror("Not found", f"Program not found: {program_name}")
+            return
+
+        path = info.get("readme_full_path")
+        if not path:
+            messagebox.showinfo("Details", f"No detailed ReadMe found for: {program_name}")
+            return
+
+        try:
+            os.startfile(str(path))
+        except Exception as e:
+            messagebox.showerror("Details open failed", f"{program_name}\n\n{e}")
 
 
 if __name__ == "__main__":

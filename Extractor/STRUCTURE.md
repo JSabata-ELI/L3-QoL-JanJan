@@ -2,6 +2,11 @@
 
 > Verified against source: 2026-08-19 · `e.py` 137 L
 
+User-facing documentation: `ReadMe_Extractor.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Extractor_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
+
 ## Files
 
 | File | Description |

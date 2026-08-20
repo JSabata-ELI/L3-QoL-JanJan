@@ -162,6 +162,13 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     shot_finder._workshop_ref     = workshop
     shot_finder._workshop_tab_idx = workshop_idx
 
+    # ...and the way back: "Show in Image Slider" opens the folder a Workshop frame
+    # came from. Only the folder — the Slider browses files on the share, so an edited
+    # picture is not something it can be handed.
+    workshop._slider_ref     = viewer
+    workshop._slider_tab_idx = tabs.indexOf(viewer)
+    workshop._tab_widget     = tabs
+
     win.setCentralWidget(tabs)
 
     # Stop All tlačítko v řádku záložek (corner widget) — status bar se nepoužívá,

@@ -6,14 +6,11 @@ import json
 import os
 import re
 import shutil
-import ssl
 import sys
 import tempfile
 import threading
 import time
 import atexit
-import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -80,6 +77,10 @@ SOURCE_RE = re.compile(r"(\d+)$")
 
 # ── ENERGY CSV CONFIG ─────────────────────────────────────────────────────────
 # Root folder where daily CSV files live
+# Salvation is NOT running (as of 2026-08-19), so no new daily CSV is written and
+# this fallback yields nothing for recent days — energy comes from the CPVA archiver
+# alone. Kept wired up on purpose: historical days still have their CSV, and the
+# fallback costs nothing until the archiver answers a day with no samples.
 ENERGY_CSV_ROOT = r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata"
 
 # File name pattern: dataof{year}{MonthAbbr}_{day}  e.g. dataof2026Mar_24
@@ -96,24 +97,10 @@ ENERGY_COLUMNS_AVAILABLE = [
 # Default selected columns shown pre-checked in the column picker dialog
 ENERGY_COLUMNS_DEFAULT = []
 
-# Display names for columns in UI and on annotated images.
-# Key = exact CSV column name, Value = label shown to user.
-# Columns not listed here use their CSV name as-is.
-# Edit freely — these names never affect CSV parsing.
-ENERGY_COLUMNS_DISPLAY: dict[str, str] = {
-    "waveplate": "Waveplate",
-    "ptm1":      "PTM1",
-    "pcm2":      "PCM2",
-    "pcm4":      "PCM4",
-    "pap1":      "PAP1",
-    "sbw4":      "SBW4",
-    "CampOn":    "Camp ON",
-    "E2_Open":   "E2 Open",
-    "E3_Open":   "E3 Open",
-    "E4_Open":   "E4 Open",
-    "E5_Open":   "E5 Open",
-    "Back_Ref":  "Back Ref",
-}
+# The CSV-column → label table that used to live here is gone: what a PV is CALLED now
+# comes from the shared registry (_pv_label_for → PV_LABELS), which is also where the
+# operator's own name for it is typed. Two label tables meant a PV could be "SBW4" in
+# one tab and "Compressed SBW4" in the other while both read the same channel.
 
 # Match tolerance in seconds: |t_image - t_csv| must be ≤ this value.
 # The daily energy CSV is logged irregularly (~20 s median between rows, gaps up
@@ -175,6 +162,64 @@ CPVA_CHANNEL_MAP: dict[str, str] = cpva.CHANNEL_MAP
 # SBW4 was renamed — the channel name now comes from cpva_client only.
 CPVA_SBW4_CHANNEL = cpva.SBW4_CHANNEL
 
+# ── PV registry, shared with the Image Slider ────────────────────────────────
+# The Slider module OWNS the registry — the presets, the PVs the operator added, the
+# names given to them, their units and the formulas — and its picker is the one editor
+# for it (PvConfigDialog). This tab reads that same module-level registry instead of
+# keeping a second list of CSV column names beside it, which is what let "SBW4" mean
+# one number here and a different one there.
+#
+# A picked PV is therefore identified by its REGISTRY NAME ("SBW4", "Compressed SBW4",
+# an added channel's own name, a formula's name) — not by a CSV column name as it used
+# to be. The CSV columns that only ever existed in Salvation's file (CampOn, E2..E5
+# Open) are still reachable: type the column name into the picker's search box and the
+# CSV fallback below finds it.
+def _pv_all_names() -> "list[str]":
+    return _get_slider_module().pv_all_names()
+
+
+def _pv_channel_for(name: str) -> "str | None":
+    """The archiver channel a picked PV reads. None for a formula (computed, not read)
+    and for a CSV-only column. An added PV's name IS its channel."""
+    sl = _get_slider_module()
+    if sl.pv_is_derived(name):
+        return None
+    ch = sl.pv_channel_for(name)
+    if ch:
+        return ch
+    return None if name in ENERGY_COLUMNS_AVAILABLE else name
+
+
+def _pv_csv_col(name: str) -> "str | None":
+    """The daily-CSV column for a picked PV, or None if it has none.
+
+    Salvation stopped writing on 2026-08-19, so this only decides what a HISTORICAL
+    day can still serve — and an arbitrary archiver PV was never in that file."""
+    col = _get_slider_module().PV_DISPLAY_TO_COL.get(name)
+    if col in ENERGY_COLUMNS_AVAILABLE:
+        return col
+    return name if name in ENERGY_COLUMNS_AVAILABLE else None
+
+
+def _pv_scale_for(name: str) -> float:
+    """The registry's own factor for a NAMED PV — 1.0 for everything except entries
+    that exist to be a conversion, such as "Compressed SBW4". Never a number typed per
+    tab: this tab applied 0.749 to SBW4 on its own and so reported a different SBW4
+    than every other tab did."""
+    try:
+        return float(_get_slider_module().PV_SCALE.get(name, 1.0)) or 1.0
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _pv_label_for(name: str) -> str:
+    return _get_slider_module().pv_label_for(name)
+
+
+def _pv_unit_for(name: str) -> str:
+    return _get_slider_module().pv_units_for(name)
+
+
 _SLIDER_MOD = None
 
 
@@ -201,39 +246,6 @@ def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
     """Fetch archiver samples via the shared pooled client (kept as a thin
     wrapper so existing call sites stay unchanged). Raises cpva.CpvaError."""
     return cpva.fetch_samples(channel, start_ns, end_ns, timeout=timeout)
-
-
-def _cpva_best_shot_ns(start_ns: int, end_ns: int,
-                       channel: str = CPVA_SHOT_CHANNEL,
-                       timeout: float = CPVA_HTTP_TIMEOUT) -> "int | None":
-    """
-    Query the CPVA archiver for the shot with the highest energy in [start_ns, end_ns].
-    Returns the UTC nanosecond timestamp of that shot, or None on any failure.
-    Only considers samples with value > 0.
-    """
-    try:
-        samples = _cpva_fetch_samples(channel, start_ns, end_ns, timeout=timeout)
-        if not isinstance(samples, list) or not samples:
-            return None
-        best_t: int | None = None
-        best_v: float = 0.0
-        for s in samples:
-            t_ns = s.get("time")
-            if t_ns is None:
-                continue
-            val = s.get("value")
-            if isinstance(val, list):
-                val = val[0] if len(val) == 1 else None
-            try:
-                v = float(val)
-            except (TypeError, ValueError):
-                continue
-            if v > best_v:
-                best_v = v
-                best_t = int(t_ns)
-        return best_t  # None if no sample with v > 0
-    except Exception:
-        return None
 
 
 def _cam_totalpower_channel(cam_name: str) -> "str | None":
@@ -547,47 +559,99 @@ def _read_img_max_value(path: Path) -> "float | None":
     return img_scale.read_max_value(path)
 
 
-def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None):
+# ── Contrast / Brightness / Gamma rows ─────────────────────────────────────
+# Built exactly like the Image Slider's block, down to the short names and the readout
+# widths: the same three controls with the same rule (an Auto checkbox overrides its own
+# row's slider) have to look the same in both tabs, or the operator learns them twice.
+# The names are shortened to Con / Bri / Gam so a numeric readout of the value actually
+# in use fits on the same row — acceptable only because the full name and the meaning
+# are one hover away: the tooltip sits on the name label, the slider AND the readout.
+_BC_NAME_W = 34          # room for "Con:" / "Bri:" / "Gam:" so the three sliders align
+_BC_VALUE_W = 38         # room for "-127", "-255", "0.10" without the row jittering
+
+_TT_CONTRAST = (
+    "Contrast (-127 to +127) — multiplicative gain around the frame's own black level.\n"
+    "0 = untouched; positive spreads the values apart, negative squeezes them together.")
+_TT_BRIGHTNESS = (
+    "Brightness (-255 to +255) — additive offset: the number is added to every pixel.\n"
+    "0 = untouched; positive lifts the whole frame, negative darkens it.")
+_TT_GAMMA = (
+    f"Gamma ({img_scale.GAMMA_MIN:.2f}–{img_scale.GAMMA_MAX:.2f}) — the number shown is "
+    "the exponent of the display curve.\n"
+    "1.00 = linear absolute scale. Below 1 lifts the dark end (0.50 is the usable "
+    "working point on these cameras); above 1 darkens.\n"
+    "Comparability survives — the same pixel value always gives the same colour. "
+    "What changes is that equal count differences stop looking equally big.")
+
+
+def _bc_value_label(text: str, tooltip: str) -> "QLabel":
+    """Read-only numeric readout for a Contrast/Brightness/Gamma row."""
+    lbl = QLabel(text)
+    lbl.setFixedWidth(_BC_VALUE_W)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    lbl.setToolTip(tooltip)
+    lbl.setStyleSheet(
+        "QLabel { font-weight: 700; color: #111; }"
+        "QLabel:disabled { color: #9a9a9a; }")
+    return lbl
+
+
+def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None,
+               contrast: int = 0, offset: int = 0, out: "dict | None" = None):
     """Decoded frame → uint8 for display. Every render path in this tab goes through
     here, so the Finder cannot drift from the Slider on what an intensity means.
 
-    Absolute unless the Auto stretch box is ticked — see img_scale.to_u8. `gamma` is in
+    Absolute unless an Auto box is ticked — see img_scale.render_u8. `contrast` and
+    `offset` are the manual pair, applied on top of the mapping. `gamma` is in
     slider units and bends the absolute curve without costing comparability. What this
     replaced was `MaxValue * arr / arr.max()` followed by `/4095`, which was the right
     answer only for 12-bit cameras: it rendered the 6–11 bit diode cameras nearly black
     and, with the tEXt chunk missing, blew every frame out to white."""
     if full_scale is None:
         full_scale = img_scale.FULL_SCALE_16
-    return img_scale.to_u8(arr, auto, full_scale, gamma)
+    return img_scale.render_u8(arr, auto, full_scale, gamma, contrast, offset, out)
 
 
 def _scale_note(info: dict, arr, auto: bool, full_scale: float = None, gamma=None,
-                path=None, pil_mode: str = None) -> str:
+                path=None, pil_mode: str = None,
+                contrast: int = 0, offset: int = 0,
+                gamma_applied: "float | None" = None) -> str:
     """One line saying what the displayed intensities mean, for the label under the
     preview. `info` is an already-open image's `.info` — never re-open the file for it,
     a share read costs 130–160 ms.
 
     A gamma other than 1 is named here because it moves which count a colour sits on;
-    Auto gamma is resolved from the frame so the number shown is the one applied.
+    Auto gamma is resolved from the frame so the number shown is the one applied. A
+    manual contrast or brightness is named for exactly the same reason. Pass
+    `gamma_applied` when the render already resolved Auto gamma, so this does not repeat
+    the median pass over the frame.
 
     "8-bit source" is decided by the PIL MODE when it is given: a 16-bit frame drawn on
     its camera's reference range also has a full_scale of its own (see img_scale), so
     testing the number alone would label it an 8-bit file."""
     applied = None
     if not auto:
-        applied = (img_scale.auto_gamma(arr, full_scale or img_scale.FULL_SCALE_16)
-                   if img_scale.is_auto_gamma(gamma) else img_scale.gamma_from_slider(gamma))
+        applied = gamma_applied
+        if applied is None:
+            applied = (img_scale.auto_gamma(arr, full_scale or img_scale.FULL_SCALE_16)
+                       if img_scale.is_auto_gamma(gamma)
+                       else img_scale.gamma_from_slider(gamma))
     is_8bit = (pil_mode not in ("I", "I;16")) if pil_mode is not None else (
         full_scale is not None and full_scale != img_scale.FULL_SCALE_16)
     if is_8bit:
         mode = "auto stretch" if auto else "absolute scale"
         if applied is not None and abs(applied - img_scale.GAMMA_NEUTRAL) > 0.005:
             mode += f"  ·  gamma {applied:.2f}"
+        if contrast:
+            mode += f"  ·  contrast {int(contrast):+d}"
+        if offset:
+            mode += f"  ·  brightness {int(offset):+d}"
         return f"8-bit source  ·  {mode}"
     return img_scale.meta_from_info(info, arr).scale_note(
         auto, gamma, applied,
         img_scale.current_reference_bits(img_scale.camera_from_path(path))
-        if path is not None else None)
+        if path is not None else None,
+        contrast, offset)
 
 
 # Frames whose physical max pixel value is below this are considered "empty"
@@ -1204,7 +1268,11 @@ def _energy_api_for_day(
     src_flags: dict[str, str] = {}   # col → "api" | "csv"
 
     def _fetch_one_col(col: str) -> "tuple[str, list[tuple[int, datetime, str]], bool, str]":
-        channel = CPVA_CHANNEL_MAP.get(col)
+        # `col` is a registry NAME. get(col, col) is what makes an arbitrary archiver
+        # channel work at all: it used to be get(col) alone, so anything outside the
+        # eight presets resolved to None and fell straight through to a CSV that has
+        # never heard of it.
+        channel = _pv_channel_for(col)
         col_rows: list[tuple[int, datetime, str]] = []
         had_error = False
         src = "api"
@@ -1229,19 +1297,24 @@ def _energy_api_for_day(
         else:
             _log(f"  {col}: no CPVA channel mapping, trying CSV only")
 
-        # CSV fallback if API returned nothing
-        if not col_rows:
+        # CSV fallback if API returned nothing — only for a PV that HAS a column in
+        # that file. An arbitrary archiver channel has none, and looking for it used to
+        # mean opening the day's CSV once per such PV to find nothing.
+        csv_col = _pv_csv_col(col)
+        if not col_rows and csv_col is not None:
             root = csv_root if csv_root is not None else ENERGY_CSV_ROOT
             fname = dt.strftime(ENERGY_CSV_NAME_FMT) + ".csv"
             csv_path = Path(root) / fname
             csv_rows = _load_energy_csv(csv_path)
             for r in csv_rows:
-                if col in r.values:
+                if csv_col in r.values:
                     if PRAGUE is not None:
                         t_ns = int(r.ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
                     else:
                         t_ns = int((r.ts_dt - datetime(1970, 1, 1)).total_seconds() * 1_000_000_000)
-                    col_rows.append((t_ns, r.ts_dt, r.values[col]))
+                    # Stored under the REGISTRY NAME, not under the CSV column name:
+                    # everything downstream looks a value up by the name that was picked.
+                    col_rows.append((t_ns, r.ts_dt, r.values[csv_col]))
             if col_rows:
                 had_error = False   # CSV covered the outage
                 src = "csv"
@@ -1403,43 +1476,49 @@ def _format_energy_diff_s(diff_s: float) -> str:
         return f"{diff_s*1000:.0f} ms"
     return f"{diff_s:.1f} s"
 
-def _format_energy_value(col: str, raw_val: str) -> str:
-    """Format a CSV value with appropriate units and conversion."""
+# Energies small enough to be read in mJ. House convention, kept: these two are
+# fractions of a joule and "0.0031 J" is harder to compare at a glance than "3.10 mJ".
+_MJ_NAMES = {"Back_Ref", "PAP1"}
+# Columns that only ever lived in Salvation's CSV and hold a 0/1 flag.
+_YESNO_NAMES = {"CampOn", "E2_Open", "E3_Open", "E4_Open", "E5_Open"}
+
+
+def _format_energy_value(name: str, raw_val: str) -> str:
+    """One PV's value as text, keyed by its REGISTRY NAME.
+
+    SBW4 used to be multiplied by 0.749 here, so this tab printed the compressed
+    energy under the name of the channel that reads the uncompressed one — a number
+    that matched no other tab and no archiver query. A PV now reports what the
+    archiver holds; the only factor left is the registry's own for an entry that
+    exists to BE a conversion ("Compressed SBW4")."""
     v = raw_val.strip() if raw_val else "—"
     if v == "—" or v == "":
         return "—"
-    # YES/NO columns
-    if col in ("CampOn", "E2_Open", "E3_Open", "E4_Open", "E5_Open"):
+    if name in _YESNO_NAMES:
         try:
             return "YES" if int(float(v)) == 1 else "NO"
         except Exception:
             return v
-    # mJ columns (value in CSV is in J → multiply by 1000)
-    if col in ("Back_Ref", "pap1"):
-        try:
-            return f"{float(v) * 1000:.2f} mJ"
-        except Exception:
-            return f"{v} mJ"
-    # Plain J columns
-    if col in ("ptm1", "pcm2", "pcm4", "sbw4"):
-        try:
-            v_f = float(v)
-            if col == "sbw4":
-                v_f = v_f * 0.749   # actual energy after optics
-            return f"{v_f:.3f} J"
-        except Exception:
-            return f"{v} J"
     # Waveplate — plain number, no unit, snapped onto its 1000-count grid. The
     # waveplate is only ever commanded to whole multiples of 1000, so anything else
     # is the motor readback caught mid-travel. int() also TRUNCATED, so a settled
     # 349 999.6 printed as 349 999 — one count below a position that does exist.
-    if col == "waveplate":
+    if name == "Waveplate" or name == "waveplate":
         try:
-            return f"{cpva.quantize(CPVA_CHANNEL_MAP.get(col, col), float(v))[0]:.0f}"
+            ch = _pv_channel_for(name) or "waveplate"
+            return f"{cpva.quantize(ch, float(v))[0]:.0f}"
         except Exception:
             return v
-    # Fallback
-    return v
+    try:
+        v_f = float(v) * _pv_scale_for(name)
+    except Exception:
+        return v
+    if name in _MJ_NAMES:
+        return f"{v_f * 1000:.2f} mJ"
+    unit = _pv_unit_for(name)
+    if unit == "J":
+        return f"{v_f:.3f} J"
+    return f"{v_f:.4g} {unit}".strip() if unit else f"{v_f:.4g}"
 
 def _annotate_image_with_energy(
     src: Path,
@@ -1464,13 +1543,11 @@ def _annotate_image_with_energy(
         parts = []
         for col in selected_cols:
             val   = _format_energy_value(col, match_row.values.get(col, "—"))
-            label = ENERGY_COLUMNS_DISPLAY.get(col, col)
-            parts.append(f"{label}: {val}")
+            parts.append(f"{_pv_label_for(col)}: {val}")
         text = "   |   ".join(parts) if parts else "(no columns selected)"
     else:
         # PV values only — no timestamps or extra info in the bar
-        parts = [f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: n/a"
-                 for col in selected_cols]
+        parts = [f"{_pv_label_for(col)}: n/a" for col in selected_cols]
         text = "   |   ".join(parts) if parts else "n/a"
 
     # Create bar — dynamický počet řádků, font a výška se přizpůsobí obsahu
@@ -2135,48 +2212,12 @@ class _EnergyLoadTask(QRunnable):
 
 # ── COLUMN PICKER DIALOG ──────────────────────────────────────────────────────
 
-class EnergyColumnDialog(QDialog):
-    """
-    Modal dialog listing available energy columns as checkboxes.
-    User selects which columns to annotate on saved images.
-    Selection is remembered globally for the session.
-    """
-    def __init__(self, current_selection: list[str], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Select energy columns")
-        self.setMinimumWidth(300)
-        self._checks: dict[str, QCheckBox] = {}
-
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(
-            "Select which CSV columns to annotate on saved images.\n"
-            "All available columns from today's data file:"))
-
-        for col in ENERGY_COLUMNS_AVAILABLE:
-            label = ENERGY_COLUMNS_DISPLAY.get(col, col)
-            cb = QCheckBox(label)
-            cb.setChecked(col in current_selection)
-            cb.setStyleSheet(_CHECKBOX_STYLE)
-            self._checks[col] = cb   # key is always the CSV column name
-            lay.addWidget(cb)
-
-        # Select all / None buttons
-        row = QHBoxLayout()
-        btn_all  = QPushButton("Select all")
-        btn_none = QPushButton("Select none")
-        btn_all.clicked.connect(lambda: [c.setChecked(True)  for c in self._checks.values()])
-        btn_none.clicked.connect(lambda: [c.setChecked(False) for c in self._checks.values()])
-        row.addWidget(btn_all); row.addWidget(btn_none)
-        lay.addLayout(row)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-    def selected_columns(self) -> list[str]:
-        return [col for col, cb in self._checks.items() if cb.isChecked()]
+# EnergyColumnDialog used to live here: a fixed list of the twelve Salvation CSV
+# columns as tick boxes. It is gone — the PV picker is the Image Slider's
+# PvConfigDialog now (see _pick_energy_columns), which reads the shared registry, can
+# search the whole archiver, takes a channel typed in full, and carries the names,
+# units and formulas. Two pickers over one registry is what let the two tabs disagree
+# about what "SBW4" means.
 
 
 class _LoadSignals(QObject):
@@ -2257,7 +2298,11 @@ class ImageFinderWidget(QWidget):
 
         # ── energy CSV state ─────────────────────────────────────────────────
         # Selected columns — loaded from ENERGY_COLUMNS_DEFAULT, user can change
+        # Registry NAMES (see _pv_channel_for), not CSV column names. Restored from
+        # this tab's own state at the end of the build, once the widgets it paints into
+        # exist.
         self._energy_selected_cols: list[str] = list(ENERGY_COLUMNS_DEFAULT)
+        self._energy_hidden_pvs: set = set()
         # Cached CSV rows for the last loaded day: {date_str: list[_EnergyRow]}
         self._energy_cache: dict[str, list[_EnergyRow]] = {}
         # Per-column cache: {date_str: dict[str, list[_EnergyRow]]}
@@ -2430,6 +2475,18 @@ class ImageFinderWidget(QWidget):
 
         self._energy_info = QPlainTextEdit()
         self._energy_info.setReadOnly(True)
+        # The PV list. Literally the Image Slider's widget (PvValueTable) over the
+        # Slider's registry, so one PV cannot read one way in this tab and another way
+        # there. The eye takes a PV off the picture without stopping it being read.
+        self._pv_table = _get_slider_module().PvValueTable()
+        self._pv_table.setVisible(False)
+        self._pv_table.eye_clicked.connect(self._pv_toggle_eye)
+        ll.addWidget(self._pv_table)
+        self._pv_no_pv_lbl = QLabel("No PVs selected. Click PVs to choose.")
+        self._pv_no_pv_lbl.setStyleSheet("font-size: 10px; color: #888; padding: 2px 0;")
+        self._pv_no_pv_lbl.setWordWrap(True)
+        ll.addWidget(self._pv_no_pv_lbl)
+
         self._energy_info.setMaximumHeight(120)
         self._energy_info.setPlaceholderText(
             "Energy values appear here after View.")
@@ -2437,6 +2494,12 @@ class ImageFinderWidget(QWidget):
             "font-family:Consolas,monospace;font-size:11px;"
             "background:#f9f9f9;border:1px solid #ddd;")
         ll.addWidget(self._energy_info)
+        # The picked PVs come back now that the table they paint into exists. Before
+        # this the tab started every session reading NOTHING until the picker was
+        # opened by hand, which reads exactly like "the PVs are there but it ignores
+        # them".
+        self._load_pv_state()
+        self._pv_refresh_table()
         # Navigation row for energy results
         # Row 1: ◀ label ▶  |  PVs
         nav_row = QHBoxLayout()
@@ -2461,7 +2524,10 @@ class ImageFinderWidget(QWidget):
         nav_row.addWidget(sep)
         self._btn_energy_cols = QPushButton("PVs")
         self._btn_energy_cols.setFixedWidth(36)
-        self._btn_energy_cols.setToolTip("Choose which CSV columns to show / annotate")
+        self._btn_energy_cols.setToolTip(
+            "Pick the PVs to read: the presets, any archiver channel (search it or "
+            "type its name in full), and formulas.\n"
+            "The same picker the Image Slider has, over the same list.")
         self._btn_energy_cols.clicked.connect(self._pick_energy_columns)
         nav_row.addWidget(self._btn_energy_cols)
         ll.addLayout(nav_row)
@@ -2526,58 +2592,126 @@ class ImageFinderWidget(QWidget):
         grad_row.addWidget(self._gradient_cb, 1)
         btn_grid.addLayout(grad_row, 2, 0, 1, 2)
 
-        # Absolute scale is the default (see img_scale): one palette colour = one
-        # intensity, so frames and cameras are comparable. This switch trades that away
-        # for legibility on the dim cameras, which is why it is visible and off by
-        # default rather than something the viewer does behind the operator's back.
-        self._cb_auto_stretch = QCheckBox("Auto stretch")
+        # Contrast / Brightness / Gamma — the Image Slider's three-row block, control
+        # for control. Moving a slider re-renders the previewed frame, which is a read
+        # off the share, so the three of them share one debounce instead of firing on
+        # every pixel of a drag.
+        self._bc_debounce = QTimer(self)
+        self._bc_debounce.setSingleShot(True)
+        self._bc_debounce.setInterval(120)
+        self._bc_debounce.timeout.connect(self._bc_reshow_preview)
+
+        # CONTRAST. Its Auto box is the percentile auto-stretch this tab used to show as
+        # a separate "Auto stretch" checkbox — the same operation, now sitting on the row
+        # it overrides, the way the Slider has always had it. Absolute scale stays the
+        # default (see img_scale): one palette colour = one intensity, so frames and
+        # cameras are comparable. Auto trades that away for legibility on the dim
+        # cameras, which is why it is visible and off by default rather than something
+        # the viewer does behind the operator's back.
+        row_con = QHBoxLayout()
+        self._lbl_contrast_name = QLabel("Con:")
+        self._lbl_contrast_name.setMinimumWidth(_BC_NAME_W)
+        self._lbl_contrast_name.setToolTip(_TT_CONTRAST)
+        row_con.addWidget(self._lbl_contrast_name)
+        self._contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self._contrast_slider.setRange(img_scale.CONTRAST_MIN, img_scale.CONTRAST_MAX)
+        self._contrast_slider.setValue(0)
+        self._contrast_slider.setToolTip(_TT_CONTRAST)
+        self._contrast_slider.valueChanged.connect(self._on_contrast_slider_changed)
+        # The manual value to come back to when Auto is switched off — the greyed-out
+        # slider is overwritten while Auto is on (see _park_auto_bc).
+        self._contrast_manual = 0
+        row_con.addWidget(self._contrast_slider, 1)
+        self._lbl_contrast_val = _bc_value_label("0", _TT_CONTRAST)
+        row_con.addWidget(self._lbl_contrast_val)
+        self._btn_contrast_reset = QPushButton("↺")
+        self._btn_contrast_reset.setFixedWidth(26)
+        self._btn_contrast_reset.setToolTip("Reset contrast")
+        self._btn_contrast_reset.clicked.connect(self._reset_contrast_slider)
+        row_con.addWidget(self._btn_contrast_reset)
+        self._cb_auto_stretch = QCheckBox("Auto")
         self._cb_auto_stretch.setStyleSheet(_CHECKBOX_STYLE)
         self._cb_auto_stretch.setToolTip(
+            "Auto contrast — stretch each frame over its own p0.5–p99.5 window. "
+            "Overrides the Contrast slider.\n"
             "OFF: absolute scale — pixel value / camera full scale. Brightness is "
             "comparable between frames and between cameras.\n"
-            "ON: stretch each frame over its own p0.5–p99.5 window. A dim frame becomes "
-            "readable, but colours no longer mean the same intensity from frame to frame.\n"
+            "ON: a dim frame becomes readable, but colours no longer mean the same "
+            "intensity from frame to frame.\n"
             "The Binary and False Colors palettes always map per frame, by design.")
         self._cb_auto_stretch.toggled.connect(self._on_auto_stretch_toggled)
-        btn_grid.addWidget(self._cb_auto_stretch, 3, 0, 1, 2)
+        row_con.addWidget(self._cb_auto_stretch)
+        btn_grid.addLayout(row_con, 3, 0, 1, 2)
 
-        # Gamma — the same control the Slider has, so a frame looks the same in both tabs
-        # at the same setting. Unlike Auto stretch it keeps one colour = one intensity:
-        # the curve depends only on the pixel value (see img_scale).
-        gamma_row = QHBoxLayout()
-        self._lbl_gamma = QLabel("Gamma 1.00:")
-        self._lbl_gamma.setMinimumWidth(78)   # fixed room, or the row jitters on update
-        gamma_row.addWidget(self._lbl_gamma)
+        # BRIGHTNESS — an additive offset, never a gain (that is what Contrast is).
+        # Its Auto box is the auto LEVEL: the same p0.5–p99.5 window as Auto contrast,
+        # placed on the data. No additive rule can do that job — a shift cannot spread a
+        # narrow range — which is why Auto brightness and Auto contrast are one pass and
+        # ticking both does not level the frame twice.
+        row_bri = QHBoxLayout()
+        self._lbl_bright_name = QLabel("Bri:")
+        self._lbl_bright_name.setMinimumWidth(_BC_NAME_W)
+        self._lbl_bright_name.setToolTip(_TT_BRIGHTNESS)
+        row_bri.addWidget(self._lbl_bright_name)
+        self._bright_slider = QSlider(Qt.Orientation.Horizontal)
+        self._bright_slider.setRange(img_scale.BRIGHTNESS_MIN, img_scale.BRIGHTNESS_MAX)
+        self._bright_slider.setValue(0)
+        self._bright_slider.setToolTip(_TT_BRIGHTNESS)
+        self._bright_slider.valueChanged.connect(self._on_bright_slider_changed)
+        self._bright_manual = 0
+        row_bri.addWidget(self._bright_slider, 1)
+        self._lbl_bright_val = _bc_value_label("0", _TT_BRIGHTNESS)
+        row_bri.addWidget(self._lbl_bright_val)
+        self._btn_bright_reset = QPushButton("↺")
+        self._btn_bright_reset.setFixedWidth(26)
+        self._btn_bright_reset.setToolTip("Reset brightness")
+        self._btn_bright_reset.clicked.connect(self._reset_bright_slider)
+        row_bri.addWidget(self._btn_bright_reset)
+        self._cb_bright_auto = QCheckBox("Auto")
+        self._cb_bright_auto.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_bright_auto.setToolTip(
+            "Auto brightness — auto level: the frame's p0.5–p99.5 window mapped onto "
+            "the full range. Overrides the Brightness slider.\n"
+            "Per-frame, so it gives up comparability the same way Auto contrast does.")
+        self._cb_bright_auto.toggled.connect(self._on_bright_auto_toggled)
+        row_bri.addWidget(self._cb_bright_auto)
+        btn_grid.addLayout(row_bri, 4, 0, 1, 2)
+
+        # GAMMA — the third member of the pattern, and the only one that does NOT cost
+        # comparability: the curve depends on the pixel value alone, so one colour still
+        # means one intensity (see img_scale). It is the answer to "the absolute scale is
+        # right but the frame is dark" that Auto contrast answers by giving that up.
+        row_gam = QHBoxLayout()
+        self._lbl_gamma = QLabel("Gam:")
+        self._lbl_gamma.setMinimumWidth(_BC_NAME_W)
+        self._lbl_gamma.setToolTip(_TT_GAMMA)
+        row_gam.addWidget(self._lbl_gamma)
         self._gamma_slider = QSlider(Qt.Orientation.Horizontal)
         self._gamma_slider.setRange(img_scale.GAMMA_SLIDER_MIN, img_scale.GAMMA_SLIDER_MAX)
         self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
-        self._gamma_slider.setToolTip(
-            f"Display gamma {img_scale.GAMMA_MIN:.2f}–{img_scale.GAMMA_MAX:.2f}. "
-            "1.00 = linear absolute scale.\n"
-            "Below 1 lifts the dark end (0.50 is the usable working point on these "
-            "cameras); above 1 darkens.\n"
-            "Brightness stays comparable between frames — only the shape of the curve "
-            "changes, never its dependence on the frame.")
+        self._gamma_slider.setToolTip(_TT_GAMMA)
         self._gamma_slider.valueChanged.connect(self._on_gamma_slider_changed)
         self._gamma_manual = img_scale.GAMMA_SLIDER_NEUTRAL
-        gamma_row.addWidget(self._gamma_slider, 1)
+        row_gam.addWidget(self._gamma_slider, 1)
+        self._lbl_gamma_val = _bc_value_label("1.00", _TT_GAMMA)
+        row_gam.addWidget(self._lbl_gamma_val)
         self._btn_gamma_reset = QPushButton("↺")
         self._btn_gamma_reset.setFixedWidth(26)
         self._btn_gamma_reset.setToolTip("Reset gamma to 1.00 (linear)")
         self._btn_gamma_reset.clicked.connect(self._reset_gamma_slider)
-        gamma_row.addWidget(self._btn_gamma_reset)
+        row_gam.addWidget(self._btn_gamma_reset)
         self._cb_gamma_auto = QCheckBox("Auto")
         self._cb_gamma_auto.setStyleSheet(_CHECKBOX_STYLE)
         self._cb_gamma_auto.setToolTip(
             "Auto gamma — the curve that lands THIS frame's median at "
             f"{int(img_scale.AUTO_GAMMA_TARGET * 100)} % of the range.\n"
             "Per-frame, so it overrides the slider and gives up comparability, same as "
-            "Auto stretch.")
+            "Auto contrast.")
         self._cb_gamma_auto.toggled.connect(self._on_gamma_auto_toggled)
-        gamma_row.addWidget(self._cb_gamma_auto)
-        btn_grid.addLayout(gamma_row, 4, 0, 1, 2)
-        # Both boxes exist now, so put the gamma row in the state they call for.
-        self._sync_gamma_enabled()
+        row_gam.addWidget(self._cb_gamma_auto)
+        btn_grid.addLayout(row_gam, 5, 0, 1, 2)
+        # All three rows exist now, so put them in the state their checkboxes call for.
+        self._sync_bc_enabled()
 
         ll.addLayout(btn_grid)
 
@@ -2899,16 +3033,10 @@ class ImageFinderWidget(QWidget):
         if energy_text:
             pm = self._paint_pv_bar(pm, energy_text)
         self._preview_scale_lbl.setText(getattr(self, "_preview_scale_note", ""))
-        # Park the greyed-out slider on what Auto gamma actually applied to this frame,
-        # so the number on screen is the number in the picture (same contract as the
-        # Slider tab's Auto controls).
-        g_applied = getattr(self, "_preview_gamma_applied", None)
-        if g_applied is not None and self._cb_gamma_auto.isChecked():
-            gv = img_scale.slider_from_gamma(g_applied)
-            self._gamma_slider.blockSignals(True)
-            self._gamma_slider.setValue(gv)
-            self._gamma_slider.blockSignals(False)
-            self._lbl_gamma.setText(f"Gamma {img_scale.gamma_from_slider(gv):.2f}:")
+        # Park the greyed-out sliders on what the Auto passes actually applied to this
+        # frame, so the number on screen is the number in the picture (same contract as
+        # the Slider tab's Auto controls).
+        self._park_auto_bc(getattr(self, "_bc_applied", None))
         lbl = self._preview_lbl
         avail_w = max(lbl.width(),  200)
         avail_h = max(lbl.height(), 200)
@@ -2996,11 +3124,13 @@ class ImageFinderWidget(QWidget):
         self._preview_energy_text = ""
         # Cleared here so a failed load shows no note rather than the previous frame's.
         self._preview_scale_note = ""
-        if (self._cb_pv_preview.isChecked() and self._energy_selected_cols):
+        if (self._cb_pv_preview.isChecked() and self._pv_visible_cols()):
             entry = self._energy_entry_for_path(path)
             if entry is not None:
                 parts = self._energy_parts_for_path(path, entry)
                 self._preview_energy_text = "  |  ".join(parts)
+        # The table reports on THIS frame, so it follows the preview.
+        self._pv_refresh_table()
 
         self._preview_gen += 1
         gen = self._preview_gen
@@ -3008,8 +3138,7 @@ class ImageFinderWidget(QWidget):
         grad_name = self._gradient_cb.currentText()
         # Read the widgets HERE: _load runs on a worker thread and touching a widget
         # from one is not safe.
-        auto = self._cb_auto_stretch.isChecked()
-        gamma = self._gamma_arg()
+        auto, gamma, contrast, offset = self._bc_args()
 
         def _load():
             try:
@@ -3021,12 +3150,17 @@ class ImageFinderWidget(QWidget):
                 # The camera's reference range for a 16-bit frame, 255 for an 8-bit one —
                 # see img_scale.full_scale_for_pil.
                 full_scale = img_scale.full_scale_for_pil(path, img.info, img.mode)
-                arr8 = _render_u8(arr, auto, full_scale, gamma)
+                # `bc_out` comes back with what the Auto passes actually applied, so
+                # the greyed-out sliders can be parked on it and Auto gamma costs no
+                # second median pass over the frame.
+                bc_out: dict = {}
+                arr8 = _render_u8(arr, auto, full_scale, gamma, contrast, offset, bc_out)
+                self._bc_applied = bc_out
+                g_applied = (bc_out.get("gamma")
+                             if (not auto and img_scale.is_auto_gamma(gamma)) else None)
                 self._preview_scale_note = _scale_note(img.info, arr, auto, full_scale,
-                                                       gamma, path, img.mode)
-                self._preview_gamma_applied = (
-                    img_scale.auto_gamma(arr, full_scale)
-                    if (not auto and img_scale.is_auto_gamma(gamma)) else None)
+                                                       gamma, path, img.mode,
+                                                       contrast, offset, g_applied)
                 lut = GRADIENTS.get(grad_name)
                 if lut is not None:
                     pil_img = PilImage.fromarray(
@@ -3271,67 +3405,320 @@ class ImageFinderWidget(QWidget):
         if self._preview_paths:
             self._preview_show()
 
-    def _on_auto_stretch_toggled(self, on: bool):
-        self._log(f"SCALE -> {'auto stretch (per frame)' if on else 'absolute'}")
-        self._sync_gamma_enabled()
+    def _sync_bc_enabled(self):
+        """Enable/disable the Contrast, Brightness and Gamma controls. Every
+        enable/disable of them goes through here, so the rules cannot overwrite
+        each other:
+          - Auto on → that row's own slider and reset button are greyed out (the
+            app-wide 'checkbox beats slider' rule).
+          - Either Auto contrast or Auto brightness on → the whole Gamma row goes dead.
+            Both of them set the frame's two ends themselves, so gamma has nothing left
+            to bend and the render drops it (see img_scale.to_u8). The Slider tab keeps
+            its gamma row alive under Auto brightness because its subtraction mode still
+            uses it; this tab has no such mode, so a live-but-ignored slider would just
+            be a lie.
+        The name labels and the numeric readouts stay live either way: while Auto is on,
+        the readout is exactly what the user wants to see — the value Auto picked, put
+        there by _park_auto_bc."""
+        c_live = not self._cb_auto_stretch.isChecked()
+        b_live = not self._cb_bright_auto.isChecked()
+        self._contrast_slider.setEnabled(c_live)
+        self._btn_contrast_reset.setEnabled(c_live)
+        self._bright_slider.setEnabled(b_live)
+        self._btn_bright_reset.setEnabled(b_live)
+        gamma_usable = c_live and b_live
+        g_live = gamma_usable and not self._cb_gamma_auto.isChecked()
+        self._cb_gamma_auto.setEnabled(gamma_usable)
+        self._lbl_gamma.setEnabled(gamma_usable)
+        self._lbl_gamma_val.setEnabled(gamma_usable)
+        self._gamma_slider.setEnabled(g_live)
+        self._btn_gamma_reset.setEnabled(g_live)
+
+    def _bc_args(self):
+        """(auto, gamma, contrast, offset) for the render — read on the MAIN thread and
+        passed into the workers; never read a widget from one.
+
+        Honours the 'Auto checkbox overrides its own slider' rule of each pair, exactly
+        as the Slider tab does: Auto contrast zeroes the manual contrast, Auto brightness
+        zeroes the manual offset, and each leaves the other one live. Both Autos are the
+        same percentile pass (see img_scale.stretch_u8), so `auto` is set by either and
+        ticking both does not level the frame twice."""
+        auto_c = self._cb_auto_stretch.isChecked()
+        auto_b = self._cb_bright_auto.isChecked()
+        auto = auto_c or auto_b
+        if auto:
+            gamma = img_scale.GAMMA_SLIDER_NEUTRAL
+        elif self._cb_gamma_auto.isChecked():
+            gamma = img_scale.GAMMA_SLIDER_AUTO
+        else:
+            gamma = int(self._gamma_slider.value())
+        contrast = 0 if auto_c else int(self._contrast_slider.value())
+        offset = 0 if auto_b else int(self._bright_slider.value())
+        return auto, gamma, contrast, offset
+
+    def _sync_bc_value_labels(self):
+        """Write the three numeric readouts from the sliders themselves.
+
+        The sliders are the single source of truth for what is on screen — Auto
+        included, because the Auto pass parks its own value there (_park_auto_bc). That
+        parking blocks signals, so the handlers do not run and this is called instead."""
+        self._lbl_contrast_val.setText(str(int(self._contrast_slider.value())))
+        self._lbl_bright_val.setText(str(int(self._bright_slider.value())))
+        self._lbl_gamma_val.setText(
+            f"{img_scale.gamma_from_slider(int(self._gamma_slider.value())):.2f}")
+
+    def _park_auto_bc(self, applied: "dict | None"):
+        """Park each greyed-out slider on the value its Auto pass actually applied to the
+        previewed frame, instead of leaving it at 0 while the picture is clearly changed.
+        Signals are blocked: no reload.
+
+        DISPLAY ONLY. Unticking an Auto box restores the user's own value instead of
+        keeping what was parked (see the toggle handlers) — an Auto checkbox has to be
+        undoable, and the parked number is Auto's, not the user's."""
+        if not applied:
+            return
+        c = applied.get("contrast")
+        if c is not None and self._cb_auto_stretch.isChecked():
+            self._contrast_slider.blockSignals(True)
+            self._contrast_slider.setValue(int(c))
+            self._contrast_slider.blockSignals(False)
+        o = applied.get("offset")
+        if o is not None and self._cb_bright_auto.isChecked():
+            self._bright_slider.blockSignals(True)
+            self._bright_slider.setValue(int(o))
+            self._bright_slider.blockSignals(False)
+        g = applied.get("gamma")
+        if g is not None and self._cb_gamma_auto.isChecked():
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(img_scale.slider_from_gamma(float(g)))
+            self._gamma_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+
+    def _bc_reshow_preview(self):
         if self._preview_paths:
             self._preview_show()
 
-    def _sync_gamma_enabled(self):
-        """Auto stretch sets both ends of the frame itself, so gamma has nothing left to
-        bend — the whole row goes dead while it is on (the render ignores it too, see
-        img_scale.to_u8). Auto gamma greys out its own slider, the same 'checkbox beats
-        slider' rule the Slider tab uses."""
-        usable = not self._cb_auto_stretch.isChecked()
-        live = usable and not self._cb_gamma_auto.isChecked()
-        self._cb_gamma_auto.setEnabled(usable)
-        self._lbl_gamma.setEnabled(usable)
-        self._gamma_slider.setEnabled(live)
-        self._btn_gamma_reset.setEnabled(live)
+    def _on_contrast_slider_changed(self, value: int):
+        # Only user moves reach this (_park_auto_bc blocks signals), so this is the value
+        # to come back to when Auto is switched off.
+        self._contrast_manual = int(value)
+        self._lbl_contrast_val.setText(str(int(value)))
+        self._bc_debounce.start()
 
-    def _gamma_arg(self):
-        """Gamma in slider units for the render, or the AUTO sentinel. Read on the main
-        thread and passed into workers — never read the widget from one."""
-        if self._cb_auto_stretch.isChecked():
-            return img_scale.GAMMA_SLIDER_NEUTRAL
-        if self._cb_gamma_auto.isChecked():
-            return img_scale.GAMMA_SLIDER_AUTO
-        return int(self._gamma_slider.value())
+    def _reset_contrast_slider(self):
+        self._contrast_slider.setValue(0)
+
+    def _on_auto_stretch_toggled(self, on: bool):
+        self._log(f"CONTRAST -> {'auto stretch (per frame)' if on else 'absolute'}")
+        self._sync_bc_enabled()
+        if not on:
+            # Auto off → the slider is live again, so it must not be left on the number
+            # Auto parked there: the stretch of a dim frame needs a gain the slider
+            # cannot reach, so the parked value saturates and does not reproduce the
+            # picture.
+            self._contrast_slider.blockSignals(True)
+            self._contrast_slider.setValue(int(self._contrast_manual))
+            self._contrast_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+        self._bc_reshow_preview()
+
+    def _on_bright_slider_changed(self, value: int):
+        self._bright_manual = int(value)
+        self._lbl_bright_val.setText(str(int(value)))
+        self._bc_debounce.start()
+
+    def _reset_bright_slider(self):
+        self._bright_slider.setValue(0)
+
+    def _on_bright_auto_toggled(self, on: bool):
+        self._log(f"BRIGHTNESS -> {'auto level (per frame)' if on else 'manual'}")
+        self._sync_bc_enabled()
+        if not on:
+            # Auto off → back to the user's own offset, not the black level Auto parked
+            # on the greyed-out slider. Same rule as contrast: an Auto checkbox has to be
+            # undoable.
+            self._bright_slider.blockSignals(True)
+            self._bright_slider.setValue(int(self._bright_manual))
+            self._bright_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+        self._bc_reshow_preview()
 
     def _on_gamma_slider_changed(self, value: int):
         self._gamma_manual = int(value)
-        self._lbl_gamma.setText(f"Gamma {img_scale.gamma_from_slider(value):.2f}:")
-        if self._preview_paths:
-            self._preview_show()
+        self._lbl_gamma_val.setText(f"{img_scale.gamma_from_slider(value):.2f}")
+        self._bc_debounce.start()
 
     def _reset_gamma_slider(self):
         self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
 
     def _on_gamma_auto_toggled(self, on: bool):
         self._log(f"GAMMA -> {'auto (per frame)' if on else 'manual'}")
-        self._sync_gamma_enabled()
+        self._sync_bc_enabled()
         if not on:
             # Auto off → the user's own value, not the one Auto parked on the greyed-out
             # slider. An Auto checkbox has to be undoable.
             self._gamma_slider.blockSignals(True)
             self._gamma_slider.setValue(int(self._gamma_manual))
             self._gamma_slider.blockSignals(False)
-            self._lbl_gamma.setText(
-                f"Gamma {img_scale.gamma_from_slider(self._gamma_manual):.2f}:")
-        if self._preview_paths:
-            self._preview_show()
+        self._sync_bc_value_labels()
+        self._bc_reshow_preview()
 
     # ── ENERGY CSV METHODS ────────────────────────────────────────────────────
 
     def _pick_energy_columns(self):
-        """Open the column picker dialog and update selected columns."""
-        dlg = EnergyColumnDialog(self._energy_selected_cols, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._energy_selected_cols = dlg.selected_columns()
-            self._log(f"ENERGY: columns = {self._energy_selected_cols}")
-            # Refresh displayed info with new column selection
-            if self._energy_results:
-                self._refresh_energy_info()
+        """The Image Slider's PV picker — one dialog, one registry, for both tabs.
+
+        What comes back is split in two: the REGISTRY (added PVs, formulas, names,
+        units) is shared and goes to the shared store, while the selection and the eye
+        state belong to this tab alone."""
+        sl = _get_slider_module()
+        dlg = sl.PvConfigDialog(self._energy_selected_cols, sl.PV_CUSTOM_CHANNELS,
+                               sl.PV_DERIVED, sl.PV_LABELS,
+                               hidden=self._energy_hidden_pvs,
+                               units=sl.PV_CUSTOM_UNITS, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        sl.PV_CUSTOM_CHANNELS.clear()
+        sl.PV_CUSTOM_CHANNELS.update(dlg.custom_channels())
+        sl.PV_DERIVED[:] = dlg.derived_defs()
+        sl.PV_LABELS.clear()
+        sl.PV_LABELS.update(dlg.labels())
+        sl.PV_CUSTOM_UNITS.clear()
+        sl.PV_CUSTOM_UNITS.update(dlg.custom_units())
+        sl.pv_registry_save()
+        self._energy_selected_cols = dlg.selected_names()
+        self._energy_hidden_pvs = (set(dlg.hidden_names())
+                                   & set(self._energy_selected_cols))
+        self._save_pv_state()
+        self._log(f"PVs: {self._energy_selected_cols}")
+        # The cached days were fetched for the PREVIOUS list, so a PV added just now
+        # would read "n/a" until the day happened to be re-fetched for another reason.
+        self._energy_cache.clear()
+        self._energy_per_col_cache.clear()
+        if hasattr(self, "_energy_cache_time"):
+            self._energy_cache_time.clear()
+        if hasattr(self, "_energy_error_days"):
+            self._energy_error_days.clear()
+        self._pv_refresh_table()
+        if self._energy_results:
+            self._refresh_energy_info()
+
+    # ── the PV list: selection, eye, saved state ──────────────────────────
+    def _pv_visible_cols(self) -> "list[str]":
+        """The picked PVs whose value is PRINTED — in the info panel, in the bar under
+        the preview and in a burned-in image. Everything picked is still read; the eye
+        only decides what is shown, exactly as in the Slider."""
+        return [c for c in self._energy_selected_cols
+                if c not in self._energy_hidden_pvs]
+
+    def _pv_fetch_cols(self) -> "list[str]":
+        """What has to be READ for the picked list: every picked PV that is a channel,
+        plus the sources of every picked formula — a formula built on a PV that is not
+        itself picked would otherwise read n/a."""
+        sl = _get_slider_module()
+        out = [c for c in self._energy_selected_cols if not sl.pv_is_derived(c)]
+        for src in sl.pv_source_names(list(self._energy_selected_cols)):
+            if src not in out:
+                out.append(src)
+        return out
+
+    def _pv_toggle_eye(self, name: str):
+        """Eye column of the PV table: take this PV off the picture (or put it back).
+        It keeps being read and stays listed either way."""
+        if name not in self._energy_selected_cols:
+            return
+        if name in self._energy_hidden_pvs:
+            self._energy_hidden_pvs.discard(name)
+        else:
+            self._energy_hidden_pvs.add(name)
+        self._save_pv_state()
+        self._pv_refresh_table()
+        # The bar under the preview follows the eye, so the frame has to be repainted.
+        if self._preview_paths:
+            self._preview_show()
+
+    def _current_preview_path(self) -> "Path | None":
+        """The frame the preview is showing, or None."""
+        paths = getattr(self, "_preview_paths", None) or []
+        idx = getattr(self, "_preview_idx", 0)
+        return paths[idx] if 0 <= idx < len(paths) else None
+
+    def _pv_refresh_table(self):
+        """Repaint the PV table for the frame currently previewed."""
+        tbl = getattr(self, "_pv_table", None)
+        if tbl is None:
+            return
+        has = bool(self._energy_selected_cols)
+        tbl.setVisible(has)
+        self._pv_no_pv_lbl.setVisible(not has)
+        if not has:
+            return
+        vals: dict = {}
+        path = self._current_preview_path()
+        entry = self._energy_entry_for_path(path) if path is not None else None
+        if entry is not None:
+            img_ns = extract_ns_from_stem(path.stem) or 0
+            per_col = entry[6] if len(entry) > 6 else {}
+            match = entry[1] if len(entry) > 1 else None
+            for col, raw, state in self._pv_values_for_ns(
+                    img_ns, self._energy_selected_cols, per_col, match=match,
+                    allow_network=False):
+                vals[col] = self._format_pv_state(col, raw, state)
+
+        def _value_of(name: str):
+            txt = vals.get(name)
+            if txt is None:
+                # No frame previewed yet, or this PV was not resolved for it — say
+                # "not read yet" in grey rather than printing a bare dash that reads
+                # like a PV with no data.
+                return "…", True, ("No frame selected yet — pick a result row."
+                                   if entry is None else
+                                   "Not resolved for this frame.")
+            grey = txt in (cpva.PV_TEXT_NOT_FOUND, cpva.PV_TEXT_ERROR, "—")
+            tip = ""
+            if txt == cpva.PV_TEXT_ERROR:
+                tip = ("The archiver fetch failed for this PV. It is retried on the "
+                       "next lookup.")
+            elif txt == cpva.PV_TEXT_NOT_FOUND:
+                tip = ("Nothing was archived near this frame's time for this PV "
+                       "(the day loaded fine).")
+            return txt, grey, tip
+
+        tbl.refresh(self._energy_selected_cols, self._energy_hidden_pvs, _value_of)
+
+    _PV_STATE_PATH = (Path(os.environ.get("APPDATA", Path.home()))
+                      / "ELI_ImageTools" / "finder_ui_state.json")
+
+    def _load_pv_state(self):
+        """This tab's own selection. The PVs themselves come from the shared registry
+        (see is_t.pv_registry_load) — what is stored here is only WHICH of them this
+        tab shows, and which of those are off the picture."""
+        sl = _get_slider_module()
+        sl.pv_registry_load()
+        try:
+            data = json.loads(self._PV_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        known = set(sl.pv_all_names()) | set(ENERGY_COLUMNS_AVAILABLE)
+        sel = data.get("pv_selected")
+        if isinstance(sel, list):
+            # Iterating the SAVED list keeps the operator's order; the filter drops a
+            # PV that no longer exists, so a removed channel cannot come back.
+            self._energy_selected_cols = [str(n) for n in sel if str(n) in known]
+        hid = data.get("pv_hidden")
+        if isinstance(hid, list):
+            self._energy_hidden_pvs = ({str(n) for n in hid}
+                                       & set(self._energy_selected_cols))
+
+    def _save_pv_state(self):
+        try:
+            self._PV_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._PV_STATE_PATH.write_text(json.dumps(
+                {"pv_selected": list(self._energy_selected_cols),
+                 "pv_hidden": sorted(self._energy_hidden_pvs)},
+                indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     def _get_energy_rows_for_dt(self, dt: datetime) -> list[_EnergyRow]:
         """
@@ -3355,7 +3742,8 @@ class ImageFinderWidget(QWidget):
             age = time.monotonic() - self._energy_cache_time.get(day_key, 0.0)
             if age < 30.0:
                 return self._energy_cache[day_key]
-        cols = self._energy_selected_cols
+        # Read the sources of the picked formulas too — see _pv_fetch_cols.
+        cols = self._pv_fetch_cols()
         if cols:
             rows, per_col, had_error = _energy_api_for_day(dt, cols, log=self._log_safe)
             if had_error:
@@ -3456,33 +3844,61 @@ class ImageFinderWidget(QWidget):
         look-back. allow_network=False (UI thread) still serves look-back
         cache hits.
         """
-        out: "list[tuple[str, str, str]]" = []
-        for col in cols:
+        sl = _get_slider_module()
+        want = list(cols)
+        # A formula is COMPUTED, so it is never looked up here — but its sources are,
+        # whether or not they are picked themselves.
+        read_names = [c for c in want if not sl.pv_is_derived(c)]
+        for src in sl.pv_source_names(want):
+            if src not in read_names:
+                read_names.append(src)
+        resolved: dict = {}
+        for col in read_names:
             # API rows are per-shot → tight window; sparse CSV keeps the wide one.
             tol = (ENERGY_MATCH_TOL_API_S if per_col.get(f"_src:{col}") == "api"
                    else ENERGY_MATCH_TOL_S)
             raw_val = _find_closest_per_col_value(per_col, col, img_ns, tol_s=tol)
             if raw_val and raw_val != "—":
-                out.append((col, raw_val, "ok"))
+                resolved[col] = (raw_val, "ok")
                 continue
             if match is not None:
                 mv = match.values.get(col, "")
                 if mv and mv != "—":
-                    out.append((col, mv, "ok"))
+                    resolved[col] = (mv, "ok")
                     continue
-            channel = CPVA_CHANNEL_MAP.get(col)
+            channel = _pv_channel_for(col)
             if channel and channel in cpva.FORWARD_CHANNELS:
                 res = cpva.value_at_or_before(channel, int(img_ns),
                                               timeout=CPVA_HTTP_TIMEOUT,
                                               network_ok=allow_network)
                 if res.value is not None:
-                    out.append((col, str(res.value), "ok"))
+                    resolved[col] = (str(res.value), "ok")
                     continue
                 if res.status == "error":
-                    out.append((col, "", "error"))
+                    resolved[col] = ("", "error")
                     continue
-            out.append((col, "", "not_found"))
-        return out
+            resolved[col] = ("", "not_found")
+
+        # Formulas, evaluated in definition order from the numbers just resolved —
+        # the SAME evaluator the Slider uses (pv_eval_derived), so a formula cannot
+        # mean one thing here and another there. It wants values with the registry's
+        # own factor already applied.
+        if any(sl.pv_is_derived(c) for c in want):
+            raw_num: dict = {}
+            statuses: dict = {}
+            for _n, (_rw, _st) in resolved.items():
+                try:
+                    raw_num[_n] = float(_rw) * _pv_scale_for(_n)
+                except (TypeError, ValueError):
+                    raw_num[_n] = None
+                statuses[_n] = _st
+            for _n, (_val, _st) in sl.pv_eval_derived(want, raw_num, statuses).items():
+                resolved[_n] = ("" if _val is None else f"{_val}", _st)
+
+        # Answer in the order that was ASKED for, and only for what was asked: a
+        # formula's sources were read as a means, not because the caller wants them
+        # printed.
+        return [(c, *resolved.get(c, ("", "not_found"))) for c in want]
 
     @staticmethod
     def _format_pv_state(col: str, raw: str, state: str) -> str:
@@ -3504,11 +3920,10 @@ class ImageFinderWidget(QWidget):
         img_ns   = extract_ns_from_stem(path.stem) or 0
         parts: list[str] = []
         for col, raw, state in self._pv_values_for_ns(
-                img_ns, self._energy_selected_cols, per_col, match=match,
+                img_ns, self._pv_visible_cols(), per_col, match=match,
                 allow_network=False):
             val   = self._format_pv_state(col, raw, state)
-            label = ENERGY_COLUMNS_DISPLAY.get(col, col)
-            parts.append(f"{label}={val}")
+            parts.append(f"{_pv_label_for(col)}={val}")
         return parts
 
     def _energy_entry_for_path(self, path: Path) -> "tuple | None":
@@ -3628,10 +4043,9 @@ class ImageFinderWidget(QWidget):
             if 0 <= target_csv_idx < len(csv_rows):
                 row = csv_rows[target_csv_idx]
                 parts = []
-                for col in self._energy_selected_cols:
+                for col in self._pv_visible_cols():
                     val   = _format_energy_value(col, row.values.get(col, "—"))
-                    label = ENERGY_COLUMNS_DISPLAY.get(col, col)
-                    parts.append(f"{label}={val}")
+                    parts.append(f"{_pv_label_for(col)}={val}")
                 ts = row.ts_dt.strftime("%H:%M:%S.%f")[:-3]
                 lines.append(f"{ts}  (CSV row)\n  " + "  |  ".join(parts))
             else:
@@ -5336,16 +5750,22 @@ class ImageFinderWidget(QWidget):
     def _apply_gradient_to_image(self, img: PilImage.Image, src_path: "Path | None" = None,
                                  grad_name: "str | None" = None,
                                  auto: "bool | None" = None,
-                                 gamma=None) -> PilImage.Image:
-        """Apply the selected gradient LUT. Pass grad_name / auto / gamma when calling
-        from a worker thread (reading a widget off the main thread is unsafe)."""
+                                 gamma=None,
+                                 contrast: "int | None" = None,
+                                 offset: "int | None" = None) -> PilImage.Image:
+        """Apply the selected gradient LUT. Pass grad_name and the display settings when
+        calling from a worker thread (reading a widget off the main thread is unsafe)."""
         name = grad_name if grad_name is not None else self._gradient_cb.currentText()
         lut  = GRADIENTS.get(name)
         if lut is None: return img
-        if auto is None:
-            auto = self._cb_auto_stretch.isChecked()
-        if gamma is None:
-            gamma = self._gamma_arg()
+        if auto is None or gamma is None or contrast is None or offset is None:
+            # Called without a snapshot, so this is the main thread: read the controls
+            # now. Only the ones the caller left out are taken from the widgets.
+            _a, _g, _c, _o = self._bc_args()
+            auto = _a if auto is None else auto
+            gamma = _g if gamma is None else gamma
+            contrast = _c if contrast is None else contrast
+            offset = _o if offset is None else offset
         arr = np.array(img)
         if arr.ndim == 3: arr = arr.mean(axis=2)
         arr = arr.astype(np.float32)
@@ -5355,7 +5775,7 @@ class ImageFinderWidget(QWidget):
         full_scale = (img_scale.full_scale_for_pil(src_path, img.info, img.mode)
                       if src_path is not None
                       else (img_scale.FULL_SCALE_16 if img.mode in ("I", "I;16") else 255.0))
-        arr8 = _render_u8(arr, auto, full_scale, gamma)
+        arr8 = _render_u8(arr, auto, full_scale, gamma, contrast, offset)
         return PilImage.fromarray(
             _lut_pixels(lut, arr8, name).astype(np.uint8), mode="RGB")
 
@@ -5469,7 +5889,7 @@ class ImageFinderWidget(QWidget):
         best_shot_ns: "int | None" = None
         for ref_ch in (CPVA_SBW4_CHANNEL, CPVA_SHOT_CHANNEL):
             try:
-                t = _cpva_best_shot_ns(start_ns, end_ns, channel=ref_ch, timeout=4.0)
+                t = cpva.best_shot_ns(start_ns, end_ns, channel=ref_ch, timeout=4.0)
                 if t is not None:
                     best_shot_ns = t
                     log(f"  {ref_ch}: best shot at {t/1e9:.3f} UTC")
@@ -5753,9 +6173,8 @@ class ImageFinderWidget(QWidget):
             # copies used to freeze the whole UI here.
             annotate  = self._cb_annotate.isChecked()
             grad_name = self._gradient_cb.currentText()
-            auto      = self._cb_auto_stretch.isChecked()
-            gamma     = self._gamma_arg()
-            sel_cols  = list(self._energy_selected_cols)
+            auto, gamma, contrast, offset = self._bc_args()
+            sel_cols  = self._pv_visible_cols()
 
             self._save_as_sig = _CollectSignals()
             _sig = self._save_as_sig  # local ref — prevents GC if called again
@@ -5827,7 +6246,8 @@ class ImageFinderWidget(QWidget):
                                 try:
                                     self._apply_gradient_to_image(
                                         PilImage.open(src), src, grad_name=grad_name,
-                                        auto=auto, gamma=gamma).save(tmp_path)
+                                        auto=auto, gamma=gamma, contrast=contrast,
+                                        offset=offset).save(tmp_path)
                                     _annotate_image_with_energy(
                                         tmp_path, dst, match, before, after,
                                         img_ts_ns, sel_cols)
@@ -5847,7 +6267,8 @@ class ImageFinderWidget(QWidget):
                                 try:
                                     self._apply_gradient_to_image(
                                         PilImage.open(src), src, grad_name=grad_name,
-                                        auto=auto, gamma=gamma).save(dst)
+                                        auto=auto, gamma=gamma, contrast=contrast,
+                                        offset=offset).save(dst)
                                     if _copy_meta_fn is not None:
                                         try: _copy_meta_fn(src, dst, save_txt=False)
                                         except Exception: pass
@@ -5898,9 +6319,10 @@ class ImageFinderWidget(QWidget):
         if wk is None:
             return
 
-        auto = self._cb_auto_stretch.isChecked()
-        gamma = self._gamma_arg()
-
+        # The Workshop measures and builds its histogram from the picture it is given,
+        # so it gets the plain absolute mapping — never this tab's Auto passes,
+        # Contrast, Brightness or Gamma, which would hand it a display curve instead
+        # of data.
         def _send_one(src: Path):
             from PIL import Image as _PilImg
             import numpy as _np
@@ -5910,7 +6332,7 @@ class ImageFinderWidget(QWidget):
             else:
                 arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
             full_scale = img_scale.full_scale_for_pil(src, pil.info, pil.mode)
-            arr8 = _render_u8(arr_f, auto, full_scale, gamma)
+            arr8 = _render_u8(arr_f, False, full_scale, None)
             cam_name = src.parent.name
             label = f"{cam_name}  |  {src.name}"
             wk.receive_image(arr8, label, source_path=src)
@@ -7973,7 +8395,10 @@ class MultiDayPreviewWindow(QWidget):
             return ""
         if not finder._cb_annotate.isChecked():
             return ""
-        cols = getattr(finder, "_energy_selected_cols", [])
+        # The eye applies to a burned-in bar exactly as it does on screen: what the
+        # operator took off the picture must not reappear in the saved file.
+        cols = (finder._pv_visible_cols() if hasattr(finder, "_pv_visible_cols")
+                else getattr(finder, "_energy_selected_cols", []))
         if not cols:
             return ""
         ns = extract_ns_from_stem(path.stem)
@@ -7994,7 +8419,7 @@ class MultiDayPreviewWindow(QWidget):
             parts = []
             for col, raw, state in finder._pv_values_for_ns(
                     ns, cols, per_col, match=match, allow_network=False):
-                parts.append(f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: "
+                parts.append(f"{_pv_label_for(col)}: "
                              f"{finder._format_pv_state(col, raw, state)}")
             return "  ".join(parts)
         except Exception:
@@ -8225,7 +8650,9 @@ class MultiDayPreviewWindow(QWidget):
                     ann_parts: list[str] = []
                     if finder is not None and ns is not None:
                         try:
-                            cols = getattr(finder, "_energy_selected_cols", [])
+                            cols = (finder._pv_visible_cols()
+                                    if hasattr(finder, "_pv_visible_cols")
+                                    else getattr(finder, "_energy_selected_cols", []))
                             if cols:
                                 dt_csv = datetime.fromtimestamp(ns / 1e9, tz=timezone.utc)
                                 if PRAGUE:
@@ -8242,7 +8669,7 @@ class MultiDayPreviewWindow(QWidget):
                                         ns, cols, per_col, match=match,
                                         allow_network=True):
                                     ann_parts.append(
-                                        f"{ENERGY_COLUMNS_DISPLAY.get(col, col)}: "
+                                        f"{_pv_label_for(col)}: "
                                         f"{finder._format_pv_state(col, raw, state)}")
                         except Exception:
                             pass

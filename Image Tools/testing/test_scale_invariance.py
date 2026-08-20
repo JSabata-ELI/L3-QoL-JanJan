@@ -12,20 +12,24 @@ Three things are asserted per frame:
     ALONE — the preview layer has no full-resolution maximum and must rely on the rule,
     so a mismatch means preview and refined render could pick different ranges;
   * unsaturated frames exist at all (stored_max < 65535) — a per-frame stretch onto the
-    full range would pin every single frame's maximum to 65535.
+    full range would pin every single frame's maximum to 65535;
+  * the bracket never exceeds `img_scale.SENSOR_BITS`. That constant is the range every
+    frame is DISPLAYED against, and it is a constant precisely because the archive holds
+    exactly one camera model. A frame above it means a deeper camera was added and the
+    constant has to be revisited — the display would otherwise clip that camera's top end.
 
-And one thing is REPORTED per camera: how many frames sit in a different bracket from
-the camera's largest. Those are the frames whose brightness would double or halve on
-screen without the reference-range correction (C03-081-PCW3NF, whose peak sits on
-1023/1024, is the camera that made this visible). A camera drifting onto a power of two
-shows up here before anyone notices coloured flicker.
+Two things are REPORTED. Per camera: how many frames sit in a different bracket from the
+camera's largest — those are the frames whose brightness would double or halve on screen
+without the fixed reference range (C03-081-PCW3NF, whose peak sits on 1023/1024, is the
+camera that made this visible). And overall: the `Camera type` values seen, because more
+than one model is the other way `SENSOR_BITS` could stop being true.
 
 Not shipped: the builder keeps `test_*` out of the bundle.
 
 Usage — one camera-hour, or a whole day:
 
-    python test_scale_invariance.py "\\\\users-L3.tier0.lcs.local\\cpva-image-2026\\2026\\08\\14\\05"
-    python test_scale_invariance.py "\\\\users-L3.tier0.lcs.local\\cpva-image-2026\\2026\\08\\14" --limit 400
+    python testing/test_scale_invariance.py "\\\\users-L3.tier0.lcs.local\\cpva-image-2026\\2026\\08\\14\\05"
+    python testing/test_scale_invariance.py "\\\\users-L3.tier0.lcs.local\\cpva-image-2026\\2026\\08\\14" --limit 400
 
 Exit code is 1 when a frame violates the rule, so it can gate a build.
 """
@@ -37,7 +41,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent.parent   # app dir; this file sits in testing/
 sys.path.insert(0, str(_HERE))
 import img_scale  # noqa: E402  (path set above so this runs from anywhere)
 
@@ -74,6 +78,7 @@ def main(argv=None):
     bad = []
     depths: dict[int, int] = {}
     cameras: dict[str, set] = {}
+    models: dict[str, int] = {}
 
     for f in frames(args.paths, args.limit):
         try:
@@ -98,8 +103,16 @@ def main(argv=None):
             continue
         matched += 1
         depths[meta.bit_depth] = depths.get(meta.bit_depth, 0) + 1
+        model = str(info.get("Camera type") or "?")
+        models[model] = models.get(model, 0) + 1
         cam = img_scale.camera_from_path(f) or f.parent.name
         cameras.setdefault(cam, []).append(meta.bit_depth)
+        # The claim behind the display range being a constant.
+        if meta.bit_depth > img_scale.SENSOR_BITS:
+            bad.append((f, f"{meta.bit_depth}-bit bracket is deeper than "
+                           f"img_scale.SENSOR_BITS ({img_scale.SENSOR_BITS}) — a deeper "
+                           f"camera model is in the archive and the constant must be "
+                           f"revisited"))
         if meta.stored_max < img_scale.FULL_SCALE_16:
             unsaturated += 1
         recovered = meta.stored_max / meta.factor
@@ -120,6 +133,15 @@ def main(argv=None):
           f"{'' if unsaturated else '   <-- suspicious: check for per-frame stretching'}")
     print(f"bit depths seen         : "
           f"{', '.join(f'{b}-bit x{c}' for b, c in sorted(depths.items())) or '-'}")
+    print(f"display range           : {img_scale.SENSOR_BITS}-bit "
+          f"({img_scale.SENSOR_FULL_SCALE_COUNTS} counts), fixed for every frame")
+    # '?' is a frame with no `Camera type` chunk at all — a truncated write, not another
+    # model. Warning on it would cry wolf on every scan, so only real names count.
+    named = [m for m in models if m != "?"]
+    print(f"camera models seen      : "
+          f"{', '.join(f'{m} x{c}' for m, c in sorted(models.items())) or '-'}"
+          + ("" if len(named) <= 1 else
+             "\n    <-- more than one model: check that SENSOR_BITS still fits them all"))
     straddling = 0
     for cam, ds in sorted(cameras.items()):
         if len(set(ds)) <= 1:
@@ -130,7 +152,7 @@ def main(argv=None):
         print(f"  {cam}: straddles a bracket — {off} of {len(ds)} frames are not "
               f"{ref}-bit ({', '.join(f'{d}-bit x{ds.count(d)}' for d in sorted(set(ds)))}). "
               f"Those frames render at {2 ** (ref - min(ds))}x the brightness of the rest "
-              f"unless the camera's reference range is applied.")
+              f"unless the fixed {img_scale.SENSOR_BITS}-bit range is applied.")
     print(f"cameras straddling      : {straddling}")
     print(f"no MaxValue tEXt        : {len(no_meta)}")
     for p in no_meta[:5]:

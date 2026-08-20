@@ -2,6 +2,11 @@
 
 > Verified against source: 2026-08-05, re-checked 2026-08-19 (unchanged) · `s.py` 4569 L
 
+User-facing documentation: `ReadMe Screenshots.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Screenshots_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
+
 ## Files
 
 | File | Description |

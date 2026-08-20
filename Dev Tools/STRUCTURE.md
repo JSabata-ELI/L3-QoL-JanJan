@@ -1,6 +1,11 @@
 # Dev Tools — STRUCTURE
 
-> Verified against source: 2026-08-19 · `dev_tools.py` 86 L · `b_t.py` 1215 L · `cm_t.py` 2128 L
+> Verified against source: 2026-08-19 · `dev_tools.py` 87 L · `b_t.py` 1495 L · `cm_t.py` 2129 L
+
+User-facing documentation: `ReadMe Dev Tools.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Dev Tools_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
 ## Files
 
@@ -46,6 +51,14 @@ roots come from `%APPDATA%\DevTools\config.json` (`src_root`, `dist_root`,
 `<scratch>/Versions.txt` is a flat `Name = vX.Y.Z` list, written by the Builder
 after every successful build (`write_version_to_txt`) and read back by
 `read_versions_txt()`. Both tabs carry their own copy of these two helpers.
+
+The Builder's copy is **cached for 15 s** (`_VERSIONS_CACHE`,
+`invalidate_versions_cache()`, `read_versions_txt(force=True)` for the
+read-modify-write in `write_version_to_txt`). The file sits on the scratch share,
+where one read costs tens of milliseconds, and the project list asks for it once
+per row — so an uncached read turned every tick into ~17 share reads and the list
+felt stuck. The cache is dropped on every write, on `_reload_projects` and after
+a build (`invalidate_version_cache()`, which also clears `_last_version_cache`).
 
 ---
 
@@ -123,9 +136,67 @@ after every successful build (`write_version_to_txt`) and read back by
   "hidden_imports":   ["module"],
   "copy_metadata":    ["module"],
   "exclude_modules":  ["module"],
-  "extra_files":      ["data.json", "images"]
+  "extra_files":      ["data.json", "images"],
+  "extra_exes":       [{"script": "helper.py",
+                        "name":   "My Helper",
+                        "windowed": false,
+                        "hidden_imports": ["module"],
+                        "extra_files": ["data.dat"]}]
 }
 ```
+
+### Helper exes — `extra_exes`
+
+A helper is a program that lives in a project's source folder but is **started on
+its own**: Diagnostic's Webex listener (`remote_launcher.py`) is the one that
+exists. It runs all day so `@Diagnostics /run` can open the app while the app is
+closed.
+
+| Piece | Behaviour |
+|-------|-----------|
+| `find_helpers(projects)` | Re-read on **every refresh**, not at startup, from each project's `build_config.json`. Nothing has to be registered: a project has helpers exactly when its config lists them, so the expander in the project list appears by itself and cannot go stale. A `str` entry is accepted as `{"script": …}`; a script that does not exist is dropped. |
+| `helpers_by_parent` / `helpers_of(name)` | project name → helper specs |
+| `helper_checks` / `helper_next_labels` | **Kept outside the rows.** A tick that vanished when the list was rebuilt would be a tick the build silently ignores. |
+| `expanded_projects` + `helper_rows` + `_build_helper_row` | Helper rows are built together with their parent and only `grid_remove()`d while folded, so `_toggle_expanded` / `_apply_expanded` is a show/hide of one or two frames instead of a rebuild of the whole list (which cost a version lookup per row and made the list flash). Folded by default: most projects have no helpers and an always-open tree pushes the projects off the visible list. Projects without helpers get a spacer label so every tick box stays on the same left edge. |
+| `project_checks` | **Not rebuilt with the rows.** A tick is a selection the user made, so `_render_project_buttons` reuses the existing `BooleanVar` per name; only names that left `projects_sorted` are dropped, and a project whose row is not rendered (Ignored + *Show ignored* off) is unticked together with its helpers, so what builds is what is on screen. |
+| `_select_helper(h)` + `_focused_name()` | A helper can be the focused program too: **Details** on a helper row fills the same panel with its name, its script as MAINPY and its own last/next version. `project_next_override` and `effective_next_version_for_project` are keyed by program name, and a helper's name *is* its dist folder, so editing **Next version** while a helper is focused sets the helper's version and nothing else. The Group combo is emptied and disabled (a helper follows its parent), and `_on_group_changed` guards on `selected_helper` so a stray event cannot re-group the parent. `_on_build_finished` re-focuses the helper it was showing. |
+| `_open_helper_readme(h)` | **ReadMe** on a helper row opens `ReadMe_<helper name>.txt` **from the parent's folder** — named after the helper, because that is what `Launcher/l.py::find_readme_or_none` looks for in the helper's own deployed folder. Offers to create it (UTF-8 BOM) when it is missing; `_build_one_helper` copies both the short and the `_Full` document into the version folder and logs which one is absent. |
+| `_on_project_clicked` | Row click, `<Button-1>` on the row frame and on the version label, and the **Details** button: focuses the project and opens its helpers. Ticking does the same (`_on_project_check_clicked` → `_toggle_expanded(open_it=tick)`), so the tick that was just pushed onto the helpers is visible. The arrow button still folds. |
+| `_update_focus_styles` | Repaints only the row that lost focus and the one that gained it (`_focused_row_name`). `Focused.TFrame` / `FocusedRow.TCheckbutton` / `Focused.TLabel` are configured in `_init_row_styles` — the frame style used to be declared empty in `dev_tools.py`, so the focused project looked like every other one. The painted widget is an inner **band** frame that starts at the tick box, not the row: the slot reserved for the expander arrow stays outside it, because a highlight drawn across that empty slot read as a hole punched in it. |
+| Ticking a project | pushes its tick down onto its helpers — the usual case is a released version where app and helper match. **One-way push, not a lock**: unticking a helper afterwards sticks, which is how you rebuild only the app. |
+| `_get_checked_helpers()` | reads `helper_checks`, in project order, so a helper ticked and then folded away still counts. |
+
+#### `_build_one_helper(h, ver)` — and why it differs from a project build
+
+Output is **`dist/<helper name>/vX.Y.Z/`** — the helper's *own* dist entry with its
+*own* version, not a file inside the parent's version folder:
+
+- a helper can be built without its parent, and a parent version folder holding
+  only the helper would be "a version of the app that is not the app";
+- it therefore also shows up as its own row in the Copy Manager and deploys to
+  `<dst>/<helper name>/` like any other program.
+
+`--onefile`, unlike the projects' `--onedir`:
+
+- a second `--onedir` build would want its own `_internal` beside the app's and the
+  two would overwrite each other. One self-contained file cannot collide;
+- a single file is the form that survives being copied somewhere by hand, which is
+  how these get installed.
+
+`--console` by default (`"windowed": true` hides it): a background helper's window
+is the only sign it is alive, and closing it is how you stop it.
+
+Also per helper: the parent's `icon.ico` if present, the source copied in as
+`<name> v<ver>.py` so the version folder says what it was built from, and
+`extra_files` — **inherited from the project config by default**, because a helper
+that ships beside the app generally reads the same data files (Diagnostic's
+listener needs `notify_provision.dat`) and in its own folder cannot borrow the
+app's copy. `hidden_imports` are the project's plus the helper's;
+`exclude_modules` are the project's. The version goes into `Versions.txt` like any
+other build.
+
+A helper that fails to build **only logs a warning** — the app itself is already
+built and usable, and failing the whole build would throw that away.
 
 ---
 
@@ -204,6 +275,22 @@ from the plain `Name vX.Y.Z.exe` filename.
    is copied; conflicts use the `icon_decisions` answers)
 3. Delete leftover folders on the destination that the new version does not bring
    — except `_internal`, `archive`, and anything in `incoming_dirs`
+
+### The two user documents
+A program has **two** user-facing docs and the Launcher has a button for each:
+`ReadMe_<folder>` (short, **ReadMe**) and `ReadMe_<folder>_Full` (detailed,
+**Details**; `_Details` and `Manual_<folder>` are also accepted). Both tabs carry
+both:
+
+| Step | Function | Note |
+|------|----------|------|
+| build | the doc block in `_build_one_project` | copies **both** into the version folder; logs `readme:` and `readme (details):`. A missing detailed doc is a *note*, not a warning — a program may legitimately have only the short one |
+| deploy | `find_readme_or_raise` + **`find_readme_full_or_none`** | resolved from the same search dirs in the same order, excluded from `src_extras` (they are copied as docs, not as generic extras), logged as `ReadMe:` / `Details:`, and copied in one loop that counts both into `stats["readme_copied"]` |
+| ReadMe only | `_on_copy_readme_only` | also copies both; it skips a program only when **neither** exists |
+
+`find_readme_full_or_none` mirrors `l.py::find_readme_full_or_none` exactly — if the
+two ever diverge, a publish lands a file the Launcher will not open, which is
+invisible until somebody presses the button.
 
 ### ReadMe lookup order
 Five places, in this order, and the second one is the reason the order matters:

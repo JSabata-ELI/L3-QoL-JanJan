@@ -13,9 +13,9 @@ second half holds up against the first. Both the share read (145 ms) and the arc
 round-trip are simulated, because the whole question is what happens when both are slow at
 once — on local files with an instant archiver neither can starve anything.
 
-  python bench_live_pv_load.py                 # PV panel on
-  python bench_live_pv_load.py --no-pv         # the control: same run, no PV at all
-  python bench_live_pv_load.py --seconds 60 --cams 6
+  python testing/bench_live_pv_load.py                 # PV panel on
+  python testing/bench_live_pv_load.py --no-pv         # the control: same run, no PV at all
+  python testing/bench_live_pv_load.py --seconds 60 --cams 6
 
 Compare the two: if the pictures only stall with PV on, the panel is the cause.
 """

@@ -43,9 +43,11 @@ import numpy as np
 # ── PySide6 ────────────────────────────────────────────────────────────────
 from PySide6.QtCore import (
     Qt, QObject, QTimer, Signal, QDate, QLocale, QRect, QSize, QPoint,
+    QPointF, QEvent,
 )
 from PySide6.QtGui import (
     QColor, QIcon, QPalette, QPainter, QPen, QShortcut, QKeySequence,
+    QPolygonF,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -57,6 +59,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QToolButton, QMenu, QColorDialog,
     QCalendarWidget, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
     QTextEdit, QProgressBar, QLayout,
+    QAbstractSpinBox, QAbstractScrollArea, QSlider,
 )
 
 # ── matplotlib ─────────────────────────────────────────────────────────────
@@ -195,6 +198,10 @@ _GRAPH_OPTS_DEFAULTS = {
     # is ~400 objects and by far the largest single cost of a redraw, so they are
     # off by default and can be switched back on in Graph settings.
     "y_minor_ticks":     False,
+    # Time axis
+    "x_ticks_max":       8,     # upper bound on time stamps across the plot
+    "x_tick_seconds":    0,     # fixed spacing in s; 0 = pick a round one to fit
+    "x_time_format":     "auto",  # auto | hms (12:34:56) | hm (12:34)
     # Plot rectangle (figure fractions)
     "margin_right":      0.015,
     "margin_top":        0.97,
@@ -205,6 +212,16 @@ _GRAPH_OPTS_DEFAULTS = {
     "cursor_boxes_max":   20,    # boxes are dropped above this many visible PVs
     "line_markers":       True,  # dots on short traces
 }
+
+# Fixed spacings offered for the time stamps on the X axis (label, seconds).
+# 0 = let the graph pick a round step that fits the window.
+_X_TICK_STEPS = [
+    ("Automatic", 0), ("1 s", 1), ("2 s", 2), ("5 s", 5), ("10 s", 10),
+    ("15 s", 15), ("30 s", 30), ("1 min", 60), ("2 min", 120), ("5 min", 300),
+    ("10 min", 600), ("15 min", 900), ("30 min", 1800), ("1 h", 3600),
+    ("2 h", 7200), ("3 h", 10800), ("6 h", 21600), ("12 h", 43200),
+    ("1 day", 86400),
+]
 
 # ── Custom-PV expression variables ─────────────────────────────────────────
 # Channel letters (A, B, … AA) used as variables in custom-PV expressions.
@@ -295,6 +312,112 @@ class _ChanSig(QObject):
 
 
 # ── Color swatch delegate ──────────────────────────────────────────────────
+
+class _WheelGuard(QObject):
+    """The mouse wheel must never change a number box or a drop-down just
+    because the pointer happens to hover over it.
+
+    A field only reacts to the wheel once it has been clicked into (focused);
+    otherwise the scroll is handed to the panel underneath, so the toolbar or
+    the page scrolls the way the user expects.
+    """
+
+    _TARGETS = (QAbstractSpinBox, QComboBox, QSlider)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() != QEvent.Type.Wheel or not isinstance(obj, self._TARGETS):
+            return False
+        if obj.hasFocus():
+            return False                    # clicked into it -> normal behaviour
+        w = obj.parentWidget()
+        while w is not None:                # pass the scroll on to the panel
+            if isinstance(w, QAbstractScrollArea):
+                QApplication.sendEvent(w.viewport(), ev)
+                break
+            w = w.parentWidget()
+        return True
+
+
+def _install_wheel_guard():
+    """Install _WheelGuard once for the whole application."""
+    app = QApplication.instance()
+    if app is None or getattr(app, "_wheel_guard", None) is not None:
+        return
+    guard = _WheelGuard(app)
+    app._wheel_guard = guard
+    app.installEventFilter(guard)
+
+
+class _CenteredCheckDelegate(QStyledItemDelegate):
+    """Draws a tick box in the MIDDLE of its column instead of hard against the
+    left cell edge (Show / Autoscale / Grid columns of the PV list).
+
+    Qt always lays the check indicator out on the left, and the app stylesheet
+    re-positions it again, so the box is painted here by hand: that is the only
+    way to know exactly where it sits — and the click area has to match it.
+    """
+
+    _SIZE = 18          # outer size of the box, in pixels
+
+    def _box(self, rect: QRect) -> QRect:
+        b = QRect(0, 0, self._SIZE, self._SIZE)
+        b.moveCenter(rect.center())
+        return b
+
+    def paint(self, painter: QPainter, option, index):
+        if index.data(Qt.ItemDataRole.CheckStateRole) is None:
+            super().paint(painter, option, index)   # e.g. a group divider row
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style  = widget.style() if widget else QApplication.style()
+        checked = opt.checkState == Qt.CheckState.Checked
+        # Row background / selection only — the built-in (left-hugging)
+        # indicator and the empty text are dropped.
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        opt.text = ""
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+
+        box = self._box(option.rect)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        edge = QColor("#1565C0") if checked else QColor("#4a4a4a")
+        painter.setPen(QPen(edge, 2))
+        painter.setBrush(QColor("#1565C0") if checked else QColor("#ffffff"))
+        painter.drawRoundedRect(box.adjusted(1, 1, -1, -1), 3, 3)
+        if checked:
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            c = box.center()
+            painter.drawPolyline(QPolygonF([QPointF(c.x() - 3.5, c.y() + 0.5),
+                                            QPointF(c.x() - 0.5, c.y() + 3.5),
+                                            QPointF(c.x() + 4.0, c.y() - 3.5)]))
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        flags = index.flags()
+        if not (flags & Qt.ItemFlag.ItemIsUserCheckable) or not (flags & Qt.ItemFlag.ItemIsEnabled):
+            return False
+        etype = event.type()
+        if etype in (QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonPress,
+                     QEvent.Type.MouseButtonDblClick):
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+            # Hit area = the drawn box, grown a little so it is easy to hit.
+            if not self._box(option.rect).adjusted(-5, -3, 5, 3).contains(event.position().toPoint()):
+                return False
+            if etype != QEvent.Type.MouseButtonRelease:
+                return True                      # swallow press / double click
+        elif etype == QEvent.Type.KeyPress:
+            if event.key() not in (Qt.Key.Key_Space, Qt.Key.Key_Select):
+                return False
+        else:
+            return False
+        state = Qt.CheckState(index.data(Qt.ItemDataRole.CheckStateRole) or 0)
+        new   = (Qt.CheckState.Unchecked if state == Qt.CheckState.Checked
+                 else Qt.CheckState.Checked)
+        return model.setData(index, new, Qt.ItemDataRole.CheckStateRole)
+
 
 class _ColorSwatchDelegate(QStyledItemDelegate):
     """Paints axis-settings table Color cells; opens QColorDialog on click."""
@@ -1494,6 +1617,14 @@ class CSSLoggerWidget(QWidget):
 
         bar.addStretch()
         self._refresh_preset_combo()
+    def resizeEvent(self, ev):
+        # The cap on the PV list height follows the window height.
+        super().resizeEvent(ev)
+        try:
+            self._autosize_axis_pane()
+        except Exception:
+            pass
+
     # ── Graph tab ──────────────────────────────────────────────────────────
 
     def _build_graph_tab(self):
@@ -1519,7 +1650,8 @@ class CSSLoggerWidget(QWidget):
         b_cond = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
         b_cpv  = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
         b_gset = QPushButton("Graph settings")
-        b_gset.setToolTip("Fonts, axis-column spacing, plot margins, cursor readouts")
+        b_gset.setToolTip("Fonts, axis-column spacing, time stamps, plot margins, "
+                          "cursor readouts")
         b_gset.clicked.connect(self._open_graph_settings_dialog); ctrl.addWidget(b_gset)
 
         ctrl.addWidget(QLabel("Font:"))
@@ -1623,6 +1755,7 @@ class CSSLoggerWidget(QWidget):
         hdr = QHBoxLayout()
         h = QLabel("Axis settings")
         h.setStyleSheet("font-weight:700;color:#1565C0;")
+        self._axis_hdr_label = h
         hdr.addWidget(h)
         hdr.addStretch()
         lay.addLayout(hdr)
@@ -1656,6 +1789,8 @@ class CSSLoggerWidget(QWidget):
             "QTableWidget{background:#ffffff;}"
             "QTableWidget QTableCornerButton::section{background:#ffffff;}"
             "QTableWidget::item:selected{background:#BBDEFB;color:#0D47A1;}")
+        # The table fills its pane; how tall that pane is follows the number of
+        # PV rows (see _autosize_axis_pane).
         self._axis_tv.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         hdr = self._axis_tv.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -1671,6 +1806,13 @@ class CSSLoggerWidget(QWidget):
 
         for i, col in enumerate(_COLS):
             self._axis_tv.setColumnWidth(i, _COL_W.get(col, 60))
+
+        # Tick boxes sit in the middle of the Show / Autoscale / Grid columns.
+        self._check_delegate = _CenteredCheckDelegate(self._axis_tv)
+        for _c in ("show", "auto_scale", "grid"):
+            if _c in _COLS:
+                self._axis_tv.setItemDelegateForColumn(_COLS.index(_c),
+                                                       self._check_delegate)
 
         # Color swatch delegate on column 3
         self._color_delegate = _ColorSwatchDelegate(self._axis_tv)
@@ -2021,7 +2163,10 @@ class CSSLoggerWidget(QWidget):
         # are user-tunable (Graph settings) because the "right" spacing depends on
         # the font size and how many PVs share the width.
         _GAP_PX      = max(0.0, float(_opts.get("axis_gap_px", 6)))
-        _MIN_PAD_PX  = max(0.0, float(_opts.get("label_pad_px", 5)))
+        # May be negative: the rotated tick numbers keep a couple of pixels of
+        # empty margin around their digits, so a small negative value moves the
+        # title closer without touching any ink.
+        _MIN_PAD_PX  = max(-8.0, float(_opts.get("label_pad_px", 5)))
         _ticksize    = max(5, _fsize + int(_opts.get("tick_font_delta", -1)))
         _ticklen_px  = 3.5 * _PX_PER_PT          # rcParams ytick.major.size
         _tickpad_px  = 2 * _PX_PER_PT            # tick_params(pad=2) below
@@ -2296,13 +2441,18 @@ class CSSLoggerWidget(QWidget):
         else:
             ax0.xaxis.set_major_locator(mdates.AutoDateLocator(tz=TZ_PRAGUE, minticks=5, maxticks=8))
 
+        # Clock format of the time stamps: "auto" keeps seconds, the other two
+        # are the user's fixed choice (Graph settings → Time axis).
+        _xfmt   = str(_opts.get("x_time_format", "auto"))
+        _clock  = "%H:%M" if _xfmt == "hm" else "%H:%M:%S"
+
         def _fmt_x(x, _):
             try:
                 dt = mdates.num2date(x, tz=TZ_PRAGUE)
             except Exception:
                 return ""
-            if same_day: return dt.strftime("%H:%M:%S")
-            return dt.strftime("%m-%d\n00:00") if (dt.hour == 0 and dt.minute == 0) else dt.strftime("%H:%M:%S")
+            if same_day: return dt.strftime(_clock)
+            return dt.strftime("%m-%d\n00:00") if (dt.hour == 0 and dt.minute == 0) else dt.strftime(_clock)
 
         ax0.xaxis.set_major_formatter(FuncFormatter(_fmt_x))
         if _minor_ticks:
@@ -2562,14 +2712,17 @@ class CSSLoggerWidget(QWidget):
                 if minors:
                     ax0.xaxis.set_minor_locator(_FL(minors))
 
-                def _fmt_x_live(x, _p, _same=same_d):
+                _clk = ("%H:%M" if str(self._graph_opts.get("x_time_format", "auto")) == "hm"
+                        else "%H:%M:%S")
+
+                def _fmt_x_live(x, _p, _same=same_d, _c=_clk):
                     try:
                         dt = mdates.num2date(x, tz=TZ_PRAGUE)
                     except Exception:
                         return ""
-                    if _same: return dt.strftime("%H:%M:%S")
+                    if _same: return dt.strftime(_c)
                     return (dt.strftime("%m-%d\n00:00")
-                            if (dt.hour == 0 and dt.minute == 0) else dt.strftime("%H:%M:%S"))
+                            if (dt.hour == 0 and dt.minute == 0) else dt.strftime(_c))
                 ax0.xaxis.set_major_formatter(_FF(_fmt_x_live))
 
         # Keep the crosshair snap data in sync, and force a fresh blit background
@@ -2678,6 +2831,7 @@ class CSSLoggerWidget(QWidget):
                 hl.set_ydata([y_frac, y_frac]); hl.set_visible(True)
                 if bg is not None: hl.axes.draw_artist(hl)
 
+        _boxes = []          # (axis, value box, height it wants) — placed below
         for ax_i, ax in enumerate(self._graph_axes):
             pv = self._graph_pvs[ax_i] if ax_i < len(self._graph_pvs) else None
             snap_val = None
@@ -2707,7 +2861,7 @@ class CSSLoggerWidget(QWidget):
                     # hovered X (snap_val) — not the arbitrary raw mouse Y.
                     has_data = snap_val is not None
                     val_str = _fmt_cursor_value(snap_val) if has_data else "—"
-                    txt = f" {val_str}"
+                    ann.set_text(f" {val_str}")
                     if has_data:
                         y_ann = snap_val
                     else:
@@ -2715,19 +2869,13 @@ class CSSLoggerWidget(QWidget):
                         # row (y_frac is the mouse Y in axes fractions).
                         _ylo, _yhi = ax.get_ylim()
                         y_ann = _ylo + (_yhi - _ylo) * (y_frac if y_frac is not None else 0.5)
-                    # Stagger every other axis label onto a second row, with
-                    # enough vertical padding that the two rows' boxes clear
-                    # each other (box height ≈ font size + bbox padding).
-                    if ax_i % 2 == 1:
-                        try:
-                            ylo, yhi = ax.get_ylim()
-                            h_px = ax.get_window_extent().height
-                            pad_px = ann.get_fontsize() + 16
-                            if h_px > 0: y_ann += (yhi - ylo) / h_px * pad_px
-                        except Exception:
-                            pass
-                    ann.set_position((x_f, y_ann)); ann.set_text(txt); ann.set_visible(True)
-                    if bg is not None: ax.draw_artist(ann)
+                    # The final height is decided once every box is known, so
+                    # boxes that would land on top of each other can be spread
+                    # apart (see _place_cursor_boxes).
+                    _boxes.append((ax, ann, y_ann))
+
+        if _boxes:
+            self._place_cursor_boxes(_boxes, x_f, bg)
 
         if self._x_cursor_ann is not None:
             try:
@@ -2759,6 +2907,68 @@ class CSSLoggerWidget(QWidget):
         # Push the per-PV cursor values into the axis-settings table only once the
         # mouse settles (rewriting QTableWidget items every move stutters).
         self._cursor_tbl_timer.start(120)
+
+    def _place_cursor_boxes(self, boxes, x_f, bg):
+        """Put every value box exactly where the cursor line crosses its own
+        trace, and keep boxes from covering each other.
+
+        Boxes used to be pushed onto two alternating rows, which moved half of
+        them away from their curve even when there was nothing in the way. Here
+        each box starts on its own curve; only boxes that would really overlap
+        are treated as one stack and spread out around the average height the
+        stack asked for. So a box moves only when it has to, and only as far as
+        it has to.
+        """
+        items = []
+        for ax, ann, y_data in boxes:
+            try:
+                y_px = float(ax.transData.transform((0.0, y_data))[1])
+            except Exception:
+                y_px = float("nan")
+            if not np.isfinite(y_px):
+                ann.set_visible(False)
+                continue
+            # Box height from the font size (every box shares it): one text line
+            # ≈ 1.2 × font size, plus the rounded frame, plus a little air so two
+            # stacked boxes do not touch.
+            fs_px = ann.get_fontsize() * self._mpl_figure.dpi / 72.0
+            items.append((ax, ann, y_px, fs_px * 1.5 + 2.0))
+        if not items:
+            return
+        items.sort(key=lambda it: it[2])
+
+        # Walk the boxes bottom to top. Each one starts as its own stack; while a
+        # stack still runs into the one below it the two are merged and the merged
+        # stack is re-centred on the average of the heights its members wanted.
+        stacks = []   # [bottom px, total height px, sum of wanted px, members]
+        for it in items:
+            stacks.append([it[2] - it[3] / 2.0, it[3], it[2], [it]])
+            while len(stacks) > 1 and stacks[-2][0] + stacks[-2][1] > stacks[-1][0]:
+                top = stacks.pop(); low = stacks[-1]
+                low[1] += top[1]; low[2] += top[2]; low[3] += top[3]
+                low[0] = low[2] / len(low[3]) - low[1] / 2.0
+
+        try:
+            _bb  = items[0][0].get_window_extent()
+            lo_px, hi_px = float(_bb.y0), float(_bb.y1)
+        except Exception:
+            lo_px = hi_px = None
+        for st in stacks:
+            # Keep the stack inside the plot rectangle (unless it is taller).
+            if lo_px is not None and (hi_px - lo_px) > st[1]:
+                st[0] = min(max(st[0], lo_px), hi_px - st[1])
+            y = st[0]
+            for ax, ann, _wanted, h in st[3]:
+                try:
+                    y_data = float(ax.transData.inverted().transform(
+                        (0.0, y + h / 2.0))[1])
+                except Exception:
+                    ann.set_visible(False); y += h; continue
+                y += h
+                ann.set_position((x_f, y_data))
+                ann.set_visible(True)
+                if bg is not None:
+                    ax.draw_artist(ann)
 
     def _flush_cursor_table(self):
         """Write the latest cursor values (already cached in _pv_settings by the
@@ -3090,6 +3300,7 @@ class CSSLoggerWidget(QWidget):
                                  self._graph_tab_label)
         self._notebook.setCurrentWidget(self._tab_graph)
         popup.deleteLater()
+        QTimer.singleShot(0, self._autosize_axis_pane)   # pane was hidden
         self._lbl_status.setText("Graph docked back.")
 
     # ── Downsampling / averaging ──────────────────────────────────────────────
@@ -3105,19 +3316,29 @@ class CSSLoggerWidget(QWidget):
         if self._samples_by_pv:
             self._schedule_replot()   # coalesce rapid spinner clicks into one redraw
 
-    @staticmethod
-    def _compute_x_ticks(t_lo, t_hi):
+    def _compute_x_ticks(self, t_lo, t_hi):
         """Major + minor X-tick positions (matplotlib date numbers) for the local
         time window [t_lo, t_hi]. The endpoints are always ticked; interior majors
-        land on a 'nice' step chosen so ≤ ~8 fit. Shared by the full replot and the
+        land on a 'nice' step chosen so at most "Max time stamps" (Graph settings)
+        fit, or on the fixed spacing set there. Shared by the full replot and the
         live fast path so a scrolling live window keeps FRESH ticks — otherwise the
         initial FixedLocator ticks scroll out of view and the time axis goes blank.
         """
         span_s = (t_hi - t_lo).total_seconds()
-        _STEPS = [5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800]
-        step_s = _STEPS[-1]
-        for s in _STEPS:
-            if span_s / s <= 8: step_s = s; break
+        _opts  = getattr(self, "_graph_opts", None) or {}
+        _want  = max(2, int(_opts.get("x_ticks_max", 8)))
+        _fixed = max(0, int(_opts.get("x_tick_seconds", 0)))
+        _STEPS = [1,2,5,10,15,30,60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800]
+        if _fixed > 0:
+            # A fixed spacing on a long window could ask for thousands of time
+            # stamps (matplotlib gives up past ~1000 and the axis goes blank), so
+            # the spacing is doubled until the count is sane.
+            step_s = float(_fixed)
+            while span_s / step_s > 120: step_s *= 2.0
+        else:
+            step_s = _STEPS[-1]
+            for s in _STEPS:
+                if span_s / s <= _want: step_s = s; break
         epoch    = datetime(t_lo.year, t_lo.month, t_lo.day, tzinfo=t_lo.tzinfo)
         offset_s = (t_lo - epoch).total_seconds()
         first_s  = math.ceil((offset_s + step_s * 0.25) / step_s) * step_s
@@ -4398,6 +4619,54 @@ class CSSLoggerWidget(QWidget):
                         self._axis_tv.setItem(row_i, col_j, item)
         finally:
             self._axis_tv.blockSignals(False)
+        self._autosize_axis_pane()
+
+    # Never let the PV list eat the whole tab: the graph keeps at least this
+    # much height, so the buttons above it always stay on screen.
+    _AXIS_PANE_MIN_GRAPH = 240
+
+    def _autosize_axis_pane(self):
+        """Make the PV list exactly as tall as the rows it holds.
+
+        Fewer PVs -> a shorter table and a bigger graph; many PVs -> it grows
+        only until the graph is down to its minimum, then the table scrolls.
+        """
+        pane = getattr(self, "_graph_axis_pane", None)
+        tv   = getattr(self, "_axis_tv", None)
+        spl  = getattr(self, "_graph_v_splitter", None)
+        if pane is None or tv is None or spl is None or pane.isHidden():
+            return
+        if getattr(self, "_axis_pane_sizing", False):
+            return                           # re-entry from our own relayout
+        self._axis_pane_sizing = True
+        try:
+            self._autosize_axis_pane_now(pane, tv, spl)
+        finally:
+            self._axis_pane_sizing = False
+
+    def _autosize_axis_pane_now(self, pane, tv, spl):
+
+        need = tv.horizontalHeader().height() + 2 * tv.frameWidth() + 2
+        for r in range(tv.rowCount()):
+            need += tv.rowHeight(r)
+        if tv.horizontalScrollBar().isVisible():
+            need += tv.horizontalScrollBar().sizeHint().height()
+
+        lay = pane.layout()
+        m   = lay.contentsMargins()
+        chrome = (m.top() + m.bottom() + lay.spacing() +
+                  self._axis_hdr_label.sizeHint().height())
+
+        total = spl.height()
+        if total <= 1:                       # not laid out yet
+            QTimer.singleShot(0, self._autosize_axis_pane)
+            return
+        room  = total - spl.handleWidth() - self._AXIS_PANE_MIN_GRAPH
+        floor = chrome + tv.horizontalHeader().height() + 26   # header + one row
+        want  = max(floor, min(need + chrome, max(floor, room)))
+
+        pane.setMaximumHeight(want)          # can be dragged smaller, never bigger
+        spl.setSizes([max(1, total - spl.handleWidth() - want), want])
 
     def _on_axis_tv_double_click(self, row, col):
         col_name = list(self._axis_tv_cols)[col] if col < len(self._axis_tv_cols) else ""
@@ -5332,8 +5601,11 @@ class _GraphSettingsDialog(QDialog):
                               tip="Whitespace between an axis title and the axis "
                                   "to its left — this is the gap that made the "
                                   "columns wide")
-        self.w_pad    = _spin(0, 40, o.get("label_pad_px", 4), "px",
-                              tip="Gap between an axis title and its own tick numbers")
+        self.w_pad    = _spin(-8, 40, o.get("label_pad_px", 4), "px",
+                              tip="Gap between an axis title and its own tick "
+                                  "numbers. Negative values pull the title into "
+                                  "the empty margin around the rotated numbers, "
+                                  "which is the last bit of slack there is.")
         self.w_outer  = _spin(0, 80, o.get("outer_margin_px", 6), "px",
                               tip="Whitespace left of the outermost axis title")
         self.w_yticks = _spin(2, 12, o.get("y_ticks_max", 6),
@@ -5347,6 +5619,29 @@ class _GraphSettingsDialog(QDialog):
                                   ("Outer margin", self.w_outer),
                                   ("Max Y ticks", self.w_yticks),
                                   ("Minor ticks", self.w_minor)], left)
+
+        # Time axis. "Every" overrides the automatic spacing; the list is the same
+        # set of round steps the automatic choice picks from.
+        self.w_xticks = _spin(2, 24, o.get("x_ticks_max", 8),
+                              tip="Upper bound on how many time stamps are drawn "
+                                  "across the plot (ignored when a fixed spacing "
+                                  "is chosen below)")
+        self.w_xstep  = QComboBox(); self.w_xstep.setFixedWidth(110)
+        self.w_xstep.setToolTip("Fixed spacing between time stamps. Automatic "
+                                "picks a round step that fits the window.")
+        for _lbl, _sec in _X_TICK_STEPS:
+            self.w_xstep.addItem(_lbl, _sec)
+        _cur_step = int(o.get("x_tick_seconds", 0))
+        _idx = self.w_xstep.findData(_cur_step)
+        self.w_xstep.setCurrentIndex(_idx if _idx >= 0 else 0)
+        self.w_xfmt   = QComboBox(); self.w_xfmt.setFixedWidth(110)
+        for _lbl, _key in (("Automatic", "auto"), ("12:34:56", "hms"), ("12:34", "hm")):
+            self.w_xfmt.addItem(_lbl, _key)
+        _idx = self.w_xfmt.findData(str(o.get("x_time_format", "auto")))
+        self.w_xfmt.setCurrentIndex(_idx if _idx >= 0 else 0)
+        _group("Time axis", [("Max time stamps", self.w_xticks),
+                             ("Every", self.w_xstep),
+                             ("Clock format", self.w_xfmt)], right)
 
         self.w_mright = _pct(0, 30, float(o.get("margin_right", 0.015)))
         self.w_mtop   = _pct(0, 40, 1.0 - float(o.get("margin_top", 0.97)))
@@ -5400,6 +5695,9 @@ class _GraphSettingsDialog(QDialog):
             "outer_margin_px":    self.w_outer.value(),
             "y_ticks_max":        self.w_yticks.value(),
             "y_minor_ticks":      self.w_minor.isChecked(),
+            "x_ticks_max":        self.w_xticks.value(),
+            "x_tick_seconds":     int(self.w_xstep.currentData() or 0),
+            "x_time_format":      str(self.w_xfmt.currentData() or "auto"),
             "margin_right":       round(self.w_mright.value() / 100.0, 5),
             "margin_top":         round(1.0 - self.w_mtop.value() / 100.0, 5),
             "margin_bottom":      round(self.w_mbot.value() / 100.0, 5),
@@ -5420,6 +5718,9 @@ class _GraphSettingsDialog(QDialog):
         self.w_outer.setValue(d["outer_margin_px"])
         self.w_yticks.setValue(d["y_ticks_max"])
         self.w_minor.setChecked(d["y_minor_ticks"])
+        self.w_xticks.setValue(d["x_ticks_max"])
+        self.w_xstep.setCurrentIndex(max(0, self.w_xstep.findData(d["x_tick_seconds"])))
+        self.w_xfmt.setCurrentIndex(max(0, self.w_xfmt.findData(d["x_time_format"])))
         self.w_mright.setValue(round(d["margin_right"] * 100, 1))
         self.w_mtop.setValue(round((1.0 - d["margin_top"]) * 100, 1))
         self.w_mbot.setValue(round(d["margin_bottom"] * 100, 1))
@@ -5734,6 +6035,7 @@ class CPVASuiteWindow(QMainWindow):
         if icon_path:
             self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1600, 950)
+        _install_wheel_guard()
         self._build_ui()
         self._restore_geometry()
 
@@ -5816,6 +6118,7 @@ def _run():
         app.setWindowIcon(QIcon(str(_ico)))   # taskbar + alt-tab
     app.setStyle("Fusion")
     app.setStyleSheet(_APP_STYLESHEET)
+    _install_wheel_guard()
     pal = QPalette()
     pal.setColor(QPalette.ColorRole.Window,          QColor("#F5F5F5"))
     pal.setColor(QPalette.ColorRole.WindowText,      QColor("#212121"))

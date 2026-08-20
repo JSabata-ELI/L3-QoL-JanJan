@@ -12,8 +12,8 @@ invisible (swallowed by `except Exception: pass` in the poll workers, or by
 Runs offscreen against synthetic local files, no share and no network, in well under a
 minute:
 
-  python bench_live_dot.py
-  python bench_live_dot.py --cams 1        # the single-camera predicate + summary
+  python testing/bench_live_dot.py
+  python testing/bench_live_dot.py --cams 1        # the single-camera predicate + summary
 """
 import argparse
 import os

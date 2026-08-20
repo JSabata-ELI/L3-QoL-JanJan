@@ -14,10 +14,16 @@
 #   raw    native-precision counts read back from the source file, for measurement only
 #   base   the pixel data being displayed and edited (8-bit, as the sender rendered it)
 #   annots vector annotations in image coordinates, painted on top at draw time
+#
+# Three blocks, in this order: PIXEL OPERATIONS, BEAM MEASUREMENTS, then the tab itself.
+# The first two use no Qt at all — an operation that can be checked against a synthetic
+# Gaussian has no business being tangled up with widgets — and the panel calls them
+# through the names `wk_ops` and `wk_beam`, which are bound to this module further down.
 
 import os
 import re
 import sys
+import csv
 import json
 import math
 from datetime import datetime
@@ -32,13 +38,14 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QImage, QColor, QPainter, QPen, QBrush, QFont, QPolygonF, QCursor, QGuiApplication,
-    QFontMetrics, QIcon, QPixmap, QPainterPath,
+    QFontMetrics, QIcon, QPixmap, QPainterPath, QShortcut, QKeySequence,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QSlider, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFileDialog,
     QMessageBox, QSizePolicy, QScrollArea, QFrame, QToolButton, QButtonGroup,
-    QColorDialog, QSplitter, QDialog, QInputDialog,
+    QColorDialog, QSplitter, QDialog, QInputDialog, QAbstractButton, QMenu,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 
 try:
@@ -53,25 +60,44 @@ except Exception:                                    # pragma: no cover - tzdata
 #  Sibling modules — borrow, do not copy
 # ─────────────────────────────────────────────────────────────────
 
-def _import_img_scale():
-    """Load the shared intensity-scale helper (sibling img_scale.py): one instance per
-    process, registered before exec, the same way if_t/sf_t/is_t do it."""
+def _import_sibling(name: str):
+    """Load a sibling .py by file path: one instance per process, registered before
+    exec, the same way if_t/sf_t/is_t load img_scale.
+
+    By path and not by `import name`, because main.py strips site-packages from
+    sys.path in the frozen build and these files sit next to the exe, not on the
+    import path."""
     import importlib.util as _ilu
-    mod = sys.modules.get("img_scale")
+    mod = sys.modules.get(name)
     if mod is not None:
         return mod
-    p = Path(__file__).resolve().parent / "img_scale.py"
-    spec = _ilu.spec_from_file_location("img_scale", p)
+    p = Path(__file__).resolve().parent / f"{name}.py"
+    spec = _ilu.spec_from_file_location(name, p)
     mod = _ilu.module_from_spec(spec)
-    sys.modules["img_scale"] = mod     # register BEFORE exec (re-entrancy safe)
+    sys.modules[name] = mod            # register BEFORE exec (re-entrancy safe)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _import_img_scale():
+    return _import_sibling("img_scale")
 
 
 try:
     img_scale = _import_img_scale()
 except Exception:                                    # pragma: no cover - standalone run
     img_scale = None
+
+#  The panel calls the two groups above through these two names. They point at this
+#  module because the whole tab has to live in one file; keeping the call sites reading
+#  `wk_ops.median(...)` and `wk_beam.beam_stats(...)` says which group a function
+#  belongs to at every call, and leaves the door open to splitting them out later
+#  without touching a single caller. The empty error strings are what the panel checks
+#  before it greys a button out.
+wk_ops = sys.modules[__name__]
+wk_beam = sys.modules[__name__]
+_OPS_ERROR = ""
+_BEAM_ERROR = ""
 
 
 _SLIDER_MOD = None
@@ -214,6 +240,24 @@ def _write_image(img: QImage, path: "Path") -> bool:
     tabs use, so PNG and TIFF behave the same here as they do there."""
     try:
         _arr_to_pil(_qimage_to_np(img)).save(str(path))
+        return True
+    except Exception:
+        return False
+
+
+def _write_csv(path, header, rows) -> bool:
+    """One CSV writer for every table in this tab.
+
+    newline="" and the csv module rather than hand-built lines: a label can contain a
+    comma (camera names do), and a value written by hand would then split into two
+    columns in Excel without anything looking wrong."""
+    try:
+        with open(str(path), "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            if header:
+                w.writerow(list(header))
+            for row in rows:
+                w.writerow(list(row))
         return True
     except Exception:
         return False
@@ -405,6 +449,912 @@ def render_view(base: np.ndarray, view: _ViewSettings) -> np.ndarray:
     return _lut_pixels(lut, u8, name).astype(np.uint8)
 
 
+# ═════════════════════════════════════════════════════════════════
+#  PIXEL OPERATIONS
+# ═════════════════════════════════════════════════════════════════
+#  Everything from here to the beam maths takes arrays and returns NEW arrays.
+#  Nothing is modified in place: the undo history shares array references between
+#  states (see _WorkshopSlot._state), so an in-place write would rewrite history too.
+#
+#  Two layers travel together through every operation:
+#    base   the 8-bit picture on screen (grey HxW or RGB HxWx3)
+#    raw    the camera's counts, uint16 grey, used for every measurement
+#  An operation that changes what the picture LOOKS like has to change what it
+#  MEASURES the same way, or the Measure panel describes a picture that is no longer
+#  on screen. So each op below works on either layer, in its own dtype, and
+#  WorkshopWidget._apply_to_both applies it to both.
+#
+#  No Qt in this block, on purpose: an operation that can be checked against a
+#  synthetic Gaussian has no business being tangled up with widgets.
+#
+#  scipy is used where it does the job better (median, gaussian, morphology) and is
+#  already part of the build, but every one of those has a numpy fallback so the tab
+#  still works in a build without it.
+
+
+_ND = "unset"        # "unset" until the first look; then the module or None
+
+
+def _ndimage():
+    """scipy.ndimage or None. Imported on first use, not at module import: the
+    Workshop must open even in a build where scipy was left out."""
+    global _ND
+    if _ND == "unset":
+        try:
+            from scipy import ndimage as nd
+            _ND = nd
+        except Exception:
+            _ND = None
+    return _ND
+
+
+def has_scipy() -> bool:
+    return _ndimage() is not None
+
+
+# ── dtype bookkeeping ────────────────────────────────────────────────────────
+
+def _limits(arr: np.ndarray) -> "tuple[float, float]":
+    """The range a result has to fit back into, taken from the input dtype."""
+    if arr.dtype == np.uint8:
+        return 0.0, 255.0
+    if arr.dtype == np.uint16:
+        return 0.0, 65535.0
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        return float(info.min), float(info.max)
+    return -math.inf, math.inf
+
+
+def _restore(work: np.ndarray, like: np.ndarray) -> np.ndarray:
+    """Float result → the dtype and range it came from."""
+    lo, hi = _limits(like)
+    if math.isfinite(lo):
+        work = np.clip(work, lo, hi)
+    if np.issubdtype(like.dtype, np.integer):
+        work = np.rint(work)
+    return np.ascontiguousarray(work.astype(like.dtype))
+
+
+def _per_channel(arr: np.ndarray, fn) -> np.ndarray:
+    """Run a 2-D function over a grey image or over each channel of an RGB one."""
+    if arr.ndim == 2:
+        return fn(arr)
+    out = np.empty(arr.shape, dtype=np.float64)
+    for c in range(arr.shape[2]):
+        out[:, :, c] = fn(arr[:, :, c])
+    return out
+
+
+# ── neighbourhood filters ────────────────────────────────────────────────────
+
+def _box_mean(a: np.ndarray, radius: int) -> np.ndarray:
+    """Mean over a (2r+1)² box, from the integral image — O(1) per pixel and no
+    dependency. Edges use the smaller box that actually fits, so a filtered frame
+    does not grow a dark border."""
+    a = a.astype(np.float64)
+    h, w = a.shape
+    s = np.zeros((h + 1, w + 1), dtype=np.float64)
+    s[1:, 1:] = a.cumsum(axis=0).cumsum(axis=1)
+    ys = np.arange(h)
+    xs = np.arange(w)
+    y0 = np.maximum(0, ys - radius)
+    y1 = np.minimum(h, ys + radius + 1)
+    x0 = np.maximum(0, xs - radius)
+    x1 = np.minimum(w, xs + radius + 1)
+    tot = (s[np.ix_(y1, x1)] - s[np.ix_(y0, x1)]
+           - s[np.ix_(y1, x0)] + s[np.ix_(y0, x0)])
+    cnt = np.outer(y1 - y0, x1 - x0).astype(np.float64)
+    return tot / np.maximum(cnt, 1.0)
+
+
+def _gauss_1d(sigma: float) -> np.ndarray:
+    r = max(1, int(math.ceil(3.0 * sigma)))
+    x = np.arange(-r, r + 1, dtype=np.float64)
+    k = np.exp(-(x * x) / (2.0 * sigma * sigma))
+    return k / k.sum()
+
+
+def _sep_convolve(a: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Separable convolution with edge clamping (no dark border)."""
+    r = (len(k) - 1) // 2
+    h, w = a.shape
+    pad = np.pad(a.astype(np.float64), r, mode="edge")
+    cols = np.zeros((h + 2 * r, w), dtype=np.float64)
+    for i, weight in enumerate(k):
+        if weight:
+            cols += weight * pad[:, i:i + w]
+    rows = np.zeros((h, w), dtype=np.float64)
+    for i, weight in enumerate(k):
+        if weight:
+            rows += weight * cols[i:i + h, :]
+    return rows
+
+
+def gaussian(arr: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian blur. `sigma` is in pixels."""
+    sigma = max(0.1, float(sigma))
+    nd = _ndimage()
+    if nd is not None:
+        fn = lambda a: nd.gaussian_filter(a.astype(np.float64), sigma, mode="nearest")
+    else:
+        k = _gauss_1d(sigma)
+        fn = lambda a: _sep_convolve(a, k)
+    return _restore(_per_channel(arr, fn), arr)
+
+
+def median(arr: np.ndarray, radius: int) -> np.ndarray:
+    """Median over a (2r+1)² box — the filter for hot pixels and salt-and-pepper
+    speckle. Unlike a blur it removes the outlier without smearing an edge."""
+    radius = max(1, int(radius))
+    nd = _ndimage()
+    if nd is not None:
+        fn = lambda a: nd.median_filter(a, size=2 * radius + 1, mode="nearest")
+        return _restore(_per_channel(arr, fn), arr)
+    # Fallback: a stack of the (2r+1)² shifted copies. Fine for the small radii the
+    # panel offers, and it is only ever reached in a build without scipy.
+    def fn(a):
+        pad = np.pad(a.astype(np.float64), radius, mode="edge")
+        h, w = a.shape
+        stack = np.empty(((2 * radius + 1) ** 2, h, w), dtype=np.float64)
+        i = 0
+        for dy in range(2 * radius + 1):
+            for dx in range(2 * radius + 1):
+                stack[i] = pad[dy:dy + h, dx:dx + w]
+                i += 1
+        return np.median(stack, axis=0)
+    return _restore(_per_channel(arr, fn), arr)
+
+
+def sharpen(arr: np.ndarray, amount: float = 1.0, sigma: float = 1.0) -> np.ndarray:
+    """Unsharp mask: add back what a blur removed. `amount` 0 does nothing, 1 is a
+    normal sharpen, 3 is heavy."""
+    blur = gaussian(arr, sigma).astype(np.float64)
+    work = arr.astype(np.float64) + float(amount) * (arr.astype(np.float64) - blur)
+    return _restore(work, arr)
+
+
+def edges(arr: np.ndarray) -> np.ndarray:
+    """Sobel gradient magnitude — bright where the picture changes fastest."""
+    nd = _ndimage()
+
+    def fn(a):
+        a = a.astype(np.float64)
+        if nd is not None:
+            gx = nd.sobel(a, axis=1, mode="nearest")
+            gy = nd.sobel(a, axis=0, mode="nearest")
+        else:
+            pad = np.pad(a, 1, mode="edge")
+            kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+            gx = np.zeros_like(a)
+            gy = np.zeros_like(a)
+            for dy in range(3):
+                for dx in range(3):
+                    win = pad[dy:dy + a.shape[0], dx:dx + a.shape[1]]
+                    gx += kx[dy, dx] * win
+                    gy += kx[dx, dy] * win
+        return np.hypot(gx, gy)
+
+    return _restore(_per_channel(arr, fn), arr)
+
+
+# ── background ───────────────────────────────────────────────────────────────
+
+BACKGROUND_MODES = ("Constant level", "Sloping plane", "Curved surface",
+                    "Rolling ball")
+
+
+def background_map(arr: np.ndarray, mode: str, param: float) -> np.ndarray:
+    """The background this frame is sitting on, as a float array the size of the
+    frame. Subtracting it is the caller's job (see subtract_background), because the
+    two layers clip differently.
+
+    Constant level  a percentile of the whole frame (param = that percentile)
+    Sloping plane   least-squares plane through the frame
+    Curved surface  least-squares quadratic surface — for vignetting and glow
+    Rolling ball    a morphological opening: what is left after everything smaller
+                    than `param` pixels across has been rolled away. Same idea as
+                    ImageJ's rolling ball, done with an opening plus a smooth rather
+                    than with ImageJ's shrink-and-roll, so the numbers will not match
+                    ImageJ to the count.
+    """
+    data = arr.astype(np.float64)
+    if data.ndim == 3:
+        # One background for the whole picture, taken from its luma, so the three
+        # channels do not drift apart in colour.
+        flat = luma(data)
+    else:
+        flat = data
+
+    if mode == BACKGROUND_MODES[0]:
+        pct = min(99.0, max(0.0, float(param)))
+        return np.full(flat.shape, float(np.percentile(flat, pct)))
+
+    if mode in (BACKGROUND_MODES[1], BACKGROUND_MODES[2]):
+        deg = 1 if mode == BACKGROUND_MODES[1] else 2
+        return _surface_fit(flat, deg)
+
+    radius = max(1, int(param))
+    nd = _ndimage()
+    if nd is not None:
+        size = 2 * radius + 1
+        bg = nd.grey_opening(flat, size=(size, size), mode="nearest")
+        return nd.gaussian_filter(bg, radius / 2.0, mode="nearest")
+    # Opening = erosion then dilation, both as box extremes over the integral-free
+    # shifted stack. Slower, only used without scipy.
+    er = _box_extreme(flat, radius, np.minimum)
+    di = _box_extreme(er, radius, np.maximum)
+    return _sep_convolve(di, _gauss_1d(max(0.5, radius / 2.0)))
+
+
+def _box_extreme(a: np.ndarray, radius: int, fn) -> np.ndarray:
+    out = a.astype(np.float64).copy()
+    pad = np.pad(a.astype(np.float64), radius, mode="edge")
+    h, w = a.shape
+    for dy in range(2 * radius + 1):
+        for dx in range(2 * radius + 1):
+            out = fn(out, pad[dy:dy + h, dx:dx + w])
+    return out
+
+
+def _surface_fit(flat: np.ndarray, deg: int) -> np.ndarray:
+    """Least-squares plane (deg 1) or quadratic surface (deg 2) through the frame.
+
+    Fitted on a subsample: a full-frame design matrix for a 4 Mpx image is 24 MB per
+    column and buys nothing — a smooth surface is decided by thousands of points, not
+    by millions."""
+    h, w = flat.shape
+    sy = max(1, h // 256)
+    sx = max(1, w // 256)
+    ys = np.arange(0, h, sy, dtype=np.float64)
+    xs = np.arange(0, w, sx, dtype=np.float64)
+    gy, gx = np.meshgrid(ys, xs, indexing="ij")
+    z = flat[::sy, ::sx].ravel()
+    gx, gy = gx.ravel(), gy.ravel()
+    cols = [np.ones_like(gx), gx, gy]
+    if deg >= 2:
+        cols += [gx * gx, gy * gy, gx * gy]
+    A = np.stack(cols, axis=1)
+    try:
+        coef, *_ = np.linalg.lstsq(A, z, rcond=None)
+    except Exception:
+        return np.full(flat.shape, float(np.median(flat)))
+    Y, X = np.mgrid[0:h, 0:w].astype(np.float64)
+    out = coef[0] + coef[1] * X + coef[2] * Y
+    if deg >= 2:
+        out = out + coef[3] * X * X + coef[4] * Y * Y + coef[5] * X * Y
+    return out
+
+
+def subtract_background(arr: np.ndarray, mode: str, param: float,
+                        bg: "np.ndarray | None" = None) -> np.ndarray:
+    """Frame minus its background, negatives cut to zero.
+
+    `bg` lets the caller compute the background once and apply the SAME map to both
+    layers — the base and the counts must not each fit their own surface, or the
+    picture and the numbers stop describing the same subtraction."""
+    if bg is None:
+        bg = background_map(arr, mode, param)
+    data = arr.astype(np.float64)
+    if data.ndim == 3 and bg.ndim == 2:
+        bg = bg[:, :, None]
+    return _restore(data - bg, arr)
+
+
+# ── combining several images ─────────────────────────────────────────────────
+
+PROJECT_MODES = ("Average", "Maximum", "Sum", "Minimum")
+
+
+def luma(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim == 2:
+        return arr.astype(np.float64)
+    return (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] +
+            0.114 * arr[:, :, 2]).astype(np.float64)
+
+
+def common_shape(arrays) -> "tuple[int, int]":
+    """The overlap of a set of frames — the largest area every one of them covers."""
+    hs = [a.shape[0] for a in arrays]
+    ws = [a.shape[1] for a in arrays]
+    return min(hs), min(ws)
+
+
+def project(arrays, mode: str, out_dtype=None) -> np.ndarray:
+    """Average / maximum / sum / minimum across several frames, over their overlap.
+
+    Sum is the one that can leave the input range (ten frames of 200 counts make
+    2000), so it is computed in float64 and the caller decides what scale the result
+    lives on — that is why `out_dtype` is explicit rather than copied from the input.
+    """
+    if not arrays:
+        raise ValueError("nothing to combine")
+    h, w = common_shape(arrays)
+    grey = any(a.ndim == 2 for a in arrays)
+    stack = []
+    for a in arrays:
+        part = a[:h, :w]
+        if grey and part.ndim == 3:
+            part = luma(part)
+        stack.append(part.astype(np.float64))
+    data = np.stack(stack, axis=0)
+    if mode == "Average":
+        out = data.mean(axis=0)
+    elif mode == "Maximum":
+        out = data.max(axis=0)
+    elif mode == "Minimum":
+        out = data.min(axis=0)
+    else:
+        out = data.sum(axis=0)
+    if out_dtype is None:
+        return out
+    lo, hi = _limits(np.zeros(0, dtype=out_dtype))
+    if math.isfinite(lo):
+        out = np.clip(out, lo, hi)
+    if np.issubdtype(np.dtype(out_dtype), np.integer):
+        out = np.rint(out)
+    return np.ascontiguousarray(out.astype(out_dtype))
+
+
+def merge_rg(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Two frames as one colour picture: the first in red, the second in green.
+
+    Where both have signal the result is yellow, so a shift between them shows up as
+    a red edge on one side and a green edge on the other — much easier to see than a
+    difference image, which only says "something moved here"."""
+    h, w = common_shape([a, b])
+    ra = np.clip(luma(a[:h, :w]), 0, 255).astype(np.uint8)
+    rb = np.clip(luma(b[:h, :w]), 0, 255).astype(np.uint8)
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    out[:, :, 0] = ra
+    out[:, :, 1] = rb
+    return out
+
+
+# ── geometry ─────────────────────────────────────────────────────────────────
+
+def _pil_resample(nearest: bool):
+    res = getattr(_PilImg, "Resampling", None)
+    if res is not None:
+        return res.NEAREST if nearest else res.BILINEAR
+    return _PilImg.NEAREST if nearest else _PilImg.BILINEAR
+
+
+def rotate(arr: np.ndarray, degrees: float, expand: bool = True,
+           nearest: bool = False) -> np.ndarray:
+    """Turn by any angle, anticlockwise.
+
+    `nearest` is for the counts layer: interpolating measured values would invent
+    numbers the sensor never recorded. Pillow handles uint8 and uint16 grey directly;
+    anything else is routed through float32, which its affine transform also takes."""
+    img = arr
+    to_float = arr.dtype not in (np.uint8, np.uint16)
+    if to_float:
+        img = arr.astype(np.float32)
+    pil = _PilImg.fromarray(np.ascontiguousarray(img))
+    out = pil.rotate(float(degrees), resample=_pil_resample(nearest),
+                     expand=bool(expand), fillcolor=0)
+    res = np.asarray(out)
+    return _restore(res.astype(np.float64), arr) if to_float else np.ascontiguousarray(res)
+
+
+def _rotate_matrix(shape, degrees: float, expand: bool):
+    """Pillow's own rotation matrix and output size, worked out the same way
+    Image.rotate does it.
+
+    Reproduced rather than approximated because the annotations have to land on the
+    rotated picture to the pixel: a rounded-off size of my own was one pixel out from
+    Pillow's at some angles, which is enough to walk a region off its feature. The
+    matrix maps OUTPUT coordinates back to INPUT ones — that is the direction Pillow's
+    affine transform works in."""
+    h, w = shape[0], shape[1]
+    ang = -math.radians(float(degrees))
+    a = round(math.cos(ang), 15)
+    b = round(math.sin(ang), 15)
+    d = -b
+    e = a
+    cx, cy = w / 2.0, h / 2.0
+    c = a * -cx + b * -cy + cx
+    f = d * -cx + e * -cy + cy
+    nw, nh = w, h
+    if expand:
+        xs, ys = [], []
+        for x, y in ((0, 0), (w, 0), (w, h), (0, h)):
+            xs.append(a * x + b * y + c)
+            ys.append(d * x + e * y + f)
+        nw = int(math.ceil(max(xs)) - math.floor(min(xs)))
+        nh = int(math.ceil(max(ys)) - math.floor(min(ys)))
+        # Pillow shifts the sampling origin by the ROTATED half-growth, not by the
+        # half-growth itself: the translation is multiplied into the matrix from the
+        # right, so it goes through the rotation first. Adding it straight to c and f
+        # looks right and puts every annotation tens of pixels out.
+        tx, ty = -(nw - w) / 2.0, -(nh - h) / 2.0
+        c, f = a * tx + b * ty + c, d * tx + e * ty + f
+    return (a, b, c, d, e, f), (nh, nw)
+
+
+def rotate_size(shape, degrees: float, expand: bool) -> "tuple[int, int]":
+    """The (h, w) `rotate` will produce — needed to map annotations onto the result."""
+    return _rotate_matrix(shape, degrees, expand)[1]
+
+
+def rotate_point_map(shape, degrees: float, expand: bool):
+    """(x, y) in the original → (x, y) in the rotated frame.
+
+    The matrix above goes the other way, so this is its inverse. For a pure rotation
+    the 2×2 part is orthogonal with determinant 1, which makes the inverse a matter of
+    swapping two signs."""
+    (a, b, c, d, e, f), _ = _rotate_matrix(shape, degrees, expand)
+
+    def fn(x: float, y: float):
+        # Pillow's matrix is written in corner coordinates while an annotation point
+        # names a pixel, i.e. its centre. Half a pixel in and half a pixel back out —
+        # without it a quarter turn lands one row off.
+        px, py = float(x) + 0.5 - c, float(y) + 0.5 - f
+        return (e * px - b * py - 0.5, a * py - d * px - 0.5)
+
+    return fn
+
+
+def bin_pixels(arr: np.ndarray, factor: int, mode: str = "Average") -> np.ndarray:
+    """Join factor × factor blocks into one pixel.
+
+    "Sum" is what a detector does when you bin it on the chip — the values add up, so
+    the result no longer fits the original full scale and the caller has to move the
+    scale with it. "Average" keeps the scale and just trades resolution for noise.
+    Rows and columns that do not fill a whole block are dropped rather than padded:
+    a half-weighted edge pixel would read as a dark line."""
+    factor = max(2, int(factor))
+    h = (arr.shape[0] // factor) * factor
+    w = (arr.shape[1] // factor) * factor
+    if h < factor or w < factor:
+        return arr
+    cut = arr[:h, :w].astype(np.float64)
+    if cut.ndim == 3:
+        blocks = cut.reshape(h // factor, factor, w // factor, factor, cut.shape[2])
+        out = blocks.sum(axis=(1, 3)) if mode == "Sum" else blocks.mean(axis=(1, 3))
+    else:
+        blocks = cut.reshape(h // factor, factor, w // factor, factor)
+        out = blocks.sum(axis=(1, 3)) if mode == "Sum" else blocks.mean(axis=(1, 3))
+    if mode == "Sum":
+        # Summed counts outgrow uint16; the dtype has to grow with them or the first
+        # bright spot wraps around to black.
+        if np.issubdtype(arr.dtype, np.integer):
+            return np.ascontiguousarray(np.rint(out).astype(np.uint32))
+        return np.ascontiguousarray(out.astype(arr.dtype))
+    return _restore(out, arr)
+
+
+# ── writing files ────────────────────────────────────────────────────────────
+
+ANIM_SUFFIXES = (".gif", ".png", ".webp")
+
+
+def pad_frames(frames) -> list:
+    """Frames of different sizes onto one canvas, each centred on black.
+
+    Padding rather than scaling on purpose: an animation is usually made to compare
+    frames, and resampling one of them to match another would change the very thing
+    being compared."""
+    if not frames:
+        return []
+    h = max(f.shape[0] for f in frames)
+    w = max(f.shape[1] for f in frames)
+    out = []
+    for f in frames:
+        if f.ndim == 2:
+            f = np.stack([f] * 3, axis=2)
+        if f.shape[0] == h and f.shape[1] == w:
+            out.append(np.ascontiguousarray(f))
+            continue
+        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        y = (h - f.shape[0]) // 2
+        x = (w - f.shape[1]) // 2
+        canvas[y:y + f.shape[0], x:x + f.shape[1]] = f
+        out.append(canvas)
+    return out
+
+
+def write_animation(frames, path, ms_per_frame: int = 200, loop: bool = True) -> str:
+    """Write an animated GIF, animated PNG or animated WebP; the suffix decides which.
+
+    Returns "" on success or a message explaining what went wrong. GIF carries 256
+    colours per frame, which is plenty for a greyscale camera but will band a colour
+    palette; APNG and WebP keep full colour and make much bigger files.
+    """
+    frames = pad_frames([np.asarray(f) for f in frames])
+    if len(frames) < 2:
+        return "an animation needs at least two images"
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix not in ANIM_SUFFIXES:
+        return f"{suffix or 'that'} is not an animation format"
+    ms = max(10, int(ms_per_frame))
+    try:
+        images = [_PilImg.fromarray(f) for f in frames]
+        kw = dict(save_all=True, append_images=images[1:], duration=ms,
+                  loop=0 if loop else 1)
+        if suffix == ".gif":
+            # Palette per frame, and disposal 2 so a frame is cleared before the next
+            # one is drawn — without it a smaller frame leaves the previous one showing
+            # around its edges.
+            kw["disposal"] = 2
+            kw["optimize"] = False
+        elif suffix == ".webp":
+            kw["lossless"] = True
+            kw["quality"] = 90
+        images[0].save(str(p), **kw)
+        return ""
+    except Exception as e:
+        return f"{e}"
+
+
+def write_data_tiff(arr: np.ndarray, path, description: str = "") -> str:
+    """Write the measurement layer as a single-channel TIFF, values untouched.
+
+    This is the file to open in ImageJ or to feed a script: no palette, no display
+    stretch, no annotations — the counts as they were measured. Returns "" on success
+    or a message.
+    """
+    try:
+        data = np.asarray(arr)
+        if data.ndim == 3:
+            data = luma(data)
+        if data.dtype == np.uint8:
+            out = data
+        elif np.issubdtype(data.dtype, np.integer):
+            out = np.clip(data, 0, 65535).astype(np.uint16)
+        else:
+            out = np.clip(np.rint(data), 0, 65535).astype(np.uint16)
+        img = _PilImg.fromarray(np.ascontiguousarray(out))
+        kw = {}
+        if description:
+            kw["description"] = description
+        img.save(str(Path(path)), format="TIFF", **kw)
+        return ""
+    except Exception as e:
+        return f"{e}"
+
+# ═════════════════════════════════════════════════════════════════
+#  BEAM MEASUREMENTS
+# ═════════════════════════════════════════════════════════════════
+#  The numbers a laser lab asks a camera frame for, and the ones ImageJ does not have:
+#  how wide the spot is (FWHM, D4σ, 1/e²), how round it is, which way its long axis
+#  points, and how much of the energy sits inside a given circle.
+#
+#  TWO RULES THROUGHOUT
+#
+#  1. A pedestal ruins a width. Every second-moment width weights a pixel by its value
+#     times its distance SQUARED, so a background of a few counts spread over the whole
+#     frame outweighs the spot itself and D4σ comes out as roughly the frame size. So a
+#     baseline is subtracted before any moment is taken, and which baseline was used is
+#     returned with the result — a width without its baseline is not a measurement.
+#
+#  2. Nothing here is fitted unless it is asked for. FWHM and D4σ are read off the data;
+#     the Gaussian fit is a separate call whose r² says how much the shape can be
+#     trusted as a Gaussian at all.
+#
+#  scipy.optimize refines the Gaussian fit when it is present, and the moment estimate
+#  stands in for it when it is not.
+
+
+def _gray(arr: np.ndarray) -> np.ndarray:
+    if arr.ndim == 2:
+        return arr.astype(np.float64)
+    return (0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] +
+            0.114 * arr[:, :, 2]).astype(np.float64)
+
+
+def baseline_value(data: np.ndarray, percentile: float = 5.0) -> float:
+    """The level the spot is sitting on: a low percentile of the area being measured.
+
+    A percentile rather than the minimum, because one dead pixel reading zero would
+    otherwise define the background for the whole frame."""
+    if data.size == 0:
+        return 0.0
+    return float(np.percentile(data, max(0.0, min(50.0, float(percentile)))))
+
+
+def width_at_fraction(vals: np.ndarray, frac: float,
+                      baseline: float = 0.0) -> "dict | None":
+    """Width of a 1-D trace at `frac` of its height above `baseline`.
+
+    frac 0.5 gives FWHM, frac 1/e² = 0.135 gives the 1/e² width the laser world
+    quotes. The two crossings are found by walking OUT from the peak, so a second,
+    smaller bump elsewhere in the trace cannot be mistaken for the far edge, and each
+    crossing is interpolated between its two neighbouring samples — rounding to whole
+    pixels would quantise a 20 px spot to 5 % steps.
+
+    Returns None when the trace never comes back down on one side, i.e. the feature is
+    wider than the data given."""
+    y = np.asarray(vals, dtype=np.float64)
+    if y.size < 3:
+        return None
+    peak_i = int(np.argmax(y))
+    peak = float(y[peak_i])
+    height = peak - float(baseline)
+    if height <= 0:
+        return None
+    level = float(baseline) + height * float(frac)
+
+    left = None
+    for i in range(peak_i, 0, -1):
+        if y[i - 1] <= level <= y[i] or y[i - 1] >= level >= y[i]:
+            span = y[i] - y[i - 1]
+            t = 0.0 if span == 0 else (level - y[i - 1]) / span
+            left = (i - 1) + t
+            break
+    right = None
+    for i in range(peak_i, y.size - 1):
+        if y[i] >= level >= y[i + 1] or y[i] <= level <= y[i + 1]:
+            span = y[i + 1] - y[i]
+            t = 0.0 if span == 0 else (level - y[i]) / span
+            right = i + t
+            break
+    if left is None or right is None:
+        return None
+    return {"width": float(right - left), "left": float(left),
+            "right": float(right), "level": level, "peak": peak,
+            "peak_pos": float(peak_i), "baseline": float(baseline)}
+
+
+# ── line profile measurements ────────────────────────────────────────────────
+
+def profile_metrics(x, y, baseline_pct: float = 5.0) -> dict:
+    """Everything worth reading off a line profile: peak, centre of mass, FWHM and
+    1/e² width, all in the units of `x` (pixels, or millimetres once a scale is set).
+
+    The widths come back in x units by scaling the sample-index width by the average
+    step of `x`, so a profile drawn diagonally still reads its true length."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    out = {}
+    if y.size < 3:
+        return out
+    base = baseline_value(y, baseline_pct)
+    step = float(np.mean(np.diff(x))) if x.size > 1 else 1.0
+    if not math.isfinite(step) or step <= 0:
+        step = 1.0
+    out["baseline"] = base
+    out["peak"] = float(y.max())
+    out["peak_x"] = float(x[int(np.argmax(y))])
+    above = np.clip(y - base, 0, None)
+    tot = float(above.sum())
+    if tot > 0:
+        out["centroid_x"] = float((above * x).sum() / tot)
+        # Second moment of the same trace: the "D4σ" of a one-dimensional cut.
+        var = float((above * (x - out["centroid_x"]) ** 2).sum() / tot)
+        if var > 0:
+            out["d4sigma"] = 4.0 * math.sqrt(var)
+    for key, frac in (("fwhm", 0.5), ("w_1e2", 1.0 / math.e ** 2)):
+        w = width_at_fraction(y, frac, base)
+        if w is not None:
+            out[key] = w["width"] * step
+            out[f"{key}_left"] = float(x[0]) + w["left"] * step
+            out[f"{key}_right"] = float(x[0]) + w["right"] * step
+            out[f"{key}_level"] = w["level"]
+    return out
+
+
+def gaussian_fit(x, y) -> "dict | None":
+    """Least-squares Gaussian on a pedestal: base + amp · exp(−(x−mu)²/(2σ²)).
+
+    The starting point comes from the data's own moments, which is already close
+    enough to plot; scipy then refines it when it is available. r² is reported so the
+    operator can see whether calling this spot Gaussian is honest — a clipped or
+    double-lobed profile fits badly and says so.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if y.size < 5:
+        return None
+    base = baseline_value(y, 5.0)
+    above = np.clip(y - base, 0, None)
+    tot = float(above.sum())
+    if tot <= 0:
+        return None
+    mu = float((above * x).sum() / tot)
+    var = float((above * (x - mu) ** 2).sum() / tot)
+    sigma = math.sqrt(var) if var > 0 else max(1.0, float(np.ptp(x)) / 10.0)
+    amp = float(y.max() - base)
+    p = [amp, mu, max(1e-6, sigma), base]
+
+    try:
+        from scipy.optimize import curve_fit
+
+        def model(xx, a, m, s, b):
+            return b + a * np.exp(-((xx - m) ** 2) / (2.0 * s * s))
+
+        popt, _ = curve_fit(model, x, y, p0=p, maxfev=8000)
+        p = [float(v) for v in popt]
+        fitted = model(x, *p)
+    except Exception:
+        fitted = p[3] + p[0] * np.exp(-((x - p[1]) ** 2) / (2.0 * p[2] * p[2]))
+
+    resid = y - fitted
+    denom = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - float((resid ** 2).sum()) / denom if denom > 0 else 0.0
+    sigma = abs(p[2])
+    return {"amp": p[0], "mu": p[1], "sigma": sigma, "base": p[3],
+            # 2·√(2·ln2)·σ for FWHM, 4σ for the 1/e² diameter of a Gaussian.
+            "fwhm": 2.0 * math.sqrt(2.0 * math.log(2.0)) * sigma,
+            "d_1e2": 4.0 * sigma, "r2": r2, "fitted": fitted}
+
+
+# ── whole-spot measurements ──────────────────────────────────────────────────
+
+def beam_stats(arr: np.ndarray, mask: "np.ndarray | None" = None,
+               baseline_pct: float = 5.0) -> dict:
+    """Spot size and shape from the intensity moments of a region.
+
+    Returns, all in pixels and counts:
+      total, peak, peak_x/peak_y, cx/cy          how much and where
+      d4s_x, d4s_y                              D4σ along the image axes
+      d4s_major, d4s_minor, angle_deg           the same after finding the long axis
+      ellipticity                               minor / major, 1.0 = round
+      fwhm_x, fwhm_y, w1e2_x, w1e2_y            read off the row and column through
+                                                the centre of mass
+      baseline                                  what was taken off first
+
+    The axis-aligned D4σ pair and the major/minor pair are both given because a spot
+    that is tilted reads wider on both axes than it really is — comparing the two is
+    how you notice the tilt.
+    """
+    data = _gray(arr)
+    if mask is not None:
+        if not mask.any():
+            return {}
+        sel = data[mask]
+    else:
+        sel = data
+    base = baseline_value(sel, baseline_pct)
+    work = np.clip(data - base, 0, None)
+    if mask is not None:
+        work = np.where(mask, work, 0.0)
+    tot = float(work.sum())
+    out = {"baseline": base, "total": tot, "peak": float(sel.max())}
+    if tot <= 0:
+        return out
+
+    h, w = work.shape
+    xs = np.arange(w, dtype=np.float64)
+    ys = np.arange(h, dtype=np.float64)
+    col = work.sum(axis=0)            # collapsed onto x
+    row = work.sum(axis=1)            # collapsed onto y
+    cx = float((col * xs).sum() / tot)
+    cy = float((row * ys).sum() / tot)
+    out["cx"], out["cy"] = cx, cy
+
+    py, px = np.unravel_index(int(np.argmax(np.where(mask, data, -np.inf)
+                                            if mask is not None else data)), data.shape)
+    out["peak_x"], out["peak_y"] = float(px), float(py)
+
+    sxx = float((col * (xs - cx) ** 2).sum() / tot)
+    syy = float((row * (ys - cy) ** 2).sum() / tot)
+    # The cross moment needs the full 2-D array: it cannot be had from the two
+    # collapsed profiles, and it is the term that carries the tilt.
+    sxy = float((work * np.outer(ys - cy, xs - cx)).sum() / tot)
+    out["d4s_x"] = 4.0 * math.sqrt(max(0.0, sxx))
+    out["d4s_y"] = 4.0 * math.sqrt(max(0.0, syy))
+
+    # Principal axes of the second-moment matrix [[sxx, sxy], [sxy, syy]].
+    diff = sxx - syy
+    root = math.sqrt(max(0.0, diff * diff + 4.0 * sxy * sxy))
+    lam1 = 0.5 * (sxx + syy + root)
+    lam2 = 0.5 * (sxx + syy - root)
+    out["d4s_major"] = 4.0 * math.sqrt(max(0.0, lam1))
+    out["d4s_minor"] = 4.0 * math.sqrt(max(0.0, lam2))
+    if out["d4s_major"] > 0:
+        out["ellipticity"] = out["d4s_minor"] / out["d4s_major"]
+    # Angle of the long axis, measured anticlockwise from the horizontal as it appears
+    # on screen (image y grows downwards, hence the minus).
+    out["angle_deg"] = -0.5 * math.degrees(math.atan2(2.0 * sxy, diff)) if (
+        abs(sxy) > 0 or abs(diff) > 0) else 0.0
+
+    # Widths straight off the data, on the row and the column through the centre of
+    # mass — the number a Gaussian fit should agree with, and does not when the spot
+    # is clipped or has a shoulder.
+    iy = int(min(h - 1, max(0, round(cy))))
+    ix = int(min(w - 1, max(0, round(cx))))
+    row_vals = data[iy, :].copy()
+    col_vals = data[:, ix].copy()
+    if mask is not None:
+        row_vals = np.where(mask[iy, :], row_vals, base)
+        col_vals = np.where(mask[:, ix], col_vals, base)
+    for key, vals, frac in (("fwhm_x", row_vals, 0.5), ("fwhm_y", col_vals, 0.5),
+                            ("w1e2_x", row_vals, 1.0 / math.e ** 2),
+                            ("w1e2_y", col_vals, 1.0 / math.e ** 2)):
+        m = width_at_fraction(vals, frac, base)
+        if m is not None:
+            out[key] = m["width"]
+    return out
+
+
+def radial_profile(arr: np.ndarray, cx: float, cy: float,
+                   mask: "np.ndarray | None" = None,
+                   bin_px: float = 1.0) -> "tuple[np.ndarray, np.ndarray]":
+    """Average value against distance from (cx, cy).
+
+    Averaging every direction together beats a single line through the spot: the noise
+    on the average falls with the number of pixels in the ring, so a faint halo that a
+    single profile cannot separate from noise shows up clearly.
+
+    Returns (radius in px, mean value)."""
+    data = _gray(arr)
+    h, w = data.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    r = np.hypot(xx - float(cx), yy - float(cy))
+    if mask is not None:
+        r = r[mask]
+        vals = data[mask]
+    else:
+        r = r.ravel()
+        vals = data.ravel()
+    if r.size == 0:
+        return np.zeros(0), np.zeros(0)
+    step = max(0.25, float(bin_px))
+    idx = (r / step).astype(np.int64)
+    n = int(idx.max()) + 1
+    counts = np.bincount(idx, minlength=n).astype(np.float64)
+    sums = np.bincount(idx, weights=vals.astype(np.float64), minlength=n)
+    keep = counts > 0
+    radii = (np.arange(n, dtype=np.float64)[keep] + 0.5) * step
+    return radii, sums[keep] / counts[keep]
+
+
+def encircled_energy(arr: np.ndarray, cx: float, cy: float,
+                     mask: "np.ndarray | None" = None,
+                     baseline_pct: float = 5.0,
+                     fractions=(0.5, 0.865, 0.9)) -> dict:
+    """How much of the signal sits inside a circle, against the circle's radius.
+
+    The classic focus-quality number: 86.5 % is the fraction inside the 1/e² radius of
+    a perfect Gaussian, so comparing the measured 86.5 % radius with D4σ/4 says how
+    much energy is in the wings that the width alone hides.
+
+    Returns {"radii", "fraction", "r50"/"r86"/…, "total"} — radii in pixels, fraction
+    from 0 to 1. The circle is only meaningful out to the edge of the data, so the
+    curve stops where the ring first leaves the region and the caller is told (key
+    "clipped")."""
+    data = _gray(arr)
+    h, w = data.shape
+    sel = data[mask] if mask is not None else data
+    base = baseline_value(sel, baseline_pct)
+    work = np.clip(data - base, 0, None)
+    if mask is not None:
+        work = np.where(mask, work, 0.0)
+    yy, xx = np.mgrid[0:h, 0:w]
+    r = np.hypot(xx - float(cx), yy - float(cy))
+    idx = np.rint(r).astype(np.int64)
+    n = int(idx.max()) + 1
+    ring = np.bincount(idx.ravel(), weights=work.ravel(), minlength=n)
+    cum = np.cumsum(ring)
+    total = float(cum[-1])
+    out = {"radii": np.arange(n, dtype=np.float64), "total": total,
+           "baseline": base}
+    if total <= 0:
+        out["fraction"] = np.zeros(n)
+        return out
+    frac = cum / total
+    out["fraction"] = frac
+    # Where the circle first runs off the data: past that the "fraction" only grows
+    # because there are no more pixels to add, not because the beam ended.
+    out["r_max_valid"] = float(min(cx, cy, w - 1 - cx, h - 1 - cy))
+    for f in fractions:
+        i = int(np.searchsorted(frac, f))
+        if i >= n:
+            continue
+        if i == 0:
+            radius = 0.0
+        else:
+            span = frac[i] - frac[i - 1]
+            t = 0.0 if span <= 0 else (f - frac[i - 1]) / span
+            radius = (i - 1) + t
+        out[f"r{int(round(f * 1000))}"] = float(radius)
+        out["clipped"] = bool(radius > out["r_max_valid"])
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────
 #  Annotations — objects in image coordinates, painted on top
 # ─────────────────────────────────────────────────────────────────
@@ -416,6 +1366,12 @@ A_FREE, A_LINE, A_ARROW, A_RECT, A_ELLIPSE, A_POLY = (
     "free", "line", "arrow", "rect", "ellipse", "poly")
 A_TEXT, A_RULER, A_PROFILE, A_ROI_RECT, A_ROI_ELLIPSE, A_CROSS = (
     "text", "ruler", "profile", "roi_rect", "roi_ellipse", "cross")
+#  Three points: two arms and the corner between them, which is where the angle is read.
+A_ANGLE = "angle"
+#  A bar of a known real length, drawn into the picture so a saved copy carries its own
+#  scale. Its `value` is that length in millimetres and its pixel length is recomputed
+#  from the slot's scale on every refresh — the bar can never disagree with the scale.
+A_SCALEBAR = "scalebar"
 
 #  Shapes whose geometry is a bounding box (two corner points) and which therefore get
 #  the full eight resize handles.
@@ -423,7 +1379,12 @@ _BOX_KINDS = {A_RECT, A_ELLIPSE, A_ROI_RECT, A_ROI_ELLIPSE}
 #  Shapes defined by two free endpoints.
 _SEG_KINDS = {A_LINE, A_ARROW, A_RULER, A_PROFILE}
 #  Shapes that measure something and report it in the Measure section.
-MEASURE_KINDS = {A_RULER, A_ROI_RECT, A_ROI_ELLIPSE, A_PROFILE, A_CROSS}
+MEASURE_KINDS = {A_RULER, A_ROI_RECT, A_ROI_ELLIPSE, A_PROFILE, A_CROSS, A_ANGLE,
+                 A_SCALEBAR}
+#  The shapes the Measure panel can read numbers out of.
+_REGION_KINDS = {A_ROI_RECT, A_ROI_ELLIPSE}
+#  What the results table has a row for, in the order the table lists them.
+_TABLE_KINDS = (A_ROI_RECT, A_ROI_ELLIPSE, A_RULER, A_ANGLE, A_CROSS, A_PROFILE)
 
 
 @dataclass
@@ -436,10 +1397,35 @@ class _Annot:
     text: str = ""
     font_size: int = 16
     label: str = ""                            # measurement caption, filled on refresh
+    #  One number a shape may need to carry. Only the scale bar uses it so far (its
+    #  length in millimetres); it is here rather than in a subclass so that the undo
+    #  history, the session file and copy() keep working without a special case.
+    value: float = 0.0
 
     def copy(self) -> "_Annot":
         return _Annot(self.kind, [list(p) for p in self.pts], self.color, self.width,
-                      self.filled, self.text, self.font_size, self.label)
+                      self.filled, self.text, self.font_size, self.label, self.value)
+
+    def to_dict(self) -> dict:
+        """Plain-JSON form, for the session file."""
+        return {"kind": self.kind, "pts": [[float(p[0]), float(p[1])] for p in self.pts],
+                "color": self.color, "width": int(self.width), "filled": bool(self.filled),
+                "text": self.text, "font_size": int(self.font_size),
+                "value": float(self.value)}
+
+    @staticmethod
+    def from_dict(d: dict) -> "_Annot | None":
+        try:
+            kind = str(d["kind"])
+            pts = [[float(p[0]), float(p[1])] for p in d["pts"]]
+        except Exception:
+            return None
+        if not pts:
+            return None
+        return _Annot(kind, pts, str(d.get("color", "#ff0000")),
+                      int(d.get("width", 2)), bool(d.get("filled", False)),
+                      str(d.get("text", "")), int(d.get("font_size", 16)),
+                      "", float(d.get("value", 0.0)))
 
     def bbox(self) -> "tuple[float, float, float, float]":
         xs = [p[0] for p in self.pts] or [0.0]
@@ -463,6 +1449,11 @@ class _Annot:
         if self.kind in _SEG_KINDS and len(self.pts) >= 2:
             return {"p0": tuple(self.pts[0]), "p1": tuple(self.pts[1]),
                     "move": (cx, cy)}
+        if self.kind == A_ANGLE and len(self.pts) >= 3:
+            # One handle per corner: an angle is adjusted by moving an arm, and the
+            # middle point is the vertex the number is read at.
+            return {"a0": tuple(self.pts[0]), "a1": tuple(self.pts[1]),
+                    "a2": tuple(self.pts[2]), "move": (cx, cy)}
         return {"move": (cx, cy)}
 
     def set_handle(self, name: str, x: float, y: float, square: bool = False):
@@ -472,6 +1463,13 @@ class _Annot:
             elif name == "p1":
                 self.pts[1] = [x, y]
             return
+        if self.kind == A_ANGLE:
+            idx = {"a0": 0, "a1": 1, "a2": 2}.get(name)
+            if idx is not None and idx < len(self.pts):
+                self.pts[idx] = [x, y]
+            return
+        if self.kind == A_SCALEBAR:
+            return                     # its length comes from the scale, not the mouse
         x0, y0, x1, y1 = self.bbox()
         if "n" in name:
             y0 = y
@@ -497,7 +1495,7 @@ class _Annot:
         x0, y0, x1, y1 = self.bbox()
         if self.kind in _SEG_KINDS and len(self.pts) >= 2:
             return _dist_to_segment(x, y, self.pts[0], self.pts[1]) <= tol
-        if self.kind == A_FREE or self.kind == A_POLY:
+        if self.kind in (A_FREE, A_POLY, A_ANGLE):
             for a, b in zip(self.pts, self.pts[1:]):
                 if _dist_to_segment(x, y, a, b) <= tol:
                     return True
@@ -505,6 +1503,53 @@ class _Annot:
         if self.kind == A_CROSS:
             return abs(x - x0) <= tol * 3 and abs(y - y0) <= tol * 3
         return (x0 - tol) <= x <= (x1 + tol) and (y0 - tol) <= y <= (y1 + tol)
+
+
+def _nice_length(value: float) -> float:
+    """The round number nearest below `value`: 1, 2 or 5 times a power of ten.
+
+    A scale bar reading "4.7 mm" makes the reader do arithmetic; one reading "5 mm"
+    does not."""
+    if value <= 0:
+        return 1.0
+    exp = math.floor(math.log10(value))
+    base = 10.0 ** exp
+    for step in (5.0, 2.0, 1.0):
+        if value >= step * base:
+            return step * base
+    return base
+
+
+def _fmt_mm(mm: float) -> str:
+    """A length in the unit that keeps it readable: 0.05 mm reads as 50 µm, 12 mm as
+    12 mm. Trailing zeros are dropped so a round number looks round."""
+    if mm <= 0:
+        return "0"
+    if mm < 1.0:
+        txt = f"{mm * 1000.0:.4g}"
+        return f"{txt} µm"
+    txt = f"{mm:.4g}"
+    return f"{txt} mm"
+
+
+def angle_between(p0, vertex, p2) -> float:
+    """The angle at `vertex` between the arms to p0 and p2, in degrees, 0…180.
+
+    Always the inner angle: a protractor reading of 250° is the same corner measured
+    the long way round, and nobody means that."""
+    ax, ay = p0[0] - vertex[0], p0[1] - vertex[1]
+    bx, by = p2[0] - vertex[0], p2[1] - vertex[1]
+    na, nb = math.hypot(ax, ay), math.hypot(bx, by)
+    if na < 1e-9 or nb < 1e-9:
+        return 0.0
+    cos = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
+    return math.degrees(math.acos(cos))
+
+
+def line_angle_deg(p0, p1) -> float:
+    """Direction of a line as it looks on screen: degrees anticlockwise from
+    horizontal. Image y grows downwards, so the sign is flipped on the way out."""
+    return math.degrees(math.atan2(-(p1[1] - p0[1]), p1[0] - p0[0]))
 
 
 def _dist_to_segment(px: float, py: float, a, b) -> float:
@@ -571,17 +1616,40 @@ def region_stats(arr: np.ndarray, mask: "np.ndarray | None") -> dict:
     return out
 
 
-def line_profile(arr: np.ndarray, p0, p1) -> "tuple[np.ndarray, np.ndarray]":
+def line_profile(arr: np.ndarray, p0, p1, width: int = 1) -> "tuple[np.ndarray, np.ndarray]":
     """Values sampled along a line, one sample per pixel of length.
+
+    `width` averages that many pixels ACROSS the line, the way ImageJ's line width
+    does. On a noisy frame a one-pixel-wide profile is mostly noise; averaging 5 or 9
+    rows perpendicular to the line cuts that down by the square root of the count
+    without moving the peak, so an FWHM read off it is far steadier.
+
     Returns (distance in pixels, value)."""
     data = _to_gray(arr) if arr.ndim == 3 else arr
     h, w = data.shape[:2]
     n = max(2, int(round(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))) + 1)
-    xs = np.clip(np.linspace(p0[0], p1[0], n), 0, w - 1)
-    ys = np.clip(np.linspace(p0[1], p1[1], n), 0, h - 1)
-    vals = data[np.rint(ys).astype(int), np.rint(xs).astype(int)].astype(np.float64)
+    xs = np.linspace(p0[0], p1[0], n)
+    ys = np.linspace(p0[1], p1[1], n)
     dist = np.hypot(xs - p0[0], ys - p0[1])
-    return dist, vals
+
+    width = max(1, int(width))
+    if width == 1:
+        vals = data[np.clip(np.rint(ys), 0, h - 1).astype(int),
+                    np.clip(np.rint(xs), 0, w - 1).astype(int)].astype(np.float64)
+        return dist, vals
+
+    # Unit vector across the line, and an odd number of offsets centred on it so the
+    # middle sample is still the line itself.
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    ln = math.hypot(dx, dy) or 1.0
+    nx, ny = -dy / ln, dx / ln
+    offsets = np.arange(width, dtype=np.float64) - (width - 1) / 2.0
+    acc = np.zeros(n, dtype=np.float64)
+    for off in offsets:
+        yy = np.clip(np.rint(ys + ny * off), 0, h - 1).astype(int)
+        xx = np.clip(np.rint(xs + nx * off), 0, w - 1).astype(int)
+        acc += data[yy, xx].astype(np.float64)
+    return dist, acc / len(offsets)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -621,10 +1689,18 @@ class _WorkshopSlot:
     def _state(self):
         # base / raw are never modified in place — every edit builds a new array — so
         # the history can share references instead of copying megabytes per step.
-        return (self.base, self.raw, [a.copy() for a in self.annots], self.px_per_mm)
+        #
+        # full_scale belongs in here even though it is one number: binning with "Sum"
+        # multiplies it, and an undo that put the pixels back but left the scale
+        # four times too big made every "% of full scale" and the histogram axis wrong,
+        # with nothing on screen to show why.
+        return (self.base, self.raw, [a.copy() for a in self.annots], self.px_per_mm,
+                self.full_scale)
 
     def _restore(self, st):
         self.base, self.raw, self.annots, self.px_per_mm = st[0], st[1], st[2], st[3]
+        if len(st) > 4:
+            self.full_scale = st[4]
 
     def push_undo(self):
         self.undo_stack.append(self._state())
@@ -716,15 +1792,69 @@ class _RawLoadTask(QRunnable):
                 return
             full_scale = None
             camera = ""
+            note = ""
             if img_scale is not None:
                 try:
                     camera = img_scale.camera_from_path(str(p)) or ""
-                    full_scale = float(img_scale.full_scale_for_pil(str(p), info, mode))
+                    fb = img_scale.bits_from_max_value(
+                        img_scale.max_value_from_info(info or {}))
+                    rb = img_scale.reference_bits(camera or None, fb)
+                    # Undo the archiver's stretch: what is in the file is the frame's
+                    # bracket blown up to 16 bits, not what the sensor counted.
+                    arr, full_scale = img_scale.measure_counts(arr, fb, rb)
+                    full_scale = float(full_scale)
+                    if not fb:
+                        note = ("no bracket in the file — values are the stored "
+                                "16-bit numbers")
                 except Exception:
                     full_scale = None
-            self._sig.done.emit(slot, arr, full_scale, camera, "")
+            self._sig.done.emit(slot, arr, full_scale, camera, note)
         except Exception as e:
             self._sig.done.emit(slot, None, None, "", f"could not read source file ({e})")
+
+
+class _WriteSignals(QObject):
+    done = Signal(str, str)                            # message, error ("" = fine)
+
+
+class _WriteTask(QRunnable):
+    """Any job that writes files, run off the GUI thread.
+
+    Encoding a dozen full-size frames takes seconds, and doing it in the event handler
+    froze the whole window while it happened — with no way to tell whether the program
+    had crashed. The callable must already hold plain arrays and paths: nothing Qt owns
+    may be touched from here."""
+
+    def __init__(self, fn, signals: _WriteSignals):
+        super().__init__()
+        self._fn = fn
+        self._sig = signals
+
+    def run(self):
+        try:
+            message, error = self._fn()
+        except Exception as e:
+            message, error = "", f"{e}"
+        self._sig.done.emit(message or "", error or "")
+
+
+def _view_from_dict(d) -> "_ViewSettings":
+    """Display settings out of a session file, ignoring anything it does not recognise
+    — an older or newer session must not stop the rest of the file from loading."""
+    view = _ViewSettings()
+    if not isinstance(d, dict):
+        return view
+    for key, value in d.items():
+        if not hasattr(view, key):
+            continue
+        try:
+            current = getattr(view, key)
+            setattr(view, key, type(current)(value) if current is not None else value)
+        except Exception:
+            pass
+    if view.palette not in GRADIENTS:
+        view.palette = PALETTE_DEFAULT
+    return view
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -736,7 +1866,7 @@ TOOL_BRUSH, TOOL_LINE, TOOL_ARROW = "brush", "line", "arrow"
 TOOL_RECT, TOOL_ELLIPSE, TOOL_POLY, TOOL_TEXT = "rect", "ellipse", "poly", "text"
 TOOL_CROP, TOOL_EYEDROP, TOOL_ERASER = "crop", "eyedrop", "eraser"
 TOOL_RULER, TOOL_ROI_RECT, TOOL_ROI_ELLIPSE = "ruler", "roi_rect", "roi_ellipse"
-TOOL_PROFILE, TOOL_CROSS = "profile", "cross"
+TOOL_PROFILE, TOOL_CROSS, TOOL_ANGLE = "profile", "cross", "angle"
 
 #  tool → the annotation it creates
 _TOOL_ANNOT = {
@@ -744,6 +1874,19 @@ _TOOL_ANNOT = {
     TOOL_ELLIPSE: A_ELLIPSE, TOOL_POLY: A_POLY, TOOL_TEXT: A_TEXT,
     TOOL_RULER: A_RULER, TOOL_ROI_RECT: A_ROI_RECT,
     TOOL_ROI_ELLIPSE: A_ROI_ELLIPSE, TOOL_PROFILE: A_PROFILE, TOOL_CROSS: A_CROSS,
+    TOOL_ANGLE: A_ANGLE,
+}
+
+#  A single letter picks a tool, the way ImageJ and the drawing programs do. These
+#  live in the canvas keyPressEvent rather than in a window shortcut, so that typing
+#  into a text annotation keeps every letter for itself.
+_TOOL_KEYS = {
+    "H": TOOL_PAN, "Z": TOOL_ZOOM, "S": TOOL_SELECT,
+    "B": TOOL_BRUSH, "L": TOOL_LINE, "A": TOOL_ARROW,
+    "R": TOOL_RECT, "E": TOOL_ELLIPSE, "P": TOOL_POLY, "T": TOOL_TEXT,
+    "U": TOOL_RULER, "Shift+R": TOOL_ROI_RECT, "Shift+E": TOOL_ROI_ELLIPSE,
+    "Shift+P": TOOL_PROFILE, "M": TOOL_CROSS, "G": TOOL_ANGLE,
+    "C": TOOL_CROP, "I": TOOL_EYEDROP, "D": TOOL_ERASER,
 }
 
 _ZOOM_MIN, _ZOOM_MAX = 0.02, 64.0
@@ -764,9 +1907,11 @@ class WorkshopCanvas(QWidget):
     annots_changed = Signal()          # annotation list or geometry changed
     color_picked   = Signal(QColor)
     cursor_moved   = Signal(float, float)   # image coordinates, (-1, -1) when outside
+    selection_changed = Signal()        # a different shape (or none) is now selected
     zoom_changed   = Signal(float)
     status         = Signal(str)
     profile_requested = Signal(object)      # _Annot of kind A_PROFILE
+    tool_requested = Signal(str)            # a letter key asked for another tool
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -793,6 +1938,10 @@ class WorkshopCanvas(QWidget):
         self.brush_size = 6
         self.font_size = 16
         self.fill_shapes = False
+        #  Off: a new measuring region replaces the old one, so the numbers under the
+        #  panel can only ever belong to the one region on screen. On: regions pile up
+        #  and the results table is the place to read them.
+        self.keep_regions = False
 
         self._new: "_Annot | None" = None
         self._press_pos: "QPointF | None" = None
@@ -803,8 +1952,10 @@ class WorkshopCanvas(QWidget):
         self._drag_handle = ""
         self._drag_last: "QPointF | None" = None
         self._poly: "_Annot | None" = None
+        self._angle: "_Annot | None" = None      # protractor being clicked out
         self._text_active = False
         self._hover_img: "QPointF | None" = None
+        self._menu_request = None                # set by the tab: right-click menu
 
     # ── Slot binding ──────────────────────────────────────────────
 
@@ -1022,8 +2173,16 @@ class WorkshopCanvas(QWidget):
         return a[self._sel] if 0 <= self._sel < len(a) else None
 
     def select_index(self, idx: int):
-        self._sel = idx if 0 <= idx < len(self._annots()) else -1
+        self._set_sel(idx if 0 <= idx < len(self._annots()) else -1)
         self.update()
+
+    def _set_sel(self, idx: int):
+        """Selection is what the Measure panel reads, so every change has to announce
+        itself — otherwise the panel keeps showing the region that was selected before."""
+        if idx == self._sel:
+            return
+        self._sel = idx
+        self.selection_changed.emit()
 
     def _tol_img(self) -> float:
         return max(1.0, 6.0 / max(self._zoom, 1e-6))
@@ -1048,6 +2207,14 @@ class WorkshopCanvas(QWidget):
         if self._slot is None:
             return
         self._slot.push_undo()
+        if a.kind in _REGION_KINDS and not self.keep_regions:
+            # A region is what the Measure panel reads, and it reads exactly one. Two
+            # of them on screen with one set of numbers under them is a trap, so a new
+            # region replaces the old one. Undo brings the old one back. Switch on
+            # "Keep several regions" and they pile up instead — then the results table
+            # is what lists them, and the panel shows whichever one is selected.
+            self._slot.annots = [x for x in self._slot.annots
+                                 if x.kind not in _REGION_KINDS]
         self._slot.annots.append(a)
         self._sel = len(self._slot.annots) - 1
         self.update_labels()
@@ -1088,6 +2255,17 @@ class WorkshopCanvas(QWidget):
                     dpx = math.hypot(a.pts[1][0] - a.pts[0][0], a.pts[1][1] - a.pts[0][1])
                     a.label = (f"{dpx:.1f} px" if not slot.px_per_mm
                                else f"{dpx / slot.px_per_mm:.3f} mm  ({dpx:.1f} px)")
+                elif a.kind == A_ANGLE and len(a.pts) >= 3:
+                    a.label = f"{angle_between(a.pts[0], a.pts[1], a.pts[2]):.1f}°"
+                elif a.kind == A_SCALEBAR and len(a.pts) >= 2:
+                    # The bar is redrawn from the scale every time, so changing the
+                    # scale moves the bar instead of leaving a bar that lies.
+                    if a.value > 0 and slot.px_per_mm:
+                        a.pts[1] = [a.pts[0][0] + a.value * slot.px_per_mm,
+                                    a.pts[0][1]]
+                        a.label = _fmt_mm(a.value)
+                    else:
+                        a.label = f"{abs(a.pts[1][0] - a.pts[0][0]):.0f} px"
                 elif a.kind == A_PROFILE:
                     a.label = "profile — double-click to plot"
                 elif a.kind == A_CROSS and a.pts:
@@ -1136,6 +2314,9 @@ class WorkshopCanvas(QWidget):
         if btn == Qt.MouseButton.RightButton:
             if self._poly is not None:
                 self._finish_poly()
+            elif self._angle is not None:
+                self._angle = None
+                self.update()
             return
         if btn != Qt.MouseButton.LeftButton:
             return
@@ -1160,7 +2341,7 @@ class WorkshopCanvas(QWidget):
         if self.tool == TOOL_ERASER:
             idx = self._annot_at(p)
             if idx >= 0:
-                self._sel = idx
+                self._set_sel(idx)
                 self.delete_selected()
             return
         if self.tool == TOOL_SELECT:
@@ -1173,7 +2354,7 @@ class WorkshopCanvas(QWidget):
                     self._drag_last = p
                     return
             idx = self._annot_at(p)
-            self._sel = idx
+            self._set_sel(idx)
             if idx >= 0:
                 self._slot.push_undo()
                 self._drag_handle = "move"
@@ -1193,6 +2374,21 @@ class WorkshopCanvas(QWidget):
                 self._poly = _Annot(A_POLY, [[p.x(), p.y()]], self.draw_color.name(),
                                     self.line_width, self.fill_shapes)
             self._poly.pts.append([p.x(), p.y()])
+            self.update()
+            return
+        if self.tool == TOOL_ANGLE:
+            # Three clicks: one arm end, the corner, the other arm end. The point under
+            # the cursor is kept at the end of the list while it is being placed, which
+            # is what makes the shape follow the mouse between clicks.
+            if self._angle is None:
+                self._angle = _Annot(A_ANGLE, [[p.x(), p.y()], [p.x(), p.y()]],
+                                     self.draw_color.name(), self.line_width)
+            elif len(self._angle.pts) < 3:
+                self._angle.pts.append([p.x(), p.y()])
+            else:
+                a, self._angle = self._angle, None
+                a.pts[2] = [p.x(), p.y()]
+                self.add_annot(a)
             self.update()
             return
         if self.tool == TOOL_CROSS:
@@ -1271,6 +2467,14 @@ class WorkshopCanvas(QWidget):
             p = self._widget_to_img(pos)
             self._poly.pts[-1] = [p.x(), p.y()]
             self.update()
+            return
+
+        if self._angle is not None:
+            p = self._widget_to_img(pos)
+            self._angle.pts[-1] = [p.x(), p.y()]
+            if len(self._angle.pts) >= 3:
+                self._angle.label = f"{angle_between(*self._angle.pts[:3]):.1f}°"
+            self.update()
 
     def mouseReleaseEvent(self, e):
         pos = QPointF(e.position())
@@ -1333,7 +2537,7 @@ class WorkshopCanvas(QWidget):
         p = self._widget_to_img(QPointF(e.position()))
         idx = self._annot_at(p)
         if idx >= 0 and self._slot.annots[idx].kind == A_PROFILE:
-            self._sel = idx
+            self._set_sel(idx)
             self.profile_requested.emit(self._slot.annots[idx])
 
     def _finish_poly(self):
@@ -1375,8 +2579,9 @@ class WorkshopCanvas(QWidget):
             self.delete_selected(); return
         if k == Qt.Key.Key_Escape:
             self._poly = None
+            self._angle = None
             self._new = None
-            self._sel = -1
+            self._set_sel(-1)
             self.update(); return
         if k in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
             self.zoom_in(); return
@@ -1386,6 +2591,18 @@ class WorkshopCanvas(QWidget):
             self.fit_to_view(); return
         if k == Qt.Key.Key_1:
             self.zoom_reset(); return
+
+        mods = e.modifiers()
+        if not (mods & (Qt.KeyboardModifier.ControlModifier
+                        | Qt.KeyboardModifier.AltModifier
+                        | Qt.KeyboardModifier.MetaModifier)):
+            ch = e.text().upper()
+            if len(ch) == 1 and ch.isalpha():
+                name = ("Shift+" if mods & Qt.KeyboardModifier.ShiftModifier else "") + ch
+                tool = _TOOL_KEYS.get(name)
+                if tool is not None:
+                    self.tool_requested.emit(tool)
+                    return
 
         step = 10 if e.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
         dx = dy = 0
@@ -1419,9 +2636,12 @@ class WorkshopCanvas(QWidget):
         self._commit_text()
         if self._poly is not None:
             self._finish_poly()
+        # A half-clicked protractor is thrown away rather than finished: two of the
+        # three points would give an angle nobody asked for.
+        self._angle = None
         self.tool = tool
         if tool != TOOL_SELECT:
-            self._sel = -1
+            self._set_sel(-1)
         self._apply_cursor()
         self.update()
 
@@ -1517,6 +2737,8 @@ class WorkshopCanvas(QWidget):
             paint_annots(p, [self._new], self._img_to_widget, self._zoom)
         if self._poly is not None:
             paint_annots(p, [self._poly], self._img_to_widget, self._zoom)
+        if self._angle is not None:
+            paint_annots(p, [self._angle], self._img_to_widget, self._zoom)
 
         a = self.selected()
         if a is not None and self.tool == TOOL_SELECT:
@@ -1575,6 +2797,22 @@ class WorkshopCanvas(QWidget):
                 p.drawRect(QRectF(w.x() - _HANDLE_PX, w.y() - _HANDLE_PX,
                                   _HANDLE_PX * 2, _HANDLE_PX * 2))
 
+    # ── Right-click menu ──────────────────────────────────────────
+
+    def contextMenuEvent(self, e):
+        """The common commands where the picture is, instead of across the panel.
+
+        Right-click already means two other things — it zooms out under Magnify and it
+        closes a polygon — so the menu stays out of the way in exactly those cases
+        rather than taking the button off them."""
+        if self._menu_request is None or self.tool == TOOL_ZOOM \
+                or self._poly is not None or self._angle is not None:
+            e.ignore()
+            return
+        p = self._widget_to_img(QPointF(e.pos()), clamp=False)
+        self._menu_request(e.globalPos(), p)
+        e.accept()
+
     # ── Drag and drop ─────────────────────────────────────────────
 
     def dragEnterEvent(self, e):
@@ -1608,7 +2846,15 @@ def paint_annots(p: QPainter, annots, to_widget, scale: float, text_caret: int =
         p.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(), 70))
                    if a.filled else Qt.BrushStyle.NoBrush)
 
-        if a.kind in (A_FREE, A_POLY) and len(a.pts) >= 2:
+        if a.kind == A_SCALEBAR and len(a.pts) >= 2:
+            _draw_scale_bar(p, a, to_widget, scale, col)
+            continue
+        if a.kind == A_ANGLE and len(a.pts) >= 2:
+            poly = QPolygonF([to_widget(x, y) for x, y in a.pts])
+            p.drawPolyline(poly)
+            if len(a.pts) >= 3:
+                _draw_angle_arc(p, a, to_widget, scale, col)
+        elif a.kind in (A_FREE, A_POLY) and len(a.pts) >= 2:
             poly = QPolygonF([to_widget(x, y) for x, y in a.pts])
             if a.kind == A_POLY and a.filled:
                 p.drawPolygon(poly)
@@ -1661,6 +2907,66 @@ def _draw_end_ticks(p: QPainter, p0: QPointF, p1: QPointF, size: float):
     dx, dy = size * math.cos(ang), size * math.sin(ang)
     for e in (p0, p1):
         p.drawLine(QPointF(e.x() - dx, e.y() - dy), QPointF(e.x() + dx, e.y() + dy))
+
+
+def _draw_angle_arc(p: QPainter, a: "_Annot", to_widget, scale: float, col: QColor):
+    """Small arc inside the corner, so it is obvious WHICH of the two angles the
+    number belongs to."""
+    v = to_widget(*a.pts[1])
+    w0 = to_widget(*a.pts[0])
+    w2 = to_widget(*a.pts[2])
+    r = max(10.0, min(34.0, 0.35 * min(math.hypot(w0.x() - v.x(), w0.y() - v.y()),
+                                       math.hypot(w2.x() - v.x(), w2.y() - v.y()))))
+    a0 = math.degrees(math.atan2(-(w0.y() - v.y()), w0.x() - v.x()))
+    a2 = math.degrees(math.atan2(-(w2.y() - v.y()), w2.x() - v.x()))
+    span = a2 - a0
+    while span <= -180.0:
+        span += 360.0
+    while span > 180.0:
+        span -= 360.0
+    pen = QPen(col, max(1.0, a.width * scale * 0.7))
+    pen.setStyle(Qt.PenStyle.DotLine)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    # Qt's arc angles are in sixteenths of a degree, anticlockwise from three o'clock.
+    p.drawArc(QRectF(v.x() - r, v.y() - r, 2 * r, 2 * r),
+              int(round(a0 * 16)), int(round(span * 16)))
+
+
+def _draw_scale_bar(p: QPainter, a: "_Annot", to_widget, scale: float, col: QColor):
+    """A solid bar with end ticks and its length written above it.
+
+    Drawn on a dark plate like the measurement captions: a scale bar that lands on a
+    saturated white spot and disappears is worse than none, because the reader still
+    believes the picture is calibrated."""
+    w0 = to_widget(*a.pts[0])
+    w1 = to_widget(*a.pts[1])
+    thick = max(2.0, a.width * scale * 1.6)
+    x0, x1 = min(w0.x(), w1.x()), max(w0.x(), w1.x())
+    y = w0.y()
+    text = a.label or a.text
+    f = QFont("Segoe UI", max(7, int(round(a.font_size * min(max(scale, 0.4), 1.6) * 0.62))),
+              QFont.Weight.Bold)
+    p.setFont(f)
+    fm = QFontMetrics(f)
+    tw = fm.horizontalAdvance(text) if text else 0
+    th = fm.height() if text else 0
+    plate = QRectF(x0 - 6, y - thick - th - 8, max(x1 - x0 + 12, tw + 12),
+                   thick + th + 12)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor(0, 0, 0, 150)))
+    p.drawRect(plate)
+    p.setPen(QPen(col, thick, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+    p.drawLine(QPointF(x0, y), QPointF(x1, y))
+    tick = max(3.0, thick * 1.8)
+    p.setPen(QPen(col, max(1.0, thick * 0.5), Qt.PenStyle.SolidLine,
+                  Qt.PenCapStyle.FlatCap))
+    for xe in (x0, x1):
+        p.drawLine(QPointF(xe, y - tick), QPointF(xe, y + tick * 0.2))
+    if text:
+        p.setPen(QPen(col))
+        p.drawText(QRectF(x0, y - thick - th - 5, max(x1 - x0, tw), th),
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, text)
 
 
 def _draw_caption(p: QPainter, a: "_Annot", to_widget, scale: float, col: QColor):
@@ -1802,29 +3108,49 @@ class _StatCell(QLabel):
 
 
 class _HistogramWidget(QWidget):
-    """Histogram of the displayed 8-bit codes with draggable black and white points.
+    """Histogram of the measured values with draggable black and white points.
 
     This is the ImageJ way of setting a display range: you see where the data actually
-    is, instead of guessing with two sliders."""
+    is, instead of guessing with two sliders.
+
+    The bars are counted from the NATIVE data whenever the source file could be read —
+    a 12-bit frame really does reach 4095, and folding it into 256 display codes first
+    hides where the values sit. The two draggable points stay display codes 0…255,
+    because that is what the display mapping is built from; the numbers written next to
+    them are converted to the axis unit so the operator reads real counts."""
 
     changed = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(84)
+        self.setFixedHeight(96)
         self.setMinimumWidth(120)
         self.setMouseTracking(True)
         self._counts = np.zeros(256, dtype=np.float64)
         self._lo, self._hi = 0, 255
         self._drag = ""
+        self._vmax = 255.0
+        self._unit = "code"
 
-    def set_data(self, gray: "np.ndarray | None"):
-        if gray is None or gray.size == 0:
+    def set_data(self, values: "np.ndarray | None", vmax: float = 255.0,
+                 unit: str = "code"):
+        """`values` are in the axis unit, `vmax` is the top of the axis (255 for display
+        codes, the camera's full scale for native counts)."""
+        self._vmax = float(vmax) if vmax and vmax > 0 else 255.0
+        self._unit = unit
+        if values is None or values.size == 0:
             self._counts = np.zeros(256, dtype=np.float64)
         else:
-            s = _stat_sample(np.clip(gray, 0, 255).astype(np.uint8))
-            self._counts = np.bincount(np.ravel(s), minlength=256).astype(np.float64)
+            s = _stat_sample(values)
+            # 256 buckets over 0…vmax, so the bar positions line up with the display
+            # codes the black / white points are expressed in.
+            idx = np.clip(np.asarray(s, dtype=np.float64) * (255.0 / self._vmax),
+                          0, 255).astype(np.int32)
+            self._counts = np.bincount(np.ravel(idx), minlength=256).astype(np.float64)
         self.update()
+
+    def _axis_value(self, code: int) -> float:
+        return code / 255.0 * self._vmax
 
     def set_window(self, lo: int, hi: int):
         self._lo, self._hi = int(lo), int(hi)
@@ -1845,7 +3171,7 @@ class _HistogramWidget(QWidget):
         p.setPen(QPen(QColor("#d0d0d0")))
         p.drawRect(self.rect().adjusted(0, 0, -1, -1))
         top = float(self._counts.max())
-        h = self.height() - 12
+        h = self.height() - 24
         if top > 0:
             # Square-root scaling: a beam spot is a handful of pixels next to a huge
             # background peak, and on a linear axis it is invisible.
@@ -1863,11 +3189,16 @@ class _HistogramWidget(QWidget):
         for code, colour in ((self._lo, "#111111"), (self._hi, "#c02020")):
             x = self._x_of(code)
             p.setPen(QPen(QColor(colour), 2))
-            p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+            p.drawLine(QPointF(x, 0), QPointF(x, h + 11))
         p.setPen(QColor("#555"))
         p.setFont(QFont("Segoe UI", 7))
-        p.drawText(2, 10, f"{self._lo}")
-        p.drawText(self.width() - 26, 10, f"{self._hi}")
+        p.drawText(2, 10, f"{self._axis_value(self._lo):.0f}")
+        p.drawText(QRectF(0, 0, self.width() - 2, 12),
+                   Qt.AlignmentFlag.AlignRight,
+                   f"{self._axis_value(self._hi):.0f}")
+        p.drawText(QRectF(0, self.height() - 12, self.width(), 12),
+                   Qt.AlignmentFlag.AlignHCenter,
+                   f"0 … {self._vmax:.0f} {self._unit}")
 
     def mousePressEvent(self, e):
         c = self._code_at(e.position().x())
@@ -1908,14 +3239,46 @@ class _PlotWidget(QWidget):
         self._x = np.zeros(0)
         self._y = np.zeros(0)
         self._unit = ""
+        self._xunit = "px"
+        self._xlabel = "distance along the line"
         self._hover = None
+        self._overlay = None          # (x, y, colour, caption) drawn over the trace
+        self._hlines = []             # [(value, colour, caption)] — e.g. the half maximum
+        self._vlines = []             # [(x, colour)] — e.g. the two FWHM crossings
 
-    def set_data(self, x, y, unit: str):
+    def set_data(self, x, y, unit: str, xlabel: str = "distance along the line",
+                 xunit: str = "px"):
         self._x, self._y, self._unit = np.asarray(x), np.asarray(y), unit
+        self._xlabel, self._xunit = xlabel, xunit
+        self.update()
+
+    def set_overlay(self, x=None, y=None, colour: str = "#d05000", caption: str = ""):
+        """A second trace over the first — the Gaussian fit. None clears it."""
+        self._overlay = None if x is None else (np.asarray(x), np.asarray(y),
+                                               colour, caption)
+        self.update()
+
+    def set_marks(self, hlines=None, vlines=None):
+        self._hlines = list(hlines or [])
+        self._vlines = list(vlines or [])
         self.update()
 
     def _plot_rect(self) -> QRectF:
-        return QRectF(52, 12, max(10, self.width() - 68), max(10, self.height() - 46))
+        return QRectF(56, 12, max(10, self.width() - 72), max(10, self.height() - 46))
+
+    def _limits(self):
+        ymin, ymax = float(self._y.min()), float(self._y.max())
+        for h in self._hlines:
+            ymin, ymax = min(ymin, h[0]), max(ymax, h[0])
+        if self._overlay is not None and self._overlay[1].size:
+            ymin = min(ymin, float(self._overlay[1].min()))
+            ymax = max(ymax, float(self._overlay[1].max()))
+        if ymax <= ymin:
+            ymax = ymin + 1.0
+        xmin, xmax = float(self._x.min()), float(self._x.max())
+        if xmax <= xmin:
+            xmax = xmin + 1.0
+        return xmin, xmax, ymin, ymax
 
     def paintEvent(self, _e):
         p = QPainter(self)
@@ -1925,49 +3288,72 @@ class _PlotWidget(QWidget):
         p.drawRect(r)
         if self._x.size < 2:
             return
-        ymin, ymax = float(self._y.min()), float(self._y.max())
-        if ymax <= ymin:
-            ymax = ymin + 1.0
-        xmax = float(self._x.max()) or 1.0
+        xmin, xmax, ymin, ymax = self._limits()
 
-        p.setPen(QPen(QColor("#e6e6e6")))
+        def to_px(xv, yv) -> QPointF:
+            return QPointF(r.left() + r.width() * (float(xv) - xmin) / (xmax - xmin),
+                           r.bottom() - r.height() * (float(yv) - ymin) / (ymax - ymin))
+
         p.setFont(QFont("Segoe UI", 7))
         for i in range(5):
             yy = r.bottom() - r.height() * i / 4.0
             p.setPen(QPen(QColor("#ececec")))
             p.drawLine(QPointF(r.left(), yy), QPointF(r.right(), yy))
             p.setPen(QColor("#555"))
-            p.drawText(QRectF(2, yy - 8, 46, 16),
+            p.drawText(QRectF(2, yy - 8, 50, 16),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                        f"{ymin + (ymax - ymin) * i / 4.0:.0f}")
         p.setPen(QColor("#555"))
         p.drawText(QRectF(r.left(), r.bottom() + 4, r.width(), 16),
-                   Qt.AlignmentFlag.AlignHCenter, f"distance along the line (px), 0 … {xmax:.0f}")
+                   Qt.AlignmentFlag.AlignHCenter,
+                   f"{self._xlabel} ({self._xunit}), {xmin:.0f} … {xmax:.0f}")
 
-        poly = QPolygonF([
-            QPointF(r.left() + r.width() * float(xv) / xmax,
-                    r.bottom() - r.height() * (float(yv) - ymin) / (ymax - ymin))
-            for xv, yv in zip(self._x, self._y)])
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for value, colour, caption in self._hlines:
+            y = to_px(xmin, value).y()
+            p.setPen(QPen(QColor(colour), 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+            if caption:
+                p.setPen(QColor(colour))
+                p.drawText(QRectF(r.right() - 96, y - 14, 92, 14),
+                           Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+                           caption)
+        for value, colour in self._vlines:
+            if not (xmin <= value <= xmax):
+                continue
+            x = to_px(value, ymin).x()
+            p.setPen(QPen(QColor(colour), 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+
+        if self._overlay is not None:
+            ox, oy, colour, caption = self._overlay
+            if ox.size >= 2:
+                p.setPen(QPen(QColor(colour), 1.4, Qt.PenStyle.DashLine))
+                p.drawPolyline(QPolygonF([to_px(a, b) for a, b in zip(ox, oy)]))
+                if caption:
+                    p.setPen(QColor(colour))
+                    p.drawText(QRectF(r.left() + 6, r.top() + 22, r.width() - 12, 14),
+                               Qt.AlignmentFlag.AlignLeft, caption)
+
         p.setPen(QPen(QColor("#2f6fd0"), 1.6))
-        p.drawPolyline(poly)
+        p.drawPolyline(QPolygonF([to_px(a, b) for a, b in zip(self._x, self._y)]))
 
         if self._hover is not None and r.contains(self._hover):
             frac = (self._hover.x() - r.left()) / r.width()
             idx = int(max(0, min(self._x.size - 1, round(frac * (self._x.size - 1)))))
-            hx = r.left() + r.width() * float(self._x[idx]) / xmax
-            hy = r.bottom() - r.height() * (float(self._y[idx]) - ymin) / (ymax - ymin)
+            hp = to_px(self._x[idx], self._y[idx])
             p.setPen(QPen(QColor("#c02020"), 1, Qt.PenStyle.DashLine))
-            p.drawLine(QPointF(hx, r.top()), QPointF(hx, r.bottom()))
+            p.drawLine(QPointF(hp.x(), r.top()), QPointF(hp.x(), r.bottom()))
             p.setBrush(QBrush(QColor("#c02020")))
-            p.drawEllipse(QPointF(hx, hy), 3, 3)
-            txt = f"{self._x[idx]:.1f} px   {self._y[idx]:.1f} {self._unit}"
+            p.drawEllipse(hp, 3, 3)
+            txt = (f"{self._x[idx]:.2f} {self._xunit}   "
+                   f"{self._y[idx]:.1f} {self._unit}")
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(QColor(0, 0, 0, 180)))
-            p.drawRect(QRectF(r.left() + 4, r.top() + 4, 190, 18))
+            p.drawRect(QRectF(r.left() + 4, r.top() + 4, 210, 18))
             p.setPen(QColor("#fff"))
             p.setFont(QFont("Segoe UI", 8))
-            p.drawText(QRectF(r.left() + 8, r.top() + 4, 186, 18),
+            p.drawText(QRectF(r.left() + 8, r.top() + 4, 206, 18),
                        Qt.AlignmentFlag.AlignVCenter, txt)
 
     def mouseMoveEvent(self, e):
@@ -1980,56 +3366,468 @@ class _PlotWidget(QWidget):
 
 
 class ProfileDialog(QDialog):
-    """Values along a line, with the numbers one click away."""
+    """Values along a line, with the numbers one click away.
 
+    Also where a width is read: FWHM and the 1/e² width straight off the samples, and
+    a Gaussian fit on request whose r² says whether calling this spot Gaussian is
+    honest. Distances are in millimetres as soon as the image has a scale."""
+
+    #  How many pixels across the line to average. Set by the tab from its own
+    #  spinbox before the profile is handed over.
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Line profile")
-        self.resize(640, 380)
+        self.resize(700, 460)
         self._x = np.zeros(0)
         self._y = np.zeros(0)
         self._unit = ""
+        self._xunit = "px"
+        self._title = ""
+        self._metrics = {}
+        self._recompute = None            # set by the tab: (width) -> (x, y)
+
         lay = QVBoxLayout(self)
         self._info = QLabel("—")
+        self._info.setWordWrap(True)
         self._info.setStyleSheet("color: #222; font-size: 11px;")
+        self._widths = QLabel("—")
+        self._widths.setWordWrap(True)
+        self._widths.setStyleSheet(
+            "QLabel { color: #10243c; font-size: 11px; background: #eef3fa;"
+            " border: 1px solid #cfdcea; border-radius: 3px; padding: 4px 6px; }")
         self._plot = _PlotWidget()
         lay.addWidget(self._info)
+        lay.addWidget(self._widths)
         lay.addWidget(self._plot, 1)
+
         row = QHBoxLayout()
+        row.addWidget(_small_label("Average across the line"))
+        self._width_sb = QSpinBox()
+        self._width_sb.setRange(1, 199)
+        self._width_sb.setSingleStep(2)
+        self._width_sb.setValue(1)
+        self._width_sb.setSuffix(" px")
+        self._width_sb.setFixedWidth(74)
+        self._width_sb.setToolTip(
+            "Average this many pixels across the line. A wider strip is much less "
+            "noisy and gives a steadier width, as long as the spot does not change "
+            "along it.")
+        self._width_sb.valueChanged.connect(self._on_width)
+        row.addWidget(self._width_sb)
+        self._cb_fit = QCheckBox("Gaussian fit")
+        self._cb_fit.setStyleSheet(_CHECK_QSS)
+        self._cb_fit.setToolTip("Fit a Gaussian on a pedestal and draw it over the trace")
+        self._cb_fit.toggled.connect(self._refresh)
+        row.addWidget(self._cb_fit)
+        row.addStretch(1)
         b_copy = _btn("Copy values", "Copy the samples to the clipboard as text")
         b_copy.clicked.connect(self._copy)
         b_csv = _btn("Save CSV…", "Write the samples to a CSV file")
         b_csv.clicked.connect(self._save_csv)
-        row.addWidget(b_copy); row.addWidget(b_csv); row.addStretch(1)
+        row.addWidget(b_copy); row.addWidget(b_csv)
         lay.addLayout(row)
 
-    def set_profile(self, x, y, unit: str, title: str):
-        self._x, self._y, self._unit = np.asarray(x), np.asarray(y), unit
-        self._plot.set_data(x, y, unit)
-        if y.size:
-            self._info.setText(
-                f"{title} — {y.size} samples, min {y.min():.0f}, max {y.max():.0f}, "
-                f"mean {y.mean():.1f} {unit}")
+    def line_width(self) -> int:
+        return int(self._width_sb.value())
 
-    def _text(self) -> str:
-        return "distance_px\tvalue\n" + "\n".join(
-            f"{a:.3f}\t{b:.4f}" for a, b in zip(self._x, self._y))
+    def set_profile(self, x, y, unit: str, title: str, xunit: str = "px",
+                    recompute=None):
+        self._x, self._y, self._unit = np.asarray(x), np.asarray(y), unit
+        self._xunit = xunit
+        self._title = title
+        self._recompute = recompute
+        self._refresh()
+
+    def _on_width(self, _v):
+        """Re-sample at the new width. The dialog does not own the image, so it asks
+        the tab for the samples through the callback it was given."""
+        if self._recompute is None:
+            return
+        got = self._recompute(self.line_width())
+        if got is None:
+            return
+        self._x, self._y = np.asarray(got[0]), np.asarray(got[1])
+        self._refresh()
+
+    def _refresh(self):
+        x, y, unit = self._x, self._y, self._unit
+        if y.size == 0:
+            return
+        self._info.setText(
+            f"{self._title} — {y.size} samples, min {y.min():.0f}, max {y.max():.0f}, "
+            f"mean {y.mean():.1f} {unit}")
+        self._plot.set_data(x, y, unit, "distance along the line", self._xunit)
+
+        m = wk_beam.profile_metrics(x, y) if wk_beam is not None else {}
+        self._metrics = m
+        bits = []
+        if "fwhm" in m:
+            bits.append(f"FWHM <b>{m['fwhm']:.2f} {self._xunit}</b>")
+        if "w_1e2" in m:
+            bits.append(f"1/e² width <b>{m['w_1e2']:.2f} {self._xunit}</b>")
+        if "d4sigma" in m:
+            bits.append(f"D4σ {m['d4sigma']:.2f} {self._xunit}")
+        if "centroid_x" in m:
+            bits.append(f"centre of mass {m['centroid_x']:.2f} {self._xunit}")
+        if "peak" in m:
+            bits.append(f"peak {m['peak']:.0f} {unit} at {m['peak_x']:.2f} "
+                        f"{self._xunit}")
+        if "baseline" in m:
+            bits.append(f"baseline {m['baseline']:.0f} {unit}")
+
+        hlines, vlines = [], []
+        if "fwhm_level" in m:
+            hlines.append((m["fwhm_level"], "#c02020", "half maximum"))
+            vlines += [(m["fwhm_left"], "#c02020"), (m["fwhm_right"], "#c02020")]
+        if "w_1e2_level" in m:
+            hlines.append((m["w_1e2_level"], "#0a8f4a", "1/e²"))
+            vlines += [(m["w_1e2_left"], "#0a8f4a"), (m["w_1e2_right"], "#0a8f4a")]
+        self._plot.set_marks(hlines, vlines)
+
+        if self._cb_fit.isChecked() and wk_beam is not None:
+            fit = wk_beam.gaussian_fit(x, y)
+            if fit is None:
+                self._plot.set_overlay(None)
+                bits.append("Gaussian fit failed")
+            else:
+                self._plot.set_overlay(
+                    x, fit["fitted"], "#d05000",
+                    f"Gaussian fit: σ {fit['sigma']:.2f} {self._xunit}, "
+                    f"FWHM {fit['fwhm']:.2f} {self._xunit}, r² {fit['r2']:.4f}")
+                bits.append(f"fitted FWHM <b>{fit['fwhm']:.2f} {self._xunit}</b> "
+                            f"(r² {fit['r2']:.4f})")
+        else:
+            self._plot.set_overlay(None)
+
+        self._widths.setText("  |  ".join(bits) if bits
+                             else "not enough of a peak to measure a width")
+
+    def _rows(self):
+        return [(f"{a:.4f}", f"{b:.4f}") for a, b in zip(self._x, self._y)]
+
+    def _header(self):
+        return (f"distance_{self._xunit}", "value")
 
     def _copy(self):
-        QGuiApplication.clipboard().setText(self._text())
+        head = "\t".join(self._header())
+        QGuiApplication.clipboard().setText(
+            head + "\n" + "\n".join("\t".join(r) for r in self._rows()))
 
     def _save_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save profile", "profile.csv",
                                               "CSV (*.csv)")
         if not path:
             return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("distance_px,value\n")
-                for a, b in zip(self._x, self._y):
-                    f.write(f"{a:.3f},{b:.4f}\n")
-        except Exception as e:
-            QMessageBox.warning(self, "Save error", f"Could not save:\n{e}")
+        if _write_csv(path, self._header(), self._rows()):
+            return
+        QMessageBox.warning(self, "Save error", f"Could not save:\n{path}")
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Tables of numbers
+# ─────────────────────────────────────────────────────────────────
+
+_TABLE_QSS = (
+    "QTableWidget { background: #ffffff; alternate-background-color: #f5f7fa;"
+    " color: #16202c; gridline-color: #dfe4ea; font-size: 11px;"
+    " selection-background-color: #cfe0f7; selection-color: #10243c; }"
+    "QHeaderView::section { background: #eef1f5; color: #16202c; font-weight: 600;"
+    " border: 0px; border-right: 1px solid #dfe4ea;"
+    " border-bottom: 1px solid #cfd6de; padding: 4px 6px; }"
+    "QTableCornerButton::section { background: #eef1f5; border: 0px; }"
+)
+
+
+class _TableDialog(QDialog):
+    """A table of numbers with Copy and Save CSV — the results table, the histogram
+    counts and the beam report all use this one window.
+
+    Every colour is stated: the table would otherwise take the application's light
+    palette for the cells and the system palette for the header, which on this machine
+    puts grey-on-grey text in the header row."""
+
+    def __init__(self, title: str, parent=None, extra_buttons=()):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setStyleSheet("QDialog { background: #ffffff; }")
+        self.resize(760, 480)
+        self._headers: list = []
+        self._rows: list = []
+        self._name = title
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        self._note = QLabel("")
+        self._note.setWordWrap(True)
+        self._note.setStyleSheet("color: #4a5566; font-size: 11px;")
+        lay.addWidget(self._note)
+
+        self._table = QTableWidget(0, 0)
+        self._table.setStyleSheet(_TABLE_QSS)
+        self._table.setAlternatingRowColors(True)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self._table.verticalHeader().setVisible(False)
+        lay.addWidget(self._table, 1)
+
+        row = QHBoxLayout()
+        for text, tip, fn in extra_buttons:
+            b = _btn(text, tip)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        row.addStretch(1)
+        b_copy = _btn("Copy", "Copy the whole table to the clipboard")
+        b_copy.clicked.connect(self._copy)
+        b_csv = _btn("Save CSV…", "Write the table to a CSV file")
+        b_csv.clicked.connect(self._save_csv)
+        b_close = _btn("Close", "")
+        b_close.clicked.connect(self.close)
+        for b in (b_copy, b_csv, b_close):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+    def set_content(self, headers, rows, note: str = ""):
+        self._headers = [str(h) for h in headers]
+        self._rows = [[("" if c is None else str(c)) for c in r] for r in rows]
+        self._note.setText(note)
+        self._note.setVisible(bool(note))
+        self._table.clear()
+        self._table.setColumnCount(len(self._headers))
+        self._table.setRowCount(len(self._rows))
+        self._table.setHorizontalHeaderLabels(self._headers)
+        for ri, r in enumerate(self._rows):
+            for ci, cell in enumerate(r):
+                item = QTableWidgetItem(cell)
+                # Numbers right, words left — a column of right-aligned numbers can be
+                # compared down the column, a ragged one cannot.
+                if _looks_numeric(cell):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                          | Qt.AlignmentFlag.AlignVCenter)
+                self._table.setItem(ri, ci, item)
+        self._table.resizeColumnsToContents()
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        if self._headers:
+            hdr.setStretchLastSection(True)
+
+    def _copy(self):
+        lines = ["\t".join(self._headers)] if self._headers else []
+        lines += ["\t".join(r) for r in self._rows]
+        QGuiApplication.clipboard().setText("\n".join(lines))
+
+    def _save_csv(self):
+        stem = re.sub(r"[^\w\-]+", "_", self._name.lower()).strip("_") or "table"
+        path, _ = QFileDialog.getSaveFileName(self, "Save table", f"{stem}.csv",
+                                              "CSV (*.csv)")
+        if not path:
+            return
+        if not _write_csv(path, self._headers, self._rows):
+            QMessageBox.warning(self, "Save error", f"Could not save:\n{path}")
+
+
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(str(text).replace("°", "").replace("%", "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+class _CurveDialog(QDialog):
+    """One painted curve with a hover readout, Copy and Save CSV — the radial profile
+    and the encircled-energy curve. Deliberately the same plot widget as the line
+    profile, so the three read the same way."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setStyleSheet("QDialog { background: #ffffff; }")
+        self.resize(660, 420)
+        self._x = np.zeros(0)
+        self._y = np.zeros(0)
+        self._cols = ("x", "y")
+        lay = QVBoxLayout(self)
+        self._info = QLabel("—")
+        self._info.setWordWrap(True)
+        self._info.setStyleSheet("color: #222; font-size: 11px;")
+        self._plot = _PlotWidget()
+        lay.addWidget(self._info)
+        lay.addWidget(self._plot, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_copy = _btn("Copy values", "Copy the samples to the clipboard as text")
+        b_copy.clicked.connect(self._copy)
+        b_csv = _btn("Save CSV…", "Write the samples to a CSV file")
+        b_csv.clicked.connect(self._save_csv)
+        b_close = _btn("Close", "")
+        b_close.clicked.connect(self.close)
+        for b in (b_copy, b_csv, b_close):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+    def set_curve(self, x, y, info: str, xlabel: str, xunit: str, yunit: str,
+                  columns=("x", "y"), hlines=None, vlines=None):
+        self._x, self._y, self._cols = np.asarray(x), np.asarray(y), columns
+        self._plot.set_data(x, y, yunit, xlabel, xunit)
+        self._plot.set_marks(hlines, vlines)
+        self._info.setText(info)
+
+    def _rows(self):
+        return [(f"{a:.4f}", f"{b:.5f}") for a, b in zip(self._x, self._y)]
+
+    def _copy(self):
+        QGuiApplication.clipboard().setText(
+            "\t".join(self._cols) + "\n" +
+            "\n".join("\t".join(r) for r in self._rows()))
+
+    def _save_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save curve", "curve.csv",
+                                              "CSV (*.csv)")
+        if path and not _write_csv(path, self._cols, self._rows()):
+            QMessageBox.warning(self, "Save error", f"Could not save:\n{path}")
+
+
+class _PlayDialog(QDialog):
+    """Steps through the images in the Workshop like a projector.
+
+    Here so an animation can be looked at before it is written to a file — a GIF that
+    turns out to be too fast is a file saved twice.
+
+    The timer is a precise one: a default Qt timer is coarse on Windows and a 33 ms
+    frame time comes out at about 21 frames a second, which reads as a stutter."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Play the images")
+        self.setStyleSheet("QDialog { background: #ffffff; }")
+        self.resize(720, 620)
+        self._frames: list = []
+        self._labels: list = []
+        self._idx = 0
+
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._step)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        self._view = QLabel("—")
+        self._view.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._view.setMinimumSize(320, 320)
+        self._view.setStyleSheet("QLabel { background: #2b2b2b; color: #dddddd;"
+                                 " border: 1px solid #d5dae1; }")
+        self._view.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                 QSizePolicy.Policy.Expanding)
+        lay.addWidget(self._view, 1)
+
+        self._caption = QLabel("—")
+        self._caption.setStyleSheet("color: #16202c; font-size: 11px;")
+        lay.addWidget(self._caption)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, 0)
+        self._slider.valueChanged.connect(self._on_slider)
+        lay.addWidget(self._slider)
+
+        row = QHBoxLayout()
+        self._btn_play = _btn("Play", "Start and stop the animation")
+        self._btn_play.clicked.connect(self._toggle)
+        row.addWidget(self._btn_play)
+        for text, tip, delta in (("◀", "One image back", -1), ("▶", "One image on", 1)):
+            b = _btn(text, tip)
+            b.setFixedWidth(34)
+            b.clicked.connect(lambda _c, d=delta: self._jump(d))
+            row.addWidget(b)
+        row.addWidget(_small_label("Frame time"))
+        self._ms = QSpinBox()
+        self._ms.setRange(20, 5000)
+        self._ms.setSingleStep(20)
+        self._ms.setValue(200)
+        self._ms.setSuffix(" ms")
+        self._ms.setFixedWidth(84)
+        self._ms.valueChanged.connect(
+            lambda v: self._timer.setInterval(int(v)) if self._timer.isActive() else None)
+        row.addWidget(self._ms)
+        self._cb_loop = QCheckBox("Repeat")
+        self._cb_loop.setStyleSheet(_CHECK_QSS)
+        self._cb_loop.setChecked(True)
+        row.addWidget(self._cb_loop)
+        row.addStretch(1)
+        b_close = _btn("Close", "")
+        b_close.clicked.connect(self.close)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+
+    def frame_ms(self) -> int:
+        return int(self._ms.value())
+
+    def loops(self) -> bool:
+        return self._cb_loop.isChecked()
+
+    def set_frames(self, images, labels):
+        self._frames = list(images)
+        self._labels = list(labels)
+        self._idx = 0
+        self._slider.blockSignals(True)
+        self._slider.setRange(0, max(0, len(self._frames) - 1))
+        self._slider.setValue(0)
+        self._slider.blockSignals(False)
+        self._show()
+
+    def _show(self):
+        if not self._frames:
+            self._view.setText("No images.")
+            self._caption.setText("—")
+            return
+        img = self._frames[self._idx]
+        pm = QPixmap.fromImage(img).scaled(
+            self._view.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self._view.setPixmap(pm)
+        name = self._labels[self._idx] if self._idx < len(self._labels) else ""
+        self._caption.setText(f"{self._idx + 1} / {len(self._frames)}   {name}")
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._show()
+
+    def _on_slider(self, v: int):
+        self._idx = int(v)
+        self._show()
+
+    def _jump(self, delta: int):
+        if not self._frames:
+            return
+        self._idx = (self._idx + delta) % len(self._frames)
+        self._slider.blockSignals(True)
+        self._slider.setValue(self._idx)
+        self._slider.blockSignals(False)
+        self._show()
+
+    def _step(self):
+        if not self._frames:
+            return
+        if self._idx + 1 >= len(self._frames) and not self._cb_loop.isChecked():
+            self._toggle()
+            return
+        self._jump(1)
+
+    def _toggle(self):
+        if self._timer.isActive():
+            self._timer.stop()
+            self._btn_play.setText("Play")
+        else:
+            if len(self._frames) < 2:
+                return
+            self._timer.start(self.frame_ms())
+            self._btn_play.setText("Stop")
+
+    def closeEvent(self, e):
+        self._timer.stop()
+        self._btn_play.setText("Play")
+        super().closeEvent(e)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -2201,6 +3999,20 @@ def _ico_ruler(p, c):
     p.restore()
 
 
+def _ico_angle(p, c):
+    # Two arms from a corner with a dotted arc between them — a protractor reading,
+    # which is what the tool measures. The arc is what separates it from the "line"
+    # icons; without it the shape reads as a bent line.
+    v = QPointF(4.2, 15.8)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 2.0))
+    p.drawLine(v, QPointF(17.4, 15.8))
+    p.drawLine(v, QPointF(14.6, 4.4))
+    p.setPen(_ipen(c, 1.5, cap=Qt.PenCapStyle.FlatCap, dash=[1.6, 1.4]))
+    r = 8.2
+    p.drawArc(QRectF(v.x() - r, v.y() - r, 2 * r, 2 * r), 0, int(40.5 * 16))
+
+
 def _ico_roi_rect(p, c):
     # Dashed = marching ants = a selection, the way ImageJ shows one.
     p.setBrush(Qt.BrushStyle.NoBrush)
@@ -2301,7 +4113,8 @@ _ICON_RECIPES = {
     TOOL_LINE: _ico_line,           TOOL_ARROW: _ico_arrow,
     TOOL_RECT: _ico_rect,           TOOL_ELLIPSE: _ico_ellipse,
     TOOL_POLY: _ico_poly,           TOOL_TEXT: _ico_text,
-    TOOL_RULER: _ico_ruler,         TOOL_ROI_RECT: _ico_roi_rect,
+    TOOL_RULER: _ico_ruler,         TOOL_ANGLE: _ico_angle,
+    TOOL_ROI_RECT: _ico_roi_rect,
     TOOL_ROI_ELLIPSE: _ico_roi_ellipse, TOOL_PROFILE: _ico_profile,
     TOOL_CROSS: _ico_cross,         TOOL_CROP: _ico_crop,
     TOOL_EYEDROP: _ico_eyedrop,     TOOL_ERASER: _ico_eraser,
@@ -2503,6 +4316,8 @@ _TOOL_STRIP = [
     ("Text", "Text — click, then type; Enter confirms", TOOL_TEXT),
     None,
     ("Ruler", "Ruler — measures length; set a scale to read it in millimetres", TOOL_RULER),
+    ("Angle", "Angle — click the end of one arm, then the corner, then the end of the "
+              "other arm", TOOL_ANGLE),
     ("Rectangle region", "Rectangle region — min, max, mean and more for that area", TOOL_ROI_RECT),
     ("Ellipse region", "Ellipse region — min, max, mean and more for that area", TOOL_ROI_ELLIPSE),
     ("Profile line", "Profile line — double click the line to plot the values along it", TOOL_PROFILE),
@@ -2515,10 +4330,15 @@ _TOOL_STRIP = [
 
 _SECTION_ACCENTS = {
     "images": "#2f6fd0", "display": "#7a4fc0", "measure": "#b0396b",
-    "edit": "#2e9e5b", "compare": "#d08a1e", "save": "#c0392b",
+    "beam": "#0f7f8f", "filters": "#4d7a2a", "edit": "#2e9e5b",
+    "combine": "#5a5f8f", "compare": "#d08a1e", "save": "#c0392b",
 }
 
 COMPARE_MODES = ["Off", "Side by side", "Blend", "Difference"]
+
+#  What "Save all…" and the animation can be written as.
+_SAVE_FORMATS = ("PNG", "TIFF", "JPEG")
+_FORMAT_SUFFIX = {"PNG": "png", "TIFF": "tiff", "JPEG": "jpg"}
 
 
 class WorkshopWidget(QWidget):
@@ -2535,10 +4355,21 @@ class WorkshopWidget(QWidget):
         self._ref = -1
         self._last_save_dir: "Path | None" = None
         self._sync_guard = False
+        #  Every window this panel can open is kept and reused, so a second press
+        #  raises the one already on screen instead of stacking another copy of it.
         self._profile_dlg: "ProfileDialog | None" = None
+        self._results_dlg: "_TableDialog | None" = None
+        self._hist_dlg: "_TableDialog | None" = None
+        self._beam_dlg: "_TableDialog | None" = None
+        self._radial_dlg: "_CurveDialog | None" = None
+        self._encircled_dlg: "_CurveDialog | None" = None
+        self._play_dlg: "_PlayDialog | None" = None
+        self._save_task_busy = False
 
         self._raw_sig = _RawSignals()
         self._raw_sig.done.connect(self._on_raw_loaded)
+        self._write_sig = _WriteSignals()
+        self._write_sig.done.connect(self._on_write_done)
 
         self._view_timer = QTimer(self)
         self._view_timer.setSingleShot(True)
@@ -2550,6 +4381,9 @@ class WorkshopWidget(QWidget):
         self._update_slot_list()
         self._set_tool(TOOL_PAN)
         self._update_enabled()
+        self._keys_dlg: "QDialog | None" = None
+        self._shortcuts: list = []
+        self._install_shortcuts()
 
     # ── persisted section state ───────────────────────────────────
 
@@ -2605,7 +4439,10 @@ class WorkshopWidget(QWidget):
         self._build_images_section()
         self._build_display_section()
         self._build_measure_section()
+        self._build_beam_section()
+        self._build_filters_section()
         self._build_edit_section()
+        self._build_combine_section()
         self._build_compare_section()
         self._build_save_section()
         self._panel_layout.addStretch(1)
@@ -2616,10 +4453,13 @@ class WorkshopWidget(QWidget):
         self._canvas.annots_changed.connect(self._on_annots_changed)
         self._canvas.color_picked.connect(self._on_color_picked)
         self._canvas.cursor_moved.connect(self._on_cursor_moved)
+        self._canvas.selection_changed.connect(self._on_selection_changed)
         self._canvas.zoom_changed.connect(self._on_zoom_changed)
         self._canvas.status.connect(self._say)
         self._canvas.profile_requested.connect(self._show_profile)
         self._canvas.files_dropped.connect(self.open_files)
+        self._canvas.tool_requested.connect(self._set_tool)
+        self._canvas._menu_request = self._canvas_menu
 
         split.addWidget(panel_scroll)
         split.addWidget(self._canvas)
@@ -2747,13 +4587,12 @@ class WorkshopWidget(QWidget):
         sep3.setStyleSheet("color: #c3c9d2;")
         row2.addWidget(sep3)
 
-        self._btn_undo = _btn("Undo", "Take back the last change (Ctrl+Z)",
-                              icon="undo")
-        self._btn_undo.setShortcut("Ctrl+Z")
+        # No setShortcut here: a button shortcut reaches the whole window and would
+        # fire from the other tabs too. _install_shortcuts binds these keys instead,
+        # switched off whenever the Workshop is not the tab in front.
+        self._btn_undo = _btn("Undo", "Take back the last change", icon="undo")
         self._btn_undo.clicked.connect(self._undo)
-        self._btn_redo = _btn("Redo", "Put back what was taken back (Ctrl+Y)",
-                              icon="redo")
-        self._btn_redo.setShortcut("Ctrl+Y")
+        self._btn_redo = _btn("Redo", "Put back what was taken back", icon="redo")
         self._btn_redo.clicked.connect(self._redo)
         self._btn_clear_annots = _btn("Clear drawing",
                                       "Remove every drawn and measured item")
@@ -2761,11 +4600,311 @@ class WorkshopWidget(QWidget):
         self._btn_reset_src = _btn("Original", "Go back to the image as it arrived",
                                    danger=True, icon="reset")
         self._btn_reset_src.clicked.connect(self._reset_to_source)
-        for b in (self._btn_undo, self._btn_redo, self._btn_clear_annots, self._btn_reset_src):
+        self._btn_keys = _btn("Shortcuts", "Show every keyboard shortcut")
+        self._btn_keys.clicked.connect(self._show_shortcuts)
+        for b in (self._btn_undo, self._btn_redo, self._btn_clear_annots,
+                  self._btn_reset_src, self._btn_keys):
             row2.addWidget(b)
         row2.addStretch(1)
         outer.addLayout(row2)
         return box
+
+    # ---- keyboard shortcuts --------------------------------------------------
+
+    def _shortcut_table(self):
+        """Every key this panel binds, in one place: the shortcuts themselves, the
+        button tooltips and the help window are all built from this list, so they
+        cannot drift apart. Fields: group, key, what it does, what to call, and the
+        button whose tooltip should name the key ("" for none)."""
+        c = self._canvas
+        return [
+            ("History", "Ctrl+Z", "Undo", self._undo, "Undo"),
+            ("History", "Ctrl+Y", "Redo", self._redo, "Redo"),
+            ("History", "Ctrl+Shift+Z", "Redo", self._redo, ""),
+            ("History", "Ctrl+Alt+Z", "Back to the image as it arrived",
+             self._reset_to_source, "Original"),
+            ("History", "Ctrl+Shift+D", "Remove every drawn and measured item",
+             c.clear_annots, "Clear drawing"),
+
+            ("Images", "Ctrl+O", "Open a file", self._open_dialog, "Open file…"),
+            ("Images", "Ctrl+Right", "Next image", lambda: self._step_slot(1), ""),
+            ("Images", "Ctrl+Left", "Previous image", lambda: self._step_slot(-1), ""),
+            ("Images", "Ctrl+D", "Copy this image, or the selected region, to a new one",
+             self._duplicate_slot, "Duplicate"),
+            ("Images", "Ctrl+V", "Bring in the image on the clipboard",
+             self._paste_clipboard, "Paste"),
+
+            ("Edit picture", "Ctrl+L", "Rotate left", lambda: self._rotate(1),
+             "Rotate left"),
+            ("Edit picture", "Ctrl+R", "Rotate right", lambda: self._rotate(-1),
+             "Rotate right"),
+            ("Edit picture", "Ctrl+Shift+R", "Turn upside down",
+             lambda: self._rotate(2), "180°"),
+            ("Edit picture", "Ctrl+H", "Mirror left to right", lambda: self._flip(1),
+             "Flip across"),
+            ("Edit picture", "Ctrl+Shift+H", "Mirror top to bottom",
+             lambda: self._flip(0), "Flip down"),
+            ("Edit picture", "Ctrl+E", "Resize", self._resize_dialog, "Resize…"),
+            ("Edit picture", "Ctrl+Alt+R", "Rotate by any angle", self._rotate_free,
+             "Rotate by angle…"),
+            ("Edit picture", "Ctrl+Shift+E", "Straighten along the selected line",
+             self._straighten, "Straighten"),
+            ("Edit picture", "Ctrl+Alt+B", "Join blocks of pixels into one",
+             self._bin_dialog, "Bin…"),
+            ("Edit picture", "Ctrl+M", "Subtract the reference image",
+             lambda: self._do_diff(False), "Subtract"),
+            ("Edit picture", "Ctrl+Shift+M", "Difference against the reference image",
+             lambda: self._do_diff(True), "Difference"),
+
+            ("Filters", "Ctrl+Alt+M", "Median filter", self._filter_median, "Median…"),
+            ("Filters", "Ctrl+Alt+L", "Blur", self._filter_blur, "Blur…"),
+            ("Filters", "Ctrl+Alt+H", "Sharpen", self._filter_sharpen, "Sharpen…"),
+            ("Filters", "Ctrl+Alt+G", "Remove the background",
+             self._filter_background, "Remove background…"),
+
+            ("Combine", "Ctrl+Alt+C", "Combine every open image into a new one",
+             self._do_project, "Combine into a new image"),
+            ("Compare", "Ctrl+K", "Next comparison view", self._cycle_compare, ""),
+
+            ("Measure", "Ctrl+Shift+W", "Measure the whole picture",
+             self._measure_whole, "Whole image"),
+            ("Measure", "Ctrl+P", "Plot the profile line",
+             lambda: self._show_profile(c.selected()), "Plot profile"),
+            ("Measure", "Ctrl+T", "Every measurement in one table",
+             self._show_results, "Results table…"),
+            ("Measure", "Ctrl+J", "The histogram as numbers",
+             self._show_histogram_numbers, "Histogram numbers…"),
+
+            ("Beam", "Ctrl+B", "Beam report — width, roundness, tilt",
+             self._show_beam_report, "Beam report…"),
+            ("Beam", "Ctrl+Shift+B", "Radial profile", self._show_radial,
+             "Radial profile"),
+
+            ("View", "Ctrl++", "Zoom in", c.zoom_in, "Zoom in"),
+            ("View", "Ctrl+=", "Zoom in", c.zoom_in, ""),
+            ("View", "Ctrl+-", "Zoom out", c.zoom_out, "Zoom out"),
+            ("View", "Ctrl+0", "Fit the whole picture in the window", c.fit_to_view,
+             "Fit"),
+            ("View", "Ctrl+1", "Show at true size, 1:1", c.zoom_reset, "1:1"),
+
+            ("Save", "Ctrl+S", "Save as PNG", lambda: self._save("png"), "Save PNG…"),
+            ("Save", "Ctrl+Shift+S", "Save as TIFF", lambda: self._save("tiff"),
+             "Save TIFF…"),
+            ("Save", "Ctrl+Alt+J", "Save as JPEG", lambda: self._save("jpg"),
+             "Save JPEG…"),
+            ("Save", "Ctrl+Alt+T", "Save the measured values as a 16-bit TIFF",
+             self._save_data_tiff, "Save the values as TIFF…"),
+            ("Save", "Ctrl+Shift+P", "Play the images", self._play_images, "Play…"),
+            ("Save", "Ctrl+Shift+A", "Save an animation", self._save_animation,
+             "Save animation…"),
+            ("Save", "Ctrl+Shift+C", "Copy to the clipboard", self._copy_clipboard,
+             "Copy"),
+
+            ("Help", "F1", "This list", self._show_shortcuts, "Shortcuts"),
+        ]
+
+    def _install_shortcuts(self):
+        """Window-wide keys, switched off while another tab is in front (see
+        showEvent / hideEvent). Window scope rather than widget scope on purpose: after
+        clicking the tab itself the focus sits on the tab bar, and a widget-scoped key
+        would stay dead until the operator clicked inside the panel."""
+        for group, keys, label, fn, btn in self._shortcut_table():
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(fn)
+            self._shortcuts.append(sc)
+        self._annotate_shortcut_tooltips()
+
+    def _set_shortcuts_enabled(self, on: bool):
+        for sc in self._shortcuts:
+            sc.setEnabled(on)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._set_shortcuts_enabled(True)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._set_shortcuts_enabled(False)
+
+    def _annotate_shortcut_tooltips(self):
+        """Write the key into the tooltip of the button that does the same thing — a
+        shortcut nobody can see is a shortcut nobody uses."""
+        want = {}
+        for group, keys, label, fn, btn in self._shortcut_table():
+            if btn and btn not in want:
+                want[btn] = keys
+        for b in self.findChildren(QAbstractButton):
+            keys = want.get(b.text()) or want.get(b.accessibleName())
+            if keys:
+                tip = b.toolTip()
+                b.setToolTip(f"{tip}  ({keys})" if tip else keys)
+        for keys, tool in _TOOL_KEYS.items():
+            b = self._tool_buttons.get(tool)
+            if b is not None:
+                b.setToolTip(f"{b.toolTip()}  ({keys})")
+
+    def _shortcut_groups(self):
+        """The help window's contents: the table above with same-action keys merged
+        onto one line, plus the keys the picture area handles by itself."""
+        groups = []
+        for group, keys, label, fn, btn in self._shortcut_table():
+            if not groups or groups[-1][0] != group:
+                groups.append((group, []))
+            rows = groups[-1][1]
+            for row in rows:
+                if row[1] == label:
+                    row[0].append(keys)
+                    break
+            else:
+                rows.append([[keys], label])
+        out = [(g, [(" or ".join(k), lbl) for k, lbl in rows]) for g, rows in groups]
+
+        names = {tool: name for name, tip, tool in
+                 (e for e in _TOOL_STRIP if e is not None)}
+        out.append(("Pick a tool — click the picture first",
+                    [(k, names.get(t, t)) for k, t in _TOOL_KEYS.items()]))
+        out.append(("On the picture — click it first", [
+            ("Space + drag", "Drag the picture around (also middle mouse or Ctrl + drag)"),
+            ("+ / -", "Zoom in / out"),
+            ("0", "Fit the whole picture in the window"),
+            ("1", "Show at true size, 1:1"),
+            ("Arrows", "Move the selected item, or the picture — Shift for bigger steps"),
+            ("Delete", "Delete the selected item"),
+            ("Esc", "Drop the selection, or the polygon being drawn"),
+        ]))
+        return out
+
+    def _show_shortcuts(self):
+        if self._keys_dlg is not None:
+            self._keys_dlg.show()
+            self._keys_dlg.raise_()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard shortcuts")
+        dlg.setStyleSheet("QDialog { background: #ffffff; }")
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(6)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        body.setStyleSheet("QWidget { background: #ffffff; }")
+        grid = QGridLayout(body)
+        grid.setContentsMargins(2, 2, 2, 2)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(3)
+
+        row = 0
+        for group, entries in self._shortcut_groups():
+            head = QLabel(group)
+            head.setStyleSheet(
+                "QLabel { color: #1c2530; font-size: 12px; font-weight: bold;"
+                " padding: 8px 0 2px 0; }")
+            grid.addWidget(head, row, 0, 1, 2)
+            row += 1
+            for keys, label in entries:
+                k = QLabel(keys)
+                k.setStyleSheet(
+                    "QLabel { color: #1c2530; font-size: 11px;"
+                    " font-family: Consolas, 'Courier New', monospace;"
+                    " background: #f0f2f5; border: 1px solid #d5dae1;"
+                    " border-radius: 3px; padding: 1px 5px; }")
+                t = QLabel(label)
+                t.setWordWrap(True)
+                t.setStyleSheet("QLabel { color: #1c2530; font-size: 11px; }")
+                grid.addWidget(k, row, 0, Qt.AlignmentFlag.AlignLeft
+                               | Qt.AlignmentFlag.AlignTop)
+                grid.addWidget(t, row, 1)
+                row += 1
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(row, 1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        brow = QHBoxLayout()
+        brow.addStretch(1)
+        b_close = _btn("Close", "")
+        b_close.clicked.connect(dlg.close)
+        brow.addWidget(b_close)
+        outer.addLayout(brow)
+
+        dlg.resize(460, 620)
+        self._keys_dlg = dlg
+        dlg.show()
+
+    # ---- right-click menu on the picture -------------------------------------
+
+    _MENU_QSS = (
+        "QMenu { background: #ffffff; color: #16202c; border: 1px solid #c3c9d2;"
+        " padding: 3px; }"
+        "QMenu::item { padding: 4px 22px 4px 12px; }"
+        "QMenu::item:selected { background: #cfe0f7; color: #10243c; }"
+        "QMenu::item:disabled { color: #9aa3ad; }"
+        "QMenu::separator { height: 1px; background: #dfe4ea; margin: 3px 6px; }"
+    )
+
+    def _canvas_menu(self, global_pos, img_pt: QPointF):
+        """The commands worth having under the cursor. Built fresh each time so that
+        what is greyed out is right for this moment."""
+        slot = self._slot()
+        sel = self._canvas.selected()
+        menu = QMenu(self)
+        menu.setStyleSheet(self._MENU_QSS)
+
+        def act(text: str, fn, enabled: bool = True):
+            a = menu.addAction(text)
+            a.setEnabled(bool(enabled))
+            a.triggered.connect(fn)
+            return a
+
+        act("Undo", self._undo, slot is not None and bool(slot.undo_stack))
+        act("Redo", self._redo, slot is not None and bool(slot.redo_stack))
+        menu.addSeparator()
+        act("Measure the whole picture", self._measure_whole, slot is not None)
+        act("Results table…", self._show_results, slot is not None)
+        act("Beam report…", self._show_beam_report,
+            slot is not None and wk_beam is not None)
+        act("Plot profile", lambda: self._show_profile(self._canvas.selected()),
+            slot is not None and any(a.kind == A_PROFILE for a in slot.annots))
+        menu.addSeparator()
+        if slot is not None:
+            ix, iy = int(img_pt.x()), int(img_pt.y())
+            v = slot.value_at(ix, iy)
+            if v is not None:
+                act(f"Copy the value at {ix}, {iy}",
+                    lambda: QGuiApplication.clipboard().setText(f"{v[1]:.4f}"))
+                act(f"Put a point marker at {ix}, {iy}",
+                    lambda: self._canvas.add_annot(
+                        _Annot(A_CROSS, [[float(ix), float(iy)]],
+                               self._draw_color.name(), self._line_sb.value())))
+        act("Delete the selected item", self._canvas.delete_selected, sel is not None)
+        act("Clear the whole drawing", self._canvas.clear_annots,
+            slot is not None and bool(slot.annots))
+        menu.addSeparator()
+        act("Copy the picture", self._copy_clipboard, slot is not None)
+        act("Save PNG…", lambda: self._save("png"), slot is not None)
+        act("Duplicate", self._duplicate_slot, slot is not None)
+        menu.addSeparator()
+        act("Fit the whole picture", self._canvas.fit_to_view, slot is not None)
+        act("True size, 1:1", self._canvas.zoom_reset, slot is not None)
+        act("Shortcuts…", self._show_shortcuts)
+        menu.exec(global_pos)
+
+    def _step_slot(self, delta: int):
+        if len(self._slots) < 2:
+            return
+        self._activate_slot((self._active + delta) % len(self._slots))
+
+    def _cycle_compare(self):
+        self._compare_cb.setCurrentIndex(
+            (self._compare_cb.currentIndex() + 1) % self._compare_cb.count())
+
+    def _measure_whole(self):
+        self._canvas.select_index(-1)
+        self._refresh_measure()
 
     # ---- sections ------------------------------------------------------------
 
@@ -2786,7 +4925,7 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._slot_list)
 
         row = QHBoxLayout()
-        b_open = _btn("Open file…", "Open an image from disk")
+        b_open = _btn("Open file…", "Open one or more images from disk")
         b_open.clicked.connect(self._open_dialog)
         b_rm = _btn("Remove", "Take this image out of the Workshop", danger=True)
         b_rm.clicked.connect(self._remove_slot)
@@ -2795,6 +4934,23 @@ class WorkshopWidget(QWidget):
         for b in (b_open, b_rm, b_clear):
             row.addWidget(b)
         lay.addLayout(row)
+
+        row_b = QHBoxLayout()
+        self._btn_dup = _btn(
+            "Duplicate",
+            "A copy of this image as a new one. With a region selected, only that "
+            "part is copied — the way to cut a detail out without touching the "
+            "original.")
+        self._btn_dup.clicked.connect(self._duplicate_slot)
+        b_paste = _btn("Paste", "Bring in the image on the clipboard")
+        b_paste.clicked.connect(self._paste_clipboard)
+        self._btn_slider = _btn("Show in Image Slider",
+                                "Open the folder this frame came from in the Image "
+                                "Slider")
+        self._btn_slider.clicked.connect(self._show_in_slider)
+        row_b.addWidget(self._btn_dup); row_b.addWidget(b_paste)
+        lay.addLayout(row_b)
+        lay.addWidget(self._btn_slider)
 
         # The reference lives here, next to the active image, because both the
         # subtraction in Edit and everything in Compare work against it.
@@ -2908,12 +5064,31 @@ class WorkshopWidget(QWidget):
 
         row = QHBoxLayout()
         b_whole = _btn("Whole image", "Measure the whole picture instead of a region")
-        b_whole.clicked.connect(lambda: (self._canvas.select_index(-1),
-                                         self._refresh_measure()))
+        b_whole.clicked.connect(self._measure_whole)
         b_profile = _btn("Plot profile", "Plot the values along the selected profile line")
         b_profile.clicked.connect(lambda: self._show_profile(self._canvas.selected()))
         row.addWidget(b_whole); row.addWidget(b_profile)
         lay.addLayout(row)
+
+        self._cb_keep_regions = QCheckBox("Keep several regions")
+        self._cb_keep_regions.setStyleSheet(_CHECK_QSS)
+        self._cb_keep_regions.setToolTip(
+            "Off: a new region replaces the old one, so the numbers above always "
+            "belong to the region on screen.\nOn: regions pile up — the cells show "
+            "whichever one is selected, and the results table lists them all.")
+        self._cb_keep_regions.toggled.connect(self._on_keep_regions)
+        lay.addWidget(self._cb_keep_regions)
+
+        row2 = QHBoxLayout()
+        b_table = _btn("Results table…",
+                       "Every region, ruler, angle and point on this image in one "
+                       "table, ready to copy or save as CSV")
+        b_table.clicked.connect(self._show_results)
+        b_hist = _btn("Histogram numbers…",
+                      "The counts behind the histogram, as numbers")
+        b_hist.clicked.connect(self._show_histogram_numbers)
+        row2.addWidget(b_table); row2.addWidget(b_hist)
+        lay.addLayout(row2)
 
         lay.addWidget(_small_label("Scale"))
         srow = QHBoxLayout()
@@ -2930,6 +5105,96 @@ class WorkshopWidget(QWidget):
         b_clrscale.clicked.connect(self._clear_scale)
         srow2.addWidget(b_setscale); srow2.addWidget(b_clrscale)
         lay.addLayout(srow2)
+
+        srow3 = QHBoxLayout()
+        self._btn_scalebar = _btn(
+            "Add scale bar…",
+            "Draw a bar of a known length into the picture, so a saved copy carries "
+            "its own scale. Drag it anywhere with Select.")
+        self._btn_scalebar.clicked.connect(self._add_scale_bar)
+        b_nobar = _btn("Remove bar", "Take the scale bar off again")
+        b_nobar.clicked.connect(self._remove_scale_bar)
+        srow3.addWidget(self._btn_scalebar); srow3.addWidget(b_nobar)
+        lay.addLayout(srow3)
+
+    # ---- beam ---------------------------------------------------------------
+
+    def _build_beam_section(self):
+        sec = self._add_section("beam", "Beam", False)
+        lay = sec.body_layout
+        note = _small_label(
+            "Spot size and shape, measured on the selected region or on the whole "
+            "picture. A background is taken off first — a width is meaningless "
+            "without one, because every pixel of background counts double at the "
+            "edge of the frame.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
+        lay.addWidget(note)
+
+        brow = QHBoxLayout()
+        brow.addWidget(_small_label("Background"))
+        self._beam_base_sb = QDoubleSpinBox()
+        self._beam_base_sb.setRange(0.0, 50.0)
+        self._beam_base_sb.setDecimals(1)
+        self._beam_base_sb.setSingleStep(1.0)
+        self._beam_base_sb.setValue(5.0)
+        self._beam_base_sb.setSuffix(" %")
+        self._beam_base_sb.setFixedWidth(76)
+        self._beam_base_sb.setToolTip(
+            "The level taken as background: this percentile of the area being "
+            "measured. 5 % suits a frame with a dark surround; set 0 % to measure "
+            "the values as they are.")
+        brow.addWidget(self._beam_base_sb)
+        brow.addStretch(1)
+        lay.addLayout(brow)
+
+        grid = QGridLayout(); grid.setSpacing(3)
+        ops = [("Beam report…", "Centre, D4σ width, FWHM, roundness and the tilt of "
+                                "the long axis, in one table", self._show_beam_report),
+               ("Radial profile", "Average value against distance from the centre of "
+                                  "mass — the shape of the spot with the noise "
+                                  "averaged out", self._show_radial),
+               ("Encircled energy", "How much of the signal sits inside a circle, "
+                                    "against the radius of that circle",
+                self._show_encircled),
+               ("Mark the centre", "Put a point marker on the centre of mass",
+                self._mark_centroid)]
+        for i, (text, tip, fn) in enumerate(ops):
+            b = _btn(text, tip)
+            b.clicked.connect(fn)
+            grid.addWidget(b, i // 2, i % 2)
+        lay.addLayout(grid)
+
+    # ---- filters ------------------------------------------------------------
+
+    def _build_filters_section(self):
+        sec = self._add_section("filters", "Filters", False)
+        lay = sec.body_layout
+        warn = _small_label(
+            "These change the picture itself, and the counts behind it the same way, "
+            "so what you measure still matches what you see. Every step can be undone.")
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
+        lay.addWidget(warn)
+
+        grid = QGridLayout(); grid.setSpacing(3)
+        ops = [("Median…", "Replaces each pixel by the middle value of its "
+                           "neighbours — the filter for hot pixels and speckle",
+                self._filter_median),
+               ("Blur…", "Gaussian blur, for noise that is spread out rather than "
+                         "in single pixels", self._filter_blur),
+               ("Sharpen…", "Adds back what a blur would remove", self._filter_sharpen),
+               ("Edges", "Bright where the picture changes fastest",
+                self._filter_edges),
+               ("Remove background…", "Take off a constant level, a sloping plane, a "
+                                      "curved surface or everything larger than a "
+                                      "rolling ball", self._filter_background)]
+        for i, (text, tip, fn) in enumerate(ops):
+            b = _btn(text, tip)
+            b.clicked.connect(fn)
+            grid.addWidget(b, i // 2, i % 2)
+        lay.addLayout(grid)
+        self._filter_buttons = [grid.itemAt(i).widget() for i in range(grid.count())]
 
     def _build_edit_section(self):
         sec = self._add_section("edit", "Edit picture", False)
@@ -2955,6 +5220,20 @@ class WorkshopWidget(QWidget):
             grid.addWidget(b, i // 2, i % 2)
         lay.addLayout(grid)
 
+        grid2 = QGridLayout(); grid2.setSpacing(3)
+        ops2 = [("Rotate by angle…", "", "Turn by any angle. The picture grows so "
+                                        "nothing is cut off.", self._rotate_free),
+                ("Straighten", "", "Turn so that the selected straight line, ruler or "
+                                   "arrow becomes horizontal", self._straighten),
+                ("Bin…", "", "Join blocks of pixels into one — 2 × 2 or more. Averaging "
+                             "keeps the scale, adding is what a detector does when it "
+                             "is binned on the chip.", self._bin_dialog)]
+        for i, (text, icon, tip, fn) in enumerate(ops2):
+            b = _btn(text, tip, icon=icon)
+            b.clicked.connect(fn)
+            grid2.addWidget(b, i // 2, i % 2)
+        lay.addLayout(grid2)
+
         lay.addWidget(_small_label("Against the reference image"))
         srow = QHBoxLayout()
         b_sub = _btn("Subtract", "Active minus reference, negatives cut to zero")
@@ -2963,6 +5242,42 @@ class WorkshopWidget(QWidget):
         b_abs.clicked.connect(lambda: self._do_diff(True))
         srow.addWidget(b_sub); srow.addWidget(b_abs)
         lay.addLayout(srow)
+
+    # ---- combine ------------------------------------------------------------
+
+    def _build_combine_section(self):
+        sec = self._add_section("combine", "Combine images", False)
+        lay = sec.body_layout
+        note = _small_label(
+            "Makes a NEW image out of the ones already open. Nothing existing is "
+            "changed.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
+        lay.addWidget(note)
+
+        lay.addWidget(_small_label("Across every open image"))
+        self._project_cb = QComboBox()
+        for m in (wk_ops.PROJECT_MODES if wk_ops is not None
+                  else ("Average", "Maximum", "Sum", "Minimum")):
+            self._project_cb.addItem(m)
+        self._project_cb.setToolTip(
+            "Average — ten shots of the same thing, with the noise divided by about "
+            "three.\nMaximum — the envelope: everywhere the beam has been.\n"
+            "Sum — total signal.\nMinimum — what is there on every single frame.")
+        lay.addWidget(self._project_cb)
+        self._btn_project = _btn("Combine into a new image",
+                                 "Uses every image in the Workshop, over the area they "
+                                 "all cover")
+        self._btn_project.clicked.connect(self._do_project)
+        lay.addWidget(self._btn_project)
+
+        lay.addWidget(_small_label("Active image with the reference"))
+        self._btn_merge = _btn(
+            "Merge as red and green",
+            "The active image in red, the reference in green. A shift between them "
+            "shows as a red edge on one side and a green edge on the other.")
+        self._btn_merge.clicked.connect(self._do_merge)
+        lay.addWidget(self._btn_merge)
 
     def _build_compare_section(self):
         sec = self._add_section("compare", "Compare", False)
@@ -2996,7 +5311,10 @@ class WorkshopWidget(QWidget):
         b_png.clicked.connect(lambda: self._save("png"))
         b_tif = _btn("Save TIFF…", "Write what you see as a TIFF file")
         b_tif.clicked.connect(lambda: self._save("tiff"))
-        row.addWidget(b_png); row.addWidget(b_tif)
+        b_jpg = _btn("Save JPEG…", "Write what you see as a JPEG file — smaller, but "
+                                   "it throws detail away; never save data as JPEG")
+        b_jpg.clicked.connect(lambda: self._save("jpg"))
+        row.addWidget(b_png); row.addWidget(b_tif); row.addWidget(b_jpg)
         lay.addLayout(row)
 
         row2 = QHBoxLayout()
@@ -3006,6 +5324,56 @@ class WorkshopWidget(QWidget):
         b_clip.clicked.connect(self._copy_clipboard)
         row2.addWidget(b_all); row2.addWidget(b_clip)
         lay.addLayout(row2)
+
+        self._btn_data_tiff = _btn(
+            "Save the values as TIFF…",
+            "The measured counts as a plain 16-bit TIFF: no palette, no display "
+            "stretch, no drawing. This is the file to open in ImageJ or read from a "
+            "script.")
+        self._btn_data_tiff.clicked.connect(self._save_data_tiff)
+        lay.addWidget(self._btn_data_tiff)
+
+        lay.addWidget(_small_label("Animation from every open image"))
+        arow = QHBoxLayout()
+        arow.addWidget(_small_label("Frame time"))
+        self._anim_ms = QSpinBox()
+        self._anim_ms.setRange(20, 5000)
+        self._anim_ms.setSingleStep(20)
+        self._anim_ms.setValue(200)
+        self._anim_ms.setSuffix(" ms")
+        self._anim_ms.setFixedWidth(84)
+        self._anim_ms.setToolTip("How long each image is shown")
+        arow.addWidget(self._anim_ms)
+        self._cb_anim_loop = QCheckBox("Repeat")
+        self._cb_anim_loop.setStyleSheet(_CHECK_QSS)
+        self._cb_anim_loop.setChecked(True)
+        self._cb_anim_loop.setToolTip("Play the animation over and over")
+        arow.addWidget(self._cb_anim_loop)
+        arow.addStretch(1)
+        lay.addLayout(arow)
+
+        arow2 = QHBoxLayout()
+        self._btn_play = _btn("Play…", "Look at the animation before saving it")
+        self._btn_play.clicked.connect(self._play_images)
+        self._btn_anim = _btn("Save animation…",
+                              "Write an animated GIF, PNG or WebP. Images of different "
+                              "sizes are centred on black rather than stretched.")
+        self._btn_anim.clicked.connect(self._save_animation)
+        arow2.addWidget(self._btn_play); arow2.addWidget(self._btn_anim)
+        lay.addLayout(arow2)
+
+        lay.addWidget(_small_label("Session — the drawing, the regions and the scale"))
+        srow = QHBoxLayout()
+        b_ssave = _btn("Save session…",
+                       "Write down everything drawn on every open image, so the work "
+                       "is not lost when the Workshop is closed")
+        b_ssave.clicked.connect(self._save_session)
+        b_sload = _btn("Load session…",
+                       "Re-open the images from a saved session and put the drawing "
+                       "back on them")
+        b_sload.clicked.connect(self._load_session)
+        srow.addWidget(b_ssave); srow.addWidget(b_sload)
+        lay.addLayout(srow)
 
 
     # ─────────────────────────────────────────────── Public API ───
@@ -3061,11 +5429,98 @@ class WorkshopWidget(QWidget):
             self._say(f"Opened {added} file(s).")
 
     def _open_dialog(self):
-        paths, _ = QFileDialog.getOpenFileName(
-            self, "Open image", str(self._last_save_dir or Path.home()),
+        # Several files at once, because dropping several onto the picture has always
+        # worked and the button having its own one-at-a-time rule was just confusing.
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open images", str(self._last_save_dir or Path.home()),
             "Images (*.png *.tif *.tiff *.jpg *.jpeg *.bmp)")
         if paths:
-            self.open_files([paths])
+            self.open_files(paths)
+
+    def _duplicate_slot(self):
+        """A copy as a new image — of the whole picture, or of the selected region.
+
+        The copy carries the counts and the scale, so it can still be measured; it does
+        not carry the drawing, because the point of duplicating is usually to get a
+        clean detail out."""
+        slot = self._slot()
+        if slot is None:
+            return
+        sel = self._canvas.selected()
+        base, raw, what = slot.base, slot.raw, "copy"
+        px_per_mm = slot.px_per_mm
+        if sel is not None and sel.kind in _REGION_KINDS:
+            x0, y0, x1, y1 = sel.bbox()
+            h, w = slot.base.shape[:2]
+            ix0, iy0 = max(0, int(math.floor(x0))), max(0, int(math.floor(y0)))
+            ix1, iy1 = min(w, int(math.ceil(x1))), min(h, int(math.ceil(y1)))
+            if ix1 - ix0 >= 2 and iy1 - iy0 >= 2:
+                base = slot.base[iy0:iy1, ix0:ix1]
+                raw = (slot.raw[iy0:iy1, ix0:ix1] if slot.measures_raw() else None)
+                what = "region"
+        new = self._add_derived_slot(
+            np.ascontiguousarray(base.copy()), f"{slot.label[:44]} — {what}",
+            raw=None if raw is None else np.ascontiguousarray(raw.copy()),
+            full_scale=slot.full_scale, camera=slot.camera,
+            note="" if raw is not None else slot.raw_note)
+        new.source_path = slot.source_path
+        new.px_per_mm = px_per_mm
+        new.view = _ViewSettings(**vars(slot.view))
+        self._after_change()
+        self._say(f"Duplicated the {what}: {base.shape[1]} × {base.shape[0]} px. "
+                  f"The original is untouched.")
+
+    def _paste_clipboard(self):
+        img = QGuiApplication.clipboard().image()
+        if img.isNull():
+            self._say("There is no image on the clipboard.")
+            return
+        arr = _qimage_to_np(img)
+        self._add_derived_slot(arr, "Pasted from the clipboard")
+        self._after_change()
+        self._say(f"Pasted {arr.shape[1]} × {arr.shape[0]} px from the clipboard.")
+
+    def _show_in_slider(self):
+        """Open the folder this frame came from in the Image Slider.
+
+        The same public handoff the Finder and the Shot Finder use, so the Slider
+        clears whatever it was doing first. The Workshop cannot push its edited pixels
+        back — the Slider browses files on the share, and an edited frame is not one."""
+        slot = self._slot()
+        viewer = getattr(self, "_slider_ref", None)
+        tabs = getattr(self, "_tab_widget", None)
+        if slot is None or viewer is None:
+            self._say("The Image Slider is not available from here.")
+            return
+        if slot.source_path is None:
+            self._say("This image did not come from a file, so there is no folder to "
+                      "open.")
+            return
+        folder = Path(slot.source_path).parent
+        if not folder.is_dir():
+            self._say(f"That folder is gone: {folder}")
+            return
+        ok = False
+        recv = getattr(viewer, "receive_external_folder", None)
+        try:
+            if callable(recv):
+                ok = bool(recv(folder, discrete=False, cam_name=slot.camera or None))
+            elif hasattr(viewer, "open_folder_path"):
+                viewer.open_folder_path(folder)
+                ok = True
+        except Exception as e:
+            QMessageBox.warning(self, "Image Slider", f"Could not hand over:\n{e}")
+            return
+        if not ok:
+            self._say(f"The Image Slider would not take that folder: {folder}")
+            return
+        if tabs is not None:
+            idx = getattr(self, "_slider_tab_idx", None)
+            if idx is None:
+                idx = tabs.indexOf(viewer)
+            if idx is not None and idx >= 0:
+                tabs.setCurrentIndex(idx)
+        self._say(f"Opened in the Image Slider: {folder.name}")
 
     # ──────────────────────────────────────────────────── Slots ───
 
@@ -3305,11 +5760,20 @@ class WorkshopWidget(QWidget):
 
             gray = None
             lo, hi = v.win_lo, v.win_hi
+            hist_vals, hist_max, hist_unit = None, 255.0, "code"
             if slot is not None:
+                # The display window is still decided on the 8-bit picture — that is
+                # what render_view maps — but the bars are counted from the native data
+                # when it is there, so the axis reads real camera counts.
                 gray = np.clip(_to_gray(slot.base), 0, 255)
                 if v.auto_contrast:
                     lo, hi = auto_window(gray)
-            self._hist.set_data(gray)
+                hist_vals, hist_unit = gray, "code"
+                if slot.measures_raw() and slot.full_scale:
+                    raw = slot.raw
+                    hist_vals = _to_gray(raw) if raw.ndim == 3 else raw
+                    hist_max, hist_unit = float(slot.full_scale), "counts"
+            self._hist.set_data(hist_vals, hist_max, hist_unit)
             self._hist.set_window(lo, hi)
 
             self._contrast_val.setText(f"{v.contrast:+d}" if v.contrast else "0")
@@ -3398,6 +5862,7 @@ class WorkshopWidget(QWidget):
         button is left stale or greyed out on one of the paths."""
         self._canvas.update_labels()
         self._refresh_measure()
+        self._sync_view_controls()
         self._update_info()
         self._update_enabled()
         self._canvas.update()
@@ -3410,11 +5875,40 @@ class WorkshopWidget(QWidget):
         self._btn_clear_annots.setEnabled(has and bool(slot.annots))
         self._btn_reset_src.setEnabled(has)
 
+        # Everything added later is switched on from this one place too, so no path
+        # through the panel can leave a button dead that should work.
+        many = len(self._slots) >= 2
+        ops = wk_ops is not None
+        busy = self._save_task_busy
+        self._btn_dup.setEnabled(has)
+        self._btn_scalebar.setEnabled(has)
+        self._btn_project.setEnabled(many and ops and not busy)
+        self._btn_merge.setEnabled(has and ops and 0 <= self._ref < len(self._slots)
+                                   and self._ref != self._active)
+        self._btn_data_tiff.setEnabled(has and ops and not busy)
+        self._btn_play.setEnabled(many)
+        self._btn_anim.setEnabled(many and ops and not busy)
+        for b in getattr(self, "_filter_buttons", ()):
+            b.setEnabled(has and ops)
+        self._btn_slider.setEnabled(
+            has and slot.source_path is not None
+            and getattr(self, "_slider_ref", None) is not None)
+        self._btn_slider.setToolTip(
+            "Open the folder this frame came from in the Image Slider"
+            if getattr(self, "_slider_ref", None) is not None else
+            "Only available when the Workshop runs inside Image Tools")
+
     def _on_image_changed(self):
         self._after_change()
 
     def _on_annots_changed(self):
         self._after_change()
+
+    def _on_selection_changed(self):
+        """Picking a different region has to re-read the numbers; nothing about the
+        picture changed, so the full _after_change is not needed."""
+        self._refresh_measure()
+        self._canvas.update()
 
     def _refresh_measure(self):
         slot = self._slot()
@@ -3498,6 +5992,13 @@ class WorkshopWidget(QWidget):
         self._after_change()
         self._say("Scale cleared — lengths are in pixels again.")
 
+    def _profile_samples(self, slot, a, width: int):
+        """Samples along a profile line, in millimetres once a scale is set."""
+        x, y = line_profile(slot.measure_arr(), a.pts[0], a.pts[1], width)
+        if slot.px_per_mm:
+            x = x / slot.px_per_mm
+        return x, y
+
     def _show_profile(self, annot):
         slot = self._slot()
         if slot is None:
@@ -3510,14 +6011,631 @@ class WorkshopWidget(QWidget):
             QMessageBox.information(self, "Plot profile",
                                     "Draw a profile line over the picture first.")
             return
-        x, y = line_profile(slot.measure_arr(), a.pts[0], a.pts[1])
         if self._profile_dlg is None:
             self._profile_dlg = ProfileDialog(self)
-        self._profile_dlg.set_profile(x, y, slot.unit_name(), slot.label[:40])
-        self._profile_dlg.show()
-        self._profile_dlg.raise_()
+        dlg = self._profile_dlg
+        x, y = self._profile_samples(slot, a, dlg.line_width())
+        dlg.set_profile(x, y, slot.unit_name(), slot.label[:40],
+                        "mm" if slot.px_per_mm else "px",
+                        recompute=lambda w, s=slot, ann=a: self._profile_samples(s, ann, w))
+        dlg.show()
+        dlg.raise_()
+
+    # ---- several regions, and the results table ------------------------------
+
+    def _on_keep_regions(self, on: bool):
+        self._canvas.keep_regions = bool(on)
+        self._say("Regions pile up — read them in the results table."
+                  if on else "A new region now replaces the old one.")
+
+    def _regions(self) -> list:
+        slot = self._slot()
+        return [] if slot is None else [a for a in slot.annots
+                                        if a.kind in _REGION_KINDS]
+
+    def _measure_table(self):
+        """(headers, rows, note) for the results table: one row per measured item,
+        plus the whole picture on the first row so there is always something to
+        compare against."""
+        slot = self._slot()
+        if slot is None:
+            return [], [], ""
+        arr = slot.measure_arr()
+        unit = slot.unit_name()
+        mm = slot.px_per_mm
+        len_unit = "mm" if mm else "px"
+        area_unit = "mm²" if mm else "px²"
+        headers = ["#", "Item", "X", "Y", "Width", "Height", f"Length ({len_unit})",
+                   "Angle (°)", f"Min ({unit})", f"Max ({unit})", f"Mean ({unit})",
+                   f"Std ({unit})", f"Sum ({unit})", "Pixels", f"Area ({area_unit})",
+                   "Centre X", "Centre Y"]
+
+        def fmt(v, nd=2):
+            return "" if v is None else f"{v:.{nd}f}"
+
+        def px2len(v):
+            return v / mm if mm else v
+
+        def stat_cells(st):
+            if not st:
+                return [""] * 6 + [""] * 3
+            area = st["count"] / (mm * mm) if mm else st["count"]
+            return [fmt(st["min"], 0), fmt(st["max"], 0), fmt(st["mean"]),
+                    fmt(st["std"]), f"{st['sum']:.6g}", str(st["count"]),
+                    f"{area:.6g}", fmt(st.get("cx"), 1), fmt(st.get("cy"), 1)]
+
+        rows = []
+        whole = region_stats(arr, None)
+        h, w = arr.shape[:2]
+        rows.append(["—", "Whole image", "0", "0", str(w), str(h), "", ""]
+                    + stat_cells(whole))
+
+        for i, a in enumerate(slot.annots):
+            if a.kind not in _TABLE_KINDS:
+                continue
+            x0, y0, x1, y1 = a.bbox()
+            name = {A_ROI_RECT: "Rectangle region", A_ROI_ELLIPSE: "Ellipse region",
+                    A_RULER: "Ruler", A_ANGLE: "Angle", A_CROSS: "Point",
+                    A_PROFILE: "Profile line"}.get(a.kind, a.kind)
+            # Full width from the start: every kind fills only the columns that mean
+            # something for it, and a shape that reaches column 10 must not have to
+            # care whether column 8 has been written yet.
+            row = [""] * len(headers)
+            row[0:6] = [str(i + 1), name, fmt(x0, 1), fmt(y0, 1),
+                        fmt(x1 - x0, 1), fmt(y1 - y0, 1)]
+            if a.kind in _REGION_KINDS:
+                row[8:] = stat_cells(region_stats(arr, _region_mask(a, arr.shape)))
+            elif a.kind in (A_RULER, A_PROFILE) and len(a.pts) >= 2:
+                dpx = math.hypot(a.pts[1][0] - a.pts[0][0], a.pts[1][1] - a.pts[0][1])
+                row[6] = fmt(px2len(dpx), 3)
+                row[7] = fmt(line_angle_deg(a.pts[0], a.pts[1]), 1)
+                if a.kind == A_PROFILE:
+                    _, vals = line_profile(arr, a.pts[0], a.pts[1])
+                    row[8:] = [fmt(float(vals.min()), 0), fmt(float(vals.max()), 0),
+                               fmt(float(vals.mean())), fmt(float(vals.std())),
+                               f"{float(vals.sum()):.6g}", str(int(vals.size)),
+                               "", "", ""]
+            elif a.kind == A_ANGLE and len(a.pts) >= 3:
+                row[2] = fmt(a.pts[1][0], 1)
+                row[3] = fmt(a.pts[1][1], 1)
+                row[4] = row[5] = ""
+                row[7] = fmt(angle_between(a.pts[0], a.pts[1], a.pts[2]), 2)
+            elif a.kind == A_CROSS and a.pts:
+                px, py = int(round(a.pts[0][0])), int(round(a.pts[0][1]))
+                v = slot.value_at(px, py)
+                row[2], row[3] = str(px), str(py)
+                row[4] = row[5] = ""
+                if v is not None:
+                    row[8] = row[9] = row[10] = fmt(v[1], 0)
+                    row[13] = "1"
+            rows.append(row)
+
+        note = (f"{slot.label[:60]} — values in {unit}"
+                + (f", lengths in mm ({mm:.3f} px per mm)" if mm
+                   else ", lengths in pixels (no scale set)"))
+        return headers, rows, note
+
+    def _show_results(self):
+        slot = self._slot()
+        if slot is None:
+            QMessageBox.information(self, "Results table", "There is no image yet.")
+            return
+        headers, rows, note = self._measure_table()
+        if self._results_dlg is None:
+            self._results_dlg = _TableDialog("Results", self, extra_buttons=(
+                ("Refresh", "Read the numbers again",
+                 lambda: self._results_dlg.set_content(*self._measure_table())),))
+        self._results_dlg.set_content(headers, rows, note)
+        self._results_dlg.show()
+        self._results_dlg.raise_()
+
+    def _show_histogram_numbers(self):
+        """The histogram as numbers. Same 256 buckets and same source as the picture of
+        it in the Display section, so the two cannot disagree."""
+        slot = self._slot()
+        if slot is None:
+            QMessageBox.information(self, "Histogram", "There is no image yet.")
+            return
+        if slot.measures_raw() and slot.full_scale:
+            raw = slot.raw
+            vals = _to_gray(raw) if raw.ndim == 3 else raw
+            vmax, unit = float(slot.full_scale), slot.unit_name()
+        else:
+            vals = np.clip(_to_gray(slot.base), 0, 255)
+            vmax, unit = 255.0, "code"
+        s = _stat_sample(vals)
+        idx = np.clip(np.asarray(s, dtype=np.float64) * (255.0 / vmax),
+                      0, 255).astype(np.int32)
+        counts = np.bincount(np.ravel(idx), minlength=256).astype(np.float64)
+        total = float(counts.sum()) or 1.0
+        cum = np.cumsum(counts)
+        step = vmax / 256.0
+        rows = []
+        for i in range(256):
+            rows.append([str(i), f"{i * step:.4g}", f"{(i + 1) * step:.4g}",
+                         f"{int(counts[i])}", f"{counts[i] / total * 100:.4f}",
+                         f"{cum[i] / total * 100:.4f}"])
+        headers = ["Bucket", f"From ({unit})", f"To ({unit})", "Pixels", "Share (%)",
+                   "Up to here (%)"]
+        note = (f"{slot.label[:60]} — 256 buckets over 0 … {vmax:.0f} {unit}, "
+                f"{int(total)} pixels counted"
+                + ("  (a sample of the frame, as in the histogram picture)"
+                   if s.size != vals.size else ""))
+        if self._hist_dlg is None:
+            self._hist_dlg = _TableDialog("Histogram", self)
+        self._hist_dlg.set_content(headers, rows, note)
+        self._hist_dlg.show()
+        self._hist_dlg.raise_()
+
+    # ---- scale bar -----------------------------------------------------------
+
+    def _add_scale_bar(self):
+        slot = self._slot()
+        if slot is None:
+            return
+        if not slot.px_per_mm:
+            QMessageBox.information(
+                self, "Scale bar",
+                "Set a scale first: draw a ruler across something of a known size, "
+                "then press “Set scale…”.\nWithout that the Workshop has no idea how "
+                "long a millimetre is on this picture.")
+            return
+        h, w = slot.base.shape[:2]
+        # A round length that comes out near a fifth of the frame — the length a person
+        # would have picked, without having to think about it.
+        want_mm = (w / 5.0) / slot.px_per_mm
+        nice = _nice_length(want_mm)
+        val, ok = QInputDialog.getDouble(
+            self, "Scale bar",
+            f"The picture is {w / slot.px_per_mm:.3f} mm wide.\n"
+            f"How long should the bar be, in millimetres?",
+            nice, 0.000001, 1e6, 6)
+        if not ok or val <= 0:
+            return
+        length_px = val * slot.px_per_mm
+        if length_px > w:
+            QMessageBox.information(self, "Scale bar",
+                                    "That bar would be wider than the picture.")
+            return
+        slot.push_undo()
+        slot.annots = [a for a in slot.annots if a.kind != A_SCALEBAR]
+        margin = max(8.0, w * 0.04)
+        y = h - max(12.0, h * 0.06)
+        bar = _Annot(A_SCALEBAR, [[margin, y], [margin + length_px, y]],
+                     "#ffffff", max(2, self._line_sb.value()), False, "",
+                     max(10, self._text_sb.value()), "", float(val))
+        slot.annots.append(bar)
+        self._canvas.select_index(len(slot.annots) - 1)
+        self._after_change()
+        self._say(f"Scale bar added: {_fmt_mm(val)} = {length_px:.1f} px. "
+                  f"Drag it with Select; it is saved with the drawing.")
+
+    def _remove_scale_bar(self):
+        slot = self._slot()
+        if slot is None or not any(a.kind == A_SCALEBAR for a in slot.annots):
+            return
+        slot.push_undo()
+        slot.annots = [a for a in slot.annots if a.kind != A_SCALEBAR]
+        self._after_change()
+        self._say("Scale bar removed.")
+
+    # ─────────────────────────────────────────────────── Beam ─────
+
+    def _beam_input(self):
+        """(array, mask, what) for the beam measurements: the selected region if there
+        is one, otherwise the whole picture."""
+        slot = self._slot()
+        if slot is None:
+            return None, None, ""
+        arr = slot.measure_arr()
+        sel = self._canvas.selected()
+        if sel is not None and sel.kind in _REGION_KINDS:
+            return arr, _region_mask(sel, arr.shape), "selected region"
+        return arr, None, "whole image"
+
+    def _beam_stats(self):
+        if wk_beam is None:
+            QMessageBox.warning(self, "Beam", f"The beam maths could not be loaded"
+                                              f"{f': {_BEAM_ERROR}' if _BEAM_ERROR else ''}.")
+            return None, None, None, ""
+        slot = self._slot()
+        arr, mask, what = self._beam_input()
+        if arr is None:
+            QMessageBox.information(self, "Beam", "There is no image yet.")
+            return None, None, None, ""
+        st = wk_beam.beam_stats(arr, mask, self._beam_base_sb.value())
+        if not st or "cx" not in st:
+            QMessageBox.information(
+                self, "Beam",
+                "Nothing to measure here: after the background was taken off there is "
+                "no signal left. Try a lower background percentage, or put the region "
+                "around the spot.")
+            return None, None, None, ""
+        return st, arr, mask, what
+
+    def _show_beam_report(self):
+        st, arr, mask, what = self._beam_stats()
+        if st is None:
+            return
+        slot = self._slot()
+        unit = slot.unit_name()
+        mm = slot.px_per_mm
+        rows = []
+
+        def add(name, value, u=""):
+            rows.append([name, value, u])
+
+        def length(v):
+            return (f"{v / mm:.4f}" if mm else f"{v:.2f}")
+
+        lu = "mm" if mm else "px"
+        add("Measured on", what)
+        add("Background taken off", f"{st['baseline']:.1f}", unit)
+        add("Peak value", f"{st['peak']:.0f}", unit)
+        add("Peak at", f"{st['peak_x']:.1f}, {st['peak_y']:.1f}", "px")
+        add("Centre of mass", f"{st['cx']:.2f}, {st['cy']:.2f}", "px")
+        add("Total above background", f"{st['total']:.6g}", unit)
+        add("D4σ width across", length(st.get("d4s_x", 0.0)), lu)
+        add("D4σ width down", length(st.get("d4s_y", 0.0)), lu)
+        add("D4σ long axis", length(st.get("d4s_major", 0.0)), lu)
+        add("D4σ short axis", length(st.get("d4s_minor", 0.0)), lu)
+        if "ellipticity" in st:
+            add("Roundness (short / long)", f"{st['ellipticity']:.4f}",
+                "1.0 = round")
+        add("Long axis tilt", f"{st.get('angle_deg', 0.0):.2f}", "° anticlockwise")
+        for key, name in (("fwhm_x", "FWHM across"), ("fwhm_y", "FWHM down"),
+                          ("w1e2_x", "1/e² width across"),
+                          ("w1e2_y", "1/e² width down")):
+            if key in st:
+                add(name, length(st[key]), lu)
+            else:
+                add(name, "not reached", "")
+        if mm:
+            add("Scale", f"{mm:.4f}", "px per mm")
+
+        note = (f"{slot.label[:60]} — {what}, values in {unit}. Widths from the "
+                f"intensity moments (D4σ) and read off the row and column through the "
+                f"centre of mass (FWHM, 1/e²). “not reached” means the trace never "
+                f"comes back down to that level inside the area measured.")
+        if self._beam_dlg is None:
+            self._beam_dlg = _TableDialog("Beam report", self, extra_buttons=(
+                ("Radial profile", "Average value against distance from the centre",
+                 self._show_radial),
+                ("Encircled energy", "Signal inside a circle against its radius",
+                 self._show_encircled),
+                ("Refresh", "Measure again", self._show_beam_report)))
+        self._beam_dlg.set_content(["Quantity", "Value", "Unit"], rows, note)
+        self._beam_dlg.show()
+        self._beam_dlg.raise_()
+
+    def _show_radial(self):
+        st, arr, mask, what = self._beam_stats()
+        if st is None:
+            return
+        slot = self._slot()
+        r, v = wk_beam.radial_profile(arr, st["cx"], st["cy"], mask)
+        if r.size < 2:
+            return
+        mm = slot.px_per_mm
+        x = r / mm if mm else r
+        if self._radial_dlg is None:
+            self._radial_dlg = _CurveDialog("Radial profile", self)
+        self._radial_dlg.set_curve(
+            x, v,
+            f"{slot.label[:50]} — {what}, around the centre of mass at "
+            f"{st['cx']:.1f}, {st['cy']:.1f} px. Each point is the average of every "
+            f"pixel at that distance.",
+            "distance from the centre", "mm" if mm else "px", slot.unit_name(),
+            columns=(f"radius_{'mm' if mm else 'px'}", f"mean_{slot.unit_name()}"))
+        self._radial_dlg.show()
+        self._radial_dlg.raise_()
+
+    def _show_encircled(self):
+        st, arr, mask, what = self._beam_stats()
+        if st is None:
+            return
+        slot = self._slot()
+        ee = wk_beam.encircled_energy(arr, st["cx"], st["cy"], mask,
+                                      self._beam_base_sb.value())
+        frac = ee.get("fraction")
+        if frac is None or frac.size < 2:
+            return
+        mm = slot.px_per_mm
+        lu = "mm" if mm else "px"
+        x = ee["radii"] / mm if mm else ee["radii"]
+        bits = []
+        for key, name in (("r500", "half"), ("r865", "86.5 %"), ("r900", "90 %")):
+            if key in ee:
+                rv = ee[key] / mm if mm else ee[key]
+                bits.append(f"{name} of the signal within {rv:.3f} {lu}")
+        if ee.get("clipped"):
+            bits.append("— the circle runs off the edge of the area measured, so the "
+                        "wide end of this curve is not to be trusted")
+        hl = [(0.5, "#c02020", "half"), (0.865, "#0a8f4a", "86.5 %")]
+        if self._encircled_dlg is None:
+            self._encircled_dlg = _CurveDialog("Encircled energy", self)
+        self._encircled_dlg.set_curve(
+            x, frac,
+            f"{slot.label[:50]} — {what}. " + "  |  ".join(bits),
+            "radius of the circle", lu, "share", hlines=hl,
+            columns=(f"radius_{lu}", "fraction"))
+        self._encircled_dlg.show()
+        self._encircled_dlg.raise_()
+
+    def _mark_centroid(self):
+        st, arr, mask, what = self._beam_stats()
+        if st is None:
+            return
+        self._canvas.add_annot(_Annot(A_CROSS, [[st["cx"], st["cy"]]],
+                                      self._draw_color.name(), self._line_sb.value()))
+        self._after_change()
+        self._say(f"Centre of mass of the {what}: {st['cx']:.2f}, {st['cy']:.2f} px")
+
+    # ──────────────────────────────────────────────── Filters ────
+
+    def _editing_blocked(self) -> bool:
+        """True when a comparison view is up — and then nothing may change pixels.
+
+        The canvas already refuses to draw or crop while comparing, but the panel's
+        buttons used to go ahead: the picture on screen was the composition, so an
+        operation applied to the active image with no visible effect, and the next
+        measurement was taken off a frame nobody had looked at. One guard, in front of
+        every operation that touches pixels."""
+        if not self._canvas.comparing():
+            return False
+        self._say("Comparison is a view only — set Compare to “Off” first.")
+        return True
+
+    def _need_ops(self) -> bool:
+        if wk_ops is not None:
+            return True
+        QMessageBox.warning(self, "Filters",
+                            "The pixel operations could not be loaded"
+                            + (f":\n{_OPS_ERROR}" if _OPS_ERROR else "."))
+        return False
+
+    def _apply_to_both(self, fn, message: str, keep_raw: bool = True):
+        """Run the same operation on the picture and on the counts behind it.
+
+        Both layers or neither: filtering only what is on screen would leave the
+        Measure panel reporting numbers from a picture that is no longer displayed —
+        the one thing this tab is built not to do."""
+        slot = self._slot()
+        if slot is None or self._editing_blocked():
+            return
+        h, w = slot.base.shape[:2]
+        aligned = slot.raw is not None and slot.raw.shape[:2] == (h, w)
+        try:
+            new_base = fn(slot.base)
+            new_raw = fn(slot.raw) if (aligned and keep_raw) else None
+        except Exception as e:
+            QMessageBox.warning(self, "Could not do that", f"{e}")
+            return
+        slot.push_undo()
+        slot.base = new_base
+        if aligned:
+            if keep_raw and new_raw is not None:
+                slot.raw = new_raw
+            else:
+                slot.raw = None
+                slot.raw_note = "changed picture — values are display codes"
+        changed_size = new_base.shape[:2] != (h, w)
+        if changed_size:
+            slot.fitted = False
+            self._canvas.set_slot(slot)
+        else:
+            self._canvas.refresh()
+        self._after_change()
+        self._say(message)
+
+    def _filter_median(self):
+        if not self._need_ops():
+            return
+        r, ok = QInputDialog.getInt(
+            self, "Median filter",
+            "How far around each pixel to look, in pixels?\n"
+            "1 is a 3 × 3 neighbourhood and clears single hot pixels; 3 is heavy.",
+            1, 1, 15, 1)
+        if not ok:
+            return
+        self._apply_to_both(lambda a: wk_ops.median(a, r),
+                            f"Median filter, {2 * r + 1} × {2 * r + 1} pixels.")
+
+    def _filter_blur(self):
+        if not self._need_ops():
+            return
+        s, ok = QInputDialog.getDouble(
+            self, "Blur", "How much blur (sigma, in pixels)?", 1.0, 0.1, 50.0, 2)
+        if not ok:
+            return
+        self._apply_to_both(lambda a: wk_ops.gaussian(a, s),
+                            f"Blurred, sigma {s:g} px.")
+
+    def _filter_sharpen(self):
+        if not self._need_ops():
+            return
+        amt, ok = QInputDialog.getDouble(
+            self, "Sharpen", "How much? 1 is a normal sharpen, 3 is heavy.",
+            1.0, 0.1, 10.0, 2)
+        if not ok:
+            return
+        self._apply_to_both(lambda a: wk_ops.sharpen(a, amt),
+                            f"Sharpened, amount {amt:g}.")
+
+    def _filter_edges(self):
+        if not self._need_ops():
+            return
+        self._apply_to_both(wk_ops.edges, "Edges — bright where the picture changes.")
+
+    def _filter_background(self):
+        if not self._need_ops():
+            return
+        modes = list(wk_ops.BACKGROUND_MODES)
+        mode, ok = QInputDialog.getItem(self, "Remove background",
+                                        "What is the background like?", modes, 0, False)
+        if not ok:
+            return
+        if mode == modes[0]:
+            param, ok2 = QInputDialog.getDouble(
+                self, "Remove background",
+                "Take off this percentile of the picture as the background:",
+                5.0, 0.0, 99.0, 1)
+        elif mode == modes[3]:
+            param, ok2 = QInputDialog.getInt(
+                self, "Remove background",
+                "How big is the ball, in pixels?\nEverything smaller than this is "
+                "kept, everything larger counts as background.", 25, 2, 500, 1)
+        else:
+            param, ok2 = 0.0, True
+        if not ok2:
+            return
+        slot = self._slot()
+        if slot is None:
+            return
+        # ONE background map, applied to both layers. Fitting a surface to each of them
+        # separately would subtract two different backgrounds from the same frame.
+        try:
+            bg = wk_ops.background_map(slot.base, mode, param)
+        except Exception as e:
+            QMessageBox.warning(self, "Remove background", f"{e}")
+            return
+        aligned = slot.raw is not None and slot.raw.shape[:2] == slot.base.shape[:2]
+        bg_raw = None
+        if aligned:
+            # The counts layer has its own numbers, so it needs its own map of the same
+            # SHAPE — the same mode and parameter, measured on the counts.
+            try:
+                bg_raw = wk_ops.background_map(slot.raw, mode, param)
+            except Exception:
+                bg_raw = None
+
+        def fn(a):
+            if a is slot.raw and bg_raw is not None:
+                return wk_ops.subtract_background(a, mode, param, bg_raw)
+            return wk_ops.subtract_background(a, mode, param, bg)
+
+        self._apply_to_both(fn, f"Background removed — {mode.lower()}.",
+                            keep_raw=bg_raw is not None)
 
     # ────────────────────────────────────────── Picture editing ───
+
+    def _rotate_free(self):
+        if not self._need_ops():
+            return
+        slot = self._slot()
+        if slot is None:
+            return
+        deg, ok = QInputDialog.getDouble(
+            self, "Rotate by angle",
+            "Turn by how many degrees?\nPositive turns anticlockwise. The picture "
+            "grows so that no corner is cut off.", 0.0, -360.0, 360.0, 2)
+        if not ok or abs(deg) < 1e-9:
+            return
+        self._rotate_arbitrary(deg, "Rotated by")
+
+    def _rotate_arbitrary(self, deg: float, verb: str):
+        slot = self._slot()
+        if slot is None or self._editing_blocked():
+            return
+        h, w = slot.base.shape[:2]
+        aligned = slot.raw is not None and slot.raw.shape[:2] == (h, w)
+        try:
+            new_base = wk_ops.rotate(slot.base, deg, expand=True, nearest=False)
+            new_raw = (wk_ops.rotate(slot.raw, deg, expand=True, nearest=True)
+                       if aligned else None)
+        except Exception as e:
+            QMessageBox.warning(self, "Rotate", f"{e}")
+            return
+        fn = wk_ops.rotate_point_map(slot.base.shape, deg, True)
+        slot.push_undo()
+        slot.base = new_base
+        if aligned:
+            slot.raw = new_raw
+        self._transform_annots(slot, fn)
+        slot.fitted = False
+        self._canvas.set_slot(slot)
+        self._after_change()
+        self._say(f"{verb} {deg:.2f}° — now {new_base.shape[1]} × {new_base.shape[0]} px. "
+                  f"The corners the picture grew into are black, and they are real "
+                  f"pixels: leave them out of a region.")
+
+    def _straighten(self):
+        """Turn the picture so that a line drawn along a feature becomes horizontal."""
+        if not self._need_ops():
+            return
+        slot = self._slot()
+        if slot is None:
+            return
+        sel = self._canvas.selected()
+        kinds = (A_LINE, A_ARROW, A_RULER, A_PROFILE)
+        if sel is None or sel.kind not in kinds or len(sel.pts) < 2:
+            found = [a for a in slot.annots if a.kind in kinds]
+            sel = found[-1] if found else None
+        if sel is None:
+            QMessageBox.information(
+                self, "Straighten",
+                "Draw a straight line, an arrow or a ruler along the edge you want "
+                "level first, then press Straighten.")
+            return
+        ang = line_angle_deg(sel.pts[0], sel.pts[1])
+        # A line drawn right-to-left describes the same edge as one drawn left-to-right;
+        # folding the angle into ±90° keeps the picture the right way up either way.
+        while ang > 90.0:
+            ang -= 180.0
+        while ang < -90.0:
+            ang += 180.0
+        if abs(ang) < 1e-6:
+            self._say("That line is already level.")
+            return
+        self._rotate_arbitrary(-ang, "Straightened by")
+
+    def _bin_dialog(self):
+        if not self._need_ops():
+            return
+        slot = self._slot()
+        if slot is None or self._editing_blocked():
+            return
+        factor, ok = QInputDialog.getInt(
+            self, "Bin pixels",
+            "Join blocks of how many pixels across?\n2 makes the picture half the "
+            "size, 4 a quarter.", 2, 2, 16, 1)
+        if not ok:
+            return
+        mode, ok2 = QInputDialog.getItem(
+            self, "Bin pixels", "What should a block become?",
+            ["Average — keeps the scale", "Sum — adds the counts up"], 0, False)
+        if not ok2:
+            return
+        summing = mode.startswith("Sum")
+        m = "Sum" if summing else "Average"
+        h, w = slot.base.shape[:2]
+        aligned = slot.raw is not None and slot.raw.shape[:2] == (h, w)
+        try:
+            # The picture always averages: an 8-bit picture cannot hold four pixels
+            # added together, it would just go white. Only the counts can be summed.
+            new_base = wk_ops.bin_pixels(slot.base, factor, "Average")
+            new_raw = wk_ops.bin_pixels(slot.raw, factor, m) if aligned else None
+        except Exception as e:
+            QMessageBox.warning(self, "Bin pixels", f"{e}")
+            return
+        slot.push_undo()
+        slot.base = new_base
+        if aligned:
+            slot.raw = new_raw
+            if summing and slot.full_scale:
+                # The values grew, so the scale they are read against has to grow with
+                # them or the histogram axis and the "% of full scale" both lie.
+                slot.full_scale = float(slot.full_scale) * (factor * factor)
+        sx = new_base.shape[1] / w
+        sy = new_base.shape[0] / h
+        self._transform_annots(slot, lambda x, y: (x * sx, y * sy))
+        if slot.px_per_mm:
+            slot.px_per_mm *= (sx + sy) / 2.0
+        slot.fitted = False
+        self._canvas.set_slot(slot)
+        self._after_change()
+        self._say(f"Binned {factor} × {factor} ({m.lower()}) — now "
+                  f"{new_base.shape[1]} × {new_base.shape[0]} px.")
 
     def _transform_annots(self, slot, fn):
         for a in slot.annots:
@@ -3525,7 +6643,7 @@ class WorkshopWidget(QWidget):
 
     def _rotate(self, k: int):
         slot = self._slot()
-        if slot is None:
+        if slot is None or self._editing_blocked():
             return
         h, w = slot.base.shape[:2]
         slot.push_undo()
@@ -3547,7 +6665,7 @@ class WorkshopWidget(QWidget):
 
     def _flip(self, axis: int):
         slot = self._slot()
-        if slot is None:
+        if slot is None or self._editing_blocked():
             return
         h, w = slot.base.shape[:2]
         slot.push_undo()
@@ -3565,7 +6683,7 @@ class WorkshopWidget(QWidget):
 
     def _resize_dialog(self):
         slot = self._slot()
-        if slot is None:
+        if slot is None or self._editing_blocked():
             return
         h, w = slot.base.shape[:2]
         pct, ok = QInputDialog.getDouble(
@@ -3613,7 +6731,7 @@ class WorkshopWidget(QWidget):
 
     def _do_diff(self, absolute: bool):
         slot = self._slot()
-        if slot is None:
+        if slot is None or self._editing_blocked():
             return
         if not (0 <= self._ref < len(self._slots)) or self._ref == self._active:
             QMessageBox.information(self, "Reference",
@@ -3639,6 +6757,103 @@ class WorkshopWidget(QWidget):
         self._after_change()
         self._say(f"{'Difference' if absolute else 'Subtraction'}: "
                   f"{slot.label[:24]} − {ref.label[:24]}")
+
+    # ────────────────────────────────────────── Combine images ────
+
+    def _add_derived_slot(self, base: np.ndarray, label: str,
+                          raw: "np.ndarray | None" = None,
+                          full_scale: "float | None" = None,
+                          camera: str = "", note: str = "") -> "_WorkshopSlot":
+        """Add an image the Workshop MADE, rather than one it was given.
+
+        Deliberately not receive_image: that one starts a background read of the source
+        file to find the counts, and a combined image has no single source file to
+        read. Whatever counts it does have are handed in here instead."""
+        base = np.ascontiguousarray(base.astype(np.uint8, copy=False))
+        slot = _WorkshopSlot(label=label, base=base, source_base=base,
+                             raw=raw, source_raw=raw, full_scale=full_scale,
+                             camera=camera)
+        slot.raw_note = note or ("" if raw is not None else
+                                 "made in the Workshop — values are display codes")
+        self._slots.append(slot)
+        self._update_slot_list()
+        self._activate_slot(len(self._slots) - 1)
+        return slot
+
+    def _do_project(self):
+        if not self._need_ops():
+            return
+        if len(self._slots) < 2:
+            QMessageBox.information(
+                self, "Combine images",
+                "There is only one image open. Open or send over at least two.")
+            return
+        mode = self._project_cb.currentText()
+        bases = [s.base for s in self._slots]
+        try:
+            out = wk_ops.project(bases, mode, np.uint8)
+        except Exception as e:
+            QMessageBox.warning(self, "Combine images", f"{e}")
+            return
+
+        # The counts come along only if EVERY image has them, on the same grid and the
+        # same scale. Averaging counts from two different cameras' scales would produce
+        # a number that means nothing.
+        raw = None
+        full_scale = None
+        camera = ""
+        note = ""
+        raws = [s.raw for s in self._slots]
+        scales = {float(s.full_scale) for s in self._slots if s.full_scale}
+        cams = {s.camera for s in self._slots if s.camera}
+        if all(s.measures_raw() for s in self._slots) and len(scales) == 1 \
+                and len({r.shape[:2] for r in raws}) == 1:
+            try:
+                if mode == "Sum":
+                    raw = wk_ops.project(raws, mode, np.uint32)
+                    full_scale = scales.pop() * len(raws)
+                else:
+                    raw = wk_ops.project(raws, mode, raws[0].dtype)
+                    full_scale = scales.pop()
+                camera = cams.pop() if len(cams) == 1 else ""
+            except Exception:
+                raw = None
+        elif any(s.measures_raw() for s in self._slots):
+            note = ("not every image had its camera counts, or they were on different "
+                    "scales — values here are display codes")
+
+        h, w = out.shape[:2]
+        self._add_derived_slot(out, f"{mode} of {len(bases)} images",
+                               raw=raw, full_scale=full_scale, camera=camera,
+                               note=note)
+        self._after_change()
+        self._say(f"{mode} of {len(bases)} images — {w} × {h} px, the area they all "
+                  f"cover." + (f"  ({note})" if note else
+                               "  Camera counts came along." if raw is not None else ""))
+
+    def _do_merge(self):
+        if not self._need_ops():
+            return
+        slot = self._slot()
+        if slot is None:
+            return
+        if not (0 <= self._ref < len(self._slots)) or self._ref == self._active:
+            QMessageBox.information(self, "Merge",
+                                    "Choose a different image as the reference first.")
+            return
+        ref = self._slots[self._ref]
+        try:
+            out = wk_ops.merge_rg(render_view(slot.base, slot.view),
+                                  render_view(ref.base, ref.view))
+        except Exception as e:
+            QMessageBox.warning(self, "Merge", f"{e}")
+            return
+        self._add_derived_slot(
+            out, f"Red {slot.label[:20]} / green {ref.label[:20]}",
+            note="two pictures in one — values are display codes")
+        self._after_change()
+        self._say("Merged: the active image is red, the reference is green. Yellow is "
+                  "where both have signal.")
 
     # ───────────────────────────────────────────────── Compare ────
 
@@ -3693,30 +6908,36 @@ class WorkshopWidget(QWidget):
             p.end()
         return img
 
+    def _is_source_file(self, slot, p: Path) -> bool:
+        try:
+            return (slot.source_path is not None and
+                    p.resolve() == Path(slot.source_path).resolve())
+        except Exception:
+            return False
+
     def _save(self, fmt: str = "png"):
         slot = self._slot()
         if slot is None:
             QMessageBox.information(self, "Save", "There is no image to save.")
             return
+        names = {"png": "PNG", "tiff": "TIFF", "jpg": "JPEG"}
         stem = _build_save_stem(slot)
         start = str(Path(self._last_save_dir or Path.home()) / f"{stem}.{fmt}")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save a copy", start, f"{'PNG' if fmt == 'png' else 'TIFF'} (*.{fmt})")
+            self, "Save a copy", start,
+            f"{names.get(fmt, fmt.upper())} (*.{fmt}"
+            + (" *.jpeg)" if fmt == "jpg" else ")"))
         if not path:
             return
         p = Path(path)
-        if p.suffix.lower() != f".{fmt}":
+        if p.suffix.lower().lstrip(".") not in (fmt, "jpeg" if fmt == "jpg" else fmt):
             p = p.with_suffix(f".{fmt}")
-        try:
-            if slot.source_path is not None and \
-                    p.resolve() == Path(slot.source_path).resolve():
-                QMessageBox.warning(
-                    self, "Save",
-                    "That is the file this image came from.\n"
-                    "The Workshop never writes over a source file — choose another name.")
-                return
-        except Exception:
-            pass
+        if self._is_source_file(slot, p):
+            QMessageBox.warning(
+                self, "Save",
+                "That is the file this image came from.\n"
+                "The Workshop never writes over a source file — choose another name.")
+            return
         img = self._render_for_save(slot)
         if img is None:
             return
@@ -3726,27 +6947,306 @@ class WorkshopWidget(QWidget):
         else:
             QMessageBox.warning(self, "Save error", f"Could not write:\n{p}")
 
+    def _save_data_tiff(self):
+        """The measured values as a plain 16-bit TIFF.
+
+        Separate from "Save TIFF…" on purpose, and both are needed. That one writes
+        what is on SCREEN — the display stretch, the palette and the drawing baked into
+        8-bit RGB, which is what a report wants. This one writes what was MEASURED, so
+        the file can be read back and measured again."""
+        if not self._need_ops():
+            return
+        slot = self._slot()
+        if slot is None:
+            return
+        arr = slot.measure_arr()
+        raw = slot.measures_raw()
+        stem = _build_save_stem(slot)
+        start = str(Path(self._last_save_dir or Path.home()) / f"{stem}_data.tif")
+        path, _ = QFileDialog.getSaveFileName(self, "Save the values", start,
+                                              "TIFF (*.tif *.tiff)")
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() not in (".tif", ".tiff"):
+            p = p.with_suffix(".tif")
+        if self._is_source_file(slot, p):
+            QMessageBox.warning(self, "Save",
+                                "That is the file this image came from — choose "
+                                "another name.")
+            return
+        self._last_save_dir = p.parent
+        desc = (f"{slot.camera or slot.label} | "
+                f"{'counts' if raw else 'display codes'}"
+                f"{f' | full scale {slot.full_scale:.0f}' if slot.full_scale else ''}")
+        err = wk_ops.write_data_tiff(arr, p, desc)
+        if err:
+            QMessageBox.warning(self, "Save error", f"Could not write:\n{p}\n\n{err}")
+            return
+        self._say(f"Values written to {p.name} — "
+                  + ("camera counts" if raw else
+                     "display codes (this image has no camera counts)")
+                  + ", no drawing, no display settings.")
+
+    # ---- writing in the background -------------------------------------------
+
+    def _start_write(self, fn, busy_message: str):
+        """Hand a file-writing job to a worker thread.
+
+        Encoding a dozen frames took seconds on the GUI thread, and the window simply
+        stopped responding while it happened. `fn` must already hold plain arrays and
+        paths — no Qt objects cross the thread."""
+        if self._save_task_busy:
+            self._say("Still writing the last lot — one moment.")
+            return
+        self._save_task_busy = True
+        self._update_enabled()
+        self._say(busy_message)
+        QThreadPool.globalInstance().start(_WriteTask(fn, self._write_sig))
+
+    def _on_write_done(self, message: str, error: str):
+        self._save_task_busy = False
+        self._update_enabled()
+        if error:
+            QMessageBox.warning(self, "Save error", error)
+            self._say("Writing failed.")
+        else:
+            self._say(message)
+
     def _save_all(self):
         if not self._slots:
             return
+        fmt, ok = QInputDialog.getItem(self, "Save all", "Write them as:",
+                                       list(_SAVE_FORMATS), 0, False)
+        if not ok:
+            return
+        suffix = _FORMAT_SUFFIX[fmt]
         folder = QFileDialog.getExistingDirectory(
             self, "Save every image into…", str(self._last_save_dir or Path.home()))
         if not folder:
             return
         self._last_save_dir = Path(folder)
-        ok = fail = 0
+        jobs = []
+        skipped = 0
+        used = set()
         for slot in self._slots:
             img = self._render_for_save(slot)
-            target = Path(folder) / f"{_build_save_stem(slot)}.png"
+            if img is None:
+                skipped += 1
+                continue
+            stem = _build_save_stem(slot)
+            target = Path(folder) / f"{stem}.{suffix}"
             n = 1
-            while target.exists():
-                target = Path(folder) / f"{_build_save_stem(slot)}_{n}.png"
+            # Two frames from the same camera in the same millisecond, or a name that
+            # is already on disk, must not overwrite each other.
+            while target.exists() or target in used:
+                target = Path(folder) / f"{stem}_{n}.{suffix}"
                 n += 1
-            if img is not None and _write_image(img, target):
-                ok += 1
-            else:
-                fail += 1
-        self._say(f"Saved {ok} image(s) into {folder}" + (f", {fail} failed" if fail else ""))
+            used.add(target)
+            jobs.append((_qimage_to_np(img), target))
+        if not jobs:
+            self._say("Nothing to save.")
+            return
+        quality = 95 if fmt == "JPEG" else None
+
+        def work():
+            ok_n = fail_n = 0
+            for arr, path in jobs:
+                try:
+                    im = _PilImg.fromarray(arr)
+                    if quality is not None:
+                        im.save(str(path), quality=quality)
+                    else:
+                        im.save(str(path))
+                    ok_n += 1
+                except Exception:
+                    fail_n += 1
+            msg = f"Saved {ok_n} image(s) as {fmt} into {folder}"
+            if fail_n:
+                msg += f", {fail_n} failed"
+            if skipped:
+                msg += f", {skipped} skipped"
+            return msg, ""
+
+        self._start_write(work, f"Writing {len(jobs)} image(s)…")
+
+    # ---- animation -----------------------------------------------------------
+
+    def _animation_frames(self):
+        """(frames as RGB arrays, labels) for every open image, in list order."""
+        frames, labels = [], []
+        for slot in self._slots:
+            img = self._render_for_save(slot)
+            if img is None:
+                continue
+            frames.append(_qimage_to_np(img))
+            labels.append(slot.label)
+        return frames, labels
+
+    def _play_images(self):
+        if len(self._slots) < 1:
+            return
+        frames, labels = self._animation_frames()
+        if len(frames) < 2:
+            QMessageBox.information(
+                self, "Play",
+                "There is only one image open. Send over or open at least two.")
+            return
+        if self._play_dlg is None:
+            self._play_dlg = _PlayDialog(self)
+        self._play_dlg.set_frames([_np_to_qimage(f) for f in frames], labels)
+        self._play_dlg._ms.setValue(self._anim_ms.value())
+        self._play_dlg._cb_loop.setChecked(self._cb_anim_loop.isChecked())
+        self._play_dlg.show()
+        self._play_dlg.raise_()
+
+    def _save_animation(self):
+        if not self._need_ops():
+            return
+        frames, _labels = self._animation_frames()
+        if len(frames) < 2:
+            QMessageBox.information(
+                self, "Save animation",
+                "An animation needs at least two images. Open or send over some more.")
+            return
+        stem = _build_save_stem(self._slots[0]) if self._slots else "animation"
+        start = str(Path(self._last_save_dir or Path.home()) / f"{stem}_animation.gif")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save animation", start,
+            "Animated GIF (*.gif);;Animated PNG (*.png);;Animated WebP (*.webp)")
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() not in wk_ops.ANIM_SUFFIXES:
+            p = p.with_suffix(".gif")
+        self._last_save_dir = p.parent
+        ms = int(self._anim_ms.value())
+        loop = self._cb_anim_loop.isChecked()
+        sizes = {(f.shape[1], f.shape[0]) for f in frames}
+        n = len(frames)
+
+        def work():
+            err = wk_ops.write_animation(frames, p, ms, loop)
+            if err:
+                return "", f"Could not write the animation:\n{p}\n\n{err}"
+            note = ("" if len(sizes) == 1 else
+                    "  Images of different sizes were centred on black.")
+            return (f"Animation saved: {p.name} — {n} frames, {ms} ms each"
+                    f"{', repeating' if loop else ', played once'}.{note}"), ""
+
+        self._start_write(work, f"Writing {n} frames…")
+
+    # ---- session -------------------------------------------------------------
+
+    def _save_session(self):
+        """Write down the drawing, the regions, the scale and the display settings for
+        every open image.
+
+        The pictures themselves are NOT copied into the file — it stores where they came
+        from. That keeps the file tiny and means it can never disagree with the archive;
+        the cost is that an image the Workshop was handed without a file behind it
+        cannot come back, and the count of those is reported."""
+        if not self._slots:
+            return
+        start = str(Path(self._last_save_dir or Path.home()) / "workshop_session.json")
+        path, _ = QFileDialog.getSaveFileName(self, "Save session", start,
+                                             "Workshop session (*.json)")
+        if not path:
+            return
+        p = Path(path)
+        if p.suffix.lower() != ".json":
+            p = p.with_suffix(".json")
+        images = []
+        homeless = 0
+        for slot in self._slots:
+            if slot.source_path is None:
+                homeless += 1
+            h, w = slot.base.shape[:2]
+            images.append({
+                "label": slot.label,
+                "source_path": None if slot.source_path is None else str(slot.source_path),
+                "size": [int(w), int(h)],
+                "px_per_mm": slot.px_per_mm,
+                "camera": slot.camera,
+                "view": dict(vars(slot.view)),
+                "annots": [a.to_dict() for a in slot.annots],
+            })
+        data = {"format": "ELI Image Tools Workshop session", "version": 1,
+                "saved": datetime.now(tz=_TZ_PRAGUE).isoformat(timespec="seconds"),
+                "images": images}
+        try:
+            p.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(self, "Save error", f"Could not write:\n{p}\n\n{e}")
+            return
+        self._last_save_dir = p.parent
+        msg = f"Session saved: {p.name} — {len(images)} image(s)."
+        if homeless:
+            msg += (f" {homeless} of them has no file behind it, so only its drawing "
+                    f"is written down, not the picture.")
+        self._say(msg)
+
+    def _load_session(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load session", str(self._last_save_dir or Path.home()),
+            "Workshop session (*.json)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as e:
+            QMessageBox.warning(self, "Load error", f"Could not read:\n{path}\n\n{e}")
+            return
+        images = data.get("images") if isinstance(data, dict) else None
+        if not isinstance(images, list) or not images:
+            QMessageBox.warning(self, "Load session",
+                                "That file has no Workshop images in it.")
+            return
+        self._last_save_dir = Path(path).parent
+        opened = missing = resized = 0
+        for entry in images:
+            if not isinstance(entry, dict):
+                continue
+            src = entry.get("source_path")
+            if not src or not Path(src).exists():
+                missing += 1
+                continue
+            before = len(self._slots)
+            self.open_files([src])
+            if len(self._slots) <= before:
+                missing += 1
+                continue
+            slot = self._slots[-1]
+            opened += 1
+            if entry.get("label"):
+                slot.label = str(entry["label"])
+            try:
+                slot.px_per_mm = (None if entry.get("px_per_mm") is None
+                                  else float(entry["px_per_mm"]))
+            except (TypeError, ValueError):
+                pass
+            slot.view = _view_from_dict(entry.get("view"))
+            annots = [_Annot.from_dict(d) for d in (entry.get("annots") or [])]
+            slot.annots = [a for a in annots if a is not None]
+            want = entry.get("size")
+            h, w = slot.base.shape[:2]
+            if isinstance(want, list) and len(want) == 2 and \
+                    (int(want[0]), int(want[1])) != (w, h):
+                # The drawing is in pixel coordinates, so a file that changed size since
+                # the session was saved would put every region in the wrong place. Say
+                # so rather than quietly moving things.
+                resized += 1
+        self._update_slot_list()
+        if self._slots:
+            self._activate_slot(len(self._slots) - 1)
+        self._after_change()
+        msg = f"Session loaded: {opened} image(s) re-opened."
+        if missing:
+            msg += f" {missing} could not be found."
+        if resized:
+            msg += (f" {resized} is no longer the size it was, so its drawing may not "
+                    f"line up.")
+        self._say(msg)
 
     def _copy_clipboard(self):
         slot = self._slot()

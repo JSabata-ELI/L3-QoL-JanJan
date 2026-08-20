@@ -17,7 +17,7 @@ Case 2 below is that bug: the values for the displayed frame must arrive WITHOUT
 operator touching anything. Runs offscreen against a fake archiver transport and local
 files — no share, no network:
 
-  python bench_pv_wait.py
+  python testing/bench_pv_wait.py
 """
 import os
 import shutil

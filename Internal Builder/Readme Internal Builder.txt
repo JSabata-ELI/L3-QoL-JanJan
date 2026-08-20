@@ -1,57 +1,58 @@
-Internal Builder — Information
-Created by Jan Moučka, ELI Laser
+﻿Internal Builder — Short information
+Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
+Detailed version: ReadMe_Internal Builder_Full.txt  ("Details" button)
+-----------------------------------------------------------------
 
-Builds the one shared library folder that all the other programs use.
+WHAT IT IS FOR
 
-Every program here needs the same Python libraries. Instead of each
-build carrying its own copy, this project is built once and its
-_internal folder becomes the shared one.
-
-To hand it out afterwards use Dev Tools → Copy Manager →
-"Build internal" and "Deploy internal". (Extractor is the older,
-manual way of doing the same thing.)
-
-
-=================================================================
-IT IS NOT A PROGRAM
-=================================================================
-
-  _internal_builder.py contains nothing but import lines. It is
-  never run as an application — it exists so that PyInstaller has
-  something to follow. PyInstaller packs whatever is imported, so
-  an import in that file means a library in the shared folder.
-
-  To add a library to the shared folder: import it there.
+  All the programs here need the same set of Python support files.
+  Instead of every program carrying its own copy, this one project is
+  built once and its support folder becomes the shared one that all
+  the programs get.
 
 
-=================================================================
+THE IDEA IN ONE PARAGRAPH
+
+  The build tool packs whatever a program imports. So this project
+  is a file that does nothing but import things. It is never started
+  and has no window — it exists purely to give the build tool a list
+  to follow. Every import in it means one more library in the shared
+  folder.
+
+  To add a library to the shared folder: add an import for it.
+
+
 HOW TO BUILD IT
-=================================================================
 
   Use the .spec file, not the plain command line.
 
-  Both do the same collecting, but the .spec file additionally picks
-  up numpy's own DLL folder (numpy.libs, and scipy.libs when it is
-  there). Those DLLs are not found automatically, and a folder built
-  without them looks fine — the failure only shows up later, as an
-  import error inside a deployed program.
+  Both collect the same libraries, but the .spec file also picks up
+  the extra Windows files that numpy (and scipy) keep in a separate
+  place. Those are not found automatically, and a folder built
+  without them looks perfectly fine — the failure only appears
+  later, as a program on the share refusing to start.
 
-  Running _internal_builder.py directly starts a build too, but that
-  one writes to a fixed path (C:\Dev\dist) and skips the DLL step.
+  Running the .py file directly also starts a build, but it writes to
+  a fixed folder on C: and skips that extra step. Avoid it.
 
 
-=================================================================
-GENERAL NOTES
-=================================================================
+HOW IT REACHES THE OTHER PROGRAMS
 
-  - Some libraries are optional (xlwt, tkcalendar, epics, win32com).
-    If the build machine does not have them, the build still works —
-    the shared folder just will not contain them.
-  - build/ is PyInstaller's working folder, left over from a build.
-    It can be deleted.
-  - For whoever works on the code: STRUCTURE.md.
+  Dev Tools -> Copy Manager -> "Build internal", then
+  "Deploy internal".
+
+  Extractor is the older manual way of doing the same thing.
+
+
+NOTES
+
+  - A few libraries are optional. If the machine you build on does
+    not have them, the build still succeeds and the shared folder
+    simply does without them.
+  - The "build" folder is scratch left over from a build and can be
+    deleted at any time.
 
 -----------------------------------------------------------------

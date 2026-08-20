@@ -19,7 +19,7 @@ Integration:  class SpectraWidget, method cancel_scan()
 
 from __future__ import annotations
 
-import csv, json, os, ssl, sys, threading, urllib.parse, urllib.request
+import csv, json, os, re, ssl, sys, threading, urllib.parse, urllib.request
 from collections import deque
 from datetime import date, datetime, timezone
 
@@ -130,9 +130,27 @@ DEFAULT_LIVE_N  = 100          # default "average last N" value
 LIVE_HISTORY_S  = 600          # on Start Live, preload this many seconds of recent shots
 MAX_INDIVIDUAL_LINES = 400     # cap when overlaying a region's individual spectra
 
+# ── Colour-bar slot on the spectra graph ──────────────────────────────────────
+# The GDD/TOD colour bar lives in ONE permanent axes that is only shown or hidden.
+# It used to be created with fig.colorbar(sm, ax=ax), which takes a slice of the
+# main axes' CURRENT width and never gives it back on Colorbar.remove(): measured,
+# 30 clicks on "Colour by" shrank the plot from 93 % of the figure to 0 % and left
+# the right-hand side blank. Room for the bar now comes from the layout engine's
+# rect, and both values below are absolute — a redraw can never accumulate.
+_CBAR_BOX  = (0.90, 0.13, 0.020, 0.78)   # x, y, w, h of the bar itself
+_CBAR_RECT = (0.0, 0.0, 0.88, 1.0)       # area left to the plot while the bar shows
+_FULL_RECT = (0.0, 0.0, 1.0, 1.0)        # the whole figure, bar hidden
+
 _REGION_COLORS = [
     "#C62828", "#2E7D32", "#EF6C00", "#6A1B9A",
     "#00838F", "#4E342E", "#AD1457", "#37474F",
+]
+
+# Search-graph traces have their own palette, so a PV curve is never drawn in the
+# colour that already stands for a selected spectrum.
+_TRACE_COLORS = [
+    "#1565C0", "#00897B", "#7CB342", "#F9A825",
+    "#5E35B1", "#D81B60", "#00ACC1", "#6D4C41",
 ]
 
 _CHK_STYLE = """
@@ -281,6 +299,82 @@ def _cpva_load_all_channels() -> list:
     except Exception:
         pass
     return []
+
+
+# ── PV-name search (same behaviour as the Image Slider PV picker) ─────────────
+# Camera channels (C03-013-PFM1NF:Exposure, …) are a large slice of the archiver
+# list, so they are ranked last — otherwise a query like "pcm" returns nothing
+# but cameras before the PV the user actually wants shows up.
+_CAM_CHANNEL_RE = re.compile(r"^C\d{2}-\d{2,3}-")
+
+
+def _split_query(text: str) -> list:
+    """Query text → lowercase tokens. Spaces, commas and '*' all separate, so
+    "l3 sbw4", "l3,sbw4" and "*l3**sbw4*" are the same query: every token must
+    appear somewhere in the name (implicit wildcards between them)."""
+    return [t for t in re.split(r"[\s,;*]+", (text or "").strip().lower()) if t]
+
+
+def _tokens_in_order(hay: str, tokens: list) -> bool:
+    """True when every token occurs in `hay` in the order typed."""
+    pos = 0
+    for t in tokens:
+        i = hay.find(t, pos)
+        if i < 0:
+            return False
+        pos = i + len(t)
+    return True
+
+
+def _rank_pv_match(name: str, tokens: list) -> "int | None":
+    """Sort weight of one channel against the tokens (lower = better), or None
+    when it doesn't match. Multi-token queries are AND-matched anywhere in the
+    name; tokens found in the typed order rank above scrambled ones."""
+    if not tokens:
+        return None
+    k = name.lower()
+    field = k.rsplit(":", 1)[-1]
+    worst = 0
+    total = 0
+    for t in tokens:
+        if t == k:
+            s = 0
+        elif field == t:
+            s = 1
+        elif field.startswith(t) or k.startswith(t):
+            s = 2
+        elif t in field:
+            s = 3
+        elif t in k:
+            s = 4
+        else:
+            return None          # AND semantics: one missing token = no hit
+        worst = max(worst, s)
+        total += s
+    # The weakest token decides the tier; the sum only breaks ties.
+    score = worst * 10 + min(total, 9)
+    if len(tokens) > 1 and not _tokens_in_order(k, tokens):
+        score += 5
+    if _CAM_CHANNEL_RE.match(name):
+        score += 100
+    return score
+
+
+def _pv_search(channels, text: str, exclude=None) -> list:
+    """Channel names matching `text`, best first. Empty query → no results."""
+    tokens = _split_query(text)
+    if not tokens:
+        return []
+    skip = exclude or ()
+    scored = []
+    for i, ch in enumerate(channels):
+        if ch in skip:
+            continue
+        s = _rank_pv_match(ch, tokens)
+        if s is not None:
+            scored.append((s, i, ch))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [ch for _s, _i, ch in scored]
 
 
 def _fetch_scalars(channel: str, start_ns: int, end_ns: int) -> list[tuple[int, float]]:
@@ -576,8 +670,8 @@ QCalendarWidget QMenu { color: #111; background: #fff; }
 class _WeekendDelegate(QStyledItemDelegate):
     """Paint calendar cells: selected=blue background, Sat/Sun=red text.
 
-    Weekend detection uses index.column() (col 5=Sat, 6=Sun, Monday-first layout)
-    so spillover-month cells are coloured correctly too.
+    Weekend detection uses the cell's real date, so spillover-month cells are
+    coloured correctly too.
     initStyleOption strips State_Selected for cells not in _selected_keys so that
     Qt's own selection highlight (today after Clear, etc.) never bleeds through.
     """
@@ -586,14 +680,42 @@ class _WeekendDelegate(QStyledItemDelegate):
         self._cal = cal
         self._selected_keys: set = set()   # (year, month, day) tuples
 
+    def _first_cell(self) -> "tuple[int, int]":
+        """Row/column of the first *day* cell. Qt drops the header row when
+        NoHorizontalHeader is set and the week-number column when
+        NoVerticalHeader is set, so the grid does not always start at (1, 1)."""
+        first_row = 1
+        if (self._cal.horizontalHeaderFormat()
+                == QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader):
+            first_row = 0
+        first_col = 1
+        if (self._cal.verticalHeaderFormat()
+                == QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader):
+            first_col = 0
+        return first_row, first_col
+
     def _date_for_index(self, index) -> "QDate | None":
-        """Return the QDate for a model cell, or None for the hidden header row (row 0)."""
-        if index.row() == 0:
+        # The model knows the real date for in-month cells — always prefer it.
+        d = index.data(Qt.ItemDataRole.UserRole)
+        if isinstance(d, QDate) and d.isValid():
+            return d
+        first_row, first_col = self._first_cell()
+        if index.row() < first_row or index.column() < first_col:
+            return None                       # header row / week-number column
+        first = QDate(self._cal.yearShown(), self._cal.monthShown(), 1)
+        if not first.isValid():
             return None
-        year, month = self._cal.yearShown(), self._cal.monthShown()
-        first = QDate(year, month, 1)
-        start = first.addDays(-(first.dayOfWeek() - 1))   # Monday of first displayed week
-        return start.addDays((index.row() - 1) * 7 + index.column())
+        # Column offset of the 1st within the first displayed week.
+        offset = (first.dayOfWeek() - self._cal.firstDayOfWeek().value) % 7
+        row = index.row() - first_row
+        # Qt shifts the whole grid one week back when the 1st sits in the very
+        # first column (QCalendarModel::dateForCell, MinimumDayOffset = 1), so
+        # row 0 then shows the PREVIOUS week. Without this the painted days are
+        # a week off (clicking one day highlighted a different one).
+        if offset < 1:
+            row -= 1
+        start = first.addDays(-offset)
+        return start.addDays(row * 7 + (index.column() - first_col))
 
     def set_selected(self, dates: "list[QDate]"):
         self._selected_keys = {(d.year(), d.month(), d.day()) for d in dates}
@@ -609,11 +731,11 @@ class _WeekendDelegate(QStyledItemDelegate):
             option.state = option.state & ~QStyle.StateFlag.State_Selected
 
     def paint(self, painter, option, index):
-        is_weekend = index.column() in (5, 6)   # Mon=0 … Sat=5, Sun=6
         d = self._date_for_index(index)
         if d is None:
             super().paint(painter, option, index)
             return
+        is_weekend = d.dayOfWeek() in (6, 7)    # weekend from the date, never the column
         is_sel = (d.year(), d.month(), d.day()) in self._selected_keys
         text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
 
@@ -643,7 +765,7 @@ def _make_calendar(initial: "QDate | None" = None) -> "tuple[QFrame, QCalendarWi
       2. The QCalendarWidget with the built-in header hidden.
 
     Weekend cells (Sat/Sun) — including spillover-month cells — are coloured red
-    via _WeekendDelegate which detects weekends by column index (col 5=Sat, 6=Sun).
+    via _WeekendDelegate, which resolves each cell to its real date.
     """
     # ── QCalendarWidget (both built-in headers hidden — we supply our own nav + day row) ──
     cal = QCalendarWidget()
@@ -921,7 +1043,7 @@ class PvSearchDialog(QDialog):
         lay.setSpacing(6)
         lay.addWidget(QLabel("Search for a CPVA channel (type part of the name):"))
         self._edit = QLineEdit()
-        self._edit.setPlaceholderText("e.g. HAPLS-ENER or L3-SPFE or GDD")
+        self._edit.setPlaceholderText('search any archiver PV…  (e.g. "l3 sbw4")')
         self._edit.textEdited.connect(self._filter)
         lay.addWidget(self._edit)
         self._lbl_status = QLabel("Loading channels from CPVA…")
@@ -966,11 +1088,10 @@ class PvSearchDialog(QDialog):
         self._filter(self._edit.text())
 
     def _filter(self, text: str):
-        q = text.strip().lower()
         self._lst.clear()
-        if not q or not self._all_channels:
+        if not text.strip() or not self._all_channels:
             return
-        matches = [ch for ch in self._all_channels if q in ch.lower()]
+        matches = _pv_search(self._all_channels, text)
         for ch in matches[:300]:
             self._lst.addItem(ch)
         extra = f" (showing top 300)" if len(matches) > 300 else ""
@@ -1069,7 +1190,7 @@ class XAxisSourceDialog(QDialog):
 
         # channel picker (shared by 'pv' and 'linear')
         self._edit = QLineEdit()
-        self._edit.setPlaceholderText("Type part of an _X channel name…")
+        self._edit.setPlaceholderText('search _X channels…  (e.g. "l3 sbw4")')
         self._edit.textEdited.connect(self._filter)
         lay.addWidget(self._edit)
         self._lbl_status = QLabel("Loading channels from CPVA…")
@@ -1133,11 +1254,10 @@ class XAxisSourceDialog(QDialog):
         self._filter(self._edit.text())
 
     def _filter(self, text: str):
-        q = text.strip().lower()
         self._lst.clear()
-        if not q or not self._all_channels:
+        if not text.strip() or not self._all_channels:
             return
-        matches = [ch for ch in self._all_channels if q in ch.lower()]
+        matches = _pv_search(self._all_channels, text)
         for ch in matches[:300]:
             self._lst.addItem(ch)
         extra = " (top 300)" if len(matches) > 300 else ""
@@ -1228,7 +1348,7 @@ class PresetEditDialog(QDialog):
 
         right.addWidget(QLabel("Search channels to add (or click a green row to deselect):"))
         self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("Type part of the channel name…")
+        self._search_edit.setPlaceholderText('search any archiver PV…  (e.g. "l3 sbw4")')
         self._search_edit.textEdited.connect(self._refresh_list)
         right.addWidget(self._search_edit)
         self._lbl_search = QLabel("Loading channels from CPVA…")
@@ -1330,8 +1450,7 @@ class PresetEditDialog(QDialog):
 
         # 2. Search results below (not already selected)
         if q and self._all_channels:
-            matches = [ch for ch in self._all_channels
-                       if q in ch.lower() and ch not in sel_channels]
+            matches = _pv_search(self._all_channels, q, exclude=sel_channels)
             for ch in matches[:300]:
                 item = QListWidgetItem(ch)
                 item.setData(Qt.ItemDataRole.UserRole, ch)
@@ -1636,10 +1755,17 @@ class SpectraWidget(QWidget):
         self._blink_on          = False
         self._busy              = False
         self._cancel            = threading.Event()
+        self._cax_bot:          object | None            = None   # permanent colour-bar slot
         self._colorbar_bot:     object | None            = None
         self._colorbar_info:    dict   | None            = None
         self._twin_bot:         object | None            = None   # ratio compare axis
         self._last_saved_layout: dict                    = {}
+        # Right margin the user set by hand in the Subplots dialog, if any. Only
+        # meaningful while the layout engine is off — see _set_cbar_space().
+        self._bot_right_base:   float  | None            = None
+        # Splitter ratio the user last dragged. _update_top_visibility() restores
+        # THIS instead of resetting to a hard-coded pair on every mode switch.
+        self._split_ratio:      list                     = [440, 320]
 
         self._build_ui()
         self._connect_signals()
@@ -1790,7 +1916,7 @@ class SpectraWidget(QWidget):
 
         # ── Inline channel search (fast add) ───────────────────────────
         self._edit_pv_search = QLineEdit()
-        self._edit_pv_search.setPlaceholderText("🔍  filter CPVA channels…")
+        self._edit_pv_search.setPlaceholderText('🔍  search CPVA channels…  (e.g. "l3 sbw4")')
         self._edit_pv_search.setToolTip("Type part of a channel name; click a result to add it to the list.")
         sl.addWidget(self._edit_pv_search)
         self._lst_pv_search = QListWidget()
@@ -2056,6 +2182,14 @@ class SpectraWidget(QWidget):
         v.setSpacing(0)
         fig = Figure(tight_layout={"pad": 0.3})
         ax  = fig.add_subplot(111)
+        if suffix == "bot":
+            # Permanent colour-bar slot — created once, then only shown or hidden.
+            # set_in_layout(False) keeps tight_layout from warning about an axes with
+            # no subplotspec; the plot's own room is steered by _set_cbar_space().
+            cax = fig.add_axes(_CBAR_BOX)
+            cax.set_in_layout(False)
+            cax.set_visible(False)
+            self._cax_bot = cax
         canvas = FigureCanvasQTAgg(fig)
         canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # Matplotlib tints toolbar icons from the palette: on a dark inherited
@@ -2827,6 +2961,23 @@ class SpectraWidget(QWidget):
         else:
             self._set_status(f"Spectrum PV: {base}  (X: {self._x_axis_summary()})")
 
+    def _set_cbar_space(self, on: bool):
+        """Reserve or release the width the colour bar needs on the spectra graph.
+
+        Idempotent on purpose: both branches SET an absolute value rather than
+        adjusting the current one, so running this on every redraw can never
+        accumulate. That accumulation was the bug — see _CBAR_BOX."""
+        fig = self._fig_bot
+        eng = fig.get_layout_engine()
+        if eng is not None and hasattr(eng, "set"):
+            eng.set(rect=_CBAR_RECT if on else _FULL_RECT)
+        elif self._bot_right_base is not None:
+            # Layout engine is off because the user set the margins by hand in the
+            # Subplots dialog. Squeeze the plot only as far as the bar needs, always
+            # measured from the margin THEY chose, never from the current one.
+            base = self._bot_right_base
+            fig.subplots_adjust(right=min(base, _CBAR_RECT[2]) if on else base)
+
     def _save_layout(self, *_):
         """Persist splitter sizes and (when manually adjusted) subplot margins."""
         data: dict = {"splitter": self._splitter.sizes()}
@@ -2839,6 +2990,11 @@ class SpectraWidget(QWidget):
                 sp = fig.subplotpars
                 data[key] = {k: round(getattr(sp, k), 4)
                              for k in ("left", "right", "top", "bottom", "hspace", "wspace")}
+                # Remember the right margin the user actually chose. Skip it while
+                # the colour bar is up, or the squeezed value would become the base
+                # and the plot would never grow back.
+                if suffix == "bot" and self._colorbar_bot is None:
+                    self._bot_right_base = sp.right
         if data == self._last_saved_layout:
             return
         self._last_saved_layout = data
@@ -2861,6 +3017,10 @@ class SpectraWidget(QWidget):
             sizes = data["splitter"]
             if isinstance(sizes, list) and len(sizes) == 2 and all(s >= 0 for s in sizes):
                 self._splitter.setSizes([int(s) for s in sizes])
+                # A collapsed top graph is a "search graph hidden" state, not a
+                # ratio — keep the previous default so unhiding it works.
+                if sizes[0] > 0:
+                    self._split_ratio = [int(s) for s in sizes]
         _sp_keys = ("left", "right", "top", "bottom", "hspace", "wspace")
         for suffix, key in (("top", "fig_top"), ("bot", "fig_bot")):
             params = data.get(key)
@@ -2871,6 +3031,8 @@ class SpectraWidget(QWidget):
                 kwargs = {k: float(params[k]) for k in _sp_keys if k in params}
                 fig.set_layout_engine(None)   # disable tight_layout; use saved params
                 fig.subplots_adjust(**kwargs)
+                if suffix == "bot":
+                    self._bot_right_base = kwargs.get("right", fig.subplotpars.right)
             except Exception:
                 pass
 
@@ -2881,6 +3043,16 @@ class SpectraWidget(QWidget):
     def _active_search_label(self) -> str:
         row = self._tbl_pvs.currentRow()
         return self._search_pvs[row][0] if 0 <= row < len(self._search_pvs) else "Signal"
+
+    def _trace_colour(self, channel: str) -> str:
+        """Colour of one search-graph trace, tied to the PV ITSELF (its place in the
+        PV list), never to its position among the loaded curves. Keyed by position in
+        the loaded set, a PV with no data that day — or any reorder — silently handed
+        every other curve a different colour."""
+        for i, (_lbl, ch) in enumerate(self._search_pvs):
+            if ch == channel:
+                return _TRACE_COLORS[i % len(_TRACE_COLORS)]
+        return _TRACE_COLORS[0]
 
     def _refresh_pv_table(self, select_row: int = 0):
         self._tbl_pvs.blockSignals(True)
@@ -3028,7 +3200,7 @@ class SpectraWidget(QWidget):
             self._ensure_channels_loaded()
             self._lst_pv_search.setVisible(False)
             return
-        matches = [ch for ch in _cpva_channel_cache if q in ch.lower()]
+        matches = _pv_search(_cpva_channel_cache, q)
         for ch in matches[:200]:
             self._lst_pv_search.addItem(ch)
         self._lst_pv_search.setVisible(bool(matches))
@@ -3190,11 +3362,11 @@ class SpectraWidget(QWidget):
         # Drop the "last value before start" sample EPICS returns, so the axis
         # is clamped to the selected day instead of stretching to the previous day.
         out = []
-        for i, s in enumerate(series):
+        for s in series:
             d = [(t, v) for (t, v) in s["data"]
                  if self._day_start_ns <= t <= self._day_end_ns]
             out.append({"label": s["label"], "channel": s["channel"],
-                        "color": _REGION_COLORS[i % len(_REGION_COLORS)], "data": d})
+                        "color": self._trace_colour(s["channel"]), "data": d})
         self._energy_data = out
         total = sum(len(s["data"]) for s in out)
         if total == 0:
@@ -3292,18 +3464,22 @@ class SpectraWidget(QWidget):
             times = np.array([mdates.date2num(_ns_to_dt(t)) for t, _ in data])
             vals  = np.array([v for _, v in data], dtype=float)
             is_active = (s["channel"] == active_ch)
+            # Colour is looked up per PV on every draw, so it survives a reload, a
+            # day with no data for one PV and any change to the PV list.
+            col = self._trace_colour(s["channel"])
+            s["color"] = col
             # Archived values hold until the next sample (zero-order hold), so a
             # step-after line reflects the real signal — no false linear ramps.
             a.plot(times, vals, "-", drawstyle="steps-post",
                    lw=2.0 if is_active else 1.0,
-                   color=s["color"], alpha=0.9, marker=".", ms=3,
+                   color=col, alpha=0.9, marker=".", ms=3,
                    label=s["label"], zorder=5 if is_active else 3)
-            a.set_ylabel(s["label"], color=s["color"])
-            a.tick_params(axis="y", colors=s["color"])
+            a.set_ylabel(s["label"], color=col)
+            a.tick_params(axis="y", colors=col)
             spine = "left" if side == "left" else "right"
-            a.spines[spine].set_color(s["color"])
+            a.spines[spine].set_color(col)
             self._top_cursor_series.append({
-                "label": s["label"], "color": s["color"], "axis": a,
+                "label": s["label"], "color": col, "axis": a,
                 "side": side, "times": times, "vals": vals,
             })
 
@@ -3747,6 +3923,13 @@ class SpectraWidget(QWidget):
     def _draw_bot_empty(self, msg: str = "Analyze a spectrum in the search graph"):
         ax = self._ax_bot
         ax.clear()
+        # An empty graph never carries a colour bar — hide the slot and hand the
+        # width back, so the placeholder text is centred in the whole figure.
+        self._colorbar_bot = None
+        if self._cax_bot is not None:
+            self._cax_bot.clear()
+            self._cax_bot.set_visible(False)
+        self._set_cbar_space(False)
         ax.set_facecolor("white")
         ax.text(0.5, 0.5, msg, transform=ax.transAxes,
                 ha="center", va="center", color="#aaa", fontsize=11)
@@ -3997,9 +4180,11 @@ class SpectraWidget(QWidget):
         order_label = self._color_order_label()
         ax = self._ax_bot
         self._bot_redrawing = True
-        if self._colorbar_bot is not None:
-            self._colorbar_bot.remove()
-            self._colorbar_bot = None
+        # The colour bar is never removed — its axes is permanent, we just wipe it.
+        self._colorbar_bot = None
+        if self._cax_bot is not None:
+            self._cax_bot.clear()
+            self._cax_bot.set_visible(False)
         if self._twin_bot is not None:
             self._twin_bot.remove()
             self._twin_bot = None
@@ -4062,7 +4247,7 @@ class SpectraWidget(QWidget):
             ax.set_xlim(x_min, x_max)
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=9)
-            if self._colorbar_info is not None:
+            if self._colorbar_info is not None and self._cax_bot is not None:
                 sm = _mpl_cm.ScalarMappable(
                     cmap=self._colorbar_info["cmap"],
                     norm=_mpl_colors.Normalize(
@@ -4071,11 +4256,13 @@ class SpectraWidget(QWidget):
                     ),
                 )
                 sm.set_array([])
-                self._colorbar_bot = self._fig_bot.colorbar(
-                    sm, ax=ax, fraction=0.04, pad=0.01, aspect=30
-                )
+                self._cax_bot.set_visible(True)
+                self._set_cbar_space(True)
+                self._colorbar_bot = self._fig_bot.colorbar(sm, cax=self._cax_bot)
                 self._colorbar_bot.set_label(self._colorbar_info["label"], fontsize=9)
                 self._colorbar_bot.ax.tick_params(labelsize=8)
+            else:
+                self._set_cbar_space(False)
             # ax.clear() above detached the crosshair artists — recreate them so a
             # queued cursor redraw doesn't draw an orphaned Text (NoneType .dpi crash).
             self._install_bot_cursor_artists()

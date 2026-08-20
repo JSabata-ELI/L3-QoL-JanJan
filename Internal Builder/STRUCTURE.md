@@ -2,6 +2,11 @@
 
 > Verified against source: 2026-08-19 · `_internal_builder.py` 169 L
 
+User-facing documentation: `Readme Internal Builder.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Internal Builder_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
+
 ## Files
 
 | File | Description |

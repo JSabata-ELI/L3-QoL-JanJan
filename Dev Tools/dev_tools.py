@@ -55,13 +55,8 @@ def main():
     root = tk.Tk()
     root.title("Dev Tools")
     set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.DevTools")
-    root.geometry("950x780")
-    root.minsize(900, 600)
-
-    try:
-        ttk.Style(root).configure("Focused.TFrame")
-    except Exception:
-        pass
+    root.geometry("1180x820")
+    root.minsize(1060, 620)
 
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, side="top")
@@ -69,9 +64,9 @@ def main():
     # Sdílený log widget — fyzicky žije v CM tabu, Builder do něj píše přes log_widget
     cm_tab = DeployGUI(nb)
 
-    def _on_build_done(built_projects, build_summary=None):
+    def _on_build_done(built_projects, build_summary=None, build_info=None):
         nb.select(cm_tab)
-        cm_tab.auto_deploy(built_projects, build_summary=build_summary)
+        cm_tab.auto_deploy(built_projects, build_summary=build_summary, build_info=build_info)
 
     builder_tab = BuilderUI(nb, on_build_done=_on_build_done, log_widget=cm_tab.log)
     builder_tab._cm_ref = cm_tab

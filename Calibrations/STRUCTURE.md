@@ -2,6 +2,11 @@
 
 > Verified against source: 2026-08-19 · `cal.py` 1055 L
 
+User-facing documentation: `Readme_calibrations.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Calibrations_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
+
 ## Files
 
 | File | Description |

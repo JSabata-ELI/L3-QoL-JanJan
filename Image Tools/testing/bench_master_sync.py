@@ -24,8 +24,8 @@ the wrong one would make a correct implementation look broken.
 
 Runs offscreen against synthetic local files — no share, no network:
 
-  python bench_master_sync.py
-  python bench_master_sync.py --cams 4 --frames 60
+  python testing/bench_master_sync.py
+  python testing/bench_master_sync.py --cams 4 --frames 60
 """
 import argparse
 import bisect

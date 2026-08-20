@@ -19,7 +19,7 @@ panel that never asks the archiver again:
 Runs offscreen against a fake archiver transport and local files — no share, no
 network:
 
-  python test_pv_resilience.py
+  python testing/test_pv_resilience.py
 """
 import tempfile
 import threading

@@ -5,7 +5,7 @@ description: Line-by-line class/function map of all files in Image Tools — rea
 
 Image Tools — PySide6 multi-tab image viewer
 Files (verified 2026-08-19): `main.py` (275 L) | `if_t.py` (8627 L) | `is_t.py` (23916 L) |
-`sf_t.py` (3637 L) | `wk_t.py` (3781 L) | `cpva_client.py` (1316 L) | `img_scale.py` (640 L)
+`sf_t.py` (4085 L) | `wk_t.py` (7281 L) | `cpva_client.py` (1316 L) | `img_scale.py` (673 L)
 
 Line numbers are approximate anchors — they drift as the files change, and every file
 here has grown since the section below it was written. **Re-grep the symbol name**
@@ -37,7 +37,7 @@ The ONE owner of the intensity scale, imported by all four tabs through their
 | `FrameMeta` / `scale_note` | | peak counts, % of full scale, bit depth, mapping — the readout line |
 | `_text_chunks` / `max_value_from_info` / `read_max_value` / `read_frame_meta` / `meta_from_info` | | PNG-only metadata access; prefer `meta_from_info(img.info, arr)` — a second open of a file on the share costs 130–160 ms |
 
-`test_scale_invariance.py` (119 L, not shipped) checks the storage rule against real
+`testing/test_scale_invariance.py` (119 L, not shipped) checks the storage rule against real
 archive frames; run it from the lab after any archiver change.
 
 ---
@@ -106,12 +106,12 @@ the first activation of tab index 1.
 |------|----------|---------|
 | L137/161 | `_import_cpva_client` / `_get_slider_module` | lazy, frozen-aware imports |
 | L155/170 | `_import_img_scale` / `img_scale` | sibling import of the shared intensity-scale module (one instance per process) |
-| L179/186 | `_cpva_fetch_samples` / `_cpva_best_shot_ns` | archiver |
+| L179 | `_cpva_fetch_samples` (best shot: `cpva.best_shot_ns`) | archiver |
 | L219/232 | `_cam_totalpower_channel` / `_cpva_active_windows_ns` | merged beam-active windows |
 | L373-390 | `_make_lut` / `_make_binary_lut` / `_make_stepped_lut` | LUTs |
 | L426/431 | `_app_dir` / `load_readme_text` | |
 | L536 | `_read_img_max_value` | the frame's PEAK in raw counts (`MaxValue` tEXt, by NAME) — empty-frame test only |
-| L550/563 | `_render_u8` / `_scale_note` | the tab's one render step (absolute or `Auto stretch`) and the readout line under the preview |
+| L550/563 | `_render_u8` / `_scale_note` | the tab's one render step (absolute or the Auto stretch, then gamma and the manual Contrast / Brightness pair — all of it in `img_scale.render_u8`) and the readout line under the preview, which names every one of them |
 | L581 | `_image_is_nonempty` | frame peak, contrast fallback |
 | L641/666 | `_style_calendar` / `_make_mpl_toolbar` | house calendar QSS; toolbar built so the dark palette does not tint the icons away |
 | L789 | `_make_multiselect_calendar` | multi-select calendar factory |
@@ -221,7 +221,7 @@ the first activation of tab index 1.
 | Line | Function | Purpose |
 |------|----------|---------|
 | L137 | `_import_cpva_client` | lazy import |
-| L162-237 | `_pv_date_key`, `_pv_prev_date_key`, `_pv_last_known_ex` (delegates to `cpva.lookup_near`), `_pv_decorate`, `_pv_last_known`, `_format_pv_value`, `pv_text_for_ts` | PV value at a frame's timestamp |
+| L162-237 | `_pv_last_known_ex` (delegates to `cpva.lookup_near`), `_pv_decorate`, `_pv_last_known`, `_format_pv_value`, `pv_text_for_ts` | PV value at a frame's timestamp (day keys come from `cpva.date_key_for_ns` / `cpva.prev_date_key`) |
 | L265/283/296 | `pv_warm_days` / `_pv_bar_font` / `render_pv_bar_below` | pre-warm; white PV bar under a PIL image |
 | after `render_pv_bar_below` | `diag_note` / `qt_pv_bar_below` | one timestamped line into `image_tools_diag.log`; the same PV bar drawn with Qt — the fallback used when the PIL route (temp file + PIL + a Windows TTF, all reached at save time from a network share) fails, so a save can no longer lose its values silently |
 | L379-421 | `_copy_metadata_into_png(_bg)` / `_save_png_metadata_txt` | metadata passthrough |
@@ -325,7 +325,7 @@ the first activation of tab index 1.
 | L53-70 | `_make_lut_sf` / `_make_binary_lut_sf` / `_make_stepped_lut_sf` | LUTs |
 | L141/168 | `_import_cpva_client` / `_get_slider_module` | lazy imports |
 | L236/251 | `_import_img_scale` / `img_scale` | sibling import of the shared intensity-scale module |
-| L309/321 | `_render_u8` / `_full_scale_for_mode` | the tab's one render step (absolute or `Auto stretch`); full scale from the decoded MODE, never from `arr.max()`. The old `_read_img_max_value` is gone — the render paths were its only callers |
+| L309/321 | `_render_u8` / `_full_scale_for_mode` | the tab's one render step (absolute or the Auto stretch, then gamma and the manual Contrast / Brightness pair — all of it in `img_scale.render_u8`); full scale from the decoded MODE, never from `arr.max()`. The old `_read_img_max_value` is gone — the render paths were its only callers |
 | L236/244 | `_cpva_fetch_samples` / `_cpva_fetch_channels` | archiver |
 | L250 | `_load_csv_for_day` | daily CSV → merged + per-col |
 | **L308** | `_load_api_for_day` | per-column API + CSV fallback → `(merged, per_col, col_meta)`; does **not** fall back to CSV on an API *error* (source mixing caused the waveplate 500k/0 alternation) |
@@ -359,15 +359,23 @@ the first activation of tab index 1.
 
 ---
 
-## wk_t.py — Workshop tab (2846 L, rewritten 2026-08-18)
+## wk_t.py — Workshop tab (7281 L)
 
-Display settings never change pixels — see the wk_t section of STRUCTURE.md for the
-reasoning; this table is only a map.
+Display settings never change pixels, and a filter changes the counts the same way it
+changes the picture — see the wk_t section of STRUCTURE.md for the reasoning; this table
+is only a map.
+
+The file is three blocks: **PIXEL OPERATIONS** and **BEAM MEASUREMENTS**, both Qt-free,
+then the tab. The panel reaches the first two through the names `wk_ops` and `wk_beam`,
+which are bound to this module itself.
 
 ### Module level
 | Name | Purpose |
 |------|---------|
-| `_import_img_scale` / `_get_slider_module` | sibling imports (frozen-aware, one instance); the second one is why there is no fourth palette copy here any more |
+| `_import_sibling` / `_import_img_scale` / `_get_slider_module` | sibling imports (frozen-aware, one instance); the last one is why there is no fourth palette copy here any more |
+| **PIXEL OPERATIONS** — `median` / `gaussian` / `sharpen` / `edges`, `background_map` + `subtract_background` (+ `BACKGROUND_MODES`), `project` (+ `PROJECT_MODES`) / `merge_rg` / `common_shape` / `luma`, `rotate` / `rotate_size` / `rotate_point_map` / `_rotate_matrix`, `bin_pixels`, `pad_frames` / `write_animation` (+ `ANIM_SUFFIXES`) / `write_data_tiff`; helpers `_ndimage` / `has_scipy` / `_limits` / `_restore` / `_per_channel` / `_box_mean` / `_gauss_1d` / `_sep_convolve` / `_box_extreme` / `_surface_fit` / `_pil_resample` | arrays in, NEW arrays out — never in place, because the undo history shares references. scipy where it helps, numpy fallback always |
+| **BEAM MEASUREMENTS** — `baseline_value`, `width_at_fraction`, `profile_metrics`, `gaussian_fit`, `beam_stats`, `radial_profile`, `encircled_energy`, `_gray` | a baseline is subtracted before any moment and reported with the result |
+| `wk_ops` / `wk_beam` / `_OPS_ERROR` / `_BEAM_ERROR` | the two names the panel calls through, both this module; the error strings are what `_update_enabled` greys buttons out on |
 | `_load_palettes` → `GRADIENTS` / `ADAPTIVE_PALETTES` / `CYCLIC_PALETTES` / `PALETTE_NAMES` | borrowed from `is_t`, with a five-entry local fallback. Looked up **by name** — is_t persists palette choices by index |
 | `_np_to_qimage` / `_qimage_to_np` / `_arr_to_pil` / `_to_gray` / `_write_image` | conversions |
 | `_TZ_PRAGUE` | `ZoneInfo("Europe/Prague")` |
@@ -386,8 +394,9 @@ reasoning; this table is only a map.
 | `_RawSignals` / `_RawLoadTask` | background re-read of `source_path` for the native counts |
 | `WorkshopCanvas(QWidget)` | `TOOL_*`; `set_slot`, `refresh`, `set_compare`, `_ensure_image`, `fit_to_view` / `zoom_reset` / `_zoom_at` / `set_zoom_percent` / `zoom_to_rect`, `wheelEvent`, `resizeEvent` (keeps the zoom), mouse + key handlers, `add_annot` / `delete_selected` / `clear_annots` / `update_labels`, `paintEvent` / `_paint_pixel_values` / `_paint_handles`, `crop_to`, drag-and-drop |
 | `_FallbackSection` / `_section_cls` | stand-in for `is_t.CollapsibleSection` |
-| `_StatCell` / `_HistogramWidget` / `_PlotWidget` / `ProfileDialog` | painted by hand — no matplotlib, so no toolbar icon-tinting workaround needed |
-| `WorkshopWidget(QWidget)` | `_build_tool_strip` + `_build_*_section`, `receive_image`, `open_files`, `_activate_slot`, `_on_view_control` / `_apply_view_now` / `_sync_view_controls`, `_refresh_measure`, `_set_scale`, `_show_profile`, `_rotate` / `_flip` / `_resize_dialog` / `_do_diff`, `_update_compare`, `_render_for_save` / `_save` / `_save_all` / `_copy_clipboard`, `_after_change` |
+| `_StatCell` / `_HistogramWidget` / `_PlotWidget` / `ProfileDialog` / `_TableDialog` / `_CurveDialog` / `_PlayDialog` | painted or plain-Qt by hand — no matplotlib, so no toolbar icon-tinting workaround needed. `_PlayDialog` uses a PreciseTimer: a default Qt timer at 33 ms fires at about 21 Hz on Windows |
+| `_WriteSignals` / `_WriteTask` | anything that writes files, off the GUI thread (Save all, animation) |
+| `WorkshopWidget(QWidget)` | `_build_tool_strip` + `_build_*_section` (images / display / measure / beam / filters / edit / combine / compare / save), `receive_image`, `open_files`, `_add_derived_slot`, `_duplicate_slot`, `_paste_clipboard`, `_show_in_slider`, `_activate_slot`, `_on_view_control` / `_apply_view_now` / `_sync_view_controls`, `_refresh_measure` / `_measure_table` / `_show_results` / `_show_histogram_numbers`, `_set_scale` / `_add_scale_bar`, `_show_profile`, `_beam_stats` / `_show_beam_report` / `_show_radial` / `_show_encircled` / `_mark_centroid`, `_editing_blocked`, `_apply_to_both` + `_filter_*`, `_rotate` / `_flip` / `_resize_dialog` / `_rotate_arbitrary` / `_straighten` / `_bin_dialog` / `_do_diff`, `_do_project` / `_do_merge`, `_update_compare`, `_render_for_save` / `_save` / `_save_data_tiff` / `_save_all` / `_save_animation` / `_play_images` / `_copy_clipboard`, `_save_session` / `_load_session`, `_canvas_menu`, `_after_change`, `_update_enabled` |
 
 ---
 
@@ -551,7 +560,7 @@ continued.
   `_pv_is_held` is defined by "read for a different frame" (`_pv_held_age_s`) first, so a
   retargeted value can never render unflagged, and `_pv_is_pending` (⟳) is measured against
   the fetch TARGET rather than the screen, or a deliberate offset would light it.
-- **`bench_pv_wait.py`** pins it offscreen against a fake transport: the previous shot's
+- **`testing/bench_pv_wait.py`** pins it offscreen against a fake transport: the previous shot's
   number is never shown unflagged as this frame's, the correct value arrives with no user
   interaction, a 3.3 Hz burst shows the last published shot labelled `(-0.6 s)` and then
   catches up, and browsing back reads every shot's own value.
@@ -577,7 +586,7 @@ program brought them back. Plus: `wait` and `old` do not say what they mean.
 
 The panel is **single-flight** — while one archiver fetch is in flight no other starts —
 so anything that stops a fetch from ever finishing freezes the values for the rest of the
-session. Two ways that could happen, both fixed and both pinned by `test_pv_resilience.py`:
+session. Two ways that could happen, both fixed and both pinned by `testing/test_pv_resilience.py`:
 - **cpva `_INFLIGHT_MAX_WAIT_S`**: `get_day` waiters used to block on another thread's
   `_InFlight` record with **no bound**. A fetcher that vanished after registering itself
   (an exception in the few lines that sat outside the `try`, a killed thread) left the

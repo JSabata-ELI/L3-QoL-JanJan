@@ -1,6 +1,6 @@
 # Git Work — STRUCTURE
 
-> Verified against source: 2026-08-19 · `git_work.py` 1191 L
+> Verified against source: 2026-08-19 · `git_work.py` 1218 L
 
 ## Files
 
@@ -10,7 +10,10 @@
 | `icon.ico` | Window / taskbar icon (optional — dropped in by hand). |
 | `%APPDATA%\GitWork\config.json` | Only the chosen repository path. |
 
-User-facing documentation is in `ReadMe_Git Work.txt`.
+User-facing documentation: `ReadMe_Git Work.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Git Work_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
 ---
 

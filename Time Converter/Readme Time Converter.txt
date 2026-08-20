@@ -1,89 +1,65 @@
-﻿Time Converter — Information
-Created by Jan Moučka, ELI Laser
+﻿Time Converter — Short information
+Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
+Detailed version: ReadMe_Time Converter_Full.txt  ("Details" button)
+-----------------------------------------------------------------
 
-Batch file renaming utility that converts UNIX nanosecond
-timestamps embedded in filenames to human-readable datetime
-format, then copies the renamed files to a chosen destination.
+WHAT IT DOES
 
+  Camera files come out of the archive with a machine timestamp at
+  the end of the name, for example
 
-=================================================================
-WORKFLOW
-=================================================================
+      image_1746262710366145024.png
 
-1. START
-   - On launch, two options are shown:
-     * Convert to local time (Europe/Prague) — ON by default.
-       Turn off to keep UTC.
-     * Show detailed report after copying — ON by default.
+  which nobody can read. This tool copies the files somewhere you
+  choose and renames the copies so the time is readable:
 
-2. SELECT FILES
-   - Choose one or more files via the file picker, or select an
-     entire folder (all files in the folder are included).
+      image_2026_05_03--08_18_30__366145.png
 
-3. SELECT DESTINATION
-   - Pick the target folder where renamed copies will be saved.
-
-4. PREVIEW
-   - A preview table shows the planned rename for every file:
-     Prefix | Original timestamp | Orig. UTC | New name | Status
-   - Dashboard shows counts: Will copy / Will overwrite / Will skip.
-   - Statuses are colour-coded:
-       Green  — will copy (new file)
-       Blue   — will overwrite (file already exists at destination)
-       Grey   — skip (already converted, no timestamp, or out of range)
-       Orange — warning (unusual situation)
-       Red    — error
-   - Click Proceed to start, or Cancel to go back.
-
-5. PROGRESS
-   - A progress bar shows X / Total (percentage) and elapsed time.
-   - Click Cancel at any time to abort mid-way.
-
-6. REPORT
-   - After completion a summary shows total copied, skipped, and
-     any errors encountered.
+  The originals are never touched. Only copies are written.
 
 
-=================================================================
-FILENAME FORMAT
-=================================================================
+HOW IT WORKS
 
-  Input:  any file whose name ends with a UNIX nanosecond
-          timestamp, e.g. "image_1746262710366145024.png"
-
-  Output: "image_2026_05_03--08_18_30__366145.png"
-          (Prague local time by default)
-
-  So: underscores inside the date and inside the time, two hyphens
-  between them, and six digits of fractional seconds
-  (microseconds) after the double underscore.
-
-  Files that have already been converted are skipped
-  automatically, recognised by that exact pattern:
-  YYYY_MM_DD--HH_MM_SS__ffffff
-
-  A "-_-" or "_-_" run in the original name is tidied up to a
-  single underscore first, which is what the camera archive tends
-  to produce.
-
-  Valid timestamp range: 2000-01-01 to 2100-01-01. A trailing
-  number outside it is treated as "not a timestamp" and the file
-  is skipped rather than given a nonsense name.
+  - It reads the long number at the end of the name and turns it
+    into a date and a time.
+  - By default the time is shown in Prague local time. You can
+    switch that off in the first window and keep UTC instead.
+  - A file that already has a readable name is recognised and
+    skipped, so you can safely run the tool twice over the same
+    folder.
+  - A file with no number at the end, or with a number that is not
+    a plausible time, is skipped rather than given a nonsense name.
+  - Nothing is copied until you have seen the full list of what
+    will happen and confirmed it.
 
 
-=================================================================
-GENERAL NOTES
-=================================================================
+THE FOUR STEPS
 
-  - Original files are never modified — only copies are made.
-  - Copying runs on four threads at once, and the progress window
-    estimates the remaining time from the rate so far.
-  - The window auto-sizes to fit the content width.
-  - After a run it goes back to the start, so several batches can
-    be done without restarting.
-  - For whoever works on the code: STRUCTURE.md.
+  1. Options       Prague time on/off, detailed report on/off.
+  2. Pick files    the picker opens in the camera archive on the
+                   network. Select one file, or several, or press
+                   Ctrl+A to take everything in the folder. There is
+                   no folder picker for the source.
+  3. Pick target   the folder the copies go into. Opens in your
+                   Documents folder.
+  4. Preview       one line per file, with the new name and what
+                   will happen to it, plus counts at the top.
+                   Press Proceed to start, Cancel to go back.
+
+  A progress bar shows how far it is and how long is left, and can
+  be cancelled at any point. At the end you get a summary, and the
+  tool returns to step 1 so you can do another batch.
+
+
+THE COLOURS IN THE LIST
+
+  Green   will be copied
+  Blue    will replace a file that is already in the target folder
+  Grey    skipped
+  Orange  something unusual, worth a look
+  Red     error
 
 -----------------------------------------------------------------

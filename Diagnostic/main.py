@@ -23,21 +23,40 @@ APP_DIR = Path(__file__).parent
 
 # PID lock file: lets remote_launcher.py tell whether the app is already
 # running (so a Webex "run diagnostic" command doesn't spawn a second copy).
+#
+# Written in TWO places. This one sits next to the program and is kept only so
+# an older watcher still finds it; the one that counts is the shared status file
+# in %APPDATA%\Diagnostic (alerting.run_status_path). Next to the program is not
+# a usable meeting point any more: the app now starts either from here or from a
+# built version under C:\Dev\dist\Diagnostic\vX.Y.Z, and each of those would keep
+# its own lock — so a watcher started from one folder would never see a copy
+# launched from the other, and would open a second one.
 LOCK_FILE = APP_DIR / "diagnostic.lock"
 
 
 def _acquire_lock():
+    # Imported here, not at the top: this runs before the splash, and alerting
+    # pulls in requests. Same lazy-import rule as pandas/matplotlib above —
+    # nothing that only matters later may delay the first painted pixel.
+    import alerting
     try:
         LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
+    # monitoring=False is the honest starting point: the window is coming up but
+    # nothing is armed yet. monitor_tab flips it when the switch actually moves,
+    # which is what remote_launcher waits for before it reports "running".
+    alerting.write_run_status(pid=os.getpid(), exe=str(sys.executable),
+                              monitoring=False)
 
 
 def _release_lock():
+    import alerting
     try:
         LOCK_FILE.unlink(missing_ok=True)
     except OSError:
         pass
+    alerting.clear_run_status()
 
 
 # ---------------------------------------------------------------------------
@@ -168,10 +187,15 @@ class WorkerThread(QThread):
 
 
 class LogWidget(QPlainTextEdit):
+    # Capped like monitor_tab's log: this window is meant to stay open for
+    # weeks, and an uncapped log grows for exactly as long.
+    MAX_LINES = 20000
+
     def __init__(self):
         super().__init__()
         self.setReadOnly(True)
         self.setStyleSheet(LOG_STYLE)
+        self.setMaximumBlockCount(self.MAX_LINES)
 
     def append_line(self, text):
         self.appendPlainText(text)
@@ -271,7 +295,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Diagnostika")
+        self.setWindowTitle("Diagnostic")
         # Fallback size for when the window is un-maximized; on launch the
         # window opens maximized (see main()). Wide enough that the PV table
         # shows all columns without a horizontal scrollbar.

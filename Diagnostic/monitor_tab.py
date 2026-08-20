@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import socket
 import threading
@@ -35,7 +36,9 @@ from PySide6.QtCore import (
     QAbstractTableModel, QByteArray, QMimeData, QModelIndex, QObject, QRunnable,
     Qt, QThreadPool, QTimer, Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPixmap
+from PySide6.QtGui import (
+    QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
@@ -50,9 +53,10 @@ import shared_pvs
 from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
     NotificationHub, Thresholds, Trend, _raw_severity, classify_trend,
-    describe_reason, detect_frozen, fmt_duration,
+    describe_reason, detect_frozen, fmt_duration, write_run_status,
 )
 import bot_commands
+import memstats
 import notify_provision
 from secrets_util import encrypt_secret
 
@@ -115,10 +119,17 @@ def _btn(label, style=BUTTON_STYLE):
 
 
 class LogWidget(QPlainTextEdit):
+    # The log is the one part of this app that grows for as long as it is left
+    # open, and it is meant to be left open for weeks. Capping the number of
+    # lines Qt keeps means the oldest line drops off instead of the log slowly
+    # eating memory; 20 000 lines is far more than a day's worth here.
+    MAX_LINES = 20000
+
     def __init__(self):
         super().__init__()
         self.setReadOnly(True)
         self.setStyleSheet(LOG_STYLE)
+        self.setMaximumBlockCount(self.MAX_LINES)
 
     def append_line(self, text):
         self.appendPlainText(text)
@@ -276,6 +287,13 @@ DEFAULT_SETTINGS = {
     # graph_legend_anchor — the (x, y) in axes fractions the user dragged it to.
     "graph_legend_loc": "best",
     "graph_legend_anchor": [],
+    # PV list beside the graph: a fixed, scrollable list of the plotted curves
+    # (colour sample + name) shown left of the plot. While it is on, no legend
+    # is drawn inside the plot — the two are alternatives, and the list is the
+    # default because matplotlib re-picks a "best" legend corner on every
+    # redraw, which made the legend appear to jump around. Local-only, like the
+    # legend keys above.
+    "graph_pv_panel": True,
     "start_monitoring_on_launch": False,
     # alert graph
     "alert_plot_hours": 12,
@@ -319,7 +337,7 @@ DEFAULT_SETTINGS = {
 SHARE_LOCAL_ONLY_KEYS = (
     "shared_pv_list_enabled", "shared_pv_list_path", "shared_pv_list_timeout_s",
     "_shared_pv_root_cache",
-    "graph_legend_loc", "graph_legend_anchor",
+    "graph_legend_loc", "graph_legend_anchor", "graph_pv_panel",
 )
 
 
@@ -349,6 +367,18 @@ def shared_settings_subset(settings: dict) -> dict:
 # whole list dozens of times. Coalescing needs no changes at persist()'s many
 # call sites.
 SHARED_WRITE_DEBOUNCE_MS = 2000
+
+# --- long-run memory watch --------------------------------------------------
+# This app is meant to be left running for weeks, and the thing that fails
+# first on a Windows PC left up that long is not RAM but the COMMIT limit
+# (RAM + page file, promised across every process): once it is full, nothing
+# new starts. So the app's own committed memory and the PC's commit charge are
+# shown in the status line and written to the log at intervals — the log line
+# is what turns "it feels slower today" into a number that either climbs or
+# does not. It doubles as an "I am still alive" heartbeat in the log.
+MEM_LOG_INTERVAL_MS = 30 * 60 * 1000     # every half hour
+MEM_WARN_PCT = 90.0                       # PC commit this full -> warn in the log
+MEM_WARN_REPEAT_NS = int(3600e9)          # …and at most once an hour
 
 
 def load_config() -> dict:
@@ -824,7 +854,7 @@ class _BackfillWorker(QRunnable):
 
     def __init__(self, sig: _BackfillSignals, names: list[str],
                  start_ns: int, end_ns: int, timeout: float,
-                 ranges: dict, max_points: int):
+                 ranges: dict, max_points: int, workers: int = 24):
         super().__init__()
         self._sig = sig
         self._names = names
@@ -833,13 +863,21 @@ class _BackfillWorker(QRunnable):
         self._timeout = timeout
         self._ranges = ranges
         self._max_points = max(10, max_points)
+        self._workers = max(1, workers)
 
     def run(self):
+        # PVs are fetched concurrently and each PV's window is itself chunked
+        # into <=1 h requests, so the two multiply. Keep the product inside the
+        # HTTP connection pool (64): above it every extra request evicts a
+        # pooled connection and pays a fresh TLS handshake.
+        pv_workers = min(self._workers, max(1, len(self._names)))
+        chunk_workers = max(1, min(4, 48 // pv_workers))
+
         def fetch_one(name):
             try:
                 return name, api.cpva_fetch_samples_chunked(
                     name, self._start, self._end, self._timeout,
-                    max_workers=4)
+                    max_workers=chunk_workers)
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
                 _safe_emit(self._sig.log.emit,
                            f"History backfill failed for "
@@ -851,8 +889,12 @@ class _BackfillWorker(QRunnable):
         # archiver is only reliable for <=1h windows, so a wide window was
         # both slow and dubious. Same fix as _PollWorker: fetch PVs
         # concurrently, each internally chunked into <=1h windows.
+        # PV concurrency follows the poll setting (Concurrent fetches). At the
+        # old fixed 4 the launch backfill of ~30 PVs took ~8 s of empty graph;
+        # at the poll default it is ~2 s, and the archiver is the same server
+        # that already takes the poll pass at that rate.
         out = {}
-        with ThreadPoolExecutor(max_workers=min(4, max(1, len(self._names)))) as ex:
+        with ThreadPoolExecutor(max_workers=pv_workers) as ex:
             futures = {ex.submit(fetch_one, n): n for n in self._names}
             for fut in as_completed(futures):
                 name, samples = fut.result()
@@ -2708,6 +2750,30 @@ class EmailContactsWidget(QWidget):
         return [c["address"] for c in self.rows() if c["enabled"]]
 
 
+#  The one thing about the Webex bot nobody can guess, so it is written on screen in
+#  both places the Webex settings can appear: the editable group box (a source run) and
+#  the read-only summary of the built-in channels (the deployed build). Webex shows a
+#  bot ONLY the messages that @mention it as soon as a space has more than two people
+#  in it — the API answers 403 for anything else — so a command typed without the tag
+#  never reaches the app, and from the room that is indistinguishable from a dead bot.
+_WEBEX_MENTION_HINT = (
+    "Talking to the bot: in a room with other people in it every command has to "
+    "start by tagging the bot — “@Diagnostics /status”. Webex shows a bot only the "
+    "messages that mention it, so an untagged command never arrives at all; the bot "
+    "is not ignoring you. Pick the name from the list Webex offers while you type "
+    "“@” — a name merely typed out does not count as a mention. In a one-to-one chat "
+    "with the bot the tag is not needed. Send “/help” in the room for the full list "
+    "of commands."
+)
+
+
+def _webex_mention_hint() -> QLabel:
+    lbl = QLabel(_WEBEX_MENTION_HINT)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color:#777; font-size:11px;")
+    return lbl
+
+
 class WebexRoomsWidget(QWidget):
     """Editable On/Name/Room ID/Listen table — one bot broadcasting to N rooms.
 
@@ -3008,9 +3074,15 @@ class SettingsDialog(QDialog):
         self.webex_cmds.setToolTip(
             "When on (bot mode only), the bot reads the 'Listen for commands' "
             "room and responds to chat commands such as status/stop. When off, "
-            "the bot only sends alerts and never reads messages.")
+            "the bot only sends alerts and never reads messages.\n\n"
+            "In a room with other people in it every command must start by "
+            "tagging the bot (@Diagnostics /status) — Webex does not show a bot "
+            "any other message.")
         self.webex_cmds.setChecked(bool(s.get("webex_commands_enabled", True)))
         wf.addRow("", self.webex_cmds)
+        # Not decoration: without the tag the command never reaches the bot at
+        # all, and from the room it looks identical to a dead bot.
+        wf.addRow("", _webex_mention_hint())
         self.webex_cmd_poll = _NoWheelSpinBox()
         self.webex_cmd_poll.setRange(1, 120)
         self.webex_cmd_poll.setToolTip(
@@ -3154,7 +3226,10 @@ class SettingsDialog(QDialog):
         self.graph_win = _NoWheelSpinBox(); self.graph_win.setRange(1, 10080)
         self.graph_win.setToolTip(
             "Default visible time span (minutes) on the live graph's X axis. "
-            "Can't show more than 'History kept' holds. Range 1–10080 min.")
+            "Can't show more than 'History kept' holds. This is also the span "
+            "loaded from the archiver at launch — older data comes only when "
+            "asked for (widen this, or right-click the graph → Load older "
+            "data). Range 1–10080 min.")
         self.graph_win.setValue(int(s["graph_window_minutes"]))
         form.addRow("Graph window (min)", self.graph_win)
         self.frozen_en = QCheckBox("Flag PVs whose value never changes")
@@ -3218,7 +3293,7 @@ class SettingsDialog(QDialog):
         self.shared_en = QCheckBox("Keep the PV list and settings on the network share")
         self.shared_en.setStyleSheet(_CHK_STYLE)
         self.shared_en.setToolTip(
-            "When on, every copy of Diagnostika reads the same PV list — with its "
+            "When on, every copy of Diagnostic reads the same PV list — with its "
             "limits, rules and valid ranges — plus the shared settings (poll "
             "pacing, debounce, defaults, watchdog, graph windows) from the scratch "
             "Software share at startup, and publishes changes back to it. Nothing "
@@ -3309,6 +3384,10 @@ class SettingsDialog(QDialog):
             lbl.setWordWrap(True)
             lbl.setStyleSheet("font-weight:600;")
             v.addWidget(lbl)
+        # The Webex group box is hidden in a provisioned build, so this is the only
+        # place a deployed user can read the mention rule.
+        if self._prov.get("webex_commands_enabled") or self._prov.get("webex_rooms"):
+            v.addWidget(_webex_mention_hint())
         row = QHBoxLayout()
         for text, slot in (("Send test to Teams", self._test_teams),
                            ("Send test email", self._test_email),
@@ -3440,6 +3519,7 @@ from matplotlib.backends.backend_qtagg import (  # noqa: E402
 from matplotlib.backends.backend_agg import FigureCanvasAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 import matplotlib.dates as mdates  # noqa: E402
+import matplotlib.colors as mcolors  # noqa: E402
 
 MAX_GRAPH_POINTS = 3000
 
@@ -3655,6 +3735,51 @@ class _AxisDateRangeDialog(QDialog):
                 datetime.strptime(self.hi.text().strip(), _DT_FMT))
 
 
+class _GraphPVList(QListWidget):
+    """Scrollable list of the curves the graph is drawing, shown beside it.
+
+    Stands in for the in-plot legend, which matplotlib re-places on every
+    redraw. Emits `hovered` with the row's PV name so the graph can highlight
+    that curve, and with None over blank space or once the mouse leaves.
+    """
+
+    hovered = Signal(object)
+
+    _STYLE = """
+    QListWidget {
+        background: #ffffff;
+        color: #222222;
+        border: 1px solid #cccccc;
+        font-size: 11px;
+    }
+    QListWidget::item { padding: 2px 3px; }
+    QListWidget::item:hover { background: #d8e8ff; color: #111111; }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet(self._STYLE)
+        self.setMouseTracking(True)      # required for hover tracking
+        self.setUniformItemSizes(True)
+        self.setSelectionMode(QAbstractItemView.NoSelection)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setTextElideMode(Qt.ElideRight)
+        self.setMinimumWidth(110)
+
+    def _pv_at(self, ev):
+        pos = ev.position().toPoint() if hasattr(ev, "position") else ev.pos()
+        it = self.itemAt(pos)
+        return it.data(Qt.UserRole) if it is not None else None
+
+    def mouseMoveEvent(self, ev):
+        super().mouseMoveEvent(ev)
+        self.hovered.emit(self._pv_at(ev))
+
+    def leaveEvent(self, ev):
+        super().leaveEvent(ev)
+        self.hovered.emit(None)
+
+
 class GraphPanel(QWidget):
     def __init__(self, win: "MonitorWidget"):
         super().__init__()
@@ -3699,7 +3824,38 @@ class GraphPanel(QWidget):
             self.canvas, self,
             on_user_view=self._capture_user_view, on_home=self.reset_zoom)
         lay.addWidget(self.toolbar)
-        lay.addWidget(self.canvas, 1)
+
+        # The plotted-PV list sits left of the plot, in a splitter so long names
+        # can be given more room; all the stretch stays with the canvas.
+        st = getattr(self._win, "settings", None) or {}
+        self._pv_panel_on = bool(st.get("graph_pv_panel", True))
+        self.pv_list = _GraphPVList()
+        self.pv_list.setToolTip(
+            "The PVs currently drawn in the graph, with each one's line colour. "
+            "Hover a name to highlight its curve and fade the rest. Right-click "
+            "the graph to hide this list and use an in-plot legend instead.")
+        self.pv_list.hovered.connect(self._on_pv_hover)
+        self.pv_list.setVisible(self._pv_panel_on)
+        self._hover_pv = None     # PV name whose curve is highlighted, or None
+        self._hover_pending = False   # a highlight repaint is already queued
+        self._curve_rows = []     # [(pv_name, display_name, colour, Line2D), …]
+        self._panel_sig = None    # last list contents, so a redraw that changed
+                                  # nothing doesn't rebuild (and drop) the rows
+        # Shape of the picture the last full redraw drew (curves, units, axes,
+        # placement). refresh_data() compares it: unchanged means the existing
+        # lines only need their new samples pushed in, which skips rebuilding
+        # axes, legend, side list and layout on every poll.
+        self._plot_sig = None
+        # Set when new samples arrived while the graph was on a hidden tab, so
+        # nothing is drawn until it is actually on screen again.
+        self._pending_data = False
+        split = QSplitter(Qt.Horizontal)
+        split.addWidget(self.pv_list)
+        split.addWidget(self.canvas)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([170, 830])
+        lay.addWidget(split, 1)
 
         # Crosshair cursor: artists are recreated on every redraw (ax.clear()
         # drops them); animated=True keeps them out of the blit background so
@@ -3737,6 +3893,7 @@ class GraphPanel(QWidget):
         # New selection = different data/scale; a zoom pinned on the previous
         # selection would show a nonsense viewport, so drop it.
         self._user_view = None
+        self._hover_pv = None      # the previous view's highlight is meaningless
         self.redraw()
 
     def _capture_user_view(self):
@@ -3830,12 +3987,24 @@ class GraphPanel(QWidget):
         menu.exec(global_pos)
 
     def _add_view_actions(self, menu: QMenu):
-        """Grid + legend items, shared by the axis and plot-area menus."""
+        """PV list + grid + legend items, shared by the axis and plot menus."""
+        panel = menu.addAction("PV list beside graph")
+        panel.setCheckable(True)
+        panel.setChecked(self._pv_panel_on)
+        panel.toggled.connect(self._set_pv_panel)
         self._add_legend_menu(menu)
         grid_action = menu.addAction("Grid lines")
         grid_action.setCheckable(True)
         grid_action.setChecked(self._grid_on)
         grid_action.toggled.connect(self._set_grid_on)
+        menu.addSeparator()
+        # Launch only fetches the visible window from the archiver (a wider
+        # span costs one request per hour per PV). This is the on-request way
+        # to reach further back without changing the window.
+        older = menu.addAction("Load older data from archive")
+        older.setToolTip("Fetch the full kept history from the archiver so the "
+                         "graph can be zoomed or panned further back.")
+        older.triggered.connect(lambda: self._win.extend_backfill())
 
     def _set_grid_on(self, on: bool):
         self._grid_on = on
@@ -3878,13 +4047,118 @@ class GraphPanel(QWidget):
 
     def _set_legend_loc(self, loc: str):
         self._legend_loc = loc
+        # Asking for a legend inside the plot means asking for it instead of the
+        # side list; "Hidden" only means no legend, so it leaves the list alone.
+        if loc != "off":
+            self._pv_panel_on = False
+            self.pv_list.setVisible(False)
         self._persist_legend()
         self.redraw()
+
+    # --- PV list beside the plot ------------------------------------------
+
+    def _set_pv_panel(self, on: bool):
+        self._pv_panel_on = bool(on)
+        self.pv_list.setVisible(self._pv_panel_on)
+        if not self._pv_panel_on:
+            self._hover_pv = None      # nothing left to un-highlight from
+        self._persist_legend()
+        self.redraw()
+
+    def _on_pv_hover(self, pv_name):
+        if pv_name == self._hover_pv:
+            return                     # every mouse move fires; ignore repeats
+        self._hover_pv = pv_name
+        # Repaint once, shortly after the pointer settles: dragging it down the
+        # list crosses every row, and one full canvas redraw per row is what
+        # made the highlight feel sticky.
+        if not self._hover_pending:
+            self._hover_pending = True
+            QTimer.singleShot(40, self._apply_hover)
+
+    def _apply_hover(self):
+        self._hover_pending = False
+        self._apply_highlight()
+
+    def _pointer_on_list(self) -> bool:
+        """Is the mouse really over the side list right now?
+
+        Checked against the live cursor position rather than the last hover
+        event: Qt does not always deliver a leave event (a redraw or a tooltip
+        under the pointer can swallow it), and a hover state that outlives the
+        pointer would keep every curve faded.
+        """
+        if not self.pv_list.isVisible():
+            return False
+        try:
+            return self.pv_list.rect().contains(
+                self.pv_list.mapFromGlobal(QCursor.pos()))
+        except Exception:
+            return True
+
+    def _apply_highlight(self):
+        """Fade every curve except the hovered one (all plain when none)."""
+        if not self._curve_rows:
+            return
+        target = self._hover_pv
+        # Only fade for a pointer that is still on the list and a PV that is
+        # still drawn. Without this, a missed leave event or a PV that dropped
+        # out of the plot leaves every curve faded — an apparently empty graph.
+        if target is not None and (not self._pointer_on_list()
+                                   or all(n != target
+                                          for n, *_ in self._curve_rows)):
+            target = self._hover_pv = None
+        for name, _label, _color, line in self._curve_rows:
+            hot = target is not None and name == target
+            line.set_alpha(1.0 if target is None or hot else self._FADED_ALPHA)
+            line.set_linewidth(self._CURVE_LW * (2.0 if hot else 1.0))
+            line.set_zorder(8 if hot else 2)
+        # Curve properties changed, so the blitted crosshair background is stale.
+        self._blit_bg = None
+        self.canvas.draw_idle()
+
+    @staticmethod
+    def _swatch_icon(color, dashed: bool) -> QIcon:
+        """A short line sample in the curve's colour and dash pattern."""
+        pm = QPixmap(22, 12)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        pen = QPen(QColor(mcolors.to_hex(color)))
+        pen.setWidth(3)
+        if dashed:
+            pen.setDashPattern([2.0, 1.5])
+        p.setPen(pen)
+        p.drawLine(1, 6, 21, 6)
+        p.end()
+        return QIcon(pm)
+
+    def _sync_pv_list(self):
+        """Refill the side list from the curves the redraw just drew."""
+        if not self._pv_panel_on:
+            return
+        sig = [(n, lbl, mcolors.to_hex(c), str(ln.get_linestyle()))
+               for n, lbl, c, ln in self._curve_rows]
+        if sig == self._panel_sig:
+            return    # same curves as before: leave the rows (and hover) alone
+        self._panel_sig = sig
+        self.pv_list.clear()
+        if not self._curve_rows:
+            empty = QListWidgetItem("No data to plot")
+            empty.setFlags(Qt.NoItemFlags)
+            self.pv_list.addItem(empty)
+            return
+        for name, label, color, line in self._curve_rows:
+            dashed = str(line.get_linestyle()) not in ("-", "solid")
+            it = QListWidgetItem(self._swatch_icon(color, dashed), label)
+            it.setData(Qt.UserRole, name)
+            it.setToolTip(f"{label}\n{name}")
+            self.pv_list.addItem(it)
 
     def _persist_legend(self):
         s = getattr(self._win, "settings", None)
         if s is None:
             return
+        s["graph_pv_panel"] = self._pv_panel_on
         s["graph_legend_loc"] = self._legend_loc
         s["graph_legend_anchor"] = list(self._legend_anchor) \
             if self._legend_anchor else []
@@ -3895,6 +4169,8 @@ class GraphPanel(QWidget):
 
     def _draw_legend(self, handles, labels):
         """Build the combined legend per the current placement; None if hidden."""
+        if self._pv_panel_on:
+            return None      # the side list is showing the same information
         if not handles or self._legend_loc == "off":
             return None
         # Solid white frame: where the legend does land on a trace, it hides it
@@ -4047,22 +4323,14 @@ class GraphPanel(QWidget):
 
     def _plot_one(self, pv: PVConfig, color, with_thresholds: bool, ax=None):
         ax = ax if ax is not None else self.ax
-        rt = self._win.runtime.get(pv.name)
-        if not rt or not rt.history:
+        xs, ys = self._series(pv)
+        if not xs:
             return
-        pts = list(rt.history)
-        if len(pts) > MAX_GRAPH_POINTS:
-            # Thin evenly across the whole history (a plain tail-cut would
-            # silently shorten the graph's time span); keep the newest point.
-            step = len(pts) / MAX_GRAPH_POINTS
-            last = pts[-1]
-            pts = [pts[int(i * step)] for i in range(MAX_GRAPH_POINTS)]
-            pts[-1] = last
-        xs = [api.ns_to_prague(t) for t, _ in pts]
-        ys = [v for _, v in pts]
-        ax.plot(xs, ys, drawstyle="steps-post", color=color,
-                linestyle=self._unit_linestyle(self._pv_units(pv)),
-                label=pv.display_name, linewidth=1.6)
+        lines = ax.plot(xs, ys, drawstyle="steps-post", color=color,
+                        linestyle=self._unit_linestyle(self._pv_units(pv)),
+                        label=pv.display_name, linewidth=self._CURVE_LW)
+        # Keep the drawn line so the side list can highlight it on hover.
+        self._curve_rows.append((pv.name, pv.display_name, color, lines[0]))
         # Cache the plotted (thinned) series so the cursor value box can snap to
         # each PV's value at the hovered time — reuses the exact drawn data and
         # its curve colour for both the single-PV and All-PVs views.
@@ -4075,6 +4343,21 @@ class GraphPanel(QWidget):
                 if val is not None:
                     ax.axhline(val, color=color, linestyle=ls,
                                linewidth=lw, alpha=0.6)
+
+    def _series(self, pv: PVConfig):
+        """The PV's plottable history as (times, values); ([], []) if empty."""
+        rt = self._win.runtime.get(pv.name)
+        if not rt or not rt.history:
+            return [], []
+        pts = list(rt.history)
+        if len(pts) > MAX_GRAPH_POINTS:
+            # Thin evenly across the whole history (a plain tail-cut would
+            # silently shorten the graph's time span); keep the newest point.
+            step = len(pts) / MAX_GRAPH_POINTS
+            last = pts[-1]
+            pts = [pts[int(i * step)] for i in range(MAX_GRAPH_POINTS)]
+            pts[-1] = last
+        return [api.ns_to_prague(t) for t, _ in pts], [v for _, v in pts]
 
     def _pv_units(self, pv: PVConfig) -> str:
         rt = self._win.runtime.get(pv.name)
@@ -4107,6 +4390,14 @@ class GraphPanel(QWidget):
     # Outward spacing (points) between consecutive right-hand (twin) axes.
     _EXTRA_AXIS_SPACING = 55
 
+    # Normal curve width; a curve hovered in the side list is drawn twice this.
+    _CURVE_LW = 1.6
+
+    # Alpha of the curves that are *not* hovered. Faint enough to push the
+    # hovered one forward, but still clearly drawn, so a highlight that gets
+    # stuck can never look like a graph with no data in it.
+    _FADED_ALPHA = 0.35
+
     @classmethod
     def _unit_family(cls, unit: str) -> str:
         """"degC" -> "temperature", "mbar" -> "pressure", … .
@@ -4131,6 +4422,7 @@ class GraphPanel(QWidget):
             a.remove()
         self._extra_axes = []
         self._snap_series = []
+        self._curve_rows = []
         self.ax.clear()
         sel = self.combo.currentData()
         win_min = float(self._win.settings["graph_window_minutes"])
@@ -4182,11 +4474,6 @@ class GraphPanel(QWidget):
                                ax=ax_of_unit[self._unit_key(self._pv_units(p))])
             for k, a in ax_of_unit.items():
                 a.set_ylabel(self._axis_label(unit_text[k]))
-            # Any fixed range pinned via the extra-axis context menu wins over
-            # autoscale (main axis fixed range is applied further below).
-            for idx, a in enumerate(self._extra_axes):
-                if idx in self._extra_yaxis:
-                    a.set_ylim(*self._extra_yaxis[idx])
             self._units = unit_text[units_order[0]] if len(units_order) == 1 \
                 else ""
         else:
@@ -4206,27 +4493,7 @@ class GraphPanel(QWidget):
         self.ax.grid(self._grid_on, alpha=0.3)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=api.TZ_PRAGUE))
 
-        # A view the user zoomed/panned to is pinned and always wins over the
-        # rolling window, so periodic redraws never yank the zoom away.
-        if self._user_view is not None:
-            self.ax.set_xlim(self._user_view[0])
-            self.ax.set_ylim(self._user_view[1])
-        else:
-            # Limit x to the configured window if we have data. orig=False
-            # gives the unit-converted float date numbers (the original data
-            # are datetimes, which can't take a float offset). Twin axes share
-            # x, so clamping the main axis clamps them all.
-            all_x = [ln.get_xdata(orig=False)
-                     for a in [self.ax] + self._extra_axes for ln in a.get_lines()]
-            if any(len(x) for x in all_x):
-                try:
-                    xmax = max(x[-1] for x in all_x if len(x))
-                    xmin = xmax - (win_min / (24 * 60))
-                    self.ax.set_xlim(xmin, xmax)
-                except Exception:
-                    pass
-            if self._yaxis is not None:
-                self.ax.set_ylim(*self._yaxis)
+        self._apply_limits(win_min)
         for lbl in self.ax.get_xticklabels():
             lbl.set_rotation(0)
             lbl.set_ha("center")
@@ -4244,9 +4511,113 @@ class GraphPanel(QWidget):
         if self._legend_loc == "outside":
             self._reserve_legend_margin()
 
+        self._plot_sig = self._layout_sig()
+        self._sync_pv_list()
+        # A PV hovered in the list keeps its highlight across the periodic
+        # redraws, which replaced the Line2D objects it was applied to.
+        if self._hover_pv is not None:
+            self._apply_highlight()
         self._make_cursor_artists()
         self._blit_bg = None
         self.canvas.draw_idle()
+
+    def _layout_sig(self):
+        """Everything the drawn picture depends on except the sample values.
+
+        Two equal signatures mean the same curves, on the same axes, in the
+        same colours and with the same placement — so the figure can be reused.
+        """
+        sel = self.combo.currentData()
+        rows = []
+        for p in self._win.pvs:
+            if sel is None:
+                if not p.show_in_graph:
+                    continue
+            elif p.name != sel:
+                continue
+            rt = self._win.runtime.get(p.name)
+            if not rt or not rt.history:
+                continue        # PVs without data aren't drawn and get no axis
+            rows.append((p.name, p.display_name,
+                         self._unit_key(self._pv_units(p)),
+                         None if sel is None else (p.warn_low, p.warn_high,
+                                                   p.alarm_low, p.alarm_high)))
+        return (sel, tuple(rows), self._pv_panel_on, self._legend_loc,
+                self._grid_on, tuple(sorted(self._extra_yaxis.items())),
+                self._yaxis, self._user_view is not None)
+
+    def _apply_limits(self, win_min: float):
+        """Autoscale y, then put the axes back on the window the user wants."""
+        for a in [self.ax] + self._extra_axes:
+            a.relim()
+            a.autoscale_view(scalex=False)
+        # Any fixed range pinned via the extra-axis context menu wins over
+        # autoscale (the main axis fixed range is applied further below).
+        for idx, a in enumerate(self._extra_axes):
+            if idx in self._extra_yaxis:
+                a.set_ylim(*self._extra_yaxis[idx])
+        # A view the user zoomed/panned to is pinned and always wins over the
+        # rolling window, so periodic redraws never yank the zoom away.
+        if self._user_view is not None:
+            self.ax.set_xlim(self._user_view[0])
+            self.ax.set_ylim(self._user_view[1])
+            return
+        # Limit x to the configured window if we have data. orig=False gives
+        # the unit-converted float date numbers (the original data are
+        # datetimes, which can't take a float offset). Twin axes share x, so
+        # clamping the main axis clamps them all.
+        all_x = [ln.get_xdata(orig=False)
+                 for a in [self.ax] + self._extra_axes for ln in a.get_lines()]
+        if any(len(x) for x in all_x):
+            try:
+                xmax = max(x[-1] for x in all_x if len(x))
+                xmin = xmax - (win_min / (24 * 60))
+                self.ax.set_xlim(xmin, xmax)
+            except Exception:
+                pass
+        if self._yaxis is not None:
+            self.ax.set_ylim(*self._yaxis)
+
+    def refresh_data(self):
+        """Show the samples of the poll that just finished.
+
+        Reuses the drawn figure whenever the picture's shape is unchanged:
+        only the curves' data is replaced. A full redraw() rebuilds the axes,
+        the legend, the side list and the layout, which is what made the graph
+        hitch on every poll — it is kept for the cases that need it (a curve
+        appeared or vanished, units changed, the selection changed, …).
+        """
+        if not self.isVisible():
+            self._pending_data = True   # nothing to draw for a hidden tab
+            return
+        self._pending_data = False
+        if self._plot_sig is None or self._layout_sig() != self._plot_sig:
+            self.redraw()
+            return
+        snap = []
+        by_name = {p.name: p for p in self._win.pvs}
+        for name, label, color, line in self._curve_rows:
+            pv = by_name.get(name)
+            xs, ys = self._series(pv) if pv is not None else ([], [])
+            if not xs:
+                self.redraw()      # curve lost its data: shape changed after all
+                return
+            line.set_data(xs, ys)
+            snap.append((np.asarray(mdates.date2num(xs), dtype=float),
+                         np.asarray(ys, dtype=float), color, label))
+        # The cursor value box reads this cache, and its text artists are keyed
+        # by position in it — same curves in the same order, so they still fit.
+        self._snap_series = snap
+        self._apply_limits(float(self._win.settings["graph_window_minutes"]))
+        if self._hover_pv is not None:
+            self._apply_highlight()
+        self._blit_bg = None
+        self.canvas.draw_idle()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if self._pending_data:
+            self.refresh_data()
 
     # --- crosshair cursor ------------------------------------------------
     _READOUT_LINE_PTS = 14   # vertical step (points) between value-box lines
@@ -4300,6 +4671,9 @@ class GraphPanel(QWidget):
         ev = self._mouse_ev
         if ev is None or not self._cross or self._legend_drag:
             return   # a legend drag repaints the figure; don't blit over it
+        if self._hover_pv is not None:
+            self._hover_pv = None      # pointer is on the plot, not on the list
+            self._apply_highlight()
         try:
             self._draw_cursor(ev)
         except Exception:
@@ -4574,6 +4948,14 @@ class MonitorWidget(QWidget):
         self._gate_values: dict[str, Optional[float]] = {}
         self._poll_gen = 0
         self._poll_inflight = False
+        # Oldest archive timestamp the graph backfill has already fetched (0 =
+        # nothing fetched yet). Launch only covers the visible graph window;
+        # anything older is fetched on request, and this marks where that
+        # on-request fetch has to start so nothing is downloaded twice.
+        self._backfill_start_ns = 0
+        self._backfill_inflight = False
+        # Extra minutes to fetch once the first (visible-window) pass is drawn.
+        self._backfill_followup_min = 0.0
         self._monitoring = False
         self._sim_timer: Optional[QTimer] = None
         self._resume_timer: Optional[QTimer] = None   # auto-resume after /stop <h>
@@ -4591,6 +4973,13 @@ class MonitorWidget(QWidget):
         self._cmd_backoff_until_ns = 0   # honour Webex 429 Retry-After
         self._watchdog_fail_streak = 0   # consecutive fully-failed polls
         self._watchdog_bad = False       # True once the "no data" alert fired
+        # Memory watch (see MEM_LOG_INTERVAL_MS). The launch reading is the
+        # baseline every later one is compared against, so growth over days is
+        # a number and not an impression.
+        self._mem_timer: Optional[QTimer] = None
+        self._mem_start = memstats.read()
+        self._mem_start_ns = api.now_ns()
+        self._mem_warned_ns = 0
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -4605,7 +4994,12 @@ class MonitorWidget(QWidget):
         if self._shared_dirty:
             self._schedule_shared_write()
 
-        if self.settings.get("start_monitoring_on_launch"):
+        # The environment variable is how remote_launcher.py asks for monitoring
+        # on THIS launch only, without touching the saved setting — so a Webex
+        # "/run" comes up armed while opening the app by hand still behaves the
+        # way the Settings checkbox says.
+        if (self.settings.get("start_monitoring_on_launch")
+                or os.environ.get("DIAGNOSTIC_START_MONITORING") == "1"):
             self.toggle_monitoring(True)
         # Reading PVs is independent of the monitoring switch, so the poll loop
         # runs from launch (after the autostart above, which does its own first
@@ -4748,6 +5142,10 @@ class MonitorWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._start_poll)
 
+        self._mem_timer = QTimer(self)
+        self._mem_timer.timeout.connect(self._log_memory)
+        self._mem_timer.start(MEM_LOG_INTERVAL_MS)
+
         self._update_status()
         for line in self._shared_log:
             self._log(line)
@@ -4759,6 +5157,7 @@ class MonitorWidget(QWidget):
             self._log(f"Loaded {len(self.pvs)} PV(s) — LOCAL list: {CONFIG_FILE}. "
                       f"PV changes will NOT be shared this session.")
         self._log(f"Local settings: {CONFIG_FILE}")
+        self._log_memory()   # the baseline every later reading is compared to
 
     # --- helpers -------------------------------------------------------
     def _log(self, msg: str):
@@ -4791,10 +5190,50 @@ class MonitorWidget(QWidget):
                        if (rt := self.runtime.get(pv.name)) is not None
                        and rt.frozen)
         frozen = f"  ·  ⚠ {n_frozen} {FROZEN_LABEL}" if n_frozen else ""
+        # Memory belongs in the always-visible line for the same reason as the
+        # frozen count: on a program left running for weeks it is the figure
+        # nobody thinks to check until the PC will not start anything.
+        snap = memstats.read()
+        mem = f"  ·  {memstats.short_line(snap)}" if snap is not None else ""
+        if snap is not None and snap.sys_commit_pct >= MEM_WARN_PCT:
+            mem += "  ⚠"
         self._status_lbl.setText(
             f"{state}  ·  {len(self.pvs)} PV(s)  ·  every "
             f"{self.settings['poll_interval_s']}s  ·  {self._channel_summary()}"
-            f"  ·  {share}{frozen}")
+            f"  ·  {share}{frozen}{mem}")
+        self._status_lbl.setToolTip(
+            "mem — memory this program has been promised by Windows (its "
+            "commit size), with the part actually held in RAM in brackets.\n"
+            "PC — how much of the whole computer's commit limit (RAM + page "
+            "file) is promised to all programs together. When this reaches "
+            "100 % nothing new can start on the PC, even if RAM looks free.\n"
+            "The Log tab records both every half hour, with the growth since "
+            "this program started.")
+
+    def _log_memory(self):
+        """Write the memory figures to the log, with the growth since launch.
+
+        Doubles as this program's heartbeat: a line every half hour is proof it
+        is still running through a quiet spell with no alerts, and the series
+        of lines is the only record that says whether its memory use settles
+        (normal) or keeps climbing (a leak worth chasing).
+        """
+        snap = memstats.read()
+        if snap is None:
+            return
+        since = self._mem_start.proc_commit if self._mem_start else None
+        up = fmt_duration((api.now_ns() - self._mem_start_ns) / 1e9)
+        self._log(f"{memstats.long_line(snap, since)} Running for {up}.")
+        if snap.sys_commit_pct >= MEM_WARN_PCT:
+            now = api.now_ns()
+            if now - self._mem_warned_ns >= MEM_WARN_REPEAT_NS:
+                self._mem_warned_ns = now
+                self._log(
+                    f"⚠ This PC has promised {snap.sys_commit_pct:.0f}% of its "
+                    f"memory limit ({memstats.fmt(snap.sys_commit_limit)}). "
+                    "Close what is not needed or restart the PC — near 100 % "
+                    "Windows can no longer start new programs.")
+        self._update_status()
 
     def persist(self):
         """Save locally (always, instant) and publish to the share (debounced)."""
@@ -4862,6 +5301,8 @@ class MonitorWidget(QWidget):
     def shutdown(self):
         """Called by the main window on close; state is also saved per-change."""
         self.timer.stop()
+        if self._mem_timer is not None:
+            self._mem_timer.stop()
         self._stop_cmd_listener()
         self.persist()
         self._shared_timer.stop()       # don't let the debounce race the close
@@ -5394,6 +5835,9 @@ class MonitorWidget(QWidget):
                 if rt.history.maxlen != ml:
                     rt.history = deque(rt.history, maxlen=ml)
             self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
+            # A widened graph window asks for data further back than launch
+            # fetched, so top the history up now.
+            self.ensure_window_backfilled()
             # Only restart the Webex command listener when its own settings
             # changed (or it isn't running) — a needless restart re-primes and
             # briefly drops commands for no reason.
@@ -5410,7 +5854,7 @@ class MonitorWidget(QWidget):
                 self._shared_timer.stop()
                 self._shared_dirty = False
                 self.shared_ok = False
-                self._log("Shared PV list location changed. Restart Diagnostika "
+                self._log("Shared PV list location changed. Restart Diagnostic "
                           "to load from the new location — until then this copy "
                           "will not publish any PV-list changes.")
             self._update_status()
@@ -5459,6 +5903,11 @@ class MonitorWidget(QWidget):
                       "thresholds are evaluated and no alerts are sent.")
         self.model.refresh_all()
         self._update_status()
+        # Tell anyone outside this process — remote_launcher.py waits on exactly
+        # this before it answers "running and tracking". Every route into the
+        # switch passes through here (button, autostart, /start, auto-resume),
+        # so there is one writer and it cannot report a state that is not real.
+        write_run_status(monitoring=on)
 
     def _cancel_resume(self):
         if self._resume_timer is not None:
@@ -5514,29 +5963,83 @@ class MonitorWidget(QWidget):
 
     # --- graph history backfill ----------------------------------------
     def _backfill_history(self):
-        """Pre-fill each PV's history with archive data covering the graph
-        window, so the plot shows the whole window right away instead of only
-        samples collected since monitoring started."""
+        """Pre-fill each PV's history with archive data covering the *visible*
+        graph window, so the plot shows that window right away instead of only
+        samples collected since monitoring started.
+
+        Deliberately only the visible window: the archiver serves at most one
+        hour per request, so a wider span means one request per hour per PV and
+        the graph stayed empty for tens of seconds on every launch. Older data
+        is fetched only when asked for -- see extend_backfill().
+        """
+        self._run_backfill(float(self.settings["graph_window_minutes"]),
+                           "Fetching archive history for the graph window…")
+        # The "value unchanged" check needs frozen_after_minutes of history to
+        # ever fire, which is normally more than the visible window. Fetch that
+        # remainder as a follow-up instead of widening the first pass, so the
+        # graph appears immediately and the check is armed a few seconds later.
+        self._backfill_followup_min = 0.0
+        if self.settings.get("frozen_check_enabled", True)                 and any(pv.frozen_check for pv in self.pvs):
+            need = float(self.settings.get("frozen_after_minutes", 120))
+            if need > float(self.settings["graph_window_minutes"]):
+                self._backfill_followup_min = need
+
+    def extend_backfill(self, minutes: Optional[float] = None):
+        """Fetch archive data older than what the graph already holds.
+
+        Called when the user asks to see further back (widening the graph
+        window, or the graph's own "Load older data" item). Only the span that
+        is not covered yet is fetched, so nothing is downloaded twice.
+        """
+        if minutes is None:
+            minutes = float(self.settings["history_minutes"])
+        self._run_backfill(minutes,
+                           f"Fetching {minutes / 60.0:g} h of older archive "
+                           f"data for the graph…", extend=True)
+
+    def ensure_window_backfilled(self):
+        """Fetch older data if the visible window now reaches further back than
+        what has been fetched so far (the user widened the graph window)."""
+        mins = float(self.settings["graph_window_minutes"])
+        need = api.now_ns() - int(mins * 60e9)
+        if self._backfill_start_ns and need < self._backfill_start_ns:
+            self.extend_backfill(mins)
+
+    def _run_backfill(self, minutes: float, message: str, extend: bool = False):
         names = [pv.name for pv in self.pvs]
         if not names:
             return
+        if self._backfill_inflight:
+            self._log("Archive history is still being fetched — wait for it "
+                      "to finish.")
+            return
+        # Never keep more than the history buffer can hold.
+        minutes = min(float(minutes), float(self.settings["history_minutes"]))
         end = api.now_ns()
-        # Cover the whole kept history, not just the default view, so zooming
-        # or panning back past the graph window still finds data.
-        minutes = max(float(self.settings["graph_window_minutes"]),
-                      float(self.settings["history_minutes"]))
         start = end - int(minutes * 60e9)
+        if extend:
+            # Only the still-missing older part: the newer part is already in
+            # memory, and re-fetching it would cost the same as the first pass.
+            end = self._backfill_start_ns or end
+            if start >= end:
+                self._log("The graph already holds that much history.")
+                return
         ranges = {pv.name: self._valid_range(pv) for pv in self.pvs}
         sig = _BackfillSignals(self)
         sig.log.connect(self._log)
+        sig.done.connect(sig.deleteLater)   # see _start_poll
         sig.done.connect(self._on_backfill)
         self._backfill_sig = sig           # keep signals alive while running
+        self._backfill_inflight = True
+        self._backfill_start_ns = min(start, self._backfill_start_ns or start)
         QThreadPool.globalInstance().start(_BackfillWorker(
             sig, names, start, end, float(self.settings["http_timeout_s"]),
-            ranges, self._history_maxlen()))
-        self._log("Fetching archive history for the graph window…")
+            ranges, self._history_maxlen(),
+            int(self.settings.get("poll_max_workers", 24))))
+        self._log(message)
 
     def _on_backfill(self, results: dict):
+        self._backfill_inflight = False
         filled = 0
         for name, pts in results.items():
             rt = self.runtime.get(name)
@@ -5549,12 +6052,27 @@ class MonitorWidget(QWidget):
                      if oldest_live is None or p[0] < oldest_live]
             if not older:
                 continue
-            rt.history = deque(older + list(rt.history),
-                               maxlen=rt.history.maxlen)
+            # Thin the combined series evenly to what the buffer holds. Handing
+            # an over-long list to deque(maxlen=...) would keep only its tail,
+            # i.e. silently drop exactly the older data just fetched.
+            merged = older + list(rt.history)
+            ml = rt.history.maxlen
+            if ml and len(merged) > ml:
+                step = len(merged) / ml
+                newest = merged[-1]
+                merged = [merged[int(i * step)] for i in range(ml)]
+                merged[-1] = newest
+            rt.history = deque(merged, maxlen=ml)
             filled += 1
         if filled:
             self._log(f"Backfilled graph history for {filled} PV(s).")
             self.graph.redraw()
+        # Arm the frozen check right after the graph is up (see
+        # _backfill_history). Deferred by a tick so this pass is fully settled.
+        if self._backfill_followup_min:
+            mins = self._backfill_followup_min
+            self._backfill_followup_min = 0.0
+            QTimer.singleShot(0, lambda: self.extend_backfill(mins))
 
     def _start_poll(self):
         monitored = {pv.name for pv in self.pvs}
@@ -5576,8 +6094,16 @@ class MonitorWidget(QWidget):
         gen = self._poll_gen
         self._poll_inflight = True
         sig = _PollSignals(self)
+        # Every poll makes one of these, and a poll happens for as long as the
+        # app is open. Parented to the widget they would ALL still be alive a
+        # week later (tens of thousands of them, plus the connection each one
+        # holds) — a slow, invisible climb in the app's memory. deleteLater is
+        # connected first so it is queued before the result handler runs; Qt
+        # only performs the delete once the current event is finished, so the
+        # handler below still gets its data.
+        sig.done.connect(sig.deleteLater)
         sig.done.connect(lambda res, g=gen: self._poll_done(res, g))
-        self._poll_sig = sig
+        self._poll_sig = sig   # stale after the delete; only kept as a handle
         QThreadPool.globalInstance().start(
             _PollWorker(sig, names, dict(self.settings), ranges))
 
@@ -5644,7 +6170,7 @@ class MonitorWidget(QWidget):
         self.model.refresh_all()
         self._refresh_dep_combos()
         self._update_status()
-        self.graph.redraw()
+        self.graph.refresh_data()
 
     # --- "not updating" check ------------------------------------------
     def _frozen_check_on(self, pv: PVConfig) -> bool:
@@ -5891,6 +6417,7 @@ class MonitorWidget(QWidget):
         timeout = float(self.settings["http_timeout_s"])
         vmin, vmax = valid_range
         sig = _AlertSignals(self)
+        sig.done.connect(sig.deleteLater)   # see _start_poll
         sig.done.connect(self._on_alert_result)
         # Each dispatch keeps its own signals object alive via the worker, so
         # concurrent alerts (several PVs tripping at once) don't clobber one
@@ -5989,6 +6516,7 @@ class MonitorWidget(QWidget):
         self._cmd_bot_id_inflight = True
         gen = self._cmd_gen
         sig = _MeIdSignals(self)
+        sig.done.connect(sig.deleteLater)   # see _start_poll
         sig.done.connect(lambda bot_id, g=gen: self._on_bot_id(bot_id, g))
         self._me_id_sig = sig
         QThreadPool.globalInstance().start(_MeIdWorker(sig, self.hub.webex))
@@ -6031,6 +6559,7 @@ class MonitorWidget(QWidget):
         self._cmd_poll_started_ns = api.now_ns()
         gen = self._cmd_gen
         sig = _CmdPollSignals(self)
+        sig.done.connect(sig.deleteLater)   # see _start_poll: one per poll, forever
         sig.done.connect(lambda result, g=gen: self._on_commands(result, g))
         self._cmd_sig = sig
         QThreadPool.globalInstance().start(
@@ -6050,6 +6579,15 @@ class MonitorWidget(QWidget):
             self._cmd_last_logged_error = err
         elif not err:
             self._cmd_last_logged_error = ""
+        # Said once, the first time Webex admits this is a group space: from then on
+        # the bot can only see messages that tag it. Worth a line, because "the bot
+        # answers nothing" otherwise looks like a broken token and the fix — type
+        # the bot's name first — is not something anybody guesses.
+        if getattr(self.hub.webex, "mention_only_notice", False):
+            self.hub.webex.mention_only_notice = False
+            self._log(f"Webex: this room has other people in it, so I only see "
+                      f"messages that tag me. Start commands with "
+                      f"“{self.hub.webex.mention_name()} /status”.")
         ra = getattr(self.hub.webex, "retry_after_s", 0.0)
         if ra:
             self._cmd_backoff_until_ns = api.now_ns() + int(ra * 1e9)
@@ -6177,6 +6715,7 @@ class MonitorWidget(QWidget):
             elif cmd == "/window":
                 mins = int(float(args[0]))
                 self.settings["graph_window_minutes"] = mins
+                self.ensure_window_backfilled()
                 self.graph.redraw()
                 self.persist()
                 self._reply(f"Graph window set to {mins} min.")
@@ -6229,6 +6768,20 @@ class MonitorWidget(QWidget):
                     state = "enabled" if cmd == "/enable" else "disabled"
                     names = ", ".join(pv.display_name for pv in pvs)
                     self._reply(f"Alerting {state} for {names}.")
+            elif cmd in ("/run", "/rundiagnostic"):
+                # This command belongs to the standalone listener
+                # (remote_launcher.py), which starts the app when it is closed.
+                # But the app sits in the same room, and it used to answer
+                # "unknown command" to it — so with the listener not running,
+                # the only reply /run ever got was an error message, even
+                # though the app was up and tracking. Answering here means the
+                # app being open is itself the answer. Czech, to match the
+                # listener's replies to the same command.
+                if self._monitoring:
+                    self._reply("ℹ️ Diagnostika už běží a trackuje.")
+                else:
+                    self._reply("ℹ️ Diagnostika už běží, ale netrackuje — "
+                                "pošli /start.")
             else:
                 self._reply(f"❓ Unknown command {cmd}. Try /help.")
         except bot_commands.CommandError as e:
@@ -6279,6 +6832,7 @@ class MonitorWidget(QWidget):
             body += f"- **Y range:** {opts.yaxis[0]:g} … {opts.yaxis[1]:g}\n"
         body += "\n".join(self._status_line(pv) for pv in pvs)
         sig = _ChartSignals(self)
+        sig.done.connect(sig.deleteLater)   # see _start_poll
         sig.done.connect(self._on_chart_result)
         self._chart_sig = sig      # handle to the latest; the worker owns it
         QThreadPool.globalInstance().start(_ChartWorker(
@@ -6296,8 +6850,13 @@ class MonitorWidget(QWidget):
                       else "Chart sent (no data in that window — text only).")
 
     def _cmd_help(self) -> str:
+        # The mention rule goes first, and with the bot's real name in it when the
+        # listener has already asked Webex for it.
         return (
-            bot_commands.SYNTAX_HELP + "\n"
+            bot_commands.mention_help(
+                getattr(self.hub.webex, "bot_name", "")) + "\n"
+            "\n"
+            + bot_commands.SYNTAX_HELP + "\n"
             "\n"
             "**Commands**\n"
             "- `/status [pv, pv]` — values + state, all PVs or just those\n"
@@ -6315,7 +6874,9 @@ class MonitorWidget(QWidget):
             "(no argument: show current state)\n"
             "- `/graph <pv|all>` — what the app window itself shows\n"
             "- `/window <minutes>` — time window of that live graph\n"
-            "- `/yaxis <lo-hi>|auto` — Y range of that live graph")
+            "- `/yaxis <lo-hi>|auto` — Y range of that live graph\n"
+            "- `/run` — start the app when it is closed (answered by the "
+            "always-on listener; if the app is already open it says so)")
 
     def _status_line(self, p: PVConfig) -> str:
         rt = self.runtime.get(p.name)
@@ -6350,8 +6911,17 @@ class MonitorWidget(QWidget):
             if errors:
                 return "⚠ " + "; ".join(errors)
         mon = "MONITORING" if self._monitoring else "stopped (reading only)"
-        return (f"**Status ({mon}):**\n"
-                + "\n".join(self._status_line(p) for p in pvs))
+        out = (f"**Status ({mon}):**\n"
+               + "\n".join(self._status_line(p) for p in pvs))
+        # Only on the whole-list status, and only as a footer: asked from a
+        # phone, this is the one way to see how the PC that runs the monitor is
+        # doing after days of uptime.
+        if not items:
+            snap = memstats.read()
+            if snap is not None:
+                up = fmt_duration((api.now_ns() - self._mem_start_ns) / 1e9)
+                out += (f"\n\n_Up {up} · {memstats.short_line(snap)}_")
+        return out
 
     def _cmd_alarms(self) -> str:
         lines, frozen = [], []
@@ -6437,4 +7007,4 @@ class MonitorWidget(QWidget):
         if note is not None:
             self._dispatch_alert(pv, rt, note)
         self.model.refresh_all()
-        self.graph.redraw()
+        self.graph.refresh_data()
