@@ -12,6 +12,16 @@ Shift planner/
 *.zip
 *.exe
 
+# --- Credentials: never commit ---
+# Baked notification channels (Webex bot token, mailbox password). The blob is
+# only obfuscated, so anyone with the file can recover the credentials.
+# It has to exist next to Diagnostic when building - just not in the repo.
+Diagnostic/notify_provision.dat
+
+# --- Runtime logs and generated output ---
+*.log
+Pulser Monitor/gui_out/
+
 # --- Lokální stav Dev Tools (každý má svůj) ---
 Dev Tools/build_usage.json
 Dev Tools/copy_manager_state.ini

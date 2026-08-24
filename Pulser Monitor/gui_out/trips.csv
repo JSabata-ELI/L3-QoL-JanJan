@@ -1,2 +1,0 @@
-array,kind,is_outage,trip_start,trip_end,duration_s,restarted,likely_cause,cause_dark_frames,n_recovered,n_died,died_pulsers
-PD1M1,trip,1,2026-06-24 08:14:34,2026-06-24 08:16:14,100,1,C4,6,40,0,
