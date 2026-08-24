@@ -52,6 +52,30 @@ def _icon_file() -> Path:
 
 ICON = _icon_file()
 
+
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
 # Colours (readable on the light #f0f0f0 / white surfaces).
 C_TEXT = "#111111"
 C_CMD = "#1565C0"
@@ -152,8 +176,41 @@ def repo_toplevel(path):
 
 
 def list_branches(repo) -> list:
-    rc, out, _ = git_capture(repo, "branch", "--format=%(refname:short)")
-    return [b.strip() for b in out.splitlines() if b.strip()] if rc == 0 else []
+    """Branches that exist on this PC.
+
+    'git branch' is deliberately not used: while you are not on any branch it
+    prints an extra fake line - "(HEAD detached at 1234abc)" - which lands in
+    the branch box, sorts to the top and hijacks the selection, so the box
+    shows a name the user never picked and Switch then does nothing.
+    """
+    rc, out, _ = git_capture(repo, "for-each-ref", "--format=%(refname:short)",
+                             "refs/heads")
+    if rc != 0:
+        return []
+    return [b.strip() for b in out.splitlines()
+            if b.strip() and not b.strip().startswith("(")]
+
+
+def list_remote_only_branches(repo) -> list:
+    """Branches that exist only on the server, as 'origin/name'.
+
+    Without these the box cannot even offer the branch the user is looking for
+    (after a fresh clone only 'main' is here, everyone else's branches are on
+    the server), and the box looks as if their work was gone.
+    """
+    rc, out, _ = git_capture(repo, "for-each-ref", "--format=%(refname:short)",
+                             "refs/remotes")
+    if rc != 0:
+        return []
+    local = set(list_branches(repo))
+    names = []
+    for ref in (r.strip() for r in out.splitlines()):
+        if not ref or "/" not in ref or ref.endswith("/HEAD"):
+            continue
+        short = ref.split("/", 1)[1]
+        if short and short not in local and ref not in names:
+            names.append(ref)
+    return names
 
 
 def current_branch(repo) -> str:
@@ -451,12 +508,30 @@ class GitJobs:
         self._run("merge", self.target, "--no-edit")
         self._log(f"'{source}' is now level with '{self.target}'.", "ok")
 
-    def checkout(self, name, stash):
+    def checkout(self, name, stash, from_remote=False):
         if stash:
             self._run("stash", "push", "-u", "-m", "GitWork auto-stash")
             self._log("Your changes were stashed. Use 'Restore stash' to get "
                       "them back on this branch later.", "hint")
-        self._run("switch", name)
+        if from_remote:
+            local = name.split("/", 1)[1]
+            self._run("switch", "--track", name)
+            self._log(f"Created a local copy of '{name}'.", "ok")
+            name = local
+        else:
+            self._run("switch", name)
+        # Never claim a switch git did not actually make. Ask git where we
+        # ended up and compare - that is what turns "it silently put me on
+        # some other branch" into a message that says so.
+        now = self._out("branch", "--show-current")
+        if now != name:
+            raise GitError(
+                f"You did not end up on '{name}' - "
+                + (f"you are on '{now}'." if now
+                   else "you are on no branch at all (detached HEAD)."),
+                "Nothing else was changed. Click Refresh, check the branch box "
+                "and try Switch again; if it keeps happening, open the "
+                "repository in VS Code.")
         self._log(f"Switched to '{name}'.", "ok")
         self._report_state(name)
 
@@ -594,6 +669,7 @@ class App(QWidget):
         self.pool = QThreadPool.globalInstance()
         self._worker = None
         self._action_buttons = []
+        self._pending_pick = ""   # branch the user picked but has not switched to
 
         self._build_ui()
         self._init_repo()
@@ -634,13 +710,27 @@ class App(QWidget):
         il.addWidget(b_id)
         root.addWidget(ig)
 
-        # Branch & status
-        bg = QGroupBox("Branch & status")
+        # Branch and status ("&" in a group box title is eaten as a shortcut
+        # and the title comes out as "Branch  status")
+        bg = QGroupBox("Branch and status")
         bl = QVBoxLayout(bg)
+        # The box alone used to be both "where I am" and "where I want to go",
+        # so a pick looked like a move. This line always says where git
+        # actually is, on its own full-width row so long names still fit.
+        self.here_lbl = QLabel("")
+        self.here_lbl.setWordWrap(True)
+        self.here_lbl.setStyleSheet(f"color: {C_TEXT}; font-weight: 600;")
+        bl.addWidget(self.here_lbl)
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Branch:"))
         self.branch_cb = QComboBox()
         self.branch_cb.setMinimumWidth(220)
+        self.branch_cb.setToolTip(
+            "The branch you want to work on. Branches shown as 'origin/name'\n"
+            "exist only on the server - picking one creates a local copy.")
+        # activated fires only when the user picks something, never on a
+        # rebuild, so a hand-made pick can be told apart and kept.
+        self.branch_cb.activated.connect(self._on_branch_picked)
         r1.addWidget(self.branch_cb)
         for text, cb, tip in (
             ("Switch", self._on_switch,
@@ -886,24 +976,58 @@ class App(QWidget):
     def _refresh(self):
         if not self.repo:
             return
-        branches = list_branches(self.repo)
+        local = list_branches(self.repo)
+        remote_only = list_remote_only_branches(self.repo)
         info = status_info(self.repo)
+        cur = "" if info["detached"] else (info["branch"] or current_branch(self.repo))
+        # A pick the user made by hand has to survive the refresh that follows
+        # every action. It used to be overwritten with the current branch, so
+        # the chosen name vanished and Switch then quietly did nothing.
+        keep = self._pending_pick if self._pending_pick in (local + remote_only) else ""
         self.branch_cb.blockSignals(True)
         self.branch_cb.clear()
-        self.branch_cb.addItems(branches)
-        cur = info["branch"] or current_branch(self.repo)
-        idx = self.branch_cb.findText(cur)
+        self.branch_cb.addItems(local)
+        if remote_only:
+            self.branch_cb.insertSeparator(self.branch_cb.count())
+            self.branch_cb.addItems(remote_only)
+        want = keep or cur
+        idx = self.branch_cb.findText(want)
         if idx >= 0:
             self.branch_cb.setCurrentIndex(idx)
-        elif cur:
-            self.branch_cb.addItem(cur)
-            self.branch_cb.setCurrentText(cur)
+        elif want:
+            self.branch_cb.addItem(want)
+            self.branch_cb.setCurrentText(want)
         self.branch_cb.blockSignals(False)
+        self._pending_pick = keep
+        self._update_here(info, cur)
         self._update_status_badge(info)
         try:
             self.stash_btn.setEnabled(not self.busy and has_stash(self.repo))
         except Exception:
             pass
+
+    def _on_branch_picked(self, _index):
+        self._pending_pick = self.branch_cb.currentText().strip()
+        if self.repo:
+            info = status_info(self.repo)
+            cur = "" if info["detached"] else info["branch"]
+            self._update_here(info, cur)
+
+    def _update_here(self, info, cur):
+        """Say where git really is, and whether the box is only a plan so far."""
+        if info["detached"]:
+            self.here_lbl.setText("You are on: NO branch")
+            self.here_lbl.setStyleSheet(f"color: {C_ERR}; font-weight: 600;")
+            return
+        pick = self._selected_branch()
+        if pick and pick != cur and pick != f"origin/{cur}":
+            self.here_lbl.setText(
+                f"You are on: {cur}  -  the box shows '{pick}'; you are not "
+                "there until you click Switch")
+            self.here_lbl.setStyleSheet(f"color: {C_WARN}; font-weight: 600;")
+        else:
+            self.here_lbl.setText(f"You are on: {cur}" if cur else "You are on: ?")
+            self.here_lbl.setStyleSheet(f"color: {C_TEXT}; font-weight: 600;")
 
     def _update_status_badge(self, info):
         if info["detached"]:
@@ -1012,8 +1136,30 @@ class App(QWidget):
 
     def _on_switch(self):
         target = self._selected_branch()
-        if not target or target == current_branch(self.repo):
+        # Both of these used to end in silence, which is why "I picked a branch
+        # and clicked Switch" could look like the button was broken.
+        if not target:
+            QMessageBox.information(
+                self, "No branch picked",
+                "Pick a branch name in the Branch box first, then click Switch.")
             return
+        cur = current_branch(self.repo)
+        if target == cur:
+            QMessageBox.information(
+                self, "Already there", f"You are already on '{target}'.")
+            self._pending_pick = ""
+            self._refresh()
+            return
+        from_remote = target in list_remote_only_branches(self.repo)
+        if from_remote:
+            local = target.split("/", 1)[1]
+            if QMessageBox.question(
+                    self, "Branch from the server",
+                    f"'{target}' exists only on the server.\n\nCreate your own "
+                    f"copy of it here (as '{local}') and switch to it?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes) != QMessageBox.Yes:
+                return
         stash = False
         if status_info(self.repo)["changes"]:
             ans = QMessageBox.question(
@@ -1025,7 +1171,8 @@ class App(QWidget):
             if ans != QMessageBox.Yes:
                 return
             stash = True
-        self._start_job(lambda j: j.checkout(target, stash))
+        self._pending_pick = ""
+        self._start_job(lambda j: j.checkout(target, stash, from_remote))
 
     def _on_new(self):
         name, ok = QInputDialog.getText(self, "New branch", "Name of the new branch:")
@@ -1068,13 +1215,34 @@ class App(QWidget):
 
     # -- everyday action handlers -----------------------------------------
 
+    def _ensure_on_branch(self) -> bool:
+        """Stop before an action that needs a branch, and say which box fixes
+        it. Otherwise these actions only fail deep inside git."""
+        if not status_info(self.repo)["detached"]:
+            return True
+        local = list_branches(self.repo)
+        extra = (f"\n\nBranches on this PC: {', '.join(local)}"
+                 if local else "")
+        QMessageBox.warning(
+            self, "You are not on a branch",
+            "Right now your files belong to no branch (git calls this a "
+            "detached HEAD), so there is nothing to commit onto and nothing to "
+            "push.\n\nPick your branch in the Branch box and click Switch "
+            "first - the line next to it then has to say 'You are on: <your "
+            "branch>'." + extra)
+        return False
+
     def _on_fetch(self):
         self._start_job(lambda j: j.fetch())
 
     def _on_pull(self):
+        if not self._ensure_on_branch():
+            return
         self._start_job(lambda j: j.pull())
 
     def _on_commit_push(self):
+        if not self._ensure_on_branch():
+            return
         msg = self._commit_message()
         if status_info(self.repo)["changes"] and not self._ensure_identity():
             return
@@ -1089,6 +1257,8 @@ class App(QWidget):
         self._start_job(lambda j: j.commit_push(msg))
 
     def _on_sync(self):
+        if not self._ensure_on_branch():
+            return
         msg = self._commit_message()
         if status_info(self.repo)["changes"] and not self._ensure_identity():
             return
@@ -1097,6 +1267,8 @@ class App(QWidget):
         self._start_job(lambda j: j.sync(msg))
 
     def _on_merge(self):
+        if not self._ensure_on_branch():
+            return
         if current_branch(self.repo) == TARGET:
             QMessageBox.warning(self, "On main",
                                 f"Switch to your working branch before merging into '{TARGET}'.")
@@ -1244,9 +1416,12 @@ class App(QWidget):
 
 def _set_app_id():
     if os.name == "nt":
+        aumid = _icon_app_id("ELI.GitWork", ICON if ICON and ICON.exists() else None)
+        if not aumid:
+            return
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.GitWork")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(aumid)
         except Exception:
             pass
 

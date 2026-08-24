@@ -60,12 +60,99 @@ def _icon_file() -> Path | None:
     return None
 
 
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 # Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
 # here. Measured on Win11: with the window icon and the window-class icon
 # deliberately set to two different images, the taskbar draws the *window*
 # icon, so Qt's setWindowIcon is already sufficient and forcing the class icon
 # changes nothing. (That helper is only needed for the Tk apps, where
 # iconbitmap leaves the small slots on Tk's default feather.)
+
+
+# ── wheel guard ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so a settings panel still
+    scrolls when the pointer happens to pass over a field on the way down. A
+    control that is meant to take the wheel at any time carries the "wheelAlways"
+    property — the frame sliders of the Slider tab use it, because stepping
+    through shots with the wheel is the whole point of them.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `_import_img_scale` is copied into each tab).
+    """
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QApplication, QComboBox,
+                                   QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
 
 
 # ── main window ───────────────────────────────────────────────────────────────
@@ -198,6 +285,10 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         one_moment._workshop_ref     = workshop
         one_moment._workshop_tab_idx = workshop_idx
         one_moment._tab_widget       = tabs
+        # ...and "Send to Image Slider": One Moment finds the shot, the Slider is
+        # where it gets looked at (viewer.open_moment).
+        one_moment._slider_ref       = viewer
+        one_moment._slider_tab_idx   = tabs.indexOf(viewer)
 
     # ...and the way back: "Show in Image Slider" opens the folder a Workshop frame
     # came from. Only the folder — the Slider browses files on the share, so an edited
@@ -273,15 +364,17 @@ def main():
 
     # Nastav AppUserModelID před vytvořením QApplication — Windows použije
     # toto ID pro groupování v taskbaru a zobrazení správné ikony.
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "ELIBeamlines.ImageTools"
-        )
-    except Exception:
-        pass
+    # See _icon_app_id() for why the id carries a hash of the icon.
+    _aumid = _icon_app_id("ELIBeamlines.ImageTools", _icon_file())
+    if _aumid:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+        except Exception:
+            pass
 
     app = QApplication.instance() or QApplication(sys.argv)
+    install_wheel_guard(app)
 
     # Nastav ikonu na úrovni aplikace — platí pro taskbar i alt-tab
     _ico = _icon_file()

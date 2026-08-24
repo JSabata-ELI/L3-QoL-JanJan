@@ -18,7 +18,7 @@ WHAT IT IS
                      several side by side, recorded or live
       Shot Finder    find the shots where a value was what you want
       One Moment     pick a moment in the graph and see every
-                     camera at that moment  (under construction)
+                     camera at that moment
       Workshop       look at one image properly: measure it, mark
                      it, export it
 
@@ -69,6 +69,49 @@ THE FIVE TABS
     waiting for the archive if it has to rather than showing the
     previous shot's numbers.
 
+    LIMITS AND TRIPS — LIVE MODE ONLY
+    Any of those values can be given a limit. Open "Select PV
+    channels" and fill in Min, Max or both next to the value — a
+    back reflection you want kept under 0.3, say. An empty box means
+    that value is not watched.
+
+    This watches the shots as they come in. It is NOT a search of the
+    archive: picking a whole day and scrubbing through it will not
+    tell you whether the back reflection was ever over 0.3 that day,
+    and nothing flashes or gets recorded while you are browsing.
+    Only frames you actually look at are ever read, so there would be
+    nothing to search anyway.
+
+    When a value goes past its limit it flashes red over the picture,
+    and a line appears at the top of the Info panel saying WHEN it
+    happened: "14:32:07  Back reflection 0.42 J — above 0.30". The
+    flashing stops by itself as soon as the next shot comes in, so it
+    never sits there shouting about a moment that has passed. The
+    line stays.
+
+    Press "See" next to that line and the picture goes back to that
+    shot: every camera at that moment, and the machine values read
+    again for it. Live mode switches off so it stays on screen — and
+    because the watching is live-mode only, nothing flashes once you
+    are there; the line itself says which value it was and what it
+    read. "Clear trips" empties the list.
+
+    Leaving live mode stops the flashing straight away. The lines
+    stay: they are the record of what happened while it was live, and
+    going back to look at one is exactly what takes you out of live
+    mode.
+
+    A camera that stops delivering — an image that cannot be read, a
+    folder that cannot be listed — leaves the same kind of line, so a
+    gap in the record can be gone back to as well. It is one line per
+    problem, not one per shot, with a count on it if it went on.
+
+    "Overlay settings" chooses what the warning looks like: just the
+    value flashing, or the whole panel flashing red after it. The
+    panel flash keeps going until you have looked at every trip or
+    pressed "Clear trips", so nothing can pass unnoticed while you
+    are looking away.
+
     With several cameras open, the program sizes their windows so
     that even the smallest picture comes out as large as the screen
     allows, and then, among the arrangements that are as good as that,
@@ -91,52 +134,103 @@ THE FIVE TABS
     several conditions at once. The results can be opened, previewed
     or sent to Workshop.
 
-    Two buttons say what is searched: "Time window" for the period
-    and "Cameras..." for the cameras. The camera list is the same
-    one the Image Slider uses, saved sets included, and the cameras
-    you picked stay listed on the panel.
+    Two buttons say what is searched: "Time window" for the days and
+    hours and "Cameras" for the cameras. Both pickers are the ones
+    the Image Slider uses — one calendar with the times to the
+    minute, and the camera list with its saved sets — so the days
+    need not follow one another, and a set of cameras saved in one
+    tab is offered in the other.
 
-  ONE MOMENT   (under construction)
+    Double-click a day in the results and you get every matching shot
+    of that day, with a graph beside it showing the searched value
+    over the whole day and where in it the shot you are looking at
+    sits. Switching to another camera's tab keeps that place.
+
+  ONE MOMENT
     The other way round from every other tab. They show one thing
     over time; this one shows everything at one time.
 
     All the settings are in the panel down the left, as in the Image
-    Slider. "Time window" picks the day and the From/To times,
-    "Camera" picks the cameras, "Search / select PVs..." picks the
-    machine values — the same search and the same list as everywhere
-    else in the program. "Load" then draws them, ALL IN ONE GRAPH:
+    Slider. The first button opens the calendar and picks the day and
+    the From/To times — the same calendar as in the Image Slider —
+    and afterwards it says on itself what you picked, for example
+    "24.08.  07:00-19:00". The button beside it picks the cameras and
+    says how many. "Search / select PVs..." picks the machine values
+    — the same search and the same list as everywhere else in the
+    program. "Load" then draws them, ALL IN ONE GRAPH:
     values in the same unit share a scale, values in different units
     each get a scale of their own, and nothing is stretched to fit
-    anything else. ("Stacked" gives a separate graph per value, for
-    when a single one gets too busy.)
+    anything else.
 
-    Then two things you can do on the graph:
-      - CLICK a moment. The frame from every camera you picked comes
-        up on the right, and the left panel says what each value was
-        at that moment. "prev" / "next" step from shot to shot.
-      - DRAG across a stretch. "Range statistics" then gives the
+    On the graph, the LEFT button reads it and the RIGHT button looks
+    closer at it:
+      - LEFT CLICK a moment. The frame from every camera you picked
+        comes up on the right, and the left panel says what each
+        value was at that moment. "prev" / "next" step from shot to
+        shot.
+      - LEFT DRAG across a stretch. "Range statistics" then gives the
         average, the spread and the count for each value; hover a row
         for the smallest, the largest and the peak-to-peak.
+      - RIGHT DRAG across a stretch to zoom the time axis into it;
+        RIGHT CLICK to step back out again. The marked stretch and
+        the picked moment are not touched by zooming.
 
-    A click lands on the nearest real reading of the value chosen in
-    "Snap to", because a moment between two readings has no shot
-    behind it. Each frame is captioned with the camera and its own
-    time; hover it for how far it is from the moment you asked for —
-    a frame is stored only about every 35 seconds, so a few seconds'
+    A moment you CLICK in the graph is kept, listed under "The
+    moment" with the newest at the top. Click a row to go back to
+    that moment instead of hunting for it again; "Forget" drops one
+    row and "Clear" empties the list. The list survives a restart.
+
+    "prev" and "next" save nothing — stepping through a stretch of
+    the day would otherwise bury the list under moments you were only
+    walking past. When you get to one worth keeping, press "Save".
+    It greys out once that moment is already on the list.
+
+    Going back to a moment you have already looked at is instant: the
+    frames are kept in memory, so nothing is read from the share a
+    second time.
+
+    "Send to Image Slider" opens the moment in the Image Slider with
+    the cameras you picked here — full size, with everything that tab
+    can do. It gets the quarter of an hour on either side of the
+    moment, so you can slide through the shots around it, and it
+    opens on the one you sent.
+
+    If a value has no reading inside the marked stretch — a waveplate
+    or a motor is only written down when it MOVES — the last reading
+    from before the stretch is carried forward instead. Those rows
+    are amber and say "held" where the spread would be, with the
+    count at 0, so they cannot be mistaken for a real average.
+
+    A click lands on the nearest real reading of the first value
+    drawn, because a moment between two readings has no shot behind
+    it. Each frame is captioned with the camera and its own time;
+    hover it for how far it is from the moment you asked for — a
+    frame is stored only about every 35 seconds, so a few seconds'
     difference is normal.
 
     "Image / Display" changes how the frames look: contrast,
     brightness, gamma, palette and size, with the same meanings as in
     the Image Slider. Changing them redraws the frames without
-    reading them from the share again.
+    reading them from the share again, and going back to a setting you
+    already had is instant too. Holding Ctrl and rolling the
+    mouse wheel over the frames makes them bigger or smaller in
+    place — the window and the graph do not move.
 
     The eye next to a value takes it off the graph without unpicking
-    it. Click a frame to send it to Workshop. "Pop out the frames"
-    opens the same frames in a window of their own.
+    it. Click a frame to send it to Workshop. The grey bar between
+    the graph and the frames can be dragged to give either of them
+    more room.
 
-    Still unfinished: a value you built from a formula is listed but
-    not drawn, and nothing on this tab is remembered when you close
-    the program.
+    A value you built from a FORMULA is drawn like any other one. The
+    values it is built from are read even if you did not tick them,
+    and the line breaks wherever one of them has nothing to give,
+    rather than being drawn straight across the gap. A formula with
+    no unit gets a scale of its own, so a ratio around 1.5 is not
+    flattened against a motor position of 20000.
+
+    The tab remembers what you left it on: the window, the cameras,
+    the values, the saved moments, the sliders and which panels were
+    open. Nothing is read from the archive until you press "Load".
 
   WORKSHOP
     One image at a time, properly. Zoom and pan, non-destructive

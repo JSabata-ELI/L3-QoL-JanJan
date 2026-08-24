@@ -95,9 +95,37 @@ appear on the buttons, so they are worth ten lines of explanation.
     Shows the name and e-mail currently in use. "Change..." edits
     them. These are global to this computer, not per project.
 
-3.3 BRANCH & STATUS
-    The dropdown lists the local lines of work, with the current one
-    selected. Three buttons act on the selection:
+3.3 BRANCH AND STATUS
+    The first line of this box is the one that tells the truth:
+
+      You are on: <name>     where git really is right now
+      You are on: NO branch  (red) you are on no line of work at
+                             all; nothing can be saved or sent up
+                             until you pick one and Switch
+      You are on: <name> - the box shows '<other>'; you are not
+      there until you click Switch
+                             (orange) you have picked something,
+                             but you have not moved yet
+
+    The dropdown below it is a choice, not a move. It lists the
+    lines of work on this computer and, after the separator, the
+    ones that exist only on the server, shown as "origin/name".
+    Picking such a name and clicking Switch makes your own copy of
+    it here (you are asked first) - that is how you get to a
+    colleague's line of work, or back to your own after a fresh
+    copy of the project.
+
+    A pick is kept. Every action ends with a re-read of the state,
+    and that re-read used to reset the dropdown to the current line
+    of work, so a name you had chosen quietly disappeared and
+    Switch then did nothing at all. Now your choice stays in the
+    box until you switch to it or pick something else.
+
+    After a Switch the program asks git where it actually ended up
+    and compares. If it is not the line of work you asked for, it
+    says so instead of reporting success.
+
+    Three buttons act on the selection:
 
       Switch     move to the selected line of work. If you have
                  unsaved changes it offers to put them on the shelf
@@ -264,10 +292,12 @@ appear on the buttons, so they are worth ten lines of explanation.
       refused, which is the correct behaviour, but the error is not
       obvious if you have not seen it before.
 
-  "detached HEAD"
+  "detached HEAD" / "You are on: NO branch"
       You are looking at an old point in the history rather than
       standing on a line of work. Anything you save here is easy to
-      lose. Pick a branch in the dropdown and press Switch.
+      lose. Pick a branch in the dropdown and press Switch; Pull,
+      Commit + Push, Sync and Merge say this and stop instead of
+      failing halfway through.
 
 
 =================================================================
@@ -296,6 +326,21 @@ appear on the buttons, so they are worth ten lines of explanation.
 
   I switched branches and my changes are gone
       They are on the shelf. Press "Restore stash".
+
+  The branch I pick keeps turning into a different one
+      Read the first line of the Branch box. If it says "You are
+      on: NO branch", you were on no line of work, and the dropdown
+      used to fill itself with a name git only invents for that
+      state - so the box showed something nobody chose and Switch
+      did nothing. Pick your branch, click Switch, and check that
+      the first line now names it. If it does not, the log says
+      what git actually did.
+
+  My branch is not in the list
+      It exists on the server but not yet on this computer. Press
+      "Fetch", then look below the separator in the dropdown for
+      "origin/<your branch>". Pick it and Switch - you are asked
+      whether to make your own copy of it here.
 
 
 =================================================================

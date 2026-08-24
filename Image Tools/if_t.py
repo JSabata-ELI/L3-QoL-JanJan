@@ -198,10 +198,13 @@ def _pv_csv_col(name: str) -> "str | None":
 
 
 def _pv_scale_for(name: str) -> float:
-    """The registry's own factor for a NAMED PV — 1.0 for everything except entries
-    that exist to be a conversion, such as "Compressed SBW4". Never a number typed per
-    tab: this tab applied 0.749 to SBW4 on its own and so reported a different SBW4
-    than every other tab did."""
+    """The registry's own factor for a NAMED PV.
+
+    1.0 for everything today: the one entry that carried a factor ("Compressed SBW4")
+    is a FORMULA in the shared registry now, so the conversion is visible in the picker
+    instead of being applied out of sight. This stays as the single place a
+    registry-wide factor would live — never a number typed per tab, which is how this
+    tab came to apply 0.749 to SBW4 and report a different SBW4 than every other tab."""
     try:
         return float(_get_slider_module().PV_SCALE.get(name, 1.0)) or 1.0
     except (TypeError, ValueError):
@@ -439,7 +442,8 @@ Steps:
      Search by name or number; a click adds or removes a camera.
   3. The picked cameras are listed under the Workshop button.
      Click one to preview it, double-click it to unpick it.
-  4. Click View to open images, or Save As... to copy to a folder.
+  4. Click "Load data" (Source group) to read the images, or Save As...
+     to copy them to a folder.
   5. Enable "Auto-open in Slider" to automatically switch to the
      Image Slider tab and load the first selected camera folder.
   6. Use Add to A / Add to B + Compare A vs B for diff comparison.
@@ -902,7 +906,11 @@ def _make_mpl_toolbar(nav_cls, canvas, parent=None):
     which under the app's dark palette makes the icons invisible. It never
     re-tints afterwards, so the palette must be right before the toolbar is
     created. We give it a light-palette host parent → tinting is skipped and
-    the original black icons survive → then paint a light toolbar background."""
+    the original black icons survive → then paint a light toolbar background.
+
+    Belt AND braces: the icons are then REPAINTED here in a fixed dark ink, so
+    no palette, no style and no Windows dark mode can turn them white again.
+    Relying on matplotlib's own decision has already failed once."""
     host = QWidget(parent)
     hp = host.palette()
     hp.setColor(QPalette.ColorRole.Window, QColor("#f0f0f0"))
@@ -917,7 +925,52 @@ def _make_mpl_toolbar(nav_cls, canvas, parent=None):
         "QToolButton { background: transparent; padding: 3px; }"
         "QToolButton:hover { background: #d6d6d6; border-radius: 3px; }"
         "QLabel { color: #202020; }")
+    _repaint_mpl_toolbar_icons(toolbar)
     return toolbar
+
+
+def _repaint_mpl_toolbar_icons(toolbar, ink: str = "#1e2530",
+                               ink_off: str = "#9aa0a8"):
+    """Redraw every toolbar action's icon from matplotlib's own artwork in `ink`.
+
+    The artwork is black on transparent, so painting the ink THROUGH its own alpha
+    keeps the shape and replaces only the colour. Every QIcon mode is spelled out:
+    left alone, Qt invents a disabled icon by fading the normal one until it is
+    barely there."""
+    try:
+        from matplotlib import cbook
+        from PySide6.QtGui import QIcon, QPainter, QPixmap
+    except Exception:
+        return
+    by_text = {a.text(): a for a in toolbar.actions() if a.text()}
+    for item in getattr(toolbar, "toolitems", ()):
+        text, _tip, image_file, _cb = item
+        act = by_text.get(text)
+        if act is None or not image_file:
+            continue
+        try:
+            path = cbook._get_data_path("images", image_file + ".png")
+            large = path.with_name(path.name.replace(".png", "_large.png"))
+            base = QPixmap(str(large if large.exists() else path))
+            if base.isNull():
+                continue
+            icon = QIcon()
+            for mode, col in ((QIcon.Mode.Normal, ink), (QIcon.Mode.Active, ink),
+                              (QIcon.Mode.Selected, ink),
+                              (QIcon.Mode.Disabled, ink_off)):
+                pm = QPixmap(base.size())
+                pm.fill(Qt.GlobalColor.transparent)
+                p = QPainter(pm)
+                p.drawPixmap(0, 0, base)
+                p.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceIn)
+                p.fillRect(pm.rect(), QColor(col))
+                p.end()
+                for state in (QIcon.State.Off, QIcon.State.On):
+                    icon.addPixmap(pm, mode, state)
+            act.setIcon(icon)
+        except Exception:
+            continue
 
 
 # ── MULTI-SELECT CALENDAR (ported from CSS Logger/sp_t.py) ────────────────────
@@ -2488,16 +2541,19 @@ class ImageFinderWidget(QWidget):
         _exp_row.addWidget(_btn_exp); _exp_row.addWidget(_btn_col)
         panel_lay.addLayout(_exp_row)
 
-        # No group of its own for the cameras: the button sits in Time (the day and
+        # No group of its own for the cameras: the button sits in Source (the day and
         # the cameras are the one "what to search" question, the way the Slider's
         # Source group asks it) and the list of picked cameras sits in Actions.
-        s_time = _add_section("time",     "Time",             True)
-        s_pv   = _add_section("pv",       "PV Values",        True)
+        # Source first, then Actions right under it: the panel is read top-down as
+        # "what to search" → "Load data" → "what to do with what came back". PV Values
+        # is a reading of the result, so it sits below both.
+        s_time = _add_section("time",     "Source",           True)
         s_act  = _add_section("actions",  "Actions",          True)
+        s_pv   = _add_section("pv",       "PV Values",        True)
         s_disp = _add_section("display",  "Image / Display",  False)
         s_cmp  = _add_section("compare",  "Comparison",       False)
 
-        # ══════════════════ Group: TIME ══════════════════════════════════════
+        # ══════════════════ Group: SOURCE ════════════════════════════════════
         # The Image Slider's Source pattern: one button opens the calendar, the
         # button next to it picks the cameras, PV Search sits underneath. The panel
         # itself stays short — the calendar is only interesting while choosing.
@@ -2540,6 +2596,17 @@ class ImageFinderWidget(QWidget):
         sum_row.addWidget(self._time_summary, 1)
         sum_row.addWidget(self._status_dot, 0, Qt.AlignmentFlag.AlignTop)
         ll.addLayout(sum_row)
+
+        # Load data — the button that actually goes and reads the frames for the
+        # day, hour and cameras picked above. It belongs to those pickers, not to
+        # the things you do afterwards, so it closes this group instead of opening
+        # Actions.
+        self._btn_view = QPushButton("Load data")
+        self._btn_view.setToolTip(
+            "Read the frames for the picked day(s), hour and cameras, and show "
+            "them in the view on the right.")
+        self._btn_view.clicked.connect(self.view_primary_files)
+        ll.addWidget(self._btn_view)
 
         # ── The Time window dialog's contents ────────────────────────────────
         # Built here, exactly as before, but into a pane of its own instead of into
@@ -2628,7 +2695,7 @@ class ImageFinderWidget(QWidget):
 
         self._energy_info.setMaximumHeight(120)
         self._energy_info.setPlaceholderText(
-            "Energy values appear here after View.")
+            "Energy values appear here after Load data.")
         self._energy_info.setStyleSheet(
             "font-family:Consolas,monospace;font-size:11px;"
             "background:#f9f9f9;border:1px solid #ddd;")
@@ -2706,22 +2773,21 @@ class ImageFinderWidget(QWidget):
         # ══════════════════ Group: ACTIONS ═══════════════════════════════════
         ll = s_act.body_layout
 
-        # action buttons  row0=[View|Save As]  row1=[Folder|Workshop]
+        # action buttons  row0=[Save As|Folder]  row1=[Workshop]
+        # Load data moved up into Source — this group is only what you do with the
+        # frames once they are loaded.
         btn_grid = QGridLayout(); btn_grid.setSpacing(4)
-        self._btn_view = QPushButton("View")
-        self._btn_view.clicked.connect(self.view_primary_files)
         self._btn_save = QPushButton("Save As...")
         self._btn_save.clicked.connect(self.save_primary_files_as)
-        btn_grid.addWidget(self._btn_view, 0, 0)
-        btn_grid.addWidget(self._btn_save, 0, 1)
-
         self._btn_open_folder = QPushButton("📁 Folder")
         self._btn_open_folder.clicked.connect(self.open_folder_in_explorer)
+        btn_grid.addWidget(self._btn_save, 0, 0)
+        btn_grid.addWidget(self._btn_open_folder, 0, 1)
+
         self._btn_send_workshop = QPushButton("➤ Workshop")
         self._btn_send_workshop.setToolTip("Send currently selected images to Workshop tab for editing")
         self._btn_send_workshop.clicked.connect(self._send_to_workshop)
-        btn_grid.addWidget(self._btn_open_folder, 1, 0)
-        btn_grid.addWidget(self._btn_send_workshop, 1, 1)
+        btn_grid.addWidget(self._btn_send_workshop, 1, 0, 1, 2)
         ll.addLayout(btn_grid)
 
         # The cameras that will be searched — just the list, no banner and no count
@@ -2740,23 +2806,8 @@ class ImageFinderWidget(QWidget):
         self._sel_table.doubleClicked.connect(self._on_sel_table_double_clicked)
         ll.addWidget(self._sel_table)
 
-        # Step through the loaded frames. These arrows used to sit above the camera
-        # table; they belong to the picture, not to the list of cameras.
-        nav_prev_row = QHBoxLayout(); nav_prev_row.setSpacing(4)
-        nav_prev_row.addWidget(QLabel("Frame:"))
-        self._prev_btn = QPushButton("◀"); self._prev_btn.setFixedWidth(30)
-        self._prev_btn.setToolTip("Previous loaded frame")
-        self._prev_btn.clicked.connect(self._preview_prev)
-        self._next_btn = QPushButton("▶"); self._next_btn.setFixedWidth(30)
-        self._next_btn.setToolTip("Next loaded frame")
-        self._next_btn.clicked.connect(self._preview_next)
-        self._preview_counter = QLabel("")
-        self._preview_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview_counter.setStyleSheet("font-size:10px; color:#555;")
-        nav_prev_row.addWidget(self._prev_btn)
-        nav_prev_row.addWidget(self._preview_counter, 1)
-        nav_prev_row.addWidget(self._next_btn)
-        ll.addLayout(nav_prev_row)
+        # The frame arrows are NOT here any more — they are under the picture on the
+        # One frame page, where the frame they step through is.
 
         # ══════════════════ Group: IMAGE / DISPLAY ═══════════════════════════
         ll = s_disp.body_layout
@@ -3031,6 +3082,31 @@ class ImageFinderWidget(QWidget):
         self._preview_scale_lbl.setStyleSheet(
             "font-size: 11px; color: #bbb; background: transparent; padding: 0 6px;")
         pcl.addWidget(self._preview_scale_lbl, 0)
+
+        # Step through the loaded frames. These arrows lived in the panel on the left,
+        # far from the picture they move — nobody found them, and the page looked like
+        # it could only ever show one frame. They belong under the frame.
+        nav_prev_row = QHBoxLayout(); nav_prev_row.setSpacing(4)
+        nav_prev_row.addStretch(1)
+        self._prev_btn = QPushButton("◀"); self._prev_btn.setFixedWidth(40)
+        self._prev_btn.setToolTip("Previous loaded frame")
+        self._prev_btn.clicked.connect(self._preview_prev)
+        self._next_btn = QPushButton("▶"); self._next_btn.setFixedWidth(40)
+        self._next_btn.setToolTip("Next loaded frame")
+        self._next_btn.clicked.connect(self._preview_next)
+        # "0 / 0" from the start, not an empty label: the row has to read as frame
+        # navigation before anything is loaded, or it looks like decoration again.
+        self._prev_btn.setEnabled(False)
+        self._next_btn.setEnabled(False)
+        self._preview_counter = QLabel("0 / 0")
+        self._preview_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview_counter.setMinimumWidth(90)
+        self._preview_counter.setStyleSheet("font-size:11px; color:#333;")
+        nav_prev_row.addWidget(self._prev_btn)
+        nav_prev_row.addWidget(self._preview_counter, 0)
+        nav_prev_row.addWidget(self._next_btn)
+        nav_prev_row.addStretch(1)
+        pcl.addLayout(nav_prev_row, 0)
 
         outer.addWidget(preview_col, 1)
 
@@ -4361,16 +4437,23 @@ class ImageFinderWidget(QWidget):
             data = json.loads(self._PV_STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             return
-        known = set(sl.pv_all_names()) | set(ENERGY_COLUMNS_AVAILABLE)
-        sel = data.get("pv_selected")
-        if isinstance(sel, list):
-            # Iterating the SAVED list keeps the operator's order; the filter drops a
-            # PV that no longer exists, so a removed channel cannot come back.
-            self._energy_selected_cols = [str(n) for n in sel if str(n) in known]
         hid = data.get("pv_hidden")
         if isinstance(hid, list):
-            self._energy_hidden_pvs = ({str(n) for n in hid}
-                                       & set(self._energy_selected_cols))
+            self._energy_hidden_pvs = {str(n) for n in hid}
+        sel = data.get("pv_selected")
+        if isinstance(sel, list):
+            # A recipe preset saved by an older version (the "Compressed SBW4"
+            # channel) becomes its source PV plus the formula that converts it. Before
+            # the filter: the recipe name is no longer a channel, so `known` would drop
+            # it first. The eye set is handed in because the recipe takes its source
+            # off the picture.
+            sel = sl.pv_migrate_preset_recipes([str(n) for n in sel],
+                                               self._energy_hidden_pvs)
+            # Iterating the SAVED list keeps the operator's order; the filter drops a
+            # PV that no longer exists, so a removed channel cannot come back.
+            known = set(sl.pv_all_names()) | set(ENERGY_COLUMNS_AVAILABLE)
+            self._energy_selected_cols = [n for n in sel if n in known]
+        self._energy_hidden_pvs &= set(self._energy_selected_cols)
 
     def _read_ui_state_file(self) -> dict:
         try:
@@ -8699,9 +8782,12 @@ class _DayWall(QWidget):
                     ts / 1e9, tz=timezone.utc).astimezone(PRAGUE).strftime("%H:%M:%S")
             except Exception:
                 pass
-        tag = self._SOURCE_TAG.get((cell.get("meta") or {}).get("source"))
-        if tag:
-            txt += f"  [{tag}]"
+        # Only the WARNING is captioned. Naming the channel the frame was picked by
+        # ("[SBW4]") repeated the search on every tile — the operator just chose it,
+        # and it is the same for the whole wall. A frame nobody vouched for still has
+        # to say so, or a black tile reads as a broken camera.
+        if (cell.get("meta") or {}).get("source") == "blind":
+            txt += f"  [{self._SOURCE_TAG['blind']}]"
         if self._shared.adj.get(cell.get("path")):
             # Plain words, matching "(reference)" — this has to be legible in the caption
             # strip at any tile size, which a decorative glyph is not.
@@ -9052,9 +9138,71 @@ class _DayWall(QWidget):
         self.update()
 
 
+# ── wheel guard ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so a settings panel still
+    scrolls when the pointer happens to pass over a field on the way down. A
+    control that is meant to take the wheel at any time carries the "wheelAlways"
+    property.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `_import_img_scale` is copied into each tab).
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
+
+
 def main():
     """Run Image Finder as a standalone window (without Image Slider)."""
     app = QApplication.instance() or QApplication(sys.argv)
+    install_wheel_guard(app)
     app.setStyle("Fusion")
     app.setStyleSheet("""
         QWidget     { background: #f3f3f3; color: #111; }

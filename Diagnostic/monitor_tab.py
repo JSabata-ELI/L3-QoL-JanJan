@@ -1124,6 +1124,13 @@ def _describe_profile(pv: "PVConfig", prof: dict) -> str:
 
 FROZEN_LABEL = "not updating"
 
+# Said of the program itself rather than of a PV: the numbers on screen are the
+# ones from the last pass that worked, and no newer pass has landed since. Kept
+# apart from FROZEN_LABEL ("this PV's reading is dead") because the cure is
+# different — one is a sensor/archiver fault, the other means this program has
+# stopped reading and everything it shows is out of date.
+NOT_REFRESHED_LABEL = "not refreshed"
+
 
 def _frozen_tooltip(rt: "PVRuntime") -> str:
     """Why this PV is flagged as not updating, spelled out for the table."""
@@ -1218,6 +1225,11 @@ class PVTableModel(QAbstractTableModel):
         # Mirrors MonitorWidget._monitoring; only affects how the State cell is
         # rendered (values are polled either way).
         self.monitoring = False
+        # Mirrors MonitorWidget._refresh_bad: the program has stopped reading,
+        # so every cell in the table is a leftover from the last pass that
+        # worked. Set by the window's refresh watchdog.
+        self.stale = False
+        self.stale_since = ""     # clock time of that last working pass
         self._display: list[tuple] = []
         # Collapsed rows: ("g", group) hides a group's contents, ("s", (group,
         # subgroup)) hides one subgroup's PVs. In-memory only (not persisted).
@@ -1397,6 +1409,12 @@ class PVTableModel(QAbstractTableModel):
                 return _alarm_status_tooltip(pv, rt)
             if col == COL_STATE:
                 parts = []
+                if self.stale:
+                    parts.append(
+                        "This program has stopped reading. Everything in this "
+                        "row is what it read at "
+                        f"{self.stale_since or 'the last working pass'} — not "
+                        "what the PV is doing now.")
                 if rt is not None and rt.frozen:
                     parts.append(_frozen_tooltip(rt))
                 if pv.enabled and not self.monitoring:
@@ -1442,7 +1460,9 @@ class PVTableModel(QAbstractTableModel):
         stopped = not self.monitoring and pv.enabled
 
         if role == Qt.BackgroundRole and col == COL_STATE:
-            if frozen:
+            # Same paint for both "not live" states, since they mean the same
+            # thing to whoever is looking: do not trust this cell.
+            if self.stale or frozen:
                 return QColor(FROZEN_COLOR)
             if bad:
                 return QColor(BADDATA_COLOR)
@@ -1452,8 +1472,8 @@ class PVTableModel(QAbstractTableModel):
                 return QColor(STOPPED_COLOR)
             return _STATE_BG[level]
         if role == Qt.ForegroundRole and col == COL_STATE:
-            if level in (AlertLevel.WARNING, AlertLevel.ALARM) or level is None \
-                    or stopped or frozen:
+            if self.stale or level in (AlertLevel.WARNING, AlertLevel.ALARM) \
+                    or level is None or stopped or frozen:
                 return QColor("white")
             return QColor(SUCCESS)
         # The value itself is real but no longer moving: italics mark it as
@@ -1495,6 +1515,10 @@ class PVTableModel(QAbstractTableModel):
             if col == COL_UNITS:
                 return (rt.current_units if rt and rt.current_units else pv.units) or ""
             if col == COL_STATE:
+                # Nothing has been read for a while: the cell must not keep
+                # saying "ok", which reads as "checked just now and fine".
+                if self.stale:
+                    return NOT_REFRESHED_LABEL
                 if frozen:
                     # Shown for disabled PVs too: a stuck sensor is worth
                     # seeing whether or not this PV may raise alerts.
@@ -3618,13 +3642,23 @@ def _fetch_series(series: ChartSeries, start_ns: int, end_ns: int,
 
 def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
                      timeout: float, window_label: str = "",
-                     yaxis: Optional[tuple] = None) -> bytes | None:
+                     yaxis: Optional[tuple] = None,
+                     stale_after_s: float = 0.0,
+                     out_info: Optional[dict] = None) -> bytes | None:
     """Render one PNG with a curve per PV over [start_ns, end_ns].
 
     Worker-thread safe: builds its own Figure and uses the non-Qt Agg canvas,
     rendering to in-memory PNG bytes (no temp file, no shared matplotlib state).
     Threshold lines are drawn only for a single-PV chart — on an overlay they
     would belong to no visible curve. Returns None when no PV had any data.
+
+    `stale_after_s` > 0 asks the picture to say whether it is current: if the
+    newest point plotted falls short of the end of the window by more than that
+    many seconds, a warning is printed into the corner of the graph. Pass 0 for
+    a window that ends in the past, where a curve stopping at the right-hand
+    edge is simply what was asked for. `out_info`, if given, is filled with the
+    same finding (`stale_s`, `newest_ns`, `note`) so the covering message can
+    repeat it in words.
     """
     fetched = []
     for s in series:
@@ -3666,6 +3700,31 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
     if yaxis:
         ax.set_ylim(yaxis[0], yaxis[1])
     ax.grid(True, alpha=0.3)
+    # How current is this picture? The curve simply stopping is otherwise
+    # indistinguishable from a flat reading, and on a phone-sized image nobody
+    # reads the x axis to find out.
+    newest_ns = 0
+    for _s, xs, _ys, _u in fetched:
+        try:
+            newest_ns = max(newest_ns, int(max(xs).timestamp() * 1e9))
+        except (ValueError, OverflowError, OSError):
+            pass
+    lag_s = (end_ns - newest_ns) / 1e9 if newest_ns else 0.0
+    if stale_after_s > 0 and newest_ns and lag_s > stale_after_s:
+        note = (f"NOT CURRENT - newest data "
+                f"{api.ns_to_prague(newest_ns).strftime('%d.%m. %H:%M')}, "
+                f"{fmt_duration(lag_s)} before the end of the window")
+        # No emoji: the bundled font has no glyph for one and it would render
+        # as an empty box.
+        ax.text(0.99, 0.02, note, transform=ax.transAxes, ha="right",
+                va="bottom", fontsize=8, color=ALARM_COLOR,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          edgecolor=ALARM_COLOR, alpha=0.85))
+        if out_info is not None:
+            out_info["note"] = note
+    if out_info is not None:
+        out_info["newest_ns"] = newest_ns
+        out_info["stale_s"] = lag_s
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=api.TZ_PRAGUE))
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -3677,13 +3736,19 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
 
 def render_pv_png(pv_name: str, display_name: str, hours: float,
                   thr: Thresholds, timeout: float,
-                  vmin=None, vmax=None) -> bytes | None:
-    """Fetch the last `hours` h from CPVA and render a value+threshold PNG."""
+                  vmin=None, vmax=None,
+                  stale_after_s: float = 0.0) -> bytes | None:
+    """Fetch the last `hours` h from CPVA and render a value+threshold PNG.
+
+    This window always ends now, so the plot is marked when its newest point is
+    older than `stale_after_s` — an alert whose evidence stops an hour short of
+    the present must show that on the picture."""
     end = api.now_ns()
     start = end - int(hours * 3600 * 1e9)
     return render_chart_png(
         [ChartSeries(pv_name, display_name, thr, vmin, vmax)],
-        start, end, timeout, window_label=f"last {hours:g} h")
+        start, end, timeout, window_label=f"last {hours:g} h",
+        stale_after_s=stale_after_s)
 
 
 class _AxisRangeDialog(QDialog):
@@ -3816,6 +3881,19 @@ class GraphPanel(QWidget):
         self.btn_refresh.clicked.connect(self.reset_view)
         top.addWidget(self.btn_refresh)
         lay.addLayout(top)
+
+        # Banner over the graph, hidden while all is well. A curve that simply
+        # stops looks exactly like a steady reading, so when this program stops
+        # reading, the graph has to say so in words. A plain label rather than
+        # text drawn into the figure: it survives every redraw and cannot upset
+        # the blitted crosshair.
+        self.lbl_stale = QLabel("")
+        self.lbl_stale.setWordWrap(True)
+        self.lbl_stale.setStyleSheet(
+            f"QLabel {{ color: white; background: {ALARM_COLOR}; "
+            f"padding: 4px 8px; border-radius: 3px; font-weight: bold; }}")
+        self.lbl_stale.hide()
+        lay.addWidget(self.lbl_stale)
 
         self.fig = Figure(figsize=(6, 3), dpi=96)
         self.ax = self.fig.add_subplot(111)
@@ -4578,6 +4656,16 @@ class GraphPanel(QWidget):
         if self._yaxis is not None:
             self.ax.set_ylim(*self._yaxis)
 
+    def set_stale_note(self, text: str):
+        """Show (or clear) the red banner above the graph. `text` is the reason
+        the picture is out of date; empty hides it."""
+        if text:
+            self.lbl_stale.setText(f"⚠ {NOT_REFRESHED_LABEL.upper()} — {text}")
+            self.lbl_stale.show()
+        else:
+            self.lbl_stale.clear()
+            self.lbl_stale.hide()
+
     def refresh_data(self):
         """Show the samples of the poll that just finished.
 
@@ -4767,7 +4855,8 @@ class _AlertSignals(QObject):
 class _AlertWorker(QRunnable):
     def __init__(self, sig: _AlertSignals, hub: NotificationHub,
                  payload: AlertPayload, thr: Thresholds, hours: float,
-                 timeout: float, tag: str, vmin=None, vmax=None):
+                 timeout: float, tag: str, vmin=None, vmax=None,
+                 stale_after_s: float = 0.0):
         super().__init__()
         self._sig = sig
         self._hub = hub
@@ -4778,6 +4867,7 @@ class _AlertWorker(QRunnable):
         self._tag = tag
         self._vmin = vmin
         self._vmax = vmax
+        self._stale_after_s = stale_after_s
 
     def run(self):
         png = None
@@ -4785,7 +4875,7 @@ class _AlertWorker(QRunnable):
             try:
                 png = render_pv_png(self._payload.pv_name, self._payload.display_name,
                                     self._hours, self._thr, self._timeout,
-                                    self._vmin, self._vmax)
+                                    self._vmin, self._vmax, self._stale_after_s)
             except Exception:  # noqa: BLE001 - alert must still go out text-only
                 png = None
         errors = self._hub.dispatch(self._payload, png)
@@ -4804,7 +4894,7 @@ class _ChartWorker(QRunnable):
     def __init__(self, sig: _ChartSignals, hub: NotificationHub,
                  series: list[ChartSeries], start_ns: int, end_ns: int,
                  timeout: float, title: str, window_label: str,
-                 body_md: str, yaxis=None):
+                 body_md: str, yaxis=None, stale_after_s: float = 0.0):
         super().__init__()
         self._sig = sig
         self._hub = hub
@@ -4816,17 +4906,28 @@ class _ChartWorker(QRunnable):
         self._window_label = window_label
         self._body_md = body_md
         self._yaxis = yaxis
+        self._stale_after_s = stale_after_s
 
     def run(self):
         png = None
+        info: dict = {}
         try:
             png = render_chart_png(self._series, self._start_ns, self._end_ns,
-                                   self._timeout, self._window_label, self._yaxis)
+                                   self._timeout, self._window_label,
+                                   self._yaxis, self._stale_after_s, info)
         except Exception:  # noqa: BLE001 - the reply must go out text-only
             png = None
         body = self._body_md
         if png is None:
             body += "\n\n_No archived data in that window — text only._"
+        elif info.get("note"):
+            # Said in the message as well as on the picture: a chat client may
+            # show the text before the image has loaded, and the warning is the
+            # part that must not be missed.
+            body += f"\n\n**⚠ {info['note']}**"
+        elif info.get("newest_ns"):
+            body += (f"\n\n_Newest data point: "
+                     f"{api.ns_to_prague(info['newest_ns']).strftime('%d.%m. %H:%M:%S')}._")
         text = re.sub(r"[*`_]", "", body)
         errors = self._hub.dispatch_chart(self._title, text, body, png)
         _safe_emit(self._sig.done.emit, (errors, png is not None))
@@ -4976,6 +5077,15 @@ class MonitorWidget(QWidget):
         self._cmd_backoff_until_ns = 0   # honour Webex 429 Retry-After
         self._watchdog_fail_streak = 0   # consecutive fully-failed polls
         self._watchdog_bad = False       # True once the "no data" alert fired
+        # Refresh watchdog — the program's own heartbeat, as opposed to the
+        # data watchdog above (which is about the archiver answering). A poll
+        # that never comes back leaves every number on screen, in the table and
+        # in every /status reply exactly as it was, with nothing saying so.
+        # These three fields are what turns that into something the operator
+        # and the bot can both see.
+        self._last_poll_ok_ns = 0        # when a pass last landed
+        self._refresh_bad = False        # True once the "not refreshed" alert fired
+        self._refresh_bad_since_ns = 0   # when it was first noticed
         # Memory watch (see MEM_LOG_INTERVAL_MS). The launch reading is the
         # baseline every later one is compared against, so growth over days is
         # a number and not an impression.
@@ -5193,6 +5303,13 @@ class MonitorWidget(QWidget):
                        if (rt := self.runtime.get(pv.name)) is not None
                        and rt.frozen)
         frozen = f"  ·  ⚠ {n_frozen} {FROZEN_LABEL}" if n_frozen else ""
+        # The program having stopped reading outranks everything else on this
+        # line — while it is true, none of the other figures mean anything.
+        if self._refresh_bad:
+            when = (api.ns_to_prague(self._last_poll_ok_ns).strftime("%H:%M:%S")
+                    if self._last_poll_ok_ns else "never")
+            frozen = (f"  ·  ⚠ {NOT_REFRESHED_LABEL.upper()} "
+                      f"(last read {when})") + frozen
         # Memory belongs in the always-visible line for the same reason as the
         # frozen count: on a program left running for weeks it is the figure
         # nobody thinks to check until the PC will not start anything.
@@ -6094,6 +6211,9 @@ class MonitorWidget(QWidget):
             QTimer.singleShot(0, lambda: self.extend_backfill(mins))
 
     def _start_poll(self):
+        # Runs on every tick, including the ones that give up below: this is the
+        # heartbeat that notices the values have stopped moving.
+        self._check_refresh_health()
         monitored = {pv.name for pv in self.pvs}
         names = [pv.name for pv in self.pvs]
         if not names:
@@ -6156,6 +6276,10 @@ class MonitorWidget(QWidget):
 
     def _on_poll(self, results: dict):
         now = api.now_ns()
+        # A pass came back: this is the one place that proves the program is
+        # still reading. Everything the refresh watchdog says is measured from
+        # here.
+        self._last_poll_ok_ns = now
         # Refresh gate-PV values first so threshold switching below sees this
         # pass's data (a gate PV may not itself be in the monitored list).
         for g in self._gate_pv_names():
@@ -6208,6 +6332,7 @@ class MonitorWidget(QWidget):
                 rt.notify_status = ""      # episode over — clear the status cell
                 rt.notify_error = ""
         self._check_data_watchdog(results)
+        self._check_refresh_health()   # clears (and announces) a stall that ended
         self._check_frozen_alerts()
         self.model.refresh_all()
         self._refresh_dep_combos()
@@ -6329,6 +6454,135 @@ class MonitorWidget(QWidget):
         self._launch_alert_worker(payload, self._active_thresholds(pv),
                                   tag=f"frozen:{pv.name}",
                                   valid_range=self._valid_range(pv))
+
+    # --- "the program itself stopped refreshing" check -------------------
+    def _refresh_limit_s(self) -> float:
+        """How long the program may go without completing a read before what it
+        shows counts as out of date.
+
+        Deliberately longer than the wedge watchdog in _start_poll, which writes
+        a lost pass off after five intervals and immediately starts a fresh one:
+        a stall that cures itself that way should pass without anyone being
+        woken, and only a stall that survives the cure is worth announcing.
+        Never under three minutes.
+        """
+        poll_s = max(1, int(self.settings.get("poll_interval_s", 30)))
+        timeout = float(self.settings.get("http_timeout_s", 10.0))
+        return max(5.0 * poll_s + 60.0, 3.0 * timeout + 60.0, 180.0)
+
+    def _refresh_age_s(self) -> float:
+        """Seconds since the last completed read of every PV. Before the first
+        one ever completes, measured from launch — a program that has been open
+        for ten minutes and never read anything is just as broken as one that
+        stopped."""
+        ref = self._last_poll_ok_ns or self._mem_start_ns
+        return max(0.0, (api.now_ns() - ref) / 1e9)
+
+    def _refresh_fault(self) -> str:
+        """Empty while values are being refreshed, otherwise one plain sentence
+        saying they are not — written to be pasted straight into a chat reply,
+        the status line or the log."""
+        if not self.pvs:
+            return ""
+        age = self._refresh_age_s()
+        if age <= self._refresh_limit_s():
+            return ""
+        poll_s = max(1, int(self.settings.get("poll_interval_s", 30)))
+        if self._last_poll_ok_ns:
+            what = (f"nothing has been read for {fmt_duration(age)} "
+                    f"(a reading is due every {poll_s} s); the newest values I "
+                    f"have are the ones from "
+                    f"{api.ns_to_prague(self._last_poll_ok_ns).strftime('%H:%M:%S')}")
+        else:
+            what = (f"no reading has completed since this program started "
+                    f"{fmt_duration(age)} ago")
+        if self._poll_inflight and self._poll_started_ns:
+            waited = (api.now_ns() - self._poll_started_ns) / 1e9
+            what += (f"; the read that began {fmt_duration(waited)} ago has "
+                     f"not come back")
+        return what
+
+    def _check_refresh_health(self):
+        """Announce it — once — when the program stops refreshing, and once
+        more when it starts again.
+
+        Called from the poll tick and from the Webex listener tick, so whichever
+        clock is still running catches the other one being stuck. Deliberately
+        separate from the data watchdog: that one fires when the archiver stops
+        answering, this one fires when this program stops asking.
+        """
+        if not hasattr(self, "graph"):
+            return   # called before the window is built (nothing to show on yet)
+        fault = self._refresh_fault()
+        if fault and not self._refresh_bad:
+            self._refresh_bad = True
+            self._refresh_bad_since_ns = api.now_ns()
+            self._log(f"⚠ {NOT_REFRESHED_LABEL.upper()} — {fault}")
+            if self._monitoring:
+                self._send_refresh_alert(
+                    AlertLevel.ALARM,
+                    f"VALUES ARE {NOT_REFRESHED_LABEL.upper()} — {fault}. "
+                    f"Anything I report until this clears is out of date.")
+            self._mark_stale_ui(fault)
+        elif not fault and self._refresh_bad:
+            gap = fmt_duration(
+                (api.now_ns() - self._refresh_bad_since_ns) / 1e9)
+            self._refresh_bad = False
+            self._refresh_bad_since_ns = 0
+            self._log(f"Values are refreshing again (stopped for {gap}).")
+            if self._monitoring:
+                self._send_refresh_alert(
+                    AlertLevel.OK,
+                    f"Values are refreshing again after {gap}.")
+            self._mark_stale_ui("")
+
+    def _mark_stale_ui(self, fault: str):
+        """Put the 'not refreshed' marking on (or take it off) the status line,
+        the table's State column and the banner above the graph."""
+        self.model.stale = bool(fault)
+        self.model.stale_since = (
+            api.ns_to_prague(self._last_poll_ok_ns).strftime("%H:%M:%S")
+            if self._last_poll_ok_ns else "")
+        self.model.refresh_all()
+        self.graph.set_stale_note(fault)
+        self._update_status()
+
+    def _send_refresh_alert(self, level: AlertLevel, reason: str):
+        prev = AlertLevel.ALARM if level == AlertLevel.OK else AlertLevel.OK
+        payload = AlertPayload(
+            level=level, prev_level=prev,
+            pv_name="System", display_name="Value refresh",
+            value=0.0, units="", reason=reason,
+            timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="transition")
+        # Its own tag, so it can never overwrite a PV's "Alarm status" cell nor
+        # the data watchdog's.
+        self._launch_alert_worker(payload, Thresholds(), tag="refresh",
+                                  render_plot=False)
+
+    def _pv_stale_note(self, pv: PVConfig, rt: Optional[PVRuntime]) -> str:
+        """Empty when this PV's reading is as fresh as it should be, otherwise
+        why it is not — worked out at the moment of asking, not at the last poll.
+
+        That timing is the whole point: when a poll wedges, every verdict stored
+        on the PV (including its 'not updating' flag) is itself frozen at the
+        last good pass, so only a check made now can tell the truth.
+
+        Kept to a few words: it is repeated on every line of a status list, and
+        the full explanation belongs in that list's header instead.
+        """
+        if self._refresh_bad:
+            age = self._refresh_age_s()
+            return f"nothing read for {fmt_duration(age)}"
+        if rt is None or not self._frozen_check_on(pv):
+            return ""
+        if not rt.data_ts_ns:
+            return ""
+        age = (api.now_ns() - rt.data_ts_ns) / 1e9
+        if age <= self._sample_age_limit_s():
+            return ""
+        return (f"newest reading is from "
+                f"{api.ns_to_prague(rt.data_ts_ns).strftime('%H:%M:%S')}, "
+                f"{fmt_duration(age)} ago")
 
     def _check_data_watchdog(self, results: dict):
         """Alert once when every monitored PV stops getting data (fetch errors
@@ -6467,7 +6721,7 @@ class MonitorWidget(QWidget):
         self._alert_sig = sig
         QThreadPool.globalInstance().start(
             _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag,
-                         vmin, vmax))
+                         vmin, vmax, self._sample_age_limit_s()))
         return True
 
     def _on_alert_result(self, result):
@@ -6578,6 +6832,10 @@ class MonitorWidget(QWidget):
                       "(Own-message IDs are still filtered as a backstop.)")
 
     def _poll_commands(self):
+        # Second heartbeat for the refresh watchdog: this timer and the poll
+        # timer are independent, so if the reading loop stops ticking at all
+        # (not just stops finishing), the listener still notices and can say so.
+        self._check_refresh_health()
         if not self.hub.webex.can_listen():
             return
         if api.now_ns() < self._cmd_backoff_until_ns:
@@ -6880,6 +7138,12 @@ class MonitorWidget(QWidget):
         if opts.yaxis:
             body += f"- **Y range:** {opts.yaxis[0]:g} … {opts.yaxis[1]:g}\n"
         body += "\n".join(self._status_line(pv) for pv in pvs)
+        body = self._freshness_header() + body
+        # Only judge the picture's freshness when the window was asked to run up
+        # to now. A window that ends in the past is supposed to stop where it
+        # stops, and calling that "not current" would be nonsense.
+        live_window = (api.now_ns() - end_ns) < int(120 * 1e9)
+        stale_after_s = self._sample_age_limit_s() if live_window else 0.0
         sig = _ChartSignals(self)
         sig.done.connect(sig.deleteLater)   # see _start_poll
         sig.done.connect(self._on_chart_result)
@@ -6887,7 +7151,8 @@ class MonitorWidget(QWidget):
         QThreadPool.globalInstance().start(_ChartWorker(
             sig, self.hub, series, start_ns, end_ns,
             float(self.settings["http_timeout_s"]),
-            f"Plot — {short} ({label})", label, body, opts.yaxis))
+            f"Plot — {short} ({label})", label, body, opts.yaxis,
+            stale_after_s))
         self._reply(f"📈 Rendering {short} — {label}…")
 
     def _on_chart_result(self, result):
@@ -6908,7 +7173,10 @@ class MonitorWidget(QWidget):
             + bot_commands.SYNTAX_HELP + "\n"
             "\n"
             "**Commands**\n"
-            "- `/status [pv, pv]` — values + state, all PVs or just those\n"
+            "- `/status [pv, pv]` — values + state, all PVs or just those. "
+            "Every reply says when the values were last read; if I have stopped "
+            f"reading, each line says `{NOT_REFRESHED_LABEL}` instead of `ok` "
+            "and a warning goes above the list.\n"
             "- `/alarms` — only PVs currently in warning/alarm, plus any that "
             "stopped updating\n"
             "- `/list` — the configured PVs\n"
@@ -6921,6 +7189,9 @@ class MonitorWidget(QWidget):
             "- `/enable <pv, pv>` `/disable <pv, pv>` — alerting per PV\n"
             "- `/datawatchdog on|off` — the 'no data at all' alert "
             "(no argument: show current state)\n"
+            "- I also announce it by myself, without being asked, if I stop "
+            "refreshing the values at all, and again when I start again. That "
+            "one cannot be switched off.\n"
             "- `/graph <pv|all>` — what the app window itself shows\n"
             "- `/window <minutes>` — time window of that live graph\n"
             "- `/yaxis <lo-hi>|auto` — Y range of that live graph\n"
@@ -6937,7 +7208,13 @@ class MonitorWidget(QWidget):
         else:
             val = "–"
         units = (rt.current_units if rt and rt.current_units else p.units) or ""
-        if rt and rt.frozen:
+        # Freshness comes first: if the number is out of date, saying "ok" about
+        # it is worse than saying nothing, because "ok" reads as "checked just
+        # now and fine".
+        stale = self._pv_stale_note(p, rt)
+        if stale:
+            state = f"⚠ {NOT_REFRESHED_LABEL} — {stale}"
+        elif rt and rt.frozen:
             state = f"⚠ {FROZEN_LABEL} — {rt.frozen_reason}"
         elif not p.enabled:
             state = "off"
@@ -6962,15 +7239,39 @@ class MonitorWidget(QWidget):
         mon = "MONITORING" if self._monitoring else "stopped (reading only)"
         out = (f"**Status ({mon}):**\n"
                + "\n".join(self._status_line(p) for p in pvs))
+        # The warning goes ABOVE the values, not below them: read on a phone,
+        # the first line is the only one that is certain to be read, and if the
+        # numbers are out of date that is the thing to know before reading them.
+        out = self._freshness_header() + out
         # Only on the whole-list status, and only as a footer: asked from a
         # phone, this is the one way to see how the PC that runs the monitor is
         # doing after days of uptime.
         if not items:
+            out += f"\n\n_{self._freshness_footer()}_"
             snap = memstats.read()
             if snap is not None:
                 up = fmt_duration((api.now_ns() - self._mem_start_ns) / 1e9)
-                out += (f"\n\n_Up {up} · {memstats.short_line(snap)}_")
+                out += (f"\n_Up {up} · {memstats.short_line(snap)}_")
         return out
+
+    def _freshness_header(self) -> str:
+        """The banner that goes above any list of values, or '' when they are
+        current."""
+        fault = self._refresh_fault()
+        if not fault:
+            return ""
+        return (f"**⚠ {NOT_REFRESHED_LABEL.upper()} — {fault}.**\n"
+                f"_Everything below is the last reading I managed to take, not "
+                f"the present state._\n\n")
+
+    def _freshness_footer(self) -> str:
+        """One line saying when the values below were actually read."""
+        if not self._last_poll_ok_ns:
+            return "No reading has completed yet."
+        when = api.ns_to_prague(self._last_poll_ok_ns).strftime("%H:%M:%S")
+        age = fmt_duration(self._refresh_age_s())
+        late = f" — {NOT_REFRESHED_LABEL} ⚠" if self._refresh_fault() else ""
+        return f"Values read at {when} ({age} ago){late}"
 
     def _cmd_alarms(self) -> str:
         lines, frozen = [], []
@@ -6980,6 +7281,16 @@ class MonitorWidget(QWidget):
             rt = self.runtime.get(p.name)
             val = _fmt(rt.current_value) if rt else "–"
             units = (rt.current_units if rt and rt.current_units else p.units) or ""
+            # Out of date as of right now — checked here rather than trusting
+            # the verdict stored at the last poll, which is itself out of date
+            # when the poll is what stopped. Skipped while the whole program is
+            # stalled: the header already says that, and repeating it once per
+            # PV would bury the alarms.
+            stale = "" if self._refresh_bad else self._pv_stale_note(p, rt)
+            if stale:
+                frozen.append(f"- **{p.display_name}**: {val} {units} "
+                              f"[{NOT_REFRESHED_LABEL} — {stale}]")
+                continue
             # A frozen PV is listed as the data fault it is, not as whatever its
             # dead reading happens to score against the limits.
             if rt is not None and rt.frozen:
@@ -6994,11 +7305,17 @@ class MonitorWidget(QWidget):
         if lines:
             out.append("**Current alarms:**\n" + "\n".join(lines))
         if frozen:
-            out.append(f"**⚠ {FROZEN_LABEL} (reading is not live):**\n"
-                       + "\n".join(frozen))
+            out.append(f"**⚠ Reading is not live:**\n" + "\n".join(frozen))
+        fault = self._refresh_fault()
         if not out:
-            return "✅ No PVs currently in warning/alarm."
-        return "\n\n".join(out)
+            # "No alarms" is a claim about the present. While the values are
+            # out of date it is not one this program is entitled to make.
+            if fault:
+                return (f"**⚠ {NOT_REFRESHED_LABEL.upper()} — {fault}.**\n"
+                        f"_I cannot tell whether anything is in alarm right "
+                        f"now; nothing was in alarm at the last reading._")
+            return f"✅ No PVs currently in warning/alarm.\n\n_{self._freshness_footer()}_"
+        return self._freshness_header() + "\n\n".join(out)
 
     # --- simulate ------------------------------------------------------
     def simulate_alert(self):

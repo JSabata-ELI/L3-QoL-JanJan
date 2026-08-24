@@ -113,6 +113,17 @@ def _apply_config_to_root_options(cfg: dict) -> list:
 
 IGNORE_DIR_NAMES = {"archive", "dist"}  # program\archive is ignored
 
+# Two cards to a row, always: never one, never three. The window is kept wide
+# enough for two of the widest cards instead (see _fit_two_columns).
+GROUP_COLS = 2
+MIN_WINDOW_H = 430
+# The cards get less than the canvas is wide: the grid is packed with padx=8
+# inside a frame packed with padx=6, on both sides. Measuring this live reads
+# the previous size while a resize is still on its way and then the second
+# column lands past the right edge, so it is taken from the two pack() calls in
+# _rebuild_buttons_inner — change it there and change it here.
+GRID_PAD_PX = 2 * (8 + 6)
+
 NOTES_LAB    = Path(r"\\hapls-share.lcs.local\scratch\Software\notes.txt")
 NOTES_OFFICE = Path(r"\\hapls-share.cs.eli-beams.eu\scratch\Software\notes.txt")
 
@@ -767,6 +778,30 @@ def prompt_restore_swap_state(parent: tk.Tk, stuck: list[tuple[str, Path, Path]]
         )
 
 # ---------------- APP ----------------
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 def set_app_icon(win, ico_path, app_id=None):
     """Apply icon.ico to the title bar AND the Windows taskbar button.
 
@@ -775,9 +810,10 @@ def set_app_icon(win, ico_path, app_id=None):
     default feather. We force every slot from icon.ico via Win32.
     """
     import ctypes
-    if app_id:
+    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
+    if _aumid:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
     try:
@@ -822,15 +858,22 @@ class Launcher(tk.Tk):
 
         # Jednotná typografie
         self.option_add("*Font", "SegoeUI 10")
-        # --- fixed cell sizing + dynamic columns ---
-        self._group_cols = 2
-        # Fallback only. The real value is measured from the first card that gets
-        # built (`_measured_cell_px`): a guess here goes stale the moment the card
-        # gains a button, and a stale guess is what let two columns be drawn into
-        # the space for one.
-        self._group_min_cell_px = 280
+        # --- two columns, window sized to the cards ---
+        self._group_cols = GROUP_COLS
+        # How wide the widest card on screen really is. Nothing is guessed: a
+        # guess goes stale the moment a card gains a button, and a stale guess is
+        # what let two columns be drawn into the space for one.
         self._measured_cell_px = None
-        self._cell_remeasure_done = False
+        # A card is not the same width in every group (the ReadMe+Details pair
+        # makes it narrower than the archive dropdown does), so one measured
+        # width re-taken per group used to bounce between two values and each
+        # bounce booked another rebuild — the window flickered between one and
+        # two columns for ever. Now the width is taken from the widest card on
+        # screen and may only GROW inside one relayout chain, and the chain is
+        # capped, so it always settles.
+        self._relayouts = 0
+        self._btn_chars_used: int | None = None
+        self._chrome_px: int | None = None   # window width that is not card space
         self._doc_btn_px = None
 
         # Jemnější buttony
@@ -924,16 +967,14 @@ class Launcher(tk.Tk):
             self.refresh()
 
     def _calc_group_cols(self) -> int:
-        # kolik sloupců se vejde do aktuální šířky okna
-        w = self.sf.canvas.winfo_width()
-        if w <= 50:
-            return self._group_cols
+        """Always two columns of program buttons.
 
-        cell = self._measured_cell_px or self._group_min_cell_px
-        cols = max(1, w // max(1, cell))
-        # A one-column layout is a valid answer: forcing two drew the second card
-        # into space that was not there, so it was clipped at the window edge.
-        return max(1, min(int(cols), 4))
+        The count used to follow the window width, which is what let the layout
+        flip between one and two columns while the cards were being measured.
+        The window is now sized to the cards instead (`_fit_two_columns`), so
+        this is a constant and a resize never re-flows the grid.
+        """
+        return GROUP_COLS
 
     def _build_ui(self):
         root = ttk.Frame(self, padding=10)
@@ -981,6 +1022,8 @@ class Launcher(tk.Tk):
         self.status.pack(fill="x", pady=(8, 0))
 
     def _refresh_cols_and_rebuild(self):
+        if getattr(self, "_in_rebuild", False):
+            return
         new_cols = self._calc_group_cols()
         if new_cols != getattr(self, "_group_cols", 2):
             self._group_cols = new_cols
@@ -1033,6 +1076,12 @@ class Launcher(tk.Tk):
         self.current_root_path = selected_root
         self._update_available.clear()
         self._pending_updates.clear()
+        # A new scan can bring different names and different cards, so the card
+        # width is measured again from scratch instead of keeping the widest one
+        # some earlier source happened to have.
+        self._measured_cell_px = None
+        self._btn_chars_used = None
+        self._relayouts = 0
         # Startup check: flag programs whose on-disk version differs from last acknowledged
         for name, info in self.programs.items():
             ack_ver = self._acknowledged.get(name)
@@ -1066,9 +1115,21 @@ class Launcher(tk.Tk):
             prompt_restore_swap_state(self, stuck)
 
     def _rebuild_buttons(self):
-        # A rebuild after a rescan may hold different (longer) names, so let the
-        # card be measured again exactly once for this layout.
-        self._cell_remeasure_done = False
+        # Measuring a card runs Tk's pending idle work, and one of those idle
+        # jobs is the column check — which would call this again from inside
+        # itself, on widgets that are being replaced. One rebuild at a time.
+        if getattr(self, "_in_rebuild", False):
+            return
+        self._in_rebuild = True
+        try:
+            self._rebuild_buttons_inner()
+        finally:
+            self._in_rebuild = False
+
+    def _rebuild_buttons_inner(self):
+        # One column count for the whole rebuild: asking again per group is what
+        # let two groups be drawn to two different layouts in the same pass.
+        self._group_cols = self._calc_group_cols()
         for w in self.sf.inner.winfo_children():
             w.destroy()
 
@@ -1116,6 +1177,16 @@ class Launcher(tk.Tk):
         self._group_headers: dict[str, ttk.Frame] = {}  # header widget per group, for pack(after=)
         self._group_items: dict[str, list] = {}         # items per group for lazy build
 
+        # Fill the item lists for EVERY group first. The button width is taken
+        # from them, and the first group used to be built while the later groups
+        # were still missing — so it got sized to its own longest name only.
+        for _title, _gkey in GROUP_ORDER:
+            if grouped.get(_gkey):
+                self._group_items[_gkey] = grouped[_gkey]
+                # Default: Scripts expanded, everything else collapsed
+                if _gkey not in self._group_expanded:
+                    self._group_expanded[_gkey] = (_gkey == "scripts")
+
         any_group_shown = False
         for title, gkey in GROUP_ORDER:
             group_items = grouped.get(gkey, [])
@@ -1123,10 +1194,6 @@ class Launcher(tk.Tk):
                 continue
 
             any_group_shown = True
-
-            # Default: Scripts expanded, everything else collapsed
-            if gkey not in self._group_expanded:
-                self._group_expanded[gkey] = (gkey == "scripts")
 
             expanded = self._group_expanded[gkey]
             arrow = "▼" if expanded else "▶"
@@ -1157,20 +1224,104 @@ class Launcher(tk.Tk):
 
         if not any_group_shown:
             ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
+            return
+
+        self._sync_cell_width()
+
+    def _shown_group_keys(self) -> list:
+        """Groups that are open right now — the only ones the sizes come from."""
+        return [g for g, items in self._group_items.items()
+                if items and self._group_expanded.get(g)]
 
     def _prog_btn_chars(self) -> int:
         """Width of the program buttons, in characters.
 
-        Sized to the longest label actually on screen rather than a fixed 18: at
-        18 the widest label ("Internal Builder") left 28 px of empty button, and
-        that slack is exactly what the second doc button needs. One width for all
-        groups, so the cards still line up.
+        Sized to the longest name in the groups that are OPEN, so every card on
+        screen gets the same button and they line up column to column. A name
+        hidden in a collapsed group does not stretch them: at a fixed 18 the
+        widest label ("Internal Builder") left 28 px of empty button, and that
+        slack is exactly what the second doc button needs.
         """
         longest = 0
-        for items in self._group_items.values():
-            for _name, info in items:
+        shown = self._shown_group_keys()
+        for gkey in (shown or list(self._group_items)):
+            for _name, info in self._group_items.get(gkey, []):
                 longest = max(longest, len(ui_label(info.get("label", ""))))
         return max(10, min(longest, 22))
+
+    def _sync_cell_width(self, allow_shrink: bool = False):
+        """Re-flow the grid if the widest card on screen does not fit the layout.
+
+        The width may only grow while a relayout chain is running, so it cannot
+        bounce between the two card sizes; `allow_shrink` is for the one case
+        where a card really did get narrower — a group was just closed — and it
+        is only ever asked for by a click, never from inside a chain.
+        """
+        widest = 0
+        for gkey in self._shown_group_keys():
+            grid = self._group_grids.get(gkey)
+            if grid is None:
+                continue
+            try:
+                grid.update_idletasks()
+                for cell in grid.winfo_children():
+                    widest = max(widest, cell.winfo_reqwidth() + 12)
+            except Exception:
+                return          # widgets went away under us — nothing to size
+        if widest <= 50:
+            return
+
+        if allow_shrink:
+            changed = widest != self._measured_cell_px
+        else:
+            changed = self._measured_cell_px is None or widest > self._measured_cell_px
+        if changed:
+            self._measured_cell_px = widest
+
+        self._fit_two_columns()
+
+        if self._calc_group_cols() != self._group_cols and self._relayouts < 3:
+            self._relayouts += 1
+            self.after(0, self._rebuild_buttons)
+        else:
+            self._relayouts = 0
+
+    def _fit_two_columns(self):
+        """Keep the window wide enough for two of the widest cards side by side.
+
+        Opening a group can bring wider cards, and two of those no longer fit in
+        the window the user left the last group in — the second column would be
+        drawn past the right edge. So the minimum width follows the cards, and a
+        window that is already too narrow is widened once. It is never made
+        narrower again: the size the user chose is theirs to keep.
+        """
+        cell = self._measured_cell_px
+        if not cell:
+            return          # no real card measured yet — nothing to size to
+        try:
+            win_w, win_h = self.winfo_width(), self.winfo_height()
+            canvas_w = self.sf.canvas.winfo_width()
+            # The scrollbar takes its share of the width as soon as the list is
+            # long enough, so count it even while it is hidden. A scrollbar that
+            # was never mapped asks for far more than it takes (69 px measured),
+            # hence the cap — otherwise the window jumps wider than it needs.
+            vsb_w = 0 if self.sf.vsb.winfo_ismapped() else min(self.sf.vsb.winfo_reqwidth(), 24)
+        except Exception:
+            return
+        if win_w <= 1 or canvas_w <= 1:
+            return
+
+        # Everything the window spends on itself: padding, border, scrollbar.
+        # Measured right after a resize the canvas is still the old size, which
+        # makes this look bigger than it is — and it is a property of the window,
+        # not of the moment, so keep the smallest reading rather than the latest.
+        chrome = max(0, win_w - canvas_w) + max(0, vsb_w)
+        if self._chrome_px is None or chrome < self._chrome_px:
+            self._chrome_px = chrome
+        needed = GROUP_COLS * cell + self._chrome_px + GRID_PAD_PX
+        self.minsize(needed, MIN_WINDOW_H)
+        if win_w < needed:
+            self.geometry(f"{needed}x{max(win_h, MIN_WINDOW_H)}")
 
     def _doc_btn_width_px(self) -> int:
         """
@@ -1198,9 +1349,9 @@ class Launcher(tk.Tk):
         group_items = self._group_items.get(gkey, [])
         if grid is None or not group_items:
             return
-        cols = self._calc_group_cols()
+        cols = self._group_cols
         prog_chars = self._prog_btn_chars()
-        first_cell = None
+        self._btn_chars_used = prog_chars
         for i, (name, info) in enumerate(group_items):
             r = i // cols
             c = i % cols
@@ -1230,7 +1381,10 @@ class Launcher(tk.Tk):
                 img = self._icon_cache.get(key)
 
             btn_style = "Update.Prog.TButton" if name in self._update_available else "Prog.TButton"
-            btn_text = ui_label(info["label"])
+            # The button is as wide as the longest name in the open groups, but
+            # not wider than the cap — a name over the cap ends in "..." instead
+            # of being cut off mid-word at the edge of the button.
+            btn_text = clamp_label(ui_label(info["label"]), prog_chars)
             btn = ttk.Button(
                 cell,
                 text=btn_text,
@@ -1304,30 +1458,24 @@ class Launcher(tk.Tk):
             else:
                 ttk.Frame(sub, width=1).grid(row=1, column=1)
 
-            if first_cell is None:
-                first_cell = cell
-
         for c in range(cols):
             grid.grid_columnconfigure(c, weight=0, uniform="grpcols")
-
-        # How wide a card really is, including the padding it is placed with.
-        # Anything that changes a card (a new button, a longer name, a different
-        # font) then re-flows the grid by itself instead of silently overflowing.
-        if first_cell is not None and not self._cell_remeasure_done:
-            try:
-                first_cell.update_idletasks()
-                measured = first_cell.winfo_reqwidth() + 12
-            except Exception:
-                measured = None
-            if measured and measured > 50 and measured != self._measured_cell_px:
-                self._measured_cell_px = measured
-                self._cell_remeasure_done = True     # once per scan, no loop
-                if self._calc_group_cols() != cols:
-                    self.after(0, self._rebuild_buttons)
 
     def _toggle_group(self, gkey: str):
         expanded = not self._group_expanded.get(gkey, False)
         self._group_expanded[gkey] = expanded
+        self._relayouts = 0          # a click starts a fresh relayout chain
+
+        # The buttons are as wide as the longest name in the OPEN groups, so a
+        # group that brings a longer (or takes away the longest) name resizes
+        # every card — that needs the whole grid built again, not just this one.
+        if self._prog_btn_chars() != self._btn_chars_used:
+            self._rebuild_buttons()
+            # The rebuild itself may only widen the cards; this click may also
+            # narrow them, so the columns come back after closing a group.
+            self._sync_cell_width(allow_shrink=True)
+            return
+
         frame = self._group_frames.get(gkey)
         btn = self._group_toggle_btns.get(gkey)
         if frame:
@@ -1347,6 +1495,12 @@ class Launcher(tk.Tk):
             current = btn.cget("text")
             arrow = "▼" if expanded else "▶"
             btn.configure(text=arrow + current[1:])
+
+        # Opening a group can bring a wider card; closing one can take the
+        # widest away, and then the cards may fit in more columns again. A click
+        # is allowed to make the cards narrower again; a rebuild it starts is
+        # not, so the two card sizes can never take turns.
+        self._sync_cell_width(allow_shrink=True)
 
     def _show_group_menu(self, event, program_name: str):
         current_gkey = self._custom_groups.get(

@@ -3,12 +3,13 @@
 Two halves, both offline:
 
   PART 1 — the graph and the numbers.  PV series are injected by hand, so what is
-  under test is the logic: ONE graph with an axis per unit (and the stacked mode as the
-  alternative), snapping a click onto a REAL sample (a moment between two samples has
-  no shot behind it), stepping shot by shot and stopping at the ends of the window, the
-  marked-range statistics in the left panel, telling a click apart from a drag, the eye
-  taking a PV off the graph without unpicking it, and a picked formula being listed
-  rather than silently dropped.
+  under test is the logic: ONE graph with an axis per unit, snapping a click onto a REAL
+  sample (a moment between two samples has no shot behind it), stepping shot by shot and
+  stopping at the ends of the window, the marked-range statistics in the left panel
+  (including the hold-forward for a range with no sample in it), telling a left click
+  from a left drag and a right drag (zoom) from a right click (zoom out), the saved-
+  moments list, the eye taking a PV off the graph without unpicking it, and a picked
+  formula being listed rather than silently dropped.
 
   PART 2 — the frames.  A real …/cpva-image-YYYY/Y/M/D/H/CAM/<unix_ns>.png tree is
   built on local disk with unpadded folder names, UTC hours and 16-bit frames carrying
@@ -78,7 +79,6 @@ load("shot_finder", "sf_t.py")
 om = load("one_moment", "om_t.py")
 sl = sys.modules["image_slider"]
 
-MODE_ONE, MODE_STACKED = 0, 1
 
 
 def pump(w, ready, timeout=30.0):
@@ -95,6 +95,8 @@ def part1():
     print("\n=== PART 1: graph and numbers ===")
     w = om.OneMomentWidget()
     check(True, "widget builds")
+    check(w._cmb_palette.currentText() == "Gradient",
+          f"a fresh tab opens on the Gradient palette: {w._cmb_palette.currentText()!r}")
 
     day_start = w._windows[0][0]
     n = 900
@@ -116,7 +118,6 @@ def part1():
     w._refresh_pv_table()
 
     print("\n[one graph, an axis per unit]")
-    check(w._cmb_mode.currentIndex() == MODE_ONE, "one graph is the default")
     check(w._plot_order == ["SBW4", "Waveplate"], f"both PVs drawn: {w._plot_order}")
     check(len(w._fig.axes) == 2 and len(w._axes) == 2,
           f"two different units → two y axes in ONE plot ({len(w._fig.axes)})")
@@ -125,21 +126,35 @@ def part1():
     check(w._ax_x is w._axes[0] and w._ax_x.xaxis.get_visible(),
           "the time axis is the one whose ticks are actually painted")
     check(w._canvas is not None and w._toolbar is not None, "canvas and toolbar built")
-    check(len(w._selectors) == 2, "a range selector on every axes")
-    check(w._cmb_snap.count() == 2, "the snap list offers both PVs")
+    check(len(w._selectors) == 4,
+          f"a LEFT and a RIGHT selector on every axes ({len(w._selectors)})")
+    check(sorted(b for s in w._selectors for b in getattr(s, "validButtons", [])
+                 ) == [1, 1, 3, 3],
+          "left marks a range, right zooms — never both on one button")
+    check(w._snap_pv() == "SBW4",
+          f"a click snaps onto the first PV drawn: {w._snap_pv()!r}")
     check(w._pv_table.rowCount() == 2,
           f"a left-panel row per PV ({w._pv_table.rowCount()})")
+
+    print("\n[the graph toolbar can be seen]")
+    inks = set()
+    for act in w._toolbar.actions():
+        if act.icon().isNull():
+            continue
+        im = act.icon().pixmap(18, 18).toImage()
+        for yy in range(im.height()):
+            for xx in range(im.width()):
+                c = im.pixelColor(xx, yy)
+                if c.alpha() > 120:
+                    inks.add(c.name())
+    check(bool(inks) and all(om.QColor(n).value() < 128 for n in inks),
+          f"every toolbar icon is DARK, never white on white: {sorted(inks)[:3]}")
 
     sl.PV_UNITS["Waveplate"] = "J"
     w._rebuild_graph()
     check(len(w._fig.axes) == 1, "one unit → a single y axis, still one plot")
     sl.PV_UNITS["Waveplate"] = ""
-
-    print("\n[stacked, the alternative]")
-    w._cmb_mode.setCurrentIndex(MODE_STACKED)
-    check(len(w._fig.axes) == 2 and len(w._axes_paint) == 2,
-          f"one plot per PV ({len(w._fig.axes)})")
-    w._cmb_mode.setCurrentIndex(MODE_ONE)
+    w._rebuild_graph()
 
     print("\n[moment]")
     x_click = 12 * 3600 + 137.0                 # 12:02:17, between two samples
@@ -160,10 +175,29 @@ def part1():
 
     print("\n[stepping]")
     i0 = int(np.searchsorted(ts, w._moment_ns))
+    n_saved = len(w._moments)
     w._step_moment(+1)
     check(int(np.searchsorted(ts, w._moment_ns)) == i0 + 1, "next shot moves one sample")
     w._step_moment(-1)
     check(int(np.searchsorted(ts, w._moment_ns)) == i0, "previous shot comes back")
+    # Stepping is walking past a moment, not picking one: the arrows must leave the
+    # saved list alone. Saving is the Save button, by hand.
+    w._step_moment(+1)
+    w._step_moment(+1)
+    check(len(w._moments) == n_saved,
+          f"the arrows save nothing ({len(w._moments)} on the list, was {n_saved})")
+    check(w._btn_save_moment.isEnabled(),
+          "and Save is live on the moment they walked to")
+    w._save_moment()
+    check(len(w._moments) == n_saved + 1 and int(w._moment_ns) in w._moments,
+          f"Save puts that moment on the list ({len(w._moments)})")
+    check(not w._btn_save_moment.isEnabled(),
+          "and greys out, because pressing it again would do nothing")
+    w._drop_moment()
+    check(len(w._moments) == n_saved, "Forget takes it back off")
+    w._step_moment(-1)
+    w._step_moment(-1)
+    check(int(np.searchsorted(ts, w._moment_ns)) == i0, "back where the stepping began")
     w._apply_moment(int(ts[-1]))
     w._step_moment(+1)
     check(int(w._moment_ns) == int(ts[-1]),
@@ -194,6 +228,75 @@ def part1():
     check(w._span is None and w._stat_table.rowCount() == 0, "clearing empties it")
     w._on_span(9 * 3600.0, 9 * 3600.0)
     check(w._span is None, "a zero-width drag is a click, not a range")
+
+    print("\n[a range with no sample of a PV in it]")
+    # A waveplate is archived when it MOVES: three positions all morning, and then
+    # nothing for hours. A range inside that silence still has a value.
+    wp_ts = np.asarray([day_start + h * 3600 * om.NS_PER_S for h in (7, 8, 9)],
+                       dtype=np.int64)
+    w._series["Waveplate"] = {"channel": "FAKE:WP", "ts": wp_ts,
+                              "val": np.asarray([1000.0, 2000.0, 3000.0]),
+                              "status": "ok", "role": "read"}
+    w._rebuild_graph()
+    w._on_span(14 * 3600.0, 15 * 3600.0)        # long after the last move
+    row = [w._stat_table.item(1, c).text() for c in (1, 2, 3)]
+    check(row == ["3000", "held", "0"],
+          f"the last value from before the range is held forward: {row}")
+    tip = w._stat_table.item(1, 1).toolTip()
+    check("Held forward" in tip and "09:00" in tip,
+          "and the tooltip says where that value came from")
+    check(w._stat_table.item(0, 3).text() != "0",
+          "while a PV that DOES have samples there is unaffected")
+
+    print("\n[a range before the channel's first sample]")
+    w._on_span(2 * 3600.0, 3 * 3600.0)
+    row = [w._stat_table.item(1, c).text() for c in (1, 2, 3)]
+    check(row == ["—", "—", "0"],
+          f"nothing before it either → no number is invented: {row}")
+    check("none before it either" in w._stat_table.item(1, 1).toolTip(),
+          "and it says so")
+    # …unless the load brought back what it was sitting at when the window opened.
+    w._series["Waveplate"]["seed"] = (int(day_start - 60 * om.NS_PER_S), 500.0)
+    w._on_span(2 * 3600.0, 3 * 3600.0)
+    check(w._stat_table.item(1, 1).text() == "500",
+          f"the value from before the WINDOW covers it: "
+          f"{w._stat_table.item(1, 1).text()}")
+    print("\n[a PV with no sample in the window at all]")
+    w._series["Waveplate"] = {"channel": "FAKE:WP",
+                              "ts": np.zeros(0, dtype=np.int64),
+                              "val": np.zeros(0), "status": "ok", "role": "read",
+                              "seed": (int(day_start - 3600 * om.NS_PER_S), 777.0)}
+    w._on_span(10 * 3600.0, 11 * 3600.0)        # SBW4 has plenty of samples here
+    check(w._stat_table.rowCount() == 2,
+          f"it is still on the statistics table ({w._stat_table.rowCount()} rows)")
+    row = [w._stat_table.item(1, c).text() for c in (1, 2, 3)]
+    check(row == ["777", "held", "0"],
+          f"with the value it was sitting at when the window opened: {row}")
+    check(w._stat_table.item(0, 3).text() != "0",
+          "and the PV that does have samples is still a real mean of them")
+    w._clear_span()
+    w._series["Waveplate"] = {"channel": "FAKE:WP", "ts": ts, "val": waveplate,
+                              "status": "ok", "role": "read"}
+    w._rebuild_graph()
+
+    print("\n[right button = zoom, left button = read]")
+    full = w._axes[0].get_xlim()
+    w._on_zoom_span(9 * 3600.0, 11 * 3600.0)
+    lo, hi = w._axes[0].get_xlim()
+    check(abs(lo - 9 * 3600.0) < 1 and abs(hi - 11 * 3600.0) < 1,
+          f"a right drag shows only that stretch ({lo:.0f}–{hi:.0f} s)")
+    check(w._span is None, "and does NOT mark a range — zooming is looking")
+    w._on_zoom_span(9.5 * 3600.0, 10 * 3600.0)
+    w._zoom_out()
+    lo, hi = w._axes[0].get_xlim()
+    check(abs(lo - 9 * 3600.0) < 1 and abs(hi - 11 * 3600.0) < 1,
+          "a right click steps back out the way it came in")
+    w._zoom_out()
+    check(all(abs(a - b) < 1 for a, b in zip(w._axes[0].get_xlim(), full)),
+          "and again to the whole window")
+    w._zoom_out()
+    check(all(abs(a - b) < 1 for a, b in zip(w._axes[0].get_xlim(), full)),
+          "one more does nothing — there is nowhere further out to go")
 
     print("\n[the eye]")
     w._on_pv_eye("Waveplate")
@@ -232,7 +335,7 @@ def part1():
     check("Ratio" in w._plot_order, f"it is drawn: {w._plot_order}")
     check(len(w._fig.axes) == 3,
           f"a unitless formula gets a y axis of its OWN ({len(w._fig.axes)})")
-    check(w._cmb_snap.count() == 3, "and can be snapped to")
+    check("Ratio" in w._plot_order, "and is one of the curves a click can snap onto")
     w._set_moment_from_x((ts[400] - w._axis_t0_ns) / om.NS_PER_S)
     w._refresh_pv_table()
     cell = w._pv_table.item(2, 2)
@@ -279,7 +382,7 @@ def part1():
     print("\n[rebuild]")
     w._pv_selected = ["SBW4"]
     w._rebuild_graph()
-    check(len(w._axes) == 1 and len(w._selectors) == 1,
+    check(len(w._axes) == 1 and len(w._selectors) == 2,
           "a rebuild replaces the old graph rather than stacking on it")
     check(w._graph_lay.count() == 2,
           f"toolbar + canvas and nothing else ({w._graph_lay.count()})")
@@ -495,13 +598,18 @@ def part1c():
     w._cams = ["C03-040-PFM13NF-_-IMG"]
     w._pv_selected = ["SBW4", "Waveplate"]
     w._pv_hidden = {"Waveplate"}
-    w._cmb_mode.setCurrentIndex(MODE_STACKED)
+    w._moments = [int(w._windows[0][0] + 3600 * om.NS_PER_S)]
     w._sld_size.setValue(410)
     w._sld_contrast.setValue(41)
     w._cb_gamma_auto.setChecked(True)
     w._sections["stats"].set_expanded(False)
+    # A slider is dragged, so the write is coalesced through a timer — one file write
+    # per adjustment, not one per pixel of travel.
     w._save_state()
-    check(state.exists(), f"the settings file is written: {state.name}")
+    check(not state.exists() and w._save_timer.isActive(),
+          "a change arms the write instead of doing it there and then")
+    w._save_state_now()
+    check(state.exists(), f"and the settings file is written: {state.name}")
 
     scans = []
     real_cams = sl.cameras_for_windows
@@ -516,10 +624,11 @@ def part1c():
     check(w2._cams == w._cams, "the cameras come back")
     check(w2._pv_selected == ["SBW4", "Waveplate"] and w2._pv_hidden == {"Waveplate"},
           "the PV pick and the eye come back")
-    check(w2._cmb_mode.currentIndex() == MODE_STACKED
-          and w2._sld_size.value() == 410 and w2._sld_contrast.value() == 41
+    check(w2._sld_size.value() == 410 and w2._sld_contrast.value() == 41
           and w2._cb_gamma_auto.isChecked(),
-          "the graph mode and the display controls come back")
+          "the display controls come back")
+    check(w2._moments == w._moments and w2._lst_moments.count() == 1,
+          f"and so do the saved moments: {w2._moments}")
     check(w2._sections["stats"]._expanded is False,
           "and a section left closed stays closed")
     check(not scans, "and building it read NOTHING from the share")
@@ -530,7 +639,7 @@ def part1c():
 
     print("\n[a PV that no longer exists]")
     w2._pv_selected = ["SBW4", "GhostPV"]
-    w2._save_state()
+    w2._save_state_now()
     w3 = om.OneMomentWidget()
     check(w3._pv_selected == ["SBW4"],
           f"a PV gone from the shared registry is dropped: {w3._pv_selected}")
@@ -551,9 +660,11 @@ def part1c():
     check(w3._moment_ns is None, "a fresh load drops the moment")
     check(w3._lbl_moment.text() == "—",
           f"and says so instead of showing the old one: {w3._lbl_moment.text()!r}")
-    check(not w3._btn_prev.isEnabled() and not w3._btn_next.isEnabled()
-          and not w3._btn_popout.isEnabled(),
-          "prev / next / pop out are switched off with it")
+    check(not w3._btn_prev.isEnabled() and not w3._btn_next.isEnabled(),
+          "prev / next are switched off with it")
+    check(w3._lst_moments.count() == 2,
+          "but the moment stays ON the saved list — that is what the list is for "
+          f"({w3._lst_moments.count()} rows: the remembered one and the new one)")
     check(w3._lbl_frames.text() == "The frames" and w3._tiles_grid.count() == 0,
           "and the frame wall is empty, with no title over it")
 
@@ -586,6 +697,14 @@ def part2():
     sl.container_root_for_year = lambda year: ROOT / f"cpva-image-{year}"
     try:
         w = om.OneMomentWidget()
+        # Grayscale on purpose: the absolute-scale check below reads a PIXEL CODE, and
+        # the tab's default palette (Gradient) maps a code to a colour whose channels
+        # say nothing about brightness. The palette is what part 1 covers.
+        w._cmb_palette.setCurrentIndex(sl.GRADIENT_ID_GRAYSCALE)
+        # A state file left by the earlier parts carries their saved moments; this part
+        # counts rows, so it starts from an empty list.
+        w._moments = []
+        w._refresh_moments_list()
         w._day = DAY
         w._windows = [om.cpva.day_bounds_ns("2026-08-21")]
         day_start = w._windows[0][0]
@@ -600,7 +719,7 @@ def part2():
 
         x = (MOMENT_NS - day_start) / om.NS_PER_S
         w._set_moment_from_x(x)
-        pump(w, lambda: w._btn_popout.isEnabled())
+        pump(w, lambda: len(w._tile_results) >= 3)
 
         print("\n[tiles]")
         res = {r["cam"]: r for r in w._tile_results}
@@ -660,7 +779,10 @@ def part2():
         print("\n[a display control re-renders, it does not re-read]")
         res_gen, rnd_gen = w._res_gen, w._rnd_gen
         w._cmb_palette.setCurrentIndex(sl.GRADIENT_NAMES.index("Hot"))
-        pump(w, lambda: w._rnd_gen > rnd_gen and w._tile_results
+        # All three, not "at least one": the camera with no frame is answered from
+        # memory and lands in _tile_results before the two real renders even start,
+        # so a wait on "everything so far has a picture" is satisfied instantly.
+        pump(w, lambda: w._rnd_gen > rnd_gen and len(w._tile_results) >= 3
              and all(r.get("img") is not None or r.get("path") is None
                      for r in w._tile_results), timeout=20)
         check(w._res_gen == res_gen, "the share is not walked again")
@@ -670,15 +792,40 @@ def part2():
               and b3["img"].format() != QImage.Format.Format_Grayscale8,
               "and a colour palette comes out in colour")
 
-        print("\n[the pop-out follows the tab]")
-        w._popout()
-        dlg = w._popout_dlg
-        check(dlg is not None
-              and len(dlg._holder.findChildren(om._Tile)) == 3,
-              "the pop-out shows the same three frames")
-        w._popout()
-        check(w._popout_dlg is dlg,
-              "opening it again raises the one window instead of making a second")
+        print("\n[Ctrl + wheel over the frames]")
+        was = w._sld_size.value()
+        w._zoom_tiles(+1)
+        bigger = w._sld_size.value()
+        check(bigger > was, f"a notch up makes the frames bigger ({was} → {bigger})")
+        w._zoom_tiles(-1)
+        check(w._sld_size.value() < bigger, "a notch down makes them smaller again")
+        w._sld_size.setValue(w._sld_size.maximum())
+        w._zoom_tiles(+5)
+        check(w._sld_size.value() == w._sld_size.maximum(),
+              "and it stops at the end of the slider instead of running off it")
+        w._sld_size.setValue(was)
+        # The real event, not just the handler: a wheel over the pane has to arrive at
+        # the scroll area, and only WITH Ctrl may it resize instead of scroll.
+        from PySide6.QtCore import QPoint, QPointF, Qt as _Qt
+        from PySide6.QtGui import QWheelEvent
+
+        def wheel(mods):
+            return QWheelEvent(QPointF(20, 20), QPointF(20, 20), QPoint(0, 0),
+                               QPoint(0, 120), _Qt.MouseButton.NoButton, mods,
+                               _Qt.ScrollPhase.NoScrollPhase, False)
+
+        before = w._sld_size.value()
+        app.sendEvent(w._tiles_area.viewport(), wheel(
+            _Qt.KeyboardModifier.ControlModifier))
+        check(w._sld_size.value() > before,
+              f"a real Ctrl+wheel over the pane resizes the frames "
+              f"({before} → {w._sld_size.value()})")
+        held = w._sld_size.value()
+        app.sendEvent(w._tiles_area.viewport(), wheel(
+            _Qt.KeyboardModifier.NoModifier))
+        check(w._sld_size.value() == held,
+              "and a plain wheel scrolls the pane, leaving the size alone")
+        w._sld_size.setValue(was)
 
         print("\n[a second click]")
         w._set_moment_from_x(x + 35.0)
@@ -690,13 +837,57 @@ def part2():
         b2 = {r["cam"]: r for r in w._tile_results}.get(CAM_BRIGHT, {})
         check(b2.get("ts_ns") == MOMENT_NS + 40 * om.NS_PER_S,
               "and they follow the new moment")
-        tiles2 = w._popout_dlg._holder.findChildren(om._Tile)
-        caps = " | ".join(c.text() for t in tiles2 for c in t.findChildren(QLabel))
-        check("12:00:40" in caps,
-              "the open pop-out moved to the new moment with the wall")
-        w._invalidate_moment()
-        check(w._popout_dlg is None,
-              "and it is closed rather than left showing frames that are gone")
+        check(w._lst_moments.count() == 2,
+              f"both moments are on the saved list ({w._lst_moments.count()})")
+
+        print("\n[going back to a saved moment]")
+        first = w._lst_moments.item(1)          # newest is on top, so this is the first
+        w._on_moment_picked(first)
+        pump(w, lambda: {r["cam"]: r for r in w._tile_results}
+             .get(CAM_BRIGHT, {}).get("ts_ns") == MOMENT_NS + 5 * om.NS_PER_S)
+        b4 = {r["cam"]: r for r in w._tile_results}.get(CAM_BRIGHT, {})
+        check(b4.get("ts_ns") == MOMENT_NS + 5 * om.NS_PER_S,
+              "clicking the older row brings its frames back")
+        check(w._lst_moments.count() == 2,
+              "and revisiting does not add a second copy of it")
+
+        print("\n[a moment gone back to is instant]")
+        # Both halves of the cost are already in memory for this moment: which file
+        # each camera answers with, and the picture rendered from it at exactly these
+        # display settings. So the wall must go back up with NO event loop at all —
+        # no share walk, no worker thread, nothing to wait for.
+        check(w._img_cache_bytes > 0 and len(w._res_cache) >= 2,
+              f"the caches hold something ({len(w._res_cache)} file(s), "
+              f"{w._img_cache_bytes // 1024} KB of pictures)")
+        rows = [int(w._lst_moments.item(i).data(_Qt.ItemDataRole.UserRole))
+                for i in range(w._lst_moments.count())]
+
+        def row(ts_ns):
+            """A fresh item for that moment. Every refresh REBUILDS the list, so an
+            item held on to across one is a dead C++ pointer."""
+            for i in range(w._lst_moments.count()):
+                it = w._lst_moments.item(i)
+                if int(it.data(_Qt.ItemDataRole.UserRole)) == int(ts_ns):
+                    return it
+            return None
+
+        w._on_moment_picked(row(rows[0]))       # the other moment, seen once already
+        got = {r["cam"]: r for r in w._tile_results}
+        check(len(w._tile_results) == 3,
+              f"every tile is back before the event loop runs "
+              f"({len(w._tile_results)} of 3)")
+        check(got.get(CAM_BRIGHT, {}).get("img") is not None,
+              "with its picture, straight out of memory")
+        check(int(w._moment_ns) == rows[0], "and it is the moment that was clicked")
+
+        w._on_moment_picked(row(rows[1]))       # back to the older one for the rest
+        pump(w, lambda: {r["cam"]: r for r in w._tile_results}
+             .get(CAM_BRIGHT, {}).get("ts_ns") == MOMENT_NS + 5 * om.NS_PER_S)
+        w._drop_moment()
+        check(w._lst_moments.count() == 1, "Forget takes one row off")
+        w._clear_moments()
+        check(w._lst_moments.count() == 0 and not w._btn_clear_moments.isEnabled(),
+              "Clear empties the list")
 
         print("\n[the buttons are painted, not typed]")
         check(om._icon("play") is not None and om._icon("calendar") is not None,

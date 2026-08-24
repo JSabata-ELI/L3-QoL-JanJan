@@ -14,9 +14,6 @@ Image Tools is a multi-tab application for browsing, analysing and
 exporting camera images from ELI Laser experiments.
 It consists of five integrated tools accessible via tabs at the top:
 Image Finder, Image Slider, Shot Finder, One Moment and Workshop.
-One Moment is marked "under construction" in its tab title: it is
-shipped and usable, and it is not finished — what is missing is
-listed at the end of its section.
 
 
 =================================================================
@@ -108,9 +105,12 @@ LOOKING AT ONE DAY CLOSELY
     rest, throwing away the selection it had just worked out.)
 
 SEARCH
-  - The Time group is laid out the way the Image Slider's Source
-    group is: "Time window" and "Cameras..." side by side, and
-    "PV Search..." under them.
+  - The Source group is laid out the way the Image Slider's Source
+    group is: "Time window" and "Cameras..." side by side,
+    "PV Search..." under them, and "Load data" at the bottom — the
+    button that actually goes and reads the frames. Actions (Save
+    As..., Folder, Workshop and the list of picked cameras) sits
+    directly below Source.
   - "Time window" opens the calendar in a window of its own, with
     the hour (Lab time / UTC) and the weekday gate under it. A plain
     click takes one day. Ctrl+click adds or removes a weekday,
@@ -170,8 +170,10 @@ PVs
   - Every PV is reported exactly as the archiver has it. SBW4 used
     to be multiplied by the compressor transmission (0.749) behind
     the scenes, so SBW4 here did not match SBW4 anywhere else; it no
-    longer is. For the compressed energy pick "Compressed SBW4",
-    which is a PV of its own.
+    longer is. For the compressed energy tick "Compressed SBW4" in
+    the picker — it adds SBW4, adds the formula SBW4 x 0.749 under
+    that name and takes SBW4 off the picture, so only the compressed
+    value is printed.
   - Back Ref and PAP1 are still shown in mJ, and the waveplate is
     still snapped onto its own 1000-count grid.
   - The CSV-only columns (Camp ON, E2-E5 Open) have no archiver
@@ -620,8 +622,9 @@ TIMESTAMPS
 PV VALUES
   - "Configure" opens the PV picker. It is one dialog for this tab
     and for the Image Finder, over one list of PVs.
-  - THE PICKER READS AS TWO TABLES: "On the picture" and "Read, not
-    on the picture". A PV being in the list at all is what makes it
+  - THE PICKER READS AS TWO TABLES, ruled like a table with the
+    column names once at the top of each: "On the picture" and
+    "Read, not on the picture". A PV being in the list at all is what makes it
     read; the Show column in front of it is the eye, i.e. whether
     its value is printed over the frame and burned into a saved
     image. Ticking or unticking Show moves the row between the two
@@ -630,9 +633,22 @@ PV VALUES
     being read.
   - Each row says: Show, the channel LETTER (for formulas), the PV
     (the archiver channel it reads, or the formula), the name you
-    want to see, the unit, and what kind of PV it is.
-  - Presets are added by one click on their button under the search
-    box; the button greys out once the PV is in the list.
+    want to see, the unit, its Min and Max alarm limits (see ALARM
+    LIMITS AND TRIPS below), and what kind of PV it is.
+  - Presets are TICK BOXES under the search box. Ticked means the PV
+    is in the list and read; unticking is the same as pressing that
+    row's X. The tick always shows what is in the list, so it can
+    never disagree with the tables below it.
+  - "Compressed SBW4" is not a channel of its own but a RECIPE.
+    Ticking it does three things at once: it adds SBW4, it adds the
+    formula SBW4 x 0.749 (the compressor transmission) under the
+    name "Compressed SBW4", and it takes SBW4 off the picture — so
+    only the compressed energy is printed while the raw channel is
+    still read, which the formula needs. Unticking removes the
+    formula and puts SBW4 back on the picture. The factor is in the
+    formula row for anyone to read and change; it used to be applied
+    invisibly inside the programme, which meant the picker showed a
+    PV whose number matched no archiver reading.
   - Own PVs: the search box browses ALL archiver channels. Type
     fragments — they are AND-matched with wildcards between them, so
     "hapls sbw4" finds every channel holding "hapls" and, later,
@@ -794,6 +810,110 @@ PV VALUES
     archiver publishes its sample burns "no data yet" for that PV —
     save it again later to get the number.
 
+ALARM LIMITS AND TRIPS
+  - LIVE MODE ONLY. This watches the shots as they arrive; it is not a
+    search of the archive, and browsing is not shooting. Turning the
+    Slider on in archive mode and picking a whole day does NOT walk
+    the day looking for a value over its limit — nothing flashes and
+    nothing is recorded while you scrub, however bad the numbers on
+    screen are. Two reasons, and the second is the real one:
+      · a trip dated by when the operator happened to drag past a
+        frame is not a record of anything;
+      · only the frames actually looked at are ever read, so there is
+        no day to search. Answering "was the back reflection ever
+        over 0.3 today" would be a different feature — a sweep of the
+        day's archived samples, not a check of the frame on screen.
+    Leaving live mode stops the flashing at once and closes whatever
+    was still going; the trip LINES stay, because going back to look
+    at one is exactly what takes the program out of live mode. A new
+    live run therefore opens a new trip rather than counting shots
+    onto one dated in the previous run.
+  - SETTING A LIMIT. Every row of the PV picker has a Min and a Max
+    box. Fill in either, or both, and that value is watched — a back
+    reflection kept under 0.3, a temperature kept between 10 and 40.
+    An empty box is never watched: an empty box is NOT a limit of
+    zero.
+      · A comma is accepted as the decimal mark as well as a dot, and
+        is normalised when you leave the box, so what the box shows
+        is what is stored. Something that is not a number at all
+        turns the box pink and says so — a limit you believe is set
+        but is not is the one failure this must not have.
+      · Formulas can be given limits too: a ratio or a difference is
+        exactly the sort of number worth watching.
+      · Limits live with the rest of the PV setup
+        (%APPDATA%\ELI_ImageTools\pv_registry.json), so they survive
+        a restart and the Image Finder's picker shows the same ones.
+      · Removing a PV with X removes its limit with it. Merely taking
+        it off the picture does not.
+  - WHAT HAPPENS. A value past its limit is printed RED and flashing
+    over the picture, and red in the side panel. Only that value —
+    the others are untouched.
+      · The flashing stops by itself the moment the next shot comes
+        in. It is about the shot on screen, and a value shouting
+        about a moment that has passed is noise.
+      · Only a real reading for THIS shot can trip. A number carried
+        over from an earlier shot, "no data yet", "n/a" and "ERR"
+        never do — a held value next to a live picture would
+        otherwise raise an alarm about a shot nobody is looking at.
+      · The comparison is the raw threshold you typed. No deadband,
+        no smoothing.
+  - THE TRIP LIST, at the very top of the Info panel, and invisible
+    until something trips. One line per trip:
+        14:32:07  Back reflection 0.42 J — above 0.30  ×12   [See]
+    the time of the shot it happened on, what happened, and how many
+    shots it went on for. Hover it for the whole story.
+      · ONE line per problem, not one per shot. A value that stays
+        high for ten seconds is one trip with a count on it, and the
+        time is the FIRST of those shots — the one worth looking at.
+        A value that goes back inside its limits closes the trip; the
+        line stays, and the next crossing starts a new one.
+      · "See" puts the picture back on that shot: every camera at
+        that moment, and the machine values read again for it. Live
+        mode switches off first, or the next arriving frame would
+        drag the slider straight back off it.
+      · "Clear trips" empties the list. It changes nothing about the
+        limits — the next value past one starts a new trip.
+      · The list holds the last 50 and scrolls; it never grows past
+        about four rows of the panel.
+      · Every trip also writes a line to image_tools_diag.log.
+  - A CAMERA THAT STOPS DELIVERING leaves the same kind of line —
+    live mode only, for the same reason plus one of its own: outside
+    live mode nothing is supposed to be refreshing, so "not
+    refreshing" is not a fault. It leaves a line so a
+    gap in the record can be gone back to as well: "the image cannot
+    be read", "the camera folder cannot be read", "the folder is not
+    answering", "a newer image is not on screen", "the program was
+    busy". These are the same five faults the red refresh dot names,
+    and the trip uses the dot's own verdict — already latched over
+    8 s — so a frame caught mid-write cannot fill the list. The row
+    is one short line; the seconds and the filename are in the
+    tooltip.
+      · A read fault counts the frames that would not decode. The
+        other four are one event, however long it lasts, so nothing
+        counts 600 ms ticks.
+      · A PV the archiver refuses for 15 s is a trip of its own. Not
+        on the first failure — one failed read is ordinary.
+      · No new retrying was added. The program carries on; the frame
+        is read from the share again when you press "See".
+  - HOW LOUD, in "Overlay settings":
+      · "Flash the value" — just the number flashes.
+      · "Flash the value, then the whole panel" — the panel goes red
+        with white text between the red-value steps. The text turns
+        white because the values are black by default and black on
+        red is the one thing this must never produce.
+    The value flash always dies with the next shot. The PANEL flash
+    keeps going until every trip has been looked at, or "Clear trips"
+    is pressed — so a trip cannot pass unnoticed while you are
+    looking away. This choice survives a restart, along with the
+    overlay's font, size, opacity and colours, which used to be
+    forgotten every time.
+  - The flash is only a colour. It never changes the overlay's size,
+    weight or row count, so it cannot make the panel hop or move
+    under the cursor.
+  - Saved images are not affected: the burned-in values bar stays
+    plain black on white. A limit trip is a live warning, not part of
+    the record.
+
 CAMERA PRESETS (multi-cam mode)
   - Save/load named sets of cameras via the Presets panel in the
     camera picker dialog (stored in %APPDATA%\ELI_ImageTools).
@@ -823,15 +943,30 @@ Find specific shots by PV target value across a date range.
 Useful for locating shots at a given energy, waveplate angle, etc.
 
 WHAT IS SEARCHED
-  - "Time window" — the start day and hour and the end day and
-    hour. Both calendars are the same one the Image Slider uses:
-    Monday first, weekends in red, the month and the year on the bar
-    above the days. "Now" jumps the end to today and this hour.
-  - "Cameras..." — the camera list. It is the Image Slider's own
+  - "Time window" and "Cameras" sit side by side, the picked days are
+    listed under them, and "Load data" is at the bottom of the same
+    group — the action next to everything it acts on.
+  - "Time window" opens the Image Slider's own picker: one calendar
+    (Monday first, weekends in red, the month and the year on the bar
+    above the days), the times From and To to the minute, and a
+    "Multiple days" tick. With that ticked, every day you click is
+    added to the list and the From/To window applies to all of them;
+    the gear next to one day in the list gives just that day its own
+    window. So the days need NOT follow one another — Monday and
+    Thursday alone is a perfectly good search. "Now" moves the
+    calendar to today. There is no Live mode here; this tab searches
+    what is already archived.
+    What this replaced was a pair of calendars of its own, Start
+    point and End point, which could only pick whole hours and only a
+    run of days from one date to another.
+  - "Cameras" — the camera list. It is the Image Slider's own
     picker, with the same saved sets ("presets"), so a set of
     cameras saved in one tab is offered in the other. The cameras
-    you picked stay listed on the panel, with the count on the
-    button.
+    you picked stay listed on the panel below the button.
+  - "Load data" reads the PV data for those days and finds the
+    matching frames. While it runs, the bar under it says what it is
+    reading, how far along it is, how many matches are in and roughly
+    how long is left.
   - There used to be a Lab / Office switch next to the Time window
     button. Both of its settings pointed at the SAME network path
     for the pictures, the archiver answers the same from the lab and
@@ -897,10 +1032,26 @@ TECHNICAL NOTES
     same one. Every shot is looked up in the hour folder of its own
     time, so shots outside the hour of the day's best shot show up too.
   - The divider between the two tables can be dragged. "✕" closes the
-    shot list; it also closes itself when another day row is clicked,
-    when the camera tab is switched or when a new search is started.
-  - "Open selected in Slider" and "Save image" in the shot list work
-    with the shots picked there (with the whole day when none are).
+    shot list; it also closes itself when another day row is clicked
+    or when a new search is started.
+  - Switching to another camera's tab keeps your place: the same day
+    stays selected, the shot list stays open and the shot with the
+    same time stays picked, so you see that exact moment through the
+    other camera.
+  - The last column of the shot list is the picture belonging to that
+    shot. Click it to open the folder with the file selected. It is
+    filled in only for the shot you look at or the one you click - a
+    day can hold tens of thousands of shots, and finding every file
+    would mean tens of thousands of trips to the share.
+  - Next to the shot list is the day's own graph: every PV you
+    searched by over the whole day, the target and its tolerance, a
+    red dot on each shot in range and a black line on the shot you
+    are looking at. Clicking in the graph picks the nearest shot, so
+    you can see at a glance where in the day this frame sits.
+  - Sending and saving live in "Save & Send" in the left panel. "Act
+    on" chooses what they mean: the whole selected day(s), or only the
+    shot picked in the shot list. The shot choice is available while
+    the shot list is open.
   - Pixel normalization: same value / 65535 pipeline as the Slider —
     the camera's absolute full scale, so a colour means the same
     intensity in every result row.
@@ -930,7 +1081,7 @@ TECHNICAL NOTES
 
 
 =================================================================
-TAB 4 — ONE MOMENT   (under construction)
+TAB 4 — ONE MOMENT
 =================================================================
 
 The other way round from every other tab in this program. They all
@@ -945,11 +1096,17 @@ WHERE THE CONTROLS ARE
   fold away by clicking their coloured headers:
 
     Source            time window, cameras, and Load
-    The moment        which moment is picked, prev / next, pop out
-    PV channels       the value picker, the graph mode, the snap
-                      value, and the list of picked values
+    PV channels       the value picker and the list of picked
+                      values with their number at the moment
+    The moment        which moment is picked, prev / next, "Send to
+                      Image Slider", and the list of saved moments
+                      with Save / Forget / Clear
     Range statistics  the numbers for a marked stretch
     Image / Display   how the frames look
+
+  The order is the order of the work: the window and the cameras,
+  then the values that are about to be read over them, then the
+  moment picked out of the graph they draw.
 
   The graph is at the top right, the frames underneath it. The bar
   between them can be dragged to give either one more room. Progress
@@ -959,12 +1116,19 @@ WHERE THE CONTROLS ARE
 
 HOW IT IS USED
 
-  1. "Time window" — the day and the From/To times. This is the
-     Image Slider's own picker, so a window picked there is picked
+  1. The CALENDAR button (the first one, with the calendar symbol) —
+     the day and the From/To times. This is the Image Slider's own
+     picker, the same calendar, so a window picked there is picked
      here the same way, multiple days included. Only the readings
-     inside the window are read and drawn.
-  2. "Camera" — which cameras a moment should show. Again the
-     Slider's own picker, saved camera sets included.
+     inside the window are read and drawn. Afterwards the button
+     itself says what is picked, for example "24.08.  07:00-19:00";
+     hover it for the whole sentence, including how long the window
+     is. There is no "Live mode" tick in this picker, because this
+     tab does not follow new images — the Image Slider is the tab
+     that does.
+  2. The CAMERA button beside it — which cameras a moment should
+     show. Again the Slider's own picker, saved camera sets included.
+     It then says how many are picked, and names them on hover.
   3. "Search / select PVs..." — which machine values to draw. The
      Slider's own picker over the same shared list, with the same
      search, so a value added or named here is added or named
@@ -984,43 +1148,182 @@ ONE GRAPH, NOT ONE PER VALUE
   value is stretched or shifted to fit another one, so every number
   on every scale is a number that was really archived.
 
-  "Graph: Stacked" is the alternative: a separate small graph per
-  value, one under the other on a shared time axis. It is there for
-  the case of many unrelated values, where a single graph becomes a
-  tangle.
+  There is no second arrangement to choose between. One graph per
+  value, one under the other, was offered for a while and never used
+  — and the eye (below) already answers "this one is in the way".
 
   The eye next to a value in the list takes it OFF the graph without
   unpicking it: the value stays read and stays listed with its
   number, it is just not drawn. Nothing is re-read when you switch it
   back on.
 
+  The time axis is labelled on the clock: every minute, quarter of an
+  hour, hour or three hours, whichever fits — never at some round
+  number of seconds like 02:46:40.
+
+A VALUE BUILT FROM A FORMULA
+
+  A formula (a value you built yourself in the value picker, for
+  example one energy divided by another) is drawn like any other
+  value, and it means exactly what it means everywhere else in the
+  program — the same piece of the program works it out for the graph
+  here, for the live overlay in the Image Slider and for the table in
+  the Image Finder.
+
+  Three things worth knowing about it:
+
+  - The values a formula is built FROM are read even if you did not
+    tick them yourself. Without that a formula built on an unticked
+    value would silently come out empty.
+  - It is worked out at the moments its own inputs were really
+    recorded, and each input keeps its last reading until it publishes
+    a new one — which is what the archive itself means for a value
+    that is only written when it changes. Where an input has nothing
+    to give (before its first reading, or across a long hole), the
+    LINE BREAKS instead of being drawn straight across the gap.
+  - A formula with no unit gets a scale of its own, because a ratio
+    around 1.5 and a motor position around 20000 are both "no unit"
+    and sharing one scale would flatten the ratio onto the bottom of
+    the graph.
+
+  If a formula cannot be worked out at all, its row says "n/a" and
+  hovering it says why — for example that one of its letters no
+  longer points at a value that exists. It is never left blank.
+
+WHAT THE TAB REMEMBERS
+
+  The window, the cameras, the picked values and their eye state, the
+  saved moments, all the display sliders and their Auto ticks, the
+  palette, the frame size, and which panels were left open. It comes
+  back the way you left it the next time you start the program.
+
+  A saved moment survives a restart, and can be clicked with nothing
+  loaded at all — a time needs no graph behind it for the frames to
+  be found.
+
+  Restoring reads NOTHING — not the archive, not the image share. The
+  tab comes up set the way you left it and waits for you to press
+  "Load".
+
 THEN, ON THE GRAPH
 
-  CLICK a moment
+  The LEFT button reads the graph, the RIGHT button looks closer at
+  it. They never do the same thing.
+
+  LEFT CLICK a moment
     Every picked camera's frame comes up on the right, and the value
     list in the left panel shows what each value was at that moment.
     Hover a number to see how far that value's nearest reading is
-    from the moment. "◀ prev" / "next ▶" step from shot to shot.
+    from the moment. "prev" / "next" step from shot to shot without
+    saving anything; "Save" keeps the one you stop on.
 
-  DRAG across a stretch
+  LEFT DRAG across a stretch
     "Range statistics" then lists, for every value, the average, the
     spread (± std) and how many readings the stretch holds. Hover a
     row for the smallest, the largest and the peak-to-peak. The
     marked stretch is shaded on the graph and "Clear the range"
     removes it. A drag works anywhere on the graph.
 
-  The two are told apart by how far the mouse moved: below about five
-  pixels it is a click, above it a drag. The zoom and pan buttons in
-  the toolbar take priority — while one of them is active, a click
-  does not move the moment.
+  RIGHT DRAG across a stretch
+    The time axis shows only that stretch. The marked range and the
+    picked moment are left exactly as they were — zooming is looking,
+    not choosing.
+
+  RIGHT CLICK
+    Back out one zoom step, the way you came in; once there are no
+    steps left, back to the whole window.
+
+  Click and drag are told apart by how far the mouse moved: below
+  about five pixels it is a click, above it a drag. The zoom and pan
+  buttons in the toolbar take priority — while one of them is active,
+  the mouse belongs to the toolbar.
 
 WHY A CLICK SNAPS
 
   A click lands wherever the mouse was, and a time between two
   readings has no shot behind it — the frames shown for it would be
   an arbitrary pick. So the moment used is the nearest real reading
-  of the value chosen in "Snap to" (the first one by default). That
-  is also what "prev" and "next" step along.
+  of the FIRST value drawn, which is the topmost one in the value
+  list that is not hidden by its eye. That is also what "prev" and
+  "next" step along.
+
+THE SAVED MOMENTS
+
+  Finding an interesting shot in a day of readings is the slow part
+  of this tab, so a moment you went looking for is kept. What goes on
+  the list under "The moment", newest at the top:
+
+    - a moment you CLICK in the graph,
+    - a moment you go back to off the list itself,
+    - whatever is on screen when you press "Save".
+
+  What does NOT: "prev" and "next". Stepping through a stretch of the
+  day shot by shot used to put every step on the list, which pushed
+  the moments somebody had actually gone looking for off the end of
+  it. When a step lands on one worth keeping, press "Save" — it greys
+  out as soon as that moment is on the list, so the button also says
+  whether it is.
+
+  Click a row and that moment comes back: the frames and the value
+  list follow. "Forget" takes the selected row off the list, "Clear"
+  empties it. Neither touches the frames on screen. The list holds
+  the last 60 moments and survives a restart.
+
+  Changing the value list does NOT clear it: a time keeps its meaning
+  whatever is being plotted.
+
+GOING BACK IS INSTANT
+
+  A moment costs two things: finding which file each camera answers
+  with, and reading and drawing that file. Both are kept in memory,
+  so a moment looked at a second time — off the list, with the
+  arrows, or by clicking the same place again — goes back up without
+  the share being touched at all. The same holds for a display
+  setting you go back to: the picture for it is already there.
+
+  What is kept is capped in size (about 190 MB of pictures), oldest
+  first, because it is the commit charge and not the RAM that runs
+  out on these PCs. "This camera has nothing near this moment" is
+  only remembered once the moment is more than ten minutes old — for
+  a moment that recent the answer can still change, so the share is
+  asked again.
+
+SEND TO IMAGE SLIDER
+
+  The way out of this tab. It opens the Image Slider on the moment
+  that is on screen, with the cameras picked here: full size, with
+  the subtraction, the overlays, the profile tools and everything
+  else that tab can do.
+
+  The Slider is given the quarter of an hour on either side of the
+  moment as its window — so the shots around the interesting one can
+  be slid through — and it opens ON the moment that was sent, not at
+  the start of that window. Nothing has to be picked there a second
+  time. Whatever the Slider was doing before is put down first: live
+  mode, focus mode and the watcher, which would otherwise drag the
+  view to the newest frame or hide the slider itself.
+
+  The button is grey until there is both a moment and at least one
+  camera.
+
+A STRETCH WITH NO READING IN IT
+
+  Some values are written only when they CHANGE — a waveplate angle
+  or a motor position can sit still for hours. Mark a stretch inside
+  that silence and there is not one reading in it, but the value was
+  perfectly well defined the whole time.
+
+  So the statistics fall back to the last reading BEFORE the stretch
+  and carry it forward: the average column shows that value, the
+  spread column says "held", the count says 0, and the whole row is
+  amber so it can never be mistaken for an average of readings that
+  are really there. Hover it for where that reading came from and how
+  old it is.
+
+  This also covers a value with no readings in the whole window: it
+  is still listed, with whatever it was sitting at when the window
+  opened. Only when the archive holds nothing at all that old are the
+  dashes shown.
 
 THE FRAMES
 
@@ -1051,31 +1354,39 @@ HOW THE FRAMES LOOK  ("Image / Display")
           point on these cameras). Unlike Auto contrast it costs
           nothing in comparability: one pixel value still always
           gives one brightness.
-    Palette  the colours. "Default" is the untouched file as it sits
-          in the folder — while it is selected, Con and Bri do
-          nothing and are greyed out.
-    Size  how large the frames are drawn.
+    Palette  the colours. A new tab opens on "Gradient", because
+          these frames are read as beams and grey hides everything
+          the dark end of the scale is doing; a palette picked by
+          hand is remembered and wins over that. "Default" is the
+          untouched file as it sits in the folder — while it is
+          selected, Con and Bri do nothing and are greyed out.
+    Size  how large the frames are drawn. Holding Ctrl and rolling
+          the mouse wheel OVER THE FRAMES does the same thing, and
+          moves this slider with it. Only the pictures grow: the
+          window does not move and neither does the graph above.
 
   Changing any of them redraws the frames from the files already
   found, WITHOUT reading the share again, so the picture follows the
-  slider instead of waiting on the network.
+  slider instead of waiting on the network. A setting you go back to
+  is instant: that picture is still in memory.
 
   Click a frame to send it to Workshop; it goes there on the plain
   absolute scale, never with these display settings, because
-  Workshop measures the picture it is given. "⧉ Pop out the frames"
-  shows the same frames in a window of their own, which stays open
-  while you carry on using the graph.
+  Workshop measures the picture it is given.
 
-WHAT IS NOT FINISHED YET
+  The line between the graph and the frames can be dragged: it is a
+  grey bar with a grip in the middle of it, and it lights up under
+  the mouse. Neither half can be dragged away to nothing.
 
-  - A value built from a formula is listed and NOT drawn. Only real
-    archiver channels are plotted; evaluating a formula needs all its
-    sources put onto one time base, which is a decision of its own.
-  - Nothing on this tab is remembered when the program closes: the
-    window, the values, the cameras and the display settings have to
-    be picked again.
+WHAT IS NOT DONE THIS WAY, ON PURPOSE
+
   - The frames are laid out in a plain grid, not in the Image
     Slider's fitted arrangement.
+  - A window with more than 200000 readings behind a formula is
+    refused, with the reason written where the number would be,
+    rather than being thinned out: a thinned formula next to
+    full-rate values is a different curve, and one drawn without
+    saying so would be worse than one not drawn.
 
 
 =================================================================

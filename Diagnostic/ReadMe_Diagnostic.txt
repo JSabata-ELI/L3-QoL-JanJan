@@ -45,7 +45,7 @@ HOW IT DECIDES SOMETHING IS WRONG
 
   Recovery is announced too.
 
-  There are three other kinds of fault it can find:
+  There are four other kinds of fault it can find:
 
     no data at all      every value stops answering — one message
                         when it happens, one when it comes back.
@@ -58,6 +58,9 @@ HOW IT DECIDES SOMETHING IS WRONG
                         number never moves. A dead sensor or a stuck
                         system. This one is worth understanding —
                         see below.
+    not refreshed       this program itself stopped reading. Nothing
+                        on screen is wrong, it is simply old — see
+                        below.
 
 
 "NOT UPDATING"
@@ -78,6 +81,38 @@ HOW IT DECIDES SOMETHING IS WRONG
   dead reading means nothing. Values that genuinely hold still —
   switch positions, setpoints, enable flags — can be excused
   individually.
+
+
+"NOT REFRESHED"
+
+  The one above is about a value being dead. This one is about the
+  program being stuck: a reading that goes out and never comes back
+  leaves everything on screen exactly as it was, and nothing about a
+  screen full of last-known values says they are last-known. Asked
+  from a phone, it would happily keep answering "ok" for hours.
+
+  So the program watches its own pulse. If nothing has been read for
+  a few minutes — long enough that its own attempt to unstick itself
+  has already been tried and failed — then:
+
+    the status bar leads with NOT REFRESHED and the time of the last
+      reading that worked,
+    a red band appears above the graph, because a curve that simply
+      stops looks exactly like a steady value,
+    every State cell reads "not refreshed" instead of "ok",
+    the bot says it, unasked, in the chat room, and says it again
+      when the readings come back, and
+    every answer it gives until then carries the warning at the top
+      and says when the values were last read.
+
+  The chat's own graphs are checked the same way: if the newest point
+  falls short of the end of the window, the picture is stamped
+  "NOT CURRENT" and the message repeats it in words. A graph of a
+  past window — "yesterday 7-18" — is never stamped, since a curve
+  ending where the window ends is what was asked for.
+
+  This one cannot be switched off. Everything else the program says
+  is only worth as much as this.
 
 
 THE GRAPH

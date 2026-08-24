@@ -32,11 +32,21 @@ THE WINDOW, TOP TO BOTTOM
   Identity          The name and e-mail your saved work is signed
                     with. Asked once, before your first save.
 
-  Branch & status   Which line of work you are on, and a sentence
-                    saying what to do about it — for example
-                    "3 behind - Pull". "Fetch" asks the server what
-                    is new without changing any of your files;
-                    "Refresh" only re-reads what is already known.
+  Branch and status The top line always says where you really are
+                    ("You are on: Mouka"). The box below it is what
+                    you have picked — picking is not moving, you get
+                    there by clicking "Switch", and until you do,
+                    the top line says so in orange. Branches shown
+                    as "origin/name" exist only on the server; pick
+                    one and Switch makes your own copy of it here.
+                    If the top line says "You are on: NO branch" in
+                    red, nothing can be saved or sent up until you
+                    pick a branch and Switch.
+                    The status line adds a sentence about what to do
+                    — for example "3 behind - Pull". "Fetch" asks
+                    the server what is new without changing any of
+                    your files; "Refresh" only re-reads what is
+                    already known.
 
   Commit message    A short note about what you changed. It comes
                     prefilled with today's date, which is a valid

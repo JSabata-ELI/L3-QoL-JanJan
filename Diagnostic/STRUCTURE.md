@@ -55,7 +55,8 @@ monitor_tab._PollWorker       every poll_interval_s, poll_max_workers at a time
   ▼
 PVRuntime.samples ──► PVTableModel ──► GraphPanel
   ├─ alerting.AlertEvaluator     thresholds + debounce/settle + re-notify
-  ├─ alerting.detect_frozen      "not updating"
+  ├─ alerting.detect_frozen      "not updating"  (this PV's reading is dead)
+  ├─ _check_refresh_health       "not refreshed" (this program stopped reading)
   ▼
 alerting.NotificationHub ──► Teams webhook / SMTP / Webex rooms
                                     ▲
@@ -158,6 +159,28 @@ per PV.
 for PVs with **On** unchecked. A threshold alert raised on a frozen PV carries the
 warning in its reason. Per-PV opt-out: `frozen_check` in **Edit PV**, for values that
 genuinely hold still (switch positions, setpoints, enable flags).
+
+### "Not refreshed" — the program's own pulse
+
+`_check_refresh_health()`, run from both the poll tick and the Webex listener tick
+(two independent clocks), compares now against `_last_poll_ok_ns` — set only in
+`_on_poll`, where a pass actually lands. Past `_refresh_limit_s()` (five poll
+intervals + 1 min, min 3 min — deliberately longer than the wedge write-off in
+`_start_poll`, so a stall that self-heals wakes nobody) the program is not reading:
+
+| Where | What it shows |
+|---|---|
+| status bar | leads with `⚠ NOT REFRESHED (last read HH:MM:SS)` |
+| graph | red banner above it (`GraphPanel.set_stale_note`) — a QLabel, not figure text, so redraws and the blitted crosshair are untouched |
+| State column | `not refreshed` for every row (`PVTableModel.stale`) |
+| chat | one alert out (tag `refresh`) and one on recovery; alerting stopped silences the message, not the display |
+| `/status` | warning above the list, `[not refreshed — …]` in place of `[ok]`, and `Values read at …` in the footer (present even when healthy) |
+| `/alarms` | will not say "all clear" on out-of-date values |
+| plots | `render_chart_png(stale_after_s=…)` stamps `NOT CURRENT` on the picture and repeats it in the message; only for windows that end at now |
+
+`_pv_stale_note()` does the same for one PV, judged **at reply time** rather than
+trusted from the last poll — when the poll is what stopped, the stored verdict is
+stale too. It honours the same `frozen_check` opt-out.
 
 ---
 
@@ -342,8 +365,10 @@ silently decrypts to an empty string and alerting stops working with no error.
 
 ```
 python test_alerting.py         the alerting layer incl. detect_frozen
-python test_monitor_frozen.py   the "not updating" check as the tab uses it:
-                                verdict, one-shot notification, table rendering
+python test_monitor_frozen.py   the two "not live" checks as the tab uses them:
+                                "not updating" (verdict, one-shot notification,
+                                table rendering) and the refresh watchdog
+                                (/status, /alarms, State column, chart stamp)
 python test_bot_commands.py     the chat command grammar
 ```
 

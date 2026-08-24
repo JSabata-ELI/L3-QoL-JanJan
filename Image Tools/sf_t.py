@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import atexit
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QLineEdit,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QCalendarWidget,
+    QHeaderView, QAbstractItemView,
     QMessageBox, QMainWindow, QStyledItemDelegate, QSizePolicy,
     QProgressBar, QPlainTextEdit, QRadioButton, QButtonGroup,
     QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QGroupBox, QSlider,
@@ -280,6 +281,28 @@ def _get_slider_module():
         _SLIDER_MOD = mod
     return _SLIDER_MOD
 
+
+_FINDER_MOD = None
+
+
+def _get_finder_module():
+    """Borrow the Image Finder's `_make_mpl_toolbar` — the one graph toolbar factory
+    that also REPAINTS the icons, without which matplotlib draws them white on this
+    app's palette. Same one-instance rule as _get_slider_module."""
+    global _FINDER_MOD
+    mod = _sys.modules.get("image_finder")
+    if mod is not None:
+        return mod
+    if _FINDER_MOD is None:
+        import importlib.util as _ilu
+        p = Path(__file__).resolve().parent / "if_t.py"
+        spec = _ilu.spec_from_file_location("if_t_helpers", p)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FINDER_MOD = mod
+    return _FINDER_MOD
+
+
 PV_COLUMNS: dict[str, str] = {
     "sbw4":      "SBW4 [J]",
     "ptm1":      "PTM1 [J]",
@@ -446,6 +469,19 @@ def _load_csv_for_day(day: date, cols: "list[str]",
             if col in row_dict:
                 per_col.setdefault(col, []).append(row_dict)
     return merged, per_col
+
+
+def _ns_to_prague(t_ns: int) -> datetime:
+    """UTC nanoseconds → lab (Prague) wall clock. The archive is UTC, everything the
+    operator reads is Prague — see the shared timezone rule.
+
+    Returned NAIVE, like the `_dt` field of every sample row: matplotlib plots a
+    tz-aware datetime in ITS own timezone (UTC by default), which shifted the whole
+    day's curve two hours to the left."""
+    if PRAGUE is not None:
+        return (datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+                .astimezone(PRAGUE).replace(tzinfo=None))
+    return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc).replace(tzinfo=None)
 
 
 def _load_api_for_day(day: date, cols: "list[str]",
@@ -887,6 +923,9 @@ class _SearchSignals(QObject):
     done     = Signal()
     log_msg  = Signal(str)
     progress = Signal(int)
+    # What is being read right now — printed on the progress bar, so a long search
+    # says where it is instead of showing a bar with no words on it.
+    stage    = Signal(str)
 
 
 class _CamLoadSignals(QObject):
@@ -896,6 +935,9 @@ class _CamLoadSignals(QObject):
 class _PreviewSignals(QObject):
     show    = Signal(object, str, int)  # (QImage | None, energy_text, gen)
     log_msg = Signal(str)
+    # (row of the shot list, image path or "", why there is none) — the Image column
+    # of the opened day is filled in from worker threads.
+    day_img = Signal(int, str, str)
 
 class _ChannelSignals(QObject):
     loaded = Signal(list)  # archiver channel names
@@ -906,6 +948,20 @@ class _NoScrollComboBox(QComboBox):
 
 
 # ── UI HELPERS ────────────────────────────────────────────────────────────────
+
+# House table look — the same values the Workshop's tables use (wk_t._TABLE_QSS).
+# Spelled out here rather than imported: wk_t is loaded AFTER this tab, and a table
+# left unstyled takes its alternate row colour from the app palette, which paints
+# every second row dark red-brown.
+_TABLE_QSS = (
+    "QTableWidget { background: #ffffff; alternate-background-color: #f5f7fa;"
+    " color: #16202c; gridline-color: #dfe4ea; font-size: 11px;"
+    " selection-background-color: #cfe0f7; selection-color: #10243c; }"
+    "QHeaderView::section { background: #eef1f5; color: #16202c; font-weight: 600;"
+    " border: 0px; border-right: 1px solid #dfe4ea;"
+    " border-bottom: 1px solid #cfd6de; padding: 4px 6px; }"
+    "QTableCornerButton::section { background: #eef1f5; border: 0px; }"
+)
 
 def _hsep() -> QFrame:
     f = QFrame()
@@ -1029,137 +1085,6 @@ class _PreviewWidget(QWidget):
         p.drawPixmap(x, y, scaled)
         p.end()
 
-# ── TIME WINDOW DIALOG ────────────────────────────────────────────────────────
-
-class _TimeWindowDialog(QDialog):
-    """Pick start and end datetime (date + hour) for Shot Finder."""
-
-    def __init__(self, start_dt: datetime | None = None, end_dt: datetime | None = None,
-                 parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Time window")
-
-        now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        if start_dt is None:
-            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if end_dt is None:
-            end_dt = now
-
-        def _make_cal(init_date: datetime) -> "tuple[QFrame, QCalendarWidget]":
-            """One calendar in the house style — literally the Image Slider's widget
-            (Monday first, gray day-name header, red weekends, white cells, month
-            button + year box instead of Qt's own nav bar), so a day looks and clicks
-            the same in every tab.
-
-            The Slider's delegate paints the selection itself, so the picked day has
-            to be handed to it — Qt's own highlight is stripped from every other cell.
-            Returns (frame_to_add, cal); the frame carries the header and nav row."""
-            frame, cal = _get_slider_module()._make_multiselect_calendar(
-                QDate(init_date.year, init_date.month, init_date.day))
-            cal.setMinimumWidth(238)
-
-            def _paint_one(d: QDate):
-                dele = getattr(cal, "_wk_delegate", None)
-                if dele is not None:
-                    dele.set_selected([d])
-                    dele.set_focus_date(d)
-
-            cal.clicked.connect(_paint_one)
-            cal._paint_one = _paint_one      # so "Now" can repaint after jumping
-            _paint_one(cal.selectedDate())
-            return frame, cal
-
-        # Start section
-        grp_start = QGroupBox("Start point")
-        start_lay = QVBoxLayout(grp_start)
-        self._cal_start_frame, self._cal_start = _make_cal(start_dt)
-        self._hour_start = QSpinBox()
-        self._hour_start.setRange(0, 23)
-        self._hour_start.setValue(start_dt.hour)
-        self._hour_start.setFixedWidth(70)
-        hr_start_row = QHBoxLayout()
-        hr_start_row.addWidget(QLabel("Hour:"))
-        hr_start_row.addWidget(self._hour_start)
-        hr_start_row.addStretch(1)
-        start_lay.addWidget(self._cal_start_frame)
-        start_lay.addLayout(hr_start_row)
-
-        # End section
-        grp_end = QGroupBox("End point")
-        end_lay = QVBoxLayout(grp_end)
-        self._cal_end_frame, self._cal_end = _make_cal(end_dt)
-        self._hour_end = QSpinBox()
-        self._hour_end.setRange(0, 23)
-        self._hour_end.setValue(end_dt.hour)
-        self._hour_end.setFixedWidth(70)
-        hr_end_row = QHBoxLayout()
-        hr_end_row.addWidget(QLabel("Hour:"))
-        hr_end_row.addWidget(self._hour_end)
-        btn_now = QPushButton("Now")
-        btn_now.setFixedWidth(48)
-        btn_now.clicked.connect(self._go_to_now)
-        hr_end_row.addWidget(btn_now)
-        hr_end_row.addStretch(1)
-        end_lay.addWidget(self._cal_end_frame)
-        end_lay.addLayout(hr_end_row)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
-        btns.accepted.connect(self._on_accept)
-        btns.rejected.connect(self.reject)
-
-        cals_row = QHBoxLayout()
-        cals_row.addWidget(grp_start)
-        cals_row.addWidget(grp_end)
-
-        main_lay = QVBoxLayout(self)
-        main_lay.addLayout(cals_row)
-        main_lay.addWidget(btns)
-
-    def _go_to_now(self):
-        now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        qd = QDate(now.year, now.month, now.day)
-        self._cal_end.setSelectedDate(qd)
-        self._cal_end.setCurrentPage(qd.year(), qd.month())
-        # setSelectedDate does not go through clicked(), so repaint by hand or the
-        # blue day stays on the day the dialog opened on.
-        paint = getattr(self._cal_end, "_paint_one", None)
-        if paint is not None:
-            paint(qd)
-        self._hour_end.setValue(now.hour)
-
-    def _on_accept(self):
-        start = self._selected_start()
-        end = self._selected_end()
-        if end < start:
-            QMessageBox.warning(self, "Invalid range", "End must be after start.")
-            return
-        self.accept()
-
-    def _selected_start(self) -> datetime:
-        d = self._cal_start.selectedDate()
-        tz = PRAGUE if PRAGUE else timezone.utc
-        return datetime(d.year(), d.month(), d.day(), self._hour_start.value(), 0, 0, tzinfo=tz)
-
-    def _selected_end(self) -> datetime:
-        d = self._cal_end.selectedDate()
-        tz = PRAGUE if PRAGUE else timezone.utc
-        return datetime(d.year(), d.month(), d.day(), self._hour_end.value(), 59, 59, tzinfo=tz)
-
-    def selected_range(self) -> tuple[datetime, datetime]:
-        return self._selected_start(), self._selected_end()
-
-    def selected_days(self) -> list[date]:
-        start = self._selected_start().date()
-        end = self._selected_end().date()
-        days = []
-        cur = start
-        while cur <= end:
-            days.append(cur)
-            cur += timedelta(days=1)
-        return days
-
-
 # ── MAIN WIDGET ───────────────────────────────────────────────────────────────
 
 class ShotFinderWidget(QWidget):
@@ -1185,6 +1110,20 @@ class ShotFinderWidget(QWidget):
         self._day_cam: "str | None" = None
         self._day_hour_cache: dict = {}
         self._day_split_sized = False
+        self._day_img_col = -1          # index of the Image column, -1 = not built
+        self._day_reveal_row = -1       # row whose click is waiting for its path
+        self._day_canvas = None         # matplotlib canvas (built on first open)
+        self._day_toolbar = None
+        self._day_ax = None
+        self._day_marker = None         # the vertical line on the picked shot
+        self._day_plot_ns: "list[int]" = []   # shot timestamps, for click-to-pick
+
+        # The day and the shot to come back to when another camera's tab is brought
+        # to the front. Without them, switching camera dropped both.
+        self._focus_day = None
+        self._focus_shot_ns = None
+        self._focus_panel_open = False
+        self._restoring_focus = False
 
         self._all_cameras: list[tuple[str, str]] = []
         self._selected_cameras: list[tuple[str, str]] = []
@@ -1199,9 +1138,15 @@ class ShotFinderWidget(QWidget):
         self._custom_labels: dict[str, str] = {}   # col → name to display
         self._load_pv_state()
 
+        # The picked time window — the Image Slider's own picker fills these in.
+        # `_tw_windows` is ONE (start_ns, end_ns) per picked day, the END EXCLUSIVE
+        # (see is_t.seg_bounds_ns); a day set need not be contiguous.
         _now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        self._tw_start: datetime = _now.replace(hour=0, minute=0, second=0, microsecond=0)
-        self._tw_end: datetime = _now
+        self._tw_windows: "list[tuple[int, int]]" = []
+        self._tw_segments = None            # so the dialog reopens on the last pick
+        self._tw_day = _now.date()
+        self._tw_times = (0, 0, 23, 59)     # h_from, m_from, h_to, m_to
+        self._set_time_window_from_times()
 
         self._temp_dir: str | None = None
         self._preview_pixmap_orig = None
@@ -1210,6 +1155,7 @@ class ShotFinderWidget(QWidget):
         self._current_preview_path: "Path | None" = None
         self._preview_sig.show.connect(self._on_preview_ready)
         self._preview_sig.log_msg.connect(self._log)
+        self._preview_sig.day_img.connect(self._on_day_img_resolved)
         atexit.register(self._cleanup_temp)
         self._last_save_dir: "Path | None" = None
 
@@ -1368,7 +1314,9 @@ class ShotFinderWidget(QWidget):
         s_time = _add_section("time",    "Source",               True)
         s_pv   = _add_section("pv",      "PVs",                  True)
         s_cam  = _add_section("cameras", "Cameras",              True)
-        s_srch = _add_section("search",  "Search & Results",     True)
+        # Same key as before ("search"), so the remembered open/closed state of this
+        # section survives the rename.
+        s_srch = _add_section("search",  "Save & Send",          True)
         s_disp = _add_section("display", "Image / Display",      False)
         s_log  = _add_section("log",     "Log",                  False)
 
@@ -1377,22 +1325,59 @@ class ShotFinderWidget(QWidget):
         # the Image Slider has it. The Lab / Office picker that used to sit here is
         # gone — see IMAGES_ROOT.
         ll = s_time.body_layout
+        # Side by side, the way the Image Slider's Source group asks the same pair of
+        # questions: WHEN, and WHICH cameras.
+        src_row = QHBoxLayout()
+        src_row.setSpacing(4)
         self._btn_time_window = QPushButton("📅  Time window")
-        self._btn_time_window.setToolTip("Pick start and end date/hour for the search")
+        self._btn_time_window.setToolTip(
+            "Pick the days and the time window to search — the Image Slider's own "
+            "picker,\nso a day looks and clicks the same in every tab.")
         self._btn_time_window.clicked.connect(self._open_time_window)
-        ll.addWidget(self._btn_time_window)
+        src_row.addWidget(self._btn_time_window, 1)
 
-        self._btn_cameras = QPushButton("📷  Cameras…")
+        self._btn_cameras = QPushButton("📷  Cameras")
         self._btn_cameras.setToolTip(
             "Choose which cameras to search — the same picker (and the same saved "
             "presets) as the Image Slider.\n"
             "The list is the cameras found in the picked time window.")
         self._btn_cameras.clicked.connect(self._open_camera_picker)
-        ll.addWidget(self._btn_cameras)
+        src_row.addWidget(self._btn_cameras, 1)
+        ll.addLayout(src_row)
 
         self._date_info_lbl = QLabel("")
         self._date_info_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        self._date_info_lbl.setWordWrap(True)
         ll.addWidget(self._date_info_lbl)
+
+        # ── Load data ─────────────────────────────────────────────────────
+        # The action belongs with what it acts on: the days, the hours and the
+        # cameras are all right above it.
+        self._btn_search = QPushButton("🔍  Load data")
+        self._btn_search.setFixedHeight(32)
+        self._btn_search.setStyleSheet(
+            "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
+            "border-radius: 4px; font-size: 13px; }"
+            "QPushButton:hover { background: #1a6aee; }"
+            "QPushButton:disabled { background: #aaa; }")
+        self._btn_search.setToolTip(
+            "Read the PV data for the picked days and find the matching frames.")
+        self._btn_search.clicked.connect(self._start_search)
+        ll.addWidget(self._btn_search)
+
+        # The bar says what is being read right now, how far along it is and roughly
+        # how much is left — a search over many days and cameras is minutes long.
+        self._prog = QProgressBar()
+        self._prog.setVisible(False)
+        self._prog.setTextVisible(True)
+        self._prog.setFormat("")
+        self._prog.setRange(0, 0)
+        self._prog.setStyleSheet(
+            "QProgressBar { border: 1px solid #c3cbd6; border-radius: 3px; "
+            "background: #ffffff; color: #16202c; font-size: 10px; "
+            "text-align: center; }"
+            "QProgressBar::chunk { background: #9fc4f5; }")
+        ll.addWidget(self._prog)
 
         # ── PV search state ───────────────────────────────────────────────
         # ONE ordered list of picked PVs. Each entry carries its own "filter"
@@ -1480,41 +1465,46 @@ class ShotFinderWidget(QWidget):
         self._cam_status_lbl.setStyleSheet("font-size: 10px; color: #555;")
         ll.addWidget(self._cam_status_lbl)
 
-        # ══════════════════ Group: SEARCH & RESULTS ═════════════════════════
+        # ══════════════════ Group: SAVE & SEND ══════════════════════════════
         ll = s_srch.body_layout
 
-        # Search button
-        self._btn_search = QPushButton("🔍  Search")
-        self._btn_search.setFixedHeight(32)
-        self._btn_search.setStyleSheet(
-            "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
-            "border-radius: 4px; font-size: 13px; }"
-            "QPushButton:hover { background: #1a6aee; }"
-            "QPushButton:disabled { background: #aaa; }")
-        self._btn_search.clicked.connect(self._start_search)
-        ll.addWidget(self._btn_search)
+        # What the two buttons below act on. "Selected shot" is only reachable while
+        # the day detail under the table is open — it is the shot picked THERE. This
+        # is what the detail's own duplicate Open/Save buttons used to do.
+        scope_row = QHBoxLayout()
+        scope_row.setSpacing(4)
+        scope_row.addWidget(QLabel("Act on:"))
+        self._scope_cb = _NoScrollComboBox()
+        self._scope_cb.addItem("Whole day(s)", "day")
+        self._scope_cb.addItem("Selected shot", "shot")
+        self._scope_cb.setToolTip(
+            "Whole day(s) — the selected day rows (all of them when nothing is "
+            "selected).\n"
+            "Selected shot — only the shot picked in the day detail under the table; "
+            "available while that detail is open.")
+        # Ink spelled out, both states: left to the style a disabled combo comes out
+        # pale on pale and reads as a broken control.
+        self._scope_cb.setStyleSheet(
+            "QComboBox { padding: 3px 6px; background: #fff; color: #16202c; "
+            "border: 1px solid #ccc; border-radius: 4px; }"
+            "QComboBox:disabled { background: #ededed; color: #808890; }")
+        self._scope_cb.currentIndexChanged.connect(self._on_scope_changed)
+        scope_row.addWidget(self._scope_cb, 1)
+        ll.addLayout(scope_row)
 
-        self._prog = QProgressBar()
-        self._prog.setVisible(False)
-        self._prog.setTextVisible(False)
-        self._prog.setRange(0, 0)
-        ll.addWidget(self._prog)
-
-        # Open in Slider — hned pod Search
         self._btn_open_slider = QPushButton("➤  Send to Image Slider")
         self._btn_open_slider.setEnabled(False)
-        self._btn_open_slider.setVisible(False)
         self._btn_open_slider.setToolTip(
-            "Send the matched images (selected rows, or all when nothing is selected)\n"
-            "to the Image Slider — whatever the Slider currently shows is replaced.")
-        self._btn_open_slider.clicked.connect(self._open_in_slider)
+            "Send the matched images to the Image Slider — whatever the Slider "
+            "currently shows is replaced.")
+        self._btn_open_slider.clicked.connect(self._on_send_to_slider)
         ll.addWidget(self._btn_open_slider)
 
         self._btn_save_results = QPushButton("💾  Save images")
         self._btn_save_results.setEnabled(False)
         self._btn_save_results.setToolTip(
             "Save matched images to a selected folder.")
-        self._btn_save_results.clicked.connect(self._save_results)
+        self._btn_save_results.clicked.connect(self._on_save_images)
         ll.addWidget(self._btn_save_results)
 
         self._btn_send_workshop = QPushButton("➤ Workshop")
@@ -1771,17 +1761,9 @@ class ShotFinderWidget(QWidget):
         self._day_panel_lbl.setStyleSheet("font-weight: 700; font-size: 12px;")
         hdr.addWidget(self._day_panel_lbl)
         hdr.addStretch(1)
-        self._btn_day_open = QPushButton("▶ Open selected in Slider")
-        self._btn_day_open.setStyleSheet(
-            "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
-            "border-radius: 4px; padding: 2px 8px; font-size: 11px; }"
-            "QPushButton:hover { background: #1a6aee; }")
-        self._btn_day_open.clicked.connect(self._day_open_in_slider)
-        hdr.addWidget(self._btn_day_open)
-        self._btn_day_save_img = QPushButton("Save image")
-        self._btn_day_save_img.setStyleSheet("font-size: 11px; padding: 2px 8px;")
-        self._btn_day_save_img.clicked.connect(self._day_save_image)
-        hdr.addWidget(self._btn_day_save_img)
+        # No Open/Save buttons here — they exist once, in the panel's Save & Send
+        # group, where the "Act on" selector says whether they mean the day or the
+        # shot picked here.
         btn_close = QPushButton("✕")
         btn_close.setToolTip("Close the shot list")
         btn_close.setFixedWidth(24)
@@ -1794,9 +1776,32 @@ class ShotFinderWidget(QWidget):
         self._day_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._day_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._day_table.setAlternatingRowColors(True)
+        self._day_table.setStyleSheet(_TABLE_QSS)
         self._day_table.verticalHeader().setVisible(False)
         self._day_table.selectionModel().selectionChanged.connect(self._show_day_shot)
-        lay.addWidget(self._day_table, 1)
+        self._day_table.cellClicked.connect(self._on_day_cell_clicked)
+
+        # The shot list is narrow (its columns fit their contents), so the rest of the
+        # width goes to the day's PV curve — where in the day this shot sits.
+        self._day_split = QSplitter(Qt.Orientation.Horizontal)
+        self._day_split.setChildrenCollapsible(False)
+        self._day_split.addWidget(self._day_table)
+        self._day_graph_host = QWidget()
+        self._day_graph_lay = QVBoxLayout(self._day_graph_host)
+        self._day_graph_lay.setContentsMargins(0, 0, 0, 0)
+        self._day_graph_lay.setSpacing(2)
+        self._day_graph_placeholder = QLabel("")
+        self._day_graph_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._day_graph_placeholder.setStyleSheet("color: #777; font-size: 11px;")
+        self._day_graph_lay.addWidget(self._day_graph_placeholder)
+        self._day_split.addWidget(self._day_graph_host)
+        self._day_split.setStretchFactor(0, 4)
+        self._day_split.setStretchFactor(1, 6)
+        # Sized for real on the first open (_show_day_panel) — a size hint alone
+        # leaves the table narrower than its own columns and hides the Image cell
+        # behind a scrollbar.
+        self._day_hsplit_sized = False
+        lay.addWidget(self._day_split, 1)
         return w
 
     def _hide_day_panel(self, *_a):
@@ -1807,6 +1812,9 @@ class ShotFinderWidget(QWidget):
         self._day_rows = []
         self._day_cam = None
         self._day_hour_cache = {}
+        self._day_img_col = -1
+        self._clear_day_graph()
+        self._sync_scope_selector()
 
     def _show_day_panel(self, dr):
         self._day_dr = dr
@@ -1818,13 +1826,26 @@ class ShotFinderWidget(QWidget):
             f"{dr.day} — {len(self._day_rows)} shot(s) in range"
             + (f"   ({self._day_cam})" if self._day_cam else ""))
         self._fill_day_table(dr)
+        self._draw_day_graph(dr)
+        # After setVisible: the scope selector reads isHidden() to decide whether the
+        # "selected shot" scope is reachable at all.
         self._day_panel.setVisible(True)
+        self._sync_scope_selector()
+        if not self._restoring_focus:
+            self._focus_day = dr.day
+            self._focus_panel_open = True
         # First open gives the day rows the bigger half instead of an even split;
         # after that the user's own drag of the divider is kept.
         if not self._day_split_sized:
             h = max(self._results_split.height(), 240)
             self._results_split.setSizes([int(h * 0.6), int(h * 0.4)])
             self._day_split_sized = True
+        # Same rule sideways: the shot list gets a bit over half so its columns fit,
+        # the curve gets the rest. The operator's own drag wins afterwards.
+        if not self._day_hsplit_sized:
+            w_px = max(self._day_split.width(), 480)
+            self._day_split.setSizes([int(w_px * 0.55), int(w_px * 0.45)])
+            self._day_hsplit_sized = True
         if self._day_table.rowCount():
             self._day_table.selectRow(0)
 
@@ -1847,6 +1868,13 @@ class ShotFinderWidget(QWidget):
         for c in extra_cols:
             headers.append(self._col_short(c))
             header_tips.append(self._col_channel(c))
+        # Last column: the file, like the Folder column of the day table. It is filled
+        # in LAZILY — a day can hold tens of thousands of shots and every path is an
+        # SMB probe, so nothing is resolved until a shot is previewed or its cell is
+        # clicked.
+        headers.append("Image")
+        header_tips.append("The frame belonging to this shot")
+        self._day_img_col = len(headers) - 1
 
         tbl = self._day_table
         tbl.setRowCount(0)
@@ -1860,6 +1888,9 @@ class ShotFinderWidget(QWidget):
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for h_idx in range(len(headers)):
             hh.setSectionResizeMode(h_idx, QHeaderView.ResizeMode.ResizeToContents)
+        # The file name takes whatever width is left, so the column cannot end up
+        # behind a horizontal scrollbar.
+        hh.setSectionResizeMode(self._day_img_col, QHeaderView.ResizeMode.Stretch)
 
         def _row_col_value(row, cc, row_ns):
             raw = row.get(cc, "")
@@ -1895,6 +1926,283 @@ class ShotFinderWidget(QWidget):
                 tbl.setItem(r2, c_idx, QTableWidgetItem(
                     _format_value_state(ec, raw_ec, state_ec)))
                 c_idx += 1
+            img_item = QTableWidgetItem("")
+            img_item.setForeground(QColor("#2d7dff"))
+            img_item.setToolTip("Click to find this shot's frame and open the folder "
+                               "with it selected")
+            tbl.setItem(r2, self._day_img_col, img_item)
+
+    # ── the day's PV curve, next to the shot list ─────────────────────────────
+    #
+    # Answers "where in the day is this shot?" — the searched PV over the whole day,
+    # the target ± tolerance band, a dot on every shot in range and a line on the one
+    # picked. Everything it draws was captured at search time (dr.per_col), so no day
+    # is read from the archiver again.
+
+    def _ensure_day_graph(self) -> bool:
+        """Build the canvas on the FIRST day opened, not at startup — importing
+        matplotlib costs seconds on a cold cache. True when a canvas exists."""
+        if self._day_canvas is not None:
+            return True
+        try:
+            import matplotlib
+            matplotlib.use("QtAgg", force=False)
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from matplotlib.backends.backend_qtagg import (
+                NavigationToolbar2QT as _NavTb)
+            from matplotlib.figure import Figure
+        except Exception as exc:
+            self._day_graph_placeholder.setText(f"Graph unavailable: {exc}")
+            return False
+
+        fig = Figure(figsize=(4, 2.2), dpi=96)
+        fig.patch.set_facecolor("#ffffff")
+        self._day_fig = fig
+        self._day_ax = fig.add_subplot(111)
+        self._day_canvas = FigureCanvasQTAgg(fig)
+        self._day_canvas.setMinimumWidth(220)
+        # Through the shared helper: a plain NavigationToolbar comes out with white
+        # icons on a white bar under this app's palette.
+        self._day_toolbar = _get_finder_module()._make_mpl_toolbar(
+            _NavTb, self._day_canvas, self._day_graph_host)
+        self._day_canvas.mpl_connect("button_press_event", self._on_day_graph_click)
+        self._day_graph_placeholder.setVisible(False)
+        self._day_graph_lay.addWidget(self._day_toolbar)
+        self._day_graph_lay.addWidget(self._day_canvas, 1)
+        return True
+
+    def _clear_day_graph(self):
+        self._day_marker = None
+        self._day_plot_ns = []
+        if self._day_ax is not None:
+            self._day_ax.clear()
+            if self._day_canvas is not None:
+                self._day_canvas.draw_idle()
+
+    def _draw_day_graph(self, dr):
+        """One line per searched PV over the whole day, in the units the table
+        prints. A second unit gets its own right-hand axis."""
+        if not self._ensure_day_graph():
+            return
+        ax = self._day_ax
+        ax.clear()
+        for extra in getattr(self, "_day_ax_extra", []):
+            try:
+                extra.remove()
+            except Exception:
+                pass
+        self._day_ax_extra = []
+        self._day_marker = None
+
+        criteria = dr.criteria_csv or [{"col": dr.col, "target_csv": dr.target_csv,
+                                        "tol_ui": 0.0}]
+        # Shot timestamps, for click-to-pick and for the dots.
+        self._day_plot_ns = [int(r["_ns"]) for r in self._day_rows
+                             if r.get("_ns") is not None]
+
+        colors = ["#1f6fc0", "#c0521f", "#2e8b57", "#8b2e8b", "#8b8b2e"]
+        units_seen: "dict[str, object]" = {}
+        drawn = 0
+        missing = []
+        for k, crit in enumerate(criteria):
+            cc = crit["col"]
+            samples = dr.per_col.get(cc) or []
+            unit = self._col_unit(cc)
+            # One axis per unit: two energies share the left axis, a waveplate count
+            # gets its own on the right.
+            if unit in units_seen:
+                axis = units_seen[unit]
+            elif not units_seen:
+                axis = ax
+                units_seen[unit] = ax
+            else:
+                axis = ax.twinx()
+                units_seen[unit] = axis
+                self._day_ax_extra.append(axis)
+
+            colr = colors[k % len(colors)]
+            xs, ys = [], []
+            for s in samples:
+                try:
+                    v = _quantize_col(cc, float(s.get(cc, "")))
+                except (TypeError, ValueError):
+                    continue
+                xs.append(_ns_to_prague(int(s["_ns"])))
+                # Plot in the units the table prints, or the curve and the cells
+                # would disagree by a factor of 1000 on an mJ column.
+                ys.append(_diff_ui_value(cc, v))
+            short = self._col_short(cc)
+            if not xs:
+                missing.append(short)
+                continue
+            drawn += 1
+            axis.plot(xs, ys, "-", lw=0.8, color=colr, label=short)
+            axis.set_ylabel(f"{short}" + (f" [{unit}]" if unit and unit != "—" else ""),
+                            fontsize=8, color=colr)
+            axis.tick_params(axis="y", labelsize=7, colors=colr)
+
+            # Target ± tolerance, in the same units
+            tgt = _diff_ui_value(cc, crit.get("target_csv", 0.0))
+            tol = float(crit.get("tol_ui", 0.0) or 0.0)
+            axis.axhline(tgt, color=colr, lw=0.7, ls="--", alpha=0.7)
+            if tol > 0:
+                axis.axhspan(tgt - tol, tgt + tol, color=colr, alpha=0.10, lw=0)
+
+            # The shots that made it into the list
+            if k == 0 and self._day_plot_ns:
+                hit_x, hit_y = [], []
+                for r in self._day_rows:
+                    try:
+                        v = _quantize_col(cc, float(r.get(cc, "")))
+                    except (TypeError, ValueError):
+                        continue
+                    hit_x.append(_ns_to_prague(int(r["_ns"])))
+                    hit_y.append(_diff_ui_value(cc, v))
+                if hit_x:
+                    axis.plot(hit_x, hit_y, "o", ms=3, color="#d11", alpha=0.85,
+                              label="in range", zorder=5)
+
+        # The picked hours of this day, so a window narrower than the day is visible
+        win = self._day_windows().get(dr.day)
+        if win:
+            ax.axvspan(_ns_to_prague(win[0]), _ns_to_prague(win[1]),
+                       color="#2d7dff", alpha=0.06, lw=0)
+
+        ax.set_xlabel("Prague time", fontsize=8)
+        ax.tick_params(axis="x", labelsize=7)
+        # One day, so the date on every tick is noise — the title already names it.
+        try:
+            import matplotlib.dates as _mdates
+            ax.xaxis.set_major_formatter(_mdates.DateFormatter("%H:%M"))
+        except Exception:
+            pass
+        ax.grid(True, color="#e4e8ee", lw=0.6)
+        ax.set_title(f"{dr.day}" + (f"  ({dr.cam})" if dr.cam else ""), fontsize=8)
+        if not drawn:
+            ax.text(0.5, 0.5, "no samples for "
+                    + (", ".join(missing) if missing else "this day"),
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=9, color="#777")
+        elif missing:
+            ax.set_title(f"{dr.day} — no samples for {', '.join(missing)}",
+                         fontsize=8, color="#a11")
+        try:
+            self._day_fig.autofmt_xdate()
+            self._day_fig.tight_layout()
+        except Exception:
+            pass
+        self._day_canvas.draw_idle()
+
+    def _move_day_marker(self, ns):
+        """Move the vertical line to the picked shot without replotting — a day can
+        hold tens of thousands of samples and picking shot after shot would redraw
+        all of them."""
+        if self._day_ax is None or self._day_canvas is None or ns is None:
+            return
+        x = _ns_to_prague(int(ns))
+        if self._day_marker is not None:
+            try:
+                self._day_marker.set_xdata([x, x])
+                self._day_canvas.draw_idle()
+                return
+            except Exception:
+                self._day_marker = None
+        self._day_marker = self._day_ax.axvline(x, color="#111", lw=1.1, alpha=0.85)
+        self._day_canvas.draw_idle()
+
+    def _on_day_graph_click(self, event):
+        """Left-click in the graph picks the nearest shot of the list, so the graph
+        and the table drive each other. The toolbar owns every other button."""
+        if event.button != 1 or event.inaxes is None or event.xdata is None:
+            return
+        if not self._day_plot_ns:
+            return
+        try:
+            import matplotlib.dates as mdates
+            # The axis carries Prague wall clock as NAIVE datetimes (see
+            # _ns_to_prague), and num2date hands them back labelled UTC — so the
+            # tz has to be replaced, not converted.
+            clicked = mdates.num2date(event.xdata).replace(tzinfo=None)
+        except Exception:
+            return
+        tz = PRAGUE if PRAGUE else timezone.utc
+        want_ns = int(clicked.replace(tzinfo=tz).timestamp() * 1_000_000_000)
+        self._select_day_shot_by_ns(want_ns)
+
+    # ── the Image column of the shot list ─────────────────────────────────────
+
+    def _day_set_image_cell(self, row_idx: int, img, problem: str = ""):
+        """Fill one Image cell once the path is known (main thread only)."""
+        if self._day_dr is None or self._day_img_col < 0:
+            return
+        if row_idx < 0 or row_idx >= self._day_table.rowCount():
+            return
+        item = self._day_table.item(row_idx, self._day_img_col)
+        if item is None:
+            return
+        if img is None:
+            item.setText("no image")
+            item.setForeground(QColor("#cc0000"))
+            item.setToolTip(problem or "No frame found for this shot")
+            item.setData(Qt.ItemDataRole.UserRole, None)
+            return
+        p = Path(img)
+        item.setText(p.name)
+        item.setForeground(QColor("#2d7dff"))
+        item.setToolTip(f"{p}\nClick to open the folder with this frame selected")
+        item.setData(Qt.ItemDataRole.UserRole, str(p))
+
+    def _on_day_cell_clicked(self, row: int, col: int):
+        """Click the Image cell — reveal the frame in Explorer, resolving the path
+        first when it is not known yet (off the UI thread: it is an SMB probe)."""
+        if col != self._day_img_col or self._day_dr is None:
+            return
+        item = self._day_table.item(row, col)
+        if item is None:
+            return
+        known = item.data(Qt.ItemDataRole.UserRole)
+        if known:
+            self._reveal_in_explorer(known)
+            return
+        if row >= len(self._day_rows):
+            return
+        dr = self._day_dr
+        shot = self._day_rows[row]
+        dt_obj = shot.get("_dt")
+        cam = self._day_cam
+        if dt_obj is None or not cam:
+            self._day_set_image_cell(row, None, "no camera for these results")
+            return
+        item.setText("looking…")
+        item.setForeground(QColor("#777"))
+        cache = self._day_hour_cache
+        # This row asked to be revealed, not just filled in.
+        self._day_reveal_row = row
+
+        def _resolve():
+            img = self._find_image_for_shot(dr, cam, dt_obj, shot.get("_ns"), cache)
+            self._preview_sig.day_img.emit(row, str(img) if img else "",
+                                           "" if img else "no frame within "
+                                           f"{IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
+
+        threading.Thread(target=_resolve, daemon=True).start()
+
+    def _on_day_img_resolved(self, row_idx: int, img_str: str, problem: str):
+        """Worker → main thread: the Image cell of one shot, and reveal it if the
+        click is what asked for it."""
+        self._day_set_image_cell(row_idx, img_str or None, problem)
+        if img_str and self._day_reveal_row == row_idx:
+            self._reveal_in_explorer(img_str)
+        self._day_reveal_row = -1
+
+    def _reveal_in_explorer(self, img_path):
+        try:
+            # /select, and the path must stay ONE argument (comma included)
+            subprocess.Popen(f'explorer /select,"{img_path}"')
+            self._log(f"EXPLORER: select {img_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error",
+                                 f"Could not open folder:\n{type(e).__name__}: {e}")
 
     def _day_selected_rows(self) -> "list[dict]":
         idxs = sorted(set(i.row() for i in self._day_table.selectedIndexes()))
@@ -1908,9 +2216,11 @@ class ShotFinderWidget(QWidget):
         # opened day.
         if dr is None or self._day_panel.isHidden():
             return
-        rows = self._day_selected_rows()
+        sel = sorted(set(i.row() for i in self._day_table.selectedIndexes()))
+        rows = [self._day_rows[i] for i in sel if i < len(self._day_rows)]
         if not rows:
             return
+        row_idx = sel[0]
         row = rows[0]
         dt_obj = row.get("_dt")
         if dt_obj is None:
@@ -1924,10 +2234,17 @@ class ShotFinderWidget(QWidget):
         auto, gam, con, off = self._bc_args()
         ns = row.get("_ns")
         cache = self._day_hour_cache
+        # The shot to come back to on another camera's tab, and the line on the graph.
+        if not self._restoring_focus:
+            self._focus_day = dr.day
+            self._focus_shot_ns = ns
+            self._focus_panel_open = True
+        self._move_day_marker(ns)
         if not cam:
             self._log("No camera for these results — nothing to preview.")
             self._current_preview_path = None
             self._on_preview_ready(None, "", gen)
+            self._day_set_image_cell(row_idx, None, "no camera for these results")
             return
 
         def _resolve_and_load():
@@ -1941,8 +2258,14 @@ class ShotFinderWidget(QWidget):
                     f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s for "
                     f"{dt_obj:%Y-%m-%d %H:%M:%S} ({cam})")
                 self._preview_sig.show.emit(None, "", gen)
+                self._preview_sig.day_img.emit(
+                    row_idx, "",
+                    f"no frame within {IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
                 return
             self._current_preview_path = img
+            # The path is now known — the Image cell of this row can name it without
+            # a second walk of the share.
+            self._preview_sig.day_img.emit(row_idx, str(img), "")
             self._load_and_show_preview(img, energy, gen, gname, auto, gam, con, off)
 
         threading.Thread(target=_resolve_and_load, daemon=True).start()
@@ -2067,6 +2390,7 @@ class ShotFinderWidget(QWidget):
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setAlternatingRowColors(True)
+        table.setStyleSheet(_TABLE_QSS)
         table.selectionModel().selectionChanged.connect(self._on_main_selection_changed)
         table.doubleClicked.connect(self._on_table_double_clicked)
         table.cellClicked.connect(self._on_table_cell_clicked)
@@ -2091,6 +2415,10 @@ class ShotFinderWidget(QWidget):
         self._cam_tables = {}
         self._cam_results = {}
         self._cam_order = list(cams) if cams else [None]
+        # The remembered day/shot described rows that no longer exist.
+        self._focus_day = None
+        self._focus_shot_ns = None
+        self._focus_panel_open = False
         for cam in self._cam_order:
             table = self._make_results_table()
             self._cam_tables[cam] = table
@@ -2139,11 +2467,65 @@ class ShotFinderWidget(QWidget):
         return [dr for cam in self._cam_order for dr in self._cam_results[cam]]
 
     def _on_result_tab_changed(self, _idx: int):
-        # Another camera, another set of rows — the preview belongs to the row that is
-        # selected HERE, and the send/save buttons to what THIS tab holds. The opened
-        # day belongs to the tab we are leaving, so it goes with it.
+        """Another camera's tab came to the front.
+
+        The day and the shot the operator was looking at are the SAME question asked of
+        another camera, so they are carried over: the row of that day is selected here
+        too, the shot list is reopened and the shot with the same timestamp is picked.
+        The shot list is PV-derived, so its timestamps are identical in every tab.
+        Before this, switching camera dropped both and left an empty preview."""
+        want_day = self._focus_day
+        want_ns = self._focus_shot_ns
+        want_panel = self._focus_panel_open
+        # The panel belongs to the tab we are leaving.
         self._hide_day_panel()
+        if want_day is None:
+            self._on_selection_changed()
+            return
+
+        results = self._day_results
+        row = next((i for i, dr in enumerate(results) if dr.day == want_day), None)
+        if row is None:
+            # This camera has no row for that day — say nothing found rather than
+            # jumping to some other day.
+            self._on_selection_changed()
+            return
+
+        self._restoring_focus = True
+        try:
+            # Select the day row FIRST: that fires _on_main_selection_changed, which
+            # closes the panel. Only then may the panel be reopened.
+            self._table.selectRow(row)
+            dr = results[row]
+            if want_panel and dr.rows_in_tol:
+                self._show_day_panel(dr)
+                self._select_day_shot_by_ns(want_ns)
+        finally:
+            self._restoring_focus = False
+        # Restore left the remembered pick untouched; the preview/buttons still need
+        # to be brought in line with the tab that is now in front.
+        self._focus_day, self._focus_shot_ns = want_day, want_ns
+        self._focus_panel_open = want_panel and not self._day_panel.isHidden()
         self._on_selection_changed()
+
+    def _select_day_shot_by_ns(self, want_ns):
+        """Pick the shot of the opened day whose timestamp matches — nearest wins, so
+        a camera whose day holds one shot fewer still lands next to the right one."""
+        if not self._day_rows:
+            return
+        if want_ns is None:
+            self._day_table.selectRow(0)
+            return
+        best_i, best_d = 0, None
+        for i, row in enumerate(self._day_rows):
+            ns = row.get("_ns")
+            if ns is None:
+                continue
+            d = abs(int(ns) - int(want_ns))
+            if best_d is None or d < best_d:
+                best_i, best_d = i, d
+        self._day_table.selectRow(best_i)
+        self._day_table.scrollToItem(self._day_table.item(best_i, 0))
 
     def _on_main_selection_changed(self):
         """A day row was picked in the results table.
@@ -2151,6 +2533,13 @@ class ShotFinderWidget(QWidget):
         The shot list underneath belongs to the day that was opened, so picking another
         row (or clearing the selection) closes it instead of leaving it describing a day
         that is no longer selected."""
+        if not self._restoring_focus:
+            rows = sorted(set(i.row() for i in self._table.selectedIndexes()))
+            results = self._day_results
+            r = rows[0] if rows else -1
+            self._focus_day = results[r].day if 0 <= r < len(results) else None
+            self._focus_shot_ns = None
+            self._focus_panel_open = False
         self._hide_day_panel()
         self._on_selection_changed()
 
@@ -2186,6 +2575,36 @@ class ShotFinderWidget(QWidget):
         user points at a PV must be able to show this name.  Arbitrary typed-in
         channels are their own name."""
         return CPVA_CHANNEL_MAP.get(col, col)
+
+    # ── SEARCH PROGRESS ───────────────────────────────────────────────────────
+
+    def _sync_prog_text(self, value: int):
+        """The words on the progress bar: what is being read, how far along, and
+        roughly how much is left. A bar with no text says nothing about a search
+        that runs for minutes."""
+        total = max(1, getattr(self, "_prog_total", 1))
+        parts = [getattr(self, "_prog_stage", "") or "working…",
+                 f"{value}/{total}"]
+        hits = getattr(self, "_prog_hits", 0)
+        if hits:
+            parts.append(f"{hits} found")
+        t0 = getattr(self, "_prog_t0", None)
+        if t0 is not None and value > 0 and value < total:
+            elapsed = time.monotonic() - t0
+            left = elapsed / value * (total - value)
+            if left >= 90:
+                parts.append(f"~{left / 60:.0f} min left")
+            else:
+                parts.append(f"~{max(1, int(left))} s left")
+        self._prog.setFormat("  ·  ".join(parts))
+
+    def _on_progress(self, value: int):
+        self._prog.setValue(value)
+        self._sync_prog_text(value)
+
+    def _on_stage(self, text: str):
+        self._prog_stage = text
+        self._sync_prog_text(self._prog.value())
 
     def _col_unit(self, col: str) -> str:
         if col in MJ_COLUMNS:
@@ -2706,17 +3125,31 @@ class ShotFinderWidget(QWidget):
                 for c in self._pv_cfg if c["filter"]]
 
     def _update_date_info(self):
-        days = self._selected_days()
-        n = len(days)
-        fmt = "%Y-%m-%d %H:%M"
-        start_s = self._tw_start.strftime(fmt) if hasattr(self._tw_start, "strftime") else "?"
-        end_s   = self._tw_end.strftime(fmt)   if hasattr(self._tw_end,   "strftime") else "?"
-        if n == 0:
-            self._date_info_lbl.setText(f"⚠ End before start\n{start_s}\n→ {end_s}")
-        elif n == 1:
-            self._date_info_lbl.setText(f"1 day  {start_s}\n→ {end_s}")
+        """The line under the two Source buttons: which days, and their hours.
+
+        Few days are named one per line with their own window, because a multi-day
+        pick can give every day a different one. Many days collapse to a count and
+        the span, or the line would push the whole panel down."""
+        wins = self._day_windows()
+        if not wins:
+            self._date_info_lbl.setText("⚠ No day picked")
+            return
+
+        def _txt(d, w):
+            s, e = w
+            s_dt, e_dt = _ns_to_prague(s), _ns_to_prague(e)
+            # The end is exclusive, so a whole day ends at the NEXT day's 00:00 —
+            # printed as 24:00, or the line reads "00:00 → 00:00".
+            e_txt = "24:00" if (e_dt.date() > d and e_dt.hour == 0
+                                and e_dt.minute == 0) else f"{e_dt:%H:%M}"
+            return f"{d:%Y-%m-%d}  {s_dt:%H:%M} → {e_txt}"
+
+        days = sorted(wins)
+        if len(days) <= 4:
+            self._date_info_lbl.setText("\n".join(_txt(d, wins[d]) for d in days))
         else:
-            self._date_info_lbl.setText(f"{n} days  {start_s}\n→ {end_s}")
+            self._date_info_lbl.setText(
+                f"{len(days)} days\n{days[0]:%Y-%m-%d} → {days[-1]:%Y-%m-%d}")
 
     def _build_energy_text(self, dr, row: dict, row_ns) -> str:
         """Multi-PV preview caption: search PVs + 'also show' PVs at this shot.
@@ -2747,18 +3180,70 @@ class ShotFinderWidget(QWidget):
         return _find_image_in_day(dr.day, cam, dt_obj, ts_ns, hour_cache,
                                   images_root=self._images_root, day_dir=day_dir)[0]
 
+    # ── WHAT SEND / SAVE ACT ON ───────────────────────────────────────────────
+    #
+    # One pair of buttons for both scopes: the day rows, or the one shot picked in the
+    # day detail. The detail used to carry its own second Open / Save pair.
+
+    def _export_scope(self) -> str:
+        """"shot" only while the day detail is open AND it is what is asked for."""
+        if self._day_dr is None or self._day_panel.isHidden():
+            return "day"
+        return self._scope_cb.currentData() or "day"
+
+    def _sync_scope_selector(self):
+        """The shot scope is only reachable while a day detail is open; leaving it
+        selected on a closed detail would name something that is not there."""
+        cb = getattr(self, "_scope_cb", None)
+        if cb is None:
+            return
+        open_day = self._day_dr is not None and not self._day_panel.isHidden()
+        cb.setEnabled(open_day)
+        if not open_day and cb.currentData() != "day":
+            cb.blockSignals(True)
+            cb.setCurrentIndex(0)
+            cb.blockSignals(False)
+        self._sync_export_buttons()
+
+    def _on_scope_changed(self, _idx: int):
+        self._sync_export_buttons()
+
+    def _on_send_to_slider(self):
+        if self._export_scope() == "shot":
+            self._day_open_in_slider()
+        else:
+            self._open_in_slider()
+
+    def _on_save_images(self):
+        if self._export_scope() == "shot":
+            self._day_save_image()
+        else:
+            self._save_results()
+
     def _sync_export_buttons(self):
         """Send / save / Workshop act on the tab in front, so they follow ITS rows.
 
         Sending works with no selection too (it then sends every row of the tab), so
         they must not go dead the moment a selection is cleared — only when the tab
         holds no picture at all."""
+        if not hasattr(self, "_scope_cb"):
+            return                      # still building the panel
+        if self._current_cam_key() not in self._cam_results:
+            return                      # mid-rebuild: the tabs do not exist yet
         has_img = any(dr.status == "ok" for dr in self._day_results)
-        self._btn_open_slider.setEnabled(
-            has_img and self._slider_ref is not None and self._tab_widget is not None)
+        shot = self._export_scope() == "shot"
+        can_link = self._slider_ref is not None and self._tab_widget is not None
+        self._btn_open_slider.setEnabled(has_img and can_link)
+        self._btn_open_slider.setVisible(can_link)
         self._btn_save_results.setEnabled(has_img)
         self._btn_send_workshop.setEnabled(has_img)
         self._btn_send_workshop.setVisible(has_img)
+        # The label names what the button will act on, so the choice is readable
+        # without opening the selector.
+        self._btn_open_slider.setText(
+            "➤  Send shot to Image Slider" if shot else "➤  Send to Image Slider")
+        self._btn_save_results.setText(
+            "💾  Save shot image" if shot else "💾  Save images")
 
     def _on_selection_changed(self):
         self._sync_export_buttons()
@@ -3060,23 +3545,65 @@ class ShotFinderWidget(QWidget):
     def _qdate_to_date(self, qd: QDate) -> date:
         return date(qd.year(), qd.month(), qd.day())
 
+    def _set_time_window_from_times(self):
+        """Rebuild `_tw_windows` from the remembered day + From/To times.
+
+        Used at startup and whenever the picker returns a single day: one window,
+        the same shape the multi-day path produces."""
+        h_f, m_f, h_t, m_t = self._tw_times
+        tz = PRAGUE if PRAGUE else timezone.utc
+        start = datetime(self._tw_day.year, self._tw_day.month, self._tw_day.day,
+                         h_f, m_f, tzinfo=tz)
+        # The end is EXCLUSIVE, and 23:59 means "to the end of the day" — the picker
+        # cannot express 24:00, so the last minute must not be lost.
+        end_day = self._tw_day
+        if (h_t, m_t) <= (h_f, m_f):
+            end_day = self._tw_day + timedelta(days=1)
+        end = datetime(end_day.year, end_day.month, end_day.day, h_t, m_t, tzinfo=tz)
+        if (h_t, m_t) == (23, 59):
+            end += timedelta(minutes=1)
+        self._tw_windows = [(int(start.timestamp() * 1_000_000_000),
+                             int(end.timestamp() * 1_000_000_000))]
+
     def _open_time_window(self):
-        dlg = _TimeWindowDialog(self._tw_start, self._tw_end, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._tw_start, self._tw_end = dlg.selected_range()
-            self._on_date_changed()
+        """The Image Slider's own time picker — one calendar, From/To to the minute,
+        and a Multiple days mode with an optional per-day window.
+
+        allow_live=False: this tab has no live mode, and a tick that does nothing
+        reads as a broken tick (One Moment passes the same)."""
+        slider = _get_slider_module()
+        h_f, m_f, h_t, m_t = self._tw_times
+        dlg = slider.DatePickerDialog(
+            hour_from_init=h_f, hour_to_init=h_t,
+            min_from_init=m_f, min_to_init=m_t,
+            init_date=self._tw_day, init_segments=self._tw_segments,
+            allow_live=False, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._tw_times = dlg.selected_times()
+        self._tw_day = dlg.selected_date_obj()
+        self._tw_segments = dlg.selected_segments()
+        # One (start_ns, end_ns) per picked day, end exclusive — the days need not be
+        # contiguous any more, so nothing may re-derive them from a first/last pair.
+        self._tw_windows = list(dlg.selected_windows())
+        self._on_date_changed()
+
+    def _day_windows(self) -> "dict[date, tuple[int, int]]":
+        """day → (start_ns, end_ns) of the window picked for it.
+
+        A day picked twice (two windows on one day) is merged into the span that
+        covers both, since a search reads whole days anyway."""
+        out: "dict[date, tuple[int, int]]" = {}
+        for s_ns, e_ns in self._tw_windows:
+            d = _ns_to_prague(s_ns).date()
+            if d in out:
+                out[d] = (min(out[d][0], s_ns), max(out[d][1], e_ns))
+            else:
+                out[d] = (s_ns, e_ns)
+        return out
 
     def _selected_days(self) -> list[date]:
-        d_from = self._tw_start.date() if hasattr(self._tw_start, "date") else self._tw_start
-        d_to   = self._tw_end.date()   if hasattr(self._tw_end,   "date") else self._tw_end
-        if d_to < d_from:
-            return []
-        days = []
-        d = d_from
-        while d <= d_to:
-            days.append(d)
-            d += timedelta(days=1)
-        return days
+        return sorted(self._day_windows())
 
     # ── CAMERA LOADING ────────────────────────────────────────────────────────
 
@@ -3169,8 +3696,10 @@ class ShotFinderWidget(QWidget):
         days = self._selected_days()
         if not days:
             return None
+        # The whole day set, not a first/last pair: a multi-day pick can be any set
+        # of days, and two different sets can share their ends.
         scan_days = list(reversed(days))[:CAM_SCAN_MAX_DAYS]
-        return (str(self._images_root), scan_days[0], scan_days[-1])
+        return (str(self._images_root), tuple(scan_days))
 
     def _on_cameras_loaded(self, camera_names: list):
         self._cam_loading = False
@@ -3249,10 +3778,10 @@ class ShotFinderWidget(QWidget):
         self._sync_cameras_button()
 
     def _sync_cameras_button(self):
-        n = len(self._selected_cameras)
-        total = len(self._all_cameras)
-        self._btn_cameras.setText(
-            f"📷  Cameras…  ({n}/{total})" if total else "📷  Cameras…")
+        """The button is a plain name. It used to carry "…" and a picked/available
+        count, which named a total nobody can act on and made the label longer than
+        the button next to it — how many are picked is in the list right below."""
+        self._btn_cameras.setText("📷  Cameras")
 
     def _on_cam_selected_clicked(self, index):
         r = index.row()
@@ -3274,9 +3803,11 @@ class ShotFinderWidget(QWidget):
         if self._search_running:
             return
 
-        days = self._selected_days()
+        day_wins = self._day_windows()
+        days = sorted(day_wins)
         if not days:
-            QMessageBox.warning(self, "Date range", "From date must be ≤ To date.")
+            QMessageBox.warning(self, "No day picked",
+                                "Open Time window and pick at least one day.")
             return
 
         # Read the ticked (filter) PVs from the unified PV list
@@ -3320,16 +3851,24 @@ class ShotFinderWidget(QWidget):
 
         self._btn_open_slider.setEnabled(False)
         self._set_busy(True)
+        # One step per (day, camera): with several cameras the bar used to stand still
+        # for a whole day's worth of picture look-ups and then jump.
+        self._prog_total = len(days) * max(1, len(cams))
+        self._prog_t0 = time.monotonic()
+        self._prog_stage = "starting…"
+        self._prog_hits = 0
         self._prog.setVisible(True)
-        self._prog.setRange(0, len(days))
+        self._prog.setRange(0, self._prog_total)
         self._prog.setValue(0)
+        self._sync_prog_text(0)
         self._search_running = True
         self._result_lbl.setText(
             f"Searching {len(days)} days…"
             + (f" × {len(cams)} cameras" if len(cams) > 1 else ""))
 
         self._sig = _SearchSignals()
-        self._sig.progress.connect(self._prog.setValue)
+        self._sig.progress.connect(self._on_progress)
+        self._sig.stage.connect(self._on_stage)
         self._sig.result.connect(self._on_day_result)
         self._sig.done.connect(self._on_search_done)
         self._sig.log_msg.connect(self._log)
@@ -3337,14 +3876,14 @@ class ShotFinderWidget(QWidget):
         images_root  = self._images_root
         csv_root     = self._energy_csv_root
 
-        # The hours of the Time window, not just its dates. They used to be collected,
-        # displayed and then thrown away, so "today 14:00 → 16:00" searched from midnight.
-        # The end is inclusive to the whole second the dialog shows (it picks :59:59),
-        # or every sample in the final second of the window would be thrown away.
-        tw_start_ns = int(self._tw_start.timestamp() * 1_000_000_000)
-        tw_end_ns   = int(self._tw_end.timestamp() * 1_000_000_000) + 999_999_999
+        # The hours of the Time window, not just its dates — and EACH DAY HAS ITS OWN
+        # window now (the picker's per-day ⚙ editor), so a single start/end pair could
+        # not express the selection. The end is exclusive (is_t.seg_bounds_ns).
+        tw_by_day = dict(day_wins)
 
         _emit_log = self._sig.log_msg.emit
+        _emit_stage = self._sig.stage.emit
+        n_cams = max(1, len(cams))
 
         def _fail_days(day, reason: str) -> None:
             """A day that produced no searchable result still gets a row — in EVERY
@@ -3355,6 +3894,14 @@ class ShotFinderWidget(QWidget):
                     {"day": day, "status": "no_data", "reason": reason,
                      "search_cols": search_cols, "extra_cols": extra_cols,
                      "criteria_csv": criteria_csv, "cam": _cam})
+
+        # Cumulative step counter — one step per (day, camera). The absolute value is
+        # emitted, so a step can never be counted twice by two code paths.
+        _done = [0]
+
+        def _bump(k: int = 1) -> None:
+            _done[0] += k
+            self._sig.progress.emit(_done[0])
 
         def worker():
             all_cols = list(search_cols) + [
@@ -3367,12 +3914,17 @@ class ShotFinderWidget(QWidget):
                 _dkeys = [d.strftime("%Y-%m-%d") for d in days]
                 if _chans and _dkeys:
                     _emit_log(f"Pre-warming {len(_chans)}×{len(_dkeys)} channel-days…")
+                    _emit_stage(f"reading {len(_chans)} PV(s) over {len(_dkeys)} day(s)")
                     cpva.warm_days(_chans, _dkeys, timeout=CPVA_HTTP_TIMEOUT)
             except Exception:
                 pass
             for i, day in enumerate(days):
+                # How many of this day's camera steps are already counted, so a throw
+                # halfway through the camera loop cannot count them a second time.
+                cams_done = 0
                 try:
                     _emit_log(f"{day}: querying API+CSV for cols={all_cols}")
+                    _emit_stage(f"reading PV data · {day}")
                     rows, per_col, col_meta = _load_api_for_day(
                         day, all_cols, log=_emit_log, csv_root=csv_root)
                     if not rows:
@@ -3381,20 +3933,23 @@ class ShotFinderWidget(QWidget):
                                if st == "error" else "no samples archived for this PV")
                         _emit_log(f"{day}: no data (API + CSV) — {why}")
                         _fail_days(day, why)
-                        self._sig.progress.emit(i + 1)
+                        _bump(n_cams)
                         continue
 
-                    # Clip the candidate shots to the picked hours. per_col is left whole
-                    # on purpose: it only serves value look-ups around a shot, and a PV
-                    # sampled just outside the window still describes a shot inside it.
+                    # Clip the candidate shots to THIS DAY's picked window. per_col is
+                    # left whole on purpose: it only serves value look-ups around a
+                    # shot, and a PV sampled just outside the window still describes a
+                    # shot inside it.
+                    d_start_ns, d_end_ns = tw_by_day.get(
+                        day, (rows[0].get("_ns", 0), rows[-1].get("_ns", 0) + 1))
                     n_all = len(rows)
                     rows = [r for r in rows
-                            if tw_start_ns <= r.get("_ns", 0) <= tw_end_ns]
+                            if d_start_ns <= r.get("_ns", 0) < d_end_ns]
                     if not rows:
                         why = "no samples inside the chosen hours"
                         _emit_log(f"{day}: {n_all} samples, none in the time window")
                         _fail_days(day, why)
-                        self._sig.progress.emit(i + 1)
+                        _bump(n_cams)
                         continue
 
                     self._sig.log_msg.emit(
@@ -3475,7 +4030,7 @@ class ShotFinderWidget(QWidget):
                         why = f"'{self._col_short(day_col)}' has no numeric values here"
                         self._sig.log_msg.emit(f"{day}: {why}")
                         _fail_days(day, why)
-                        self._sig.progress.emit(i + 1)
+                        _bump(n_cams)
                         continue
 
                     raw_best = best.get(day_col, "")
@@ -3518,7 +4073,11 @@ class ShotFinderWidget(QWidget):
                     # the worker thread — SMB probing must stay off the UI thread — with
                     # the same resolver every other place in this tab uses, so the
                     # neighbouring hours are tried here too.
-                    for _cam in cams:
+                    for _ci, _cam in enumerate(cams):
+                        _emit_stage(
+                            f"looking for the frame · {day} · "
+                            f"{_clean_cam_for_filename(_cam) if _cam else 'no camera'}"
+                            + (f" ({_ci + 1}/{len(cams)})" if len(cams) > 1 else ""))
                         folder_path = None
                         img_path = None
                         if not _cam:
@@ -3569,12 +4128,13 @@ class ShotFinderWidget(QWidget):
                             "status":       "ok" if img_problem is None else "no_image",
                             "reason":       img_problem or "",
                         })
+                        cams_done += 1
+                        _bump()
 
                 except Exception as e:
                     self._sig.log_msg.emit(f"{day}: error — {e}")
                     _fail_days(day, f"search failed: {type(e).__name__}: {e}")
-
-                self._sig.progress.emit(i + 1)
+                    _bump(max(0, n_cams - cams_done))
 
             self._sig.done.emit()
 
@@ -3660,6 +4220,8 @@ class ShotFinderWidget(QWidget):
             status=status, reason=result.get("reason", ""))
         table, results = self._tab_for(cam)
         results.append(dr)
+        if status == "ok":
+            self._prog_hits = getattr(self, "_prog_hits", 0) + 1
 
         # Folder + matched image were resolved in the worker (SMB off UI thread)
         folder_path = result.get("folder_path")
@@ -4240,10 +4802,71 @@ class ShotFinderWidget(QWidget):
             QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
 
 
+# ── WHEEL GUARD ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so a settings panel still
+    scrolls when the pointer happens to pass over a field on the way down. A
+    control that is meant to take the wheel at any time carries the "wheelAlways"
+    property.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `_import_img_scale` is copied into each tab).
+    """
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
+
+
 # ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────
 
 def main():
     app = QApplication.instance() or QApplication(_sys.argv)
+    install_wheel_guard(app)
     app.setStyle("Fusion")
     app.setStyleSheet("""
         QWidget     { background: #f3f3f3; color: #111; }

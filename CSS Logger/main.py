@@ -7694,6 +7694,30 @@ def _icon_file():
     return None
 
 
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good -- that is exactly how this program ended up
+    on a blank button and why the id once had to be hand-bumped to ".2".
+    Hashing the icon into the id makes every PC derive the same id from the
+    same picture, and retires the old id by itself the day the icon is
+    redrawn, so no further bumps are needed. Returns None when the icon cannot
+    be read; the caller then sets no id at all rather than burning a content
+    id on a run that has no picture to give it. The same helper sits in every
+    program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 # Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
 # here. Measured on Win11: with the window icon and the window-class icon
 # deliberately set to two different images, the taskbar draws the *window*
@@ -7708,10 +7732,12 @@ def _icon_file():
 # window. Measured with a discriminating experiment on 2026-08-21 — two
 # processes, same icon file, only the id different: the old id drew the generic
 # window, a fresh id drew LOG. So the fix is a new id, not more icon code.
-# Bump the suffix whenever icon.ico changes and the taskbar keeps the old
-# picture. Nothing else depends on the string: the app registers no shortcut,
-# so a new id only starts a new taskbar group.
-_APP_ID = "ELI.CSSLogger.2"
+# The suffix used to be bumped by hand whenever the taskbar kept an old
+# picture; _icon_app_id() now appends a hash of icon.ico instead, so the id
+# retires itself the day the icon changes and no bumping is needed. Nothing
+# else depends on the string: the app registers no shortcut, so a new id only
+# starts a new taskbar group.
+_APP_ID_PREFIX = "ELI.CSSLogger"
 
 
 # ── Combined main window ─────────────────────────────────────────────────────
@@ -7791,7 +7817,9 @@ class CPVASuiteWindow(QMainWindow):
             pass
         try:
             cfg = load_config()
-            g   = self.geometry()
+            # Maximized: store the underlying normal size, not the screen-filling
+            # one, so un-maximizing later still gives a windowed size back.
+            g   = self.normalGeometry() if self.isMaximized() else self.geometry()
             cfg["suite_geometry"] = [g.x(), g.y(), g.width(), g.height()]
             save_config(cfg)
         except Exception:
@@ -7802,13 +7830,15 @@ class CPVASuiteWindow(QMainWindow):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 def _run():
-    try:
-        import ctypes as _ct
-        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_APP_ID)
-    except Exception:
-        pass
-    app = QApplication.instance() or QApplication(sys.argv)
     _ico = _icon_file()
+    _aumid = _icon_app_id(_APP_ID_PREFIX, _ico)
+    if _aumid:
+        try:
+            import ctypes as _ct
+            _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+        except Exception:
+            pass
+    app = QApplication.instance() or QApplication(sys.argv)
     if _ico:
         app.setWindowIcon(QIcon(str(_ico)))   # taskbar + alt-tab
     app.setStyle("Fusion")
@@ -7825,7 +7855,7 @@ def _run():
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
     app.setPalette(pal)
     win = CPVASuiteWindow()
-    win.show()
+    win.showMaximized()   # start maximized; the restored size is what un-maximizing gives
     sys.exit(app.exec())
 
 

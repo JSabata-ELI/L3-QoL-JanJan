@@ -12,9 +12,25 @@ same place every other tab keeps its settings):
   2. CAMERA — the Slider's own camera picker, presets included,
   3. PVs — the Slider's own PV picker (search, added channels, formulas, names, units),
   4. LOAD — every picked PV is fetched for the window and drawn in ONE graph,
-  5. drag on the graph to mark a time range → statistics per PV, in the left panel,
-  6. CLICK the graph → that moment is resolved into one frame per picked camera, shown
-     as tiles on the right (or in a pop-out window).
+  5. LEFT-drag on the graph to mark a time range → statistics per PV, in the left panel,
+  6. LEFT-CLICK the graph → that moment is resolved into one frame per picked camera,
+     shown as tiles on the right, and KEPT in the saved-moments list so it can be
+     returned to with one click instead of being hunted for again,
+  7. RIGHT-drag zooms the time axis into that stretch; a plain RIGHT-CLICK zooms back
+     out one step. The two buttons never do the same thing: left is "read this",
+     right is "look closer".
+
+FROM THE MOMENT: the arrows step to the shot before / after it, SAVE puts it on the
+saved-moments list, and SEND TO IMAGE SLIDER opens it in the Slider with the cameras
+picked here (a window around the moment, landing on the moment — `Viewer.open_moment`).
+Stepping deliberately saves nothing: walking through a stretch of the day shot by shot
+would bury the list under moments nobody picked.
+
+A MOMENT LOOKED AT TWICE IS FREE THE SECOND TIME
+Both halves of the cost are kept in RAM: which file answers (camera, moment), and the
+rendered picture per (file, display settings). Going back to a moment therefore touches
+neither the share nor a worker thread — the wall goes straight back up. Both caches are
+capped in size, because it is COMMIT and not RAM that runs out on these PCs.
 
 WHY A NEW MODULE AND NOT A MODE OF THE SLIDER
 The Slider's state is a scan of folders for a camera set over a time window; this tab's
@@ -31,12 +47,20 @@ WHAT IS BORROWED, AND FROM WHERE  (nothing here re-implements a resolver or a re
     resolver in this program (hour-neighbour probing + the 30 s match window).
   * `cpva_client` — `get_day` (day cache), `day_bounds_ns`, `date_key_for_ns`.
 
-ONE GRAPH, NOT ONE PER PV
+ONE GRAPH, ALWAYS
 Every picked PV is drawn in a single graph. PVs are grouped by UNIT and each unit group
 gets its own y axis (the second on the right, further ones on outward-offset spines), so
 a joule and a motor count are never plotted against the same scale and no value is
-normalised — every number on screen is the number that was archived. "Stacked" is still
-offered for the case of many unrelated PVs, where one graph becomes a tangle.
+normalised — every number on screen is the number that was archived. There is no second
+graph mode: one plot per PV was offered for a while and never used, and the eye (which
+takes a PV off the graph without unpicking it) already answers "this one is in the way".
+
+A RANGE WITH NO SAMPLE IN IT STILL HAS A VALUE
+A setpoint-shaped channel — a waveplate angle, a motor position — is archived when it
+MOVES, so a five-minute range can easily contain not one sample of it while the value
+was perfectly well defined throughout. Range statistics therefore fall back to the last
+sample BEFORE the range, held forward, and say so (n = 0, and the age of that sample in
+the tooltip). An empty row there used to read as "this channel is broken".
 
 A FORMULA IS A CURVE LIKE ANY OTHER
 A picked formula (derived PV) is fetched, computed and drawn: its sources are read even
@@ -49,10 +73,11 @@ unit gets a y axis of its own, and its line BREAKS wherever one of its sources h
 value instead of being drawn straight across the gap.
 
 WHAT IS REMEMBERED
-The window, the cameras, the PV pick and eye state, the graph mode, the snap PV, the
-display sliders and which sections are open — in `one_moment_ui_state.json` beside every
-other tab's state file. Restoring reads no share and no archiver: Load stays a
-deliberate press.
+The window, the cameras, the PV pick and eye state, the saved moments, the display
+sliders and which sections are open — in `one_moment_ui_state.json` beside every other
+tab's state file. Restoring reads no share and no archiver: Load stays a deliberate
+press. A saved moment survives a restart and can be clicked with no graph loaded at
+all — a timestamp needs no series to resolve frames from.
 """
 
 import json
@@ -75,12 +100,13 @@ except ImportError:                                   # pragma: no cover
 
 from PySide6.QtCore import (Qt, QObject, QRunnable, QSize, QThreadPool, QTimer,
                             Signal)
-from PySide6.QtGui import QColor, QPalette, QPixmap
+from PySide6.QtGui import (QColor, QIcon, QPainter, QPalette, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-                               QLabel, QMessageBox, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QSplitter,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
+                               QLabel, QListWidget, QListWidgetItem, QMessageBox,
+                               QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+                               QSlider, QSplitter, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 
 # ── sibling modules ───────────────────────────────────────────────────────────
@@ -197,13 +223,57 @@ _TILE_SIDE_MIN, _TILE_SIDE_MAX, _TILE_SIDE_DEFAULT = 120, 700, 280
 # when the picture itself is smaller than they are.
 _TILE_MIN_W = 132
 
+# What a moment already looked at is allowed to keep in RAM.
+#
+# A moment costs two things: finding each camera's file on the share (~150 ms per
+# camera, and for a moment in the past the answer never changes) and reading and
+# rendering that file. Both are kept, so going back to a moment — off the list, with
+# the arrows, or by clicking the same place on the graph again — puts the wall back up
+# out of memory instead of walking the share a second time.
+#
+# A tile at the default 280 px is ~300 KB, so this holds a few hundred of them. It is
+# COMMIT, not just RAM, that runs out on these PCs ([[project-diagnostic-memory-watch]]),
+# which is why there is a ceiling at all and why it is counted in bytes rather than in
+# pictures: one 700 px tile is five 280 px ones.
+_IMG_CACHE_MB = 192
+# Resolved paths are a few hundred bytes each — a whole day of moments for twenty
+# cameras still costs under a megabyte.
+_RES_CACHE_MAX = 6000
+
+# "This camera has no frame near this moment" is only worth remembering once the
+# moment is old enough that the answer can no longer change. The day being looked at
+# can be today, the archiver publishes about a second late, and this PC's clock runs
+# ~25 s ahead of the facility ([[reference-archiver-timing]]) — ten minutes is well
+# clear of all of it. Inside that window the share is asked again every time, which is
+# what makes a camera that has just started producing show up.
+# It matters because a wall waits for its slowest camera: without this, ONE camera
+# that was off all day would cost every revisit a share walk.
+_MISS_CACHE_MIN_AGE_S = 600
+
 # A click is a click, not a one-pixel drag: below this many pixels of travel the
-# release sets the MOMENT instead of marking a range.
+# release sets the MOMENT (left button) or zooms back out (right button) instead of
+# marking a range or zooming in.
 _CLICK_SLOP_PX = 5
+
+# How many visited moments are kept. Long enough for a shift's worth of interesting
+# shots, short enough that the list stays a list and not an archive.
+_MOMENTS_MAX = 60
+
+# One Ctrl+wheel notch over the frames multiplies the tile size by this. A step, not a
+# jump: 15 % is about the smallest change that is visible at all on a 280 px tile.
+_TILE_ZOOM_STEP = 1.15
+
+# Ink for the graph toolbar's icons. Painted by hand rather than left to matplotlib:
+# matplotlib recolours them to the palette FOREGROUND whenever it decides the
+# background is dark, which on this program's light panels came out white on white.
+_TB_INK, _TB_INK_OFF = "#1e2530", "#9aa0a8"
 
 # A slider is dragged, not clicked: re-rendering every camera at every tick would put
 # twenty share reads on every pixel of travel. One render, once the hand stops.
 _RENDER_SETTLE_MS = 220
+
+# Same reason, for the settings file: one write once the hand stops.
+_SAVE_SETTLE_MS = 400
 
 _PLOT_COLORS = ["#1565C0", "#c62828", "#2e7d32", "#ef6c00", "#6a1b9a",
                 "#00838f", "#9e9d24", "#4e342e", "#ad1457", "#283593"]
@@ -299,6 +369,18 @@ def _hsep() -> QFrame:
     f.setFrameShape(QFrame.Shape.HLine)
     f.setStyleSheet("color: #ccc;")
     return f
+
+
+def _gradient_id(sl, name: str, fallback: int) -> int:
+    """Index of a colour palette by its NAME.
+
+    The palette list belongs to is_t and grows; an index written down here would
+    silently start meaning a different palette the first time one is inserted above
+    it."""
+    try:
+        return int(sl.GRADIENT_NAMES.index(name))
+    except Exception:
+        return int(fallback)
 
 
 def _date_keys_for_windows(windows: "list[tuple[int, int]]") -> "list[str]":
@@ -754,6 +836,26 @@ class _PvLoadTask(QRunnable):
         self._sig = signals
         self._stop = stop_flag
 
+    def _seed_before(self, channel: str) -> "tuple[int, float] | None":
+        """(timestamp, value) of the last sample BEFORE the window — the value the
+        channel was sitting at when the window opened.
+
+        Every read channel gets one, not just the ones with no samples: a setpoint is
+        archived when it MOVES, so both "nothing all window" and "nothing until 08:00"
+        are ordinary, and in both cases the value before the window is the answer for
+        the stretch with no samples in it. One query per channel per load, and the
+        client caches it per day boundary, so a second load is free."""
+        if not self._windows:
+            return None
+        try:
+            res = cpva.value_at_or_before(channel, int(self._windows[0][0]) - 1,
+                                          timeout=cpva.FULL_DAY_TIMEOUT)
+        except Exception:
+            return None
+        if getattr(res, "value", None) is None or res.ts_ns is None:
+            return None
+        return int(res.ts_ns), float(res.value)
+
     def _seeds(self, series: dict) -> dict:
         """{(source name, window start) → (ts, value)} — the last sample BEFORE each
         window, so a source read once an hour does not blank the formula until its
@@ -823,7 +925,8 @@ class _PvLoadTask(QRunnable):
                 keep = _mask_to_windows(ts, self._windows)
                 ts, val = ts[keep], val[keep]
             out[name] = {"channel": channel, "ts": ts, "val": val,
-                         "status": status, "role": role}
+                         "status": status, "role": role,
+                         "seed": self._seed_before(channel)}
             done += 1
             self._sig.progress.emit(f"{name}: {ts.size} samples", done, total)
 
@@ -1088,8 +1191,8 @@ class _Tile(QFrame):
 
 
 def _cols_for(width_px: int, tile_side: int, n: int) -> int:
-    """How many tiles fit across `width_px`. One rule for the wall beside the graph
-    and for the pop-out, so a pop-out looks like the wall it came from."""
+    """How many tiles fit across `width_px`, at the size the frames are currently
+    drawn at (the Size slider, which Ctrl+wheel over the wall also moves)."""
     tile_w = max(_TILE_MIN_W, int(tile_side)) + 12
     avail = max(int(width_px) - 12, tile_w)
     return max(1, min(max(1, int(n)), avail // tile_w))
@@ -1119,69 +1222,35 @@ def _place_in_grid(grid: QGridLayout, tiles: "list[QWidget]", cols: int,
     return cols
 
 
-class _MomentPopout(QDialog):
-    """The same tiles in a window of their own, for when the panel beside the graph is
-    too small to see twenty cameras in.
+class _TilesArea(QScrollArea):
+    """The wall of frames, with Ctrl+wheel over it as the size control.
 
-    It FOLLOWS the tab: `set_results` is called again on a new moment and after a
-    re-render, because a window still showing the previous window's frames is worse
-    than no window at all."""
+    The frames grow INSIDE the pane — the window does not move and neither does the
+    graph above it. It is the same setting the Size slider holds, so the two can never
+    disagree: this only reports the notches and the tab moves the slider.
 
-    def __init__(self, title: str, results: "list[dict]", on_tile_clicked,
-                 tile_side: int, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(1150, 820)
-        self._on_click = on_tile_clicked
-        self._tile_side = int(tile_side)
-        self._cols = 0
-        lay = QVBoxLayout(self)
-        self._head = QLabel(title)
-        self._head.setStyleSheet(_HEAD_STYLE)
-        lay.addWidget(self._head)
-        area = QScrollArea()
-        area.setWidgetResizable(True)
-        self._area = area
-        self._holder = QWidget()
-        self._grid = QGridLayout(self._holder)
-        self._grid.setSpacing(8)
-        area.setWidget(self._holder)
-        lay.addWidget(area, 1)
-        self.set_results(title, results, self._tile_side)
+    A wheel event on a tile is not handled by the tile (a QLabel has no use for one),
+    so it arrives here on its own — no filter on every child is needed."""
 
-    def set_results(self, title: str, results: "list[dict]", tile_side: int):
-        self.setWindowTitle(title)
-        self._head.setText(title)
-        self._tile_side = int(tile_side)
-        for t in self._holder.findChildren(_Tile):
-            t.setParent(None)
-            t.deleteLater()
-        tiles = []
-        for res in results:
-            t = _Tile(res, self._holder)
-            t.clicked.connect(self._on_click)
-            tiles.append(t)
-        self._place(tiles)
+    zoomed = Signal(int)                 # notches: + is bigger, - is smaller
 
-    def _place(self, tiles=None):
-        if tiles is None:
-            tiles = self._holder.findChildren(_Tile)
-        n = len(tiles)
-        self._cols = _place_in_grid(
-            self._grid, tiles,
-            _cols_for(self._area.viewport().width(), self._tile_side, n),
-            self._cols)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        QTimer.singleShot(0, self._place)
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            notches = event.angleDelta().y() / 120.0
+            if notches:
+                # Accepted, so the pane does NOT also scroll: a zoom that runs away
+                # down the wall is a zoom nobody can aim.
+                event.accept()
+                self.zoomed.emit(int(round(notches)) or (1 if notches > 0 else -1))
+                return
+        super().wheelEvent(event)
 
 
 # ── the tab ───────────────────────────────────────────────────────────────────
 class OneMomentWidget(QWidget):
     """See the module docstring. Public members main.py wires up:
-    `_workshop_ref`, `_workshop_tab_idx`, `_tab_widget`, and `cancel_scan()` for the
-    window's Stop All button."""
+    `_workshop_ref`, `_workshop_tab_idx`, `_slider_ref`, `_slider_tab_idx`,
+    `_tab_widget`, and `cancel_scan()` for the window's Stop All button."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1201,12 +1270,21 @@ class OneMomentWidget(QWidget):
         self._series: dict = {}                  # pv name → {"ts","val","status",…}
         self._plot_order: "list[str]" = []        # pv names actually drawn
         self._moment_ns: "int | None" = None
+        # Every moment ever picked, oldest first. A visited moment is worth more than
+        # the click it took to find it, so it is kept and can be gone back to.
+        self._moments: "list[int]" = []
         self._span: "tuple[int, int] | None" = None    # (from_ns, to_ns)
         # x = 0 on the graph is Prague midnight of the window's first day; every
         # conversion between the axis and a timestamp goes through it.
         self._axis_t0_ns: int = self._windows[0][0]
         self._tile_items: "list[dict]" = []      # resolved files, before rendering
         self._tile_results: "list[dict]" = []    # rendered tiles
+        # The two caches — see _IMG_CACHE_MB. Oldest-first dicts: a hit is re-inserted
+        # at the back, so what falls off the front is what has not been looked at.
+        self._res_cache: "dict[tuple[str, int], dict]" = {}   # (cam, moment) → file
+        self._img_cache: "dict[tuple[str, tuple], object]" = {}  # (file, opts) → QImage
+        self._img_cache_bytes = 0
+        self._rnd_opts_key: tuple = ()           # what the tiles arriving now are for
         self._axes: list = []                    # every axes, twins included
         self._axes_paint: list = []              # the axes cursor/span are drawn on
         self._ax_x = None                        # the axes whose x ticks are visible
@@ -1215,12 +1293,15 @@ class OneMomentWidget(QWidget):
         self._span_patches: list = []
         self._selectors: list = []               # SpanSelectors, one per axes
         self._press_px: "tuple[float, float] | None" = None
-        self._popout_dlg: "QDialog | None" = None
+        self._press_btn: "int | None" = None
+        # Right-drag zooms the time axis; each zoom pushes the limits it came from, so
+        # a right-click walks back out the way it came in rather than jumping to the
+        # whole window in one go.
+        self._xlim_stack: "list[tuple[float, float]]" = []
+        self._full_xlim: "tuple[float, float] | None" = None
         self._tiles: "dict[str, _Tile]" = {}     # camera → its tile widget
-        # No control may write the settings file until the panel is finished, and the
-        # remembered snap PV can only be applied once a graph exists to snap on.
+        # No control may write the settings file until the panel is finished.
         self._state_ready = False
-        self._snap_wanted = ""
 
         self._pv_gen = 0
         self._res_gen = 0
@@ -1248,6 +1329,12 @@ class OneMomentWidget(QWidget):
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(_RENDER_SETTLE_MS)
         self._render_timer.timeout.connect(self._render_frames)
+
+        # …and so does the settings file: one write per adjustment, not per pixel.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(_SAVE_SETTLE_MS)
+        self._save_timer.timeout.connect(self._save_state_now)
 
         # Light-palette host for every matplotlib toolbar this tab ever builds — see
         # _make_toolbar. Never shown; it exists only to own the palette at the moment
@@ -1277,6 +1364,7 @@ class OneMomentWidget(QWidget):
         self._refresh_pick_labels()
         self._refresh_pv_table()
         self._refresh_stats()
+        self._refresh_moments_list()
 
     # ══════════════════════════ UI ════════════════════════════════════════════
     def _build_ui(self):
@@ -1295,6 +1383,33 @@ class OneMomentWidget(QWidget):
         split.addWidget(self._build_moment_pane())
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 4)
+        # The line the graph and the frames share is a control, so it has to look like
+        # one. A default handle is 5 px of the background colour: invisible, and the
+        # only way to find it was to sweep the mouse until the cursor changed. This is
+        # a raised bar with a grip in the middle of it, and it lights up under the
+        # mouse. See [[feedback-ui-visibility]].
+        split.setHandleWidth(10)
+        split.setStyleSheet(
+            "QSplitter::handle:vertical {"
+            "  background: #d7dbe0; border-top: 1px solid #a8aeb6;"
+            "  border-bottom: 1px solid #a8aeb6; }"
+            "QSplitter::handle:vertical:hover { background: #b9cde6; }"
+            "QSplitter::handle:vertical:pressed { background: #9fb6d4; }")
+        # The grip is a drawn bar, not a row of typed dots: a glyph is at the mercy of
+        # whatever font the machine substitutes — see [[project-drawn-icons-not-glyphs]].
+        self._split_grip = QFrame()
+        self._split_grip.setFixedSize(72, 4)
+        self._split_grip.setStyleSheet(
+            "background: #7b828b; border-radius: 2px;")
+        # Paint, not a widget to click: without this the grip eats the press and the
+        # handle it sits on stops dragging.
+        self._split_grip.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        _gl = QHBoxLayout(split.handle(1))
+        _gl.setContentsMargins(0, 0, 0, 0)
+        _gl.addStretch(1)
+        _gl.addWidget(self._split_grip)
+        _gl.addStretch(1)
         # The graph is built LATER (the first Load), so when the splitter first lays
         # itself out the top pane holds nothing but a one-line placeholder — and the
         # handle stays where that put it. Without an explicit split the graph opens
@@ -1334,9 +1449,13 @@ class OneMomentWidget(QWidget):
             lay.addWidget(s)
             return s
 
+        # Order on screen = order of work: the window and the cameras, then the PVs
+        # that are about to be read over them, then the moment picked out of the
+        # graph they draw. (The PV group sat under the moment for a while, which put
+        # the LAST step above the one that makes it possible.)
         s_src = _sec("source", "Source", True, "#2f6fd0")       # blue
-        s_mom = _sec("moment", "The moment", True, "#d08a1e")   # amber
         s_pv = _sec("pv", "PV channels", True, "#1a9e9e")       # teal
+        s_mom = _sec("moment", "The moment", True, "#d08a1e")   # amber
         s_stat = _sec("stats", "Range statistics", True, "#2e9e5b")  # green
         s_disp = _sec("display", "Image / Display", True, "#7a4fc0")  # purple
 
@@ -1389,13 +1508,77 @@ class OneMomentWidget(QWidget):
             row_nav.addWidget(b)
         s_mom.body_layout.addLayout(row_nav)
 
-        self._btn_popout = QPushButton("Pop out the frames")
-        _icon_btn(self._btn_popout, "popout", "⧉ Pop out the frames")
-        self._btn_popout.setToolTip("Show these frames in a window of their own")
-        self._btn_popout.setStyleSheet(_SMALL_BTN)
-        self._btn_popout.setEnabled(False)
-        self._btn_popout.clicked.connect(self._popout)
-        s_mom.body_layout.addWidget(self._btn_popout)
+        # The way out of this tab. A frame here is a thumbnail on a wall of them; the
+        # Slider is where one gets looked at full size, with the subtraction, the
+        # overlays and the profile tools.
+        self._btn_to_slider = QPushButton("Send to Image Slider")
+        _icon_btn(self._btn_to_slider, "popout", "➤ Send to Image Slider")
+        try:
+            _pad = int(_sl().Viewer.PUSHED_MOMENT_PAD_MIN)
+        except Exception:
+            _pad = 15
+        self._btn_to_slider.setToolTip(
+            "Open the Image Slider on THIS moment, with the cameras picked here.\n"
+            f"It is given the {_pad} minutes on either side of the moment as its "
+            "window, so the shots around this one can be scrubbed, and it opens on "
+            "this one.")
+        self._btn_to_slider.setStyleSheet(_SMALL_BTN)
+        self._btn_to_slider.setEnabled(False)
+        self._btn_to_slider.clicked.connect(self._send_to_slider)
+        s_mom.body_layout.addWidget(self._btn_to_slider)
+
+        # Every moment picked is kept. Finding an interesting shot in a day of data is
+        # the expensive part of this tab; having to find it a second time because the
+        # next click overwrote it was the whole cost of the first version.
+        self._lst_moments = QListWidget()
+        self._lst_moments.setToolTip(
+            "Every moment picked so far, newest at the top. Click one to go back to "
+            "it — the frames and the values are read again for that time.")
+        # The selected row is spelled out. Left to the style it came out white on near
+        # black, which reads as a broken widget next to the rest of the panel — and the
+        # program's "this one is picked" blue is #2f6fb5 everywhere else.
+        self._lst_moments.setStyleSheet(
+            "QListWidget { font-size: 11px; background: #ffffff; color: #111111;"
+            "  border: 1px solid #c4c8cf; }"
+            "QListWidget::item { padding: 1px 3px; }"
+            "QListWidget::item:hover { background: #e2ecf8; color: #111111; }"
+            "QListWidget::item:selected { background: #2f6fb5; color: #ffffff; }")
+        self._lst_moments.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection)
+        self._lst_moments.itemClicked.connect(self._on_moment_picked)
+        s_mom.body_layout.addWidget(self._lst_moments)
+
+        row_hist = QHBoxLayout()
+        self._lbl_moments = QLabel("Nothing picked yet.")
+        self._lbl_moments.setStyleSheet(_HINT_STYLE)
+        # Three buttons and a count in 300 px: the count is the part that may be
+        # squeezed, never a button — a QLabel refuses to go below its own text width
+        # unless it is told it may. See [[project-narrow-qt-list-traps]].
+        self._lbl_moments.setMinimumWidth(10)
+        row_hist.addWidget(self._lbl_moments, 1)
+        # Saving is a press, not a side effect: the arrows walk shot by shot through a
+        # stretch of the day and used to put every step they took on the list, which
+        # pushed the moments somebody had actually gone looking for off the end of it.
+        self._btn_save_moment = QPushButton("Save")
+        _icon_btn(self._btn_save_moment, "plus", "+ Save")
+        self._btn_save_moment.setToolTip("Put the moment on screen on the list below")
+        self._btn_save_moment.setStyleSheet(_SMALL_BTN)
+        self._btn_save_moment.setEnabled(False)
+        self._btn_save_moment.clicked.connect(self._save_moment)
+        row_hist.addWidget(self._btn_save_moment)
+        self._btn_drop_moment = QPushButton("Forget")
+        self._btn_drop_moment.setToolTip("Take the selected moment off the list")
+        self._btn_drop_moment.setStyleSheet(_SMALL_BTN)
+        self._btn_drop_moment.setEnabled(False)
+        self._btn_drop_moment.clicked.connect(self._drop_moment)
+        row_hist.addWidget(self._btn_drop_moment)
+        self._btn_clear_moments = QPushButton("Clear")
+        self._btn_clear_moments.setToolTip("Empty the list of saved moments")
+        self._btn_clear_moments.setStyleSheet(_SMALL_BTN)
+        self._btn_clear_moments.setEnabled(False)
+        self._btn_clear_moments.clicked.connect(self._clear_moments)
+        row_hist.addWidget(self._btn_clear_moments)
+        s_mom.body_layout.addLayout(row_hist)
 
         # ══════════════ PV CHANNELS ═════════════════════════════════════════
         self._btn_pvs = QPushButton("Search / select PVs…")
@@ -1406,31 +1589,11 @@ class OneMomentWidget(QWidget):
         self._btn_pvs.clicked.connect(self._pick_pvs)
         s_pv.body_layout.addWidget(self._btn_pvs)
 
-        row_mode = QHBoxLayout()
-        row_mode.addWidget(QLabel("Graph:"))
-        self._cmb_mode = QComboBox()
-        self._cmb_mode.addItems(["One graph", "Stacked"])
-        self._cmb_mode.setToolTip(
-            "One graph: every PV in a single plot. PVs are grouped by unit and each "
-            "unit gets its own y axis, so nothing is normalised — the numbers on the "
-            "axes are the numbers that were archived.\n"
-            "Stacked: one plot per PV, for when many unrelated PVs make a single graph "
-            "unreadable.")
-        self._cmb_mode.currentIndexChanged.connect(lambda *_: self._on_mode_changed())
-        row_mode.addWidget(self._cmb_mode, 1)
-        s_pv.body_layout.addLayout(row_mode)
-
-        row_snap = QHBoxLayout()
-        row_snap.addWidget(QLabel("Snap to:"))
-        self._cmb_snap = QComboBox()
-        self._cmb_snap.setToolTip(
-            "Which PV's samples a click snaps onto. A click lands wherever the mouse "
-            "was; the moment used is the nearest real sample of this PV, so the frames "
-            "belong to a shot that exists.")
-        self._cmb_snap.currentIndexChanged.connect(lambda *_: self._save_state())
-        row_snap.addWidget(self._cmb_snap, 1)
-        s_pv.body_layout.addLayout(row_snap)
-
+        # There was a "Graph: one / stacked" choice and a "Snap to:" PV here. Both are
+        # gone: the graph is always one plot with an axis per unit, and a click snaps
+        # onto the FIRST plotted PV (the eye reorders nothing, so that is the topmost
+        # PV in the list below). Two controls that were never touched cost more panel
+        # than the choices they offered were worth.
         self._pv_table = sl.PvValueTable()
         self._pv_table.setToolTip("The picked PVs and their value at the moment. The "
                                   "eye takes a PV off the graph without unpicking it.")
@@ -1511,7 +1674,11 @@ class OneMomentWidget(QWidget):
         self._cmb_palette = QComboBox()
         for nm in sl.GRADIENT_NAMES:
             self._cmb_palette.addItem(nm)
-        self._cmb_palette.setCurrentIndex(sl.GRADIENT_ID_GRAYSCALE)
+        # Gradient, not Grayscale: these frames are read as beams, and a grey one hides
+        # everything the bottom tenth of the scale is doing. This is the DEFAULT only —
+        # a palette picked by hand is remembered and wins over it.
+        self._cmb_palette.setCurrentIndex(
+            _gradient_id(sl, "Gradient", sl.GRADIENT_ID_GRAYSCALE))
         self._cmb_palette.setToolTip(
             "Colour palette of the frames.\n"
             "Default = the untouched file from the folder: no palette and no "
@@ -1602,7 +1769,9 @@ class OneMomentWidget(QWidget):
         t = QLabel("The window")
         t.setStyleSheet(_HEAD_STYLE)
         head.addWidget(t)
-        hint = QLabel("·   click = pick that moment   ·   drag = mark a range")
+        # One line, never wrapped: wrapped it climbs over the title beside it.
+        hint = QLabel("·   left click = the moment   ·   left drag = mark a range"
+                      "   ·   right drag = zoom in   ·   right click = zoom out")
         hint.setStyleSheet(_HINT_STYLE)
         head.addWidget(hint)
         head.addStretch(1)
@@ -1640,8 +1809,9 @@ class OneMomentWidget(QWidget):
         lay.addLayout(head)
         lay.addWidget(_hsep())
 
-        self._tiles_area = QScrollArea()
+        self._tiles_area = _TilesArea()
         self._tiles_area.setWidgetResizable(True)
+        self._tiles_area.zoomed.connect(self._zoom_tiles)
         self._tiles_host = QWidget()
         self._tiles_grid = QGridLayout(self._tiles_host)
         self._tiles_grid.setSpacing(6)
@@ -1651,7 +1821,8 @@ class OneMomentWidget(QWidget):
 
         self._tiles_hint = QLabel(
             "Click a moment in the graph to see every picked camera at that moment. "
-            "Click a frame to send it to the Workshop.")
+            "Click a frame to send it to the Workshop. Ctrl + mouse wheel over the "
+            "frames makes them bigger or smaller.")
         self._tiles_hint.setStyleSheet(_HINT_STYLE)
         self._tiles_hint.setWordWrap(True)
         lay.addWidget(self._tiles_hint)
@@ -1701,8 +1872,7 @@ class OneMomentWidget(QWidget):
             "cams": list(self._cams),
             "pv_selected": list(self._pv_selected),
             "pv_hidden": sorted(self._pv_hidden),
-            "graph_mode": self._cmb_mode.currentIndex(),
-            "snap_pv": self._cmb_snap.currentText(),
+            "moments": [int(t) for t in self._moments],
             "tile_size": self._sld_size.value(),
             "palette": self._cmb_palette.currentIndex(),
             "contrast": self._sld_contrast.value(),
@@ -1719,7 +1889,15 @@ class OneMomentWidget(QWidget):
     def _save_state(self):
         """Called from every control. Silent until the panel is fully built — a
         handler firing halfway through _build_ui would save a half-empty document
-        over the real one."""
+        over the real one.
+
+        Coalesced through a timer: a slider is DRAGGED, and one file write per pixel
+        of travel is a hundred writes for one adjustment."""
+        if not getattr(self, "_state_ready", False):
+            return
+        self._save_timer.start()
+
+    def _save_state_now(self):
         if not getattr(self, "_state_ready", False):
             return
         self._write_state_file(self._state_snapshot())
@@ -1781,8 +1959,19 @@ class OneMomentWidget(QWidget):
         if isinstance(hid, list):
             self._pv_hidden = {str(n) for n in hid} & set(self._pv_selected)
 
-        pairs = ((self._cmb_mode, "graph_mode"), (self._cmb_palette, "palette"))
-        for cmb, key in pairs:
+        moments = st.get("moments")
+        if isinstance(moments, list):
+            got = []
+            for t in moments:
+                try:
+                    v = int(t)
+                except Exception:
+                    continue
+                if v > 0 and v not in got:
+                    got.append(v)
+            self._moments = got[-_MOMENTS_MAX:]
+
+        for cmb, key in ((self._cmb_palette, "palette"),):
             try:
                 i = int(st[key])
             except Exception:
@@ -1814,7 +2003,6 @@ class OneMomentWidget(QWidget):
             if want is not None and hasattr(sec, "set_expanded"):
                 sec.set_expanded(bool(want))
 
-        self._snap_wanted = str(st.get("snap_pv") or "")
         # One pass to bring the labels and the greying-out in line with what was
         # just restored — and only then may saving start.
         self._sync_display_enabled()
@@ -1840,6 +2028,8 @@ class OneMomentWidget(QWidget):
             "Pick the cameras whose frame you want at the moment you click in the "
             "graph")
         self._btn_load.setEnabled(n_pv > 0)
+        # Send needs a camera, and this is where the camera pick lands.
+        self._sync_moment_buttons()
 
     def _window_text(self) -> str:
         """What goes ON the window button — short enough to fit beside the camera
@@ -1931,8 +2121,11 @@ class OneMomentWidget(QWidget):
         """There is no picked moment any more — say so everywhere at once.
 
         Clearing the state alone used to leave the old timestamp on the panel, the old
-        "The frames at …" title over an empty wall, prev/next enabled over nothing, and
-        a pop-out window showing the previous window's frames."""
+        "The frames at …" title over an empty wall and prev/next enabled over nothing.
+
+        The SAVED moments are not touched: a timestamp keeps its meaning whatever the
+        PV list does, and throwing the list away is what the user was trying to avoid
+        by having one at all."""
         self._moment_ns = None
         self._res_stop.set()
         self._res_stop = threading.Event()
@@ -1944,15 +2137,16 @@ class OneMomentWidget(QWidget):
         self._tile_items = []
         self._tile_results = []
         self._clear_tiles()
-        self._close_popout()
         self._lbl_moment.setText("—")
         self._btn_prev.setEnabled(False)
         self._btn_next.setEnabled(False)
-        self._btn_popout.setEnabled(False)
+        self._lst_moments.clearSelection()
+        self._btn_drop_moment.setEnabled(False)
         self._lbl_frames.setText("The frames")
         self._tiles_hint.setText(
             "Click a moment in the graph to see every picked camera at that moment. "
-            "Click a frame to send it to the Workshop.")
+            "Click a frame to send it to the Workshop. Ctrl + mouse wheel over the "
+            "frames makes them bigger or smaller.")
 
     @staticmethod
     def _day_start_of(ts_ns: int) -> int:
@@ -2013,10 +2207,6 @@ class OneMomentWidget(QWidget):
         self._refresh_stats()
         self._save_state()
         self._status.setText("PV list changed — press Load.")
-
-    def _on_mode_changed(self):
-        self._rebuild_graph()
-        self._save_state()
 
     def _on_pv_eye(self, name: str):
         """The eye takes a PV off the GRAPH without unpicking it: its samples stay
@@ -2144,6 +2334,27 @@ class OneMomentWidget(QWidget):
         sl = _sl()
         return self._series[name]["val"] * float(sl.PV_SCALE.get(name, 1.0))
 
+    def _seed_of(self, name: str) -> "tuple[float, int] | None":
+        """(value, timestamp) the channel was sitting at when the window opened, or
+        None. Scaled like every other value of it, so the two can be compared."""
+        d = self._series.get(name)
+        seed = d.get("seed") if d else None
+        if not seed:
+            return None
+        try:
+            ts_ns, raw = int(seed[0]), float(seed[1])
+        except Exception:
+            return None
+        return raw * float(_sl().PV_SCALE.get(name, 1.0)), ts_ns
+
+    def _has_numbers(self, name: str) -> bool:
+        """Whether this PV can show a number at all: samples in the window, or a value
+        it was sitting at when the window opened."""
+        d = self._series.get(name)
+        if d is None:
+            return False
+        return bool(len(d["ts"])) or self._seed_of(name) is not None
+
     def _colour_of(self, name: str) -> str:
         """A PV's colour comes from the PICKED LIST, not from its position among the
         ones being drawn — hiding one PV must not repaint the others."""
@@ -2154,8 +2365,7 @@ class OneMomentWidget(QWidget):
         return _PLOT_COLORS[i % len(_PLOT_COLORS)]
 
     def _rebuild_graph(self):
-        """Draw the loaded series. One graph by default (see the module docstring);
-        Stacked when the combo asks for it."""
+        """Draw the loaded series: one plot, one y axis per unit."""
         (Figure, FigureCanvas, NavToolbar, SpanSelector, FuncFormatter,
          MultipleLocator) = _mpl()
 
@@ -2168,14 +2378,6 @@ class OneMomentWidget(QWidget):
         keep_moment, keep_span = self._moment_ns, self._span
         self._clear_graph("No samples for the picked PVs in this window.")
         self._plot_order = order
-
-        self._cmb_snap.blockSignals(True)
-        cur = self._cmb_snap.currentText() or self._snap_wanted
-        self._cmb_snap.clear()
-        self._cmb_snap.addItems(order)
-        if cur in order:
-            self._cmb_snap.setCurrentText(cur)
-        self._cmb_snap.blockSignals(False)
 
         if not order:
             return
@@ -2190,10 +2392,7 @@ class OneMomentWidget(QWidget):
         self._canvas = FigureCanvas(self._fig)
         self._canvas.setMinimumHeight(170)
 
-        if self._cmb_mode.currentIndex() == 0:
-            self._draw_one_graph(order)
-        else:
-            self._draw_stacked(order)
+        self._draw_one_graph(order)
 
         # Tick labels: clock time, and the day too once the window spans more than one.
         # They go on _ax_x, the one axes whose x ticks are actually painted — a twin
@@ -2212,6 +2411,10 @@ class OneMomentWidget(QWidget):
         self._ax_x.set_xlabel("Prague time", fontsize=8)
         lo = (self._windows[0][0] - t0) / NS_PER_S
         hi = (self._windows[-1][1] - t0) / NS_PER_S
+        # Where "zoomed all the way out" is. A rebuild is a new graph, so any zoom the
+        # previous one was under is gone with it.
+        self._xlim_stack = []
+        self._full_xlim = (lo, hi) if hi > lo else None
         if hi > lo:
             self._axes[0].set_xlim(lo, hi)
             # x = 0 is Prague midnight, so whole multiples of a clock-shaped step land
@@ -2226,8 +2429,18 @@ class OneMomentWidget(QWidget):
         # A selector per axes so a drag works wherever the mouse happens to be — with
         # twin axes the top-most one gets the events, and which one that is is not
         # something to depend on. They all report to one handler.
+        #
+        # TWO selectors per axes: the LEFT button marks a range to take statistics
+        # over, the RIGHT button zooms the time axis into that stretch. Before this
+        # both buttons did the same thing, so a right-drag meant to look closer marked
+        # a range instead.
         for ax in self._axes:
-            self._selectors.append(self._make_span_selector(SpanSelector, ax))
+            self._selectors.append(
+                self._make_span_selector(SpanSelector, ax, self._on_span,
+                                         "#1565C0", 1))
+            self._selectors.append(
+                self._make_span_selector(SpanSelector, ax, self._on_zoom_span,
+                                         "#d08a1e", 3))
 
         self._canvas.mpl_connect("button_press_event", self._on_press)
         self._canvas.mpl_connect("button_release_event", self._on_release)
@@ -2298,39 +2511,19 @@ class OneMomentWidget(QWidget):
                                           visible=False)]
         self._span_patches = [None]
 
-    def _draw_stacked(self, order: "list[str]"):
-        """One plot per PV, all sharing the time axis — for many unrelated PVs, where a
-        single graph is a tangle whatever the axes do."""
-        sl = _sl()
-        axes = self._fig.subplots(len(order), 1, sharex=True, squeeze=False)[:, 0]
-        self._axes = list(axes)
-        self._axes_paint = list(axes)
-        self._ax_x = axes[-1]
-        self._cursor_lines = []
-        self._span_patches = []
-        for i, name in enumerate(order):
-            ax = axes[i]
-            d = self._series[name]
-            x = (d["ts"] - self._axis_t0_ns) / NS_PER_S
-            y = self._values_of(name)
-            colour = self._colour_of(name)
-            ax.plot(x, y, lw=1.0, color=colour,
-                    marker="." if len(x) < 600 else None, ms=2.5)
-            unit = self._unit_of(name)
-            ax.set_ylabel(f"{sl.pv_label_for(name)}\n[{unit}]" if unit
-                          else sl.pv_label_for(name), fontsize=8, color=colour)
-            ax.tick_params(labelsize=8)
-            ax.grid(True, alpha=0.25)
-            if d["status"] == "stale":
-                ax.set_facecolor("#fff8e1")
-            self._cursor_lines.append(
-                ax.axvline(0, color="#111111", lw=1.0, ls="--", visible=False))
-            self._span_patches.append(None)
-
     def _make_toolbar(self, nav_cls, canvas):
-        """matplotlib tints the toolbar icons at construction time, and only when the
-        host palette is dark — under a dark palette the icons come out invisible. A
-        light-palette host parent skips the tinting, so the black icons survive.
+        """The graph's own little toolbar, with icons that can be SEEN.
+
+        Two separate problems, both of which have hit this program before:
+
+        * matplotlib recolours its black icons to the palette FOREGROUND at
+          construction time whenever it decides the background is dark. On the light
+          panels here that produced white artwork on a white bar — buttons that are
+          there but invisible. Building under a light-palette host avoided it by luck;
+          the icons are now REPAINTED here in a fixed dark ink, so no palette, theme or
+          Windows dark mode can turn them white again.
+        * Qt invents a disabled icon by fading the normal one until it is barely there,
+          so every mode is spelled out — see [[project-drawn-icons-not-glyphs]].
 
         The host is built ONCE in __init__ and kept: a local one is collected as soon
         as this returns, and it takes the toolbar (its C++ child) down with it."""
@@ -2339,17 +2532,65 @@ class OneMomentWidget(QWidget):
             "QToolBar { background: #f0f0f0; border: none; spacing: 1px; }"
             "QToolButton { background: transparent; padding: 3px; }"
             "QToolButton:hover { background: #d6d6d6; border-radius: 3px; }"
+            "QToolButton:pressed { background: #bcd0ea; border-radius: 3px; }"
+            "QToolButton:checked { background: #cfe0f5; border-radius: 3px; }"
             "QLabel { color: #202020; }")
+        tb.setIconSize(QSize(18, 18))
+        self._repaint_toolbar_icons(tb)
         return tb
 
-    def _make_span_selector(self, span_cls, ax):
-        kw = dict(direction="horizontal", useblit=True, minspan=0)
-        props = dict(alpha=0.20, facecolor="#1565C0")
+    @staticmethod
+    def _repaint_toolbar_icons(tb):
+        """Every toolbar action's icon, redrawn from matplotlib's own artwork in a dark
+        ink. The artwork is black-on-transparent, so painting the ink THROUGH its own
+        alpha keeps the shape and only replaces the colour."""
         try:
-            return span_cls(ax, self._on_span, props=props, **kw)
+            from matplotlib import cbook
+        except Exception:
+            return
+        by_text = {a.text(): a for a in tb.actions() if a.text()}
+        for item in getattr(tb, "toolitems", ()):
+            text, _tip, image_file, _cb = item
+            act = by_text.get(text)
+            if act is None or not image_file:
+                continue
+            try:
+                path = cbook._get_data_path("images", image_file + ".png")
+                large = path.with_name(path.name.replace(".png", "_large.png"))
+                base = QPixmap(str(large if large.exists() else path))
+                if base.isNull():
+                    continue
+                ic = QIcon()
+                for mode, ink in ((QIcon.Mode.Normal, _TB_INK),
+                                  (QIcon.Mode.Active, _TB_INK),
+                                  (QIcon.Mode.Selected, _TB_INK),
+                                  (QIcon.Mode.Disabled, _TB_INK_OFF)):
+                    pm = QPixmap(base.size())
+                    pm.fill(Qt.GlobalColor.transparent)
+                    p = QPainter(pm)
+                    p.drawPixmap(0, 0, base)
+                    p.setCompositionMode(
+                        QPainter.CompositionMode.CompositionMode_SourceIn)
+                    p.fillRect(pm.rect(), QColor(ink))
+                    p.end()
+                    for state in (QIcon.State.Off, QIcon.State.On):
+                        ic.addPixmap(pm, mode, state)
+                act.setIcon(ic)
+            except Exception:
+                continue
+
+    def _make_span_selector(self, span_cls, ax, on_select, colour: str, button: int):
+        """One horizontal drag selector on `ax`, bound to ONE mouse button.
+
+        Binding the button is the point: left marks a range, right zooms, and a
+        selector left on its default listens to every button and would do both."""
+        kw = dict(direction="horizontal", useblit=True, minspan=0, button=button)
+        props = dict(alpha=0.20, facecolor=colour)
+        try:
+            return span_cls(ax, on_select, props=props, **kw)
         except TypeError:
             # matplotlib < 3.5 spelled it rectprops.
-            return span_cls(ax, self._on_span, rectprops=props, **kw)
+            return span_cls(ax, on_select, rectprops=props, **kw)
 
     # ── graph interaction ─────────────────────────────────────────────────────
     def _toolbar_busy(self) -> bool:
@@ -2357,36 +2598,48 @@ class OneMomentWidget(QWidget):
 
     def _on_press(self, event):
         self._press_px = (event.x, event.y) if event.x is not None else None
+        self._press_btn = event.button
 
     def _on_release(self, event):
-        """A click — not a drag — is what picks the moment. The drag belongs to the
-        span selector, so the two are told apart by how far the mouse travelled."""
-        if event.button != 1 or self._toolbar_busy():
+        """A click — not a drag — with the button that was pressed.
+
+        Left click picks the moment, right click zooms back out one step. Both drags
+        belong to their span selector, so click and drag are told apart by how far the
+        mouse travelled."""
+        start, btn = self._press_px, self._press_btn
+        self._press_px = self._press_btn = None
+        if self._toolbar_busy() or btn not in (1, 3) or event.button != btn:
             return
-        start = self._press_px
-        self._press_px = None
         if start is None or event.x is None or event.inaxes is None:
             return
         if abs(event.x - start[0]) > _CLICK_SLOP_PX or \
                 abs(event.y - start[1]) > _CLICK_SLOP_PX:
-            return                                  # a drag; _on_span handles it
+            return                       # a drag; the span selectors handle it
+        if btn == 3:
+            self._zoom_out()
+            return
         if event.xdata is None:
             return
         self._set_moment_from_x(float(event.xdata))
 
+    def _is_drag(self, x_from: float, x_to: float) -> bool:
+        """True when a selector's span is wider than a click's worth of slop. Measured
+        in PIXELS, not in seconds: a day-wide axis is thousands of seconds per pixel,
+        and a threshold in seconds would swallow real drags on it."""
+        try:
+            x0_px, x1_px = self._axes[0].transData.transform(
+                [(x_from, 0), (x_to, 0)])[:, 0]
+            return abs(x1_px - x0_px) > _CLICK_SLOP_PX
+        except Exception:
+            return abs(x_to - x_from) > 0
+
     def _on_span(self, x_from: float, x_to: float):
-        """A marked time range → per-PV statistics. Sub-click-slop spans are the
+        """A LEFT-marked time range → per-PV statistics. Sub-click-slop spans are the
         release of a plain click and are left to _on_release."""
         if self._toolbar_busy() or self._canvas is None or not self._axes:
             return
-        try:
-            ax = self._axes[0]
-            x0_px, x1_px = ax.transData.transform([(x_from, 0), (x_to, 0)])[:, 0]
-            if abs(x1_px - x0_px) <= _CLICK_SLOP_PX:
-                return
-        except Exception:
-            if abs(x_to - x_from) <= 0:
-                return
+        if not self._is_drag(x_from, x_to):
+            return
         lo, hi = sorted((x_from, x_to))
         self._span = (int(self._axis_t0_ns + lo * NS_PER_S),
                       int(self._axis_t0_ns + hi * NS_PER_S))
@@ -2394,6 +2647,36 @@ class OneMomentWidget(QWidget):
         if self._canvas is not None:
             self._canvas.draw_idle()
         self._refresh_stats()
+
+    def _on_zoom_span(self, x_from: float, x_to: float):
+        """A RIGHT-marked stretch → the time axis shows only that stretch.
+
+        The marked RANGE is left alone: zooming is looking, not selecting, and a
+        statistic that changed every time the axis moved would be unreadable. The
+        limits being left are pushed, so a right-click walks back out step by step."""
+        if self._toolbar_busy() or self._canvas is None or not self._axes:
+            return
+        if not self._is_drag(x_from, x_to):
+            return
+        lo, hi = sorted((x_from, x_to))
+        self._xlim_stack.append(tuple(self._axes[0].get_xlim()))
+        # One axes carries the x: the others are its twins and share it.
+        self._axes[0].set_xlim(lo, hi)
+        self._canvas.draw_idle()
+
+    def _zoom_out(self):
+        """Back to the limits before the last right-drag, or to the whole window once
+        there is nothing left to walk back to."""
+        if self._canvas is None or not self._axes:
+            return
+        if self._xlim_stack:
+            lo, hi = self._xlim_stack.pop()
+        elif self._full_xlim is not None:
+            lo, hi = self._full_xlim
+        else:
+            return
+        self._axes[0].set_xlim(lo, hi)
+        self._canvas.draw_idle()
 
     def _clear_span(self):
         self._span = None
@@ -2421,12 +2704,18 @@ class OneMomentWidget(QWidget):
             self._span_patches[i] = ax.axvspan(lo, hi, color="#1565C0", alpha=0.10,
                                                zorder=0)
 
+    def _snap_pv(self) -> str:
+        """The PV a click snaps onto: the first one drawn, which is the first PICKED
+        one that has samples and is not hidden. No control for it any more — one was
+        offered and never used, and "the first PV in the list" is a rule the list
+        itself shows."""
+        return self._plot_order[0] if self._plot_order else ""
+
     def _set_moment_from_x(self, x_seconds: float):
         """Snap the clicked x to a real sample of the snap PV. A moment between two
         samples has no shot behind it, and the frames would be an arbitrary pick."""
         ts_ns = int(self._axis_t0_ns + x_seconds * NS_PER_S)
-        snap = self._cmb_snap.currentText() or (self._plot_order[0]
-                                                if self._plot_order else "")
+        snap = self._snap_pv()
         j = self._nearest_index(snap, ts_ns)
         if j is not None:
             ts_ns = int(self._series[snap]["ts"][j])
@@ -2463,7 +2752,12 @@ class OneMomentWidget(QWidget):
             line.set_xdata([x, x])
             line.set_visible(True)
 
-    def _apply_moment(self, ts_ns: int):
+    def _apply_moment(self, ts_ns: int, remember: bool = True):
+        """Show `ts_ns`: the cursor, the values, the frames.
+
+        `remember` is what the SAVED-MOMENTS list is for. A click on the graph is a
+        moment somebody went looking for, so it is kept; a step with the arrows is
+        walking past one, so it is not (that is what the Save button is for)."""
         self._moment_ns = int(ts_ns)
         self._move_cursor(self._moment_ns)
         if self._canvas is not None:
@@ -2471,14 +2765,116 @@ class OneMomentWidget(QWidget):
         self._lbl_moment.setText(_fmt_moment(self._moment_ns))
         self._btn_prev.setEnabled(True)
         self._btn_next.setEnabled(True)
+        if remember:
+            self._remember_moment(self._moment_ns)
+        else:
+            # The list is left alone, but its highlight has to follow the moment on
+            # screen — otherwise Forget takes away a row nobody is looking at.
+            self._refresh_moments_list()
         self._refresh_pv_table()
         self._resolve_frames()
 
-    def _step_moment(self, direction: int):
-        """Previous / next sample of the snap PV — i.e. the shot before or after."""
+    # ── the saved moments ─────────────────────────────────────────────────────
+    def _remember_moment(self, ts_ns: int):
+        """Keep this moment on the list and select it there.
+
+        A moment already on it is not added twice, it is selected where it already
+        sits. What DOES arrive here: a click on the graph, a pick off the list itself,
+        and the Save button. What does not: the prev/next arrows — see _apply_moment."""
+        ts_ns = int(ts_ns)
+        if ts_ns not in self._moments:
+            self._moments.append(ts_ns)
+            if len(self._moments) > _MOMENTS_MAX:
+                # The oldest goes, not the newest: what has just been looked at is
+                # what is about to be looked at again.
+                self._moments = self._moments[-_MOMENTS_MAX:]
+            self._save_state()
+        self._refresh_moments_list()
+
+    def _refresh_moments_list(self):
+        """Newest at the top — the list is read from the top, and the moment just
+        picked has to be the one under the mouse, not the one 40 rows down."""
+        lst = self._lst_moments
+        lst.blockSignals(True)
+        lst.clear()
+        for ts in reversed(self._moments):
+            it = QListWidgetItem(_fmt_moment(ts))
+            it.setData(Qt.ItemDataRole.UserRole, int(ts))
+            it.setToolTip("Click to go back to this moment")
+            lst.addItem(it)
+            if self._moment_ns is not None and int(ts) == int(self._moment_ns):
+                lst.setCurrentItem(it)
+        lst.blockSignals(False)
+        n = len(self._moments)
+        # As tall as it needs to be, up to six rows. A fixed box is 112 px of empty
+        # white on a panel where every pixel is somebody's setting.
+        row_h = self._lst_moments.sizeHintForRow(0) if n else 16
+        self._lst_moments.setFixedHeight(
+            max(22, min(6, max(n, 1)) * max(14, row_h) + 6))
+        self._lbl_moments.setText("Nothing picked yet." if not n
+                                  else f"{n} saved moment(s)")
+        self._btn_clear_moments.setEnabled(bool(n))
+        self._btn_drop_moment.setEnabled(lst.currentItem() is not None)
+        self._sync_moment_buttons()
+
+    def _sync_moment_buttons(self):
+        """Save and Send: both act on the moment ON SCREEN, so both are dead until
+        there is one. Save also greys out once that moment is already on the list —
+        pressing it again would do nothing, and a button that does nothing should not
+        look live. Send needs a camera as well: the Slider is being sent frames."""
+        here = self._moment_ns
+        self._btn_save_moment.setEnabled(
+            here is not None and int(here) not in self._moments)
+        self._btn_to_slider.setEnabled(
+            here is not None and bool(self._cams)
+            and getattr(self, "_slider_ref", None) is not None)
+
+    def _save_moment(self):
+        """Save — put the moment on screen on the list, by hand."""
         if self._moment_ns is None:
             return
-        snap = self._cmb_snap.currentText()
+        self._remember_moment(int(self._moment_ns))
+
+    def _on_moment_picked(self, item: QListWidgetItem):
+        """A row of the list → that moment again. Cheap: the series are already in
+        memory, and only the frames are read from the share."""
+        try:
+            ts = int(item.data(Qt.ItemDataRole.UserRole))
+        except Exception:
+            return
+        self._btn_drop_moment.setEnabled(True)
+        if self._moment_ns is not None and ts == int(self._moment_ns):
+            return                      # already there; do not re-read the share
+        self._apply_moment(ts)
+
+    def _drop_moment(self):
+        it = self._lst_moments.currentItem()
+        if it is None:
+            return
+        try:
+            ts = int(it.data(Qt.ItemDataRole.UserRole))
+        except Exception:
+            return
+        self._moments = [t for t in self._moments if int(t) != ts]
+        self._save_state()
+        self._refresh_moments_list()
+
+    def _clear_moments(self):
+        """Empty the list. The moment CURRENTLY shown is untouched — clearing the list
+        is tidying it, not undoing the frames on screen."""
+        self._moments = []
+        self._save_state()
+        self._refresh_moments_list()
+
+    def _step_moment(self, direction: int):
+        """Previous / next sample of the snap PV — i.e. the shot before or after.
+
+        Stepping does NOT save: walking through a stretch of the day shot by shot would
+        otherwise bury the list under moments nobody picked. Save keeps the one that
+        turns out to be worth keeping."""
+        if self._moment_ns is None:
+            return
+        snap = self._snap_pv()
         here = self._nearest_index(snap, self._moment_ns)
         if here is None:
             return
@@ -2494,14 +2890,22 @@ class OneMomentWidget(QWidget):
             j = max(0, min(len(ts) - 1, here + (1 if direction > 0 else -1)))
         if j == here:
             return                      # already at the first / last shot
-        self._apply_moment(int(ts[j]))
+        self._apply_moment(int(ts[j]), remember=False)
 
     # ══════════════════════════ the numbers ═══════════════════════════════════
     def _value_at(self, name: str, ts_ns: int) -> "tuple[float | None, int | None]":
-        """(value, offset in ns) of the sample nearest `ts_ns`, or (None, None)."""
+        """(value, offset in ns) of the sample nearest `ts_ns`, or (None, None).
+
+        With no sample in the window at all, the value the channel was sitting at when
+        the window opened is the answer — that is the whole of a setpoint channel's
+        story. The offset it comes back with is large and negative, which is what makes
+        the list flag it as old rather than pass it off as fresh."""
         j = self._nearest_index(name, ts_ns)
         if j is None:
-            return None, None
+            seed = self._seed_of(name)
+            if seed is None or seed[1] > int(ts_ns):
+                return None, None
+            return seed[0], seed[1] - int(ts_ns)
         d = self._series[name]
         sl = _sl()
         return (float(d["val"][j]) * float(sl.PV_SCALE.get(name, 1.0)),
@@ -2553,8 +2957,10 @@ class OneMomentWidget(QWidget):
         a ten-column table there is a table nobody can read. Mean and spread are what
         a marked range is marked for; the extremes are one hover away."""
         sl = _sl()
-        names = [n for n in self._pv_selected
-                 if n in self._series and len(self._series[n]["ts"]) > 0]
+        # A PV with no sample in the window is still listed as long as the archive knows
+        # what it was sitting at: a waveplate that did not move all day belongs on this
+        # table with its position on it, not left off it as if it did not exist.
+        names = [n for n in self._pv_selected if self._has_numbers(n)]
         has = self._span is not None
         self._btn_clear_range.setEnabled(has)
         if not has:
@@ -2584,11 +2990,7 @@ class OneMomentWidget(QWidget):
             label.setToolTip(d.get("channel", name))
             self._stat_table.setItem(r, 0, label)
             if y.size == 0:
-                for c, txt in ((1, "—"), (2, "—"), (3, "0")):
-                    it = QTableWidgetItem(txt)
-                    it.setForeground(QColor("#888888"))
-                    it.setToolTip("No sample of this PV inside the marked range.")
-                    self._stat_table.setItem(r, c, it)
+                self._fill_held_row(r, name, lo, unit)
                 self._stat_table.setRowHeight(r, 20)
                 continue
             std = float(y.std(ddof=1)) if y.size > 1 else float("nan")
@@ -2610,6 +3012,61 @@ class OneMomentWidget(QWidget):
         # Tall enough for what it holds, and no taller — the section below it must not
         # be pushed off the panel by an empty table.
         self._stat_table.setMaximumHeight(20 * max(len(names), 1) + 26)
+
+    def _last_before(self, name: str, ts_ns: int) -> "tuple[float, int] | None":
+        """(value, timestamp) of the newest FINITE sample of `name` at or before
+        `ts_ns`, or None when the archive holds nothing that old.
+
+        This is what makes a setpoint-shaped channel readable. A waveplate angle or a
+        motor position is archived when it MOVES, so a range can hold not one sample of
+        it while the value was perfectly well defined all the way through — the last
+        one before the range IS the value during it."""
+        d = self._series.get(name)
+        if d is not None and len(d["ts"]):
+            ts, val = d["ts"], self._values_of(name)
+            i = int(np.searchsorted(ts, int(ts_ns), side="right")) - 1
+            while i >= 0:
+                v = float(val[i])
+                if np.isfinite(v):          # a formula's gap marker is not a value
+                    return v, int(ts[i])
+                i -= 1
+        # Nothing inside the window is old enough — fall back to the value the channel
+        # was sitting at when the window opened.
+        seed = self._seed_of(name)
+        if seed is not None and seed[1] <= int(ts_ns):
+            return seed[0], seed[1]
+        return None
+
+    def _fill_held_row(self, r: int, name: str, lo: int, unit: str):
+        """One statistics row for a PV with no sample inside the marked range: the last
+        value from before it, held forward, and said out loud.
+
+        Amber, "held" instead of a spread and n = 0, so it can never be mistaken for a
+        mean of samples that are actually there. Three em dashes used to sit here, which
+        read as "this channel is broken"."""
+        got = self._last_before(name, lo)
+        if got is None:
+            tip = ("No sample of this PV inside the marked range, and none before it "
+                   "either — nothing was archived for it up to this point.")
+            cells = (("—", "#888888"), ("—", "#888888"), ("0", "#888888"))
+        else:
+            val, at_ns = got
+            age = int(lo) - at_ns
+            tip = (f"{_sl().pv_label_for(name)}  [{unit}]\n" if unit
+                   else f"{_sl().pv_label_for(name)}\n")
+            tip += ("No sample inside the marked range.\n"
+                    f"Last value before it: {val:.6g}\n"
+                    f"archived at {_fmt_moment(at_ns)}\n"
+                    f"{_fmt_span(age / NS_PER_S)} before the range starts\n"
+                    "Held forward — this channel is written when it changes, so that "
+                    "is its value over the whole range.")
+            cells = ((f"{val:.4g}", "#8a6114"), ("held", "#8a6114"),
+                     ("0", "#8a6114"))
+        for c, (txt, ink) in enumerate(cells, start=1):
+            it = QTableWidgetItem(txt)
+            it.setForeground(QColor(ink))
+            it.setToolTip(tip)
+            self._stat_table.setItem(r, c, it)
 
     # ══════════════════════════ the frames ════════════════════════════════════
     def _display_opts(self) -> dict:
@@ -2660,15 +3117,97 @@ class OneMomentWidget(QWidget):
             self._render_timer.start()
         self._save_state()
 
+    # ── the caches ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _opts_key(opts: dict) -> tuple:
+        """Everything about the rendering that changes a pixel. Two frames drawn with
+        the same key are the same picture, so that is what the picture cache is keyed
+        on — the Auto ticks included: each of them is computed from THIS file alone,
+        so it gives the same answer every time for the same file."""
+        return tuple(int(opts[k]) for k in (
+            "max_side", "gradient_id", "contrast", "brightness", "gamma",
+            "auto_contrast", "auto_bright"))
+
+    def _res_cache_get(self, cam: str, ts_ns: int) -> "dict | None":
+        key = (cam, int(ts_ns))
+        it = self._res_cache.pop(key, None)
+        if it is None:
+            return None
+        self._res_cache[key] = it       # touched → back of the queue
+        return dict(it)
+
+    def _res_cache_put(self, item: dict):
+        """Remember which file answers (camera, moment) — and, for a moment old enough
+        that the answer cannot change any more, remember that there is none
+        (see _MISS_CACHE_MIN_AGE_S)."""
+        cam, ts = item.get("cam"), item.get("asked_ns")
+        if not cam or ts is None:
+            return
+        if item.get("path") is None:
+            now_ns = int(datetime.now().timestamp() * NS_PER_S)
+            if int(ts) > now_ns - _MISS_CACHE_MIN_AGE_S * NS_PER_S:
+                return
+        key = (str(cam), int(ts))
+        self._res_cache.pop(key, None)
+        self._res_cache[key] = dict(item)
+        while len(self._res_cache) > _RES_CACHE_MAX:
+            self._res_cache.pop(next(iter(self._res_cache)))
+
+    @staticmethod
+    def _img_bytes(img) -> int:
+        try:
+            return int(img.sizeInBytes())
+        except Exception:
+            try:
+                return int(img.width()) * int(img.height()) * 4
+            except Exception:
+                return 0
+
+    def _img_cache_get(self, path, okey: tuple):
+        if path is None:
+            return None
+        key = (str(path), okey)
+        img = self._img_cache.pop(key, None)
+        if img is None:
+            return None
+        self._img_cache[key] = img      # touched → back of the queue
+        return img
+
+    def _img_cache_put(self, path, okey: tuple, img):
+        if path is None or img is None:
+            return
+        try:
+            if img.isNull():
+                return
+        except Exception:
+            return
+        key = (str(path), okey)
+        old = self._img_cache.pop(key, None)
+        if old is not None:
+            self._img_cache_bytes -= self._img_bytes(old)
+        self._img_cache[key] = img
+        self._img_cache_bytes += self._img_bytes(img)
+        limit = _IMG_CACHE_MB * 1024 * 1024
+        while self._img_cache and self._img_cache_bytes > limit:
+            self._img_cache_bytes -= self._img_bytes(
+                self._img_cache.pop(next(iter(self._img_cache))))
+        if self._img_cache_bytes < 0:              # a QImage that lied about its size
+            self._img_cache_bytes = 0
+
+    # ── the frames ────────────────────────────────────────────────────────────
     def _resolve_frames(self):
-        """Find each picked camera's frame for the moment, then render them."""
+        """Find each picked camera's frame for the moment, then render them.
+
+        A camera whose file for this moment has been found before is answered from
+        memory — no share walk and no thread. With every camera answered that way (a
+        moment already visited) nothing is started at all: the wall goes straight to
+        rendering, which for unchanged display settings is also just memory."""
         if self._moment_ns is None:
             return
         if not self._cams:
             self._tile_items = []
             self._tile_results = []
             self._clear_tiles()
-            self._btn_popout.setEnabled(False)
             self._tiles_hint.setText(
                 "No camera picked — press Camera to choose which frames this moment "
                 "should show.")
@@ -2679,15 +3218,31 @@ class OneMomentWidget(QWidget):
         self._tile_items = []
         self._tile_results = []
         self._clear_tiles()
-        self._btn_popout.setEnabled(False)
-        self._tiles_hint.setText(f"Looking for {len(self._cams)} camera(s) at "
-                                 f"{_ns_to_prague(self._moment_ns):%H:%M:%S}…")
-        self._pool.start(_ResolveTask(self._res_gen, self._moment_ns, self._cams,
+        ts_ns = int(self._moment_ns)
+        missing: "list[str]" = []
+        for cam in self._cams:
+            hit = self._res_cache_get(cam, ts_ns)
+            if hit is None:
+                missing.append(cam)
+            else:
+                self._tile_items.append(hit)
+        if not missing:
+            # Every file already known. The hint still has to change, or the wall
+            # would sit under the previous moment's line while it is redrawn.
+            self._tiles_hint.setText(
+                f"{len(self._tile_items)} frame(s) at "
+                f"{_ns_to_prague(ts_ns):%H:%M:%S} — from memory…")
+            self._on_resolve_done(self._res_gen)
+            return
+        self._tiles_hint.setText(f"Looking for {len(missing)} camera(s) at "
+                                 f"{_ns_to_prague(ts_ns):%H:%M:%S}…")
+        self._pool.start(_ResolveTask(self._res_gen, ts_ns, missing,
                                       self._res_sig, self._res_stop))
 
     def _on_resolved(self, item: dict, gen: int):
         if gen != self._res_gen:
             return
+        self._res_cache_put(item)
         self._tile_items.append(item)
 
     def _on_resolve_done(self, gen: int):
@@ -2703,17 +3258,35 @@ class OneMomentWidget(QWidget):
 
     def _render_frames(self):
         """Turn the found files into pictures with the current display settings. No
-        share walk here — that is _resolve_frames, and it already happened."""
+        share walk here — that is _resolve_frames, and it already happened.
+
+        Anything already drawn at these exact settings goes on the wall from memory,
+        right now; only what is not there is read and rendered. So a moment gone back
+        to is instant, and so is a display setting gone back to."""
         self._render_timer.stop()
         if not self._tile_items:
             return
         self._rnd_stop.set()
         self._rnd_stop = threading.Event()
         self._rnd_gen += 1
+        gen = self._rnd_gen
         self._tile_results = []
-        self._pool.start(_RenderTask(self._rnd_gen, self._tile_items,
-                                     self._display_opts(), self._rnd_sig,
-                                     self._rnd_stop))
+        opts = self._display_opts()
+        okey = self._opts_key(opts)
+        self._rnd_opts_key = okey
+        todo: "list[dict]" = []
+        for it in self._tile_items:
+            img = self._img_cache_get(it.get("path"), okey)
+            if img is None and it.get("path") is not None:
+                todo.append(it)
+                continue
+            res = dict(it)
+            res["img"] = img            # None = this camera had no frame
+            self._on_tile(res, gen)     # straight onto the wall
+        if not todo:
+            self._on_tiles_done(gen)
+            return
+        self._pool.start(_RenderTask(gen, todo, opts, self._rnd_sig, self._rnd_stop))
 
     def _clear_tiles(self):
         while self._tiles_grid.count():
@@ -2732,6 +3305,7 @@ class OneMomentWidget(QWidget):
         widgets and a visible flicker down the wall."""
         if gen != self._rnd_gen:
             return
+        self._img_cache_put(res.get("path"), self._rnd_opts_key, res.get("img"))
         self._tile_results.append(res)
         cam = res.get("cam", "")
         old = self._tiles.pop(cam, None)
@@ -2773,56 +3347,63 @@ class OneMomentWidget(QWidget):
         txt = f"{found} frame(s)"
         if missing:
             txt += f"   ·   {missing} camera(s) had nothing near this moment"
-        txt += "   ·   click a frame to send it to the Workshop"
+        txt += ("   ·   click a frame to send it to the Workshop   ·   Ctrl + wheel "
+                "resizes them")
         self._tiles_hint.setText(txt)
-        self._btn_popout.setEnabled(bool(self._tile_results))
         if self._moment_ns is not None:
             self._lbl_frames.setText(
                 f"The frames at {_ns_to_prague(self._moment_ns):%H:%M:%S}")
-        self._refresh_popout()
 
-    def _popout_title(self) -> str:
-        return (f"One Moment — {_fmt_moment(self._moment_ns)}"
-                if self._moment_ns else "One Moment")
+    def _zoom_tiles(self, notches: int):
+        """Ctrl+wheel over the frames → bigger or smaller frames, IN PLACE.
 
-    def _popout(self):
-        """Open the pop-out, or bring the open one to the front — a second window over
-        the first is two answers to the same question."""
-        if not self._tile_results:
-            return
-        if self._popout_dlg is not None:
-            self._refresh_popout()
-            self._popout_dlg.raise_()
-            self._popout_dlg.activateWindow()
-            return
-        self._popout_dlg = _MomentPopout(self._popout_title(), self._tile_results,
-                                     self._send_to_workshop,
-                                     self._sld_size.value(), self)
-        self._popout_dlg.finished.connect(
-            lambda *_: setattr(self, "_popout_dlg", None))
-        self._popout_dlg.show()     # non-modal: the graph stays usable behind it
+        Nothing about the window changes: the pane keeps its size, the graph above it
+        keeps its size, and only the pictures inside grow. It drives the Size slider
+        rather than a size of its own, so the slider always shows where the wheel has
+        got to — see [[feedback-auto-mode-moves-slider]].
 
-    def _refresh_popout(self):
-        """Keep an open pop-out on the CURRENT frames."""
-        if self._popout_dlg is None or not self._tile_results:
-            return
-        try:
-            self._popout_dlg.set_results(self._popout_title(), self._tile_results,
-                                     self._sld_size.value())
-        except RuntimeError:            # the window was closed under us
-            self._popout_dlg = None
-
-    def _close_popout(self):
-        dlg, self._popout_dlg = self._popout_dlg, None
-        if dlg is None:
-            return
-        try:
-            dlg.close()
-            dlg.deleteLater()
-        except RuntimeError:
-            pass
+        Multiplicative, because a fixed step is a huge jump at 130 px and imperceptible
+        at 650."""
+        sld = self._sld_size
+        cur = sld.value()
+        want = int(round(cur * (_TILE_ZOOM_STEP ** int(notches))))
+        if want == cur:                     # rounding ate the step; force one pixel
+            want = cur + (1 if notches > 0 else -1)
+        want = max(sld.minimum(), min(sld.maximum(), want))
+        if want == cur:
+            return                          # already at the end of the slider
+        sld.setValue(want)                  # → _on_display_changed → re-render
 
     # ══════════════════════════ hand-over ═════════════════════════════════════
+    def _send_to_slider(self):
+        """Hand the moment on screen to the Image Slider, with the cameras picked here.
+
+        This tab finds the shot; the Slider is where it gets looked at — full size, the
+        subtraction, the overlays, the profile tools, the frames on either side. The
+        Slider is given a window around the moment and lands on it (`open_moment`),
+        so nothing has to be picked there a second time."""
+        viewer = getattr(self, "_slider_ref", None)
+        if viewer is None or self._moment_ns is None:
+            return
+        if not self._cams:
+            QMessageBox.information(
+                self, "Image Slider",
+                "No camera picked yet — press Camera and choose which cameras the "
+                "Slider should open.")
+            return
+        try:
+            ok = viewer.open_moment(int(self._moment_ns), list(self._cams))
+        except Exception as exc:
+            QMessageBox.warning(self, "Image Slider",
+                                f"Could not hand the moment over:\n{exc}")
+            return
+        if not ok:
+            return
+        tabs = getattr(self, "_tab_widget", None)
+        idx = getattr(self, "_slider_tab_idx", None)
+        if tabs is not None and idx is not None:
+            tabs.setCurrentIndex(idx)
+
     def _send_to_workshop(self, res: dict):
         """Hand a frame to the Workshop for measuring.
 
@@ -2857,10 +3438,73 @@ class OneMomentWidget(QWidget):
             QMessageBox.warning(self, "Workshop", f"Could not send image:\n{exc}")
 
 
+# ── wheel guard ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so a settings panel still
+    scrolls when the pointer happens to pass over a field on the way down — and
+    Ctrl+wheel over a control still reaches the wall of frames, which is what
+    sizes the tiles. A control meant to take the wheel at any time carries the
+    "wheelAlways" property.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `img_scale` is loaded per tab).
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QApplication, QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
+
+
 # ── standalone ────────────────────────────────────────────────────────────────
 def main():
     from PySide6.QtWidgets import QApplication, QMainWindow
     app = QApplication.instance() or QApplication(sys.argv)
+    install_wheel_guard(app)
     app.setStyle("Fusion")
     win = QMainWindow()
     win.setWindowTitle("One Moment")

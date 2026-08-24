@@ -359,13 +359,15 @@ What is duplicated deliberately:
 | `set_app_icon(win, ico, app_id)` | every tkinter program | tkinter's `iconbitmap` only sets the title bar; the Windows 11 taskbar reads the small-icon slots and the window-class icon. Must be **frozen-aware** — in a build `__file__` does not point next to the exe. |
 | `get_app_dir()` / `_app_dir()` | every program | exe folder when frozen, source folder otherwise. Every path resolves through it. |
 | Hour-chunked archiver fetch | Chiller Log, CSS Logger, Image Tools | the one-hour limit from §2 |
-| The house calendar | CSS Logger (both tabs), Pulser Monitor, Chiller Log, Calibrations | Monday-first, grey header, red weekends, white cells. Weekends must be detected from the cell's **date**, never its column index. |
+| The house calendar | CSS Logger (both tabs), Pulser Monitor, Chiller Log, Calibrations | Monday-first, grey header, red weekends, white cells. Weekends must be detected from the cell's **date**, never its column index. Inside Image Tools it is not duplicated at all — every tab opens the Image Slider's `DatePickerDialog`, so a day looks and clicks the same in all five. A caller with no live mode passes `allow_live=False` rather than showing a tick that does nothing. |
+| A tab's own settings file | Image Tools (one JSON per tab in `%APPDATA%\ELI_ImageTools`) | the shared thing (the PV registry) has ONE file; what a single tab shows has its own. Written on every change, never on close — a tab is not told the program is quitting. Restoring must read no network and no share. |
 | Checkbox styling | the Qt programs | QSS on `::indicator` only — never a border on `QCheckBox {}` |
 | Matplotlib toolbar | Pulser Monitor (`_make_mpl_toolbar`) | build it so the icons are **not** tinted; under the dark palette a tinted toolbar goes invisible |
 | PV-name search | Image Slider (reference), CSS Logger (both tabs) | words are tokens, AND-matched anywhere in the name, order honoured, ranked, camera channels last, empty query returns nothing |
 | Identity-keyed colours | CSS Logger (Spectra tab), Chiller Log, Diagnostic | a colour that names an item comes from the **item**, never from its index in the list being drawn — otherwise a missing item silently recolours everything else |
 | Precise Qt timers | Image Tools | a default `QTimer` at 33 ms fires at 21 Hz on Windows; animation and playback need `PreciseTimer` |
 | Brightness vs contrast | Image Tools, Screenshots | brightness = additive offset, contrast = multiplicative gain. Never swapped, in code or in labels. An Auto checkbox parks its slider on the value it computed. |
+| Painted button icons | Image Tools (`wk_t.action_icon` / `tool_icon`, used by Workshop and One Moment) | a button symbol is a painted `QIcon` with every enabled/disabled/checked state spelled out at 20/30/40 px, never a text glyph — a glyph is whatever font the machine has, and it disappears the moment the button is disabled or checked. One recipe table for the program; a new symbol is added there, not copied. |
 
 ---
 

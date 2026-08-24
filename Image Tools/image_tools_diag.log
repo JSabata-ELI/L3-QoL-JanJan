@@ -6455,3 +6455,885 @@
 2026-08-24 08:50:09 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
 2026-08-24 08:50:09 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
 2026-08-24 08:50:09 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:27 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:29 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:29 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:29 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:29 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:29 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 08:57:40 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 08:56:46.846
+2026-08-24 08:57:41 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 08:56:46.846
+2026-08-24 08:57:41 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 08:56:46.846
+2026-08-24 09:01:33 TRIP image cam0: L3-OM1FF-CAM — a new image arrived but cannot be read — L3-OM1FF-CAM_1787553968938270208.png failed 3x (corrupt, locked, or truncated) @ 2026-08-24 08:46:08.938
+2026-08-24 09:01:33 TRIP image cam0: L3-OM1FF-CAM — a new image arrived but cannot be read — L3-OM1FF-CAM_1787553968938270208.png failed 3x (corrupt, locked, or truncated) @ 2026-08-24 08:46:08.938
+2026-08-24 09:01:33 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read (7 s) @ no frame
+2026-08-24 09:01:33 TRIP image cam0: L3-OM1FF-CAM — a new image arrived but cannot be read — L3-OM1FF-CAM_1787553968938270208.png failed 3x (corrupt, locked, or truncated) @ 2026-08-24 08:46:08.938
+2026-08-24 09:01:33 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read (7 s) @ no frame
+2026-08-24 09:01:33 TRIP image cam0: Camera — a new image arrived but cannot be read — L3-OM1FF-CAM_1787553968938270208.png failed 3x (corrupt, locked, or truncated) @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:02:28 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:28 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:39 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:39 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:41 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:41 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:41 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:41 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:41 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:02:43 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:43 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:02:49 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:01:55.178
+2026-08-24 09:02:50 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:01:55.178
+2026-08-24 09:02:50 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:01:55.178
+2026-08-24 09:03:26 up=   1.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   253.2MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=   94985 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=4 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=3 
+2026-08-24 09:04:26 up=   2.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   276.4MB thr=  2 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  103094 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:05:26 up=   3.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   275.9MB thr=  2 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  103094 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:06:26 up=   4.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   284.5MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  103174 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:07:26 up=   5.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   286.4MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104457 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:08:10 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:10 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:12 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:12 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:08:15 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:15 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:08:21 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:07:27.226
+2026-08-24 09:08:22 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:07:27.226
+2026-08-24 09:08:23 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:07:27.226
+2026-08-24 09:08:26 up=   6.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   279.4MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104462 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:09:26 up=   7.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   282.8MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104462 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:10:26 up=   8.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   283.2MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104462 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:11:26 up=   9.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   283.2MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104462 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:12:26 up=  10.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   283.4MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104462 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:13:26 up=  11.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   283.4MB thr=  4 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  104462 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=8 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=7 
+2026-08-24 09:14:26 up=  12.0m prev=     0 cach=     0 miss=     0 load=    8 hq=    0 prox=  21% refuse=  -1% proxMB=   78.9 renderMB=   0.0 step=1,1,1,1,1,1,1,1 tolS=   0.00 srcLag= 204.3s shownLag= 661.8s cams=0:2205+2205/b661.5,1:2206+2206/b661.5,2:2117+2117/b661.7,3:2207+2207/b661.8,4:2206+2206/b661.6,5:2113+2113/b661.7,6:2207+2207/b661.7,7:1701+1701/b661.3 rss=   405.4MB thr=  4 pools=  6 campools= 0 children=    33 items=  16962 camTot=   16962 camMax=   2207 watch=0/0 saved=0 gcObj=  173681 qpix=    -1 qimg=    -1 axisH=  1.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=   5.5s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=28 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=8 
+2026-08-24 09:15:26 up=  13.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  63% refuse=  -1% proxMB=  233.5 renderMB=   0.0 step=1,1,1,1,1,1,1,1 tolS=   0.00 srcLag= 264.4s shownLag= 661.8s cams=0:2205+0/b661.5,1:2206+0/b661.5,2:2117+0/b661.7,3:2207+0/b661.8,4:2206+0/b661.6,5:2113+0/b661.7,6:2207+0/b661.7,7:1701+0/b661.3 rss=   556.8MB thr=  4 pools=  6 campools= 0 children=    33 items=  16962 camTot=   16962 camMax=   2207 watch=0/0 saved=0 gcObj=  173830 qpix=    -1 qimg=    -1 axisH=  1.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=   4.4s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=30 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=8 
+2026-08-24 09:16:26 up=  14.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox= 100% refuse=  -1% proxMB=  367.1 renderMB=   0.0 step=1,1,1,1,1,1,1,1 tolS=   0.00 srcLag= 324.4s shownLag= 661.8s cams=0:2205+0/b661.5,1:2206+0/b661.5,2:2117+0/b661.7,3:2207+0/b661.8,4:2206+0/b661.6,5:2113+0/b661.7,6:2207+0/b661.7,7:1701+0/b661.3 rss=   664.6MB thr=  4 pools=  6 campools= 0 children=    33 items=  16962 camTot=   16962 camMax=   2207 watch=0/0 saved=0 gcObj=  173438 qpix=    -1 qimg=    -1 axisH=  1.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  64.4s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=30 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=8 
+2026-08-24 09:16:58 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:16:04.816
+2026-08-24 09:16:59 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:16:04.816
+2026-08-24 09:17:00 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:16:04.816
+2026-08-24 09:17:26 up=  15.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox= 100% refuse=  -1% proxMB=  367.1 renderMB=   0.0 step=1,1,1,1,1,1,1,1 tolS=   0.00 srcLag= 384.3s shownLag= 661.8s cams=0:2205+0/b661.5,1:2206+0/b661.5,2:2117+0/b661.7,3:2207+0/b661.8,4:2206+0/b661.6,5:2113+0/b661.7,6:2207+0/b661.7,7:1701+0/b661.3 rss=   664.4MB thr=  4 pools=  6 campools= 0 children=    33 items=  16962 camTot=   16962 camMax=   2207 watch=0/0 saved=0 gcObj=  173785 qpix=    -1 qimg=    -1 axisH=  1.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  60.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=32 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=8 
+2026-08-24 09:17:47 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:16:53.476
+2026-08-24 09:17:48 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:16:53.476
+2026-08-24 09:17:48 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:16:53.476
+2026-08-24 09:18:37 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:17:43.590
+2026-08-24 09:18:38 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:17:43.590
+2026-08-24 09:18:38 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:17:43.590
+2026-08-24 09:19:01 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:19:01 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:00 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:11 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:13 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:20:16 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:16 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:20:23 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:19:29.315
+2026-08-24 09:20:25 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:19:29.315
+2026-08-24 09:20:25 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:19:29.315
+2026-08-24 09:23:33 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:33 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:36 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:23:39 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:39 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:23:46 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:22:52.140
+2026-08-24 09:23:47 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:22:52.140
+2026-08-24 09:23:48 TRIP pv PTM1: PTM1 0.420 J — above 0.3 @ 2026-08-24 09:22:52.140
+2026-08-24 09:24:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:12 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:12 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:12 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:21 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:43 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:45 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:48 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:51 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:24:54 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:07 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:08 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:10 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:25:12 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:12 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:17 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:17 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:18 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:20 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:25:23 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:23 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:29 TRIP pv Back refl: Back refl 0.42 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv Back refl: Back refl 0.9 — above 0.30 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv0: pv0 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv1: pv1 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv2: pv2 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv3: pv3 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv4: pv4 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv5: pv5 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv6: pv6 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv7: pv7 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv8: pv8 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv9: pv9 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv10: pv10 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv11: pv11 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv12: pv12 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv13: pv13 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv14: pv14 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv15: pv15 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv16: pv16 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv17: pv17 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv18: pv18 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv19: pv19 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv20: pv20 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv21: pv21 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv22: pv22 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv23: pv23 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv24: pv24 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv25: pv25 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv26: pv26 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv27: pv27 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv28: pv28 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv29: pv29 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv30: pv30 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv31: pv31 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv32: pv32 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv33: pv33 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv34: pv34 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv35: pv35 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv36: pv36 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv37: pv37 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv38: pv38 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv39: pv39 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv40: pv40 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv41: pv41 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv42: pv42 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv43: pv43 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv44: pv44 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv45: pv45 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv46: pv46 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv47: pv47 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv48: pv48 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv49: pv49 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv50: pv50 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv51: pv51 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv52: pv52 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv53: pv53 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv54: pv54 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv55: pv55 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv56: pv56 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv57: pv57 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv58: pv58 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv59: pv59 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv60: pv60 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv pv61: pv61 over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:29 TRIP pv X: X over @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv Temp: Temp <Temp> — below 10 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv BR: BR <BR> — above 0.3 @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:32 TRIP pv err:BR: BR cannot be read @ 2023-11-14 23:13:20.000
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam1: L3-PM03-CAM — the camera folder cannot be read @ no frame
+2026-08-24 09:25:35 TRIP image cam0: Camera — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the program was busy — nothing was refreshing @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the camera folder cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the folder is not answering @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — the image cannot be read @ 2026-08-24 08:46:08.938
+2026-08-24 09:25:35 TRIP image cam0: L3-OM1FF-CAM — a newer image is not on screen @ 2026-08-24 08:46:08.938
+2026-08-24 12:15:23 up=   1.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   322.5MB thr=  3 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  102885 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:18:29 up=   1.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   301.1MB thr=  2 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=   95057 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:19:29 up=   2.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   269.5MB thr=  2 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=   95031 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:20:29 up=   3.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   326.4MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:21:29 up=   4.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   326.6MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:22:29 up=   5.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   326.8MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:23:29 up=   6.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   326.7MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:24:29 up=   7.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   325.6MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:25:29 up=   8.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   325.6MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:26:29 up=   9.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=  -1.0s shownLag=  -1.0s rss=   325.6MB thr=  1 pools=  6 campools= 0 children=    27 items=      0 camTot=       0 camMax=      0 watch=0/0 saved=0 gcObj=  203556 qpix=    -1 qimg=    -1 axisH=  0.0 online=0 pvN=2 pvFetch=  -1.0s pvLastVal=  -1.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=6 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=5 
+2026-08-24 12:27:57 up=   1.0m prev=     0 cach=     0 miss=     0 load=    6 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 316.5s shownLag=   0.0s dots=G6/R0 cams=0:21+21/b0.0,1:19+19/b0.0,2:21+21/b0.0,3:20+20/b0.0,4:19+19/b0.0,5:21+21/b0.0 rss=   265.7MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96260 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  48.2s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=5 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:28:57 up=   2.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 376.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.1MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96348 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  44.6s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=7 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:29:57 up=   3.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 436.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.1MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96564 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  38.7s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=9 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:30:57 up=   4.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 496.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.1MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96780 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  34.4s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=11 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:31:57 up=   5.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 556.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.5MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96999 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  28.6s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=13 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:32:57 up=   6.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 616.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.6MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96352 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  24.8s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=15 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:33:57 up=   7.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 676.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   269.0MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96568 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  20.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=17 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:34:57 up=   8.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 736.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.8MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96784 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  15.0s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=19 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:35:57 up=   9.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 796.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.8MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   97000 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=   9.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=21 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:36:57 up=  10.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 856.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96352 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=   4.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=23 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:37:57 up=  11.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 916.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96352 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  64.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=23 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:38:57 up=  12.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag= 976.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.8MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96568 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  59.6s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=25 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:39:57 up=  13.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1036.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96784 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  54.8s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=27 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:40:57 up=  14.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1096.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   97000 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  48.8s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=29 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:41:57 up=  15.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1156.5s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96352 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  44.8s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=31 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:42:57 up=  16.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1216.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96568 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  39.6s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=33 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:43:57 up=  17.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1276.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96784 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  34.7s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=35 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:44:57 up=  18.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1336.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   97000 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  29.5s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=37 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:45:57 up=  19.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1396.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96351 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  24.1s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=39 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:46:57 up=  20.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1456.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96567 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  19.8s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=41 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:47:57 up=  21.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1516.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96783 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  14.1s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=43 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:48:57 up=  22.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1576.6s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   268.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96999 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=   9.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=45 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:49:59 up=  23.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1638.4s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   157.4MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96464 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=   6.6s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=47 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:50:58 up=  24.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1697.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   110.0MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96680 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=   4.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=49 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:51:58 up=  25.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1757.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   110.9MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96680 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  64.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=49 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:52:58 up=  26.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1817.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=   111.1MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96896 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  59.7s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=51 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:53:58 up=  27.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1877.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=    93.2MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   97112 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  52.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=53 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:54:58 up=  28.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1937.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=    93.4MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96464 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  49.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=55 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:55:58 up=  29.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=1997.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=    93.5MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96680 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  44.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=57 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:56:58 up=  30.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=2057.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=    93.6MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96896 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  39.7s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=59 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:57:58 up=  31.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=2117.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=    93.7MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   97112 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  34.4s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=61 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 12:58:58 up=  32.0m prev=     0 cach=     0 miss=     0 load=    0 hq=    0 prox=  -1% refuse=  -1% proxMB=    0.0 renderMB=   0.0 step=-           tolS=  -1.00 srcLag=2177.7s shownLag=   0.0s dots=G6/R0 cams=0:21+0/b0.0,1:19+0/b0.0,2:21+0/b0.0,3:20+0/b0.0,4:19+0/b0.0,5:21+0/b0.0 rss=    93.8MB thr=  7 pools=  6 campools= 0 children=    30 items=    121 camTot=     121 camMax=     21 watch=6/6 saved=0 gcObj=   96349 qpix=    -1 qimg=    -1 axisH=  1.0 online=1 pvN=2 pvFetch=  -1.0s pvLastVal=  29.9s pvWait=0 pvStall=0 trips=0/0 pvOver=0 cpva req=63 httpErr=0 to=0 busy=0 poolWaitMax=0.0s drop=0 warmFail=0 take=0 split=0 days=2 
+2026-08-24 13:06:31 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.151 shown=10:53:39.848 behind=0.3s fails=2
+2026-08-24 13:07:03 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.454 shown=10:53:40.151 behind=0.3s fails=1
+2026-08-24 13:07:04 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.757 shown=10:53:40.757 behind=0.0s fails=0
+2026-08-24 13:12:01 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.151 shown=10:53:39.848 off=+0.3s fails=2
+2026-08-24 13:12:02 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.454 shown=10:53:40.151 off=+0.3s fails=1
+2026-08-24 13:12:04 STUCK retry cam1 (BENCHCAM1) behind try=1 want=10:53:40.757 shown=10:53:40.151 off=+0.6s fails=2
+2026-08-24 13:14:36 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:32.575 shown=10:53:32.272 off=+0.3s fails=2
+2026-08-24 13:14:38 STUCK retry cam1 (BENCHCAM1) behind try=1 want=10:53:32.272 shown=10:53:32.272 off=+0.0s fails=4
+2026-08-24 13:14:45 STUCK retry cam1 (BENCHCAM1) behind try=1 want=10:53:32.878 shown=10:53:32.272 off=+0.6s fails=7
+2026-08-24 13:15:16 TRIP image cam0: BENCHCAM0 — the program was busy — nothing was refreshing @ 2025-10-09 10:53:32.878
+2026-08-24 13:15:16 TRIP image cam1: BENCHCAM1 — the program was busy — nothing was refreshing @ 2025-10-09 10:53:32.878
+2026-08-24 13:17:32 STUCK retry single try=1 want=10:53:32.424 shown=10:53:31.818 behind=0.6s fails=1
+2026-08-24 13:18:12 TRIP image cam0: Camera — the program was busy — nothing was refreshing @ 2025-10-09 10:53:32.727
+2026-08-24 13:20:37 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.151 shown=10:53:39.848 off=+0.3s fails=2
+2026-08-24 13:20:38 STUCK retry cam0 (BENCHCAM0) behind try=1 want=10:53:40.454 shown=10:53:40.151 off=+0.3s fails=1
+2026-08-24 13:20:40 STUCK retry cam1 (BENCHCAM1) behind try=1 want=10:53:40.757 shown=10:53:40.151 off=+0.6s fails=2

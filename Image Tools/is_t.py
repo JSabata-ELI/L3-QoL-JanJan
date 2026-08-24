@@ -363,8 +363,6 @@ PV_DISPLAY_TO_COL: dict[str, str] = {
     "PCM4":      "pcm4",
     "PAP1":      "pap1",
     "SBW4":      "sbw4",
-    # Derived: the same archiver channel as SBW4, scaled by PV_SCALE below.
-    "Compressed SBW4": "sbw4",
     "Back_Ref":  "Back_Ref",
     "Waveplate": "waveplate",
 }
@@ -381,13 +379,35 @@ PV_CHANNEL_MAP: dict[str, str] = {
 
 PV_UNITS: dict[str, str] = {
     "PTM1": "J", "PCM2": "J", "PCM4": "J", "PAP1": "J", "SBW4": "J",
-    "Compressed SBW4": "J", "Back_Ref": "J", "Waveplate": "",
+    "Back_Ref": "J", "Waveplate": "",
 }
 
 # Multiplicative factor applied to the raw archiver value before display/burn-in.
 # Names not listed here use 1.0 (the raw value).
-PV_SCALE: dict[str, float] = {
-    "Compressed SBW4": 0.749,
+#
+# Empty on purpose. "Compressed SBW4" used to live here: a preset that read the SBW4
+# channel and printed it × 0.749, so the dialog showed a PV whose number matched no
+# archiver reading and no visible calculation. It is a RECIPE now (see
+# PV_PRESET_RECIPES) — the multiplication is an ordinary formula row the operator can
+# read, edit and untick. An entry here would bring the invisible factor back.
+PV_SCALE: dict[str, float] = {}
+
+# Presets that are not a channel of their own but a RECIPE built out of one.
+#
+# Ticking one adds the source PV it needs, adds the formula that converts it, and takes
+# the source off the picture — so only the converted value is printed, while the raw
+# channel is still read (a formula needs its source read to be computable at all).
+# Unticking removes the formula and gives the source its eye back.
+#
+#   source      the PRESET name the value is computed from
+#   factor      what the source is multiplied by
+#   unit        unit of the result
+#   hide_source take the source off the picture when the recipe is added
+PV_PRESET_RECIPES: dict[str, dict] = {
+    # L3 compressor transmission: the energy that leaves the compressor is 0.749 of
+    # what SBW4 measures in front of it.
+    "Compressed SBW4": {"source": "SBW4", "factor": 0.749, "unit": "J",
+                        "hide_source": True},
 }
 
 # Units the operator typed for a user-added PV, PV name → unit text. The archiver's
@@ -602,6 +622,51 @@ def pv_registry_load(fallback: "dict | None" = None) -> None:
     except Exception:
         data = None
     pv_registry_from_dict(data if isinstance(data, dict) else (fallback or {}))
+
+
+def pv_migrate_preset_recipes(enabled: "list[str]", hidden: "set[str]") -> "list[str]":
+    """Turn a recipe name saved by an older version into the recipe it is now.
+
+    "Compressed SBW4" used to be a preset CHANNEL with an invisible 0.749 factor; it is
+    a formula over SBW4 now. Without this, an installation that had it picked would come
+    up with that PV simply gone from the list, which reads as "the programme forgot my
+    channel" rather than as a version change.
+
+    Adds the source PV and the formula, and hides the source if the recipe says so.
+    `hidden` is updated in place. Idempotent: a recipe that already has its formula is
+    left alone.
+
+    The saved ORDER is kept and a name this module does not know is passed through
+    untouched — the Image Finder's selection may hold CSV-only columns, and ordering the
+    result by pv_all_names() here would silently drop them."""
+    picked, seen = [], set()
+    for n in enabled:                       # de-duplicate, keep the saved order
+        if n not in seen:
+            seen.add(n)
+            picked.append(n)
+    added = False
+    for name, rd in PV_PRESET_RECIPES.items():
+        if name not in picked or pv_derived_def(name) is not None:
+            continue
+        src = str(rd.get("source") or "")
+        if src not in PV_CHANNEL_MAP:
+            picked.remove(name)             # recipe over a channel that is gone
+            continue
+        if src not in picked:
+            picked.insert(picked.index(name), src)
+        if rd.get("hide_source"):
+            hidden.add(src)
+        hidden.discard(name)
+        letter = pv_letters_for(list(PV_CHANNEL_MAP)
+                               + list(PV_CUSTOM_CHANNELS))[0][src]
+        PV_DERIVED.append({"name": name,
+                           "expr": f"{letter}*{float(rd.get('factor', 1.0)):g}",
+                           "unit": str(rd.get("unit") or ""),
+                           "bindings": {letter: src}})
+        added = True
+    if added:
+        pv_registry_save()
+    return picked
 
 
 def pv_channel_for(name: str) -> "str | None":
@@ -1022,6 +1087,18 @@ TRIPS_MAX = 50
 # A PV that answers "ERR" for this long is a trip of its own. Not on the first failure:
 # one failed archiver read is normal and the next fetch usually has it.
 PV_ERROR_TRIP_S = 15.0
+
+# One short phrase per live-health fault (the five reasons _live_health returns), for
+# the trip row. _live_health's own tooltip is the fuller sentence with the filename and
+# the seconds in it — far too long for a 275 px row, where it elided down to the half
+# that says nothing. That sentence becomes the trip's tooltip instead.
+_CAM_FAULT_SHORT = {
+    "stall":  "the program was busy — nothing was refreshing",
+    "folder": "the camera folder cannot be read",
+    "poll":   "the folder is not answering",
+    "read":   "the image cannot be read",
+    "lag":    "a newer image is not on screen",
+}
 
 
 def _pv_last_known_ex(channel: str, ts_ns: int) -> "tuple[float | None, str]":
@@ -2052,6 +2129,37 @@ CAM_READ_FAIL_RED_N            = 1
 # so it must not be marked stale. Only used for paints made in live auto-follow;
 # a manually scrubbed frame is still required to match exactly.
 LIVE_PAINT_TOL_NS              = 1_500_000_000   # 1.5 s
+# ── getting a stuck picture back (see _cam_stuck_tick) ─────────────────────────
+# A tile can be left showing an old picture with NOTHING on its way. _on_cam_loaded
+# relaunches through _cam_want, which the finished load has already consumed, so one
+# undecodable frame (a file read while the camera was still writing it, a share
+# hiccup) produces two failures and then nobody ever asks again — see the note at
+# CAM_READ_FAIL_RED_N. The picture, the red timestamp label and the red dot then all
+# stay wrong until an arrival happens to succeed, and if the source has stopped, for
+# the rest of the session. Same hole on a hung read whose in-flight slot the watchdog
+# releases while _cam_want is empty: released, and then nothing relaunched.
+#
+# The retry is keyed on the last successful PAINT, never on the last request. At
+# 3.3 Hz the request moves every 0.3 s, so a clock reset by requests would never
+# reach any threshold on a wedged tile under a live stream — which is precisely the
+# case this exists for. A new picture appearing is therefore what ENDS the retrying,
+# and a working stream can never be fought by it.
+CAM_STUCK_TICK_MS              = 500
+# The tile is not showing the frame it was asked for AND has put no new picture up for
+# this long → re-ask. Comfortably above one legitimate share read (130-160 ms) and one
+# native-size decode, and it does not have to carry the dot's 8 s hysteresis: re-asking
+# for a frame is cheap and invisible, so it may fire long before anything turns red.
+CAM_STUCK_RETRY_AFTER_S        = 1.5
+# Gap between retries for the same stuck picture, doubling from min to max. The first
+# is quick because the usual cause is readable a moment later; past that a slow retry
+# is enough, and one real new shot ends the campaign anyway.
+CAM_STUCK_RETRY_MIN_S          = 1.0
+CAM_STUCK_RETRY_MAX_S          = 5.0
+# A load still in flight after this long is released before a retry, or the retry
+# cannot start at all (_start_cam_load refuses over _cam_inflight_depth()). Much
+# shorter than CAM_LOAD_WATCHDOG_S on purpose: that one must assume the read may still
+# be healthy, while here the tile is provably behind and has been for seconds.
+CAM_STUCK_INFLIGHT_S           = 1.5
 # Size of the live-mode dot in the INFO panel header. It is the one always-visible
 # verdict on the whole live pipeline (see _live_health), so it is deliberately larger
 # than body text — it has to be readable from across the room.
@@ -11800,6 +11908,9 @@ class _CamSliderRow(QWidget):
         lay.addWidget(self._lbl)
 
         self._slider = QSlider(Qt.Orientation.Horizontal)
+        # Navigation, not a setting: the wheel steps through shots without having
+        # to click the track first (see install_wheel_guard).
+        self._slider.setProperty("wheelAlways", True)
         self._slider.setMinimum(0)
         self._slider.setMaximum(SLIDER_MAX)
         self._slider.setEnabled(False)
@@ -11852,10 +11963,16 @@ class PvConfigDialog(QDialog):
 
     ONE meaning per control, which is the whole point of the layout:
 
-      * A PV is in the list  → it is READ. There is no separate tick for that any
-        more; ✕ is how a PV stops being read. The old dialog had a grid of preset tick
-        boxes on top of the same PVs' rows below, so "picked" had two owners that could
-        disagree.
+      * A PV is in the list  → it is READ. The preset tick box and ✕ are two ends of
+        the same switch: the box is TICKED exactly when the preset has a row below, and
+        unticking it is the same as pressing that row's ✕. It is one state read two
+        ways, not two states that can disagree.
+      * A **recipe** preset (PV_PRESET_RECIPES, e.g. "Compressed SBW4") is not a channel:
+        ticking it adds the PV it is computed from, adds the formula that converts it,
+        and takes the source off the picture — so only the converted number is printed
+        while the raw channel is still read. Unticking removes the formula and gives the
+        source its eye back. Everything it adds is an ordinary row the operator can see
+        and edit; the factor is in the formula, never hidden in the code.
       * The **Show** column is the EYE → the value is printed over the frame and burned
         into a saved image. The two tables ARE that split: "On the picture" and "Read,
         not on the picture". It is the same eye as in the sidebar panel, on the same
@@ -11894,14 +12011,38 @@ class PvConfigDialog(QDialog):
     _ROW_H = 22
 
     # Column widths, in px, shared by both tables so their columns line up even though
-    # they are two independent grids. Only the PV column stretches.
-    _W_SHOW, _W_LETTER, _W_NAME, _W_UNIT, _W_KIND, _W_DEL = 42, 20, 128, 46, 92, 22
+    # they are two independent grids. Only the PV column stretches. Each is the width of
+    # the CELL, which carries the ruling lines and 4 px of padding on either side, so
+    # these are a few px wider than the control they hold.
+    _W_SHOW, _W_LETTER, _W_NAME, _W_UNIT, _W_KIND, _W_DEL = 48, 28, 136, 54, 98, 30
     # Alarm thresholds. Narrow on purpose — these hold a number like 0.3, and a wide
     # box here would come out of the PV column, which is the one genuinely long thing
     # in the table.
-    _W_LIMIT = 54
+    _W_LIMIT = 62
     _COL_TITLES = ("Show", "", "PV", "Displayed name", "Unit",
                    "Min", "Max", "What it is", "")
+
+    # The two picked-PV lists are drawn as real tables: ruled cells, and the column
+    # names once at the TOP of each. They used to be bare grid layouts, which put the
+    # names of the second table under the rows of the first — so the same words read as
+    # a footer of the list above them.
+    #
+    # Every rule is scoped by object name. An unqualified "border" on the table frame
+    # would cascade into every box and button inside it (Qt style sheets apply to
+    # children as well), and the rows would come out double-ruled.
+    #
+    # The ruling is a translucent grey and the cells set NO background: they take the
+    # dialog's own, so the text keeps whatever colour the palette gives it. A painted
+    # white cell here printed light text on white the moment the dialog came up under a
+    # dark palette, and the whole PV column went invisible.
+    _TABLE_QSS = (
+        "QFrame#pvTable { border: 1px solid rgba(128,128,128,0.55); }"
+        "QFrame#pvCell { border-right: 1px solid rgba(128,128,128,0.28);"
+        " border-bottom: 1px solid rgba(128,128,128,0.28); }"
+        "QFrame#pvHead { background: rgba(128,128,128,0.16);"
+        " border-right: 1px solid rgba(128,128,128,0.40);"
+        " border-bottom: 1px solid rgba(128,128,128,0.55); }"
+    )
 
     # What the two threshold boxes are for, in the operator's words. On the header and
     # on every box, because a bare "Min" over an empty field says nothing about what
@@ -12001,22 +12142,26 @@ class PvConfigDialog(QDialog):
         self._status.setWordWrap(True)
         lay.addWidget(self._status)
 
-        # The house PVs, one click each. This replaces a grid of preset TICK boxes: a
-        # tick there meant the same thing as the preset having a row below, so the two
-        # could disagree and the operator had to know which one won.
-        pre_lbl = QLabel("Presets — click to add:")
+        # The house PVs, one tick each: ticked IS in the list, so the box shows the
+        # state instead of only being a way to reach it. There is still exactly one
+        # owner of "picked" — the box reads the list back (see _sync_preset_boxes), it
+        # does not keep a second answer of its own.
+        pre_lbl = QLabel("Presets:")
         pre_lbl.setStyleSheet("font-size: 10px; color: #555;")
         lay.addWidget(pre_lbl)
-        self._preset_buttons: "dict[str, QPushButton]" = {}
+        self._preset_boxes: "dict[str, QCheckBox]" = {}
         preset_grid = QGridLayout()
         preset_grid.setHorizontalSpacing(4)
         preset_grid.setVerticalSpacing(2)
-        for i, name in enumerate(PV_CHANNEL_MAP):
-            btn = QPushButton(name)
-            btn.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 6px; }")
-            btn.clicked.connect(lambda _=False, n=name: self._add_preset(n))
-            self._preset_buttons[name] = btn
-            preset_grid.addWidget(btn, i // 4, i % 4)
+        for i, name in enumerate(self._preset_grid_names()):
+            cb = QCheckBox(name)
+            cb.setStyleSheet("QCheckBox { font-size: 10px; }")
+            # Deferred: ticking a recipe adds a formula row and rebuilds the tables,
+            # and doing that from inside the box's own signal is how this crashes.
+            cb.toggled.connect(lambda on, n=name: self._later(
+                lambda: self._on_preset_toggled(n, on)))
+            self._preset_boxes[name] = cb
+            preset_grid.addWidget(cb, i // 4, i % 4)
         for c in range(4):
             preset_grid.setColumnStretch(c, 1)
         lay.addLayout(preset_grid)
@@ -12034,21 +12179,15 @@ class PvConfigDialog(QDialog):
 
         self._title_on = self._table_title("")
         pv_lay.addWidget(self._title_on)
-        self._grid_on = QGridLayout()
-        self._grid_on.setHorizontalSpacing(4)
-        self._grid_on.setVerticalSpacing(2)
-        self._prepare_grid(self._grid_on)
-        pv_lay.addLayout(self._grid_on)
+        self._tbl_on, self._grid_on = self._make_table()
+        pv_lay.addWidget(self._tbl_on)
 
         self._title_off = self._table_title("")
         pv_lay.addWidget(self._title_off)
-        self._grid_off = QGridLayout()
-        self._grid_off.setHorizontalSpacing(4)
-        self._grid_off.setVerticalSpacing(2)
-        self._prepare_grid(self._grid_off)
-        pv_lay.addLayout(self._grid_off)
+        self._tbl_off, self._grid_off = self._make_table()
+        pv_lay.addWidget(self._tbl_off)
 
-        self._no_pv_lbl = QLabel("No PV picked yet — click a preset above, or search "
+        self._no_pv_lbl = QLabel("No PV picked yet — tick a preset above, or search "
                                  "for one.")
         self._no_pv_lbl.setStyleSheet("font-size: 10px; color: #888;")
         pv_lay.addWidget(self._no_pv_lbl)
@@ -12136,9 +12275,13 @@ class PvConfigDialog(QDialog):
             nm = rec["name"].text().strip()
             if not nm:
                 continue            # an unnamed formula is not a PV yet
+            # The stored expression stands in while the box is still empty: a row
+            # built by the dialog itself (a recipe preset) is re-lettered into its box
+            # only at the END of the rebuild, so reading the box alone printed a bare
+            # "=" in the PV column until something else redrew the table.
             out.append({"name": nm, "kind": "formula",
-                        "pv": rec["expr"].text().strip(), "rec": rec,
-                        "shown": bool(rec.get("shown", True))})
+                        "pv": rec["expr"].text().strip() or rec["canon"][0],
+                        "rec": rec, "shown": bool(rec.get("shown", True))})
         return out
 
     def selected_names(self) -> "list[str]":
@@ -12298,10 +12441,115 @@ class PvConfigDialog(QDialog):
         if hit:
             self._add_channel(hit)
 
+    # ── the preset ticks ─────────────────────────────────────────────────────
+    def _preset_grid_names(self) -> "list[str]":
+        """The presets in the order they are ticked off: the channels, with each recipe
+        directly after the PV it is computed from, so the raw and the converted energy
+        sit next to each other."""
+        out: list = []
+        for n in PV_CHANNEL_MAP:
+            out.append(n)
+            out += [r for r, rd in PV_PRESET_RECIPES.items()
+                    if rd.get("source") == n]
+        out += [r for r in PV_PRESET_RECIPES if r not in out]
+        return out
+
+    def _on_preset_toggled(self, name: str, on: bool):
+        """One tick: in the list or not. A recipe adds/removes what it is made of."""
+        if name in PV_PRESET_RECIPES:
+            if on:
+                self._add_recipe(name)
+            else:
+                self._remove_recipe(name)
+            return
+        if on:
+            self._add_preset(name)
+        elif self._preset_in.get(name):
+            self._remove_pv({"name": name, "kind": "preset", "rec": None})
+            self._status.setText(f'Removed "{name}" — it is no longer read.')
+
+    def _set_shown(self, name: str, shown: bool):
+        """Set the eye for a PV in the dialog's state AND on its live row.
+
+        The row's tick box has to move with it: every rebuild reads the boxes back
+        first (_sync_row_state), so a state change made while the old tick is still on
+        screen would be overwritten by that tick a moment later."""
+        self._shown[name] = shown
+        for row in self._rows:
+            if row["ent"]["name"] != name:
+                continue
+            try:
+                row["chk"].blockSignals(True)
+                row["chk"].setChecked(shown)
+                row["chk"].blockSignals(False)
+            except RuntimeError:
+                pass                    # the row is already gone; state is enough
+
+    def _recipe_row(self, name: str) -> "dict | None":
+        """The formula row that IS this recipe, or None when it is not in the list."""
+        for r in self._derived_rows:
+            try:
+                if r["name"].text().strip() == name:
+                    return r
+            except RuntimeError:
+                continue
+        return None
+
+    def _add_recipe(self, name: str):
+        """Tick a recipe: add its source PV, add the formula that converts it, and take
+        the source off the picture, so only the converted value is printed. Everything
+        it adds is an ordinary row — the factor is visible in the formula."""
+        rd = PV_PRESET_RECIPES[name]
+        src = str(rd.get("source") or "")
+        factor = float(rd.get("factor", 1.0))
+        self._sync_row_state()
+        if self._recipe_row(name) is not None:
+            self._status.setText(f'"{name}" is already in the list.')
+            return
+        if name in PV_CHANNEL_MAP or name in self._custom:
+            # A read PV wins over a formula of the same name, so the formula would
+            # never be evaluated — which reads as "my PV shows the wrong number".
+            self._status.setText(f'"{name}" is already a PV that is read — remove that '
+                                 'row first.')
+            self._sync_preset_boxes()
+            return
+        if src not in PV_CHANNEL_MAP:
+            self._status.setText(f'"{name}" needs the PV {src}, which does not exist.')
+            self._sync_preset_boxes()
+            return
+        self._preset_in[src] = True
+        self._set_shown(src, not rd.get("hide_source"))
+        letter = pv_letters_for(self._pending_names())[0].get(src, "A")
+        self._add_derived_row({"name": name, "expr": f"{letter}*{factor:g}",
+                               "unit": str(rd.get("unit") or ""),
+                               "bindings": {letter: src}}, shown=True)
+        self._status.setText(
+            f'Added "{name}" = {src} × {factor:g}'
+            + (f', and took {src} off the picture — only "{name}" is printed.'
+               if rd.get("hide_source") else "."))
+
+    def _remove_recipe(self, name: str):
+        """Untick a recipe: its formula goes, and the source it took off the picture
+        gets its eye back — otherwise unticking the only thing being printed would
+        leave a list with nothing on the picture at all."""
+        rd = PV_PRESET_RECIPES[name]
+        src = str(rd.get("source") or "")
+        rec = self._recipe_row(name)
+        if rec is None:
+            self._sync_preset_boxes()
+            return
+        if rd.get("hide_source") and self._preset_in.get(src):
+            self._set_shown(src, True)
+        self._remove_derived_row(rec)            # this rebuilds the tables
+        self._status.setText(
+            f'Removed "{name}".'
+            + (f' {src} is back on the picture.'
+               if rd.get("hide_source") and self._preset_in.get(src) else ""))
+
     # ── adding and removing PVs ──────────────────────────────────────────────
     def _add_preset(self, name: str):
-        """Put a house PV in the list. Already there → say so instead of doing nothing
-        visible, which reads as a dead button."""
+        """Put a house PV in the list. Already there → say so rather than doing nothing
+        visible."""
         self._sync_row_state()
         if self._preset_in.get(name):
             self._status.setText(f'"{name}" is already in the list.')
@@ -12460,8 +12708,22 @@ class PvConfigDialog(QDialog):
                           "padding: 4px 0 1px 0;")
         return lbl
 
+    def _make_table(self) -> "tuple[QFrame, QGridLayout]":
+        """An empty ruled table: the frame that draws the outer border, and the grid its
+        cells go into. Zero spacing, so the cells' own right/bottom rules meet and read
+        as one set of lines instead of a double rule per row."""
+        frame = QFrame()
+        frame.setObjectName("pvTable")
+        frame.setStyleSheet(self._TABLE_QSS)
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(0)
+        grid.setVerticalSpacing(0)
+        self._prepare_grid(grid)
+        return frame, grid
+
     def _prepare_grid(self, grid: QGridLayout):
-        """Fix the column widths and stretch so the two grids line up as one table."""
+        """Fix the column widths and stretch so the two tables line up as one."""
         widths = (self._W_SHOW, self._W_LETTER, 0, self._W_NAME,
                   self._W_UNIT, self._W_LIMIT, self._W_LIMIT,
                   self._W_KIND, self._W_DEL)
@@ -12472,15 +12734,33 @@ class PvConfigDialog(QDialog):
             # which are the one thing here that is genuinely long.
             grid.setColumnStretch(c, 1 if c == 2 else 0)
 
+    def _cell(self, grid: QGridLayout, row: int, col: int, widget,
+              head: bool = False, center: bool = False) -> QFrame:
+        """Put one control in one ruled table cell."""
+        f = QFrame()
+        f.setObjectName("pvHead" if head else "pvCell")
+        h = QHBoxLayout(f)
+        h.setContentsMargins(4, 2, 4, 2)
+        h.setSpacing(0)
+        h.addWidget(widget)
+        if center:
+            h.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        grid.addWidget(f, row, col)
+        return f
+
     def _grid_header(self, grid: QGridLayout):
+        """The column names, once, at the top of this table. Every column gets a header
+        cell — the two nameless ones (letter, ✕) carry an empty label — or the ruling
+        would break wherever a title happens to be blank."""
         for c, title in enumerate(self._COL_TITLES):
-            if not title:
-                continue
             lbl = QLabel(title)
-            lbl.setStyleSheet("font-size: 9px; font-weight: 700; color: #666;")
+            # No colour: the header must stay readable whatever palette the dialog
+            # comes up in, and bold at 9 px already reads as a header.
+            lbl.setStyleSheet("font-size: 9px; font-weight: 700;")
             if title in ("Min", "Max"):
                 lbl.setToolTip(self._LIMIT_TIP)
-            grid.addWidget(lbl, 0, c)
+            self._cell(grid, 0, c, lbl, head=True,
+                       center=title in ("Show", "Min", "Max"))
 
     def _rebuild_picked_tables(self):
         """Rebuild both tables from the picked list: shown-on-the-picture first, then
@@ -12498,30 +12778,56 @@ class PvConfigDialog(QDialog):
                     w.setParent(None)
                     w.deleteLater()
         self._rows = []
-        self._grid_header(self._grid_on)
-        self._grid_header(self._grid_off)
 
-        n_on = n_off = 0
-        for ent in self._picked_entries():
-            if ent["shown"]:
-                n_on += 1
-                self._add_table_row(self._grid_on, n_on, ent)
-            else:
-                n_off += 1
-                self._add_table_row(self._grid_off, n_off, ent)
+        # Split first, THEN build: a table with no rows gets no header either. It used
+        # to get one regardless, and with its title hidden that left a bare row of
+        # column names under the first table — reading as a second header at the bottom
+        # of the list above it.
+        ents = self._picked_entries()
+        on_ents = [e for e in ents if e["shown"]]
+        off_ents = [e for e in ents if not e["shown"]]
+        for grid, ents in ((self._grid_on, on_ents), (self._grid_off, off_ents)):
+            if not ents:
+                continue
+            self._grid_header(grid)
+            for i, ent in enumerate(ents, 1):
+                self._add_table_row(grid, i, ent)
 
+        n_on, n_off = len(on_ents), len(off_ents)
         self._title_on.setText(f"On the picture  ({n_on})")
         self._title_off.setText(f"Read, not on the picture  ({n_off})")
         self._title_on.setVisible(bool(n_on))
+        self._tbl_on.setVisible(bool(n_on))
         self._title_off.setVisible(bool(n_off))
+        self._tbl_off.setVisible(bool(n_off))
         self._no_pv_lbl.setVisible(not (n_on or n_off))
-        for name, btn in self._preset_buttons.items():
-            picked = bool(self._preset_in.get(name))
-            btn.setEnabled(not picked)
-            btn.setToolTip(f"{PV_CHANNEL_MAP[name]}\n"
-                           + ("Already in the list" if picked
-                              else "Click to add it to the list"))
+        self._sync_preset_boxes()
         self._refresh_letters()
+
+    def _sync_preset_boxes(self):
+        """Show the list back on the preset ticks. Signals are blocked while it runs —
+        this is called from the rebuild that a tick itself asks for, and letting the box
+        emit again here would toggle the preset straight back off."""
+        for name, cb in self._preset_boxes.items():
+            rd = PV_PRESET_RECIPES.get(name)
+            if rd is not None:
+                src = str(rd.get("source") or "")
+                on = self._recipe_row(name) is not None
+                tip = (f"{src} × {float(rd.get('factor', 1.0)):g}"
+                       f" — computed, not a channel of its own.\n"
+                       f"Ticking it adds {src}, adds the formula, and takes {src} off "
+                       f"the picture, so only this value is printed.\n"
+                       "Unticking removes the formula and shows "
+                       f"{src} again.")
+            else:
+                on = bool(self._preset_in.get(name))
+                tip = (f"{PV_CHANNEL_MAP[name]}\n"
+                       + ("In the list and read. Untick to remove it."
+                          if on else "Tick to add it to the list."))
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+            cb.setToolTip(tip)
 
     def _later(self, fn):
         """Run fn once the signal that asked for it has been delivered."""
@@ -12538,11 +12844,11 @@ class PvConfigDialog(QDialog):
             "image — the same eye as in the PV panel.\n"
             "Unticked: it is still read and still listed, just not on the picture.")
         chk.toggled.connect(lambda _c=False: self._later(self._rebuild_picked_tables))
-        grid.addWidget(chk, row, 0)
+        self._cell(grid, row, 0, chk, center=True)
 
         letter = QLabel("")
         letter.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a5fb4;")
-        grid.addWidget(letter, row, 1)
+        self._cell(grid, row, 1, letter, center=True)
 
         pv_lbl = QLabel()
         pv_lbl.setStyleSheet("font-size: 11px;")
@@ -12554,7 +12860,7 @@ class PvConfigDialog(QDialog):
             pv_text, Qt.TextElideMode.ElideMiddle, 210))
         pv_lbl.setToolTip(pv_text if not is_formula else
                           f"Formula: {pv_text}\nEdited in the formulas below.")
-        grid.addWidget(pv_lbl, row, 2)
+        self._cell(grid, row, 2, pv_lbl)
 
         name_edit = None
         if is_formula:
@@ -12564,14 +12870,14 @@ class PvConfigDialog(QDialog):
             shown_as.setStyleSheet("font-size: 11px; color: #333;")
             shown_as.setToolTip("A formula is already named by you — change it in the "
                                 "formula row below.")
-            grid.addWidget(shown_as, row, 3)
+            self._cell(grid, row, 3, shown_as)
         else:
             name_edit = QLineEdit(self._labels.get(name, ""))
             name_edit.setPlaceholderText(name)
             name_edit.setToolTip(
                 "Name to show in the PV panel, over the picture and on saved images.\n"
                 f"Empty = the PV's own name ({name}).")
-            grid.addWidget(name_edit, row, 3)
+            self._cell(grid, row, 3, name_edit)
 
         unit_edit = None
         if kind == "own":
@@ -12582,13 +12888,23 @@ class PvConfigDialog(QDialog):
                 "carry units, so for a PV of your own this is the only place it can "
                 "come from.\nEmpty = whatever the channel name gives away "
                 f"({pv_unit_guess(ent['pv']) or 'nothing'}).")
-            grid.addWidget(unit_edit, row, 4)
+            self._cell(grid, row, 4, unit_edit)
         else:
-            u = QLabel(pv_units_for(name) or "—")
-            u.setStyleSheet("font-size: 11px; color: #555;")
+            # A formula's unit is read off its own row, not out of PV_DERIVED: the row
+            # may have been typed a moment ago and not committed yet, and this column
+            # printing "—" for a unit that is right there below reads as lost.
+            if is_formula and ent["rec"] is not None:
+                try:
+                    u_text = ent["rec"]["unit"].text().strip()
+                except RuntimeError:
+                    u_text = ""
+            else:
+                u_text = pv_units_for(name)
+            u = QLabel(u_text or "—")
+            u.setStyleSheet("font-size: 11px;")
             u.setToolTip("From the preset table" if kind == "preset"
                          else "Typed in the formula row below")
-            grid.addWidget(u, row, 4)
+            self._cell(grid, row, 4, u)
 
         # Alarm thresholds. Every kind of PV gets them, formulas included — a formula
         # (a ratio, a difference) is exactly the sort of number somebody wants watched.
@@ -12598,7 +12914,7 @@ class PvConfigDialog(QDialog):
             e = QLineEdit("" if val is None else f"{val:g}")
             e.setPlaceholderText(ph)
             e.setToolTip(self._LIMIT_TIP)
-            e.setMaximumWidth(self._W_LIMIT)
+            e.setMaximumWidth(self._W_LIMIT - 8)      # the cell's own padding
             # A comma is accepted as the decimal mark as well as a dot — this keyboard
             # types a comma — and normalised on the way in (see _coerce_limit). Letters
             # are refused outright rather than being quietly read as "no limit".
@@ -12607,7 +12923,7 @@ class PvConfigDialog(QDialog):
                 e))
             e.editingFinished.connect(
                 lambda w=e: self._normalise_limit_box(w))
-            grid.addWidget(e, row, col)
+            self._cell(grid, row, col, e, center=True)
             lim_edits.append(e)
 
         kind_lbl = QLabel({"preset": "preset", "own": "archiver PV",
@@ -12618,17 +12934,17 @@ class PvConfigDialog(QDialog):
             "own": "An archiver PV you added by search or by name.",
             "formula": "Computed from other PVs, not read from the archiver.",
         }[kind])
-        grid.addWidget(kind_lbl, row, 7)
+        self._cell(grid, row, 7, kind_lbl)
 
         btn = QPushButton("✕")
-        btn.setFixedSize(self._W_DEL, self._W_DEL)
+        btn.setFixedSize(self._W_DEL - 8, self._W_DEL - 8)
         btn.setToolTip("Remove this PV — it stops being read at all")
         btn.setStyleSheet(
             "QPushButton { color: #cc0000; font-weight: 700; border: none; padding: 0; }"
             "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
         btn.clicked.connect(lambda _=False, e=ent: self._later(
             lambda: self._remove_pv(e)))
-        grid.addWidget(btn, row, 8)
+        self._cell(grid, row, 8, btn, center=True)
 
         self._rows.append({"ent": ent, "chk": chk, "letter": letter,
                            "name_edit": name_edit, "unit_edit": unit_edit,
@@ -13156,11 +13472,18 @@ class _TripBox(QWidget):
     clear_trips = Signal()
 
     _MAX_H = 96                      # about four rows before it scrolls
+    # Fixed, and the same 20 px as PvValueTable.ROW_H so the two lists in the left
+    # column read as one family. It has to be FIXED: the scroll area resizes its body
+    # to the viewport, and with rows free to shrink twenty trips were squeezed into
+    # 3 px each instead of the list scrolling.
+    _ROW_H = 20
 
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 2)
+        # A couple of pixels on the right: the Info panel itself has no side margin, so
+        # without this both buttons sit flush against the panel edge and read as clipped.
+        lay.setContentsMargins(0, 0, 3, 2)
         lay.setSpacing(2)
 
         head = QHBoxLayout()
@@ -13218,19 +13541,16 @@ class _TripBox(QWidget):
         order = list(reversed(trips))
         if [r[0] for r in self._rows] != order:
             self._discard_rows()
-            row_h = 0
             for t in order:
-                w = self._make_row(t)
-                # sizeHint, not the laid-out height: the rows have only just been added
-                # and have no geometry yet. A per-row CONSTANT was worse still — it was
-                # a guess at the font's line height, and it left the last row cut in half.
-                row_h = max(row_h, w.sizeHint().height())
-                self._blay.addWidget(w)
+                self._blay.addWidget(self._make_row(t))
             self._blay.addStretch(1)
             # Only as tall as it needs to be, up to the cap: two trips should not
             # reserve four rows of the panel.
-            need = (row_h + self._blay.spacing()) * len(order) + 4
-            self._area.setMaximumHeight(min(self._MAX_H, max(row_h + 4, need)))
+            # Fixed, not just capped: a QScrollArea's own size hint is small and has
+            # nothing to do with what is inside it, so with only a maximum set the box
+            # settled at one row and hid the rest behind a scrollbar for no reason.
+            step = self._ROW_H + self._blay.spacing()
+            self._area.setFixedHeight(min(self._MAX_H, step * len(order) + 4))
         for t, lbl, btn in self._rows:
             self._paint_row(t, lbl, btn)
         self.setVisible(True)
@@ -13255,6 +13575,7 @@ class _TripBox(QWidget):
 
     def _make_row(self, t: "_Trip") -> QWidget:
         row = QWidget()
+        row.setFixedHeight(self._ROW_H)
         rl = QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(4)
@@ -14056,6 +14377,29 @@ class Viewer(QWidget):
         self._cam_dot_timer.setInterval(600)
         self._cam_dot_timer.timeout.connect(self._on_cam_dot_blink)
 
+        # ── stuck-picture recovery (see _cam_stuck_tick) ──────────────────────
+        # Per camera: the _cam_shown_mono value the current run of retries belongs to,
+        # how many retries it has made, and when the next one is due. Storing the paint
+        # clock is what makes "a new picture appeared" end the retrying — including the
+        # 3.3 Hz case, where the frame being ASKED for changes three times a second
+        # while the tile is stuck on one picture.
+        self._cam_stuck_paint_mono: list[float] = []
+        self._cam_stuck_tries: list[int] = []
+        self._cam_stuck_next_mono: list[float] = []
+        # When the tile FIRST looked stuck and has looked stuck ever since. A latch, like
+        # _cam_lag_since: every test goes briefly true between a request and the read
+        # that satisfies it, which at 3.3 Hz is three times a second.
+        self._cam_stuck_since: list[float] = []
+        # Retries issued this session — the diag log's evidence that a tile was brought
+        # back, instead of only a memory that it went dark.
+        self._cam_stuck_recoveries: int = 0
+        # Its own clock, not the 600 ms dot tick: that one paints a verdict and must not
+        # be made to carry work, and this has to react inside a couple of shots.
+        self._cam_stuck_timer = QTimer(self)
+        self._cam_stuck_timer.setInterval(CAM_STUCK_TICK_MS)
+        self._cam_stuck_timer.timeout.connect(self._cam_stuck_tick)
+        self._cam_stuck_timer.start()
+
         # ── Diagnostics: periodic health snapshot ────────────────────────────
         # Writes one line/min to image_tools_diag.log (next to the exe) so the
         # slow degradation/freeze that shows up after ~2 h online can be traced
@@ -14377,9 +14721,16 @@ class Viewer(QWidget):
                         if getattr(self, "_pv_fetch_inflight", False) else -1.0)
                 _res = getattr(self, "_pv_last_result_mono", 0.0)
                 _age = (_now - _res) if _res else -1.0
+                # trips=<in the list>/<still happening>, and how many PVs are over
+                # their limit on the frame on screen. Each trip also writes its own
+                # line when it opens (diag_note); this is what says whether one was
+                # still standing an hour later.
                 pv_txt = (f"pvN={len(self._pv_enabled)} pvFetch={_inf:6.1f}s "
                           f"pvLastVal={_age:6.1f}s pvWait={len(self._pv_awaiting)} "
-                          f"pvStall={self._pv_stall_recoveries} ")
+                          f"pvStall={self._pv_stall_recoveries} "
+                          f"trips={len(self._trips)}/"
+                          f"{sum(1 for _t in self._trips if _t.open)} "
+                          f"pvOver={len(self._pv_alarm_names)} ")
             except Exception:
                 pass
             line = (f"{datetime.now():%Y-%m-%d %H:%M:%S} up={up:6.1f}m " + paints +
@@ -14390,6 +14741,7 @@ class Viewer(QWidget):
                     f"watch={n_watch}/{n_walive} saved={n_saved} gcObj={n_gc:8d} "
                     f"qpix={n_pix:6d} qimg={n_img:6d} axisH={axis_h:5.1f} "
                     f"online={int(bool(getattr(self, '_online_mode', False)))} "
+                    f"stuck={getattr(self, '_cam_stuck_recoveries', 0)} "
                     + pv_txt + cpva_txt + "\n")
             base = (Path(_sys.executable).resolve().parent
                     if getattr(_sys, "frozen", False)
@@ -14457,7 +14809,12 @@ class Viewer(QWidget):
         # or removed channel cannot resurrect from an old state file.
         _saved_pv = self._ui_state.get("pv_enabled")
         if isinstance(_saved_pv, list):
-            _saved_pv = {str(n) for n in _saved_pv}
+            # A recipe preset saved by an older version (the "Compressed SBW4"
+            # channel) becomes its source PV plus the formula that converts it, so
+            # this runs BEFORE the filter — the recipe name is not a channel any more
+            # and pv_all_names() would drop it before it could be converted.
+            _saved_pv = set(pv_migrate_preset_recipes(
+                [str(n) for n in _saved_pv], self._pv_hidden))
             self._pv_enabled = [n for n in pv_all_names() if n in _saved_pv]
 
         # How an out-of-limits value flashes. Restored here rather than in the settings
@@ -15350,6 +15707,9 @@ class Viewer(QWidget):
         rlay.setSpacing(4)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
+        # Navigation, not a setting: the wheel steps through shots without having
+        # to click the track first (see install_wheel_guard).
+        self.slider.setProperty("wheelAlways", True)
         self.slider.setEnabled(False)
         self.slider.setMinimum(0); self.slider.setMaximum(SLIDER_MAX)
         self.slider.valueChanged.connect(self._on_slider_changed)
@@ -16584,7 +16944,8 @@ class Viewer(QWidget):
 
     # ─────────────────────────────────── trips (limits, failed reads) ──────────
     def _trip_add(self, kind: str, key: str, ts_ns: "int | None",
-                  text: str, detail: str = "") -> "_Trip | None":
+                  text: str, detail: str = "",
+                  count: int = 1) -> "_Trip | None":
         """Open a trip, or count one more shot onto the one already open for `key`.
 
         Coalescing is HERE and not in the caller: both callers run per shot (a PV fetch,
@@ -16597,6 +16958,7 @@ class Viewer(QWidget):
             self._trip_refresh_ui()
             return cur
         t = _Trip(kind, key, int(ts_ns or 0), text, detail)
+        t.count = max(1, int(count))
         self._trips.append(t)
         openmap[key] = t
         if len(self._trips) > TRIPS_MAX:
@@ -16629,6 +16991,23 @@ class Viewer(QWidget):
         self._trips = []
         self._pv_over = {}
         self._cam_fault_trip = {}
+        self._trip_refresh_ui()
+
+    def _end_live_trips(self):
+        """Live mode has stopped: nothing is being watched any more.
+
+        Closes every open trip and stops the value flashing, while leaving the LINES in
+        the list — the operator's whole reason for them is to go back and look, and
+        going back to look is what takes the program out of live mode. The whole-panel
+        flash is deliberately NOT stopped here: it says "a trip has not been looked at"
+        and that outlives the live run (it ends at Clear trips, or once every trip has
+        been seen)."""
+        for _m in (self._pv_over, self._cam_fault_trip):
+            for _t in list(_m.values()):
+                self._trip_close(_t)
+            _m.clear()
+        self._pv_alarm_names = set()
+        self._pv_err_since = {}
         self._trip_refresh_ui()
 
     def _trips_unseen(self) -> bool:
@@ -16765,7 +17144,23 @@ class Viewer(QWidget):
         to date. Runs on the GUI thread, once per completed fetch.
 
         `texts` is the fetch's RAW result strings, before the last-good substitution —
-        the only place a PV that could not be read at all still says so."""
+        the only place a PV that could not be read at all still says so.
+
+        LIVE MODE ONLY. This watches the shots as they arrive; it is not a search of
+        the archive, and browsing is not shooting. Scrubbing a day would otherwise
+        raise a trip for every frame the slider happened to land on, dated by when the
+        operator dragged past it — and it still would not answer "was BR ever over 0.3
+        today", because only the frames actually looked at are ever read. Answering
+        that would be a different feature: a sweep of the day's samples, not a check of
+        the frame on screen."""
+        if not getattr(self, "_online_mode", False):
+            # Leaving live mode stops the flashing at once. The TRIPS stay — they are
+            # the record of what happened while it was live, and going to look at one
+            # is exactly what takes you out of live mode.
+            if self._pv_alarm_names:
+                self._pv_alarm_names = set()
+                self._alarm_sync_timer()
+            return
         self._pv_check_read_errors(texts or {})
         alarm: set = set()
         for name in self._pv_enabled:
@@ -17807,7 +18202,258 @@ class Viewer(QWidget):
                 continue
             for r in hung:
                 d.pop(r, None)
+            # Relaunches only if the camera still WANTS something. A hung load whose
+            # _cam_want was already consumed leaves nothing to relaunch, and that tile
+            # is then stuck on its old picture — _cam_stuck_tick is what asks again.
             self._start_cam_load(i)
+
+    # ---- getting a stuck picture back --------------------------------------------
+    def _cam_stuck_slot(self, cam_i: int):
+        while len(self._cam_stuck_paint_mono) <= cam_i:
+            self._cam_stuck_paint_mono.append(0.0)
+            self._cam_stuck_tries.append(0)
+            self._cam_stuck_next_mono.append(0.0)
+            self._cam_stuck_since.append(0.0)
+
+    def _cam_stuck_clear(self, cam_i: int):
+        """Stop retrying for this camera. Called the moment it is no longer stuck, so
+        the next time it is, both the latch and the backoff start from the beginning."""
+        if cam_i < 0:
+            return
+        self._cam_stuck_slot(cam_i)
+        self._cam_stuck_paint_mono[cam_i] = 0.0
+        self._cam_stuck_tries[cam_i] = 0
+        self._cam_stuck_next_mono[cam_i] = 0.0
+        self._cam_stuck_since[cam_i] = 0.0
+
+    def _cam_stuck_tick(self):
+        """Ask again for the picture of every tile that is stuck on an old frame.
+
+        This is the retry the pipeline never had: every other path fires on an EVENT (a
+        frame arrived, the slider moved, a setting changed), so a frame that fails to
+        decode — or a read that hangs and is written off with nothing left to relaunch —
+        leaves the tile showing an old picture with a red timestamp label and NOBODY
+        asking again. See the note at CAM_STUCK_RETRY_AFTER_S.
+
+        It stops itself on the one thing that means the pipeline is working: a new
+        picture on the tile. Both stop conditions matter at 3.3 Hz —
+          * the tile catches up           → _cam_stuck_reason goes empty → cleared;
+          * a genuinely new shot is shown → _cam_shown_mono moved → the run of retries
+                                            ends and the backoff starts over,
+        and neither is confused by the frame being REQUESTED changing three times a
+        second, which is why none of this is keyed on the request."""
+        try:
+            if not self._is_multi_cam():
+                self._cam_stuck_tick_single()
+                return
+            if self._multi_grid is None or not self._cam_items:
+                return
+            # The user is driving: every move issues its own request and the tiles are
+            # meant to trail. Same exemption playback and _live_health get.
+            if self._navigating():
+                return
+            # The burst when live mode starts (every tile decoded at native size at once)
+            # says nothing about steady state — the same grace _live_health uses.
+            if (self._online_mode and self._live_start_mono
+                    and (time.monotonic() - self._live_start_mono) < LIVE_START_GRACE_S):
+                return
+            now = time.monotonic()
+            for i in range(min(self._multi_grid.cam_count(), len(self._cam_items))):
+                self._cam_stuck_retry_one(i, now)
+        except Exception:
+            pass
+
+    def _cam_stuck_gated_slave(self, cam_i: int) -> bool:
+        """True when this tile is a slave being held to the master's clock. Same test
+        _live_health uses for its own exemption — a slave is judged against the MASTER's
+        moment, never against its own newest frame."""
+        master = getattr(self, "_per_cam_master_idx", -1)
+        return bool(master >= 0 and cam_i != master and self._per_cam_rows)
+
+    def _cam_stuck_want_ts(self, cam_i: int) -> int:
+        """The moment this tile SHOULD be showing right now; 0 when there is nothing to
+        ask for. The one place the three regimes are named:
+
+          live + follow, master-gated slave → _live_slave_target against the picture on
+                    the MASTER's tile: the very resolver the arrival path uses, so a
+                    slave deliberately holding its own newer frames back is never
+                    mistaken for a stuck one. None from it means "nothing to do" — a
+                    camera that really stopped writing keeps its last picture.
+          live + follow, otherwise          → this camera's newest frame, which is
+                    exactly what _live_advance_cam aims at.
+          anything else (browsing, parked)  → the frame the tile was last ASKED for."""
+        if self._online_mode and self._auto_follow:
+            if self._cam_stuck_gated_slave(cam_i):
+                master = self._per_cam_master_idx
+                master_ts = _at(self._cam_shown_ts_ns, master, 0)
+                if not master_ts:
+                    return 0
+                return self._live_slave_target(cam_i, master_ts) or 0
+            cam_ts = _at(self._cam_ts, cam_i, None)
+            return cam_ts[-1] if cam_ts else 0
+        return _at(self._cam_target_ts_ns, cam_i, 0)
+
+    def _cam_stuck_reason(self, cam_i: int, now: float) -> str:
+        """Why this tile counts as stuck, "" if it does not.
+
+        "behind"  live with follow on: the picture it should be showing is not the one it
+                  is showing (_cam_behind_arrival against the resolved moment — the dot's
+                  own test, so the retry and the red dot can never disagree). The read-
+                  failure half of that test is what catches the 3.3 Hz case: one
+                  undecodable frame leaves the tile just 0.3 s behind, well inside the
+                  paint tolerance, so nothing about the timestamp label is even red — and
+                  the picture is still wrong.
+        "stale"   browsing: the tile is not showing the frame it was ASKED for (the red
+                  timestamp label). No arrival to compare against here — this is a
+                  scrubbed frame whose load failed or hung and which nothing ever asked
+                  for again."""
+        # A camera whose FOLDER is the problem is never helped by re-reading a file, and
+        # re-reading is actively harmful there: an unreachable share BLOCKS for ~45 s per
+        # read, so twelve cameras retrying every 5 s would drain the whole tile pool into
+        # dead sockets. That fault is the dot's to report ("folder" / "poll"), not this
+        # one's to fix.
+        if _at(self._cam_folder_err, cam_i, None):
+            return ""
+        if self._poll_hung_age(cam_i, now) >= CAM_POLL_HUNG_S:
+            return ""
+        if not _at(self._cam_shown_ts_ns, cam_i, 0):
+            return ""            # nothing has ever been shown here — not stuck yet
+        if self._online_mode and self._auto_follow:
+            want = self._cam_stuck_want_ts(cam_i)
+            return "behind" if (want and self._cam_behind_arrival(cam_i, want)) else ""
+        return "stale" if self._cam_is_stale(cam_i) else ""
+
+    def _cam_stuck_retry_one(self, cam_i: int, now: float):
+        """One tile's turn of _cam_stuck_tick."""
+        self._cam_stuck_slot(cam_i)
+        reason = self._cam_stuck_reason(cam_i, now)
+        if not reason:
+            self._cam_stuck_clear(cam_i)
+            return
+        # Latch: the condition has to HOLD, not merely be observed once. Every regime's
+        # test goes briefly true between a request and the read that satisfies it, and at
+        # 3.3 Hz that happens three times a second.
+        if not self._cam_stuck_since[cam_i]:
+            self._cam_stuck_since[cam_i] = now
+        if (now - self._cam_stuck_since[cam_i]) < CAM_STUCK_RETRY_AFTER_S:
+            return
+        painted = _at(self._cam_shown_mono, cam_i, 0.0)
+        if painted != self._cam_stuck_paint_mono[cam_i]:
+            # A NEW picture has landed since the last retry — a real new shot got
+            # through. The tile may be behind again already (the newest arrival is newer
+            # still), but this is a working pipeline, so start the backoff over rather
+            # than carry a long one into it.
+            self._cam_stuck_paint_mono[cam_i] = painted
+            self._cam_stuck_tries[cam_i] = 0
+            self._cam_stuck_next_mono[cam_i] = 0.0
+        if now < self._cam_stuck_next_mono[cam_i]:
+            return
+        want = self._cam_stuck_want_ts(cam_i)
+        if not want:
+            return
+        # Release whatever is holding this camera's in-flight slots. A retry that cannot
+        # start is not a retry: _start_cam_load refuses over _cam_inflight_depth(), and a
+        # read still running while the tile has been provably behind for seconds is not
+        # the one that is going to save it.
+        d = (self._cam_inflight_at[cam_i]
+             if cam_i < len(getattr(self, "_cam_inflight_at", [])) else None)
+        if d:
+            for rid in [r for r, t in d.items() if (now - t) >= CAM_STUCK_INFLIGHT_S]:
+                d.pop(rid, None)
+        self._cam_stuck_tries[cam_i] += 1
+        tries = self._cam_stuck_tries[cam_i]
+        self._cam_stuck_next_mono[cam_i] = now + min(
+            CAM_STUCK_RETRY_MAX_S, CAM_STUCK_RETRY_MIN_S * 2 ** (tries - 1))
+        self._cam_stuck_recoveries += 1
+        # Re-drive the EXACT path an arrival would have taken, so nothing about the grid
+        # is special-cased for a retry:
+        #   * a gated slave through _live_sync_one_slave — its own tile, at the master's
+        #     moment;
+        #   * a master (or an independent camera) through _live_advance_cam, which also
+        #     brings the slaves to the moment it just recovered. Without that, a master
+        #     that came back left the rest of the grid a shot behind it, showing a
+        #     different time from the picture the operator is reading;
+        #   * browsing straight through _per_cam_display_one, the ordinary request.
+        if reason == "behind" and self._cam_stuck_gated_slave(cam_i):
+            self._live_sync_one_slave(cam_i)
+        elif reason == "behind":
+            self._live_advance_cam(cam_i, want, True)
+        else:
+            self._per_cam_display_one(cam_i, want)
+        # First try and then every tenth, or a camera whose source has gone for the
+        # afternoon would write a line every 5 s for the rest of the shift.
+        if tries == 1 or tries % 10 == 0:
+            name = _strip_cam_name(_at(getattr(self, "_cam_names", []), cam_i, "")) \
+                   or f"cam{cam_i}"
+            shown = _at(self._cam_shown_ts_ns, cam_i, 0)
+            diag_note(f"STUCK retry cam{cam_i} ({name}) {reason} try={tries} "
+                      f"want={fmt_hhmmss_ms_from_ns(want)} "
+                      f"shown={fmt_hhmmss_ms_from_ns(shown)} "
+                      f"off={(want - shown) / 1e9:+.1f}s "
+                      f"fails={_at(self._cam_read_fail, cam_i, 0)}")
+
+    def _cam_stuck_tick_single(self):
+        """The same retry for the single-camera view, where the evidence is different.
+
+        Single-cam records no per-tile target (_cam_note_target is a multi-cam path) and
+        has no timestamp label to redden, so the only evidence here is the "behind"
+        branch, through the same predicate the red Info-panel dot uses. Live mode with
+        follow on only — a picture parked on an old frame on purpose is not stuck."""
+        self._cam_stuck_slot(0)
+        if not (getattr(self, "_online_mode", False)
+                and getattr(self, "_auto_follow", False)) or self._navigating():
+            self._cam_stuck_clear(0)
+            return
+        if (self._live_start_mono
+                and (time.monotonic() - self._live_start_mono) < LIVE_START_GRACE_S):
+            return
+        if not self.items:
+            return
+        now = time.monotonic()
+        # Same exclusion as _cam_stuck_reason: a folder that cannot be listed, or a
+        # listing that never comes back, is not fixed by re-reading a file — and an
+        # unreachable share blocks ~45 s per read.
+        if (_at(self._cam_folder_err, 0, None)
+                or self._poll_hung_age(0, now) >= CAM_POLL_HUNG_S):
+            self._cam_stuck_clear(0)
+            return
+        shown   = _at(self._cam_shown_ts_ns, 0, 0)
+        arrived = _at(self._cam_arrived_ts_ns, 0, 0)
+        if not (shown and self._cam_behind_arrival(0)):
+            self._cam_stuck_clear(0)
+            return
+        if not self._cam_stuck_since[0]:
+            self._cam_stuck_since[0] = now
+        if (now - self._cam_stuck_since[0]) < CAM_STUCK_RETRY_AFTER_S:
+            return
+        painted = _at(self._cam_shown_mono, 0, 0.0)
+        if painted != self._cam_stuck_paint_mono[0]:
+            self._cam_stuck_paint_mono[0] = painted
+            self._cam_stuck_tries[0] = 0
+            self._cam_stuck_next_mono[0] = 0.0
+        if now < self._cam_stuck_next_mono[0]:
+            return
+        self._cam_stuck_tries[0] += 1
+        tries = self._cam_stuck_tries[0]
+        self._cam_stuck_next_mono[0] = now + min(
+            CAM_STUCK_RETRY_MAX_S, CAM_STUCK_RETRY_MIN_S * 2 ** (tries - 1))
+        self._cam_stuck_recoveries += 1
+        # Exactly what an arrival does in live mode (see the tail of _online_apply_new):
+        # drop the backlog, then display the newest frame. _display_load_key must go
+        # too — a load that never finished leaves it set, and _request_display_target
+        # then defers every later request instead of starting one.
+        last = len(self.items) - 1
+        self.load_pool.clear()
+        self._inflight.clear()
+        self._want_display_req.clear()
+        self._display_load_key = None
+        self._display_exact_index(last, self.items[last].ts_ns, update_slider=True)
+        if tries == 1 or tries % 10 == 0:
+            diag_note(f"STUCK retry single try={tries} "
+                      f"want={fmt_hhmmss_ms_from_ns(self.items[last].ts_ns)} "
+                      f"shown={fmt_hhmmss_ms_from_ns(shown)} "
+                      f"behind={(arrived - shown) / 1e9:.1f}s "
+                      f"fails={_at(self._cam_read_fail, 0, 0)}")
 
     def _per_cam_slave_targets(self, master_cam: int, master_ts_ns: int) -> list:
         """[(cam_idx, ts_ns)] for every slave that has a frame near enough to the master's
@@ -18049,6 +18695,12 @@ class Viewer(QWidget):
         self._cam_read_fail_ts   = [0] * n
         self._cam_folder_err     = [None] * n
         self._cam_folder_err_since = [0.0] * n
+        # Stuck-picture retries (see _cam_stuck_tick) — keyed by slot like the rest, so a
+        # leftover backoff must not be inherited by whoever takes that slot next.
+        self._cam_stuck_paint_mono = [0.0] * n
+        self._cam_stuck_tries      = [0] * n
+        self._cam_stuck_next_mono  = [0.0] * n
+        self._cam_stuck_since      = [0.0] * n
         # Last time the expensive full os.listdir scan ran per camera (throttled
         # when a dir-watcher is active — see _online_poll_multi).
         self._cam_last_full_poll_ts = [0.0] * n
@@ -18462,6 +19114,12 @@ class Viewer(QWidget):
         self._cam_read_fail_ts   = [0] * n
         self._cam_folder_err = [None] * n
         self._cam_folder_err_since = [0.0] * n
+        # A run of stuck-picture retries from the previous session must not be inherited
+        # either — it would start the new one already deep in the backoff.
+        self._cam_stuck_paint_mono = [0.0] * n
+        self._cam_stuck_tries      = [0] * n
+        self._cam_stuck_next_mono  = [0.0] * n
+        self._cam_stuck_since      = [0.0] * n
         if self._is_multi_cam():
             self._cam_arrived_ts_ns = [
                 (ts[-1] if ts else 0) for ts in (self._cam_ts or [])]
@@ -18498,6 +19156,11 @@ class Viewer(QWidget):
         # The dot tick is what re-judges the timestamp labels, and it has just stopped —
         # without this the labels keep whatever colour the last live tick gave them.
         self._cam_refresh_stale_marks()
+        # Trips belong to a live run (see _pv_check_limits). Stop the flashing, and
+        # close whatever was still going: the trip LINES stay — they are the record —
+        # but an entry left open would have the next live run counting its shots onto a
+        # trip dated in the previous one.
+        self._end_live_trips()
 
     # ---------------- restoring what the live cap trimmed ----------------
     @staticmethod
@@ -18656,6 +19319,49 @@ class Viewer(QWidget):
         self._proxy_kick()
 
     # ---- the ONE verdict about live health ----------------------------------------
+    def _cam_behind_arrival(self, cam_i: int, want_ts: int = 0) -> bool:
+        """A frame that we KNOW exists and SHOULD be on this tile is not on it. Says
+        nothing about whether that is a fault — the caller decides.
+
+        ONE predicate for both the red dot (_live_health) and the retry that fetches the
+        missing picture (_cam_stuck_tick). Two copies would drift, and the dot would then
+        report a fault the retry never acted on, or the reverse.
+
+        `want_ts` is the moment the tile should be showing; the default (0) is this
+        camera's newest arrival, which is what the dot asks about. The retry passes the
+        moment it resolved instead — for a master-gated slave that is the MASTER's
+        moment, never the slave's own newest frame, which it is holding back by design.
+
+        LIVE_PAINT_TOL_NS — the SAME 1.5 s the paint path accepts (_cam_note_painted).
+        While following live a tile trails the newest arrival by one read BY DESIGN, and
+        calling that a fault is what would make a healthy 33 Hz camera red. It cannot
+        trail by more than one read, because _cam_want only ever holds the LATEST wanted
+        frame. Sharing one number with the timestamp label is also what keeps the two
+        from contradicting each other — see _cam_refresh_stale_marks.
+
+        Repeated read FAILURES bypass that tolerance, because they are not a timing
+        question: they are positive evidence that a file we know exists cannot be
+        decoded. Without this the single most literal form of the fault went unnoticed —
+        at 3.3 Hz one undecodable frame sits only 0.3 s ahead of the one on screen, i.e.
+        inside the catch-up tolerance, so a source that stopped right after writing a
+        corrupt frame read as perfectly healthy (measured in testing/bench_live_dot.py
+        case 3). It is also why the retry cannot be driven off the red timestamp label
+        alone: in that case the label is not red, and the picture is still wrong.
+
+        A frame caught mid-write still cannot flash the dot: it needs
+        CAM_READ_FAIL_RED_N consecutive failures AND then to stay unreadable for the
+        whole CAM_UNDISPLAYED_RED_S latch, and the first successful decode clears the
+        counter through _note_cam_read_ok."""
+        want  = want_ts or _at(self._cam_arrived_ts_ns, cam_i, 0)
+        shown = _at(self._cam_shown_ts_ns, cam_i, 0)
+        fails = _at(self._cam_read_fail,   cam_i, 0)
+        # abs(), not want - shown: a resolved slave moment can legitimately sit BEFORE
+        # the picture on the tile, and "wrong by 4 s in the other direction" is just as
+        # wrong. With the default want (the newest arrival) it can never be negative, so
+        # the dot's verdict is unchanged.
+        return bool(want and (abs(want - shown) > LIVE_PAINT_TOL_NS
+                              or (fails >= CAM_READ_FAIL_RED_N and want != shown)))
+
     def _live_health(self, cam_i: int, now: float) -> "tuple[str, str, str]":
         """(state, tooltip, reason) for one camera in live mode.
         state is "active" (updating), "idle" (quiet but healthy) or "fault" (red).
@@ -18712,26 +19418,7 @@ class Viewer(QWidget):
         arrived = _at(self._cam_arrived_ts_ns, cam_i, 0)
         shown   = _at(self._cam_shown_ts_ns,   cam_i, 0)
         fails = _at(self._cam_read_fail, cam_i, 0)
-        # LIVE_PAINT_TOL_NS — the SAME 1.5 s the paint path accepts (_cam_note_painted).
-        # While following live a tile trails the newest arrival by one read BY DESIGN,
-        # and calling that a fault is what would make a healthy 33 Hz camera red. It
-        # cannot trail by more than one read, because _cam_want only ever holds the
-        # LATEST wanted frame. Sharing one number with the timestamp label is also what
-        # keeps the two from contradicting each other — see _cam_refresh_stale_marks.
-        #
-        # Repeated read FAILURES bypass that tolerance, because they are not a timing
-        # question: they are positive evidence that a file we know exists cannot be
-        # decoded. Without this the single most literal form of the fault went unnoticed
-        # — at 3.3 Hz one undecodable frame sits only 0.3 s ahead of the one on screen,
-        # i.e. inside the catch-up tolerance, so a source that stopped right after
-        # writing a corrupt frame read as perfectly healthy (measured in
-        # testing/bench_live_dot.py case 3). A frame caught mid-write still cannot flash
-        # the dot:
-        # it needs CAM_READ_FAIL_RED_N consecutive failures AND then to stay unreadable
-        # for the whole CAM_UNDISPLAYED_RED_S latch, and the first successful decode
-        # clears the counter through _note_cam_read_ok.
-        behind = bool(arrived and (arrived - shown > LIVE_PAINT_TOL_NS
-                                   or (fails >= CAM_READ_FAIL_RED_N and arrived > shown)))
+        behind = self._cam_behind_arrival(cam_i)
         # A slave in master mode is parked on the master's moment ON PURPOSE
         # (_live_advance_cam), so its own newer frames are not on screen by design. Same
         # class of exemption as auto-follow off below — the pipeline is not wedged, it is
@@ -20067,6 +20754,83 @@ class Viewer(QWidget):
         # (always the case here on a first launch) — a second timer would stack a
         # duplicate dialog on top of it.
         self.open_by_date()
+
+    # A moment pushed in from One Moment brings its own window: this much on each
+    # side of it, so the shots around the interesting one can be scrubbed without
+    # scanning a whole day of every camera.
+    PUSHED_MOMENT_PAD_MIN = 15
+
+    def open_moment(self, ts_ns: int, cam_names: "list[str]",
+                    pad_minutes: "int | None" = None) -> bool:
+        """Public handoff: show THIS moment with THESE cameras ("One Moment → Send
+        to Image Slider").
+
+        The other tab has already found the shot; the Slider is where it gets looked
+        at properly. A window of ±`pad_minutes` around the moment is picked — clamped
+        to the moment's own Prague day, because one picked day is one segment here —
+        and the scan lands on the frame NEAREST `ts_ns` instead of on the start of
+        that window (`_pending_restore_ts_ns`, the same hint the camera picker uses).
+
+        Everything the Slider might have been doing before is put down first, for the
+        same reasons receive_external_folder lists: live mode would drag the view to
+        the newest frame, and focus/watcher mode would hide the slider itself.
+
+        Returns False only when no camera was given — a window with no camera loads
+        nothing at all.
+        """
+        cams = [c for c in (cam_names or []) if c]
+        if not cams:
+            return False
+        ts_ns = int(ts_ns)
+        pad = int(self.PUSHED_MOMENT_PAD_MIN if pad_minutes is None else pad_minutes)
+
+        if getattr(self, "_focus_mode", False):
+            self._toggle_focus_mode()
+        if getattr(self, "_watcher_mode", False):
+            self._toggle_watcher_mode()
+        self._pending_online_mode = False
+        try:
+            self._stop_online_mode()
+        except Exception:
+            pass
+        self.cancel_scan()
+
+        dt = _dt_from_ns(ts_ns)
+        day = dt.date()
+        centre_min = dt.hour * 60 + dt.minute
+        lo = max(0, centre_min - pad)
+        # +1 because the "to" time is the EXCLUSIVE end of the window (seg_bounds_ns).
+        hi = min(24 * 60, centre_min + pad + 1)
+        hour_from, min_from = divmod(lo, 60)
+        hour_to, min_to = divmod(hi, 60)
+        if (hour_to, min_to) == (24, 0):
+            # A QTimeEdit cannot show 24:00; 23:59 is the way "to midnight" is
+            # spelled everywhere here, and seg_bounds_ns stretches it back out.
+            hour_to, min_to = 23, 59
+
+        self.last_pick_cam_names = cams
+        self.last_pick_date = day
+        self.last_pick_hour_from = hour_from
+        self.last_pick_min_from = min_from
+        self.last_pick_hour_to = hour_to
+        self.last_pick_min_to = min_to
+        self._last_pick_segments = None
+        self._last_pick_extra_dates = None
+        windows = [seg_bounds_ns(PickSeg(day, hour_from, min_from, hour_to, min_to))]
+        self._last_pick_windows = list(windows)
+        self._ts_windows = windows
+        self.last_pick_axis_override = (windows[0][0], windows[0][1])
+        self._land_at_window_start = False
+        self._pending_restore_ts_ns = ts_ns
+        # The camera picker is never opened on this path, and a preload from an
+        # earlier window must not be offered as this one's camera set.
+        self._preloaded_cameras = []
+        self._cameras_loaded = True
+        self._set_range_display(None, hour_from, hour_to, min_from, min_to)
+        # Queued, not called: the caller is a button in another tab and is about to
+        # switch to this one — the scan starts after that has happened.
+        QTimer.singleShot(0, self._reload_with_last_cameras)
+        return True
 
     def open_folder_path(self, folder: Path):
         if not folder or not folder.exists() or not folder.is_dir():
@@ -23669,7 +24433,16 @@ class Viewer(QWidget):
         from by the next tick.
 
         This runs every 600 ms, so nothing here may open a second entry while the same
-        fault is still going — that is what the open-trip map is for."""
+        fault is still going — that is what the open-trip map is for.
+
+        LIVE MODE ONLY, like the PV limits (see _pv_check_limits). "Not refreshing" is
+        not a fault when nothing is supposed to be refreshing: outside live mode the
+        poll timer is stopped, so _live_health's own stall test would call every camera
+        faulted the moment the operator started browsing. Both blink timers are stopped
+        with live mode too, so nothing normally reaches here — this is the one place
+        the rule is stated rather than four call sites that must each remember it."""
+        if not getattr(self, "_online_mode", False):
+            return
         key = f"cam{cam_i}"
         if state != "fault":
             self._trip_close(self._cam_fault_trip.pop(key, None))
@@ -23687,10 +24460,13 @@ class Viewer(QWidget):
             name = _strip_cam_name(self._cam_names[cam_i])
         else:
             name = f"camera {cam_i + 1}"
-        # The tooltip's first line is already the fault in the operator's words; the
-        # panel is 275 px wide, so only that line goes in the row.
-        head = (tip or "not refreshing").split("\n")[0]
-        head = head.replace("NOT REFRESHING: ", "")
+        # A SHORT phrase per fault, not the tooltip's first line. That line carries the
+        # filename and the seconds, which is what the operator wants once they are
+        # reading the tooltip — in a 275 px row it elided to "a new image arrived
+        # but…", i.e. the half that says nothing. The whole line is the tooltip (detail).
+        head = _CAM_FAULT_SHORT.get(
+            reason, (tip or "not refreshing").split("\n")[0]
+            .replace("NOT REFRESHING: ", ""))
         cur = self._cam_fault_trip.get(key)
         if cur is not None and cur.open:
             # Read failures have a real count (frames that would not decode). The other
@@ -23705,9 +24481,9 @@ class Viewer(QWidget):
                     cur.count = n
                     self._trip_refresh_ui()
             return
-        t = self._trip_add("image", key, ts, f"{name} — {head}", detail=tip or "")
-        if t is not None and reason == "read":
-            t.count = max(1, _at(self._cam_read_fail, cam_i, 1) or 1)
+        self._trip_add("image", key, ts, f"{name} — {head}", detail=tip or "",
+                       count=(_at(self._cam_read_fail, cam_i, 1) or 1
+                              if reason == "read" else 1))
 
     def _on_cam_dot_blink(self):
         """Per-camera refresh dots, every 600 ms.
@@ -25945,6 +26721,67 @@ class Viewer(QWidget):
             f"From: {fmt_prague_full_from_ns(a)}\nTo: {fmt_prague_full_from_ns(b)}")
 
 
+# ── WHEEL GUARD ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so the settings panel still
+    scrolls when the pointer happens to pass over the Subtraction threshold on
+    the way down. A control meant to take the wheel at any time carries the
+    "wheelAlways" property — the frame sliders set it, because stepping through
+    shots with the wheel is the whole point of them.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `_import_img_scale` is copied into each tab).
+    """
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
+
+
 # ================================================================== MAIN
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -25952,6 +26789,7 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     app = QApplication([])
+    install_wheel_guard(app)
     app.setStyle("Fusion")
     app.setStyleSheet("""
     QWidget  { background: #f3f3f3; color: #111; }

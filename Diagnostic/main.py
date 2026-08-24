@@ -346,24 +346,60 @@ def _icon_file() -> Path | None:
     return None
 
 
+def _icon_app_id(prefix: str, ico_path) -> str | None:
+    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it: an id that was once seen without a usable icon keeps drawing the
+    generic placeholder forever, whatever icon the window later carries. That
+    is what happened to the fixed string "ELI.Diagnostic", and clearing the
+    shell icon cache would have to be repeated on every PC.
+
+    Hashing the icon's own bytes into the id was the first fix, but a
+    content-only id can be poisoned just as well and then never recovers
+    until the picture itself is redrawn (measured 2026-08-24: exe icon, title
+    bar and window icon all correct, yet the taskbar drew the placeholder for
+    the derived id while a fresh id drew the icon). So the running build's own
+    file name - which carries the version - goes into the hash too: every
+    rebuild runs under an id Windows has never seen, so it cannot be serving a
+    stale picture for it, on this PC or any other.
+
+    Returns None when the icon cannot be read; the caller then sets no id at
+    all rather than burning an id on a run that has no picture to give it.
+    The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    if getattr(sys, "frozen", False):
+        build = Path(sys.executable).name
+    else:
+        build = Path(sys.argv[0] or __file__).name
+    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
+    return f"{prefix}.{tag.hexdigest()[:12]}"
+
+
 def main():
     _acquire_lock()
     atexit.register(_release_lock)
 
     # Give the taskbar button its own identity instead of grouping under the
-    # generic host process, and hand it our icon.
-    #
-    # Windows caches the taskbar icon per AppUserModelID. "ELI.Diagnostic" was
-    # in use while the app had no icon.ico, so that id is stuck on the generic
-    # placeholder no matter what icon the window carries (measured 2026-08-24:
-    # identical probe, only the id changed → old id generic, fresh id correct).
-    # Clearing the icon cache would have to be repeated on every PC, so the fix
-    # is to bump the id string instead. Bump it again if this ever recurs.
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Diagnostic.2")
-    except Exception:
-        pass
+    # generic host process, and hand it our icon. Must happen before the first
+    # window exists, so the icon is resolved here rather than further down.
+    # See _icon_app_id() for why the id is not a fixed string.
+    _ico = _icon_file()
+    _aumid = _icon_app_id("ELI.Diagnostic", _ico)
+    if _aumid:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+        except Exception:
+            pass
 
     app = QApplication(sys.argv)
     # Every background job in the app (PV polls, graph backfill, Webex polls,
@@ -377,7 +413,6 @@ def main():
     from PySide6.QtCore import QThreadPool
     QThreadPool.globalInstance().setMaxThreadCount(
         max(32, QThreadPool.globalInstance().maxThreadCount()))
-    _ico = _icon_file()
     if _ico:
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(str(_ico)))

@@ -6818,13 +6818,60 @@ class PulserMonitorWidget(QWidget):
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
-def main():
+def _icon_file():
+    """The icon sits next to the exe. In a frozen build __file__ points into
+    the bundle, not the exe folder, so searching only there silently finds
+    nothing and the app ends up with the generic Windows icon."""
+    search_dirs = []
+    if getattr(sys, "frozen", False):
+        search_dirs.append(Path(sys.executable).resolve().parent)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            search_dirs.append(Path(meipass))
+    else:
+        search_dirs.append(Path(__file__).resolve().parent)
+    for here in search_dirs:
+        for icon_name in ("icon.ico", "icon.png", "pulser_monitor.ico"):
+            p = here / icon_name
+            if p.exists():
+                return p
+    return None
+
+
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
     try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "ELIBeamlines.PulserMonitor")
-    except Exception:
-        pass
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
+def main():
+    # Before QApplication: Windows reads the identity when the first taskbar
+    # button is created. See _icon_app_id() for the content tag.
+    _aumid = _icon_app_id("ELIBeamlines.PulserMonitor", _icon_file())
+    if _aumid:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+        except Exception:
+            pass
 
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
@@ -6867,27 +6914,10 @@ def main():
     status_bar.addPermanentWidget(btn_stop)
 
     try:
-        # The icon sits next to the exe. In a frozen build __file__ points into
-        # the bundle, not the exe folder, so searching only there silently finds
-        # nothing and the app ends up with the generic Windows icon.
-        search_dirs = []
-        if getattr(sys, "frozen", False):
-            search_dirs.append(Path(sys.executable).resolve().parent)
-            meipass = getattr(sys, "_MEIPASS", None)
-            if meipass:
-                search_dirs.append(Path(meipass))
-        else:
-            search_dirs.append(Path(__file__).resolve().parent)
-        for here in search_dirs:
-            for icon_name in ("icon.ico", "icon.png", "pulser_monitor.ico"):
-                icon_path = here / icon_name
-                if icon_path.exists():
-                    app.setWindowIcon(QIcon(str(icon_path)))
-                    win.setWindowIcon(QIcon(str(icon_path)))
-                    break
-            else:
-                continue
-            break
+        icon_path = _icon_file()
+        if icon_path:
+            app.setWindowIcon(QIcon(str(icon_path)))
+            win.setWindowIcon(QIcon(str(icon_path)))
     except Exception:
         pass
 

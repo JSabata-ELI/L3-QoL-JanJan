@@ -3,10 +3,13 @@ Screen Region Change Tracker
 Monitors a specific region on screen and alerts on change.
 """
 
+import array
 import base64
 import colorsys
 import ctypes
 import io
+import math
+import wave
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 from collections import namedtuple
@@ -81,6 +84,30 @@ for _i, _label in enumerate(_CHILLER_LABELS, start=1):
     _PV_ABS_RANGE.append((18.0, 22.0) if _i == 6 else (7.0, 17.5))
 
 
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 def set_app_icon(win, ico_path, app_id=None):
     """Apply icon.ico to the title bar AND the Windows taskbar button.
 
@@ -89,9 +116,10 @@ def set_app_icon(win, ico_path, app_id=None):
     default feather. We force every slot from icon.ico via Win32.
     """
     import ctypes
-    if app_id:
+    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
+    if _aumid:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
     try:
@@ -182,7 +210,150 @@ def _readable_pv_error(pv_name, exc):
 
 _COLOR_CYCLES = ("fixed", "rainbow_blink", "rainbow_spectrum", "rainbow_wave")
 _RESERVED_PRESET_KEYS = {"pv_thresholds", "window_geometry", "image_geometry", "flash_mode", "image_file",
-                         "color_cycle", "flash_interval", "conditions"}
+                         "color_cycle", "flash_interval", "conditions", "sound_leadin",
+                         "sound_device"}
+
+# A Bluetooth speaker only carries audio once the link has been opened, which
+# takes a moment when nothing has been played for a while. Every sound is
+# therefore given a run-up of silence; without it the whole beep lands in the
+# gap and the lab hears nothing at all.
+SOUND_LEADIN_MS = 800           # default run-up of silence before the sound
+SOUND_TAIL_MS = 150             # silence after it, so the end is not clipped
+SOUND_RATE = 44100              # samples per second of the synthesised tone
+SOUND_DEFAULT_DEVICE = "Default (Windows chooses)"
+
+
+# ----------------------------------------------------------------------
+# Playing a sound on a chosen output device
+#
+# Windows lets a sound go somewhere other than the speaker you expect: the
+# volume mixer keeps a separate volume, and Windows 11 a separate output
+# device, for each program. A program parked on the built-in output stays
+# there even after a Bluetooth speaker is made the default, which is exactly
+# how a lab can hear every system sound and nothing from this one. Naming the
+# output device outright sidesteps the whole guessing game, so the sound is
+# handed straight to the device the operator picked.
+# ----------------------------------------------------------------------
+
+_WAVE_MAPPER = 0xFFFFFFFF       # "let Windows choose" device number
+_WHDR_DONE = 0x00000001
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [("wFormatTag", ctypes.c_ushort),
+                ("nChannels", ctypes.c_ushort),
+                ("nSamplesPerSec", ctypes.c_uint),
+                ("nAvgBytesPerSec", ctypes.c_uint),
+                ("nBlockAlign", ctypes.c_ushort),
+                ("wBitsPerSample", ctypes.c_ushort),
+                ("cbSize", ctypes.c_ushort)]
+
+
+class _WAVEHDR(ctypes.Structure):
+    _fields_ = [("lpData", ctypes.c_char_p),
+                ("dwBufferLength", ctypes.c_uint),
+                ("dwBytesRecorded", ctypes.c_uint),
+                ("dwUser", ctypes.c_void_p),
+                ("dwFlags", ctypes.c_uint),
+                ("dwLoops", ctypes.c_uint),
+                ("lpNext", ctypes.c_void_p),
+                ("reserved", ctypes.c_void_p)]
+
+
+class _WAVEOUTCAPS(ctypes.Structure):
+    _fields_ = [("wMid", ctypes.c_ushort),
+                ("wPid", ctypes.c_ushort),
+                ("vDriverVersion", ctypes.c_uint),
+                ("szPname", ctypes.c_wchar * 32),
+                ("dwFormats", ctypes.c_uint),
+                ("wChannels", ctypes.c_ushort),
+                ("wReserved1", ctypes.c_ushort),
+                ("dwSupport", ctypes.c_uint)]
+
+
+def _winmm():
+    return ctypes.WinDLL("winmm")
+
+
+def list_output_devices():
+    """Every output the sound card layer offers, newest Bluetooth link included.
+
+    The list is read fresh each time: a Bluetooth speaker only appears once it
+    has connected, so a list built at start-up would never contain it."""
+    names = [SOUND_DEFAULT_DEVICE]
+    try:
+        mm = _winmm()
+        caps = _WAVEOUTCAPS()
+        for i in range(mm.waveOutGetNumDevs()):
+            if mm.waveOutGetDevCapsW(i, ctypes.byref(caps),
+                                     ctypes.sizeof(caps)) == 0:
+                name = caps.szPname.strip()
+                if name and name not in names:
+                    names.append(name)
+    except Exception:
+        pass
+    return names
+
+
+def _device_number(name):
+    """Turn the picked device name back into the number the sound layer wants.
+
+    A device that has since disconnected falls back to the Windows default
+    rather than failing: a missing speaker must not silence the alarm."""
+    if not name or name == SOUND_DEFAULT_DEVICE:
+        return _WAVE_MAPPER
+    try:
+        mm = _winmm()
+        caps = _WAVEOUTCAPS()
+        for i in range(mm.waveOutGetNumDevs()):
+            if mm.waveOutGetDevCapsW(i, ctypes.byref(caps),
+                                     ctypes.sizeof(caps)) == 0:
+                if caps.szPname.strip() == name:
+                    return i
+    except Exception:
+        pass
+    return _WAVE_MAPPER
+
+
+def play_pcm(pcm, rate, channels, width, device_name=None):
+    """Send raw sound samples to one output device and wait until they finish.
+
+    Raises on any failure so the caller can say so on screen; a sound that
+    quietly goes nowhere is the whole problem being fixed here."""
+    mm = _winmm()
+    fmt = _WAVEFORMATEX(1, channels, rate,
+                        rate * channels * width, channels * width,
+                        width * 8, 0)
+    handle = ctypes.c_void_p()
+    dev = _device_number(device_name)
+    err = mm.waveOutOpen(ctypes.byref(handle), dev, ctypes.byref(fmt), 0, 0, 0)
+    if err != 0 and dev != _WAVE_MAPPER:
+        # The named device refused the format (or vanished mid-play) — rather
+        # than stay silent, try again on whatever Windows would have used.
+        err = mm.waveOutOpen(ctypes.byref(handle), _WAVE_MAPPER,
+                             ctypes.byref(fmt), 0, 0, 0)
+    if err != 0:
+        raise OSError(f"cannot open the output device (code {err})")
+
+    buf = ctypes.create_string_buffer(pcm, len(pcm))
+    hdr = _WAVEHDR()
+    hdr.lpData = ctypes.cast(buf, ctypes.c_char_p)
+    hdr.dwBufferLength = len(pcm)
+    try:
+        err = mm.waveOutPrepareHeader(handle, ctypes.byref(hdr), ctypes.sizeof(hdr))
+        if err != 0:
+            raise OSError(f"cannot prepare the sound (code {err})")
+        err = mm.waveOutWrite(handle, ctypes.byref(hdr), ctypes.sizeof(hdr))
+        if err != 0:
+            mm.waveOutUnprepareHeader(handle, ctypes.byref(hdr), ctypes.sizeof(hdr))
+            raise OSError(f"cannot play the sound (code {err})")
+        seconds = len(pcm) / float(rate * channels * width)
+        deadline = time.time() + seconds + 5.0
+        while not (hdr.dwFlags & _WHDR_DONE) and time.time() < deadline:
+            time.sleep(0.02)
+        mm.waveOutUnprepareHeader(handle, ctypes.byref(hdr), ctypes.sizeof(hdr))
+    finally:
+        mm.waveOutClose(handle)
 
 
 def _parse_level(text):
@@ -385,9 +556,13 @@ class RegionSelector(tk.Toplevel):
 
 class ScreenTracker(tk.Tk):
     def __init__(self):
+        # Before super().__init__(): Windows reads the identity when the first
+        # taskbar button is created. See _icon_app_id() for the content tag.
         try:
             import ctypes as _ct
-            _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Announcer")
+            _aumid = _icon_app_id("ELI.Announcer", self._get_icon_path())
+            if _aumid:
+                _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
         super().__init__()
@@ -833,6 +1008,8 @@ class ScreenTracker(tk.Tk):
         self.sound_freq = tk.IntVar(value=1500)
         self.sound_duration = tk.IntVar(value=500)
         self.sound_file = tk.StringVar(value="beep")
+        self.sound_leadin = tk.IntVar(value=SOUND_LEADIN_MS)
+        self.sound_device = tk.StringVar(value=SOUND_DEFAULT_DEVICE)
         self._sound_files = self._load_sound_files()
         self._flash_color_btn = None  # created in popup
 
@@ -877,6 +1054,16 @@ class ScreenTracker(tk.Tk):
         saved_img = self._presets.get("image_file")
         if saved_img in self._image_files:
             self.image_file.set(saved_img)
+        saved_lead = self._presets.get("sound_leadin")
+        if isinstance(saved_lead, (int, float)) and 0 <= saved_lead <= 5000:
+            self.sound_leadin.set(int(saved_lead))
+        saved_dev = self._presets.get("sound_device")
+        # Kept by name, not by number: the numbers shuffle every time a
+        # Bluetooth speaker connects or drops.
+        if isinstance(saved_dev, str) and saved_dev:
+            self.sound_device.set(saved_dev)
+        self.sound_leadin.trace_add("write", lambda *_: self._save_flash_settings())
+        self.sound_device.trace_add("write", lambda *_: self._save_flash_settings())
         self.flash_mode.trace_add("write", lambda *_: self._save_flash_settings())
         self.color_cycle.trace_add("write", lambda *_: self._save_flash_settings())
         self.flash_interval.trace_add("write", lambda *_: self._save_flash_settings())
@@ -1349,6 +1536,11 @@ class ScreenTracker(tk.Tk):
         except tk.TclError:
             pass   # half-typed value in the spinbox — keep the stored one
         self._presets["image_file"] = self.image_file.get()
+        try:
+            self._presets["sound_leadin"] = int(self.sound_leadin.get())
+        except tk.TclError:
+            pass   # half-typed value in the spinbox — keep the stored one
+        self._presets["sound_device"] = self.sound_device.get()
         self._save_presets_file()
 
     def _preset_names(self):
@@ -1539,6 +1731,30 @@ class ScreenTracker(tk.Tk):
         if self.sound_file.get() in self._sound_files:
             self._sound_combo.current(self._sound_files.index(self.sound_file.get()))
         self._sound_combo.grid(row=3, column=1, padx=(0,6), pady=(0,6))
+
+        ttk.Label(sound_frame, text="Bluetooth run-up (ms):").grid(
+            row=4, column=0, padx=(6,2), pady=(0,4))
+        ttk.Spinbox(sound_frame, from_=0, to=3000, increment=100,
+                    textvariable=self.sound_leadin, width=6).grid(
+            row=4, column=1, padx=(0,6), pady=(0,4))
+
+        # The device names run to 31 characters, so they get a row of their own
+        # instead of being squeezed into the narrow right-hand column.
+        sound_frame.columnconfigure(1, weight=1)
+        ttk.Label(sound_frame, text="Play on:").grid(
+            row=5, column=0, columnspan=2, padx=6, pady=(2,0), sticky="w")
+        self._device_combo = ttk.Combobox(sound_frame, textvariable=self.sound_device,
+                                          state="readonly", width=24)
+        # Filled when the list is dropped down, not once at start-up: a
+        # Bluetooth speaker that connects later would otherwise never show up.
+        self._device_combo["postcommand"] = self._refresh_device_combo
+        self._device_combo.grid(row=6, column=0, columnspan=2,
+                                padx=6, pady=(0,4), sticky="ew")
+        self._refresh_device_combo()
+
+        ttk.Button(sound_frame, text="Test sound",
+                   command=lambda: self._play_sound(report=True)).grid(
+            row=7, column=0, columnspan=2, padx=6, pady=(0,6), sticky="ew")
 
         # Window position & size — two independent windows
         win_frame = ttk.LabelFrame(frame, text="Window position & size")
@@ -2187,21 +2403,121 @@ class ScreenTracker(tk.Tk):
             return "#000000"
         return out
 
-    def _play_sound(self):
+    def _refresh_device_combo(self):
+        """Re-read the output devices, keeping a saved one that is still absent.
+
+        The speaker chosen yesterday may not be connected yet today; dropping
+        it from the list would silently reset the choice to the default."""
+        names = list_output_devices()
+        picked = self.sound_device.get()
+        if picked and picked not in names:
+            names.append(picked)
+        self._device_combo["values"] = names
+
+    def _leadin_ms(self):
+        """Run-up of silence in front of every sound, clamped to something sane."""
+        try:
+            return max(0, min(5000, int(self.sound_leadin.get())))
+        except (tk.TclError, ValueError):
+            return SOUND_LEADIN_MS
+
+    @staticmethod
+    def _wav_bytes(frames, rate, channels, width):
+        """Wrap raw samples as a WAV file held in memory."""
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(width)
+            w.setframerate(rate)
+            w.writeframes(frames)
+        return buf.getvalue()
+
+    def _tone_pcm(self):
+        """Build the beep as real sound samples instead of asking for a beep.
+
+        winsound.Beep() drives the motherboard beeper through the kernel and
+        never reaches a Bluetooth speaker, which is why the lab stayed silent
+        while the same script was audible on the PC's own output."""
+        freq = max(50, min(10000, int(self.sound_freq.get())))
+        duration_ms = max(20, min(10000, int(self.sound_duration.get())))
+        n = int(SOUND_RATE * duration_ms / 1000)
+        fade = min(n // 2, int(SOUND_RATE * 0.005))     # 5 ms, kills the click
+        step = 2.0 * math.pi * freq / SOUND_RATE
+        samples = array.array("h", bytes(2 * n))
+        for i in range(n):
+            level = 1.0
+            if fade:
+                if i < fade:
+                    level = i / fade
+                elif i > n - fade:
+                    level = (n - i) / fade
+            samples[i] = int(16000 * level * math.sin(step * i))
+        pad = self._silence(self._leadin_ms(), SOUND_RATE, 1, 2)
+        tail = self._silence(SOUND_TAIL_MS, SOUND_RATE, 1, 2)
+        return pad + samples.tobytes() + tail, SOUND_RATE, 1, 2
+
+    @staticmethod
+    def _silence(ms, rate, channels, width):
+        return bytes(int(rate * ms / 1000) * channels * width)
+
+    def _file_pcm(self, path):
+        """The chosen sound file with the silent run-up put in front of it."""
+        with wave.open(str(path), "rb") as r:
+            channels, width, rate = r.getnchannels(), r.getsampwidth(), r.getframerate()
+            body = r.readframes(r.getnframes())
+        if width == 1:      # 8-bit WAV is unsigned: silence is 128, not 0
+            pad = bytes([128]) * (int(rate * self._leadin_ms() / 1000) * channels)
+        else:
+            pad = self._silence(self._leadin_ms(), rate, channels, width)
+        return pad + body, rate, channels, width
+
+    def _sound_pcm(self):
+        """The sound to play right now, or None when the file is missing."""
+        chosen = self.sound_file.get()
+        if chosen == "beep":
+            return self._tone_pcm()
+        if getattr(sys, "frozen", False):
+            base = Path(sys.executable).parent
+        else:
+            base = Path(__file__).parent
+        wav = base / "sounds" / f"{chosen}.wav"
+        if not wav.exists():
+            return None
+        return self._file_pcm(wav)
+
+    def _play_sound(self, report=False):
+        """Play the alarm sound on the picked output device, off the main thread.
+
+        With report on, a failure is written to the status line — that is how
+        the Test button tells you the sound went nowhere instead of leaving
+        you guessing, which is what a silent lab looked like."""
         import threading
-        import winsound
+
         def _beep():
-            chosen = self.sound_file.get()
-            if chosen == "beep":
-                winsound.Beep(self.sound_freq.get(), self.sound_duration.get())
-            else:
-                if getattr(sys, "frozen", False):
-                    base = Path(sys.executable).parent
-                else:
-                    base = Path(__file__).parent
-                wav = base / "sounds" / f"{chosen}.wav"
-                if wav.exists():
-                    winsound.PlaySound(str(wav), winsound.SND_FILENAME)
+            try:
+                made = self._sound_pcm()
+                if made is None:
+                    if report:
+                        self.after(0, lambda: self.status_var.set(
+                            "Sound file not found in the sounds folder."))
+                    return
+                pcm, rate, channels, width = made
+                play_pcm(pcm, rate, channels, width, self.sound_device.get())
+                if report:
+                    self.after(0, lambda: self.status_var.set(
+                        f"Sound played on: {self.sound_device.get()}"))
+            except Exception as exc:
+                msg = f"Sound failed: {exc}"
+                if report:
+                    self.after(0, lambda m=msg: self.status_var.set(m))
+                # Never let a sound problem stop the alarm: the flash is the
+                # part that matters, so fall back to the old beep and move on.
+                try:
+                    import winsound
+                    winsound.Beep(self.sound_freq.get(), self.sound_duration.get())
+                except Exception:
+                    pass
+
         threading.Thread(target=_beep, daemon=True).start()
     def _reset(self):
         if self._flash_job:

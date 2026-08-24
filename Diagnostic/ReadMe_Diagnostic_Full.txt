@@ -64,7 +64,7 @@ Two consequences worth knowing:
 | `remote_launcher.py` | Standalone Webex listener that starts the app on `/run` (see below). Built as its own program — `dist\Diagnostic Webex listener\` |
 | `operation_history_logic.py` | Long-term drift per waveplate, behind the History tab (see the note above about its missing input file) |
 | `test_alerting.py` | Offline tests for the alerting layer, including the frozen-value detector (`python test_alerting.py`) |
-| `test_monitor_frozen.py` | Offline tests for the "not updating" check as the PV Monitor uses it: verdict, one-shot notification, table rendering (`python test_monitor_frozen.py`) |
+| `test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict, its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python test_monitor_frozen.py`) |
 | `test_bot_commands.py` | Offline tests for the chat command grammar (`python test_bot_commands.py`) |
 | `build_config.json`, `icon.ico` | Build settings for Dev Tools (`extra_files` carries `notify_provision.dat`, `win32crypt` is forced into the bundle) and the app icon |
 | `STRUCTURE.md` | Developer map of every module, class and function |
@@ -91,7 +91,8 @@ monitor_tab._PollWorker          every poll_interval_s, poll_max_workers at a ti
 PVRuntime.samples (in memory)  ──►  PVTableModel (table)  ──►  GraphPanel (plot)
   │
   ├─ alerting.AlertEvaluator     thresholds + debounce/settle + re-notify
-  ├─ alerting.detect_frozen      "not updating"
+  ├─ alerting.detect_frozen      "not updating"  (this PV's reading is dead)
+  ├─ _check_refresh_health       "not refreshed" (this program stopped reading)
   ▼
 alerting.NotificationHub  ──►  Teams webhook / SMTP email / Webex rooms
                                         ▲
@@ -170,6 +171,9 @@ Live monitoring and alerting — in practice the whole program.
   `data_watchdog_fail_polls` polls and once when the flow resumes.
 - **"Not updating" check** — a per-PV freshness check for data that arrives but
   is no longer live (`frozen_*` keys, `alerting.detect_frozen`). See below.
+- **Refresh watchdog** — the program's own pulse: if no pass has landed for
+  several intervals, everything on screen and every chat answer is marked
+  `not refreshed` and the bot announces it unasked. See below.
 - **Settings** — everything above, plus the notification channels (or, in a
   provisioned build, a read-only summary of them) and the share location.
   `DEFAULT_SETTINGS` is the single source of truth for keys and defaults;
@@ -347,8 +351,8 @@ The commands themselves:
 | Command | What it does |
 |---|---|
 | `/help`, `/?` | this cheat sheet (a bare `help` with no slash works too) |
-| `/status [pv, pv]` | value + state for all PVs, or only the named ones |
-| `/alarms` | only PVs currently in warning/alarm |
+| `/status [pv, pv]` | value + state for all PVs, or only the named ones. Always ends with when those values were read; if the program has stopped reading, a warning goes above the list and each line reads `not refreshed` in place of `ok` |
+| `/alarms` | only PVs currently in warning/alarm. Refuses to answer "all clear" while the values are out of date |
 | `/list` | the configured PVs |
 | `/plot <pv, pv, …>[; window][; y lo-hi]` | **one** graph with a curve per PV. `/plot all` takes every PV. A single PV also gets its warning/alarm lines — an overlay does not, since the lines would belong to no visible curve. Without a window option the **Alert plot window** from Settings is used |
 | `/start` | alerting on (PVs are read and plotted either way) |
@@ -556,6 +560,62 @@ Values that genuinely hold still for hours — switch positions, setpoints, enab
 flags — would be flagged for ever, so **Edit PV** has *"Report this PV as not
 updating when its value never changes"* to opt out per PV (`frozen_check`), and
 Settings has the global switch, the time limit and the alert switch.
+
+### "Not refreshed" — the program itself stopped reading
+
+Everything above is about a *value* being wrong or dead. This is about the
+program being stuck. A poll that goes out and never comes back leaves the table,
+the graph and every chat answer exactly as they were at the last pass that
+worked — and nothing about a screen full of last-known values says they are
+last-known. Asked `/status` from a phone, it would keep replying `ok` for hours.
+The wedge that produced this (an in-flight flag that a lost pass leaves True for
+ever) is self-healed in `_start_poll`, but self-healing silently is not enough:
+if the cure does not take, somebody has to be told.
+
+`_check_refresh_health()` is that heartbeat. It runs on the poll tick *and* on
+the Webex listener tick — two independent clocks, so whichever is still running
+notices the other being stuck — and compares now against `_last_poll_ok_ns`, set
+only where a pass actually lands (`_on_poll`). The limit (`_refresh_limit_s`) is
+five poll intervals plus a minute, never under three, deliberately longer than
+the wedge watchdog's own write-off at five intervals: a stall that cures itself
+should pass without waking anybody, and only one that survives the cure is worth
+announcing.
+
+When it trips:
+
+- the status bar leads with `⚠ NOT REFRESHED (last read HH:MM:SS)`, ahead of the
+  frozen count and the memory figures — while it is true, none of them mean
+  anything;
+- a red band appears above the graph (a plain label, not text drawn into the
+  figure, so it survives every redraw and cannot upset the blitted crosshair);
+- every **State** cell reads `not refreshed`, with a tooltip naming the time the
+  values actually come from;
+- one notification goes out, and one more when the readings come back — the same
+  once-per-episode shape as the other data faults, tagged `refresh` so it can
+  never overwrite a PV's Alarm status cell. Alerting being stopped silences the
+  message, never the display.
+
+And every reply the bot gives says it, whether or not anyone asked:
+
+- `/status` puts the warning *above* the values (the first line is the one that
+  gets read on a phone) and ends with `Values read at HH:MM:SS (N ago)` — which
+  it now carries even when all is well, so "when was this read" is never a guess;
+- each PV line reads `[not refreshed — …]` in place of `[ok]`;
+- `/alarms` will not answer "✅ No PVs currently in warning/alarm" while the
+  values are old — that is a claim about the present, and it says instead that it
+  cannot tell;
+- a PV whose *own* newest reading has aged out is caught the same way, judged at
+  the moment of asking rather than trusted from the last poll — when the poll is
+  what stopped, the stored verdict is stale too. This respects the same per-PV
+  opt-out as the "not updating" check.
+
+Plotted graphs are checked as well. `render_chart_png()` compares the newest
+point drawn against the end of the requested window and, past the limit, stamps
+`NOT CURRENT — newest data …` into the corner of the picture and repeats it in
+the covering message (a chat client may show the text before the image loads).
+Only windows that were asked to run up to now are judged: a curve ending at the
+right-hand edge of `yesterday 7-18` is what was asked for, not a fault. Alert
+plots, whose window always ends now, are stamped by the same rule.
 
 ### Memory on a long uptime
 
