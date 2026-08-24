@@ -65,6 +65,13 @@ COPY MANAGER
   version last published from this computer. "Select new" ticks only
   the ones that have something newer.
 
+  Helper programs are on this list too, the same way as in the
+  Builder: the program that carries them has a small arrow, and each
+  helper is an indented line with its own tick box, version and
+  status. Ticking the program ticks its helpers as well and opens the
+  list; unticking a helper afterwards sticks, so you can publish just
+  the application.
+
   Copy publishes to whichever destinations you ticked. Before it
   overwrites anything, the previous version is moved into the
   archive, so an old version can always be run again from the

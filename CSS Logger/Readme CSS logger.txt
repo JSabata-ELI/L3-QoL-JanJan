@@ -9,9 +9,9 @@ Detailed version: ReadMe_CSS Logger_Full.txt  ("Details" button)
 WHAT IT DOES
 
   Looks at anything the control system has archived. You pick the
-  values you want, pick a period, press Load, and then you have them
-  as a table, as graphs, as statistics, and as a file you can take
-  away.
+  values you want and a period, and they arrive on their own — as a
+  table, as graphs, as statistics, and as a file you can take away.
+  There is nothing to press to fetch data.
 
   The window has two tabs: CSS Logger and Spectra. Spectra is a
   separate tool for spectrometer data and has its own documentation.
@@ -31,14 +31,20 @@ THE IDEA IN ONE PARAGRAPH
 LOADING DATA (the left-hand side)
 
   Set time window   both ends by date and time, or quick choices
-                    like the last hour or the last 24 hours.
+                    like the last hour or the last 24 hours. It starts
+                    on the last hour.
   Presets           named lists of values, so a routine question is
                     two clicks.
   Browse...         find values to add. Type words; they must all
                     appear in the name, in the order you typed them.
-  LOAD DATA         fetch everything in the list for that period.
-  Live              keep fetching, every third of a second, with the
-                    window rolling along with the clock.
+  Live mode         the one switch. On, the window rolls along with
+                    the clock and new values keep arriving. Off, the
+                    period you chose stands still.
+
+  There is no "Load data" button. Adding or removing a value, choosing
+  a different period or switching preset fetches the data by itself,
+  whether Live is on or off. Several changes in a row are collected
+  into one request rather than one each.
 
   Master PV and "Keep multiples of" thin the rows down where the
   archive recorded far more often than you need.
@@ -49,7 +55,12 @@ THE TABS
   Graph          all the values in one plot, each with its own
                  horizontal band and its own vertical axis on the
                  left, in the style of the control-room displays.
-  XY Plot        one value against another, as a scatter.
+  XY Plot        one value against another, as a scatter. The two are
+                 rarely recorded at the very same instant, so each
+                 one's last known value is held until the other
+                 reports; a value that has gone stale stops counting.
+                 The colour says how far through the period a point
+                 is, running from dark blue to red.
   PV Time Plot   the daily pattern of the ramping data kept locally.
                  Works without the archive.
   Table          every row that was loaded.
@@ -60,12 +71,37 @@ IN THE GRAPH
 
   Move the mouse   a crosshair with the time and the value of every
                    visible signal.
-  Drag a span      statistics for that interval: count, average,
-                   spread, smallest, largest, peak to peak.
-  Drag a box       zoom. "Back" steps out again.
+  Drag with the    statistics for that interval: count, average,
+  left button      spread, smallest, largest, peak to peak. The blue
+                   band and its numbers stay put through a redraw, a
+                   reload or a change of settings; "Clear selection"
+                   removes them.
+  Drag with the    zoom in on that stretch of time.
+  right button
   F11              the graph in its own window; Ctrl+F11 fullscreen.
 
-  Reference lines   horizontal lines at values you choose.
+  Above the graph is a row of picture buttons:
+
+    house      back to the whole period
+    arrows     the previous / next view you were looking at
+    cross      pan — drag the plot around
+    magnifier  zoom by drawing a box. While this is pressed in, the
+               left button zooms instead of taking statistics; press
+               it again to get statistics back.
+    sliders    how far the plot sits from the edges
+    disk       save the graph as a picture
+
+  "View" offers the same reset, typing axis limits in by hand, and
+  switching every grid off at once.
+
+  Reference lines   horizontal lines at heights you choose. A line can
+                    belong to one signal, so it sits on that signal's
+                    own scale. "Add by clicking in the graph" walks you
+                    through it: click the signal's vertical axis, then
+                    click the height. Everything you are not meant to
+                    click is greyed out, and Esc backs out. Each line
+                    has a name, colour, style and thickness, and can be
+                    moved up and down the list or deleted.
   Conditions        keep only the rows where chosen values are inside
                     a range. Everything outside is dropped from the
                     table, the graph and the export.
@@ -75,8 +111,26 @@ IN THE GRAPH
                     switches that trade detail for speed.
 
   Below the graph, one row per signal: show, name, colour, the value
-  under the cursor, the vertical range, autoscale, line width,
-  smoothing and grid.
+  under the cursor, the vertical range, autoscale, line width, line
+  style, point style, point size, transparency, smoothing and grid.
+  Grid can be ticked for as many signals as you like: each one gets
+  its own grid, in its own colour and its own kind of line — solid,
+  dashed, dotted, dash-dot and so on — so several can be read apart
+  at a glance. The upright time lines are shared, since every signal
+  shares one time axis.
+  Six more are available and start switched off: unit, last value,
+  smallest, largest, average and how many samples were recorded — the
+  quickest way to spot a signal that writes nothing.
+
+  Drag a heading to move a column anywhere. Right-click the headings
+  to choose which are shown. "Reset columns" puts everything back.
+  When the columns no longer fit, the list scrolls sideways.
+
+  "Styles" saves the whole look — colours, line and point styles,
+  reference lines and the column layout — under a name you choose, and
+  loads it back later. It can also be written to a file and read on
+  another PC. Nothing is kept automatically: start the program again
+  and the graph is plain until you load a saved look.
 
 
 EXPORT
@@ -94,7 +148,12 @@ TWO THINGS TO KNOW
     everything.
   - Live mode keeps at most the last twelve hours, on purpose. A
     rolling window of several days has to be re-merged and redrawn
-    continuously and grinds to a halt. Load Data will still load any
-    period you ask for.
+    continuously and grinds to a halt. With Live off, any period you
+    ask for is still loaded in full.
+  - In Live mode the graph and the table are refreshed on separate
+    clocks: the graph as often as the computer can manage, so the
+    window glides along, and the table about once a second, because
+    rebuilding it is the slow part. Both, and how often the archive
+    is asked, can be changed under Graph settings → Live speed.
 
 -----------------------------------------------------------------

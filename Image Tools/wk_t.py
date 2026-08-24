@@ -154,8 +154,9 @@ def _load_palettes():
     return ({
         "Default":   None,
         "Grayscale": None,
-        "Hot":       _fallback_lut([(0, (0, 0, 0)), (0.33, (255, 0, 0)),
-                                    (0.66, (255, 255, 0)), (1, (255, 255, 255))]),
+        "Hot":       _fallback_lut([(0, (0, 0, 0)), (0.27, (255, 0, 0)),
+                                    (0.53, (255, 255, 0)), (0.78, (255, 255, 190)),
+                                    (1, (255, 255, 255))]),
         "Viridis":   _fallback_lut([(0, (68, 1, 84)), (0.25, (59, 82, 139)),
                                     (0.5, (33, 145, 140)), (0.75, (94, 201, 98)),
                                     (1, (253, 231, 37))]),
@@ -1532,6 +1533,34 @@ def _fmt_mm(mm: float) -> str:
     return f"{txt} mm"
 
 
+def _region_caption(a: "_Annot", st: dict, slot, unit: str) -> str:
+    """Everything a region has to say, on three short lines.
+
+    The tool's own tooltip promises "min, max, mean and more for that area"; a caption
+    showing two of those makes the panel a liar and sends the reader looking for the
+    rest. Three lines: what the values are, how big the area is, and how much of it
+    there is."""
+    if not st:
+        return ""
+    lines = [f"{unit}:  min {st['min']:.0f}   max {st['max']:.0f}   "
+             f"mean {st['mean']:.1f}   sd {st['std']:.1f}"]
+    x0, y0, x1, y1 = a.bbox()
+    w, h = max(0.0, x1 - x0), max(0.0, y1 - y0)
+    ppm = slot.px_per_mm
+    size = f"{w:.0f} × {h:.0f} px"
+    if ppm:
+        size += f"  =  {_fmt_mm(w / ppm)} × {_fmt_mm(h / ppm)}"
+    lines.append(size)
+    tail = f"{st['count']} px"
+    if ppm:
+        tail += f"   {st['count'] / (ppm ** 2):.4g} mm²"
+    tail += f"   sum {st['sum']:.4g}"
+    if "cx" in st:
+        tail += f"   centre {st['cx']:.0f}, {st['cy']:.0f}"
+    lines.append(tail)
+    return "\n".join(lines)
+
+
 def angle_between(p0, vertex, p2) -> float:
     """The angle at `vertex` between the arms to p0 and p2, in degrees, 0…180.
 
@@ -1550,6 +1579,30 @@ def line_angle_deg(p0, p1) -> float:
     """Direction of a line as it looks on screen: degrees anticlockwise from
     horizontal. Image y grows downwards, so the sign is flipped on the way out."""
     return math.degrees(math.atan2(-(p1[1] - p0[1]), p1[0] - p0[0]))
+
+
+#  Directions Shift snaps a hand-drawn line onto: the picture's own axes and their
+#  diagonals. This is a stand-in for what is actually wanted — a line PARALLEL TO THE
+#  BEAM, since the patch in the frame is hardly ever square to the sensor. Doing that
+#  properly means finding the beam's edge first (the long axis from the second moments
+#  is already computed for the beam report, and the edges of a top-hat could be fitted)
+#  and offering those angles here as well. Until then, straight to the frame at least
+#  stops a ruler drifting a degree or two and reading long.
+_SNAP_STEP_DEG = 45.0
+
+
+def snap_direction(p0, x: float, y: float, step_deg: float = _SNAP_STEP_DEG):
+    """(x, y) pulled onto the nearest direction that is a multiple of `step_deg`.
+
+    The length is kept — only the angle is rounded — so the operator still controls how
+    long the line is while Shift controls where it points."""
+    dx, dy = float(x) - p0[0], float(y) - p0[1]
+    length = math.hypot(dx, dy)
+    if length <= 0.0:
+        return float(x), float(y)
+    step = math.radians(step_deg)
+    ang = round(math.atan2(dy, dx) / step) * step
+    return p0[0] + length * math.cos(ang), p0[1] + length * math.sin(ang)
 
 
 def _dist_to_segment(px: float, py: float, a, b) -> float:
@@ -1658,6 +1711,30 @@ def line_profile(arr: np.ndarray, p0, p1, width: int = 1) -> "tuple[np.ndarray, 
 
 _SLOT_UNDO_LIMIT = 30
 
+#  Pixel pitch of the Basler cameras on this beamline: 4.4 µm, the same sensor in all
+#  of them (acA1600-20gm). Read out of the archived frames themselves, where NI Vision
+#  writes it as "Unit length" and again as "Pixel Width (um)" in the Measurements
+#  block; the older MATLAB analysis scripts say 4.5, which is 2.3 % out.
+#
+#  It is offered as the default sensor scale so a frame can be measured in millimetres
+#  without a ruler, but it is only true AT THE SENSOR — put a lens or a magnifier in
+#  front and the number on the object is different, which is why it stays an option the
+#  operator switches on rather than something applied by itself.
+#
+#  It also assumes one stored pixel is one sensor pixel. Some cameras acquire with 2×2
+#  binning (OM1NF does, OM1FF does not), and there one stored pixel covers 8.8 µm — so
+#  a binned frame measured at 4.4 µm comes out half its real size on the sensor. That
+#  is not read from the frame yet; type the doubled value in until it is.
+BASLER_PIXEL_UM = 4.4
+
+#  What a measured value is called on screen. "Counts" is the instrument word for what
+#  a camera pixel returns; the people reading this panel call it pixel intensity, so
+#  that is what it says. The distinction the code lives by — the camera's own values
+#  versus the 8-bit picture — is kept, it is just spelled out instead of hidden in a
+#  word only half the readers know.
+UNIT_RAW = "pixel intensity"
+UNIT_CODE = "8-bit intensity"
+
 
 @dataclass
 class _WorkshopSlot:
@@ -1677,6 +1754,12 @@ class _WorkshopSlot:
     view: _ViewSettings = field(default_factory=_ViewSettings)
     annots: list = field(default_factory=list)
     px_per_mm: "float | None" = None
+    # How much of the object one pixel covers, in micrometres — the number the operator
+    # actually sets. Kept beside px_per_mm rather than replacing it so everything
+    # downstream keeps reading one number; this one is what the panel shows and what
+    # follows the picture through binning and resizing.
+    px_um: "float | None" = None
+    px_um_measured: bool = False               # True when a ruler produced it
 
     undo_stack: list = field(default_factory=list)
     redo_stack: list = field(default_factory=list)
@@ -1695,12 +1778,16 @@ class _WorkshopSlot:
         # four times too big made every "% of full scale" and the histogram axis wrong,
         # with nothing on screen to show why.
         return (self.base, self.raw, [a.copy() for a in self.annots], self.px_per_mm,
-                self.full_scale)
+                self.full_scale, self.px_um, self.px_um_measured)
 
     def _restore(self, st):
         self.base, self.raw, self.annots, self.px_per_mm = st[0], st[1], st[2], st[3]
         if len(st) > 4:
             self.full_scale = st[4]
+        if len(st) > 5:
+            self.px_um = st[5]
+        if len(st) > 6:
+            self.px_um_measured = st[6]
 
     def push_undo(self):
         self.undo_stack.append(self._state())
@@ -1740,7 +1827,11 @@ class _WorkshopSlot:
         return self.raw is not None and self.raw.shape[:2] == self.base.shape[:2]
 
     def unit_name(self) -> str:
-        return "counts" if self.measures_raw() else "code"
+        return UNIT_RAW if self.measures_raw() else UNIT_CODE
+
+    def unit_key(self) -> str:
+        """The same thing without spaces, for a CSV column heading."""
+        return "intensity" if self.measures_raw() else "intensity_8bit"
 
     def value_at(self, x: int, y: int) -> "tuple[float, float] | None":
         """(display code, measured value) at an image pixel, or None if out of range."""
@@ -2252,9 +2343,12 @@ class WorkshopCanvas(QWidget):
                 continue
             try:
                 if a.kind == A_RULER and len(a.pts) >= 2:
+                    # Both numbers, always: the pixel count is what the picture is made
+                    # of, the real size is what the operator is asking about, and having
+                    # to switch between them is how the wrong one gets written down.
                     dpx = math.hypot(a.pts[1][0] - a.pts[0][0], a.pts[1][1] - a.pts[0][1])
                     a.label = (f"{dpx:.1f} px" if not slot.px_per_mm
-                               else f"{dpx / slot.px_per_mm:.3f} mm  ({dpx:.1f} px)")
+                               else f"{dpx:.1f} px  =  {_fmt_mm(dpx / slot.px_per_mm)}")
                 elif a.kind == A_ANGLE and len(a.pts) >= 3:
                     a.label = f"{angle_between(a.pts[0], a.pts[1], a.pts[2]):.1f}°"
                 elif a.kind == A_SCALEBAR and len(a.pts) >= 2:
@@ -2271,11 +2365,10 @@ class WorkshopCanvas(QWidget):
                 elif a.kind == A_CROSS and a.pts:
                     x, y = int(round(a.pts[0][0])), int(round(a.pts[0][1]))
                     v = slot.value_at(x, y)
-                    a.label = f"({x}, {y})  {v[1]:.0f} {unit}" if v else ""
+                    a.label = f"({x}, {y})  intensity {v[1]:.0f}" if v else ""
                 else:
                     st = region_stats(arr, _region_mask(a, arr.shape))
-                    a.label = ("" if not st else
-                               f"mean {st['mean']:.1f}  max {st['max']:.0f} {unit}")
+                    a.label = _region_caption(a, st, slot, unit)
             except Exception:
                 a.label = ""
 
@@ -2437,12 +2530,19 @@ class WorkshopCanvas(QWidget):
             a = self.selected()
             if a is not None:
                 p = self._widget_to_img(pos)
+                shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
                 if self._drag_handle == "move":
                     a.translate(p.x() - self._drag_last.x(), p.y() - self._drag_last.y())
                     self._drag_last = p
                 else:
-                    a.set_handle(self._drag_handle, p.x(), p.y(),
-                                 square=bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+                    if shift and a.kind in _SEG_KINDS and \
+                            self._drag_handle in ("p0", "p1") and len(a.pts) >= 2:
+                        # Straighten against the END THAT IS STAYING PUT, so an existing
+                        # ruler can be squared up without redrawing it.
+                        anchor = a.pts[1] if self._drag_handle == "p0" else a.pts[0]
+                        sx, sy = snap_direction(anchor, p.x(), p.y())
+                        p = QPointF(sx, sy)
+                    a.set_handle(self._drag_handle, p.x(), p.y(), square=shift)
                 self.update_labels()
                 self.update()
             return
@@ -2452,12 +2552,15 @@ class WorkshopCanvas(QWidget):
             if self._new.kind == A_FREE:
                 self._new.pts.append([p.x(), p.y()])
             else:
-                if e.modifiers() & Qt.KeyboardModifier.ShiftModifier and \
-                        self._new.kind in _BOX_KINDS:
+                shift = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                if shift and self._new.kind in _BOX_KINDS:
                     x0, y0 = self._new.pts[0]
                     side = max(abs(p.x() - x0), abs(p.y() - y0))
                     p = QPointF(x0 + math.copysign(side, p.x() - x0),
                                 y0 + math.copysign(side, p.y() - y0))
+                elif shift and self._new.kind in _SEG_KINDS:
+                    # Ruler, line, arrow and profile line all straighten under Shift.
+                    p = QPointF(*snap_direction(self._new.pts[0], p.x(), p.y()))
                 self._new.pts[1] = [p.x(), p.y()]
             self._dragged = True
             self.update()
@@ -2977,8 +3080,10 @@ def _draw_caption(p: QPainter, a: "_Annot", to_widget, scale: float, col: QColor
     f = QFont("Segoe UI", max(7, int(round(9 * min(max(scale, 0.6), 2.0)))))
     p.setFont(f)
     fm = QFontMetrics(f)
-    w = fm.horizontalAdvance(a.label) + 8
-    h = fm.height() + 4
+    # A region has more to say than fits on one line, so the plate grows with the text.
+    lines = a.label.split("\n")
+    w = max(fm.horizontalAdvance(t) for t in lines) + 8
+    h = fm.height() * len(lines) + 4
     r = QRectF(anchor.x(), anchor.y() - h - 3, w, h)
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(QBrush(QColor(0, 0, 0, 165)))
@@ -3083,6 +3188,211 @@ def _small_label(text: str) -> QLabel:
     return lbl
 
 
+def _value_label(text: str, width: int = 26) -> QLabel:
+    """The number that belongs to a slider. Right aligned and given a fixed width so
+    the controls beside it do not shuffle sideways as the digits change."""
+    lbl = QLabel(text)
+    lbl.setStyleSheet("color: #111; font-size: 11px; font-weight: 600;")
+    lbl.setMinimumWidth(width)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    return lbl
+
+
+def _size_slider(lo: int, hi: int, start: int, tip: str, width: int = 96) -> QSlider:
+    sl = QSlider(Qt.Orientation.Horizontal)
+    sl.setRange(lo, hi)
+    sl.setValue(start)
+    sl.setToolTip(tip)
+    sl.setFixedWidth(width)
+    return sl
+
+
+#  The zoom slider is spaced by ratio, not by percent: 2 % to 6400 % is a 3200-fold
+#  span, so a slider spread out evenly in percent would spend nine tenths of its
+#  travel above 640 % and make every ordinary zoom one indistinguishable notch at the
+#  far left. Every step here multiplies the magnification by the same small factor,
+#  which is what makes dragging feel even at 5 % and at 3000 % alike.
+_ZOOM_SLIDER_STEPS = 1000
+_ZOOM_SLIDER_SPAN = 3200.0
+
+
+def _zoom_pct_to_slider(pct: float) -> int:
+    pct = max(2.0, min(6400.0, float(pct)))
+    return int(round(_ZOOM_SLIDER_STEPS
+                     * math.log(pct / 2.0) / math.log(_ZOOM_SLIDER_SPAN)))
+
+
+def _zoom_slider_to_pct(pos: int) -> float:
+    return 2.0 * (_ZOOM_SLIDER_SPAN ** (pos / _ZOOM_SLIDER_STEPS))
+
+
+class _StrokePreview(QWidget):
+    """The little sample beside the Line and Brush sliders. It draws a stroke in the
+    colour and thickness the next drawn item will get, so the weight can be seen
+    instead of guessed from a number.
+
+    Sizes up to _TRUE_UP_TO are drawn at their real thickness — that is the range
+    almost every drawing stays in, and there the sample is exact. Above it the box
+    would fill up solid and 20 would look the same as 200, so the rest of the range is
+    squeezed into the height that is left: a bigger number always looks thicker, but
+    no longer at true size. The frame turns amber and dashed to say so, and the number
+    beside the slider is the exact one either way."""
+
+    _TRUE_UP_TO = 14.0
+
+    def __init__(self, curved: bool, max_width: int, tip: str, parent=None):
+        super().__init__(parent)
+        self._curved = curved
+        self._max_width = float(max(2, max_width))
+        self._width = 2
+        self._color = QColor(255, 0, 0)
+        self.setFixedSize(64, 28)
+        self.setToolTip(tip)
+        self.setAccessibleName(tip)
+
+    def set_stroke(self, width: int, color: QColor):
+        w = max(1, int(width))
+        col = QColor(color)
+        if w == self._width and col == self._color:
+            return
+        self._width = w
+        self._color = col
+        self.update()
+
+    def _drawn_width(self) -> "tuple[float, bool]":
+        room = float(self.height() - 4)
+        true_cap = min(room, self._TRUE_UP_TO)
+        w = float(self._width)
+        if w <= true_cap:
+            return w, False
+        top = max(self._max_width, true_cap + 1.0)
+        frac = math.log(min(w, top) / true_cap) / math.log(top / true_cap)
+        return true_cap + (room - true_cap) * frac, True
+
+    def paintEvent(self, _e):
+        w, squeezed = self._drawn_width()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        frame = QPen(QColor("#c98a1e") if squeezed else QColor("#c9ced6"))
+        if squeezed:
+            frame.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(frame)
+        p.setBrush(QBrush(QColor("#ffffff")))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0),
+                          3, 3)
+
+        p.setPen(QPen(self._color, w, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        x0, x1 = 8.0, self.width() - 8.0
+        cy = self.height() / 2.0
+        if self._curved:
+            # The wave flattens out as the stroke grows, so a fat brush stays inside
+            # the box instead of being cut off at the top and bottom.
+            amp = max(0.0, (float(self.height() - 4) - w) / 2.0)
+            path = QPainterPath(QPointF(x0, cy + amp))
+            path.cubicTo(QPointF(x0 + (x1 - x0) * 0.35, cy - amp * 1.8),
+                         QPointF(x1 - (x1 - x0) * 0.35, cy + amp * 1.8),
+                         QPointF(x1, cy - amp))
+            p.drawPath(path)
+        else:
+            p.drawLine(QPointF(x0, cy), QPointF(x1, cy))
+
+
+class _StrokeZoomPopup(QWidget):
+    """The big sample that pops up while a size slider is being dragged.
+
+    The little sample beside the slider runs out of height above _StrokePreview's true
+    range, so a 200 wide brush ends up looking much the same as a 60 wide one. This
+    window has the room to draw the stroke at its real thickness for the whole range.
+    It appears when the slider is grabbed and goes away when it is let go."""
+
+    _PAD = 20
+
+    def __init__(self, curved: bool, max_width: int, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip |
+                         Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._curved = curved
+        self._width = 2
+        self._color = QColor(255, 0, 0)
+        side = int(max(2, max_width)) + 2 * self._PAD
+        # The extra height is the caption strip at the top; the stroke gets the rest.
+        self.setFixedSize(max(260, side + 90), max(96, side) + 18)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def show_for(self, anchor: QWidget, width: int, color: QColor, hold_ms: int = 0):
+        """Put the sample above `anchor` — below it when the screen ends there — and
+        keep it up until hide(), or for hold_ms when the size came from the keyboard
+        and there is no release to wait for."""
+        self._width = max(1, int(width))
+        self._color = QColor(color)
+        top_left = anchor.mapToGlobal(anchor.rect().topLeft())
+        cx = top_left.x() + anchor.width() // 2
+        x = cx - self.width() // 2
+        y = top_left.y() - self.height() - 8
+        scr = QGuiApplication.screenAt(top_left) or QGuiApplication.primaryScreen()
+        if scr is not None:
+            g = scr.availableGeometry()
+            x = max(g.left() + 2, min(x, g.right() - self.width() - 2))
+            if y < g.top() + 2:
+                y = top_left.y() + anchor.height() + 8
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.update()
+        if hold_ms > 0:
+            self._hide_timer.start(hold_ms)
+        else:
+            self._hide_timer.stop()
+
+    def hide(self):
+        self._hide_timer.stop()
+        super().hide()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QPen(QColor("#9aa2ad")))
+        p.setBrush(QBrush(QColor("#ffffff")))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0),
+                          5, 5)
+
+        f = QFont(); f.setPointSize(8)
+        p.setFont(f)
+        p.setPen(QPen(QColor("#666666")))
+        p.drawText(QRectF(6, 3, self.width() - 12, 14),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   f"{self._width} px — true size at 100 % zoom")
+
+        w = float(self._width)
+        p.setPen(QPen(self._color, w, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        x0 = self._PAD + w / 2.0
+        x1 = self.width() - self._PAD - w / 2.0
+        top = 18.0
+        room = self.height() - top - 4.0
+        cy = top + room / 2.0
+        # The wave is only drawn while there is clearly room left over for it. A fat
+        # stroke bent into a box it nearly fills reads as a red blob; the same stroke
+        # drawn straight shows its thickness at a glance.
+        if self._curved and w <= room * 0.45:
+            # A cubic swings out to roughly 3/4 of the way to its control points, so
+            # the amplitude is scaled back by that much to keep the stroke inside.
+            amp = max(0.0, (room - w) / 2.0) / 1.35
+            path = QPainterPath(QPointF(x0, cy + amp))
+            path.cubicTo(QPointF(x0 + (x1 - x0) * 0.35, cy - amp * 1.8),
+                         QPointF(x1 - (x1 - x0) * 0.35, cy + amp * 1.8),
+                         QPointF(x1, cy - amp))
+            p.drawPath(path)
+        else:
+            p.drawLine(QPointF(x0, cy), QPointF(x1, cy))
+
+
 class _StatCell(QLabel):
     """One statistics readout. Double-click copies the number, the way the Image
     Slider's spatial-contrast cells do."""
@@ -3130,10 +3440,10 @@ class _HistogramWidget(QWidget):
         self._lo, self._hi = 0, 255
         self._drag = ""
         self._vmax = 255.0
-        self._unit = "code"
+        self._unit = UNIT_CODE
 
     def set_data(self, values: "np.ndarray | None", vmax: float = 255.0,
-                 unit: str = "code"):
+                 unit: str = UNIT_CODE):
         """`values` are in the axis unit, `vmax` is the top of the axis (255 for display
         codes, the camera's full scale for native counts)."""
         self._vmax = float(vmax) if vmax and vmax > 0 else 255.0
@@ -4273,6 +4583,70 @@ def _ico_flip_v(p, c):
     p.drawPolygon(QPolygonF([QPointF(5.4, 12.0), QPointF(14.6, 12.0), QPointF(10.0, 17.0)]))
 
 
+def _ico_play(p, c):
+    # Filled: this is the button that starts the work, and a hollow triangle next to
+    # hollow outline icons stops reading as the primary action.
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(c))
+    p.drawPolygon(QPolygonF([QPointF(6.4, 4.4), QPointF(6.4, 15.6),
+                             QPointF(15.6, 10.0)]))
+
+
+def _ico_step_prev(p, c):
+    # Triangle plus a bar, the transport symbol for "one step back", not a bare
+    # arrow — a bare arrow is what a scrollbar uses for "keep going".
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(c))
+    p.drawPolygon(QPolygonF([QPointF(15.2, 4.6), QPointF(15.2, 15.4),
+                             QPointF(7.6, 10.0)]))
+    p.drawRect(QRectF(4.6, 4.6, 2.1, 10.8))
+
+
+def _ico_step_next(p, c):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(c))
+    p.drawPolygon(QPolygonF([QPointF(4.8, 4.6), QPointF(4.8, 15.4),
+                             QPointF(12.4, 10.0)]))
+    p.drawRect(QRectF(13.3, 4.6, 2.1, 10.8))
+
+
+def _ico_popout(p, c):
+    # A frame with an arrow leaving it through the top-right corner.
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 1.8, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRoundedRect(QRectF(3.0, 6.4, 10.6, 10.6), 1.4, 1.4)
+    p.setPen(_ipen(c, 1.9))
+    p.drawLine(QPointF(11.0, 9.0), QPointF(16.2, 3.8))
+    _arrow_head(p, c, QPointF(16.9, 3.1), 0.7071, -0.7071)
+
+
+def _ico_calendar(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 1.8, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRoundedRect(QRectF(3.0, 5.0, 14.0, 12.2), 1.4, 1.4)
+    p.setPen(_ipen(c, 1.6, cap=Qt.PenCapStyle.FlatCap))
+    p.drawLine(QPointF(3.0, 8.6), QPointF(17.0, 8.6))          # the header band
+    p.drawLine(QPointF(6.6, 2.9), QPointF(6.6, 5.9))           # the two rings
+    p.drawLine(QPointF(13.4, 2.9), QPointF(13.4, 5.9))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(c))
+    for x in (5.9, 9.3, 12.7):                                 # one week of days
+        p.drawRect(QRectF(x, 11.0, 1.8, 1.8))
+    for x in (5.9, 9.3):
+        p.drawRect(QRectF(x, 14.0, 1.8, 1.8))
+
+
+def _ico_camera(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 1.8, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRoundedRect(QRectF(2.6, 6.4, 14.8, 10.4), 1.6, 1.6)  # the body
+    p.drawLine(QPointF(6.4, 6.4), QPointF(7.6, 4.2))           # the top bevel
+    p.drawLine(QPointF(11.6, 6.4), QPointF(10.4, 4.2))
+    p.drawLine(QPointF(7.6, 4.2), QPointF(10.4, 4.2))
+    p.setPen(_ipen(c, 1.9))
+    p.drawEllipse(QRectF(6.8, 8.4, 6.4, 6.4))                  # the lens
+
+
 # "180°" keeps its plain text: a third circular arrow next to Undo and Original
 # would be one turning arrow too many to tell apart.
 _ICON_RECIPES_ACTION = {
@@ -4280,6 +4654,10 @@ _ICON_RECIPES_ACTION = {
     "reset": _ico_reset, "rotate_left": _ico_rotate_left,
     "rotate_right": _ico_rotate_right,
     "flip_h": _ico_flip_h, "flip_v": _ico_flip_v,
+    # Used by the One Moment tab, which has no icon set of its own — one painted
+    # icon vocabulary for the whole program.
+    "play": _ico_play, "step_prev": _ico_step_prev, "step_next": _ico_step_next,
+    "popout": _ico_popout, "calendar": _ico_calendar, "camera": _ico_camera,
 }
 
 
@@ -4315,7 +4693,8 @@ _TOOL_STRIP = [
     ("Polygon", "Polygon — click each corner, right click or double click to finish", TOOL_POLY),
     ("Text", "Text — click, then type; Enter confirms", TOOL_TEXT),
     None,
-    ("Ruler", "Ruler — measures length; set a scale to read it in millimetres", TOOL_RULER),
+    ("Ruler", "Ruler — length in pixels and in real size. Hold Shift while drawing to "
+              "keep it straight", TOOL_RULER),
     ("Angle", "Angle — click the end of one arm, then the corner, then the end of the "
               "other arm", TOOL_ANGLE),
     ("Rectangle region", "Rectangle region — min, max, mean and more for that area", TOOL_ROI_RECT),
@@ -4377,6 +4756,17 @@ class WorkshopWidget(QWidget):
         self._view_timer.timeout.connect(self._apply_view_now)
 
         self._ui_state = self._load_ui_state()
+        #  The pixel size a newly opened image starts with. There is no on / off: every
+        #  length is reported in pixels AND in real size, so a scale can only help. The
+        #  Basler pitch is the starting point and whatever is typed over it is kept for
+        #  the next image and the next session.
+        try:
+            self._sensor_default_um = float(self._ui_state.get("sensor_um",
+                                                               BASLER_PIXEL_UM))
+        except (TypeError, ValueError):
+            self._sensor_default_um = BASLER_PIXEL_UM
+        if not self._sensor_default_um > 0:
+            self._sensor_default_um = BASLER_PIXEL_UM
         self._build_ui()
         self._update_slot_list()
         self._set_tool(TOOL_PAN)
@@ -4526,19 +4916,39 @@ class WorkshopWidget(QWidget):
         row2.addWidget(self._color_btn)
 
         row2.addWidget(_small_label("Line"))
-        self._line_sb = QSpinBox(); self._line_sb.setRange(1, 60); self._line_sb.setValue(2)
-        self._line_sb.setFixedWidth(48)
-        self._line_sb.setToolTip("Thickness of lines and outlines. With something "
-                                 "selected it changes that item.")
-        self._line_sb.valueChanged.connect(self._on_style_changed)
-        row2.addWidget(self._line_sb)
+        self._line_sl = _size_slider(
+            1, 60, 2, "Thickness of lines and outlines. With something selected it "
+                      "changes that item.")
+        row2.addWidget(self._line_sl)
+        self._line_val = _value_label("2")
+        row2.addWidget(self._line_val)
+        self._line_prev = _StrokePreview(False, 60,
+                                        "How thick a straight line will come out")
+        row2.addWidget(self._line_prev)
 
         row2.addWidget(_small_label("Brush"))
-        self._brush_sb = QSpinBox(); self._brush_sb.setRange(1, 200); self._brush_sb.setValue(6)
-        self._brush_sb.setFixedWidth(52)
-        self._brush_sb.setToolTip("Thickness of the freehand line")
-        self._brush_sb.valueChanged.connect(self._on_style_changed)
-        row2.addWidget(self._brush_sb)
+        self._brush_sl = _size_slider(1, 200, 6, "Thickness of the freehand line")
+        row2.addWidget(self._brush_sl)
+        self._brush_val = _value_label("6", 30)
+        row2.addWidget(self._brush_val)
+        self._brush_prev = _StrokePreview(True, 200,
+                                         "How thick a freehand stroke will come out")
+        row2.addWidget(self._brush_prev)
+
+        # The big true-size samples. They are separate windows, so they can be far
+        # bigger than the row has height for.
+        self._line_zoom = _StrokeZoomPopup(False, 60, self)
+        self._brush_zoom = _StrokeZoomPopup(True, 200, self)
+        for sl, pop in ((self._line_sl, self._line_zoom),
+                        (self._brush_sl, self._brush_zoom)):
+            sl.sliderPressed.connect(
+                lambda s=sl, w=pop: w.show_for(s, s.value(), self._draw_color))
+            sl.sliderReleased.connect(pop.hide)
+
+        # Connected only once both samples exist, so the first drag cannot land in
+        # _on_style_changed before there is anything to draw into.
+        self._line_sl.valueChanged.connect(self._on_style_changed)
+        self._brush_sl.valueChanged.connect(self._on_style_changed)
 
         row2.addWidget(_small_label("Text"))
         self._text_sb = QSpinBox(); self._text_sb.setRange(6, 200); self._text_sb.setValue(16)
@@ -4554,21 +4964,22 @@ class WorkshopWidget(QWidget):
         self._fill_cb.toggled.connect(self._on_style_changed)
         row2.addWidget(self._fill_cb)
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setStyleSheet("color: #c3c9d2;")
-        row2.addWidget(sep2)
+        row2.addStretch(1)
+        outer.addLayout(row2)
 
-        row2.addWidget(_small_label("Zoom"))
-        self._zoom_sb = QDoubleSpinBox()
-        self._zoom_sb.setRange(2.0, 6400.0)
-        self._zoom_sb.setDecimals(0)
-        self._zoom_sb.setSuffix(" %")
-        self._zoom_sb.setValue(100.0)
-        self._zoom_sb.setFixedWidth(84)
-        self._zoom_sb.setKeyboardTracking(False)
-        self._zoom_sb.setToolTip("Magnification — type a value or use the buttons")
-        self._zoom_sb.valueChanged.connect(self._on_zoom_box)
-        row2.addWidget(self._zoom_sb)
+        # The view and edit buttons sit on their own row: the three sliders and their
+        # samples take the width the spin boxes used to leave over.
+        row3 = QHBoxLayout(); row3.setSpacing(5)
+        row3.addWidget(_small_label("Zoom"))
+        self._zoom_sl = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_sl.setRange(0, _ZOOM_SLIDER_STEPS)
+        self._zoom_sl.setValue(_zoom_pct_to_slider(100.0))
+        self._zoom_sl.setFixedWidth(150)
+        self._zoom_sl.setToolTip("Magnification — drag it, or use the buttons beside it")
+        self._zoom_sl.valueChanged.connect(self._on_zoom_slider)
+        row3.addWidget(self._zoom_sl)
+        self._zoom_val = _value_label("100 %", 50)
+        row3.addWidget(self._zoom_val)
         for text, icon, tip, fn in (
                 ("", "plus", "Zoom in", lambda: self._canvas.zoom_in()),
                 ("", "minus", "Zoom out", lambda: self._canvas.zoom_out()),
@@ -4581,11 +4992,11 @@ class WorkshopWidget(QWidget):
             if icon:
                 b.setAccessibleName(tip)
             b.clicked.connect(fn)
-            row2.addWidget(b)
+            row3.addWidget(b)
 
         sep3 = QFrame(); sep3.setFrameShape(QFrame.Shape.VLine)
         sep3.setStyleSheet("color: #c3c9d2;")
-        row2.addWidget(sep3)
+        row3.addWidget(sep3)
 
         # No setShortcut here: a button shortcut reaches the whole window and would
         # fire from the other tabs too. _install_shortcuts binds these keys instead,
@@ -4604,9 +5015,9 @@ class WorkshopWidget(QWidget):
         self._btn_keys.clicked.connect(self._show_shortcuts)
         for b in (self._btn_undo, self._btn_redo, self._btn_clear_annots,
                   self._btn_reset_src, self._btn_keys):
-            row2.addWidget(b)
-        row2.addStretch(1)
-        outer.addLayout(row2)
+            row3.addWidget(b)
+        row3.addStretch(1)
+        outer.addLayout(row3)
         return box
 
     # ---- keyboard shortcuts --------------------------------------------------
@@ -4726,6 +5137,9 @@ class WorkshopWidget(QWidget):
     def hideEvent(self, e):
         super().hideEvent(e)
         self._set_shortcuts_enabled(False)
+        # A separate window would otherwise stay on screen after the tab is left.
+        self._line_zoom.hide()
+        self._brush_zoom.hide()
 
     def _annotate_shortcut_tooltips(self):
         """Write the key into the tooltip of the button that does the same thing — a
@@ -4770,6 +5184,9 @@ class WorkshopWidget(QWidget):
             ("0", "Fit the whole picture in the window"),
             ("1", "Show at true size, 1:1"),
             ("Arrows", "Move the selected item, or the picture — Shift for bigger steps"),
+            ("Shift + drag", "Ruler, line, arrow and profile line come out straight — "
+                             "across, down or at 45°. Rectangles and ellipses come out "
+                             "square. Works on an end point of a finished line too."),
             ("Delete", "Delete the selected item"),
             ("Esc", "Drop the selection, or the polygon being drawn"),
         ]))
@@ -4879,7 +5296,7 @@ class WorkshopWidget(QWidget):
                 act(f"Put a point marker at {ix}, {iy}",
                     lambda: self._canvas.add_annot(
                         _Annot(A_CROSS, [[float(ix), float(iy)]],
-                               self._draw_color.name(), self._line_sb.value())))
+                               self._draw_color.name(), self._line_sl.value())))
         act("Delete the selected item", self._canvas.delete_selected, sel is not None)
         act("Clear the whole drawing", self._canvas.clear_annots,
             slot is not None and bool(slot.annots))
@@ -5085,23 +5502,54 @@ class WorkshopWidget(QWidget):
                        "table, ready to copy or save as CSV")
         b_table.clicked.connect(self._show_results)
         b_hist = _btn("Histogram numbers…",
-                      "The counts behind the histogram, as numbers")
+                      "The numbers behind the histogram: how many pixels at each "
+                      "intensity")
         b_hist.clicked.connect(self._show_histogram_numbers)
         row2.addWidget(b_table); row2.addWidget(b_hist)
         lay.addLayout(row2)
 
+        #  Scale. One number decides it all: how much of the object one pixel covers.
+        #  It is always in force — there is no "measuring in pixels" mode, because every
+        #  length is reported in pixels AND in real size side by side, so nothing is
+        #  lost by knowing the size and everything is lost by having to switch it on.
         lay.addWidget(_small_label("Scale"))
+        srow_px = QHBoxLayout()
+        self._sensor_guard = False          # True while the panel is writing the controls
+        srow_px.addWidget(_small_label("One pixel is"))
+        self._sensor_um_sb = QDoubleSpinBox()
+        self._sensor_um_sb.setRange(0.001, 10000.0)
+        self._sensor_um_sb.setDecimals(3)
+        self._sensor_um_sb.setSingleStep(0.1)
+        self._sensor_um_sb.setValue(self._sensor_default_um)
+        self._sensor_um_sb.setSuffix(" µm")
+        self._sensor_um_sb.setFixedWidth(96)
+        self._sensor_um_sb.setToolTip(
+            f"How much of the object one pixel covers. The Basler cameras here have "
+            f"{BASLER_PIXEL_UM} µm pixels, which is what this starts at.\n"
+            "That is the size AT THE SENSOR: with a lens or a magnifier in front, put "
+            "in the size the picture really has on the object — or measure it with "
+            "“Set scale…”.\n"
+            "A camera acquiring with 2×2 binning stores one pixel per four, so double "
+            "it there.\nThe value stays for the next image you open.")
+        self._sensor_um_sb.valueChanged.connect(self._on_sensor_um)
+        srow_px.addWidget(self._sensor_um_sb)
+        srow_px.addStretch(1)
+        lay.addLayout(srow_px)
+
         srow = QHBoxLayout()
-        self._scale_lbl = _small_label("not set — lengths in pixels")
+        self._scale_lbl = _small_label("—")
         self._scale_lbl.setWordWrap(True)
         srow.addWidget(self._scale_lbl, 1)
         lay.addLayout(srow)
+
         srow2 = QHBoxLayout()
         b_setscale = _btn("Set scale…",
                           "Draw a ruler over something of a known size, select it, "
-                          "then enter that size here")
+                          "then enter that size here — the pixel size is worked out "
+                          "from it")
         b_setscale.clicked.connect(self._set_scale)
-        b_clrscale = _btn("Clear", "Go back to measuring in pixels")
+        b_clrscale = _btn(f"Camera ({BASLER_PIXEL_UM} µm)",
+                          "Back to the camera's own pixel size")
         b_clrscale.clicked.connect(self._clear_scale)
         srow2.addWidget(b_setscale); srow2.addWidget(b_clrscale)
         lay.addLayout(srow2)
@@ -5171,7 +5619,8 @@ class WorkshopWidget(QWidget):
         sec = self._add_section("filters", "Filters", False)
         lay = sec.body_layout
         warn = _small_label(
-            "These change the picture itself, and the counts behind it the same way, "
+            "These change the picture itself, and the measured intensity behind it the "
+            "same way, "
             "so what you measure still matches what you see. Every step can be undone.")
         warn.setWordWrap(True)
         warn.setStyleSheet("color: #4a5566; font-size: 10px; font-style: italic;")
@@ -5403,6 +5852,7 @@ class WorkshopWidget(QWidget):
         if raw is None:
             slot.raw_note = "reading the source file…"
             QThreadPool.globalInstance().start(_RawLoadTask(slot, self._raw_sig))
+        self._apply_default_sensor_scale(slot)
         self._slots.append(slot)
         self._update_slot_list()
         self._activate_slot(len(self._slots) - 1)
@@ -5465,6 +5915,8 @@ class WorkshopWidget(QWidget):
             note="" if raw is not None else slot.raw_note)
         new.source_path = slot.source_path
         new.px_per_mm = px_per_mm
+        new.px_um = slot.px_um
+        new.px_um_measured = slot.px_um_measured
         new.view = _ViewSettings(**vars(slot.view))
         self._after_change()
         self._say(f"Duplicated the {what}: {base.shape[1]} × {base.shape[0]} px. "
@@ -5604,8 +6056,9 @@ class WorkshopWidget(QWidget):
         if slot is self._slot():
             self._after_change()
             if raw is not None:
-                self._say(f"Native values loaded from the source file — "
-                          f"measurements are in counts{f' ({camera})' if camera else ''}.")
+                self._say(f"Native values loaded from the source file — measurements "
+                          f"are the camera's own pixel intensity"
+                          f"{f' ({camera})' if camera else ''}.")
 
     # ──────────────────────────────────────────────────── Tools ───
 
@@ -5621,11 +6074,12 @@ class WorkshopWidget(QWidget):
         something is selected — restyle that item too, so a shape does not have to be
         deleted and drawn again just to change its colour."""
         c = self._canvas
-        c.line_width = self._line_sb.value()
-        c.brush_size = self._brush_sb.value()
+        c.line_width = self._line_sl.value()
+        c.brush_size = self._brush_sl.value()
         c.font_size = self._text_sb.value()
         c.fill_shapes = self._fill_cb.isChecked()
         c.draw_color = self._draw_color
+        self._refresh_stroke_samples()
         a = c.selected()
         if a is None:
             return
@@ -5635,6 +6089,24 @@ class WorkshopWidget(QWidget):
         if a.kind in (A_RECT, A_ELLIPSE, A_POLY):
             a.filled = c.fill_shapes
         c.update()
+
+    def _refresh_stroke_samples(self):
+        """Keep the two numbers and the two samples beside the sliders showing what a
+        stroke drawn right now would look like."""
+        line_w = self._line_sl.value()
+        brush_w = self._brush_sl.value()
+        self._line_val.setText(str(line_w))
+        self._brush_val.setText(str(brush_w))
+        self._line_prev.set_stroke(line_w, self._draw_color)
+        self._brush_prev.set_stroke(brush_w, self._draw_color)
+        # The big sample follows the drag, and for a size set with the arrow keys —
+        # where there is no release to hide it — it shows itself for a moment.
+        for sl, pop, w in ((self._line_sl, self._line_zoom, line_w),
+                           (self._brush_sl, self._brush_zoom, brush_w)):
+            if sl.isSliderDown():
+                pop.show_for(sl, w, self._draw_color)
+            elif pop.isVisible() or sl.hasFocus():
+                pop.show_for(sl, w, self._draw_color, hold_ms=1200)
 
     def _pick_draw_color(self):
         col = QColorDialog.getColor(self._draw_color, self, "Drawing colour")
@@ -5653,6 +6125,7 @@ class WorkshopWidget(QWidget):
         self._draw_color = col
         self._canvas.draw_color = col
         self._update_color_btn()
+        self._refresh_stroke_samples()
         self._say(f"Picked colour {col.name()} — R {col.red()}  G {col.green()}  B {col.blue()}")
 
     # ───────────────────────────────────────────────── History ────
@@ -5760,7 +6233,7 @@ class WorkshopWidget(QWidget):
 
             gray = None
             lo, hi = v.win_lo, v.win_hi
-            hist_vals, hist_max, hist_unit = None, 255.0, "code"
+            hist_vals, hist_max, hist_unit = None, 255.0, UNIT_CODE
             if slot is not None:
                 # The display window is still decided on the 8-bit picture — that is
                 # what render_view maps — but the bars are counted from the native data
@@ -5768,11 +6241,11 @@ class WorkshopWidget(QWidget):
                 gray = np.clip(_to_gray(slot.base), 0, 255)
                 if v.auto_contrast:
                     lo, hi = auto_window(gray)
-                hist_vals, hist_unit = gray, "code"
+                hist_vals, hist_unit = gray, UNIT_CODE
                 if slot.measures_raw() and slot.full_scale:
                     raw = slot.raw
                     hist_vals = _to_gray(raw) if raw.ndim == 3 else raw
-                    hist_max, hist_unit = float(slot.full_scale), "counts"
+                    hist_max, hist_unit = float(slot.full_scale), UNIT_RAW
             self._hist.set_data(hist_vals, hist_max, hist_unit)
             self._hist.set_window(lo, hi)
 
@@ -5799,15 +6272,30 @@ class WorkshopWidget(QWidget):
 
     # ───────────────────────────────────────────── Zoom / status ──
 
-    def _on_zoom_box(self, pct: float):
+    def _on_zoom_slider(self, pos: int):
         if self._sync_guard:
             return
-        self._canvas.set_zoom_percent(pct)
+        self._canvas.set_zoom_percent(_zoom_slider_to_pct(pos))
+        # With no picture on the canvas the zoom is refused, so the handle goes back
+        # instead of standing at a magnification that is not in force. When it is
+        # accepted the round trip is a step at most, which is left alone — putting the
+        # handle back then would make it fight the mouse.
+        real = _zoom_pct_to_slider(self._canvas.zoom_percent())
+        if abs(real - pos) > 1:
+            self._sync_guard = True
+            self._zoom_sl.setValue(real)
+            self._sync_guard = False
+        self._zoom_val.setText(f"{self._canvas.zoom_percent():.0f} %")
 
     def _on_zoom_changed(self, _zoom: float):
+        pct = self._canvas.zoom_percent()
         self._sync_guard = True
-        self._zoom_sb.setValue(round(self._canvas.zoom_percent()))
+        # While the handle is held, only the number follows: putting the handle back
+        # on the rounded position would make it stutter under the finger.
+        if not self._zoom_sl.isSliderDown():
+            self._zoom_sl.setValue(_zoom_pct_to_slider(pct))
         self._sync_guard = False
+        self._zoom_val.setText(f"{pct:.0f} %")
         self._update_status()
 
     def _on_cursor_moved(self, x: float, y: float):
@@ -5824,10 +6312,10 @@ class WorkshopWidget(QWidget):
                 if slot.measures_raw():
                     frac = (f"  ({val / slot.full_scale * 100:.1f} % of full scale)"
                             if slot.full_scale else "")
-                    self._cursor_text = (f"x {ix}  y {iy}   {val:.0f} counts"
-                                         f"{frac}   display code {code:.0f}")
+                    self._cursor_text = (f"x {ix}  y {iy}   intensity {val:.0f}"
+                                         f"{frac}   8-bit {code:.0f}")
                 else:
-                    self._cursor_text = f"x {ix}  y {iy}   value {code:.0f}"
+                    self._cursor_text = f"x {ix}  y {iy}   intensity {code:.0f} (8-bit)"
         self._update_status()
 
     def _update_status(self, message: str = ""):
@@ -5916,7 +6404,8 @@ class WorkshopWidget(QWidget):
             for c in self._cells.values():
                 c.set_value("—")
             self._measure_src_lbl.setText("—")
-            self._scale_lbl.setText("not set — lengths in pixels")
+            self._scale_lbl.setText("—")
+            self._sync_sensor_controls(None)
             return
 
         arr = slot.measure_arr()
@@ -5930,12 +6419,14 @@ class WorkshopWidget(QWidget):
             what = "whole image"
         st = region_stats(arr, mask)
 
-        src = (f"{what} — values in {unit}"
+        src = (f"{what} — {unit}"
                + (f", full scale {slot.full_scale:.0f}" if slot.measures_raw()
                   and slot.full_scale else ""))
         if slot.raw_note:
             src += f"  ({slot.raw_note})"
         self._measure_src_lbl.setText(src)
+        self._scale_lbl.setText(self._scale_text(slot))
+        self._sync_sensor_controls(slot)
 
         if not st:
             for c in self._cells.values():
@@ -5954,9 +6445,76 @@ class WorkshopWidget(QWidget):
                 f"{st['count'] / (slot.px_per_mm ** 2):.4g} mm²")
         else:
             self._cells["area"].set_value(f"{st['count']} px²")
-        self._scale_lbl.setText(
-            f"{slot.px_per_mm:.3f} px per mm — lengths in mm" if slot.px_per_mm
-            else "not set — lengths in pixels")
+
+    @staticmethod
+    def _scale_text(slot) -> str:
+        """The Scale line: the pixel size in force, and where it came from. A ruler and
+        the camera's nominal pitch are equally valid but not equally trustworthy, so the
+        line always says which of the two is being used."""
+        if not slot or not slot.px_per_mm:
+            return "no scale — lengths in pixels only"
+        um = slot.px_um or (1000.0 / slot.px_per_mm)
+        where = "measured with a ruler" if slot.px_um_measured else "camera pixel size"
+        return f"1 pixel = {um:.3f} µm  ({where})  —  {slot.px_per_mm:.1f} px per mm"
+
+    def _sync_sensor_controls(self, slot):
+        """Put the pixel size box back in step with the active image."""
+        if not hasattr(self, "_sensor_um_sb"):
+            return
+        self._sensor_guard = True
+        try:
+            self._sensor_um_sb.setEnabled(slot is not None)
+            if slot is not None and slot.px_um:
+                self._sensor_um_sb.setValue(float(slot.px_um))
+        finally:
+            self._sensor_guard = False
+
+    def _remember_sensor_default(self, um: float):
+        """Whatever is in force here is what the next image opens with, and it outlives
+        the session — an operator working behind a lens should not have to correct every
+        frame they open."""
+        if um and um > 0:
+            self._sensor_default_um = float(um)
+            self._ui_state["sensor_um"] = float(um)
+            self._save_ui_state()
+
+    def _apply_default_sensor_scale(self, slot):
+        """Every new image starts with a pixel size already in force — the camera's own,
+        or whatever was last put in the box."""
+        if slot is None or slot.px_per_mm:
+            return
+        um = float(getattr(self, "_sensor_default_um", BASLER_PIXEL_UM))
+        if um <= 0:
+            um = BASLER_PIXEL_UM
+        slot.px_um = um
+        slot.px_per_mm = 1000.0 / um
+        slot.px_um_measured = False
+
+    def _set_pixel_size(self, um: float, measured: bool, message: str):
+        """One way in for every change of scale, so px_um and px_per_mm can never drift
+        apart and every path lands in the undo history."""
+        slot = self._slot()
+        if slot is None or um <= 0:
+            return
+        slot.push_undo()
+        slot.px_um = float(um)
+        slot.px_per_mm = 1000.0 / float(um)
+        slot.px_um_measured = bool(measured)
+        self._remember_sensor_default(um)
+        self._after_change()
+        self._say(message)
+
+    def _on_sensor_um(self, um: float):
+        """Typing a size re-scales straight away — no second click to apply, because a
+        value shown but not in force is a trap."""
+        if getattr(self, "_sensor_guard", False) or um <= 0:
+            return
+        self._remember_sensor_default(um)
+        slot = self._slot()
+        if slot is None:
+            return
+        self._set_pixel_size(um, False,
+                             f"One pixel is {um:.3f} µm — {1000.0 / um:.1f} px per mm.")
 
     def _set_scale(self):
         slot = self._slot()
@@ -5978,19 +6536,17 @@ class WorkshopWidget(QWidget):
                                f"How long is it in millimetres?", 1.0, 0.000001, 1e6, 6)
         if not ok or val <= 0:
             return
-        slot.push_undo()
-        slot.px_per_mm = dpx / val
-        self._after_change()
-        self._say(f"Scale set: {slot.px_per_mm:.3f} pixels per millimetre.")
+        # A measured ruler beats the camera's nominal pitch, so it becomes the pixel
+        # size — the box shows what was measured instead of contradicting it.
+        um = val * 1000.0 / dpx
+        self._set_pixel_size(
+            um, True, f"Scale measured: one pixel is {um:.3f} µm "
+                      f"({dpx / val:.1f} px per mm).")
 
     def _clear_scale(self):
-        slot = self._slot()
-        if slot is None or slot.px_per_mm is None:
-            return
-        slot.push_undo()
-        slot.px_per_mm = None
-        self._after_change()
-        self._say("Scale cleared — lengths are in pixels again.")
+        self._set_pixel_size(
+            BASLER_PIXEL_UM, False,
+            f"Back to the camera's own pixel size: {BASLER_PIXEL_UM} µm.")
 
     def _profile_samples(self, slot, a, width: int):
         """Samples along a profile line, in millimetres once a scale is set."""
@@ -6043,32 +6599,58 @@ class WorkshopWidget(QWidget):
         arr = slot.measure_arr()
         unit = slot.unit_name()
         mm = slot.px_per_mm
-        len_unit = "mm" if mm else "px"
-        area_unit = "mm²" if mm else "px²"
-        headers = ["#", "Item", "X", "Y", "Width", "Height", f"Length ({len_unit})",
-                   "Angle (°)", f"Min ({unit})", f"Max ({unit})", f"Mean ({unit})",
-                   f"Std ({unit})", f"Sum ({unit})", "Pixels", f"Area ({area_unit})",
-                   "Centre X", "Centre Y"]
+        #  Pixels AND real size, side by side, in every row: the pixel count is what the
+        #  picture is made of, the millimetres are what the answer is, and a table that
+        #  carries only one of them always turns out to be carrying the other one.
+        names = ["#", "Item", "X", "Y", "Width (px)", "Height (px)", "Width (mm)",
+                 "Height (mm)", "Length (px)", "Length (mm)", "Angle (°)",
+                 f"Min ({unit})", f"Max ({unit})", f"Mean ({unit})", f"Std ({unit})",
+                 f"Sum ({unit})", "Pixels", "Area (mm²)", "Centre X", "Centre Y"]
+        headers = list(names)
+        col = {n: i for i, n in enumerate(names)}
 
         def fmt(v, nd=2):
             return "" if v is None else f"{v:.{nd}f}"
 
-        def px2len(v):
-            return v / mm if mm else v
+        def real(v_px, nd=4):
+            """A pixel distance as millimetres, blank when there is no scale."""
+            return "" if not mm else f"{v_px / mm:.{nd}f}"
 
-        def stat_cells(st):
+        def new_row():
+            return [""] * len(headers)
+
+        def put(row, name, value):
+            row[col[name]] = value
+
+        def put_stats(row, st):
             if not st:
-                return [""] * 6 + [""] * 3
-            area = st["count"] / (mm * mm) if mm else st["count"]
-            return [fmt(st["min"], 0), fmt(st["max"], 0), fmt(st["mean"]),
-                    fmt(st["std"]), f"{st['sum']:.6g}", str(st["count"]),
-                    f"{area:.6g}", fmt(st.get("cx"), 1), fmt(st.get("cy"), 1)]
+                return
+            put(row, f"Min ({unit})", fmt(st["min"], 0))
+            put(row, f"Max ({unit})", fmt(st["max"], 0))
+            put(row, f"Mean ({unit})", fmt(st["mean"]))
+            put(row, f"Std ({unit})", fmt(st["std"]))
+            put(row, f"Sum ({unit})", f"{st['sum']:.6g}")
+            put(row, "Pixels", str(st["count"]))
+            if mm:
+                put(row, "Area (mm²)", f"{st['count'] / (mm * mm):.6g}")
+            put(row, "Centre X", fmt(st.get("cx"), 1))
+            put(row, "Centre Y", fmt(st.get("cy"), 1))
+
+        def put_size(row, w_px, h_px):
+            put(row, "Width (px)", fmt(w_px, 1))
+            put(row, "Height (px)", fmt(h_px, 1))
+            put(row, "Width (mm)", real(w_px))
+            put(row, "Height (mm)", real(h_px))
 
         rows = []
         whole = region_stats(arr, None)
         h, w = arr.shape[:2]
-        rows.append(["—", "Whole image", "0", "0", str(w), str(h), "", ""]
-                    + stat_cells(whole))
+        row = new_row()
+        put(row, "#", "—"); put(row, "Item", "Whole image")
+        put(row, "X", "0"); put(row, "Y", "0")
+        put_size(row, float(w), float(h))
+        put_stats(row, whole)
+        rows.append(row)
 
         for i, a in enumerate(slot.annots):
             if a.kind not in _TABLE_KINDS:
@@ -6077,41 +6659,44 @@ class WorkshopWidget(QWidget):
             name = {A_ROI_RECT: "Rectangle region", A_ROI_ELLIPSE: "Ellipse region",
                     A_RULER: "Ruler", A_ANGLE: "Angle", A_CROSS: "Point",
                     A_PROFILE: "Profile line"}.get(a.kind, a.kind)
-            # Full width from the start: every kind fills only the columns that mean
-            # something for it, and a shape that reaches column 10 must not have to
-            # care whether column 8 has been written yet.
-            row = [""] * len(headers)
-            row[0:6] = [str(i + 1), name, fmt(x0, 1), fmt(y0, 1),
-                        fmt(x1 - x0, 1), fmt(y1 - y0, 1)]
+            row = new_row()
+            put(row, "#", str(i + 1)); put(row, "Item", name)
+            put(row, "X", fmt(x0, 1)); put(row, "Y", fmt(y0, 1))
+            put_size(row, x1 - x0, y1 - y0)
             if a.kind in _REGION_KINDS:
-                row[8:] = stat_cells(region_stats(arr, _region_mask(a, arr.shape)))
+                put_stats(row, region_stats(arr, _region_mask(a, arr.shape)))
             elif a.kind in (A_RULER, A_PROFILE) and len(a.pts) >= 2:
                 dpx = math.hypot(a.pts[1][0] - a.pts[0][0], a.pts[1][1] - a.pts[0][1])
-                row[6] = fmt(px2len(dpx), 3)
-                row[7] = fmt(line_angle_deg(a.pts[0], a.pts[1]), 1)
+                put(row, "Length (px)", fmt(dpx, 1))
+                put(row, "Length (mm)", real(dpx))
+                put(row, "Angle (°)", fmt(line_angle_deg(a.pts[0], a.pts[1]), 1))
                 if a.kind == A_PROFILE:
                     _, vals = line_profile(arr, a.pts[0], a.pts[1])
-                    row[8:] = [fmt(float(vals.min()), 0), fmt(float(vals.max()), 0),
-                               fmt(float(vals.mean())), fmt(float(vals.std())),
-                               f"{float(vals.sum()):.6g}", str(int(vals.size)),
-                               "", "", ""]
+                    put(row, f"Min ({unit})", fmt(float(vals.min()), 0))
+                    put(row, f"Max ({unit})", fmt(float(vals.max()), 0))
+                    put(row, f"Mean ({unit})", fmt(float(vals.mean())))
+                    put(row, f"Std ({unit})", fmt(float(vals.std())))
+                    put(row, f"Sum ({unit})", f"{float(vals.sum()):.6g}")
+                    put(row, "Pixels", str(int(vals.size)))
             elif a.kind == A_ANGLE and len(a.pts) >= 3:
-                row[2] = fmt(a.pts[1][0], 1)
-                row[3] = fmt(a.pts[1][1], 1)
-                row[4] = row[5] = ""
-                row[7] = fmt(angle_between(a.pts[0], a.pts[1], a.pts[2]), 2)
+                put(row, "X", fmt(a.pts[1][0], 1)); put(row, "Y", fmt(a.pts[1][1], 1))
+                put_size(row, None, None)
+                put(row, "Angle (°)", fmt(angle_between(a.pts[0], a.pts[1], a.pts[2]), 2))
             elif a.kind == A_CROSS and a.pts:
                 px, py = int(round(a.pts[0][0])), int(round(a.pts[0][1]))
                 v = slot.value_at(px, py)
-                row[2], row[3] = str(px), str(py)
-                row[4] = row[5] = ""
+                put(row, "X", str(px)); put(row, "Y", str(py))
+                put_size(row, None, None)
                 if v is not None:
-                    row[8] = row[9] = row[10] = fmt(v[1], 0)
-                    row[13] = "1"
+                    for c in (f"Min ({unit})", f"Max ({unit})", f"Mean ({unit})"):
+                        put(row, c, fmt(v[1], 0))
+                    put(row, "Pixels", "1")
             rows.append(row)
 
-        note = (f"{slot.label[:60]} — values in {unit}"
-                + (f", lengths in mm ({mm:.3f} px per mm)" if mm
+        note = (f"{slot.label[:60]} — {unit}"
+                + (f", 1 pixel = {slot.px_um:.3f} µm ({mm:.1f} px per mm)"
+                   if mm and slot.px_um else
+                   f", lengths in mm ({mm:.3f} px per mm)" if mm
                    else ", lengths in pixels (no scale set)"))
         return headers, rows, note
 
@@ -6142,7 +6727,7 @@ class WorkshopWidget(QWidget):
             vmax, unit = float(slot.full_scale), slot.unit_name()
         else:
             vals = np.clip(_to_gray(slot.base), 0, 255)
-            vmax, unit = 255.0, "code"
+            vmax, unit = 255.0, UNIT_CODE
         s = _stat_sample(vals)
         idx = np.clip(np.asarray(s, dtype=np.float64) * (255.0 / vmax),
                       0, 255).astype(np.int32)
@@ -6202,7 +6787,7 @@ class WorkshopWidget(QWidget):
         margin = max(8.0, w * 0.04)
         y = h - max(12.0, h * 0.06)
         bar = _Annot(A_SCALEBAR, [[margin, y], [margin + length_px, y]],
-                     "#ffffff", max(2, self._line_sb.value()), False, "",
+                     "#ffffff", max(2, self._line_sl.value()), False, "",
                      max(10, self._text_sb.value()), "", float(val))
         slot.annots.append(bar)
         self._canvas.select_index(len(slot.annots) - 1)
@@ -6266,19 +6851,20 @@ class WorkshopWidget(QWidget):
             rows.append([name, value, u])
 
         def length(v):
-            return (f"{v / mm:.4f}" if mm else f"{v:.2f}")
+            # Both, always — a width in millimetres alone cannot be checked against the
+            # picture, and a width in pixels alone is not the answer anyone wanted.
+            return f"{v:.1f} px" + (f"  =  {_fmt_mm(v / mm)}" if mm else "")
 
-        lu = "mm" if mm else "px"
         add("Measured on", what)
         add("Background taken off", f"{st['baseline']:.1f}", unit)
         add("Peak value", f"{st['peak']:.0f}", unit)
         add("Peak at", f"{st['peak_x']:.1f}, {st['peak_y']:.1f}", "px")
         add("Centre of mass", f"{st['cx']:.2f}, {st['cy']:.2f}", "px")
         add("Total above background", f"{st['total']:.6g}", unit)
-        add("D4σ width across", length(st.get("d4s_x", 0.0)), lu)
-        add("D4σ width down", length(st.get("d4s_y", 0.0)), lu)
-        add("D4σ long axis", length(st.get("d4s_major", 0.0)), lu)
-        add("D4σ short axis", length(st.get("d4s_minor", 0.0)), lu)
+        add("D4σ width across", length(st.get("d4s_x", 0.0)))
+        add("D4σ width down", length(st.get("d4s_y", 0.0)))
+        add("D4σ long axis", length(st.get("d4s_major", 0.0)))
+        add("D4σ short axis", length(st.get("d4s_minor", 0.0)))
         if "ellipticity" in st:
             add("Roundness (short / long)", f"{st['ellipticity']:.4f}",
                 "1.0 = round")
@@ -6287,13 +6873,14 @@ class WorkshopWidget(QWidget):
                           ("w1e2_x", "1/e² width across"),
                           ("w1e2_y", "1/e² width down")):
             if key in st:
-                add(name, length(st[key]), lu)
+                add(name, length(st[key]))
             else:
                 add(name, "not reached", "")
         if mm:
-            add("Scale", f"{mm:.4f}", "px per mm")
+            add("Scale", f"1 pixel = {slot.px_um:.3f} µm" if slot.px_um
+                else f"{mm:.4f} px per mm", f"{mm:.1f} px per mm")
 
-        note = (f"{slot.label[:60]} — {what}, values in {unit}. Widths from the "
+        note = (f"{slot.label[:60]} — {what}, {unit}. Widths from the "
                 f"intensity moments (D4σ) and read off the row and column through the "
                 f"centre of mass (FWHM, 1/e²). “not reached” means the trace never "
                 f"comes back down to that level inside the area measured.")
@@ -6326,7 +6913,7 @@ class WorkshopWidget(QWidget):
             f"{st['cx']:.1f}, {st['cy']:.1f} px. Each point is the average of every "
             f"pixel at that distance.",
             "distance from the centre", "mm" if mm else "px", slot.unit_name(),
-            columns=(f"radius_{'mm' if mm else 'px'}", f"mean_{slot.unit_name()}"))
+            columns=(f"radius_{'mm' if mm else 'px'}", f"mean_{slot.unit_key()}"))
         self._radial_dlg.show()
         self._radial_dlg.raise_()
 
@@ -6367,7 +6954,7 @@ class WorkshopWidget(QWidget):
         if st is None:
             return
         self._canvas.add_annot(_Annot(A_CROSS, [[st["cx"], st["cy"]]],
-                                      self._draw_color.name(), self._line_sb.value()))
+                                      self._draw_color.name(), self._line_sl.value()))
         self._after_change()
         self._say(f"Centre of mass of the {what}: {st['cx']:.2f}, {st['cy']:.2f} px")
 
@@ -6631,6 +7218,9 @@ class WorkshopWidget(QWidget):
         self._transform_annots(slot, lambda x, y: (x * sx, y * sy))
         if slot.px_per_mm:
             slot.px_per_mm *= (sx + sy) / 2.0
+            if slot.px_um:
+                # Joining pixels makes each one cover more of the object.
+                slot.px_um /= (sx + sy) / 2.0
         slot.fitted = False
         self._canvas.set_slot(slot)
         self._after_change()
@@ -6706,6 +7296,8 @@ class WorkshopWidget(QWidget):
         self._transform_annots(slot, lambda x, y: (x * sx, y * sy))
         if slot.px_per_mm:
             slot.px_per_mm *= (sx + sy) / 2.0
+            if slot.px_um:
+                slot.px_um /= (sx + sy) / 2.0
         slot.fitted = False
         self._canvas.set_slot(slot)
         self._after_change()
@@ -6775,6 +7367,7 @@ class WorkshopWidget(QWidget):
                              camera=camera)
         slot.raw_note = note or ("" if raw is not None else
                                  "made in the Workshop — values are display codes")
+        self._apply_default_sensor_scale(slot)
         self._slots.append(slot)
         self._update_slot_list()
         self._activate_slot(len(self._slots) - 1)
@@ -6977,15 +7570,15 @@ class WorkshopWidget(QWidget):
             return
         self._last_save_dir = p.parent
         desc = (f"{slot.camera or slot.label} | "
-                f"{'counts' if raw else 'display codes'}"
+                f"{'camera pixel intensity' if raw else '8-bit intensity'}"
                 f"{f' | full scale {slot.full_scale:.0f}' if slot.full_scale else ''}")
         err = wk_ops.write_data_tiff(arr, p, desc)
         if err:
             QMessageBox.warning(self, "Save error", f"Could not write:\n{p}\n\n{err}")
             return
         self._say(f"Values written to {p.name} — "
-                  + ("camera counts" if raw else
-                     "display codes (this image has no camera counts)")
+                  + ("the camera's own pixel intensity" if raw else
+                     "8-bit intensity (this image has no camera values)")
                   + ", no drawing, no display settings.")
 
     # ---- writing in the background -------------------------------------------
@@ -7167,6 +7760,8 @@ class WorkshopWidget(QWidget):
                 "source_path": None if slot.source_path is None else str(slot.source_path),
                 "size": [int(w), int(h)],
                 "px_per_mm": slot.px_per_mm,
+                "px_um": slot.px_um,
+                "px_um_measured": bool(slot.px_um_measured),
                 "camera": slot.camera,
                 "view": dict(vars(slot.view)),
                 "annots": [a.to_dict() for a in slot.annots],
@@ -7223,6 +7818,9 @@ class WorkshopWidget(QWidget):
             try:
                 slot.px_per_mm = (None if entry.get("px_per_mm") is None
                                   else float(entry["px_per_mm"]))
+                slot.px_um = (None if entry.get("px_um") is None
+                              else float(entry["px_um"]))
+                slot.px_um_measured = bool(entry.get("px_um_measured", False))
             except (TypeError, ValueError):
                 pass
             slot.view = _view_from_dict(entry.get("view"))

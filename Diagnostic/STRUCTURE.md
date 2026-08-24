@@ -1,7 +1,7 @@
 # Diagnostic — STRUCTURE
 
-> Verified against source: 2026-08-20 · `monitor_tab.py` 6994 L · `alerting.py` 1178 L ·
-> `remote_launcher.py` 487 L · `main.py` 395 L · `shared_pvs.py` 364 L ·
+> Verified against source: 2026-08-20 · `monitor_tab.py` 7012 L · `alerting.py` 1178 L ·
+> `remote_launcher.py` 491 L · `main.py` 395 L · `shared_pvs.py` 364 L ·
 > `bot_commands.py` 297 L · `cpva_api.py` 263 L · `notify_provision.py` 238 L ·
 > `memstats.py` 187 L · `operation_history_logic.py` 128 L · `secrets_util.py` 70 L ·
 > tests: `test_alerting.py` 565 L · `test_monitor_frozen.py` 246 L ·

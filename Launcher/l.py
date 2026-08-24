@@ -348,10 +348,21 @@ SCRIPTS = {
 }
 
 PARTS = {
-    "Image Finder",
-    "Image Slider",
-    "Shot finder",
     "Launcher",
+}
+
+# Programs that are no longer programs: their whole feature now lives inside a
+# bigger one, and the folder left on the share only offers an old build of it.
+# They are dropped in scan_programs(), so they appear in no group at all — a
+# card here would just be a way to start last spring's version by mistake.
+# Matched through _norm(), so spelling and spacing of the folder do not matter.
+SUBSUMED = {
+    "Image Finder":  "Image Tools",
+    "Image Slider":  "Image Tools",
+    "Shot finder":   "Image Tools",
+    "Spectra":       "CSS Logger",
+    "Builder":       "Dev Tools",
+    "Copy manager":  "Dev Tools",
 }
 
 IN_PROGRESS = {
@@ -387,6 +398,7 @@ def _norm_set(values: set[str]) -> set[str]:
 # pre-normalize once
 SCRIPTS_N = _norm_set(set(SCRIPTS))
 PARTS_N = _norm_set(set(PARTS))
+SUBSUMED_N = {_norm(k): v for k, v in SUBSUMED.items()}
 PERSONAL_N = _norm_set(set(PERSONAL))
 IN_PROGRESS_N = _norm_set(set(IN_PROGRESS))
 NOT_WORKING_CORRECTLY_N = _norm_set(set(NOT_WORKING_CORRECTLY))
@@ -487,6 +499,7 @@ def scan_programs(root: Path) -> dict[str, dict]:
     dirs = [
         p for p in root.iterdir()
         if p.is_dir() and p.name.lower() not in IGNORE_DIR_NAMES
+        and _norm(p.name) not in SUBSUMED_N
     ]
 
     from concurrent.futures import ThreadPoolExecutor, as_completed

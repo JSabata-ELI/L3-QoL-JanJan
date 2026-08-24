@@ -252,6 +252,24 @@ settings are the fallback that makes the built copy work.
     answers "have I published this" rather than "is this the newest
     on the share".
 
+    HELPER PROGRAMS ARE ON THIS LIST TOO, exactly as in the Builder:
+    the program that carries them gets a small arrow, and behind it
+    each helper is an indented line of its own with its own tick box,
+    its own version to pick and its own status. They are found the
+    same way the Builder finds them — from the build settings of the
+    program they belong to — so nothing has to be registered here.
+
+    Ticking the program ticks its helpers too, and opens the list so
+    that what went along is visible. It is a push, not a lock: untick
+    a helper afterwards and it stays unticked, which is how you
+    publish only the application. A tick survives folding the list
+    away.
+
+    Until this was added, a helper had no line here at all, because it
+    has no source folder of its own — so "Copy after build" reported
+    it as "NOT copied — not selected in Copy Manager" and it had to be
+    copied by hand.
+
 4.2 WHAT PUBLISHING WRITES
 
       <destination>/<program>/
@@ -292,13 +310,15 @@ settings are the fallback that makes the built copy work.
 
 4.4 WHERE THE DOCUMENTATION IS TAKEN FROM
 
-    Five places, in this order:
+    In this order:
 
       1. the version folder — the Builder puts it there
       2. THE SOURCE FOLDER IN THE REPOSITORY — the live one
       3. the build output folder for that program
-      4. the copy already on the destination
-      5. nothing found: skip, with a warning
+      4. for a helper: the folder of the program it belongs to, where
+         its own ReadMe_<helper name> documents live
+      5. the copy already on the destination
+      6. nothing found: skip, with a warning
 
     Step 2 is the important one. Builds made before the Builder
     started copying documentation have none in their version folder,

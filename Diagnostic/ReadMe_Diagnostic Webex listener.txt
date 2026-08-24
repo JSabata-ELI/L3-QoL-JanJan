@@ -34,7 +34,9 @@ HOW TO USE IT
 
       ▶️  Starting Diagnostic — it says which version it started
       ✅  Done — the program runs and is tracking values
-      ℹ️  It already runs (with a note if it is not tracking)
+      ℹ️  It already runs — and if it is open but not tracking, the
+          answer names the command that arms it:
+          @Diagnostics /start
       ⛔  Your e-mail address is not on the allowed list
       ❌  It could not be started, or it died right after starting
       ⚠️  It runs, but did not report that it is tracking

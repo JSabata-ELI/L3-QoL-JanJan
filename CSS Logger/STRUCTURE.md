@@ -1,6 +1,6 @@
 # CSS Logger — STRUCTURE
 
-> Verified against source: 2026-08-19 · `main.py` 6138 L · `sp_t.py` 1729 L ·
+> Verified against source: 2026-08-21 · `main.py` 7820 L · `sp_t.py` 5696 L ·
 > `cpva_core.py` 749 L · `test_smoke.py` 548 L · `test_live_pacing.py` 251 L ·
 > `test_count_param.py` 52 L
 
@@ -15,7 +15,7 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 |------|-------------|
 | `main.py` | The application — PySide6 "CPVA Suite" (CSS Logger + Spectra in one window). Run with `python main.py`. |
 | `cpva_core.py` | Non-UI helpers: config/preset I/O, CPVA archiver HTTP, time / PV-name / image helpers. No GUI toolkit — shared by `main.py` and the tests. |
-| `sp_t.py` | The Spectra widget, embedded as the second tab of the suite. |
+| `sp_t.py` | The Spectra widget, embedded as the second tab of the suite. This folder is its only home — see the warning at the top of `main.py`. Its own docs: `STRUCTURE_Spectra_tab.md`, `ReadMe_Spectra tab.txt`, `ReadMe_Spectra tab_Full.txt`. |
 | `test_smoke.py` | Offline smoke test — headless (`QT_QPA_PLATFORM=offscreen`), network + dialogs mocked, clicks through every button/dialog; also covers custom-PV bindings (incl. the dialog's bindings table) and the Conditions filter. |
 | `test_live_pacing.py` | Offline test of live-mode pacing: window clamping, bounded tick look-back, cursor advance on an empty tick, Stop-Live cancellation, table item reuse. |
 | `test_count_param.py` | Focused test of the archiver `count` parameter handling (hits the real archiver). |
@@ -67,7 +67,11 @@ master-multiple filter, PV count, progress bar.
 `DatePickerDialog` + `_make_calendar` + `_WeekendDelegate` (house calendar style,
 Monday-first, red weekends), `PVBrowserDialog` (loads the channel list once, then
 filters locally), `_ConditionsDialog` (min/max per PV; custom channels are
-offered too), `_RefLinesDialog`, `_CustomPVDialog`, `_GraphSettingsDialog`.
+offered too), `_RefLinesDialog` (per line: name, which signal it belongs to, Y,
+colour, style, width, reorder, delete, and a button that hands control back to
+the two-click placement in the graph — signalled by `pick_request`, which makes
+`_open_ref_lines_dialog` re-open the window afterwards), `_CustomPVDialog`,
+`_GraphSettingsDialog`.
 
 `_CustomPVDialog` holds expressions over channel letters A, B, C… plus two
 mapping tables. The top one is the automatic letter assignment for the loaded
@@ -148,7 +152,11 @@ defaults or whatever was in effect when it opened.
 | `_LIVE_TICK_OVERLAP_NS` = 30 s | an empty tick still moves `_live_last_ts` to `now −` this, so the next query stays small while the overlap covers archiver ingestion lag |
 | `_MAX_TABLE_ROWS` = 5000 | only the newest rows are rendered; export/graph/XY always use the full `_table_rows` |
 | `_TABLE_SEVERITY_FG` | severity → colour **string**. A `QColor` in a module global is destroyed after the `QApplication` and takes the interpreter down with it (0xC0000005 on exit) |
-| `_LIVE_REBUILD_MIN_INTERVAL_NS` = 1 s | the live tick polls every 300 ms, but the full merge + filter + replot is throttled to this cadence (otherwise a long session spends all its time rebuilding) |
+| `graph_opts["live_poll_ms"]` = 300 | how often the archive is asked. Was a literal duplicated in `_schedule_live_tick` **and** `_live_countdown_tick`, where the countdown label would silently disagree if only one were edited |
+| `graph_opts["live_graph_min_ms"]` = 300 / `["live_table_ms"]` = 1500 | **two separate refresh clocks.** The graph fast path is cheap, the table rebuild re-merges the whole accumulated history (~1 s with a dozen PVs). They shared one throttle of `max(1 s, 3 × measured cost)`, so one slow table rebuild set the pace for both and the window looked ~5 s behind — the reported "refresh rate is 5 s". Each now keeps `max(floor, 2 × its own measured cost)`; costs are measured separately into `_live_graph_cost_ns` / `_live_table_cost_ns` |
+| `_GRID_STYLES` | (name, matplotlib linestyle) handed out in order to the PVs that have Grid ticked, so several grids on one plot are distinguishable |
+| `_XY_CMAP` | hand-built navy → purple → magenta → red ramp for the XY scatter. The stock ranges (`plasma` et al.) end in a pale yellow that is invisible on white, hiding the newest points |
+| `_LIVE_BTN_OFF_STYLE` / `_LIVE_BTN_ON_STYLE` | the sidebar's one mode switch, green ⇄ orange, same padding either way so it does not resize when pressed |
 | `_NS_PER_DAY` / `_mpl_epoch_num()` / `_ns_to_num()` | ns → matplotlib date numbers as one numpy division, instead of a `datetime` per sample |
 | `_pairs_to_ns_arrays` / `_samples_to_ns_arrays` | samples → `(ts_ns, values)` numpy arrays |
 | `_downsample_arrays_mean(ts, vals, target)` | mean-bucket downsampling to the target point count |
@@ -160,6 +168,8 @@ defaults or whatever was in effect when it opened.
 table), `_CenteredCheckDelegate` (Show / Autoscale / Grid tick boxes painted in
 the middle of their column — Qt and the app stylesheet both push them to the
 left edge, so the box is drawn by hand and the click area matches it),
+`_ComboBoxDelegate` (Style and Points cells; the list drops open on the first
+click so picking a style is one gesture),
 `_FlowLayout` (wrapping button rows), `_GraphPopupWindow` (F11 / Ctrl+F11
 floating graph window), `_WheelGuard` + `_install_wheel_guard()` (application
 wide filter: the mouse wheel only changes a spin box / drop-down / slider that
@@ -171,15 +181,30 @@ Data: `_samples_by_pv`, `_table_rows` (+ `_table_rows_unfiltered`), `_pv_order` 
 (carry-forward value before the window start), `_pairs_cache`.
 Graph: `_mpl_figure` / `_mpl_canvas`, `_graph_axes`, `_graph_lines`, `_graph_pvs`,
 `_graph_raw` / `_graph_raw_np`, `_graph_spine_xpos`, `_span_selector`,
-`_zoom_selector` + `_zoom_history`, crosshair artists (`_crosshair_*`,
-`_x_cursor_ann`, `_y_cursor_ann`), `_blit_bg`, `_cursor_frame_ms` (adaptive frame
-budget), `_graph_popup`.
-XY: `_xy_figure`, `_xy_rows`, `_xy_scatter`, `_xy_rect_selector`,
-`_xy_zoom_history`, `_xy_choice_map`.
+`_zoom_selector`, `_graph_toolbar`, `_user_zoomed`, `_reticking`, crosshair
+artists (`_crosshair_*`, `_x_cursor_ann`, `_y_cursor_ann`), `_blit_bg`,
+`_cursor_frame_ms` (adaptive frame budget), `_graph_popup`.
+`_sel_range` — the statistics selection as `(xmin, xmax)` matplotlib date numbers,
+i.e. **absolute time**. It has to live in state and not only inside the
+`SpanSelector`: every full replot destroys the figure (and with it the selector
+and the stat cards), which is why the selected region and its numbers used to
+vanish on a reload, a font change or any axis-table edit. `_recompute_stats()`
+derives the numbers from it, so they also follow newly arrived live data.
+There is **no** `_zoom_history` / `_xy_zoom_history` any more: the view history
+belongs to the toolbars (Home / Back / Forward) and a second hand-kept one would
+drift out of step. `_on_zoom_select` pushes onto the toolbar's stack via
+`push_current()`, so a right-drag zoom is undone by the same Back. `_user_zoomed`
+only records "the user is looking somewhere of their own choosing", which stops
+the live window scrolling the view out from under them.
+XY: `_xy_figure`, `_xy_rows`, `_xy_scatter`, `_xy_rect_selector`, `_xy_toolbar`,
+`_xy_choice_map`.
+Automatic loading: `_load_in_flight`, `_reload_pending`,
+`_pending_reload_reason`, `_autoload_timer` (400 ms debounce).
 PV Time: `_pv_time_figure`, `_pv_time_df`, `_pv_time_columns`,
 `_pv_time_condition_rows`.
-Live: `_live_mode`, `_live_last_ts`, `_live_window_span`, `_live_last_rebuild_ns`,
-`_live_rebuild_cost_ns`, `_live_autoscroll`, `_live_timer` + `_countdown_timer`,
+Live: `_live_mode`, `_live_last_ts`, `_live_window_span`, `_live_last_rebuild_ns`
+(table) + `_live_last_graph_ns` (graph), `_live_table_cost_ns` +
+`_live_graph_cost_ns`, `_live_autoscroll`, `_live_timer` + `_countdown_timer`,
 `_live_epoch` (cancel token: every fetch worker captures it and its pool aborts
 once it moves — bumped by `_stop_live` and by each `_live_initial_load`).
 Coalescing timers: `_cursor_tbl_timer` (cursor table rewritten only when the
@@ -194,26 +219,112 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | Group | Methods |
 |-------|---------|
 | build | `_build_ui`, `_build_sidebar`, `_build_graph_tab`, `_build_axis_settings_panel`, `_build_xy_tab`, `_build_pv_time_tab`, `_build_table_tab`, `_build_log_tab`, `_populate_ui` |
-| load | `_on_load_clicked`, `_on_load_error`, `_on_load_finished` / `__on_load_finished_inner`, `_build_table_rows` |
-| graph | `_plot_graph` (+ `_schedule_replot`), `_plot_graph_impl`, `_update_graph_data`, `_band_ylim`, `_compute_x_ticks`, `_apply_font_size`, `_clear_graph`, `_clean_graph`, `_save_graph`, `_graph_popout` / `_restore_graph_from_popup`, `_install_graph_shortcuts` |
+| load | `_on_load_clicked(silent=)`, `_on_load_error`, `_on_load_finished` / `__on_load_finished_inner`, `_build_table_rows` |
+| automatic loading | `_request_reload(delay_ms, reason)`, `_do_auto_reload`, `_finish_load`. **There is no LOAD DATA button.** Everything that changes what should be on screen calls `_request_reload`: PV added / removed / cleared / renamed, a new time window, a new preset. A burst collapses into one fetch via `_autoload_timer`; a request made while `_load_in_flight` sets `_reload_pending` and runs from `_finish_load`. Every load end path **must** call `_finish_load()` — including the "live was switched off meanwhile" early returns in `_on_live_init_error` / `_after_live_initial_load`, or the lock stays held and no automatic reload can ever start again |
+| graph | `_plot_graph` (+ `_schedule_replot`), `_plot_graph_impl`, `_update_graph_data`, `_band_ylim`, `_apply_x_ticks`, `_retick_from_current_xlim`, `_compute_x_ticks`, `_bottom_margin_floor`, `_keep_x_label_visible`, `_grid_style_for` / `_grid_style_name` / `_grid_style_index`, `_apply_font_size`, `_clear_graph`, `_clean_graph`, `_save_graph`, `_graph_popout` / `_restore_graph_from_popup`, `_install_graph_shortcuts` |
+| graph toolbar | `_install_graph_toolbar`, `_install_xy_toolbar`, `_sync_graph_interaction_mode`, `_adopt_toolbar_margins`, `_on_graph_view_home`, `_push_graph_view`, `_on_xy_rect_zoom_push`, `_open_graph_view_menu` |
 | cursor | `_on_canvas_draw`, `_on_graph_mouse_move`, `_process_mouse_move(_impl)`, `_flush_cursor_table` |
-| stats / selection | `_on_span_select`, `_make_stat_card`, `_copy_stats_text`, `_clear_stats`, `_on_zoom_select`, `_zoom_back` |
+| stats / selection | `_on_span_select` (stores `_sel_range`, then delegates), `_recompute_stats`, `_restore_selection_band`, `_clear_selection`, `_drop_selection_if_outside`, `_make_stat_card`, `_copy_stats_text`, `_clear_stats`, `_on_zoom_select` |
 | graph options | `_open_graph_settings_dialog`, `_apply_graph_opts`, `_avg_target_points`, `_on_avg_target_changed` |
-| live | `_toggle_live_mode`, `_live_span_from_window`, `_live_initial_load`, `_on_live_init_error`, `_after_live_initial_load`, `_live_tick`, `_on_incremental_finished`, `_schedule_live_tick`, `_live_countdown_tick`, `_stop_live`, `_maybe_autostart_live` |
+| live | `_toggle_live_mode`, `_live_span_from_window`, `_live_initial_load`, `_on_live_init_error`, `_after_live_initial_load`, `_live_tick`, `_on_incremental_finished`, `_schedule_live_tick`, `_live_countdown_tick`, `_live_poll_ms`, `_scroll_live_time_axis`, `_stop_live`, `_maybe_autostart_live` |
 | filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows` |
 | custom PVs | `_col_letter`, `_channel_letters`, `_cpv_dialog_channels`, `_migrate_custom_pv_bindings`, `_compute_custom_pvs_in_rows`, `_emit_custom_pv_diag`, `_rebuild_custom_pvs`, `_custom_pv_tooltip`, `_open_custom_pv_dialog` |
 | table | `_populate_table`, `_set_table_cell`, `_format_value`, `_on_table_scroll`, `_on_table_context_menu`, `_on_table_double_click`, `_try_open_image_at_row` |
-| axis settings | `_refresh_axis_settings_tv`, `_autosize_axis_pane` (the PV list is exactly as tall as the PVs it holds, capped so the graph keeps `_AXIS_PANE_MIN_GRAPH` px and the buttons stay on screen), `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_resync_pv_colors`, `_safe_float` |
-| XY | `_refresh_xy_choices`, `_on_xy_axis_changed`, `_plot_xy(_impl)`, `_on_xy_rect_select`, `_clean_xy`, `_clear_xy_plot`, `_xy_zoom_back` |
+| axis settings | `_refresh_axis_settings_tv`, `_autosize_axis_pane` (the PV list is exactly as tall as the PVs it holds, capped so the graph keeps `_AXIS_PANE_MIN_GRAPH` px and the buttons stay on screen), `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_pv_style_kwargs`, `_pv_stats`, `_flush_axis_measured`, `_resync_pv_colors`, `_safe_float` |
+| columns / looks | `_apply_default_axis_columns`, `_reset_axis_columns`, `_open_axis_column_menu`, `_build_styles_menu`, `_fill_styles_menu`, `_current_style_payload`, `_apply_style_payload`, `_save_style_preset`, `_load_style_preset`, `_delete_style_preset`, `_export_style_preset`, `_import_style_preset` |
+| reference lines | `_open_ref_lines_dialog`, `_graph_ref_pv_choices`, `_ref_axis_for`, `_draw_ref_lines`, `_run_ref_pick`, `_set_ref_pick_step`, `_clear_ref_pick_dim`, `_end_ref_pick`, `_cancel_ref_pick`, `_on_ref_pick_click`, `_on_ref_pick_key`, `_pv_at_click` |
+| XY | `_refresh_xy_choices`, `_on_xy_axis_changed`, `_plot_xy(_impl)`, `_xy_pairs`, `_on_xy_rect_select`, `_clean_xy`, `_clear_xy_plot` |
 | PV Time | `_plot_pv_time(_impl)`, `_draw_daily_distribution`, `_pv_time_add_condition_row`, `_pv_time_add_features`, `_clear_pv_time_plot`, `_load_data_repository` |
 | PV list / presets | `_open_pv_browser`, `_remove_selected_pvs`, `_clear_pv_list`, `_on_pv_double_click`, `_real_pv_names`, `_sync_pv_list_customs`, `_update_pv_count`, `_refresh_preset_combo`, `_load_preset`, `_save_preset`, `_save_preset_as`, `_delete_preset` |
 | misc | `_open_time_window_dialog`, `_refresh_time_labels`, `_open_conditions_dialog`, `_open_ref_lines_dialog`, `_export_csv`, `_save_runtime_state`, `_log`, `_clear_log`, `_update_status` |
 
 The axis table columns are `_axis_tv_cols` = show · pv · display_name · color ·
-cursor_val · ymin · ymax · auto_scale · width · smooth · grid, and every edit
-goes through `_on_axis_item_changed` → `_schedule_replot`, so a burst of clicks
-costs one redraw. `_resync_pv_colors` keeps the stored colours aligned with the
-PV order, `_sync_pv_list_customs` keeps derived PVs in the sidebar list.
+cursor_val · ymin · ymax · auto_scale · width · style · marker · marker_size ·
+alpha · smooth · grid · unit · last · min · max · mean · count · blank. Every
+edit goes through `_on_axis_item_changed` → `_schedule_replot`, so a burst of
+clicks costs one redraw. `_resync_pv_colors` keeps the stored colours aligned
+with the PV order, `_sync_pv_list_customs` keeps derived PVs in the sidebar list.
+
+Columns are never addressed by a literal number — always
+`list(self._axis_tv_cols).index(name)` — because the header is movable
+(`setSectionsMovable`) and the user can drag any column anywhere. Row → PV comes
+from `_axis_row_pv`, never from a column position. `_AXIS_READONLY_COLS` are the
+cells the user cannot type into (the PV name, the live cursor readout and the
+measured values); `_AXIS_HIDDEN_BY_DEFAULT` start switched off in the header's
+right-click menu; `_AXIS_ALWAYS_SHOWN` (pv, blank) can never be hidden. Divider
+rows paint every cell blue, not just the spanned first one, because a span
+follows its logical column wherever it has been dragged.
+
+`unit`/`last`/`min`/`max`/`mean`/`count` are measured, not stored: `_pv_stats`
+computes them from `_samples_by_pv` and caches on the sample count
+(`_pv_stats_cache`, cleared outright on every load — a new range can hold the
+same number of samples). `_flush_axis_measured` refreshes only the ones on
+screen and runs on every Live table refresh.
+
+`style` / `marker` / `marker_size` / `alpha` are translated to matplotlib by
+`_pv_style_kwargs` via the module maps `_LINE_STYLES` and `_MARKER_STYLES`
+(`_MARKER_HOLLOW` marks the ones drawn with a white face). `marker: "auto"` is
+the pre-existing behaviour — a dot only while `graph_opts["line_markers"]` is on
+and the trace is under 200 points. Line *none* plus points *none* falls back to
+solid: a signal must never become invisible.
+
+`_build_styles_menu` / `_current_style_payload` / `_apply_style_payload` save and
+restore a whole look (per-PV styling, reference lines, column order/widths/
+visibility) as a named entry in `config["style_presets"]`, plus export/import to
+a JSON file the user picks. Nothing is stored automatically — `_pv_settings` and
+`_ref_lines` are still session-only by design.
+
+### Graph traps — read before touching the plot
+
+**The time-axis stamps are a FIXED LIST, so they must be rebuilt after every
+change of the visible range.** `_apply_x_ticks` is the only place that installs
+them, and `_retick_from_current_xlim` re-runs it for whatever is on screen. It is
+called from the full replot, `_update_graph_data`, `_on_zoom_select` and the
+toolbar's Home / Back / Forward. Miss one and the axis keeps the *old* window's
+positions: a narrow zoom then shows **zero** timestamps (measured — that was the
+bug). The live path already had its own copy of this fix; the zoom path did not.
+
+**Grids are per PV, one per ticked channel.** Each ticked PV draws
+`ax.yaxis.grid(...)` on **its own** twinx axis with its own colour and its own
+`_GRID_STYLES` entry; the shared vertical time lines are drawn once on
+`axes[0].xaxis`. Do not collapse them back into one boolean — that is exactly
+what made the 2nd..Nth tick box appear dead. Two constraints:
+- `ax.set_axisbelow(True)` on **every** axis. twinx axes draw in order, so a
+  later PV's grid otherwise crosses an earlier PV's trace.
+- matplotlib turns a grid **ON regardless of the first argument** as soon as any
+  line property is passed with it. `grid(False, linestyle=...)` draws a grid. Pass
+  the style kwargs only in the enabling branch.
+
+**Margins are FRACTIONS of the figure; the axis text is a fixed size in points.**
+So a shorter canvas silently starves the time axis. Opening the statistics strip
+shortens the graph by well over a third (measured 418 px → 256 px) and the
+"Time (Prague)" title went to y0 = −14, i.e. off the figure. `_bottom_margin_floor`
+gives the smallest workable fraction and `_keep_x_label_visible`, wired to the
+canvas `resize_event`, re-applies it in both directions — growing when the graph
+shrinks, returning to the user's own setting when the room comes back. Any new
+widget that changes the canvas height inherits this for free; anything that sets
+`subplots_adjust(bottom=...)` by hand must respect the floor.
+
+**The toolbar is bound to one canvas, and the canvas is rebuilt by every full
+replot.** `_install_graph_toolbar` therefore tears the old one down and builds a
+new one into the permanent `_graph_tb_holder`. `_clear_graph` drops it with the
+canvas, or its buttons act on a destroyed figure. The holder is hidden and shown
+alongside `_graph_ctrl_bar` in the F11 pop-out.
+
+**Toolbar icons: matplotlib tints them ONCE, AT CONSTRUCTION, and only when it
+thinks the palette is dark** — on a dark Windows theme they come out near-white
+and read as blank buttons, and fixing the palette afterwards does nothing. Build
+every matplotlib toolbar through `_make_mpl_toolbar`, which parents it to a
+light-palette host first. (Pulser Monitor and Image Tools carry the same helper
+for the same reason.) `_CustomToolbar`, `_TB_STYLE`, `_TB_HINTS` and
+`_AxisLimitsDialog` are imported from `sp_t` in this folder, which `main.py`
+already imports `SpectraWidget` from, so this adds no new coupling; the imports
+are wrapped so a change there degrades to the stock toolbar instead of breaking
+startup.
+
+**Right-drag on the canvas is the zoom, so the canvas must not get a context
+menu** — it would swallow the drag. Those entries live on the "View ▾" button
+(`_open_graph_view_menu`).
 
 ---
 

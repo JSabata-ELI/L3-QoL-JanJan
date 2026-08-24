@@ -285,26 +285,28 @@ def _wait_and_report(webex: WebexNotifier, proc: "subprocess.Popen", what: str) 
     deadline = time.monotonic() + READY_TIMEOUT_S
     while time.monotonic() < deadline:
         if is_tracking():
-            webex.post_text(f"✅ Hotovo — Diagnostika běží a trackuje. [{what}]")
+            webex.post_text(f"✅ Done — Diagnostic is running and tracking. [{what}]")
             return
         if proc.poll() is not None and not is_app_running():
             webex.post_text(
-                f"❌ Diagnostika se ukončila hned po startu (kód {proc.returncode}). "
-                f"[{what}]")
+                "❌ Diagnostic quit right after starting "
+                f"(exit code {proc.returncode}). [{what}]")
             return
         time.sleep(READY_POLL_S)
 
     if is_app_running():
         webex.post_text(
-            "⚠️ Diagnostika běží, ale trackování se samo nezapnulo — "
-            f"zapněte ho tlačítkem Start monitoring. [{what}]")
+            "⚠️ Diagnostic is running, but tracking did not arm itself — "
+            "send `@Diagnostics /start` to arm it (or use the Start "
+            f"monitoring button). [{what}]")
     elif proc.poll() is None:
         webex.post_text(
-            "⚠️ Diagnostika běží, ale nehlásí svůj stav — tahle sestavená verze "
-            f"je starší než tahle funkce. Přestavte Diagnostiku. [{what}]")
+            "⚠️ Diagnostic is running but does not report its state — this "
+            "build is older than that feature. Rebuild Diagnostic. "
+            f"[{what}]")
     else:
         webex.post_text(
-            f"❌ Diagnostiku se nepodařilo spustit do {READY_TIMEOUT_S} s. [{what}]")
+            f"❌ Diagnostic did not come up within {READY_TIMEOUT_S} s. [{what}]")
 
 
 def load_webex_settings() -> dict:
@@ -349,7 +351,7 @@ def main() -> None:
     last_id = None
     primed = False
     print(f"[remote_launcher] listening in room {webex.listen_room_id} "
-          f"every {poll_s}s — send '{COMMANDS[0]}' to launch Diagnostika.")
+          f"every {poll_s}s — send '{COMMANDS[0]}' to launch Diagnostic.")
 
     mem_start = memstats.read()
     started = time.monotonic()
@@ -413,17 +415,19 @@ def main() -> None:
                     continue
                 if is_app_running():
                     if is_tracking():
-                        webex.post_text("ℹ️ Diagnostika už běží a trackuje.")
+                        webex.post_text("ℹ️ Diagnostic is already running and tracking.")
                     else:
-                        webex.post_text("ℹ️ Diagnostika už běží, ale netrackuje "
-                                        "— zapněte Start monitoring.")
+                        webex.post_text(
+                            "ℹ️ Diagnostic is already running, but not "
+                            "tracking — send `@Diagnostics /start` to "
+                            "arm it (or use the Start monitoring button).")
                     continue
                 proc, what = launch_diagnostic()
                 if proc is None:
-                    webex.post_text(f"❌ Nepodařilo se spustit Diagnostiku: {what}")
+                    webex.post_text(f"❌ Could not start Diagnostic: {what}")
                     continue
-                webex.post_text(f"▶️ Spouštím Diagnostiku — {what}. "
-                                "Ozvu se, až poběží.")
+                webex.post_text(f"▶️ Starting Diagnostic — {what}. "
+                                "I will report back when it is up.")
                 # Off the poll loop: the "done" message must wait for a cold
                 # start, and this loop must not.
                 threading.Thread(target=_wait_and_report,

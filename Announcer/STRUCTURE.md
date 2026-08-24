@@ -1,13 +1,17 @@
 # Announcer — STRUCTURE
 
-> Verified against source: 2026-08-19 · `a.py` 1798 L
+> Verified against source: 2026-08-24 · `a.py` 2902 L
 
-Single-file tkinter app. Two independent jobs in one window:
+Single-file tkinter app. Three jobs in one window:
 
-1. **Screen region watch** — grab a rectangle of the screen every 500 ms, compare
-   it to a reference, and raise a visual + audible alarm when it changes.
-2. **PV alerts** — poll eight machine values every 500 ms and show a coloured
-   badge for each one that is out of range.
+1. **Conditions** — a saved list of things that must stay true. A `screen`
+   condition compares its own rectangle to its own reference every 500 ms; a `pv`
+   condition compares an archived value to its own limits. The first one to fail
+   raises the alarm and says, in the user's own words, what needs doing.
+2. **The ad-hoc region watch** — the original single unnamed rectangle from
+   "Set reference", watched alongside the conditions.
+3. **PV alerts** — poll eight fixed machine values every 500 ms and show a
+   coloured badge for each one that is out of range. These never raise the alarm.
 
 User-facing documentation: `ReadMe Announcer.txt` (short, the Launcher's **ReadMe**
 button) and `ReadMe_Announcer_Full.txt` (detailed, the Launcher's **Details** button).
@@ -19,8 +23,8 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | File | Description |
 |------|-------------|
 | `a.py` | The whole program. Run with `python a.py`. |
-| `presets.json` | Saved regions, window geometries, PV thresholds and flash settings. |
-| `images/scorpion_orig.png` | The alarm image. Read from `images/` **next to the exe** at runtime. |
+| `presets.json` | Saved regions, window geometries, PV thresholds, flash settings and the **conditions** (including their reference pictures). |
+| `images/scorpion_orig.png`, `images/viper.png` | Alarm images. Read from `images/` **next to the exe** at runtime. |
 | `sounds/chime.wav`, `pluck.wav`, `pop.wav` | Selectable alert sounds. |
 | `scorpion.png` | Loose copy in the folder root; the app reads `images/` only. |
 | `build_config.json` | Dev Tools build settings. `extra_files` lists `images` and `sounds` as **folders**. |
@@ -30,6 +34,15 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 only flash a plain colour, because the alarm image is read from next to the exe.
 The Builder now also picks those folder names up automatically, but the entry in
 `build_config.json` documents the requirement.
+
+**An alarm image is used as an alpha stencil, never as a picture.** `_image_mask`
+takes the file's alpha channel, and `_make_flash_photo` paints the opaque pixels
+in the flash colour and everything else in the chroma key — which is what makes
+the alarm both see-through and click-through around the shape. A file with no
+alpha channel (plain line art on white, as `announcer viper.png` arrived) is one
+solid rectangle. Such artwork has to be converted first: alpha = the inverse of
+the greyscale, hard-thresholded at 128, then cropped to `getbbox()` so the shape
+fills the window. `images/viper.png` is that conversion of the delivered artwork.
 
 ---
 
@@ -42,9 +55,12 @@ The Builder now also picks those folder names up automatically, but the entry in
 | `FLASH_DURATION_MS` | 3000 | How long the alarm blinks. |
 | `FLASH_INTERVAL_MS` | 300 | Blink speed. |
 | `FLASH_OFF_ALPHA` | 0.02 | Window opacity in the "off" half of a blink — not 0, because a fully transparent window stops receiving clicks. |
-| `PV_AVG_COUNT` | 25 | How many recent samples each PV reading averages. |
+| `PV_AVG_COUNT` | 25 | How many recent samples each PV **badge** reading averages. |
 | `PV_POLL_MS` | 500 | PV read interval. |
-| `_RESERVED_PRESET_KEYS` | | Top-level keys in `presets.json` that are **not** presets: `pv_thresholds`, `window_geometry`, `image_geometry`, `flash_mode`, `image_file`. Anything else at the top level is a preset name. |
+| `COND_PV_WINDOW_S` | 10 | How far back a `pv` **condition** looks for its worst sample. |
+| `COND_MAX_REF_BYTES` | 1 000 000 | Cap on a stored reference picture — it lives inside `presets.json`. |
+| `COND_DEFAULT_PV` | `L3-PM03-023:Energy` | Pre-filled in a new value condition: the back-reflection energy. |
+| `_RESERVED_PRESET_KEYS` | | Top-level keys in `presets.json` that are **not** presets: `pv_thresholds`, `window_geometry`, `image_geometry`, `flash_mode`, `image_file`, `color_cycle`, `flash_interval`, `conditions`. Anything else at the top level is a preset name. |
 
 ### The monitored values — `_PV_MONITORS`
 
@@ -78,12 +94,54 @@ Badge colours: purple `#7a1fa0` (absolute breach), red `#cc2200`, orange
 
 ---
 
+## Conditions
+
+Stored as one top-level `conditions` list in `presets.json`. Keys beginning with
+an underscore are runtime-only and are stripped by `_save_conditions`.
+
+```json
+{"kind": "screen", "name": "L3BT alignment check", "enabled": true,
+ "monitor": 1, "region": [2919, 166, 3288, 349], "threshold": 2.0,
+ "message": "Alignment check changed — look at the HP panel",
+ "reference": "<base64 PNG>"}
+
+{"kind": "pv", "name": "Back reflection", "enabled": true,
+ "pv": "L3-PM03-023:Energy", "warn": 1.0, "trip": 2.0, "unit": "mJ",
+ "message": "Back reflection energy over the limit"}
+```
+
+- **`_ref_img`** — the decoded reference, a PIL image, made once by
+  `_load_conditions` / `_encode_reference`. **`_uid`** — an in-memory number that
+  ties a condition to its badge widget; not saved, because editing a condition
+  replaces the dict.
+- **The reference lives inside `presets.json`, base64 PNG.** One file, one config,
+  and — more importantly — a reference held only in RAM would have to be re-taken
+  at every start, which would silently accept a screen that is *already* in the
+  bad state as normal. `COND_MAX_REF_BYTES` refuses a whole-screen reference with
+  a message instead of writing a megabyte of base64.
+- **`warn` / `trip` are `None` when unset**, written as `null`, shown as an empty
+  box. Empty is not zero: a zero limit on an energy fires the moment the laser
+  runs. `_parse_level` is the one place that turns a box into a number or `None`.
+- **A `pv` condition is judged on the peak of the last `COND_PV_WINDOW_S`
+  seconds**, not on an average — one shot over the limit is the whole event. The
+  archiver writes only on change, so `_condition_value` falls back to the newest
+  sample of the whole 60 s window: that is the value the machine is still
+  holding. Nothing at all means no judgement, and `None` never trips.
+- **A screen condition whose grab no longer matches the reference size fails.**
+  Resolution or scaling changed under it; comparing is impossible and reporting
+  "fine" would be the one wrong answer.
+- **Failure is one-shot**, exactly like the ad-hoc region: `_raise_alarm` stops
+  watching, so nothing re-alarms every 500 ms.
+
+---
+
 ## Helpers
 
 | Function | Description |
 |----------|-------------|
 | `set_app_icon(win, ico_path, app_id)` | Window + taskbar icon. Must be frozen-aware — in a build `__file__` does not point next to the exe. |
 | `_pv_key(channel)` | One dict key for either a plain PV name or a difference pair. |
+| `_parse_level(text)` | A limit box: the number in it, or `None` when empty (level off). |
 | `_HTTP_MESSAGES`, `_NETWORK_HINTS`, `_readable_pv_error(pv_name, exc)` | Turn an HTTP status or a socket error into a sentence with a hint, for the log. A raw traceback in the log window tells the operator nothing. The PVs are read with plain `urllib` — this file pulls in no `requests`. |
 
 ---
@@ -106,14 +164,16 @@ Reports `(x1, y1, x2, y2)` back through a callback to
 
 | Field | Meaning |
 |-------|---------|
-| `region` | `(x1, y1, x2, y2)` or `None`. |
-| `reference` | The reference frame, as a PIL image. The comparison is `ImageStat.Stat(ImageChops.difference(now, reference)).mean` — PIL only, no numpy in this file. |
+| `region` | The ad-hoc rectangle, `(x1, y1, x2, y2)` or `None`. |
+| `reference` | Its reference frame, as a PIL image. The comparison, for it and for every screen condition, is `_picture_diff` = `ImageStat.Stat(ImageChops.difference(now, reference)).mean` — PIL only, no numpy in this file. |
 | `tracking` | Whether the poll loop is running. |
 | `changed` | Whether an alarm is currently up. |
+| `_conditions` | The condition list, in the order shown in the panel. |
 
-The coloured circle is the whole state machine in one glance: **grey** = no
-reference, **orange** = reference set but not watching, **green** = watching, **red**
-= change detected. `_update_circle` is the only place that paints it.
+The coloured circle is the whole state machine in one glance: **grey** = nothing to
+watch, **orange** = an ad-hoc reference or an enabled condition exists but not
+watching, **green** = watching, **red** = something fired. `_update_circle` is the
+only place that paints it.
 
 ### Two independent windows
 
@@ -131,8 +191,11 @@ Both are visible at once while an alarm is up.
 | Assets | `_get_icon_path`, `_images_dir`, `_load_image_files`, `_image_path`, `_load_sound_files`, `_make_flash_photo`, `_color_rgb` |
 | UI | `_build_ui`, `_toggle_settings_popup`, `_build_settings_popup`, `_on_main_click_close_settings`, `_on_any_click` |
 | Presets | `_load_presets`, `_save_presets_file`, `_preset_names`, `_refresh_preset_combo`, `_save_preset`, `_load_preset`, `_delete_preset`, `_save_pv_thresholds`, `_save_flash_settings` |
-| Region | `_select_region`, `_on_selector_closed`, `_region_selected`, `_save_reference`, `_grab` |
-| Watching | `_toggle_tracking`, `_start_tracking`, `_stop_tracking`, `_poll`, `_on_change_detected`, `_reset`, `_update_circle` |
+| Conditions — data | `_next_cond_uid`, `_load_conditions`, `_save_conditions`, `_decode_reference`, `_encode_reference`, `_cond_summary`, `_enabled_conditions` |
+| Conditions — panel | `_build_conditions_panel`, `_refresh_cond_tree`, `_selected_condition`, `_on_cond_click`, `_delete_condition`, `_resnap_condition`, `_edit_condition` |
+| Conditions — badges | `_rebuild_cond_badges`, `_set_cond_badge`, `_clear_cond_badges` |
+| Region | `_open_region_selector`, `_select_region`, `_on_selector_closed`, `_region_selected`, `_save_reference`, `_grab`, `_grab_rect`, `_picture_diff` |
+| Watching | `_toggle_tracking`, `_start_tracking`, `_stop_tracking`, `_poll`, `_on_change_detected`, `_on_condition_failed`, `_raise_alarm`, `_reset`, `_update_circle` |
 | Alarm | `_ensure_image_win`, `_resolve_image_geometry`, `_set_flash_alpha`, `_hide_image_win`, `_start_flash`, `_do_flash`, `_play_sound` |
 | HUD | `_set_ui_visible`, `_set_transparent` |
 | Geometry recorders | `_open_geometry_recorder`, `_start_control_window_recording`, `_start_image_window_recording`, `_save_geometry` |
@@ -141,7 +204,7 @@ Both are visible at once while an alarm is up.
 | Preview | `_update_preview`, `_show_preview_popup`, `_hide_preview_popup`, `_toggle_preview_popup`, `_check_hide_preview` |
 | Log | `_log_message`, `_do_log`, `_clear_log`, `_on_log_hover`, `_hide_log_tip` |
 | Monitors | `_identify_monitors` (numbered overlay on each screen) |
-| PV alerts | `_poll_pvs`, `_update_pv_display`, `_on_pv_frame_configure`, `_relayout_pv_alerts` |
+| PV alerts | `_cpva_context`, `_fetch_samples`, `_condition_value`, `_poll_pvs`, `_update_pv_display`, `_check_pv_conditions`, `_on_pv_frame_configure`, `_relayout_pv_alerts` |
 | Shutdown | `_on_close` (cancels the PV poll job before destroying the window) |
 
 ### Things that are the way they are for a reason
@@ -159,13 +222,30 @@ Both are visible at once while an alarm is up.
   `_update_pv_display`; a 500 ms UI loop cannot wait on HTTP.
 - **The PV half is gated on `self.tracking`.** `_poll_pvs` returns immediately when
   tracking is off, it is kicked off by `_start_tracking`, and `_stop_tracking`
-  cancels the job and hides `_pv_frame`. So the badges exist only while the screen
-  watch runs — there is no PV-only mode. Worth stating plainly in any doc, because
-  "no setup needed" reads as "always on", which it is not.
-- **The archiver, not live PVs.** `_poll_pvs` calls the CPVA samples endpoint over
-  HTTPS with certificate verification disabled, asks for the last 60 s, and averages
-  the newest `PV_AVG_COUNT` samples. A single chiller sample crosses ±0.3 constantly;
-  the average does not.
+  cancels the job and hides `_pv_frame`. So the eight badges exist only while
+  watching runs. Worth stating plainly in any doc, because "no setup needed" reads
+  as "always on", which it is not. What *is* possible now is a watch with no
+  rectangle at all: `_start_tracking` accepts an ad-hoc reference **or** any
+  enabled condition, so a `pv` condition alone is enough to start.
+- **A condition's message is shown as a badge, not on the alarm window.** While
+  watching, the control window is a chroma-keyed overlay where only the circle and
+  the badges survive (`_set_ui_visible`), so a badge is the one place a sentence
+  can be read. `_rebuild_cond_badges` therefore appends its rows to
+  `self._pv_alert_rows` and reuses `_relayout_pv_alerts` for the layout — but not
+  to `_pv_alert_labels`, which stays index-aligned with `_PV_MONITORS`.
+- **`_start_tracking` logs the conditions that cannot fire** (screen with no
+  reference, value with no trip level) instead of letting a ticked condition sit
+  there doing nothing.
+- **The condition editor works on a copy** and writes into `self._conditions` only
+  on Save; `_check_pv_conditions` drops a result whose condition is no longer in
+  the list, because the fetch that produced it started before the edit.
+- **The archiver, not live PVs.** `_fetch_samples` calls the CPVA samples endpoint
+  over HTTPS with certificate verification disabled and returns `(time_ns, value)`
+  pairs; the badges average the newest `PV_AVG_COUNT` of the last 60 s. A single
+  chiller sample crosses ±0.3 constantly; the average does not. Conditions want the
+  opposite (see above), which is why they take a peak instead. The archiver
+  publishes about a second late, so a value condition is a second or two behind the
+  machine — this raises a person, not a hardware interlock.
 - **Geometry is remembered per preset or globally.** `window_geometry` /
   `image_geometry` exist both as top-level keys (global default) and inside a
   preset dict (that preset's own). `_clamp_geometry` keeps a remembered position

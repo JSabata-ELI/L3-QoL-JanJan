@@ -239,6 +239,10 @@ class GitJobs:
         self.repo = repo
         self.target = target
         self.emit = emit
+        # True once this job actually wrote a commit. The UI reads it to decide
+        # whether to re-prefill the message box: refilling it after a run that
+        # committed nothing makes the box look used when it never was.
+        self.committed = False
 
     # -- low level ---------------------------------------------------------
 
@@ -290,6 +294,7 @@ class GitJobs:
             return False, True
         self._run("add", "-A")
         self._run("commit", "-m", msg)
+        self.committed = True
         return True, False
 
     def _report_state(self, branch):
@@ -986,6 +991,25 @@ class App(QWidget):
         # committed".
         return msg
 
+    def _confirm_push_only(self, action) -> bool:
+        """Guard the silent trap: changed files plus an empty message box means
+        the action pushes old commits and quietly leaves today's work behind.
+        Returns True if the action may go ahead."""
+        if self._commit_message():
+            return True
+        n = status_info(self.repo)["changes"]
+        if not n:
+            return True
+        ans = QMessageBox.question(
+            self, "Empty commit message",
+            f"You have {n} changed file(s), but the commit message box is empty.\n\n"
+            f"Yes = {action} only what is already committed and leave those "
+            "files on this PC\n"
+            "No  = cancel so I can type a message (the date on its own is "
+            "enough)",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        return ans == QMessageBox.Yes
+
     def _on_switch(self):
         target = self._selected_branch()
         if not target or target == current_branch(self.repo):
@@ -1054,6 +1078,8 @@ class App(QWidget):
         msg = self._commit_message()
         if status_info(self.repo)["changes"] and not self._ensure_identity():
             return
+        if not self._confirm_push_only("push"):
+            return
         if current_branch(self.repo) in PROTECTED and QMessageBox.question(
                 self, "Shared branch",
                 "You are on the shared 'main' branch. Personal work usually goes "
@@ -1066,6 +1092,8 @@ class App(QWidget):
         msg = self._commit_message()
         if status_info(self.repo)["changes"] and not self._ensure_identity():
             return
+        if not self._confirm_push_only("sync"):
+            return
         self._start_job(lambda j: j.sync(msg))
 
     def _on_merge(self):
@@ -1075,6 +1103,15 @@ class App(QWidget):
             return
         msg = self._commit_message()
         if status_info(self.repo)["changes"] and not self._ensure_identity():
+            return
+        # Merging refuses to run with work left uncommitted, so say that here
+        # instead of starting a job that only fails.
+        if not msg and status_info(self.repo)["changes"]:
+            QMessageBox.warning(
+                self, "Empty commit message",
+                "You have changed files and the commit message box is empty, so "
+                f"the merge would publish an older state into '{TARGET}'.\n\n"
+                "Type a message first (the date on its own is enough).")
             return
         if QMessageBox.question(
                 self, "Confirm merge",
@@ -1167,10 +1204,28 @@ class App(QWidget):
         if not self.msg_multi.isHidden():
             self.msg_multi.setPlainText(self._today_prefix() + " ")
 
+    def _roll_date_prefill(self):
+        """Keep a still-untouched date prefill on today's date (window left
+        open past midnight). Only a bare date is rewritten - a typed message
+        and a deliberately emptied box are both left exactly as they are."""
+        if not self.msg_multi.isHidden() or self.msg_multi.toPlainText().strip():
+            return
+        line = self.msg_edit.text().strip()
+        today = self._today_prefix()
+        if line.isdigit() and len(line) == 8 and line != today:
+            self.msg_edit.setText(today + " ")
+
     def _on_job_done(self, ok):
+        # Read the flag before the worker reference is dropped below.
+        committed = bool(self._worker and self._worker.jobs.committed)
         self._append("--- done ---" if ok else "--- stopped ---", "ok" if ok else "err")
-        if ok:
+        # Only a run that really committed gets a fresh message. Otherwise the
+        # box keeps exactly what it had, so an empty box stays visibly empty
+        # instead of being refilled with today's date after the fact.
+        if ok and committed:
             self._reset_commit_message()
+        else:
+            self._roll_date_prefill()
         self.busy = False
         self._set_ui_enabled(True)
         self._worker = None

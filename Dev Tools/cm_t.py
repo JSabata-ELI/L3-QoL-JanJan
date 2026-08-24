@@ -94,6 +94,40 @@ def _programs_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def find_helper_programs(program_dirs: list[Path]) -> dict[str, list[str]]:
+    """Helper exes per program folder, read from each folder's build_config.json.
+
+    Same source as the builder's expander (`extra_exes`), so nothing has to be
+    registered here: a program has helpers exactly when its build_config.json
+    lists them.
+
+    A helper is built into its OWN dist folder under its own name, which makes it
+    a program like any other as far as the copy is concerned — it only lacks a
+    source folder, and that is precisely why it never appeared on this list and
+    was reported as "NOT copied — not selected in Copy Manager".
+    """
+    out: dict[str, list[str]] = {}
+    for p in program_dirs:
+        cfg_path = p / "build_config.json"
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        names: list[str] = []
+        for spec in (cfg.get("extra_exes") or []):
+            if isinstance(spec, str):
+                spec = {"script": spec}
+            script = p / spec.get("script", "")
+            if not script.exists():
+                continue
+            name = (spec.get("name") or script.stem).strip()
+            if name and name not in names:
+                names.append(name)
+        if names:
+            out[p.name] = names
+    return out
+
+
 def _get_scratch_root() -> Path | None:
     cfg = _load_devtools_config()
     s = cfg.get("scratch")
@@ -877,10 +911,22 @@ class DeployGUI(ttk.Frame):
 
         self.program_is_new: dict[Path, bool] = {}
         self.program_latest_version: dict[Path, str] = {}
-        
+
+        # Helper exes (a program's build_config.json -> extra_exes): they have a
+        # dist folder of their own but no source folder, so they are shown
+        # indented under their parent, the same way the builder shows them.
+        self.helper_keys_by_parent: dict[str, list[Path]] = {}
+        self.helper_parent_dir: dict[str, Path] = {}   # helper name -> parent source folder
+        self.helper_rows: dict[str, list[ttk.Frame]] = {}
+        self.expander_buttons: dict[str, ttk.Button] = {}
+        # Folded/unfolded state survives a Refresh — the rows are rebuilt, the
+        # list the user opened should not close under them.
+        self.expanded_programs: set[str] = set()
+
         self.dest_path_labels: list[tuple[ttk.Label, str]] = []
         self._log_autoscroll = True
 
+        self.arrow_col_px = 24
         self.program_col_px = 200
         self.version_col_px = 140
         self.new_col_px = 70
@@ -1067,14 +1113,13 @@ class DeployGUI(ttk.Frame):
         self.header = ttk.Frame(left)
         self.header.pack(fill="x", padx=8, pady=(8, 2))
 
-        self.header.grid_columnconfigure(0, minsize=26)
-        self.header.grid_columnconfigure(1, minsize=self.program_col_px)
-        self.header.grid_columnconfigure(2, minsize=self.version_col_px)
-        self.header.grid_columnconfigure(3, minsize=self.new_col_px)
-        self.header.grid_columnconfigure(4, weight=1)
-        ttk.Label(self.header, text="Program").grid(row=0, column=1, sticky="w")
-        ttk.Label(self.header, text="Version").grid(row=0, column=2, sticky="w")
-        ttk.Label(self.header, text="Status").grid(row=0, column=3, sticky="w")
+        # Column 0 is the slot for the fold arrow of a program that carries
+        # helpers, so every tick box stays on the same left edge and a row with
+        # an arrow does not read as indented.
+        self._configure_row_columns(self.header)
+        ttk.Label(self.header, text="Program").grid(row=0, column=2, sticky="w")
+        ttk.Label(self.header, text="Version").grid(row=0, column=3, sticky="w")
+        ttk.Label(self.header, text="Status").grid(row=0, column=4, sticky="w")
 
         self.programs_sf = ScrollableFrame(left)
         self.programs_sf.pack(fill="both", expand=True, padx=8, pady=(2, 8))
@@ -1252,6 +1297,16 @@ class DeployGUI(ttk.Frame):
             max_px = max(max_px, f.measure(n))
         return max_px + 40
 
+    def _configure_row_columns(self, frame):
+        """The column layout shared by the header and every row: fold arrow, tick
+        box, program, version, status, last deployed."""
+        frame.grid_columnconfigure(0, minsize=self.arrow_col_px)
+        frame.grid_columnconfigure(1, minsize=26)
+        frame.grid_columnconfigure(2, minsize=self.program_col_px)
+        frame.grid_columnconfigure(3, minsize=self.version_col_px)
+        frame.grid_columnconfigure(4, minsize=self.new_col_px)
+        frame.grid_columnconfigure(5, weight=1)
+
     def _load_programs(self):
         for child in self.programs_sf.inner.winfo_children():
             child.destroy()
@@ -1259,6 +1314,10 @@ class DeployGUI(ttk.Frame):
         self.program_version_vars.clear()
         self.program_is_new.clear()
         self.program_latest_version.clear()
+        self.helper_keys_by_parent.clear()
+        self.helper_parent_dir.clear()
+        self.helper_rows.clear()
+        self.expander_buttons.clear()
 
         programs_root = _programs_root()
         dist_root = _dist_root()
@@ -1283,67 +1342,152 @@ class DeployGUI(ttk.Frame):
             self._log(f"No program folders found in: {programs_root}")
             return
 
-        self.program_col_px = self._compute_program_col_px([p.name for p in program_dirs])
-        self.header.grid_columnconfigure(1, minsize=self.program_col_px)
+        # A helper whose name is already a program folder is that program — list
+        # it once, as itself.
+        taken = {p.name.lower() for p in program_dirs}
+        helper_names_by_parent = {
+            parent: [n for n in names if n.lower() not in taken]
+            for parent, names in find_helper_programs(program_dirs).items()
+        }
 
+        col_names = [p.name for p in program_dirs]
+        for names in helper_names_by_parent.values():
+            col_names += [f"↳ {n}" for n in names]
+        self.program_col_px = self._compute_program_col_px(col_names)
+        self._configure_row_columns(self.header)
+
+        # Read once for the whole list: Versions.txt lives on the scratch share
+        # and re-reading it per program made opening the list wait on the network
+        # as many times as there are programs.
+        versions_map = read_versions_txt()
+
+        self.programs_sf.inner.grid_columnconfigure(0, weight=1)
+        row_idx = 0
         for p in program_dirs:
-            dist_dir = dist_root / p.name   # may or may not exist yet
-            version_folders = list_versions(dist_dir)
-            version_names = [vf.name for vf in version_folders]
+            helper_names = helper_names_by_parent.get(p.name) or []
+            row = self._build_program_row(p, row_idx, dist_root, versions_map)
+            row_idx += 1
 
-            latest = version_names[0] if version_names else ""
-            self.program_latest_version[p] = latest
+            if helper_names:
+                # Folded by default: most programs have no helpers, and an
+                # always-open tree would push the programs themselves out of the
+                # visible part of the list.
+                open_now = p.name in self.expanded_programs
+                btn = ttk.Button(row, text="▾" if open_now else "▸", width=2,
+                                 command=lambda pn=p.name: self._toggle_expanded(pn))
+                btn.grid(row=0, column=0, sticky="w")
+                self.expander_buttons[p.name] = btn
 
-            # Read deployed version from Versions.txt (primary) or local state (fallback)
-            versions_map = read_versions_txt()
-            last_deployed = versions_map.get(p.name, "") or self.state_deployed.get(p.name.lower(), "")
-            last_deployed = last_deployed.strip()
-            is_new = bool(latest) and is_newer_version(latest, last_deployed)
-            self.program_is_new[p] = is_new
+                keys, rows = [], []
+                for n in helper_names:
+                    # No source folder of its own — the name is what the copy
+                    # keys on (dist/<name>), so a key under the programs root is
+                    # enough to make it look like any other program here.
+                    key = programs_root / n
+                    self.helper_parent_dir[n] = p
+                    keys.append(key)
+                    rows.append(self._build_program_row(key, row_idx, dist_root,
+                                                       versions_map, is_helper=True))
+                    row_idx += 1
+                self.helper_keys_by_parent[p.name] = keys
+                self.helper_rows[p.name] = rows
+                if not open_now:
+                    for hr in rows:
+                        hr.grid_remove()
 
-            var_checked = tk.BooleanVar(value=False)
-            self.program_vars[p] = var_checked
+    def _build_program_row(self, key: Path, row_idx: int, dist_root: Path,
+                           versions_map: dict, is_helper: bool = False) -> ttk.Frame:
+        """One row of the program list — a program folder or, indented, a helper
+        exe built from one. Both are copied the same way, so both get a tick box,
+        a version to pick and a status."""
+        name = key.name
+        version_folders = list_versions(dist_root / name)   # may not exist yet
+        version_names = [vf.name for vf in version_folders]
 
-            var_version = tk.StringVar(value=latest)
-            self.program_version_vars[p] = var_version
+        latest = version_names[0] if version_names else ""
+        self.program_latest_version[key] = latest
 
-            row = ttk.Frame(self.programs_sf.inner)
-            row.pack(fill="x", pady=3)
+        # Deployed version from Versions.txt (primary) or local state (fallback)
+        last_deployed = (versions_map.get(name, "")
+                         or self.state_deployed.get(name.lower(), "")).strip()
+        is_new = bool(latest) and is_newer_version(latest, last_deployed)
+        self.program_is_new[key] = is_new
 
-            row.grid_columnconfigure(0, minsize=26)
-            row.grid_columnconfigure(1, minsize=self.program_col_px)
-            row.grid_columnconfigure(2, minsize=self.version_col_px)
-            row.grid_columnconfigure(3, minsize=self.new_col_px)
-            row.grid_columnconfigure(4, weight=1)
+        var_checked = tk.BooleanVar(value=False)
+        self.program_vars[key] = var_checked
+        var_version = tk.StringVar(value=latest)
+        self.program_version_vars[key] = var_version
 
-            ttk.Checkbutton(row, variable=var_checked).grid(row=0, column=0, sticky="w")
-            ttk.Label(row, text=p.name).grid(row=0, column=1, sticky="w", padx=(6, 8))
+        row = ttk.Frame(self.programs_sf.inner)
+        row.grid(row=row_idx, column=0, sticky="ew", pady=(1 if is_helper else 3))
+        self._configure_row_columns(row)
 
-            cb = ttk.Combobox(
-                row,
-                textvariable=var_version,
-                values=version_names,
-                state="readonly" if version_names else "disabled",
-            )
-            cb.grid(row=0, column=2, sticky="w")
+        tick = ttk.Checkbutton(row, variable=var_checked)
+        if not is_helper:
+            tick.configure(command=lambda kk=key: self._on_program_check_clicked(kk))
+        tick.grid(row=0, column=1, sticky="w")
+        ttk.Label(row, text=f"↳ {name}" if is_helper else name).grid(
+            row=0, column=2, sticky="w", padx=((20 if is_helper else 6), 8))
 
-            if not version_names:
-                ttk.Label(row, text="NEW", foreground="gray").grid(row=0, column=3, sticky="w")
-            elif is_new:
-                ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=3, sticky="w")
-            elif last_deployed:
-                ttk.Label(row, text="UTD", foreground="#cc0000").grid(row=0, column=3, sticky="w")
-            else:
-                ttk.Label(row, text="").grid(row=0, column=3, sticky="w")
+        cb = ttk.Combobox(
+            row,
+            textvariable=var_version,
+            values=version_names,
+            state="readonly" if version_names else "disabled",
+        )
+        cb.grid(row=0, column=3, sticky="w")
 
-            if last_deployed:
-                ttk.Label(row, text=f"last deployed: {last_deployed}", foreground="gray").grid(
-                    row=0, column=4, sticky="w"
-                )
-            else:
-                ttk.Label(row, text="last deployed: (none)", foreground="gray").grid(
-                    row=0, column=4, sticky="w"
-                )
+        if not version_names:
+            ttk.Label(row, text="NEW", foreground="gray").grid(row=0, column=4, sticky="w")
+        elif is_new:
+            ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=4, sticky="w")
+        elif last_deployed:
+            ttk.Label(row, text="UTD", foreground="#cc0000").grid(row=0, column=4, sticky="w")
+        else:
+            ttk.Label(row, text="").grid(row=0, column=4, sticky="w")
+
+        ttk.Label(row, foreground="gray",
+                  text=f"last deployed: {last_deployed}" if last_deployed
+                       else "last deployed: (none)").grid(row=0, column=5, sticky="w")
+        return row
+
+    def _on_program_check_clicked(self, key: Path):
+        """Ticking a program takes its helpers with it — the usual case is a
+        released version where the app and its helper match. It is a one-way
+        push, not a lock: untick a helper afterwards and it stays unticked.
+        Ticking also opens the list, so what went along is not hidden away."""
+        var = self.program_vars.get(key)
+        helper_keys = self.helper_keys_by_parent.get(key.name) or []
+        if var is None or not helper_keys:
+            return
+        for hk in helper_keys:
+            hv = self.program_vars.get(hk)
+            if hv is not None:
+                hv.set(var.get())
+        if var.get():
+            self._toggle_expanded(key.name, open_it=True)
+
+    def _toggle_expanded(self, program_name: str, open_it: bool | None = None):
+        was_open = program_name in self.expanded_programs
+        want_open = (not was_open) if open_it is None else bool(open_it)
+        if want_open == was_open:
+            return
+        if want_open:
+            self.expanded_programs.add(program_name)
+        else:
+            self.expanded_programs.discard(program_name)
+
+        for hr in self.helper_rows.get(program_name, []):
+            try:
+                hr.grid() if want_open else hr.grid_remove()
+            except Exception:
+                pass
+        btn = self.expander_buttons.get(program_name)
+        if btn is not None:
+            try:
+                btn.configure(text="▾" if want_open else "▸")
+            except Exception:
+                pass
 
     def _select_all_programs(self):
         for var in self.program_vars.values():
@@ -1607,6 +1751,13 @@ class DeployGUI(ttk.Frame):
         # 5. None — skip with warning
         src_readme = None
         _readme_search_dirs = [version_folder, _programs_root() / program_name, program_dir]
+        # A helper exe has no source folder of its own: its documentation lives in
+        # the folder of the program it is built from, named after the helper
+        # (ReadMe_<helper name>.txt). Without this step a helper built before the
+        # builder started copying its ReadMe along would ship none at all.
+        _helper_parent = self.helper_parent_dir.get(program_name)
+        if _helper_parent is not None:
+            _readme_search_dirs.append(_helper_parent)
         for dst_root in destination_roots:
             _readme_search_dirs.append(dst_root / program_name)
         for _d in _readme_search_dirs:
@@ -1929,6 +2080,11 @@ class DeployGUI(ttk.Frame):
                         src_readme = None
                         version_folders = list_versions(program_dir)
                         search_dirs = (version_folders[:1] if version_folders else []) + [src_dir, program_dir]
+                        # A helper exe keeps its ReadMe in the folder of the
+                        # program it is built from — it has none of its own.
+                        _hp = self.helper_parent_dir.get(src_dir.name)
+                        if _hp is not None:
+                            search_dirs.append(_hp)
                         for dst_root in selected_roots:
                             search_dirs.append(dst_root / program_dir.name)
                         for _d in search_dirs:

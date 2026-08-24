@@ -45,11 +45,19 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | Constant | Programs |
 |----------|----------|
 | `SCRIPTS` | Image Tools, Screenshots, Time Converter, Announcer, CSS Logger, Chiller log |
-| `PARTS` | Image Finder, Image Slider, Shot finder, Launcher |
+| `PARTS` | Launcher |
 | `IN_PROGRESS` | Calibrations |
 | `NOT_WORKING_CORRECTLY` | Counter of Shots |
 | `PERSONAL` | Copy Manager, Builder, Internal Builder, Dev Tools, Git Work |
 | *(everything else)* | External |
+| `SUBSUMED` | **not shown at all** — Image Finder, Image Slider, Shot finder (Image Tools), Spectra (CSS Logger), Builder, Copy manager (Dev Tools) |
+
+`SUBSUMED` is not a group: `scan_programs()` skips those folders before a card is
+ever built. Each of them became a tab of a bigger program, so the folder left on
+the share only offers a build from last spring — a card for it is a way to start
+the wrong version by mistake. The names are matched through `_norm()`, so folder
+spelling and spacing do not matter. Note `PERSONAL` still names Copy Manager and
+Builder: harmless, because the folders never reach the grouping step.
 
 Display order (`GROUP_ORDER`): Scripts → Parts → External → In progress →
 Not working correctly → Personal.

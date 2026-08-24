@@ -167,7 +167,9 @@ Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
 | L961 | `_build_ui()` | left program list, right destinations, action buttons, progress, log |
 | L1073/1081 | `_refresh` / `auto_deploy(built_projects, build_summary)` | Builder hand-off |
 | L1116-1152 | `_log`, `_clear_log`, `_on_log_scroll`, `_on_log_scrollbar_release`, `_check_log_position`, `_compute_program_col_px` | log + layout |
-| L1159 | `_load_programs()` | dist scan → versions → rows |
+| L1159 | `_load_programs()` | source folders → dist versions → one row per program **plus an indented row per helper exe** (`find_helper_programs`, read from each folder's `build_config.json` → `extra_exes`, the Builder's source too). `Versions.txt` is read once for the whole list. Helper rows are `grid_remove()`d while folded (`expanded_programs`, `helper_rows`, `expander_buttons`, arrow in column 0) |
+| — | `_build_program_row(...)` / `_configure_row_columns(frame)` | the row itself and the shared column layout: arrow, tick box, program, version, status, last deployed |
+| — | `_on_program_check_clicked(key)` | ticking a program pushes the tick onto its helpers and opens the list — one-way push, unticking a helper sticks. Helpers share `program_vars`, so Select all / new / Clear / `auto_deploy` need no special case. This is what fixed a built helper being reported `NOT copied — not selected in Copy Manager` |
 | L1252/1256/1270 | `_select_all_programs` / `_select_new_programs` / `_clear_programs` | |
 | **L1274** | `_on_fix()` | runs `_fix_archive_dir` + `_reunite_unknown_helpers` + `_normalize_version_folder_names` over the selected programs' archives |
 | L1365 | `_collect_icon_conflicts(...)` | one compare dialog per (program, version, dest) icon conflict |
@@ -188,7 +190,9 @@ Thin launcher. Imports `BuilderUI` from `b_t.py` and `DeployGUI` from `cm_t.py`.
    the names in `incoming_dirs`
 
 **ReadMe lookup order** (L1493) — version folder → **source folder in the repo**
-→ `dist/<program>/` → `<destination>/<program>/` → warn and skip. Step 2 was added
+→ `dist/<program>/` → for a helper exe the parent's source folder
+(`helper_parent_dir[name]`, where `ReadMe_<helper name>` lives — a helper has no
+source folder of its own) → `<destination>/<program>/` → warn and skip. Step 2 was added
 because builds predating the Builder's ReadMe copy have none in the version folder,
 and the deploy then shipped no ReadMe at all. `_on_copy_readme_only` (L1767) uses
 the same order.

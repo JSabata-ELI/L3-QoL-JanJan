@@ -4,8 +4,9 @@ description: Line-by-line class/function map of all files in Image Tools — rea
 ---
 
 Image Tools — PySide6 multi-tab image viewer
-Files (verified 2026-08-19): `main.py` (275 L) | `if_t.py` (8627 L) | `is_t.py` (23916 L) |
-`sf_t.py` (4085 L) | `wk_t.py` (7281 L) | `cpva_client.py` (1316 L) | `img_scale.py` (673 L)
+Files: `main.py` (324 L) | `if_t.py` (8827 L) | `is_t.py` (25104 L) | `sf_t.py` (4278 L) |
+`wk_t.py` (7811 L) | `om_t.py` (1927 L) | `cpva_client.py` (1335 L) | `img_scale.py` (760 L)
+— sizes as of 2026-08-21; only the `om_t.py` section was written against them.
 
 Line numbers are approximate anchors — they drift as the files change, and every file
 here has grown since the section below it was written. **Re-grep the symbol name**
@@ -49,13 +50,63 @@ archive frames; run it from the lab after any archiver change.
 | L6 | frozen `sys.path` fixup | strips user site-packages, prepends `_internal` |
 | L28 | `_VER_RE` | `v#.#.#` extracted from the exe name |
 | L30 | `_detect_version()` / `APP_VERSION` / `APP_TITLE` | version string |
-| L46 | `build_main_window(folder_arg)` | loads if/is/sf/wk via importlib (`if`/`is` are keywords), builds the 4-tab `QTabWidget`, wires inter-tab refs, Stop-All button in the status bar |
+| L46 | `build_main_window(folder_arg)` | loads if/is/sf/wk/om via importlib (`if`/`is` are keywords), builds the 5-tab `QTabWidget`, wires inter-tab refs, Stop-All button in the status bar. `om_t.py` is loaded LAST (it borrows from `image_slider` + `shot_finder`) and inside its own `try`; on failure a "One Moment (unavailable)" tab carries the error rather than the tab silently not existing |
 | L188 | `_open_folder_in_slider(viewer, tabs, folder)` | switch to the Slider tab + load a folder |
 | L196 | `main()` | argparse, AppUserModelID, Fusion style + global QSS, `showMaximized` |
 
 **Inter-tab wiring:** finder / shot_finder get `_slider_ref` and `_tab_widget`; every
 tab gets `_workshop_ref` + `_workshop_tab_idx`. The Slider auto-starts live mode on
-the first activation of tab index 1.
+the first activation of tab index 1 — so One Moment is inserted BEFORE Workshop and
+AFTER Shot Finder, leaving the Slider at index 1.
+
+---
+
+## om_t.py — One Moment tab (1927 L, UNDER CONSTRUCTION)
+
+Everything at ONE time, the transpose of the other tabs. Owns no resolver, no registry
+and no renderer: the time-window + camera pickers, the PV list + picker, the panel
+section, the image renderer (`load_image_scaled`), share root and short camera label
+come from `image_slider`, the frame-for-a-timestamp resolver from `shot_finder`, the day
+cache from `cpva_client`, the absolute scale from `img_scale`.
+
+| Line | Name | What it does |
+|------|------|-------------|
+| L1-47 | module docstring | what the tab is, the six-step workflow, what is borrowed from where, why ONE graph, and the deliberate limits |
+| L79 | `_load_sibling(name, file)` | re-entrancy-safe sibling import — `sys.modules` BEFORE `exec_module`, reuses whatever main.py loaded |
+| L100/109 | `_sl()` / `_sf()` | lazy handles on `image_slider` / `shot_finder`, so the module also runs standalone |
+| L117 | `_mpl()` | matplotlib imported on FIRST GRAPH, not at import (~0.9 s cold) |
+| L128-166 | `NS_PER_S`, `_FRAME_WORKERS` (8), `_TILE_SIDE_*`, `_TILE_MIN_W`, `_CLICK_SLOP_PX` (5), `_RENDER_SETTLE_MS` (220), `_LEFT_W` (300) | the share-read fan-out width, the px threshold that separates a click from a drag, and the settle a dragged display slider waits out |
+| L169-203 | `_ns_to_prague` / `_fmt_moment` / `_fmt_hms` / `_fmt_delta` / `_fmt_span` | ns → Prague wall clock, axis tick labels, the signed frame offset (`+5.0 s`), and a duration in the unit that reads best |
+| L213/230 | `_date_keys_for_windows` / `_mask_to_windows` | every Prague day the picked windows touch (a window may cross midnight), then the mask that throws away the samples outside the pick — the archiver is only queryable a day at a time |
+| L242/250 | `_PvLoadSignals` / `_PvLoadTask` | each picked channel over the picked window(s): `cpva.get_day` per day, stitched, sorted, masked; serial (the client pools and caches), per-channel progress |
+| L328/333 | `_ResolveSignals` / `_ResolveTask` | moment + cameras → the FILE holding each camera's frame (`sf._find_image_in_day`), `ThreadPoolExecutor(8)`; emits each as it lands |
+| L387/392 | `_RenderSignals` / `_RenderTask` | those files → pictures through the Slider's `load_image_scaled` (palette, contrast, brightness, gamma, absolute scale), `ThreadPoolExecutor(8)`. Split from resolving so a display control re-renders WITHOUT walking the share again. Copies the `QImage` before it crosses the thread boundary |
+| L448 | `_Tile(QFrame)` | picture + two labels: short camera name and the frame's own time, nothing else (the offset from the moment and the file are in the tooltip). The picture area is `setFixedSize` to the picture — that is what killed the black gutter. Name/time side by side while both fit, stacked when not; the name is elided against its OWN measured width |
+| L564 | `_MomentPopout(QDialog)` | the same tiles in a non-modal window of their own |
+| L595 | `OneMomentWidget(QWidget)` | the tab |
+| L600 | `__init__` | state (`_windows`, `_axis_t0_ns`, three generation counters), ONE signals object per widget (not per task), the render settle timer, `pv_registry_load`, and `_tb_host` — the light-palette toolbar parent that must outlive `_make_toolbar` |
+| L686 | `_build_ui` | left settings panel · right splitter (graph over frames) |
+| L713 | `_build_left_panel` | the five `CollapsibleSection`s — Source, The moment, PV channels, Range statistics, Image / Display — plus progress and status BELOW them all, where no collapse can hide them |
+| L967 | `_slider_row` | one "name · slider · number · reset · Auto" row, the Slider's own shape for an image adjustment |
+| L998/1032 | `_build_graph_pane` / `_build_moment_pane` | the canvas holder; the tile wall + its hint line |
+| L1064-1081 | `_refresh_pick_labels` / `_window_text` | what is picked, in words |
+| L1084/1124/1139 | `_pick_window` / `_pick_cameras` / `_pick_pvs` | the Slider's `DatePickerDialog` / `CameraPickerDialog` / `PvConfigDialog`; the PV registry is SHARED, only the selection is this tab's |
+| L1118 | `_day_start_of` | Prague midnight of a timestamp's day — the x = 0 of the graph |
+| L1170 | `_on_pv_eye` | the eye takes a PV off the GRAPH without unpicking it — samples stay loaded, value stays listed |
+| L1182-1248 | `_load_day` → `_on_pv_progress` → `_on_series` → `_on_pv_done`, `cancel_scan` | the load cycle, generation-guarded |
+| L1250/1267-1281 | `_clear_graph`, `_unit_of` / `_values_of` / `_colour_of` | tears canvas AND selectors down; a PV's colour comes from the PICKED list, never from its position among those drawn |
+| L1283 | `_rebuild_graph` | picks the mode, sets the tick formatter on `_ax_x` (a `twinx` hides its own x axis), clamps x to the window, and restores the moment and marked range afterwards |
+| L1367 | `_draw_one_graph` | THE DEFAULT: one plot, PVs grouped by unit, an axis per unit (2nd on the right spine, further ones outward-offset), legend, nothing normalised. Cursor and range are painted once on the base axes and show through the twins |
+| L1422 | `_draw_stacked` | one plot per PV, `sharex=True` — for many unrelated PVs |
+| L1451/1466 | `_make_toolbar` / `_make_span_selector` | untinted toolbar icons; a `SpanSelector` per axes with the `props`/`rectprops` fallback |
+| L1476-1543 | `_toolbar_busy` / `_on_press` / `_on_release` / `_on_span` / `_clear_span` / `_paint_span` | click vs drag by pixel distance, both inert while the toolbar's zoom/pan is armed |
+| L1545/1556/1570 | `_set_moment_from_x` / `_nearest_index` / `_move_cursor` | a click snaps to a real sample (both neighbours compared — bisect alone names the sample after) |
+| L1576/1587 | `_apply_moment` / `_step_moment` | cursor + PV values + resolve frames; previous/next shot clamped at the ends |
+| L1602/1612/1645 | `_value_at` / `_refresh_pv_table` / `_refresh_stats` | the left panel's two tables: the Slider's `PvValueTable` (eye · PV · value at the moment) and PV · mean · ±std · n for the marked range, with min/max/peak-to-peak in the row tooltip |
+| L1708-1753 | `_display_opts` / `_on_palette_changed` / `_sync_display_enabled` / `_on_display_changed` | the render settings; an Auto tick or the Default palette greys out the slider it outranks; any change re-renders after the settle |
+| L1755-1877 | `_resolve_frames` → `_on_resolved` → `_on_resolve_done` → `_render_frames` → `_on_tile` → `_relayout_tiles` → `_on_tiles_done`, `resizeEvent`, `_popout` | the tile lifecycle; a resize re-flows the grid without re-reading the share, and the previous layout's column stretch is taken away by hand |
+| L1879 | `_send_to_workshop` | plain absolute mapping, never this tab's display settings — Workshop measures what it is given |
+| L1914 | `main()` | standalone window (`python om_t.py`) |
 
 ---
 

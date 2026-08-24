@@ -3,7 +3,7 @@ Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
 Verified against source: 2026-08-20
-  (monitor_tab.py 6994 lines, alerting.py 1178, remote_launcher.py 487,
+  (monitor_tab.py 7012 lines, alerting.py 1178, remote_launcher.py 491,
    main.py 395, shared_pvs.py 364, bot_commands.py 297,
    cpva_api.py 263, notify_provision.py 238, memstats.py 187,
    operation_history_logic.py 128, secrets_util.py 70)

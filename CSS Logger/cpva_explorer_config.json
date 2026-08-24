@@ -10,8 +10,8 @@
     "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-08-20 15:23:05",
-  "time_to": "2026-08-20 16:23:05",
+  "time_from": "2026-08-21 14:48:12",
+  "time_to": "2026-08-21 15:48:12",
   "http_timeout": 10.0,
   "conditions": [
     {
@@ -63,6 +63,10 @@
     "band_pad_frac": 0.12,
     "cursor_value_boxes": true,
     "cursor_boxes_max": 20,
-    "line_markers": true
-  }
+    "line_markers": true,
+    "live_poll_ms": 300,
+    "live_graph_min_ms": 300,
+    "live_table_ms": 1500
+  },
+  "style_presets": {}
 }

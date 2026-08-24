@@ -94,7 +94,7 @@ The last four are the guarded "danger zone"; three of them need the user to type
 | build / repo | `__init__`, `_build_ui`, `_init_repo`, `_choose_repo`, `_set_repo`, `_open_vscode`, `_set_ui_enabled` |
 | identity | `_refresh_identity`, `_edit_identity`, `_ensure_identity` (asked before the first commit), `_check_autocrlf` |
 | status | `_refresh`, `_update_status_badge` |
-| commit message | `_toggle_msg_expand`, `_today_prefix`, `_commit_message`, `_reset_commit_message` |
+| commit message | `_toggle_msg_expand`, `_today_prefix`, `_commit_message`, `_reset_commit_message`, `_roll_date_prefill`, `_confirm_push_only` |
 | branches | `_selected_branch`, `_on_switch`, `_on_new`, `_pick_branch_to_delete`, `_on_delete` |
 | actions | `_on_fetch`, `_on_pull`, `_on_commit_push`, `_on_sync`, `_on_merge`, `_on_stash_pop` |
 | danger zone | `_typed_confirm`, `_on_force_push`, `_on_hard_reset`, `_on_discard_all`, `_on_force_delete` |

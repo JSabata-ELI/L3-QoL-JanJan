@@ -103,6 +103,16 @@ a build (`invalidate_version_cache()`, which also clears `_last_version_cache`).
    read-only flags OneDrive leaves behind
 3. Collect the extra `.py` files from the project root — **`test_*.py` is excluded**
    (dev-only, nothing imports it at runtime)
+3a. `_check_module_homes()` — **the build stops** when an imported module has no
+   `.py` in the project folder, or has a second copy in another project folder.
+   PyInstaller is given the project folder as its only `--paths`, so a module
+   reached at runtime through `sys.path` is invisible to it and the copy sitting
+   in the project folder is bundled instead. That is how the built Spectra tab
+   stayed five weeks behind `Spectra/sp_t.py` with no error. Imports are read
+   with `ast`, not a regex — prose in a docstring ("from a build under …") would
+   otherwise fail the build. `_module_homes()` builds the name → folders map,
+   scanning only the top level of each project folder (that is all the build
+   sees) and skipping `_internal`, `archive`, `testing`, caches, `test_*.py`.
 4. Read the optional `build_config.json`
 5. Auto-detect imports of `numpy`, `scipy`, `sklearn`, `cv2`, `matplotlib`, `pandas`
    in the sources and add `--collect-all` for them (their native libs, e.g.
@@ -248,9 +258,21 @@ from the plain `Name vX.Y.Z.exe` filename.
 
 ### DeployGUI(ttk.Frame)
 - State: `state_deployed`, `program_vars` / `program_version_vars` / `dest_vars`,
-  `program_is_new`, `program_latest_version`, `internal_vars`
-- `_load_programs()` — scan dist → versions → rows; the program column width is
-  computed from the names (`_compute_program_col_px`)
+  `program_is_new`, `program_latest_version`, `internal_vars`,
+  `helper_keys_by_parent` / `helper_parent_dir` / `helper_rows` /
+  `expander_buttons` / `expanded_programs` (see *Helper exes on the copy list*)
+- `_load_programs()` — scan the source folders → per name: dist versions → one row
+  per program plus, indented, one per helper exe; the program column width is
+  computed from the names (`_compute_program_col_px`). `Versions.txt` is read
+  **once** for the whole list — it lives on the scratch share and the per-row read
+  made opening the list wait on the network once per program
+- `_build_program_row(key, row_idx, dist_root, versions_map, is_helper=False)` — the
+  row itself; both kinds of program get a tick box, a version combo and a status,
+  and both are keyed by a `Path` under the programs root whose **name** is what the
+  copy resolves (`dist/<name>`, `<destination>/<name>`)
+- `_configure_row_columns(frame)` — the one column layout of the header and every
+  row: fold arrow, tick box, program, version, status, last deployed. Column 0 is
+  the arrow slot, so a row without an arrow is not indented
 - Selection: `_select_all_programs`, `_select_new_programs`, `_clear_programs`,
   `_get_selected_programs`, `_get_selected_destination_roots`
 - Destinations: `_build_dest_rows`, `_reflow_dest_paths` / `_split_path_to_lines`
@@ -265,6 +287,22 @@ from the plain `Name vX.Y.Z.exe` filename.
   `_change_root()`, `_refresh()`
 - `ScrollableFrame` — the scrollable program list; `_build_summary(jobs, roots)` —
   the confirmation text
+
+### Helper exes on the copy list
+A helper (`extra_exes` in the parent's `build_config.json`) builds into
+`dist/<helper name>/` with its own version, so the copy can treat it as a program
+like any other — but it has **no source folder**, which is why it used to be
+missing from this list entirely and `auto_deploy` reported it as
+`NOT copied — not selected in Copy Manager`. It then had to be copied by hand.
+
+| Piece | Note |
+|-------|------|
+| `find_helper_programs(program_dirs)` | module level, reads each folder's `build_config.json` → `extra_exes`, same source as the Builder's `find_helpers`, so nothing is registered twice and the list cannot go stale. A `str` entry counts as `{"script": …}`; a missing script is dropped |
+| dedupe against `program_dirs` | a helper whose name is also a program folder *is* that program — listed once, as itself |
+| `helper_keys_by_parent` / `helper_parent_dir` | parent name → helper row keys, and helper name → parent **source folder** (used by the ReadMe lookup) |
+| `expanded_programs` + `helper_rows` + `expander_buttons` | rows are built with their parent and `grid_remove()`d while folded (hence `grid`, not `pack`: `pack_forget` would re-append the row at the end of the list). Folded by default; the open/closed state survives a **Refresh** |
+| `_on_program_check_clicked(key)` | ticking a program pushes the tick onto its helpers and opens the list so what went along is visible. **One-way push, not a lock** — unticking a helper afterwards sticks, which is how you publish only the app |
+| Select all / Select new / Clear / `_get_selected_programs` / `auto_deploy` | unchanged: helpers live in the same `program_vars`, so every one of them sees them without a special case |
 
 ### `_deploy_one_program()` steps
 1. Find the exe in the version folder, the ReadMe, the `.py` files, the icon and
@@ -293,7 +331,7 @@ two ever diverge, a publish lands a file the Launcher will not open, which is
 invisible until somebody presses the button.
 
 ### ReadMe lookup order
-Five places, in this order, and the second one is the reason the order matters:
+In this order, and the second one is the reason the order matters:
 
 1. the version folder — the Builder copies it there
 2. **the source folder in the repo** — the live ReadMe. Builds made before the
@@ -301,8 +339,11 @@ Five places, in this order, and the second one is the reason the order matters:
    without this step the deploy shipped no ReadMe at all, so the Launcher card
    showed no ReadMe button
 3. `dist/<program>/` — may still have one from an earlier deploy
-4. `<destination>/<program>/` — the copy already published there
-5. nothing found → skip with a warning
+4. for a helper exe: `helper_parent_dir[name]`, the parent's source folder, which
+   is where `ReadMe_<helper name>` and `ReadMe_<helper name>_Full` live — a helper
+   has no source folder of its own (same fallback in `_on_copy_readme_only`)
+5. `<destination>/<program>/` — the copy already published there
+6. nothing found → skip with a warning
 
 `_normalize_name` ignores case, underscores, spaces, hyphens and dots, so
 `Readme Image Tools.txt` and `ReadMe_Spectra.txt` both match. Note that

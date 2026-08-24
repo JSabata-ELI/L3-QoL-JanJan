@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (sp_t.py, 4658 lines)
+Verified against source: 2026-08-21  (sp_t.py)
 -----------------------------------------------------------------
 Short version: ReadMe_Spectra.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -56,7 +56,25 @@ comparison — is a way of looking at those averages.
 3. ARCHIVE MODE
 =================================================================
 
-3.1 LOADING A DAY
+3.1 WHAT IT IS DOING, AND HOW TO STOP IT
+
+    At the very top of the panel is a box saying what the tab is busy
+    with:
+
+      Idle           nothing running
+      Working...     a day is loading, or an analysis is fetching.
+                     The progress bar next to "Analyze" says how far.
+      LIVE           blinking, while live streaming runs
+
+    It used to track live mode only, so it read "idle" while an
+    analysis was fetching half a day of spectra.
+
+    "Stop" beside it stops whatever that is — the live stream, a day
+    load, or an analysis in progress. It is greyed out when there is
+    nothing to stop. Whatever had already been fetched is kept; only
+    the work still outstanding is dropped.
+
+3.2 LOADING A DAY
 
     "Load day..." opens a calendar. A plain click picks or unpicks a
     single day. Ctrl+click adds the whole range from your previous
@@ -68,12 +86,50 @@ comparison — is a way of looking at those averages.
     the window stays usable and the status line says what is
     happening.
 
-3.2 THE SEARCH SIGNAL
+3.3 THE THREE NUMBERED CARDS
 
-    The box "Search data by" holds a list of signals you can navigate
-    by, shown as a label and the channel it comes from. Click a row
-    to plot it. Double-click the label to rename it to something
-    meaningful to you — the underlying channel is unchanged.
+    The top of the left panel is three numbered cards, read downwards
+    in the order you actually work:
+
+      1  DAY          which day (or days) is loaded.
+      2  SEARCH BY    the signal the search is running on, named in
+                      full with its channel underneath, and right
+                      below it the whole PV list it is chosen from,
+                      with the presets and the channel search. Green.
+      3  SPECTRUM     which channel you are measuring, and how its
+                      wavelength axis is built. Blue.
+
+    Card 2 is one card on purpose: the list is how you choose the
+    signal, so the answer and the place you change it belong
+    together. Clicking a row in the list immediately renames the
+    headline at the top of the card, so there is never any doubt
+    about which signal the search is using.
+
+    Each row has a tick box. Ticked means the signal is drawn in the
+    search graph; unticked means it stays in the list but is left off
+    the graph, so a long list does not have to become a wall of
+    curves. The headline counts the rest as "+N more plotted" and,
+    if any are switched off, as "(N off)".
+
+    Two rules keep the graph sensible. One signal always stays
+    ticked, so the graph is never empty. And clicking a row that is
+    switched off ticks it again, because searching by a curve you
+    cannot see makes no sense. Which rows are ticked is remembered
+    between sessions.
+
+3.4 THE SEARCH SIGNAL
+
+    The lower half of card 2 holds the list of signals you can
+    navigate by, shown as a tick box, a label and the channel it
+    comes from. Click a row to search by it. Double-click the label
+    to rename it to something meaningful to you — the underlying
+    channel is unchanged. Untick a row to take that curve off the
+    graph while keeping it in the list.
+
+    The Channel column always reaches the right-hand edge of the
+    table. A channel name too long for the panel scrolls sideways
+    rather than being cut short with an ellipsis, so you never read a
+    truncated channel and think it is the whole name.
 
     Each signal keeps its own colour, and that colour belongs to the
     signal itself rather than to its position among the currently
@@ -102,7 +158,7 @@ comparison — is a way of looking at those averages.
     the preset list on one side and build its channel list on the
     other.
 
-3.3 MARKING REGIONS
+3.5 MARKING REGIONS
 
     Switch "Select" on in the toolbar above the top graph, then drag
     horizontally across the graph. The dragged stretch becomes a
@@ -112,7 +168,7 @@ comparison — is a way of looking at those averages.
     on Pan or Zoom switches Select off, because otherwise a drag
     means two things at once.
 
-3.4 ANALYZING
+3.6 ANALYZING
 
     "Analyze" fetches and averages every region that has not been
     done yet — regions already analysed are left alone, so adding one
@@ -132,7 +188,7 @@ comparison — is a way of looking at those averages.
     directly comparable on the same data, which is the point of
     having them.
 
-3.5 THE FOUR AVERAGING METHODS
+3.7 THE FOUR AVERAGING METHODS
 
     Mean                  the plain average. Sensitive to one bad
                           shot.
@@ -151,6 +207,16 @@ comparison — is a way of looking at those averages.
     common length is kept, and the count in the region row tells you
     how many spectra actually went in.
 
+    A WARNING ABOUT EXPECTATIONS. On clean spectra the four methods
+    land within a fraction of a percent of each other — measured, one
+    or two parts in a thousand of the peak. Switching between them
+    then looks as though nothing happened, and that is the honest
+    answer: nothing much did. They only pull apart once there are bad
+    shots in the region, where the difference reaches tens of percent.
+    So that the setting is never silently ignored, the active method
+    is named in the graph title, in every legend entry, and above each
+    region's numbers.
+
 
 =================================================================
 4. LIVE MODE
@@ -168,6 +234,20 @@ Switch to "Live" in the Mode box, set "Average last N", and press
   - Up to two thousand spectra are kept in memory, oldest discarded.
   - "Stop Live" freezes the display; what is on screen stays there.
 
+HOW MANY ARE REALLY AVERAGED. "Average last N" is a ceiling, not a
+promise. The average uses the newest N shots in the buffer, or all of
+them when there are fewer — and just after starting there are usually
+far fewer, because the preload only reaches back ten minutes. The
+status line spells it out: "averaging last 37 of 37 buffered (N=100)",
+with "filling up" while it is still short.
+
+Two things are dropped quietly, so the status line owns up to them.
+Spectra whose length differs from the majority cannot be averaged
+together and are counted as "skipped (different length)". And while
+every buffered shot goes into the average, at most four hundred of
+them are drawn as the faint individual traces — above that every n-th
+one is drawn, otherwise the redraw would crawl.
+
 
 =================================================================
 5. THE SPECTRUM CHANNEL AND THE WAVELENGTH AXIS
@@ -176,7 +256,7 @@ Switch to "Live" in the Mode box, set "Average last N", and press
 A spectrum needs two things: the intensity values, and the
 wavelengths they belong to. The archive does not always provide both.
 
-"Change..." in the active card picks the intensity channel. Then:
+"Change..." in card 2 picks the intensity channel. Then:
 
   - A channel whose name ends in _X or _Y is one half of a pair. The
     wavelength axis is taken from the matching _X channel
@@ -200,6 +280,20 @@ remembered.
 A partly broken wavelength channel — one with gaps or nonsense in it
 — is repaired by fitting the good part and extending it, rather than
 being rejected outright.
+
+CHANGING IT RE-RUNS WHAT YOU HAD. A region's averaged curves belong to
+one channel and one wavelength axis. Change either, and the numbers
+you are looking at are about the old channel. So changing the spectrum
+now keeps every marked region exactly where it is — same times, same
+colours, same names — throws away the stale results, and works them
+out again for the new channel by itself. You no longer have to delete
+the regions and mark them a second time, and the graph can no longer
+show two different channels' curves side by side as though they
+belonged together.
+
+If an analysis is still fetching when you change the channel, it is
+abandoned and its results discarded rather than being allowed to land
+on top of the new ones.
 
 
 =================================================================
@@ -247,9 +341,52 @@ being rejected outright.
                       "Auto-fit range to data on Analyze" which sets
                       it from what was actually measured.
 
+THE GRAPH KEEPS ITS SIZE. None of the choices above changes how big
+the graph is. That used to be untrue and it was the single worst thing
+about the tab: the colour scale for GDD/TOD was built by taking a
+slice out of the plot's current width, and putting it away again never
+gave the width back. Measured, thirty clicks on "Colour by" shrank the
+plot from 93 percent of the frame to nothing at all, leaving a blank
+right-hand side — and because every display control redraws through
+the same path, "Smooth" and "Normalize" nibbled at it too. The colour
+scale now has a slot of its own that is simply shown or hidden, and
+the room it needs is a fixed figure rather than a fraction of whatever
+is left.
+
+The divider between the two graphs is also left alone. Switching
+Archive/Live or hiding the search graph used to reset it to a built-in
+ratio; now it comes back where you dragged it, and that position is
+remembered between sessions.
+
 
 =================================================================
-7. THE REGION LIST
+7. FOCUS MODE (F11)
+=================================================================
+
+F11 shows the spectra graph on its own. There is no window frame and
+no title bar — deliberately, the same as the Image Slider's focus
+mode. The first time it fills the screen it is on.
+
+  - Esc or F11 again hands the graph back to the main window.
+  - It does NOT require Live mode. In Archive mode you get the
+    averaged spectra; in Live mode the graph carries on refreshing,
+    because focus mode moves the existing graph rather than building
+    a second one.
+  - Drag anywhere on the graph to move the window. Drag its outer
+    edge to resize it. The graph toolbar is hidden while you are in
+    there, which is what frees a plain drag for moving.
+  - Where you left the window is remembered, per monitor. A saved
+    position on a monitor that is no longer connected is ignored
+    rather than putting the window somewhere you cannot reach.
+  - The main window goes to the taskbar while you are in focus mode.
+    Restoring it from there also leaves focus mode.
+
+The same key does the same thing on the CSS Logger tab, for that
+tab's graph. Whichever tab is in front gets the key.
+
+
+=================================================================
+8. THE REGION LIST
 =================================================================
 
 One row per region. Each row has:
@@ -279,7 +416,7 @@ all regions and to analyze.
 
 
 =================================================================
-8. COMPARING TWO REGIONS
+9. COMPARING TWO REGIONS
 =================================================================
 
 "Compare regions" picks two analysed regions, A and B, and draws
@@ -295,7 +432,7 @@ export.
 
 
 =================================================================
-9. WORKING WITH THE GRAPHS
+10. WORKING WITH THE GRAPHS
 =================================================================
 
   - Both graphs have a crosshair that follows the mouse, with the X
@@ -310,7 +447,7 @@ export.
 
 
 =================================================================
-10. EXPORT
+11. EXPORT
 =================================================================
 
 "Export results" writes a data file and/or a picture of the graph
@@ -336,7 +473,7 @@ opens it directly instead of showing an import wizard.
 
 
 =================================================================
-11. WHAT IS REMEMBERED
+12. WHAT IS REMEMBERED
 =================================================================
 
 Per user, in your own application data:
@@ -344,7 +481,9 @@ Per user, in your own application data:
   the search-signal list
   the named presets
   the spectrum channel and how its wavelength axis is built
-  the window layout — the splitter position and the graph margins
+  the window layout — the divider position between the two graphs,
+    and the graph margins if you ever set them by hand
+  where you left the focus-mode window
 
 Deleting that folder resets everything to defaults. Nothing about a
 particular day's analysis is saved; regions live only as long as the
@@ -352,7 +491,7 @@ window is open.
 
 
 =================================================================
-12. WHEN SOMETHING GOES WRONG
+13. WHEN SOMETHING GOES WRONG
 =================================================================
 
   The top graph is empty after loading a day

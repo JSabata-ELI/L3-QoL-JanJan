@@ -7,10 +7,13 @@ import pathlib
 
 _HERE = pathlib.Path(__file__).parent          # CSS Logger/
 _ROOT = _HERE.parent                           # L3-QoL-JanJan/
-# cssl.py is in same folder (_HERE) — already on sys.path via __file__ location
+# Every module of the suite (sp_t.py, cpva_core.py) lives in _HERE, which is
+# already on sys.path via __file__. Never add another folder here: sp_t.py used
+# to be kept in a separate Spectra/ folder and put on sys.path from this line,
+# so running from source used that copy while the build silently used the stale
+# copy sitting next to main.py. One folder = one file = no such split.
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_ROOT / "Spectra"))     # for sp_t / SpectraWidget
 
 # Make debug print() bullet-proof: a Windows console using cp1250 raises
 # UnicodeEncodeError on the "→" used in our log lines, and a frozen windowed
@@ -68,7 +71,8 @@ matplotlib.use("QtAgg")
 matplotlib.rcParams["axes.facecolor"]   = "white"
 matplotlib.rcParams["figure.facecolor"] = "white"
 import matplotlib.dates as mdates
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.widgets import SpanSelector, RectangleSelector
@@ -95,6 +99,61 @@ except ImportError:
     DATA_REPOSITORY_DIR = _ROOT / "Diagnostic" / "DataRepository"
 
 from sp_t import SpectraWidget
+
+# Spectra's graph toolbar, reused here so both programs behave the same. It is a
+# plain NavigationToolbar2QT subclass with no Spectra state in it — it only drops
+# "Export values" from the margins dialog and reports when that dialog closes.
+# If Spectra ever moves it, fall back to the stock toolbar rather than failing.
+try:
+    from sp_t import _CustomToolbar as _MplToolbar, _TB_STYLE, _TB_HINTS
+except ImportError:      # pragma: no cover - Spectra layout changed
+    _MplToolbar = NavigationToolbar2QT
+    _TB_STYLE   = ""
+    _TB_HINTS   = {}
+try:
+    from sp_t import _AxisLimitsDialog
+except ImportError:      # pragma: no cover
+    _AxisLimitsDialog = None
+
+
+def _make_mpl_toolbar(nav_cls, canvas, parent=None):
+    """Build a matplotlib toolbar whose icons are actually visible.
+
+    matplotlib tints the toolbar icons ONCE, AT CONSTRUCTION, and only when the
+    palette background is dark: it recolours the black PNGs to the palette
+    foreground. On a dark Windows theme that foreground is near-white, so the
+    buttons come out white-on-light and read as blank. It never re-tints, so
+    fixing the palette afterwards does nothing — the parent has to be right
+    before the toolbar exists.
+
+    So: parent it to a host widget carrying a LIGHT palette (tinting is skipped,
+    the original black icons survive), then paint a light toolbar background to
+    match.
+
+    (Pulser Monitor and Image Tools carry the same helper for the same reason.)
+    """
+    host = QWidget(parent)
+    hp = host.palette()
+    hp.setColor(QPalette.ColorRole.Window,     QColor("#ffffff"))
+    hp.setColor(QPalette.ColorRole.Base,       QColor("#ffffff"))
+    hp.setColor(QPalette.ColorRole.Button,     QColor("#ffffff"))
+    hp.setColor(QPalette.ColorRole.WindowText, QColor("#000000"))
+    hp.setColor(QPalette.ColorRole.ButtonText, QColor("#000000"))
+    hp.setColor(QPalette.ColorRole.Text,       QColor("#000000"))
+    host.setPalette(hp)
+
+    toolbar = nav_cls(canvas, host)
+    toolbar.setPalette(hp)
+    toolbar.setStyleSheet(_TB_STYLE or
+                          "QToolBar{background:white;border:none;}"
+                          "QToolButton{background:transparent;color:black;}")
+    # Plain-language tooltips instead of matplotlib's terse defaults.
+    for act in toolbar.actions():
+        hint = _TB_HINTS.get(act.text())
+        if hint:
+            act.setToolTip(hint)
+    return toolbar
+
 
 # ── Styles ─────────────────────────────────────────────────────────────────
 _APP_STYLESHEET = """
@@ -211,7 +270,56 @@ _GRAPH_OPTS_DEFAULTS = {
     "cursor_value_boxes": True,  # per-PV value box at the crosshair
     "cursor_boxes_max":   20,    # boxes are dropped above this many visible PVs
     "line_markers":       True,  # dots on short traces
+    # Live mode pacing (ms). The graph and the table are refreshed on separate
+    # clocks: the graph update is cheap and runs almost every poll, while
+    # rebuilding the table walks the whole accumulated history and needs a slower
+    # one. Sharing a single clock is what made the whole window feel ~5 s slow.
+    "live_poll_ms":       300,   # how often the archive is asked for new values
+    "live_graph_min_ms":  300,   # shortest gap between graph refreshes
+    "live_table_ms":     1500,   # shortest gap between table rebuilds
 }
+
+# Colour ramp for the XY plot, marking how far through the window each point is.
+# Built by hand rather than taken from matplotlib: the stock ramps (plasma,
+# viridis, …) end in a pale yellow that is almost invisible on white, so the newest
+# points — the interesting ones — were the hardest to see. This one runs dark →
+# red and never gets light.
+_XY_CMAP = LinearSegmentedColormap.from_list(
+    "csslog_xy",
+    ["#1A237E",   # deep blue   — oldest
+     "#4A148C",   # purple
+     "#AD1457",   # magenta
+     "#D50000"],  # red         — newest
+    N=256)
+
+# The one mode switch in the sidebar. Green = following "now" is off and the
+# chosen window stands still; orange = following. Same size and shape either way,
+# so the button does not jump when it is pressed.
+_LIVE_BTN_OFF_STYLE = (
+    "QPushButton{background:#2E7D32;color:white;font-weight:700;"
+    "padding:10px;border-radius:4px;font-size:13px;border:none;}"
+    "QPushButton:hover{background:#1B5E20;}"
+    "QPushButton:disabled{background:#bbb;color:#888;}")
+_LIVE_BTN_ON_STYLE = (
+    "QPushButton{background:#F57F17;color:white;font-weight:700;"
+    "padding:10px;border-radius:4px;font-size:13px;border:none;}"
+    "QPushButton:hover{background:#EF6C00;}"
+    "QPushButton:disabled{background:#bbb;color:#888;}")
+
+# Grid line styles, handed out in this order to the channels that have Grid
+# ticked, so several grids on one plot can be told apart. The colour already says
+# which channel a grid belongs to; the style is the second, colour-blind-safe cue
+# (and it survives two channels whose colours happen to sit close together).
+_GRID_STYLES = [
+    ("solid",              "-"),
+    ("dashed",             "--"),
+    ("dotted",             ":"),
+    ("dash-dot",           "-."),
+    ("long dashes",        (0, (6, 2))),
+    ("dash-dot-dot",       (0, (5, 1, 1, 1, 1, 1))),
+    ("dot-dot-dash",       (0, (1, 1, 1, 1, 5, 2))),
+    ("wide dashes",        (0, (9, 3))),
+]
 
 # Fixed spacings offered for the time stamps on the X axis (label, seconds).
 # 0 = let the graph pick a round step that fits the window.
@@ -445,6 +553,66 @@ class _ColorSwatchDelegate(QStyledItemDelegate):
                 self.color_changed.emit(index.row(), color.name())
             return True
         return False
+
+
+# ── Per-signal line / point styling ──────────────────────────────────────────
+# Left of the arrow is what the PV list shows, right of it what matplotlib wants.
+_LINE_STYLES = {
+    "solid":    "-",
+    "dashed":   "--",
+    "dotted":   ":",
+    "dash-dot": "-.",
+    "none":     "None",
+}
+# "auto" = the old behaviour: a small dot only when the global markers switch in
+# Graph settings is on AND the trace is short enough to still be readable.
+_MARKER_STYLES = {
+    "auto": None,
+    "none": "None",
+    "●": "o", "○": "o", "▲": "^", "■": "s", "✕": "x", "+": "+",
+}
+_MARKER_HOLLOW = {"○"}          # same glyph as ●, drawn with a white face
+
+# Reference lines offer the same line styles, minus "none" (an invisible
+# reference line is never what anyone wants).
+_REF_LINE_STYLES = {k: v for k, v in _LINE_STYLES.items() if k != "none"}
+
+# PV-list columns the user cannot type into: either the PV name itself or a
+# number the program measures and fills in.
+_AXIS_READONLY_COLS = ("pv", "cursor_val", "unit", "last", "min", "max",
+                       "mean", "count")
+# Columns hidden until switched on from the right-click menu on the header.
+# Everything that was visible before this feature stays visible.
+_AXIS_HIDDEN_BY_DEFAULT = ("alpha", "unit", "last", "min", "max", "mean", "count")
+# Columns that must always stay on screen (the name, and the spacer that soaks
+# up leftover width).
+_AXIS_ALWAYS_SHOWN = ("pv", "blank")
+
+
+class _ComboBoxDelegate(QStyledItemDelegate):
+    """Cell with a fixed list of choices (the Style and Points columns).
+
+    The list drops open on the first click instead of needing a second one to
+    unfold it — picking a line style is a single gesture that way.
+    """
+
+    def __init__(self, choices, parent=None):
+        super().__init__(parent)
+        self._choices = list(choices)
+
+    def createEditor(self, parent, option, index):
+        cb = QComboBox(parent)
+        cb.addItems(self._choices)
+        QTimer.singleShot(0, cb.showPopup)
+        return cb
+
+    def setEditorData(self, editor, index):
+        txt = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        i = editor.findText(str(txt))
+        editor.setCurrentIndex(i if i >= 0 else 0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText(), Qt.ItemDataRole.EditRole)
 
 
 # ── Calendar helpers (copied from sp_t.py) ────────────────────────────────
@@ -1251,9 +1419,14 @@ class _GraphPopupWindow(QWidget):
     it."""
 
     def __init__(self, owner):
-        super().__init__(None)
+        # No title bar: "focus mode" means the graph and nothing else, the same on
+        # both tabs and the same as the Image Slider. Esc / F11 dock it back, and
+        # closeEvent below catches Alt+F4, so losing the tab is not a risk.
+        super().__init__(None, Qt.WindowType.Window
+                               | Qt.WindowType.FramelessWindowHint)
         self._owner = owner
         self.setWindowTitle("CSS Logger — Graph")
+        self._drag_start = None
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key.Key_Escape:
@@ -1265,6 +1438,17 @@ class _GraphPopupWindow(QWidget):
                 self._owner._graph_popout(windowed=True)
             return
         super().keyPressEvent(ev)
+
+    def mousePressEvent(self, ev):
+        # No title bar to grab, so a press on the window's own background (not on a
+        # child widget) drags it. Only needed in the windowed F11 mode; harmless
+        # when fullscreen.
+        if ev.button() == Qt.MouseButton.LeftButton and not self.isFullScreen():
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+                return
+        super().mousePressEvent(ev)
 
     def closeEvent(self, ev):
         # Never lose the tab — reparent it back into the notebook.
@@ -1329,7 +1513,22 @@ class CSSLoggerWidget(QWidget):
         self._graph_spine_xpos: list = []
         self._span_selector  = None
         self._zoom_selector  = None
-        self._zoom_history:  list = []
+        # Zoom state. The view history itself belongs to the graph toolbar (Home /
+        # Back / Forward), so there is only ONE history — a second, hand-kept one
+        # would drift out of step with it. This flag just records "the user is
+        # looking somewhere of their own choosing", which stops the live window
+        # from scrolling the view out from under them.
+        self._user_zoomed  = False
+        self._grid_pvs_drawn: list = []   # channels that got a grid, in style order
+        self._graph_toolbar = None
+        self._xy_toolbar    = None
+        self._reticking     = False
+        # The statistics selection, as (xmin, xmax) matplotlib date numbers, i.e.
+        # ABSOLUTE time. It has to live here and not only inside the SpanSelector:
+        # every full replot destroys the figure (and with it the selector and the
+        # stat cards), which is why the selected region and its numbers used to
+        # disappear on a reload, a font change or any axis-table edit.
+        self._sel_range = None
         self._crosshair_vlines = []
         self._crosshair_hlines = []
         self._crosshair_texts  = []
@@ -1348,7 +1547,7 @@ class CSSLoggerWidget(QWidget):
         self._xy_rows   = []
         self._xy_scatter = None
         self._xy_rect_selector = None
-        self._xy_zoom_history: list = []
+        # (No hand-kept XY view history: the XY toolbar owns Home / Back / Forward.)
         self._xy_choice_map: dict = {}
         # Single banded graph: every PV lives in its own vertical band of one
         # shared plot (CS-Studio style). A PV with Autoscale on spans full height.
@@ -1365,8 +1564,12 @@ class CSSLoggerWidget(QWidget):
         self._live_mode     = False
         self._live_last_ts  = None
         self._live_window_span = None
-        self._live_last_rebuild_ns = 0
-        self._live_rebuild_cost_ns = 0   # measured cost of one live refresh
+        # Live pacing: the graph and the table each keep their own last-run stamp
+        # and their own measured cost, so the slow one cannot hold the fast one back.
+        self._live_last_rebuild_ns = 0   # last table rebuild
+        self._live_last_graph_ns   = 0   # last graph refresh
+        self._live_table_cost_ns   = 0   # measured cost of one table rebuild
+        self._live_graph_cost_ns   = 0   # measured cost of one graph refresh
         self._live_autoscroll  = True
         self._live_programmatic_scroll = False
         # Cancel token for background fetches. Every fetch worker captures the
@@ -1382,6 +1585,15 @@ class CSSLoggerWidget(QWidget):
         self._countdown_timer.setInterval(50)
         self._countdown_timer.timeout.connect(self._live_countdown_tick)
         self._live_countdown_elapsed_ms = 0
+        # Automatic loading. There is no "Load data" button: anything that changes
+        # WHAT should be shown (channels, time window, preset) asks for a reload,
+        # and these collapse a burst of changes into one fetch.
+        self._load_in_flight  = False
+        self._reload_pending  = False
+        self._pending_reload_reason = ""
+        self._autoload_timer = QTimer(self)
+        self._autoload_timer.setSingleShot(True)
+        self._autoload_timer.timeout.connect(self._do_auto_reload)
         # Coalesced cursor-table refresh: the QTableWidget is only rewritten when
         # the mouse settles, so dragging the crosshair stays smooth (the blit
         # crosshair itself updates every move).
@@ -1413,10 +1625,24 @@ class CSSLoggerWidget(QWidget):
         self._dt_to   = now
         self._font_size: int = 11
         self._axis_tv_cols = ("show", "pv", "display_name", "color", "cursor_val",
-                               "ymin", "ymax", "auto_scale", "width", "smooth", "grid",
+                               "ymin", "ymax", "auto_scale",
+                               "width", "style", "marker", "marker_size", "alpha",
+                               "smooth", "grid",
+                               "unit", "last", "min", "max", "mean", "count",
                                "blank")
         self._axis_last_clicked_row = -1
         self._axis_row_pv: list = []     # table row → PV name (None for divider rows)
+        # Measured values per PV, keyed by (pv, sample count) so a replot does not
+        # walk 100k samples again for a number that cannot have changed.
+        self._pv_stats_cache: dict = {}
+        # Reference-line placement by clicking (None = not picking). See
+        # _start_ref_pick: {"stage": 1|2, "pv": str|None, "dialog": _RefLinesDialog}
+        self._ref_pick = None
+        self._ref_line_artists: list = []
+        self._ref_dialog = None
+        # Named looks the user chose to keep (colours, line/point styles,
+        # reference lines, column layout). Nothing is stored automatically.
+        self._style_presets: dict = dict(self.config.get("style_presets") or {})
         self._graph_popup = None       # floating graph window (F11 / Ctrl+F11)
         self._load_data_repository()
 
@@ -1560,22 +1786,16 @@ class CSSLoggerWidget(QWidget):
         self._lbl_pv_count.setStyleSheet("color:#777;font-size:10px;")
         bar.addWidget(self._lbl_pv_count)
 
-        self._btn_load = QPushButton("LOAD DATA")
-        self._btn_load.setStyleSheet(
-            "QPushButton{background:#2E7D32;color:white;font-weight:700;"
-            "padding:10px;border-radius:4px;font-size:13px;border:none;}"
-            "QPushButton:hover{background:#1B5E20;}"
-            "QPushButton:disabled{background:#bbb;color:#888;}")
-        self._btn_load.clicked.connect(self._on_load_clicked)
-        bar.addWidget(self._btn_load)
-
-        live_row = QHBoxLayout()
-        self._btn_live = QPushButton("⏵ Live")
+        # There is no "Load data" button any more: data is fetched on its own
+        # whenever the channels, the time window or the preset change, so the only
+        # thing left to decide is whether the view keeps following "now".
+        self._btn_live = QPushButton("⏵ Live mode")
         self._btn_live.clicked.connect(self._toggle_live_mode)
-        self._btn_live.setToolTip("Toggle live mode — polls for new values every 300 ms")
-        live_row.addWidget(self._btn_live)
-        live_row.addStretch()
-        bar.addLayout(live_row)
+        self._btn_live.setToolTip(
+            "Keep following new values as they arrive. Off = the chosen time "
+            "window stays put. Data is loaded automatically either way.")
+        self._btn_live.setStyleSheet(_LIVE_BTN_OFF_STYLE)
+        bar.addWidget(self._btn_live)
 
         sep_m = QFrame(); sep_m.setFrameShape(QFrame.Shape.HLine)
         bar.addWidget(sep_m)
@@ -1640,12 +1860,21 @@ class CSSLoggerWidget(QWidget):
         ctrl.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._graph_ctrl_bar)
 
+        # Zoom, pan, view history, margins and Save all live on the graph toolbar
+        # built below (the same one the Spectra tab uses), so this row no longer
+        # carries its own Back / Save graph — two view histories side by side
+        # would disagree with each other.
         b_clean = QPushButton("Clean graph"); b_clean.clicked.connect(self._clean_graph); ctrl.addWidget(b_clean)
-        b_save  = QPushButton("Save graph"); b_save.clicked.connect(self._save_graph); ctrl.addWidget(b_save)
-        self._btn_zoom_back = QPushButton("Back")
-        self._btn_zoom_back.clicked.connect(self._zoom_back)
-        self._btn_zoom_back.setEnabled(False)
-        ctrl.addWidget(self._btn_zoom_back)
+        self._btn_clear_sel = QPushButton("Clear selection")
+        self._btn_clear_sel.setToolTip(
+            "Remove the blue selected region and its statistics")
+        self._btn_clear_sel.clicked.connect(self._clear_selection)
+        ctrl.addWidget(self._btn_clear_sel)
+        self._btn_graph_view = QPushButton("View ▾")
+        self._btn_graph_view.setToolTip(
+            "Reset the view, set axis limits by hand, hide all grids")
+        self._btn_graph_view.clicked.connect(self._open_graph_view_menu)
+        ctrl.addWidget(self._btn_graph_view)
         b_ref  = QPushButton("Reference lines"); b_ref.clicked.connect(self._open_ref_lines_dialog); ctrl.addWidget(b_ref)
         b_cond = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
         b_cpv  = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
@@ -1686,6 +1915,15 @@ class CSSLoggerWidget(QWidget):
         self._lbl_graph_info.setStyleSheet("color:#777;")
         ctrl.addWidget(self._lbl_graph_info)
 
+        # Graph toolbar (zoom, pan, view history, margins, save). The toolbar is
+        # tied to one canvas and the canvas is rebuilt on every redraw, so only an
+        # empty holder is created here and refilled by _install_graph_toolbar.
+        self._graph_tb_holder = QWidget()
+        _tb_lay = QHBoxLayout(self._graph_tb_holder)
+        _tb_lay.setContentsMargins(0, 0, 0, 0)
+        _tb_lay.setSpacing(0)
+        lay.addWidget(self._graph_tb_holder)
+
         # Vertical splitter: graph canvas (top) + axis settings (bottom).
         # A wide, clearly-shaded handle tells the user where to grab to resize.
         self._graph_v_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1701,6 +1939,29 @@ class CSSLoggerWidget(QWidget):
         top_lay  = QVBoxLayout(top_pane)
         top_lay.setContentsMargins(0, 0, 0, 0)
         top_lay.setSpacing(0)
+
+        # Step-by-step guide, shown only while a reference line is being placed
+        # by clicking. It says what the next click does and offers a way out.
+        self._pick_bar = QWidget()
+        pick_lay = QHBoxLayout(self._pick_bar)
+        pick_lay.setContentsMargins(8, 4, 8, 4)
+        # A plain QWidget only paints a stylesheet background with this attribute.
+        self._pick_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._pick_bar.setStyleSheet("background:#1565C0;")
+        self._lbl_pick_hint = QLabel("")
+        self._lbl_pick_hint.setStyleSheet(
+            "background:transparent;color:#ffffff;font-weight:700;")
+        self._lbl_pick_hint.setWordWrap(True)
+        pick_lay.addWidget(self._lbl_pick_hint, stretch=1)
+        b_pick_cancel = QPushButton("Cancel")
+        b_pick_cancel.setStyleSheet(
+            "QPushButton{background:#ffffff;color:#0D47A1;border:1px solid #ffffff;"
+            "border-radius:3px;padding:3px 10px;font-weight:700;}"
+            "QPushButton:hover{background:#BBDEFB;}")
+        b_pick_cancel.clicked.connect(self._cancel_ref_pick)
+        pick_lay.addWidget(b_pick_cancel)
+        self._pick_bar.setVisible(False)
+        top_lay.addWidget(self._pick_bar)
 
         # Visible border around the graph area so its extent is obvious.
         self._graph_container = QWidget()
@@ -1747,6 +2008,30 @@ class CSSLoggerWidget(QWidget):
 
     # ── Axis settings panel ────────────────────────────────────────────────
 
+    # Heading text and starting width of every column of the PV list. Both are
+    # also what the "Reset columns" button restores.
+    _AXIS_COL_HEADS = {
+        "show":         "Show", "pv": "PV", "display_name": "Display Name",
+        "color":        "Color", "cursor_val": "Cursor",
+        "ymin": "Y min", "ymax": "Y max",
+        "auto_scale":   "Autoscale", "width": "Width",
+        "style":        "Style", "marker": "Points", "marker_size": "Size",
+        "alpha":        "Alpha %",
+        "smooth":       "Smooth", "grid": "Grid",
+        "unit":         "Unit", "last": "Last", "min": "Min", "max": "Max",
+        "mean":         "Mean", "count": "Count",
+        "blank":        "",
+    }
+    _AXIS_COL_WIDTHS = {
+        "show":40, "pv":270, "display_name":130, "color":40,
+        "cursor_val":90, "ymin":55, "ymax":55,
+        "auto_scale":70, "width":45,
+        "style":80, "marker":60, "marker_size":45, "alpha":55,
+        "smooth":50, "grid":35,
+        "unit":55, "last":80, "min":80, "max":80, "mean":80, "count":60,
+        "blank":0,
+    }
+
     def _build_axis_settings_panel(self, parent: QWidget):
         lay = QVBoxLayout(parent)
         lay.setContentsMargins(4, 2, 4, 4)
@@ -1757,23 +2042,26 @@ class CSSLoggerWidget(QWidget):
         h.setStyleSheet("font-weight:700;color:#1565C0;")
         self._axis_hdr_label = h
         hdr.addWidget(h)
+        hdr.addSpacing(12)
+        b_reset_cols = QPushButton("Reset columns")
+        b_reset_cols.setToolTip("Put the columns back in their original order, width "
+                                "and selection.\nDrag a column heading to move it; "
+                                "right-click the headings to show or hide columns.")
+        b_reset_cols.clicked.connect(self._reset_axis_columns)
+        hdr.addWidget(b_reset_cols)
+        b_styles = QToolButton()
+        b_styles.setText("Styles")
+        b_styles.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        b_styles.setToolTip("Save or load the whole look of the graph: colours, line "
+                            "and point styles, reference lines and the column layout.")
+        b_styles.setMenu(self._build_styles_menu(b_styles))
+        hdr.addWidget(b_styles)
         hdr.addStretch()
         lay.addLayout(hdr)
 
         _COLS   = list(self._axis_tv_cols)
-        _HEADS  = {
-            "show":         "Show", "pv": "PV", "display_name": "Display Name",
-            "color":        "Color", "cursor_val": "Cursor",
-            "ymin": "Y min", "ymax": "Y max",
-            "auto_scale":   "Autoscale", "width": "Width", "smooth": "Smooth", "grid": "Grid",
-            "blank":        "",
-        }
-        _COL_W  = {
-            "show":40, "pv":270, "display_name":130, "color":40,
-            "cursor_val":90, "ymin":55, "ymax":55,
-            "auto_scale":70, "width":45, "smooth":50, "grid":35,
-            "blank":0,
-        }
+        _HEADS  = self._AXIS_COL_HEADS
+        _COL_W  = self._AXIS_COL_WIDTHS
 
         self._axis_tv = QTableWidget(0, len(_COLS))
         self._axis_tv.setHorizontalHeaderLabels([_HEADS[c] for c in _COLS])
@@ -1792,7 +2080,34 @@ class CSSLoggerWidget(QWidget):
         # The table fills its pane; how tall that pane is follows the number of
         # PV rows (see _autosize_axis_pane).
         self._axis_tv.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # With this many columns a small screen cannot show them all — let the
+        # table slide sideways instead of squeezing everything to nothing. The
+        # blank spacer collapses first, so the bar only shows up when it is
+        # really needed (_autosize_axis_pane_now already reserves its height).
+        self._axis_tv.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self._axis_tv.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         hdr = self._axis_tv.horizontalHeader()
+        # Column headings can be dragged into any order; "Reset columns" undoes it.
+        hdr.setSectionsMovable(True)
+        hdr.setFirstSectionMovable(True)
+        hdr.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(self._open_axis_column_menu)
+        self._apply_default_axis_columns()
+
+        self._axis_tv.cellDoubleClicked.connect(self._on_axis_tv_double_click)
+        # Second click on an already-selected row clears the highlight (toggle).
+        self._axis_tv.clicked.connect(self._on_axis_tv_clicked)
+        # Auto-apply: any edit takes effect immediately (no Apply button).
+        self._axis_tv.itemChanged.connect(self._on_axis_item_changed)
+        lay.addWidget(self._axis_tv)
+
+    def _apply_default_axis_columns(self):
+        """Widths, resize behaviour, cell editors and the default set of visible
+        columns. Called once when the table is built and again by "Reset columns"."""
+        _COLS = list(self._axis_tv_cols)
+        hdr   = self._axis_tv.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         # PV + Display Name auto-fit their content so the full text is always visible.
         hdr.setSectionResizeMode(_COLS.index("pv"),
@@ -1805,26 +2120,201 @@ class CSSLoggerWidget(QWidget):
         hdr.setStretchLastSection(True)
 
         for i, col in enumerate(_COLS):
-            self._axis_tv.setColumnWidth(i, _COL_W.get(col, 60))
+            self._axis_tv.setColumnWidth(i, self._AXIS_COL_WIDTHS.get(col, 60))
+            self._axis_tv.setColumnHidden(i, col in _AXIS_HIDDEN_BY_DEFAULT)
 
         # Tick boxes sit in the middle of the Show / Autoscale / Grid columns.
-        self._check_delegate = _CenteredCheckDelegate(self._axis_tv)
-        for _c in ("show", "auto_scale", "grid"):
-            if _c in _COLS:
+        if getattr(self, "_check_delegate", None) is None:
+            self._check_delegate = _CenteredCheckDelegate(self._axis_tv)
+            for _c in ("show", "auto_scale", "grid"):
                 self._axis_tv.setItemDelegateForColumn(_COLS.index(_c),
                                                        self._check_delegate)
+            # Colour swatch — resolved by name, never by a literal column number.
+            self._color_delegate = _ColorSwatchDelegate(self._axis_tv)
+            self._color_delegate.color_changed.connect(self._on_axis_color_changed)
+            self._axis_tv.setItemDelegateForColumn(_COLS.index("color"),
+                                                   self._color_delegate)
+            # Line style and point style are picked from a list, not typed.
+            self._style_delegate = _ComboBoxDelegate(list(_LINE_STYLES), self._axis_tv)
+            self._axis_tv.setItemDelegateForColumn(_COLS.index("style"),
+                                                   self._style_delegate)
+            self._marker_delegate = _ComboBoxDelegate(list(_MARKER_STYLES), self._axis_tv)
+            self._axis_tv.setItemDelegateForColumn(_COLS.index("marker"),
+                                                   self._marker_delegate)
 
-        # Color swatch delegate on column 3
-        self._color_delegate = _ColorSwatchDelegate(self._axis_tv)
-        self._color_delegate.color_changed.connect(self._on_axis_color_changed)
-        self._axis_tv.setItemDelegateForColumn(3, self._color_delegate)
+    def _reset_axis_columns(self):
+        """Put every column back where it started: original order, original
+        widths, original show/hide selection."""
+        hdr   = self._axis_tv.horizontalHeader()
+        _COLS = list(self._axis_tv_cols)
+        hdr.blockSignals(True)
+        try:
+            for logical in range(len(_COLS)):
+                visual = hdr.visualIndex(logical)
+                if visual != logical:
+                    hdr.moveSection(visual, logical)
+        finally:
+            hdr.blockSignals(False)
+        self._apply_default_axis_columns()
+        self._axis_tv.horizontalScrollBar().setValue(0)
+        self._autosize_axis_pane()
 
-        self._axis_tv.cellDoubleClicked.connect(self._on_axis_tv_double_click)
-        # Second click on an already-selected row clears the highlight (toggle).
-        self._axis_tv.clicked.connect(self._on_axis_tv_clicked)
-        # Auto-apply: any edit takes effect immediately (no Apply button).
-        self._axis_tv.itemChanged.connect(self._on_axis_item_changed)
-        lay.addWidget(self._axis_tv)
+    # ── Saved looks ("style presets") ────────────────────────────────────────
+
+    def _build_styles_menu(self, parent):
+        menu = QMenu(parent)
+        menu.aboutToShow.connect(lambda: self._fill_styles_menu(menu))
+        self._fill_styles_menu(menu)
+        return menu
+
+    def _fill_styles_menu(self, menu):
+        menu.clear()
+        menu.addAction("Save current look as…", self._save_style_preset)
+        load_menu = menu.addMenu("Load")
+        del_menu  = menu.addMenu("Delete")
+        names = sorted(self._style_presets)
+        if names:
+            for name in names:
+                load_menu.addAction(name, lambda n=name: self._load_style_preset(n))
+                del_menu.addAction(name, lambda n=name: self._delete_style_preset(n))
+        else:
+            load_menu.setEnabled(False)
+            del_menu.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Export to file…", self._export_style_preset)
+        menu.addAction("Import from file…", self._import_style_preset)
+        menu.addSeparator()
+        menu.addAction("Reset columns", self._reset_axis_columns)
+
+    def _current_style_payload(self):
+        """Everything that makes up the current look of the graph."""
+        hdr   = self._axis_tv.horizontalHeader()
+        _COLS = list(self._axis_tv_cols)
+        pv_styles = {}
+        for pv, s in self._pv_settings.items():
+            pv_styles[pv] = {k: s[k] for k in self._PV_STYLE_KEYS if k in s}
+        return {
+            "pv_settings": pv_styles,
+            "ref_lines":   [dict(rl) for rl in self._ref_lines],
+            "columns": {
+                "order":  [_COLS[hdr.logicalIndex(v)] for v in range(len(_COLS))],
+                "widths": {c: self._axis_tv.columnWidth(i) for i, c in enumerate(_COLS)},
+                "hidden": [c for i, c in enumerate(_COLS)
+                           if self._axis_tv.isColumnHidden(i)],
+            },
+        }
+
+    def _apply_style_payload(self, data):
+        for pv, s in (data.get("pv_settings") or {}).items():
+            if pv not in self._pv_settings:
+                continue                    # not loaded now — leave it in the preset
+            self._pv_settings[pv].update(
+                {k: v for k, v in s.items() if k in self._PV_STYLE_KEYS})
+        if "ref_lines" in data:
+            self._ref_lines = [dict(rl) for rl in (data.get("ref_lines") or [])]
+        cols = data.get("columns") or {}
+        _COLS = list(self._axis_tv_cols)
+        hdr   = self._axis_tv.horizontalHeader()
+        if cols:
+            for col, w in (cols.get("widths") or {}).items():
+                if col in _COLS:
+                    self._axis_tv.setColumnWidth(_COLS.index(col), int(w))
+            hidden = set(cols.get("hidden") or [])
+            for i, col in enumerate(_COLS):
+                self._axis_tv.setColumnHidden(
+                    i, col in hidden and col not in _AXIS_ALWAYS_SHOWN)
+            # Put the columns in the saved left-to-right order; any column the
+            # preset does not mention keeps its place at the end.
+            order = [c for c in (cols.get("order") or []) if c in _COLS]
+            hdr.blockSignals(True)
+            try:
+                for target, col in enumerate(order):
+                    logical = _COLS.index(col)
+                    hdr.moveSection(hdr.visualIndex(logical), target)
+            finally:
+                hdr.blockSignals(False)
+        self._refresh_axis_settings_tv()
+        if self._samples_by_pv:
+            self._plot_graph()
+
+    def _save_style_preset(self):
+        name, ok = QInputDialog.getText(self, "Save look", "Name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if name in self._style_presets and QMessageBox.question(
+                self, "Save look", f"Replace the saved look “{name}”?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._style_presets[name] = self._current_style_payload()
+        self._save_runtime_state()
+        self._lbl_status.setText(f"Saved look “{name}”")
+
+    def _load_style_preset(self, name):
+        data = self._style_presets.get(name)
+        if not data:
+            return
+        self._apply_style_payload(data)
+        self._lbl_status.setText(f"Loaded look “{name}”")
+
+    def _delete_style_preset(self, name):
+        if QMessageBox.question(self, "Delete look", f"Delete the saved look “{name}”?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._style_presets.pop(name, None)
+        self._save_runtime_state()
+
+    def _export_style_preset(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export look", "css_logger_look.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self._current_style_payload(), fh, indent=2)
+            self._lbl_status.setText(f"Look exported to {path}")
+        except OSError as exc:
+            QMessageBox.warning(self, "Export look", f"Could not write the file:\n{exc}")
+
+    def _import_style_preset(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import look", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Import look", f"Could not read the file:\n{exc}")
+            return
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, "Import look", "That file is not a saved look.")
+            return
+        self._apply_style_payload(data)
+        self._lbl_status.setText(f"Look imported from {path}")
+
+    def _open_axis_column_menu(self, pos):
+        """Right-click on the headings: tick which columns are on screen."""
+        hdr   = self._axis_tv.horizontalHeader()
+        _COLS = list(self._axis_tv_cols)
+        menu  = QMenu(self._axis_tv)
+        # Offer them in the order they currently appear, so the menu matches
+        # what the eye sees.
+        for visual in range(len(_COLS)):
+            logical = hdr.logicalIndex(visual)
+            col     = _COLS[logical]
+            if col in _AXIS_ALWAYS_SHOWN:
+                continue
+            act = menu.addAction(self._AXIS_COL_HEADS.get(col, col))
+            act.setCheckable(True)
+            act.setChecked(not self._axis_tv.isColumnHidden(logical))
+            act.toggled.connect(
+                lambda on, li=logical: (self._axis_tv.setColumnHidden(li, not on),
+                                        self._flush_axis_measured(),
+                                        self._autosize_axis_pane()))
+        menu.addSeparator()
+        menu.addAction("Reset columns", self._reset_axis_columns)
+        menu.exec(hdr.mapToGlobal(pos))
 
     # ── XY tab ─────────────────────────────────────────────────────────────
 
@@ -1847,10 +2337,18 @@ class CSSLoggerWidget(QWidget):
         b_plot.clicked.connect(self._plot_xy); ctrl.addWidget(b_plot)
         b_clean = QPushButton("Clean XY"); b_clean.clicked.connect(self._clean_xy); ctrl.addWidget(b_clean)
         b_cond  = QPushButton("Conditions"); b_cond.clicked.connect(self._open_conditions_dialog); ctrl.addWidget(b_cond)
-        self._btn_xy_back = QPushButton("↩ XY Back"); self._btn_xy_back.clicked.connect(self._xy_zoom_back); ctrl.addWidget(self._btn_xy_back)
         b_cpv   = QPushButton("Add custom PV"); b_cpv.clicked.connect(self._open_custom_pv_dialog); ctrl.addWidget(b_cpv)
         ctrl.addStretch()
         lay.addLayout(ctrl)
+
+        # Zoom / pan / view history / save for the XY plot, from the same toolbar
+        # the time graph uses. The old hand-made "XY Back" is gone — the toolbar's
+        # Back and Home cover it, and one history is better than two.
+        self._xy_tb_holder = QWidget()
+        _xytb = QHBoxLayout(self._xy_tb_holder)
+        _xytb.setContentsMargins(0, 0, 0, 0)
+        _xytb.setSpacing(0)
+        lay.addWidget(self._xy_tb_holder)
 
         self._xy_canvas_container = QWidget()
         self._xy_canvas_container.setStyleSheet("background:#f5f5f5;")
@@ -1858,7 +2356,7 @@ class CSSLoggerWidget(QWidget):
         xy_inner.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._xy_canvas_container, stretch=1)
 
-        self._lbl_xy_info = QLabel("Load data first, then choose X and Y variables.")
+        self._lbl_xy_info = QLabel("Choose an X and a Y channel — data loads on its own.")
         self._lbl_xy_info.setStyleSheet("color:#777;")
         lay.addWidget(self._lbl_xy_info)
 
@@ -2076,6 +2574,10 @@ class CSSLoggerWidget(QWidget):
         stale graph — clear the canvas and show a message instead."""
         # A direct plot supersedes any pending coalesced one.
         self._replot_timer.stop()
+        # The canvas the user is clicking on is about to be thrown away, so a
+        # half-finished reference-line placement has to end here.
+        if self._ref_pick:
+            self._cancel_ref_pick()
         try:
             self._plot_graph_impl()
         except Exception:
@@ -2201,7 +2703,10 @@ class CSSLoggerWidget(QWidget):
         # when many bands share the height. Budget the major-tick count from the
         # actual plot height and a ~7-glyph label extent so they always clear.
         _TOP    = min(1.0, max(0.5, float(_opts.get("margin_top", 0.97))))
-        _BOTTOM = min(_TOP - 0.05, max(0.02, float(_opts.get("margin_bottom", 0.12))))
+        _BOTTOM = min(_TOP - 0.05,
+                      max(0.02,
+                          float(_opts.get("margin_bottom", 0.12)),
+                          self._bottom_margin_floor(_ch)))
         _plot_h_px    = max(1.0, _ch * (_TOP - _BOTTOM))
         _ylbl_ext_px  = 7 * 0.6 * _ticksize * _PX_PER_PT   # ≈ "−1.234M" rotated
         _tick_cap     = max(2, int(_opts.get("y_ticks_max", 6)))
@@ -2335,24 +2840,31 @@ class CSSLoggerWidget(QWidget):
 
             self._graph_raw.append((times_num, values))
 
+            # Per-signal look: line style, point style, point size, transparency.
+            style_kw = self._pv_style_kwargs(pv_setting, times_num.size, _markers)
+
             if eff_smooth > 1 and values.size >= eff_smooth:
                 lw_raw = (line_width * 0.5) if line_width is not None else 0.8
+                # The faint raw trace under a smoothed one stays faint, but never
+                # darker than the signal's own transparency setting.
+                raw_kw = dict(style_kw)
+                raw_kw["alpha"] = 0.3 * style_kw.get("alpha", 1.0)
                 raw_line, = ax.plot(times_num, values, color=line_color, linewidth=lw_raw,
-                                    alpha=0.3, drawstyle="steps-post", zorder=1)
+                                    drawstyle="steps-post", zorder=1, **raw_kw)
                 raw_line.set_visible(visible)
                 smoothed = _moving_avg_np(values, eff_smooth)
                 lw_sm = line_width if line_width is not None else 1.8
                 sm_line, = ax.plot(times_num, smoothed, color=line_color, linewidth=lw_sm,
                                    drawstyle="steps-post",
-                                   label=f"{disp_name} (avg {eff_smooth})", zorder=2)
+                                   label=f"{disp_name} (avg {eff_smooth})", zorder=2,
+                                   **style_kw)
                 sm_line.set_visible(visible)
                 self._graph_lines.append([raw_line, sm_line])
             else:
                 lw = line_width if line_width is not None else 1.2
                 line, = ax.plot(times_num, values, color=line_color, linewidth=lw,
-                                marker="." if (_markers and times_num.size < 200) else None,
-                                markersize=3,
-                                drawstyle="steps-post", label=disp_name, zorder=2)
+                                drawstyle="steps-post", label=disp_name, zorder=2,
+                                **style_kw)
                 line.set_visible(visible)
                 self._graph_lines.append([line])
 
@@ -2399,14 +2911,41 @@ class CSSLoggerWidget(QWidget):
             lo, hi = self._band_ylim(i, n, dmin, dmax, autosc)
             ax.set_ylim(lo, hi)
 
-        # This is a single shared plot (one X axis, stacked Y bands), so a grid
-        # can only line up with ONE Y scale — a per-PV grid is meaningless here.
-        # Treat the Grid column as a global toggle: draw the shared grid if ANY
-        # visible PV has Grid ticked (previously only the FIRST PV's checkbox was
-        # read, so ticking other rows appeared to do nothing).
-        show_grid = any(
-            self._pv_settings.get(pv, {}).get("grid", False) for pv in pvs_for_axes)
-        axes[0].grid(show_grid, which="major", alpha=0.4)
+        # Grids, one per ticked channel. Every channel has its own Y scale, so a
+        # single shared grid could only ever line up with one of them — which is
+        # why ticking the second, third, … Grid box used to do nothing visible.
+        # Each ticked channel now gets a horizontal grid on ITS OWN axis, in its
+        # own colour and its own line style, so several can be read apart at once.
+        # The vertical time lines stay single: all channels share one time axis.
+        _grid_pvs = [pv for pv in pvs_for_axes
+                     if self._pv_settings.get(pv, {}).get("grid", False)]
+        # Remembered so the tick box's tooltip can name the style a channel
+        # ACTUALLY got. Working it out again from _pv_order would drift by one
+        # whenever a shown channel carries no numeric data (it gets no axis here).
+        self._grid_pvs_drawn = list(_grid_pvs)
+        for i, (pv, ax) in enumerate(zip(pvs_for_axes, axes)):
+            # Grids must never sit on top of the traces. twinx axes are drawn in
+            # order, so a later channel's grid would otherwise cross an earlier
+            # channel's line.
+            ax.set_axisbelow(True)
+            ax.yaxis.grid(False)
+            if pv not in _grid_pvs:
+                continue
+            _st = self._grid_style_for(pv, _grid_pvs)
+            _c  = self._pv_settings.get(pv, {}).get(
+                "color", _GRAPH_COLORS[i % len(_GRAPH_COLORS)])
+            ax.yaxis.grid(True, which="major", linestyle=_st, linewidth=0.9,
+                          color=_c, alpha=0.35, zorder=0)
+        # One shared set of vertical time lines, faint grey, drawn on the axis that
+        # owns the time axis. The style arguments are only passed when the lines are
+        # actually wanted: matplotlib switches a grid ON regardless of the first
+        # argument as soon as any line property comes with it, so passing them
+        # alongside False would draw a grid nobody asked for.
+        if _grid_pvs:
+            axes[0].xaxis.grid(True, which="major", linestyle="-",
+                               linewidth=0.8, color="#9e9e9e", alpha=0.30, zorder=0)
+        else:
+            axes[0].xaxis.grid(False)
 
         # X-axis (the single shared bottom axis, axes[0])
         ax0 = ax_x
@@ -2425,40 +2964,17 @@ class CSSLoggerWidget(QWidget):
             t_max = self._dt_to.astimezone(timezone.utc)
             total_seconds = (t_max - t_min).total_seconds()
 
-        from matplotlib.ticker import FuncFormatter, AutoMinorLocator, FixedLocator
-
         t_min_local = t_min.astimezone(TZ_PRAGUE) if total_seconds > 0 else datetime.now(TZ_PRAGUE)
         t_max_local = t_max.astimezone(TZ_PRAGUE) if total_seconds > 0 else t_min_local
         same_day    = t_min_local.date() == t_max_local.date()
 
+        # Time stamps: one shared routine, so the full redraw, the live scroll and
+        # a zoom all label the axis the same way (see _apply_x_ticks).
         if total_seconds > 0:
-            _ticks, _minor_ticks = self._compute_x_ticks(
-                t_min.astimezone(TZ_PRAGUE), t_max.astimezone(TZ_PRAGUE))
+            self._apply_x_ticks(ax0, t_min_local, t_max_local)
         else:
-            _ticks, _minor_ticks = [], []
-        if _ticks:
-            ax0.xaxis.set_major_locator(FixedLocator(_ticks))
-        else:
-            ax0.xaxis.set_major_locator(mdates.AutoDateLocator(tz=TZ_PRAGUE, minticks=5, maxticks=8))
-
-        # Clock format of the time stamps: "auto" keeps seconds, the other two
-        # are the user's fixed choice (Graph settings → Time axis).
-        _xfmt   = str(_opts.get("x_time_format", "auto"))
-        _clock  = "%H:%M" if _xfmt == "hm" else "%H:%M:%S"
-
-        def _fmt_x(x, _):
-            try:
-                dt = mdates.num2date(x, tz=TZ_PRAGUE)
-            except Exception:
-                return ""
-            if same_day: return dt.strftime(_clock)
-            return dt.strftime("%m-%d\n00:00") if (dt.hour == 0 and dt.minute == 0) else dt.strftime(_clock)
-
-        ax0.xaxis.set_major_formatter(FuncFormatter(_fmt_x))
-        if _minor_ticks:
-            ax0.xaxis.set_minor_locator(FixedLocator(_minor_ticks))
-        else:
-            ax0.xaxis.set_minor_locator(AutoMinorLocator(5))
+            ax0.xaxis.set_major_locator(
+                mdates.AutoDateLocator(tz=TZ_PRAGUE, minticks=5, maxticks=8))
         ax0.set_xlabel(
             f"Time (Prague)  {t_min_local.strftime('%Y-%m-%d')}" if same_day else "Time (Prague)",
             fontsize=_fsize)
@@ -2470,9 +2986,7 @@ class CSSLoggerWidget(QWidget):
         ax0.tick_params(axis="x", which="major", labelsize=_fsize, rotation=0)
         ax0.tick_params(axis="x", which="minor", length=3, labelsize=0)
 
-        for rl in self._ref_lines:
-            ax0.axhline(y=rl["y"], color=rl["color"], linewidth=1.2, linestyle="--",
-                        label=rl.get("label") or f"y={rl['y']}")
+        self._draw_ref_lines(ax0, axes, pvs_for_axes, _fsize)
 
         # (Carry-forward is now drawn as a solid held line in the per-PV loop
         # above, so no separate dotted "last known value" overlay is needed.)
@@ -2487,6 +3001,9 @@ class CSSLoggerWidget(QWidget):
         self._mpl_canvas = canvas
         self._mpl_figure = fig
         self._graph_axes = axes
+        self._install_graph_toolbar(canvas)
+        # No right-click menu on the canvas on purpose: right-drag is the zoom, and
+        # a context menu would swallow it. Those entries live on the "View ▾" button.
 
         # Centre the rotated Y-tick numbers exactly on their tick. rotation_mode
         # "anchor" applies ha/va AFTER the 90° rotation, so ha="center"/va="center"
@@ -2590,6 +3107,9 @@ class CSSLoggerWidget(QWidget):
 
         self._mouse_pending = False; self._blit_bg = None
         canvas.mpl_connect("draw_event", self._on_canvas_draw)
+        # The graph gets shorter whenever the statistics strip or the settings
+        # table opens; the time-axis title has to stay readable through that.
+        canvas.mpl_connect("resize_event", self._keep_x_label_visible)
         self._crosshair_cid = canvas.mpl_connect("motion_notify_event", self._on_graph_mouse_move)
 
         try:
@@ -2604,6 +3124,12 @@ class CSSLoggerWidget(QWidget):
                 useblit=False, button=3, props=dict(alpha=0.20, facecolor="#FF6600"))
         except Exception:
             self._zoom_selector = None
+
+        # Put the remembered selection back: the band on the new selector, the
+        # numbers recomputed from the new arrays.
+        self._restore_selection_band()
+        if self._sel_range:
+            self._recompute_stats()
 
         canvas.draw()
         self._refresh_axis_settings_tv()
@@ -2687,14 +3213,13 @@ class CSSLoggerWidget(QWidget):
         self._graph_raw = new_raw
         if self._graph_axes:
             ax0 = self._graph_axes[0]
-            from matplotlib.ticker import FuncFormatter as _FF, FixedLocator as _FL
             live_span = self._live_window_span
             # Auto-scrolling live window: re-derive the X range AND rebuild its
             # ticks for "now" on every refresh. Previously only xlim scrolled while
             # the FixedLocator tick positions stayed frozen at the initial window —
             # once "now" moved past them the axis showed no timestamps at all (the
             # reported blank time axis). When zoomed in, leave the user's view be.
-            if live_span and live_span.total_seconds() > 0 and not self._zoom_history:
+            if live_span and live_span.total_seconds() > 0 and not self._user_zoomed:
                 x_lo, x_hi = now_utc - live_span, now_utc
                 ax0.set_xlim(x_lo, x_hi)
                 lo_l = x_lo.astimezone(TZ_PRAGUE); hi_l = x_hi.astimezone(TZ_PRAGUE)
@@ -2705,31 +3230,17 @@ class CSSLoggerWidget(QWidget):
                 lo_l = hi_l = None
 
             if lo_l is not None and (hi_l - lo_l).total_seconds() > 0:
-                same_d = lo_l.date() == hi_l.date()
-                majors, minors = self._compute_x_ticks(lo_l, hi_l)
-                if majors:
-                    ax0.xaxis.set_major_locator(_FL(majors))
-                if minors:
-                    ax0.xaxis.set_minor_locator(_FL(minors))
-
-                _clk = ("%H:%M" if str(self._graph_opts.get("x_time_format", "auto")) == "hm"
-                        else "%H:%M:%S")
-
-                def _fmt_x_live(x, _p, _same=same_d, _c=_clk):
-                    try:
-                        dt = mdates.num2date(x, tz=TZ_PRAGUE)
-                    except Exception:
-                        return ""
-                    if _same: return dt.strftime(_c)
-                    return (dt.strftime("%m-%d\n00:00")
-                            if (dt.hour == 0 and dt.minute == 0) else dt.strftime(_c))
-                ax0.xaxis.set_major_formatter(_FF(_fmt_x_live))
+                self._apply_x_ticks(ax0, lo_l, hi_l)
 
         # Keep the crosshair snap data in sync, and force a fresh blit background
         # on the next draw so the cursor boxes never ghost over stale pixels.
         self._graph_raw_np = [
             (np.asarray(t, dtype=float), np.asarray(v, dtype=float))
             for t, v in self._graph_raw]
+        # Live data just changed under the selection — refresh its numbers instead
+        # of leaving them describing samples that have since been trimmed away.
+        if self._sel_range:
+            self._recompute_stats()
         self._blit_bg = None
         self._mpl_canvas.draw_idle()
 
@@ -2979,18 +3490,52 @@ class CSSLoggerWidget(QWidget):
             return
         # These programmatic updates must not trip the auto-apply itemChanged
         # handler (it would replot on every 120 ms cursor tick).
+        row_pv = getattr(self, "_axis_row_pv", [])
         self._axis_tv.blockSignals(True)
         try:
             for row in range(self._axis_tv.rowCount()):
-                pv_item = self._axis_tv.item(row, 1)
-                if not pv_item:
+                # Which signal a row belongs to comes from _axis_row_pv, never from
+                # a fixed column number — columns can be dragged into any order.
+                pv = row_pv[row] if row < len(row_pv) else None
+                if not pv:
                     continue
-                cv = self._pv_settings.get(pv_item.text(), {}).get("cursor_val", "")
+                cv = self._pv_settings.get(pv, {}).get("cursor_val", "")
                 item = self._axis_tv.item(row, val_idx)
                 if item:
                     item.setText(cv)
         finally:
             self._axis_tv.blockSignals(False)
+
+    _AXIS_MEASURED_COLS = ("unit", "last", "min", "max", "mean", "count")
+
+    def _flush_axis_measured(self):
+        """Refresh the read-only Unit / Last / Min / Max / Mean / Count cells.
+
+        Only writes columns that are actually on screen, and only when the table
+        already has rows — during Live this runs on every table refresh.
+        """
+        tv = getattr(self, "_axis_tv", None)
+        if tv is None or not tv.rowCount():
+            return
+        _COL = list(self._axis_tv_cols)
+        idxs = [(c, _COL.index(c)) for c in self._AXIS_MEASURED_COLS
+                if not tv.isColumnHidden(_COL.index(c))]
+        if not idxs:
+            return
+        row_pv = getattr(self, "_axis_row_pv", [])
+        tv.blockSignals(True)
+        try:
+            for row in range(tv.rowCount()):
+                pv = row_pv[row] if row < len(row_pv) else None
+                if not pv:
+                    continue
+                stats = self._pv_stats(pv)
+                for col, j in idxs:
+                    item = tv.item(row, j)
+                    if item:
+                        item.setText(stats.get(col, ""))
+        finally:
+            tv.blockSignals(False)
 
     def _clear_graph(self):
         if self._mpl_canvas is not None:
@@ -3000,6 +3545,15 @@ class CSSLoggerWidget(QWidget):
             self._mpl_canvas.setParent(None)
             self._mpl_canvas.deleteLater()
             self._mpl_canvas = None
+        # The toolbar belongs to that canvas — drop it with it, or its buttons act
+        # on a figure that no longer exists.
+        if getattr(self, "_graph_toolbar", None) is not None:
+            try:
+                self._graph_toolbar.setParent(None)
+                self._graph_toolbar.deleteLater()
+            except Exception:
+                pass
+            self._graph_toolbar = None
         self._mpl_figure  = None
         self._graph_axes  = []
         self._graph_lines = []
@@ -3126,10 +3680,68 @@ class CSSLoggerWidget(QWidget):
         self._lbl_status.setText("Statistics copied to clipboard.")
 
     def _on_span_select(self, xmin, xmax):
-        # Left-drag selection over the plot → per-PV statistics for the region.
+        # Left-drag selection over the plot → remember the region, then compute.
+        # Only the REGION is remembered (absolute time); the numbers are always
+        # derived from it, so they survive a replot and follow new live data.
         if xmax - xmin < 1e-9 or not self._graph_pvs:
+            self._clear_selection()
+            return
+        self._sel_range = (float(xmin), float(xmax))
+        self._recompute_stats()
+
+    def _clear_selection(self):
+        """Forget the selected region and empty the statistics strip."""
+        self._sel_range = None
+        sel = getattr(self, "_span_selector", None)
+        if sel is not None:
+            try:
+                sel.set_visible(False)
+                if self._mpl_canvas is not None:
+                    self._mpl_canvas.draw_idle()
+            except Exception:
+                pass
+        self._clear_stats()
+
+    def _drop_selection_if_outside(self):
+        """Forget the selection when the newly chosen time window does not touch
+        it at all. A window that still overlaps keeps it (the region is absolute
+        time, so it lands on the same data); only a completely unrelated window
+        makes the numbers meaningless."""
+        if not self._sel_range:
+            return
+        try:
+            w_lo = mdates.date2num(self._dt_from)
+            w_hi = mdates.date2num(self._dt_to)
+        except Exception:
+            return
+        s_lo, s_hi = self._sel_range
+        if s_hi < w_lo or s_lo > w_hi:
+            self._clear_selection()
+
+    def _restore_selection_band(self):
+        """Paint the remembered region back onto a freshly built SpanSelector.
+
+        The selector is recreated with every figure, so without this the blue
+        band vanishes even when the numbers are still valid.
+        """
+        if not self._sel_range or self._span_selector is None:
+            return
+        try:
+            self._span_selector.extents = self._sel_range
+        except Exception:
+            pass
+
+    def _recompute_stats(self):
+        """Rebuild the per-PV statistics cards for ``self._sel_range``.
+
+        Safe to call after any redraw or live update: it reads the region from
+        state and the samples from the current arrays, so nothing is lost when
+        the figure is rebuilt and the numbers track newly arrived data.
+        """
+        if not self._sel_range or not self._graph_pvs:
             self._clear_stats()
             return
+        xmin, xmax = self._sel_range
 
         self._clear_stats()
         any_card = False
@@ -3164,40 +3776,238 @@ class CSSLoggerWidget(QWidget):
         t0 = mdates.num2date(xmin, tz=TZ_PRAGUE)
         t1 = mdates.num2date(xmax, tz=TZ_PRAGUE)
         span_s = (t1 - t0).total_seconds()
+        # Warn when the window no longer covers the whole region, so the numbers
+        # are never silently taken for the full selection.
+        _note = ""
+        if self._graph_axes:
+            try:
+                _vlo, _vhi = self._graph_axes[0].get_xlim()
+                if xmin < _vlo - 1e-9 or xmax > _vhi + 1e-9:
+                    _note = "   ⚠ partly outside the shown window"
+            except Exception:
+                pass
         self._stats_title.setText(
             f"Selection statistics  ·  {t0.strftime('%Y-%m-%d %H:%M:%S')} → "
-            f"{t1.strftime('%H:%M:%S')}  ({span_s:,.1f} s)")
+            f"{t1.strftime('%H:%M:%S')}  ({span_s:,.1f} s){_note}")
         self._stats_title.show()
         self._stats_scroll.show()
 
     def _on_zoom_select(self, xmin, xmax):
+        # Right-drag = zoom in time. The view we are leaving is pushed onto the
+        # TOOLBAR's history, so its Back / Home undo a right-drag zoom just like
+        # they undo one made with the Zoom button.
         if xmax - xmin < 1e-6: return
         if not self._graph_axes: return
         t0 = mdates.num2date(xmin, tz=TZ_PRAGUE)
         t1 = mdates.num2date(xmax, tz=TZ_PRAGUE)
-        old_xlim = self._graph_axes[0].get_xlim()
-        self._zoom_history.append(old_xlim)
+        self._push_graph_view()
         self._graph_axes[0].set_xlim(t0, t1)
-        self._btn_zoom_back.setEnabled(True)
+        self._user_zoomed = True
+        self._retick_from_current_xlim()
         if self._mpl_canvas:
             self._mpl_canvas.draw_idle()
 
-    def _zoom_back(self):
-        if not self._zoom_history or not self._graph_axes: return
-        xlim = self._zoom_history.pop()
-        self._graph_axes[0].set_xlim(xlim)
-        if not self._zoom_history:
-            self._btn_zoom_back.setEnabled(False)
-        if self._mpl_canvas:
-            self._mpl_canvas.draw_idle()
+    # ── Graph toolbar ───────────────────────────────────────────────────────
 
-    def _xy_zoom_back(self):
-        if not self._xy_zoom_history or self._xy_canvas is None: return
-        xlim, ylim = self._xy_zoom_history.pop()
-        if self._xy_figure and self._xy_figure.axes:
-            ax = self._xy_figure.axes[0]
-            ax.set_xlim(xlim); ax.set_ylim(ylim)
-            self._xy_canvas.draw_idle()
+    def _install_graph_toolbar(self, canvas):
+        """Put a fresh toolbar above the graph for the canvas just built.
+
+        Both the figure and the canvas are recreated by every full redraw and a
+        matplotlib toolbar is bound to one canvas, so the old one is thrown away
+        and a new one takes its place in the permanent holder.
+        """
+        holder = getattr(self, "_graph_tb_holder", None)
+        if holder is None:
+            return
+        lay = holder.layout()
+        old = getattr(self, "_graph_toolbar", None)
+        if old is not None:
+            try:
+                old.setParent(None); old.deleteLater()
+            except Exception:
+                pass
+        self._graph_toolbar = None
+        # Drop whatever is left in the holder (the toolbar's light-palette host).
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget() if it else None
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+
+        try:
+            tb = _make_mpl_toolbar(_MplToolbar, canvas, holder)
+        except Exception:
+            self._log("[toolbar] could not be built — graph works without it.")
+            return
+        self._graph_toolbar = tb
+        # The light-palette host only had to exist while the toolbar was being
+        # built (that is when the icons are tinted, once and never again), so the
+        # toolbar can be moved into the visible row now with its icons intact.
+        lay.addWidget(tb)
+        tb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # "Customize" opens matplotlib's own styling dialog, which knows nothing
+        # about this graph's stacked axes and would fight every setting made in
+        # Graph settings. Spectra drops it for the same reason.
+        for act in list(tb.actions()):
+            if act.text() == "Customize":
+                tb.removeAction(act)
+
+        # Home hands the view back to the app (the live window may scroll again).
+        for act in tb.actions():
+            if act.text() == "Home":
+                act.triggered.connect(self._on_graph_view_home)
+            elif act.text() in ("Back", "Forward"):
+                act.triggered.connect(self._retick_from_current_xlim)
+            elif act.text() in ("Zoom", "Pan"):
+                act.toggled.connect(self._sync_graph_interaction_mode)
+        # Margins changed in the toolbar's dialog: keep them, otherwise the next
+        # redraw would put the stored ones straight back.
+        if hasattr(tb, "subplot_params_changed"):
+            try:
+                tb.subplot_params_changed.connect(self._adopt_toolbar_margins)
+            except Exception:
+                pass
+        self._sync_graph_interaction_mode()
+
+    def _sync_graph_interaction_mode(self, *_):
+        """Decide what a LEFT drag on the graph does.
+
+        Zoom or Pan pressed in on the toolbar → left drag belongs to the toolbar.
+        Neither pressed in → left drag selects a region and shows its statistics.
+        Right-drag zoom keeps working either way.
+        """
+        tb = self._graph_toolbar
+        mode = ""
+        if tb is not None:
+            try:
+                mode = str(tb.mode or "")
+            except Exception:
+                mode = ""
+        busy = bool(mode.strip())
+        sel = getattr(self, "_span_selector", None)
+        if sel is not None:
+            try:
+                sel.set_active(not busy)
+            except Exception:
+                pass
+
+        if busy:
+            # Zoom or pan engaged: the user is inspecting a particular stretch, so
+            # the live window must stop dragging the view along underneath them.
+            self._user_zoomed = True
+        else:
+            # Both let go again. If the view happens to be back on the live window,
+            # following "now" may resume — otherwise the flag would stick and the
+            # graph would never scroll again short of pressing Home.
+            self._user_zoomed = not self._view_matches_live_window()
+
+        lbl = getattr(self, "_lbl_graph_info", None)
+        if lbl is not None:
+            lbl.setText("Zoom/pan on — left drag zooms instead of taking statistics"
+                        if busy else "")
+
+    def _view_matches_live_window(self):
+        """Is the visible range (near enough) the rolling live window?"""
+        span = self._live_window_span
+        if not self._graph_axes or not span or span.total_seconds() <= 0:
+            return False
+        try:
+            lo_n, hi_n = self._graph_axes[0].get_xlim()
+            shown_s = (hi_n - lo_n) * 86400.0        # date numbers are in days
+            return abs(shown_s - span.total_seconds()) <= 0.02 * span.total_seconds()
+        except Exception:
+            return False
+
+    def _adopt_toolbar_margins(self):
+        """Copy the margins set in the toolbar's dialog into the saved settings.
+
+        Every redraw re-applies the stored margins, so without this the sliders
+        would be undone by the next redraw. The LEFT margin is deliberately not
+        copied: it is computed from how many channels have their own axis.
+        """
+        fig = self._mpl_figure
+        if fig is None:
+            return
+        try:
+            sp = fig.subplotpars
+            self._graph_opts["margin_right"]  = float(1.0 - sp.right)
+            self._graph_opts["margin_top"]    = float(sp.top)
+            self._graph_opts["margin_bottom"] = float(sp.bottom)
+            self.config["graph_opts"] = dict(self._graph_opts)
+            self._lbl_status.setText("Plot margins updated.")
+        except Exception:
+            pass
+
+    def _open_graph_view_menu(self):
+        """The "View ▾" menu: reset, axis limits, hide grids.
+
+        Deliberately a button and not a right-click menu on the graph — right-drag
+        on the graph is the zoom, and a context menu there would swallow it.
+        """
+        canvas = self._mpl_canvas
+        if canvas is None or not self._graph_axes:
+            return
+        menu = QMenu(self)
+        act_reset = menu.addAction("Reset view")
+        act_clear = menu.addAction("Clear selection")
+        act_clear.setEnabled(bool(self._sel_range))
+        menu.addSeparator()
+        act_lim = menu.addAction("Axis limits…") if _AxisLimitsDialog else None
+        menu.addSeparator()
+        act_grid_off = menu.addAction("Hide all grids")
+        btn = getattr(self, "_btn_graph_view", None)
+        _at = (btn.mapToGlobal(btn.rect().bottomLeft()) if btn is not None
+               else self.mapToGlobal(QPoint(0, 0)))
+        chosen = menu.exec(_at)
+        if chosen is None:
+            return
+        if chosen is act_reset:
+            tb = self._graph_toolbar
+            if tb is not None:
+                try:
+                    tb.home()
+                except Exception:
+                    pass
+            self._on_graph_view_home()
+        elif chosen is act_clear:
+            self._clear_selection()
+        elif act_lim is not None and chosen is act_lim:
+            try:
+                _AxisLimitsDialog(self._graph_axes[0], canvas, self).exec()
+                self._retick_from_current_xlim()
+            except Exception:
+                pass
+        elif chosen is act_grid_off:
+            for pv in list(self._pv_settings):
+                self._pv_settings[pv]["grid"] = False
+            self._refresh_axis_settings_tv()
+            self._schedule_replot()
+
+    def _push_graph_view(self):
+        """Remember the current view in the toolbar history (so Back returns to it)."""
+        tb = self._graph_toolbar
+        if tb is None:
+            return
+        try:
+            tb.push_current()
+        except Exception:
+            pass
+
+    def _on_graph_view_home(self):
+        """Home pressed: the user gave the view back, so the live window may
+        scroll again, and the stamps must match the restored range."""
+        self._user_zoomed = False
+        self._retick_from_current_xlim()
+
+    def _on_xy_rect_zoom_push(self):
+        tb = self._xy_toolbar
+        if tb is None:
+            return
+        try:
+            tb.push_current()
+        except Exception:
+            pass
 
     # ── Save / clean graph ──────────────────────────────────────────────────
 
@@ -3222,11 +4032,12 @@ class CSSLoggerWidget(QWidget):
                         pass
             self._graph_raw    = []
             self._graph_raw_np = []
-            self._clear_stats()
+            self._clear_selection()   # deliberate act: drop the region too
             self._mpl_canvas.draw_idle()
             self._lbl_graph_info.setText("Graph cleared — data points removed.")
         else:
             self._clear_graph()
+            self._sel_range = None
             self._lbl_graph_info.setText("")
 
     # ── Fullscreen / windowed graph (F11 / Ctrl+F11) ──────────────────────────
@@ -3244,9 +4055,15 @@ class CSSLoggerWidget(QWidget):
     def _graph_popout(self, windowed: bool):
         """Show the Graph tab in its own window. F11 → resizable window,
         Ctrl+F11 → fullscreen. Pressing the same shortcut again docks it back."""
-        # Ignore the app-wide shortcut when the user is on another tool's tab and
-        # nothing is popped out yet.
+        # F11 is registered application-wide, so it also fires while another tab is
+        # in front. Hand it to that tab instead of doing nothing — the Spectra tab
+        # has its own focus mode. Keeping ONE owner of the key sequence is what
+        # stops Qt from reporting an ambiguous shortcut and calling neither.
         if self._graph_popup is None and not self.isVisible():
+            spectra = getattr(self.window(), "_spectra", None)
+            toggle = getattr(spectra, "toggle_focus_mode", None)
+            if toggle is not None and spectra.isVisible():
+                toggle()
             return
 
         if self._graph_popup is not None:
@@ -3275,6 +4092,7 @@ class CSSLoggerWidget(QWidget):
         self._tab_graph.show()
         # "Graph only": hide the toolbar and the axis-settings table.
         self._graph_ctrl_bar.hide()
+        self._graph_tb_holder.hide()
         self._graph_axis_pane.hide()
         self._graph_popup = popup
         if windowed:
@@ -3295,6 +4113,7 @@ class CSSLoggerWidget(QWidget):
         self._tab_graph.setParent(None)
         # Restore the toolbar and axis-settings table hidden during pop-out.
         self._graph_ctrl_bar.show()
+        self._graph_tb_holder.show()
         self._graph_axis_pane.show()
         self._notebook.insertTab(self._graph_tab_index, self._tab_graph,
                                  self._graph_tab_label)
@@ -3315,6 +4134,140 @@ class CSSLoggerWidget(QWidget):
         self.config["avg_target_points"] = self._avg_target_points()
         if self._samples_by_pv:
             self._schedule_replot()   # coalesce rapid spinner clicks into one redraw
+
+    def _grid_style_index(self, pv, grid_pvs):
+        """Position of ``pv`` among the channels that have Grid ticked.
+
+        Counted over the TICKED channels, not over every row, so the first grid is
+        always a solid line and a style does not change just because some unrelated
+        channel above it was hidden or added.
+        """
+        try:
+            return list(grid_pvs).index(pv)
+        except ValueError:
+            return 0
+
+    def _grid_style_for(self, pv, grid_pvs):
+        """matplotlib line style for this channel's grid."""
+        idx = self._grid_style_index(pv, grid_pvs)
+        return _GRID_STYLES[idx % len(_GRID_STYLES)][1]
+
+    def _grid_style_name(self, pv, grid_pvs):
+        """Plain-language name of this channel's grid style, for the tooltip."""
+        idx = self._grid_style_index(pv, grid_pvs)
+        return _GRID_STYLES[idx % len(_GRID_STYLES)][0]
+
+    def _bottom_margin_floor(self, fig_h_px, dpi=96):
+        """Smallest bottom gap (as a figure fraction) that still fits the time
+        stamps and the "Time (Prague)" title below them.
+
+        The gap is set as a PERCENTAGE of the figure, but the text is a fixed
+        number of POINTS tall — so on a short graph pane the percentage stops
+        being enough. It cost the axis title: opening the statistics strip
+        shortens the graph by well over a third, and the title was cut in half.
+        """
+        _opts = getattr(self, "_graph_opts", None) or {}
+        f_pt  = float(_opts.get("font_size", 11))
+        t_pt  = max(4.0, f_pt + float(_opts.get("tick_font_delta", -1)))
+        need_px = (t_pt + f_pt) * (dpi / 72.0) * 1.6 + 6.0
+        return min(0.45, need_px / max(1.0, float(fig_h_px)))
+
+    def _keep_x_label_visible(self, *_):
+        """Re-apply the bottom-gap floor after the canvas changes size.
+
+        Called on every canvas resize: the margins matplotlib keeps are
+        fractions, so a shorter canvas silently gives the time axis fewer pixels
+        than its text needs. The gap grows when the graph shrinks and goes back to
+        the user's own setting when the room returns, so no space is left unused.
+        """
+        fig = self._mpl_figure
+        if fig is None or self._mpl_canvas is None:
+            return
+        try:
+            h_px = float(fig.get_size_inches()[1] * fig.dpi)
+            top  = float(fig.subplotpars.top)
+            _opts = getattr(self, "_graph_opts", None) or {}
+            want = min(top - 0.05,
+                       max(0.02,
+                           float(_opts.get("margin_bottom", 0.12)),
+                           self._bottom_margin_floor(h_px, fig.dpi)))
+            if abs(want - float(fig.subplotpars.bottom)) > 0.002:
+                fig.subplots_adjust(bottom=want)
+                self._blit_bg = None
+                self._mpl_canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _apply_x_ticks(self, ax, t_lo_local, t_hi_local):
+        """Put fresh time stamps on ``ax`` for the local window [t_lo, t_hi].
+
+        The single place that installs the time-axis locators and label format.
+        It has to be re-run after EVERY change of the visible range — a full
+        redraw, a live scroll, a zoom, a Back — because the positions are a fixed
+        list: keep the old list over a new range and the stamps drift out of view
+        (a narrow zoom used to end up with barely a label on it).
+        """
+        from matplotlib.ticker import FuncFormatter, AutoMinorLocator, FixedLocator
+        if t_lo_local is None or t_hi_local is None:
+            return
+        span_s = (t_hi_local - t_lo_local).total_seconds()
+        if span_s <= 0:
+            ax.xaxis.set_major_locator(
+                mdates.AutoDateLocator(tz=TZ_PRAGUE, minticks=5, maxticks=8))
+            return
+
+        majors, minors = self._compute_x_ticks(t_lo_local, t_hi_local)
+        if majors:
+            ax.xaxis.set_major_locator(FixedLocator(majors))
+        else:
+            ax.xaxis.set_major_locator(
+                mdates.AutoDateLocator(tz=TZ_PRAGUE, minticks=5, maxticks=8))
+        if minors:
+            ax.xaxis.set_minor_locator(FixedLocator(minors))
+        else:
+            ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+
+        # Clock format of the time stamps: "auto" keeps seconds, the other two
+        # are the user's fixed choice (Graph settings → Time axis).
+        _clock = ("%H:%M"
+                  if str(self._graph_opts.get("x_time_format", "auto")) == "hm"
+                  else "%H:%M:%S")
+        same_day = t_lo_local.date() == t_hi_local.date()
+
+        def _fmt_x(x, _p, _same=same_day, _c=_clock):
+            try:
+                dt = mdates.num2date(x, tz=TZ_PRAGUE)
+            except Exception:
+                return ""
+            if _same:
+                return dt.strftime(_c)
+            return (dt.strftime("%m-%d\n00:00")
+                    if (dt.hour == 0 and dt.minute == 0) else dt.strftime(_c))
+
+        ax.xaxis.set_major_formatter(FuncFormatter(_fmt_x))
+
+    def _retick_from_current_xlim(self):
+        """Re-stamp the time axis for whatever range is on screen right now.
+
+        Called after a zoom, a Back/Forward/Home or a pan, so the stamps always
+        belong to the view being shown.
+        """
+        if not self._graph_axes:
+            return
+        ax0 = self._graph_axes[0]
+        if getattr(self, "_reticking", False):
+            return
+        self._reticking = True
+        try:
+            lo_n, hi_n = ax0.get_xlim()
+            if hi_n > lo_n:
+                self._apply_x_ticks(ax0,
+                                    mdates.num2date(lo_n, tz=TZ_PRAGUE),
+                                    mdates.num2date(hi_n, tz=TZ_PRAGUE))
+        except Exception:
+            pass
+        finally:
+            self._reticking = False
 
     def _compute_x_ticks(self, t_lo, t_hi):
         """Major + minor X-tick positions (matplotlib date numbers) for the local
@@ -3367,17 +4320,74 @@ class CSSLoggerWidget(QWidget):
     # (Time-binned averaging lives in the module-level _downsample_arrays_mean:
     # every caller feeds matplotlib, so the whole path stays in numpy arrays.)
 
+    # ── Automatic loading ───────────────────────────────────────────────────
+
+    def _finish_load(self):
+        """A fetch has ended (well or badly): let the next one start, and run one
+        that was asked for while this was busy."""
+        self._load_in_flight = False
+        if getattr(self, "_reload_pending", False):
+            self._reload_pending = False
+            self._request_reload(delay_ms=0)
+
+    def _request_reload(self, delay_ms=400, reason=""):
+        """Ask for the current channels + window to be (re)loaded.
+
+        Everything that changes WHAT should be on screen calls this instead of a
+        button: adding or removing a channel, a new time window, a new preset.
+        Several changes in a row collapse into one fetch, and a fetch that is
+        already running is allowed to finish first.
+        """
+        if reason:
+            self._pending_reload_reason = reason
+        if getattr(self, "_load_in_flight", False):
+            self._reload_pending = True     # run it when the current one lands
+            return
+        timer = getattr(self, "_autoload_timer", None)
+        if timer is None:
+            return
+        timer.start(max(0, int(delay_ms)))
+
+    def _do_auto_reload(self):
+        """The debounced reload itself. Live restarts its window; otherwise the
+        chosen window is fetched. Quiet when no channel is selected yet."""
+        if not self._real_pv_names():
+            return
+        if getattr(self, "_load_in_flight", False):
+            self._reload_pending = True
+            return
+        why = getattr(self, "_pending_reload_reason", "") or "selection changed"
+        self._pending_reload_reason = ""
+        self._log(f"Auto reload ({why}).")
+        if self._live_mode:
+            self._live_timer.stop()
+            self._countdown_timer.stop()
+            self._live_window_span = self._live_span_from_window()
+            self._live_last_ts = None
+            self._live_last_rebuild_ns = 0
+            self._live_last_graph_ns   = 0
+            self._live_init_retries = 0
+            self._lbl_status.setText("Live: reloading…")
+            self._live_initial_load()
+        else:
+            self._on_load_clicked(silent=True)
+
     # ── Load data ───────────────────────────────────────────────────────────
 
-    def _on_load_clicked(self):
+    def _on_load_clicked(self, silent=False):
+        """Fetch the chosen window. Reached from the automatic reload, not a button.
+
+        ``silent`` keeps it quiet when nothing is selected yet (the automatic path
+        must not pop a warning up while the user is still choosing channels).
+        """
         pvs = self._real_pv_names()
         if not pvs:
-            QMessageBox.warning(self, "No PVs", "Add at least one PV to the list."); return
-        # A manual load freezes the view in the past: stop live first so its
-        # auto-scrolling window doesn't fight the historical data being shown.
-        if self._live_mode:
-            self._stop_live("Live stopped — showing loaded window.")
-        self._btn_load.setEnabled(False)
+            if not silent:
+                QMessageBox.warning(self, "No PVs", "Add at least one PV to the list.")
+            return
+        # Live is NOT stopped here any more: it is the only mode switch the user
+        # has, so a reload must never turn it off behind their back.
+        self._load_in_flight = True
         self._lbl_status.setText("Loading…")
         self._progress_bar.setValue(0)
         self._progress_bar.show()
@@ -3481,7 +4491,7 @@ class CSSLoggerWidget(QWidget):
     def _on_load_error(self, e: str):
         self._log(f"Load error: {e}")
         self._lbl_status.setText("Error — see Log tab.")
-        self._btn_load.setEnabled(True)
+        self._finish_load()
         self._progress_bar.hide()
 
     def _on_load_finished(self, result):
@@ -3494,10 +4504,13 @@ class CSSLoggerWidget(QWidget):
             print(f"[CSS Logger] ERROR in _on_load_finished:\n{tb}")
             self._log(f"[ERROR in _on_load_finished]\n{tb}")
             self._lbl_status.setText(f"Internal error — see Log tab: {exc}")
-            self._btn_load.setEnabled(True)
+            self._finish_load()
             self._progress_bar.hide()
 
     def __on_load_finished_inner(self, result):
+        # A fresh range can hold the same NUMBER of samples as the last one, so
+        # the measured-value cache has to be dropped outright, not just re-keyed.
+        self._pv_stats_cache.clear()
         if len(result) == 6:
             samples_by_pv, pv_order, errors, start_ns, end_ns, pre_window_vals = result
         else:
@@ -3505,7 +4518,7 @@ class CSSLoggerWidget(QWidget):
             pre_window_vals = {}
         self._pre_window_vals = pre_window_vals
         self._plot_window_ns = None   # regular load uses the user's From/To
-        self._btn_load.setEnabled(True)
+        self._finish_load()
         self._progress_bar.hide()
 
         # Sort every PV by timestamp (parallel fetch can arrive out of order)
@@ -3636,7 +4649,7 @@ class CSSLoggerWidget(QWidget):
             self._log(f"Live window {window_diff/3600:.1f} h is wider than the "
                       f"{_LIVE_MAX_INIT_SPAN_S/3600:.0f} h live limit — "
                       f"using {_LIVE_MAX_INIT_SPAN_S/3600:.0f} h "
-                      f"(LOAD DATA still loads the full window).")
+                      f"(with live off the full window is still loaded).")
             return timedelta(seconds=_LIVE_MAX_INIT_SPAN_S)
         return timedelta(seconds=window_diff)
 
@@ -3649,38 +4662,43 @@ class CSSLoggerWidget(QWidget):
                 QMessageBox.warning(self, "No PVs", "Add PVs before starting live mode."); return
             self._live_mode = True
             self._live_window_span = self._live_span_from_window()
-            self._btn_live.setText("⏹ Stop Live")
-            self._btn_live.setStyleSheet(
-                "QPushButton{background:#F57F17;color:white;font-weight:700;border-radius:3px;padding:5px;}")
+            self._btn_live.setText("⏹ Stop live")
+            self._btn_live.setStyleSheet(_LIVE_BTN_ON_STYLE)
             self._refresh_time_labels()
             self._lbl_status.setText("Live: initial load…")
-            self._btn_load.setEnabled(False)
+            self._load_in_flight = True
             self._live_last_ts = None
             self._live_last_rebuild_ns = 0
+            self._live_last_graph_ns   = 0
             self._live_init_retries = 0      # fresh retry budget for this session
             self._live_initial_load()
 
     def _stop_live(self, status="Live mode stopped."):
-        """Stop live polling and restore the idle UI. Safe to call when not live
-        (used by the Live toggle and by LOAD DATA so a manual load freezes the
-        view instead of fighting the auto-scrolling live window)."""
+        """Stop following "now" and show the chosen window standing still.
+
+        Safe to call when not live. Data keeps being loaded automatically either
+        way — this only decides whether the window follows the clock.
+        """
         self._live_mode = False
         # Abandon whatever is in flight, not just the next tick: a running fetch
         # pool ignores the timers entirely and would keep the GUI stuttering.
         self._live_epoch += 1
         self._live_timer.stop()
         self._countdown_timer.stop()
-        self._btn_live.setText("⏵ Live")
-        self._btn_live.setStyleSheet("")
-        # Free the LOAD DATA button even if the initial live fetch is still
-        # running (its callback bails once _live_mode is False).
-        self._btn_load.setEnabled(True)
+        self._btn_live.setText("⏵ Live mode")
+        self._btn_live.setStyleSheet(_LIVE_BTN_OFF_STYLE)
+        # Let a fetch start again even if the initial live fetch is still running
+        # (its callback bails once _live_mode is False).
+        self._finish_load()
         self._progress_bar.hide()
         self._plot_window_ns = None
         self._refresh_time_labels()
         self._lbl_status.setText(status)
 
     def _live_initial_load(self):
+        if not self._live_mode or not self._live_window_span:
+            return
+        self._load_in_flight = True
         now_utc = datetime.now().astimezone(timezone.utc)
         t_from  = now_utc - self._live_window_span
         start_ns = dt_to_ns(t_from)
@@ -3780,10 +4798,13 @@ class CSSLoggerWidget(QWidget):
 
     def _on_live_init_error(self, e: str):
         """Live initial load failed — retry a couple of times before giving up so
-        a transient archiver hiccup doesn't make Live look like it needs a manual
-        LOAD DATA first."""
+        a transient archiver hiccup doesn't leave Live looking permanently
+        broken."""
         self._log(f"Live initial load error: {e}")
         if not self._live_mode:
+            # Live was switched off meanwhile. Release the fetch lock anyway or no
+            # automatic reload could ever start again.
+            self._finish_load()
             self._progress_bar.hide(); return
         retries = getattr(self, "_live_init_retries", 0)
         if retries < 2:
@@ -3796,8 +4817,9 @@ class CSSLoggerWidget(QWidget):
 
     def _after_live_initial_load(self, result):
         if not self._live_mode:
+            self._finish_load()
             self._progress_bar.hide(); return
-        self._btn_load.setEnabled(True)
+        self._finish_load()
         self._progress_bar.hide()
         self._live_init_retries = 0          # success clears the retry budget
         try:
@@ -3811,6 +4833,7 @@ class CSSLoggerWidget(QWidget):
             # clobbering the user's chosen From/To) so the held line spans it.
             self._plot_window_ns = (start_ns, end_ns)
             self._samples_by_pv = samples_by_pv
+            self._pv_stats_cache.clear()      # measured values start over
             # Same pre-window seed safety net as the historical load path: if the
             # fetch already holds a sample before the window start, use it as the
             # held value so Live doesn't start the trace mid-window.
@@ -3919,28 +4942,37 @@ class CSSLoggerWidget(QWidget):
                 new_samples, added_count, end_ns = result; errors = []
             self._live_tick_count = getattr(self, "_live_tick_count", 0) + 1
 
-            # Re-merging + re-filtering + re-plotting the WHOLE accumulated
-            # history is too expensive to redo on every 300 ms tick once a
-            # live session has run for a while — throttle it to at most once
-            # a second. New samples are still appended below on every tick;
-            # only the expensive rebuild/redraw is deferred.
+            # The graph and the table are refreshed on SEPARATE clocks.
+            #
+            # They used to share one, so the slower of the two set the pace for
+            # both: rebuilding the table means re-merging the whole accumulated
+            # history, and with a dozen channels that alone can take about a
+            # second — which then held the graph back to a redraw every ~5 s.
+            # Now the cheap graph update runs as often as it can keep up while the
+            # costly table rebuild keeps its own, slower schedule.
             now = now_ns()
-            # Adaptive cadence: with many PVs one rebuild+redraw can take a
-            # sizeable fraction of a second, and firing it again every second
-            # leaves the GUI thread almost no idle time (the app feels stuck even
-            # though it is working). Keep at least ~3× the measured cost between
-            # rebuilds, so the graph stays live but the UI keeps breathing.
-            _interval_ns = max(_LIVE_REBUILD_MIN_INTERVAL_NS,
-                               3 * getattr(self, "_live_rebuild_cost_ns", 0))
-            refresh_due = (now - self._live_last_rebuild_ns) >= _interval_ns
-            _rebuild_t0 = time.perf_counter()
-            if refresh_due:
-                self._live_last_rebuild_ns = now
+            _graph_floor_ns = int(max(50, int(
+                self._graph_opts.get("live_graph_min_ms", 300))) * 1e6)
+            _table_floor_ns = int(max(200, int(
+                self._graph_opts.get("live_table_ms", 1500))) * 1e6)
+            # Each one still keeps at least ~2× its own measured cost free, so a
+            # slow machine backs off instead of leaving the window no idle time.
+            _graph_interval_ns = max(_graph_floor_ns,
+                                     2 * getattr(self, "_live_graph_cost_ns", 0))
+            _table_interval_ns = max(_table_floor_ns,
+                                     2 * getattr(self, "_live_table_cost_ns", 0))
+            graph_due = (now - getattr(self, "_live_last_graph_ns", 0)) >= _graph_interval_ns
+            table_due = (now - getattr(self, "_live_last_rebuild_ns", 0)) >= _table_interval_ns
+            refresh_due = table_due            # the table rebuild, as before
+            if graph_due:
+                self._live_last_graph_ns = now
                 # Advance the carry-forward / plot window so a full replot (and the
                 # held "last value" line) tracks "now" instead of the initial load.
                 if self._live_window_span:
                     span_ns = int(self._live_window_span.total_seconds() * 1e9)
                     self._plot_window_ns = (now - span_ns, now)
+            if table_due:
+                self._live_last_rebuild_ns = now
 
             if added_count > 0:
                 # Advance the cursor to the newest sample we actually received —
@@ -3962,7 +4994,8 @@ class CSSLoggerWidget(QWidget):
                     else:
                         self._samples_by_pv[pv] = existing
 
-                if refresh_due:
+                if table_due:
+                    _table_t0 = time.perf_counter()
                     rows = self._build_table_rows(
                         self._samples_by_pv, self._base_pv_order or self._pv_order)
                     rows = self._remove_master_only_rows(rows)
@@ -3972,6 +5005,9 @@ class CSSLoggerWidget(QWidget):
                     rows = self._filter_master_multiple_rows(self._table_rows_unfiltered)
                     self._table_rows = self._apply_conditions_to_rows(rows)
                     self._populate_table()
+                    self._flush_axis_measured()   # Last/Min/Max/… keep up with Live
+                    self._live_table_cost_ns = int(
+                        (time.perf_counter() - _table_t0) * 1e9)
                 total_pts = sum(len(v) for v in self._samples_by_pv.values())
                 self._lbl_status.setText(
                     f"Live +{added_count} pts  |  total {total_pts}")
@@ -4009,13 +5045,12 @@ class CSSLoggerWidget(QWidget):
                 self._log(f"Live polling (tick {self._live_tick_count}); "
                           f"last data {ns_to_local_str(last_ns)[:19] if last_ns else '—'}")
 
-            # Refresh the graph on the same throttled cadence as the table so
-            # the live window keeps scrolling to "now" without redoing the
-            # (expensive, full-history) redraw every 300 ms tick.
-            # If the graph has no lines yet or a PV just gained its first numeric
-            # data, the existing artists can't represent it — do a full replot;
-            # otherwise just mutate the existing artists (fast path).
-            if refresh_due:
+            # Graph on its own, faster clock. If the graph has no lines yet or a
+            # channel just gained its first numeric data, the existing lines can't
+            # represent it — do a full redraw; otherwise just move the existing
+            # ones (the cheap path).
+            if graph_due:
+                _graph_t0 = time.perf_counter()
                 numeric_now = {
                     pv for pv in self._pv_order
                     if self._pv_settings.get(pv, {}).get("show", True)
@@ -4026,11 +5061,16 @@ class CSSLoggerWidget(QWidget):
                     self._plot_graph()
                 else:
                     self._update_graph_data()
-                # Cost of this whole refresh (table + graph); paces the next one.
-                # The canvas repaint itself happens later via draw_idle, so add a
-                # rough allowance for it rather than under-counting the work.
-                self._live_rebuild_cost_ns = int(
-                    (time.perf_counter() - _rebuild_t0) * 1.6e9)
+                # Cost of the graph refresh alone; paces the next one. The canvas
+                # repaint itself happens later via draw_idle, so add a rough
+                # allowance for it rather than under-counting the work.
+                self._live_graph_cost_ns = int(
+                    (time.perf_counter() - _graph_t0) * 1.6e9)
+            else:
+                # Between graph refreshes, still slide the time axis so the window
+                # glides instead of jumping once per refresh. This touches no data:
+                # new range, fresh time stamps, repaint.
+                self._scroll_live_time_axis()
         except Exception:
             # A failed incremental update must NOT kill the live loop or crash
             # the Qt timer callback — log and keep polling.
@@ -4039,9 +5079,43 @@ class CSSLoggerWidget(QWidget):
         finally:
             self._schedule_live_tick()
 
+    def _scroll_live_time_axis(self):
+        """Slide the live window to "now" without touching the data.
+
+        The costly part of a live refresh is rebuilding the traces; moving the
+        visible range and re-labelling the time axis is nearly free. Doing that on
+        every poll makes the window glide smoothly instead of jumping forward once
+        per refresh. Left alone while the user is zoomed in on something.
+        """
+        if self._mpl_canvas is None or not self._graph_axes:
+            return
+        if self._user_zoomed or not self._live_mode:
+            return
+        span = self._live_window_span
+        if not span or span.total_seconds() <= 0:
+            return
+        try:
+            now_utc = datetime.now().astimezone(timezone.utc)
+            x_lo, x_hi = now_utc - span, now_utc
+            ax0 = self._graph_axes[0]
+            ax0.set_xlim(x_lo, x_hi)
+            self._apply_x_ticks(ax0, x_lo.astimezone(TZ_PRAGUE),
+                                x_hi.astimezone(TZ_PRAGUE))
+            self._blit_bg = None
+            self._mpl_canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _live_poll_ms(self) -> int:
+        """How often the archive is asked for new values (Graph settings)."""
+        try:
+            return max(50, int(self._graph_opts.get("live_poll_ms", 300)))
+        except Exception:
+            return 300
+
     def _schedule_live_tick(self):
         if not self._live_mode: return
-        interval_ms = 300  # fixed 300 ms poll interval
+        interval_ms = self._live_poll_ms()
         self._live_countdown_elapsed_ms = 0
         self._countdown_timer.start()
         self._live_timer.start(interval_ms)
@@ -4050,7 +5124,7 @@ class CSSLoggerWidget(QWidget):
         if not self._live_mode:
             self._countdown_timer.stop(); return
         self._live_countdown_elapsed_ms += 50
-        interval_ms = 300  # fixed 300 ms poll interval
+        interval_ms = self._live_poll_ms()
         remaining   = max(0, interval_ms - self._live_countdown_elapsed_ms)
         self._lbl_tw_live.setText(
             f"Live  {remaining/1000:.1f}s")
@@ -4433,6 +5507,9 @@ class CSSLoggerWidget(QWidget):
         self.config["master_multiple"] = self._get_master_multiple()
         self.config["avg_target_points"] = self._avg_target_points()
         self.config["graph_opts"]        = dict(self._graph_opts)
+        # Named looks only — the CURRENT colours, styles and reference lines are
+        # deliberately not carried over to the next start.
+        self.config["style_presets"]     = dict(self._style_presets)
         self.config["time_from"] = self._dt_from.strftime("%Y-%m-%d %H:%M:%S")
         self.config["time_to"]   = self._dt_to.strftime("%Y-%m-%d %H:%M:%S")
         save_config(self.config)
@@ -4577,6 +5654,14 @@ class CSSLoggerWidget(QWidget):
 
         _COL = list(self._axis_tv_cols)
         ncol = len(_COL)
+        # Channels that have their own grid, in the order the plot gave them their
+        # styles. Taken from the last redraw when there is one, so the tooltip
+        # never names a style the channel did not actually get.
+        _grid_on = getattr(self, "_grid_pvs_drawn", None)
+        if not _grid_on:
+            _grid_on = [pv for pv in self._pv_order
+                        if self._pv_settings.get(pv, {}).get("show", True)
+                        and self._pv_settings.get(pv, {}).get("grid", False)]
         # Rebuilding fires itemChanged for every setItem/setCheckState — block it
         # so the auto-apply handler doesn't run mid-rebuild.
         self._axis_tv.blockSignals(True)
@@ -4591,11 +5676,21 @@ class CSSLoggerWidget(QWidget):
                     hdr.setForeground(QColor("#0D47A1"))
                     hdr.setFlags(Qt.ItemFlag.ItemIsEnabled)   # not selectable/editable
                     self._axis_tv.setItem(row_i, 0, hdr)
+                    # Columns can be dragged around, and a span then paints from
+                    # wherever its first column ended up. Give every other cell of
+                    # the divider the same blue so the row reads as one solid band
+                    # no matter what order the user chose.
+                    for col_j in range(1, ncol):
+                        pad = QTableWidgetItem("")
+                        pad.setBackground(QColor("#E3F2FD"))
+                        pad.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                        self._axis_tv.setItem(row_i, col_j, pad)
                     self._axis_tv.setSpan(row_i, 0, 1, ncol)
                     continue
                 pv  = payload
                 idx = self._pv_order.index(pv)
                 s = self._pv_settings.get(pv, self._get_pv_default_settings(pv, idx))
+                stats = self._pv_stats(pv)
                 for col_j, col_name in enumerate(_COL):
                     val = s.get(col_name, "")
                     if col_name == "blank":
@@ -4605,6 +5700,15 @@ class CSSLoggerWidget(QWidget):
                     elif col_name in ("show", "auto_scale", "grid"):
                         chk = QTableWidgetItem()
                         chk.setCheckState(Qt.CheckState.Checked if val else Qt.CheckState.Unchecked)
+                        if col_name == "grid":
+                            # Name the line style this channel's grid gets, so the
+                            # lines on the plot can be matched to their channel.
+                            chk.setToolTip(
+                                f"Grid for this signal — {self._grid_style_name(pv, _grid_on)} lines "
+                                f"in the signal's own colour"
+                                if val else
+                                "Tick to give this signal its own grid (each one "
+                                "gets a different kind of line)")
                         self._axis_tv.setItem(row_i, col_j, chk)
                     elif col_name == "color":
                         item = QTableWidgetItem("")
@@ -4612,9 +5716,12 @@ class CSSLoggerWidget(QWidget):
                         item.setData(Qt.ItemDataRole.UserRole, color_hex)
                         self._axis_tv.setItem(row_i, col_j, item)
                     else:
-                        txt = "" if val is None else str(val)
+                        if col_name in stats:            # measured, not typed
+                            txt = stats[col_name]
+                        else:
+                            txt = "" if val is None else str(val)
                         item = QTableWidgetItem(txt)
-                        if col_name in ("pv", "cursor_val"):
+                        if col_name in _AXIS_READONLY_COLS:
                             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                         self._axis_tv.setItem(row_i, col_j, item)
         finally:
@@ -4670,7 +5777,7 @@ class CSSLoggerWidget(QWidget):
 
     def _on_axis_tv_double_click(self, row, col):
         col_name = list(self._axis_tv_cols)[col] if col < len(self._axis_tv_cols) else ""
-        if col_name in ("pv", "cursor_val"): return
+        if col_name in _AXIS_READONLY_COLS: return
 
     def _on_axis_tv_clicked(self, index):
         # Toggle behaviour: clicking an already-selected row again clears the
@@ -4757,11 +5864,20 @@ class CSSLoggerWidget(QWidget):
                 elif col_name == "color":
                     c = item.data(Qt.ItemDataRole.UserRole)
                     if c: s[col_name] = c
-                elif col_name in ("pv", "cursor_val"):
-                    pass
-                elif col_name in ("ymin", "ymax", "width"):
+                elif col_name in _AXIS_READONLY_COLS:
+                    pass                     # the PV name and the measured numbers
+                elif col_name in ("ymin", "ymax", "width", "marker_size"):
                     # Bad numeric input keeps the previous value instead of crashing.
                     s[col_name] = self._safe_float(item.text(), s.get(col_name))
+                elif col_name == "alpha":
+                    a = self._safe_float(item.text(), s.get("alpha", 100))
+                    s[col_name] = 100 if a is None else max(0.0, min(100.0, a))
+                elif col_name == "style":
+                    txt = item.text().strip().lower()
+                    s[col_name] = txt if txt in _LINE_STYLES else "solid"
+                elif col_name == "marker":
+                    txt = item.text().strip()
+                    s[col_name] = txt if txt in _MARKER_STYLES else "auto"
                 elif col_name == "smooth":
                     txt = item.text().strip()
                     s[col_name] = int(txt) if txt.isdigit() else 1
@@ -4782,9 +5898,95 @@ class CSSLoggerWidget(QWidget):
             "ymax":         None,
             "auto_scale":   False,
             "width":        None,
+            "style":        "solid",
+            "marker":       "auto",     # follow the global markers switch
+            "marker_size":  3,
+            "alpha":        100,        # percent
             "smooth":       1,
-            "grid":         idx == 0,
+            # Each ticked signal draws its OWN grid now, so starting the first one
+            # ticked would put a grid on the plot nobody asked for.
+            "grid":         False,
         }
+
+    @staticmethod
+    def _pv_style_kwargs(pv_setting, n_points, global_markers):
+        """Turn one signal's Style / Points / Size / Alpha into matplotlib
+        keywords.
+
+        A signal can never end up invisible: switching both the line and the
+        points off brings the line back as solid.
+        """
+        style_name = str(pv_setting.get("style", "solid") or "solid").lower()
+        if style_name not in _LINE_STYLES:
+            style_name = "solid"
+        marker_name = str(pv_setting.get("marker", "auto") or "auto")
+        if marker_name not in _MARKER_STYLES:
+            marker_name = "auto"
+
+        if marker_name == "auto":
+            # Unchanged behaviour: a small dot only while the global markers
+            # switch is on and the trace is short enough to stay readable.
+            marker = "." if (global_markers and n_points < 200) else "None"
+        else:
+            marker = _MARKER_STYLES[marker_name]
+
+        if style_name == "none" and marker == "None":
+            style_name = "solid"
+
+        try:
+            size = max(0.5, float(pv_setting.get("marker_size", 3)))
+        except (TypeError, ValueError):
+            size = 3.0
+        try:
+            alpha = max(0.0, min(100.0, float(pv_setting.get("alpha", 100)))) / 100.0
+        except (TypeError, ValueError):
+            alpha = 1.0
+
+        kw = {"linestyle": _LINE_STYLES[style_name], "marker": marker,
+              "markersize": size, "alpha": alpha}
+        if marker_name in _MARKER_HOLLOW:
+            kw["markerfacecolor"] = "none"
+        return kw
+
+    # Keys of _pv_settings that describe how a signal LOOKS. These are what a
+    # style preset carries; cursor_val is a live readout and never saved.
+    _PV_STYLE_KEYS = ("display_name", "color", "color_auto", "show",
+                      "ymin", "ymax", "auto_scale", "width", "style",
+                      "marker", "marker_size", "alpha", "smooth", "grid")
+
+    def _pv_stats(self, pv):
+        """Unit and the measured numbers of one signal over the loaded range.
+
+        Cached on the sample count, so hovering or replotting never walks the
+        samples again for a number that cannot have changed.
+        """
+        samples = self._samples_by_pv.get(pv) or []
+        key = (pv, len(samples))
+        hit = self._pv_stats_cache.get(key)
+        if hit is not None:
+            return hit
+        unit = ""
+        for _ts, _v, u in reversed(samples):
+            if u:
+                unit = str(u)
+                break
+        vals = np.array([v for _ts, v, _u in samples
+                         if isinstance(v, (int, float))], dtype=float)
+        if vals.size:
+            out = {"unit": unit,
+                   "last":  _fmt_cursor_value(float(vals[-1])),
+                   "min":   _fmt_cursor_value(float(np.nanmin(vals))),
+                   "max":   _fmt_cursor_value(float(np.nanmax(vals))),
+                   "mean":  _fmt_cursor_value(float(np.nanmean(vals))),
+                   "count": str(vals.size)}
+        else:
+            out = {"unit": unit, "last": "", "min": "", "max": "", "mean": "",
+                   "count": "0"}
+        # One entry per signal: a new sample count replaces the old answer.
+        for stale in [k for k in self._pv_stats_cache if k[0] == pv]:
+            self._pv_stats_cache.pop(stale, None)
+        self._pv_stats_cache[key] = out
+        return out
 
     def _resync_pv_colors(self):
         """Re-assign palette colors by current display position so that two
@@ -4847,23 +6049,12 @@ class CSSLoggerWidget(QWidget):
         if not x_pv or not y_pv:
             self._lbl_xy_info.setText("Select X and Y variables first."); return
 
-        xs, ys = [], []
-        for ts, row_dict in self._table_rows:
-            xval = None
-            yval = None
-            if x_pv in row_dict:
-                v, _ = row_dict[x_pv]
-                try: xval = float(v)
-                except (TypeError, ValueError): pass
-            if y_pv in row_dict:
-                v, _ = row_dict[y_pv]
-                try: yval = float(v)
-                except (TypeError, ValueError): pass
-            if xval is not None and yval is not None:
-                xs.append(xval); ys.append(yval)
+        xs, ys, n_rows = self._xy_pairs(x_pv, y_pv)
 
         if not xs:
-            self._lbl_xy_info.setText("No data to plot."); return
+            self._lbl_xy_info.setText(
+                "No data to plot — neither channel has values in this window.")
+            return
 
         self._clear_xy_plot()
 
@@ -4873,12 +6064,18 @@ class CSSLoggerWidget(QWidget):
         fig  = Figure(figsize=(_cw / _dpi, _ch / _dpi), dpi=_dpi)
         ax   = fig.add_subplot(111)
 
-        sc   = ax.scatter(xs, ys, s=12, alpha=0.7,
-                          c=range(len(xs)), cmap="plasma")
+        # Dense clouds hide their own points, so the dots shrink as the count grows
+        # and every one keeps a hairline dark edge — overlapping dots stay
+        # countable instead of merging into one blob.
+        _n = len(xs)
+        _size = 24 if _n < 300 else (12 if _n < 2000 else (6 if _n < 20000 else 3))
+        sc   = ax.scatter(xs, ys, s=_size, alpha=0.85,
+                          linewidths=0.3, edgecolors="#00000055",
+                          c=range(_n), cmap=_XY_CMAP)
         ax.set_xlabel(x_label, fontsize=10)
         ax.set_ylabel(y_label, fontsize=10)
         ax.set_title(f"{x_label}  vs  {y_label}")
-        fig.colorbar(sc, ax=ax, label="Sample index")
+        fig.colorbar(sc, ax=ax, label="Sample order (dark = first, red = last)")
         ax.grid(True, alpha=0.3)
 
         canvas = FigureCanvasQTAgg(fig)
@@ -4886,13 +6083,75 @@ class CSSLoggerWidget(QWidget):
         if layout: layout.addWidget(canvas)
         self._xy_canvas = canvas
         self._xy_figure = fig
+        self._install_xy_toolbar(canvas)
         canvas.draw()
 
         self._xy_rect_selector = RectangleSelector(
             ax, self._on_xy_rect_select, useblit=False, button=3,
             props=dict(alpha=0.2, facecolor="#FF6600"))
 
-        self._lbl_xy_info.setText(f"{len(xs)} points plotted.")
+        self._lbl_xy_info.setText(
+            f"{_n:,} points plotted (from {n_rows:,} rows).")
+
+    def _xy_pairs(self, x_pv, y_pv):
+        """Pair two channels up into (x, y) points.
+
+        A point needs a value for BOTH channels at the same moment. Insisting on
+        both landing in the very same row is far too strict: two channels are
+        rarely archived at the same instant, so that gave a nearly empty plot. Each
+        channel's LAST KNOWN value is carried forward instead — the same thing the
+        time graph does with its held lines — up to a staleness limit, so a channel
+        that stopped reporting cannot go on inventing points forever.
+        """
+        rows = self._table_rows
+        if not rows:
+            return [], [], 0
+        # Staleness limit: a value may stand in for at most this long. Derived from
+        # the window, so it scales with what is on screen, and clamped to a sane range.
+        span_s = max(1.0, (self._dt_to - self._dt_from).total_seconds())
+        max_hold_ns = int(min(max(span_s * 0.02, 60.0), 1800.0) * 1e9)
+
+        xs, ys = [], []
+        last_x = last_y = None          # (ts_ns, value)
+        for ts, row_dict in rows:
+            for pv, slot in ((x_pv, "x"), (y_pv, "y")):
+                if pv not in row_dict:
+                    continue
+                v, _ = row_dict[pv]
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if slot == "x":
+                    last_x = (ts, fv)
+                else:
+                    last_y = (ts, fv)
+            if last_x is None or last_y is None:
+                continue
+            if (ts - last_x[0]) > max_hold_ns or (ts - last_y[0]) > max_hold_ns:
+                continue                # one of them has been silent too long
+            xs.append(last_x[1]); ys.append(last_y[1])
+        return xs, ys, len(rows)
+
+    def _install_xy_toolbar(self, canvas):
+        """Same toolbar as the main graph, for the XY plot's own canvas."""
+        holder = getattr(self, "_xy_tb_holder", None)
+        if holder is None:
+            return
+        lay = holder.layout()
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget() if it else None
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+        self._xy_toolbar = None
+        try:
+            tb = _make_mpl_toolbar(_MplToolbar, canvas, holder)
+        except Exception:
+            return
+        self._xy_toolbar = tb
+        lay.addWidget(tb)
+        tb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def _on_xy_rect_select(self, eclick, erelease):
         if not self._xy_figure or not self._xy_figure.axes: return
@@ -4900,7 +6159,9 @@ class CSSLoggerWidget(QWidget):
         x0, x1 = sorted([eclick.xdata, erelease.xdata])
         y0, y1 = sorted([eclick.ydata, erelease.ydata])
         if x1 - x0 < 1e-12 or y1 - y0 < 1e-12: return
-        self._xy_zoom_history.append((ax.get_xlim(), ax.get_ylim()))
+        # The view being left goes onto the toolbar's history, so its Back and Home
+        # undo a right-drag zoom exactly like one made with the Zoom button.
+        self._on_xy_rect_zoom_push()
         ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
         self._xy_canvas.draw_idle()
 
@@ -4915,7 +6176,6 @@ class CSSLoggerWidget(QWidget):
                 except Exception:
                     pass
             self._xy_rect_selector = None
-            self._xy_zoom_history = []
             self._xy_canvas.draw_idle()
             self._lbl_xy_info.setText("XY cleared — points removed.")
         else:
@@ -4929,6 +6189,14 @@ class CSSLoggerWidget(QWidget):
             self._xy_canvas.setParent(None)
             self._xy_canvas.deleteLater()
             self._xy_canvas = None
+        # The toolbar belongs to that canvas — drop it too.
+        if getattr(self, "_xy_toolbar", None) is not None:
+            try:
+                self._xy_toolbar.setParent(None)
+                self._xy_toolbar.deleteLater()
+            except Exception:
+                pass
+            self._xy_toolbar = None
         self._xy_figure = None; self._xy_rect_selector = None
 
     # ── PV Time Plot ────────────────────────────────────────────────────────
@@ -5073,20 +6341,12 @@ class CSSLoggerWidget(QWidget):
             self._master_multiple_edit.setText(str(p["master_multiple"]))
         self._refresh_time_labels()
         self._log(f"Preset '{p['name']}' loaded.")
-        # Reflect the new PV set in the graph immediately, honouring the current
-        # mode: restart the live window, or reload the historical window — so the
-        # user no longer has to press LOAD DATA after switching presets.
-        if self._live_mode:
-            self._live_timer.stop()
-            self._countdown_timer.stop()
-            self._live_window_span = self._live_span_from_window()
-            self._live_last_ts = None
-            self._live_init_retries = 0
-            self._zoom_history.clear()
-            self._lbl_status.setText("Live: reloading preset…")
-            self._live_initial_load()
-        else:
-            self._on_load_clicked()
+        # The new channel set and window are fetched on their own; the preset also
+        # brings a different time range, so a selection from the old one may no
+        # longer mean anything.
+        self._user_zoomed = False
+        self._drop_selection_if_outside()
+        self._request_reload(delay_ms=0, reason="preset loaded")
 
     def _save_preset(self):
         idx = self._preset_combo.currentIndex()
@@ -5141,22 +6401,22 @@ class CSSLoggerWidget(QWidget):
                     added = True
             self._sync_pv_list_customs()   # keep custom rows pinned at the bottom
             self._update_pv_count()
-            if added and self._live_mode:
-                # A PV added mid-session has no history yet. The live tick only
-                # fetches from the last-seen timestamp forward, so the new PV used
-                # to stay blank until Live was stopped and LOAD DATA pressed. Re-run
-                # the live initial load so it is fetched over the whole window right
-                # away (all PVs load concurrently in one pool, so this is quick).
-                self._live_timer.stop()
-                self._countdown_timer.stop()
-                self._live_last_ts = None
-                self._lbl_status.setText("Live: loading added PV…")
-                self._live_initial_load()
+            if added:
+                # A channel added mid-session has no history yet: the live tick only
+                # fetches from the last-seen timestamp forward, so it would stay
+                # blank. A full reload gets it over the whole window (all channels
+                # load together in one pool, so this is quick).
+                self._request_reload(reason="channel added")
 
     def _remove_selected_pvs(self):
+        removed = False
         for item in reversed(self._pv_list.selectedItems()):
             self._pv_list.takeItem(self._pv_list.row(item))
+            removed = True
         self._update_pv_count()
+        if removed:
+            # Several rows can go in one click, so the reload is debounced.
+            self._request_reload(reason="channel removed")
 
     def _clear_pv_list(self):
         ans = QMessageBox.question(self, "Clear PVs", "Remove all PVs from list?")
@@ -5164,13 +6424,15 @@ class CSSLoggerWidget(QWidget):
             self._pv_list.clear()
             self._sync_pv_list_customs()   # keep custom PVs on show after a clear
             self._update_pv_count()
+            self._request_reload(reason="channel list cleared")
 
     def _on_pv_double_click(self, item):
         if item.data(Qt.ItemDataRole.UserRole):
             return                         # custom/divider row — not editable here
         pv, ok = QInputDialog.getText(self, "Edit PV", "PV name:", text=item.text())
-        if ok and pv.strip():
+        if ok and pv.strip() and pv.strip() != item.text():
             item.setText(pv.strip())
+            self._request_reload(reason="channel renamed")
 
     def _real_pv_names(self):
         """The real archiver PVs queued for fetching — the only ones sent to the
@@ -5181,7 +6443,7 @@ class CSSLoggerWidget(QWidget):
                 if not self._pv_list.item(i).data(Qt.ItemDataRole.UserRole)]
 
     def _sync_pv_list_customs(self):
-        """Mirror the defined custom PVs into the PV LIST (above LOAD DATA) as
+        """Mirror the defined custom PVs into the PV LIST (above the Live button) as
         read-only, visually distinct rows so they sit alongside the real PVs.
         Source of truth stays ``self._custom_pvs``; these rows are tagged and
         excluded from every fetch/save path via :meth:`_real_pv_names`."""
@@ -5238,20 +6500,12 @@ class CSSLoggerWidget(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._dt_from, self._dt_to = dlg._result_from, dlg._result_to
             self._refresh_time_labels()
-            if self._live_mode:
-                # Live mode tracks "now": the chosen window sets the live span
-                # (graph width). Restart the live load so the new span takes
-                # effect and data is re-fetched immediately.
-                self._live_timer.stop()
-                self._countdown_timer.stop()
-                self._live_window_span = self._live_span_from_window()
-                self._live_last_ts = None
-                self._zoom_history.clear()
-                self._lbl_status.setText("Live: reloading window…")
-                self._live_initial_load()
-            else:
-                # Not live: load the newly chosen window now.
-                self._on_load_clicked()
+            self._drop_selection_if_outside()
+            # In live mode the chosen window is the graph WIDTH and the view keeps
+            # following "now"; otherwise it is a fixed range. Either way the fetch
+            # happens on its own.
+            self._user_zoomed = False
+            self._request_reload(delay_ms=0, reason="time window changed")
 
     # ── Conditions dialog ────────────────────────────────────────────────────
 
@@ -5272,14 +6526,297 @@ class CSSLoggerWidget(QWidget):
             if self._samples_by_pv:
                 self._plot_graph()
 
-    # ── Reference lines dialog ───────────────────────────────────────────────
+    # ── Reference lines ──────────────────────────────────────────────────────
 
     def _open_ref_lines_dialog(self):
-        dlg = _RefLinesDialog(self._ref_lines, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._ref_lines = dlg.result_lines
-            if self._samples_by_pv:
-                self._plot_graph()
+        """Open the Reference lines window, and keep re-opening it while the user
+        goes off to place a line by clicking in the graph."""
+        while True:
+            dlg = _RefLinesDialog(self._ref_lines, self._graph_ref_pv_choices(), self)
+            self._ref_dialog = dlg
+            accepted = (dlg.exec() == QDialog.DialogCode.Accepted)
+            self._ref_dialog = None
+            if dlg.pick_request is not None and not accepted:
+                # "Pick in graph" was pressed: keep the rows the user has typed so
+                # far, run the two clicks, then come straight back to the window.
+                self._ref_lines = dlg.result_lines
+                placed = self._run_ref_pick()
+                if placed is not None:
+                    self._ref_lines.append(placed)
+                if self._samples_by_pv:
+                    self._plot_graph()
+                continue
+            if accepted:
+                self._ref_lines = dlg.result_lines
+                if self._samples_by_pv:
+                    self._plot_graph()
+            return
+
+    def _graph_ref_pv_choices(self):
+        """Signals a reference line can be tied to — the ones currently drawn
+        first, then the rest of the loaded list."""
+        drawn = [pv for pv in getattr(self, "_graph_pvs", []) if pv]
+        rest  = [pv for pv in self._pv_order if pv not in drawn]
+        return drawn + rest
+
+    def _ref_axis_for(self, pv, ax0, axes, pvs_for_axes):
+        """The axis a reference line belongs on.
+
+        Every signal has its own Y scale squeezed into its own horizontal band, so
+        a line tied to a signal must be drawn on THAT signal's axis — otherwise it
+        sits at the height of signal #1 and means nothing for any other trace.
+        """
+        if pv and pv in pvs_for_axes:
+            return axes[list(pvs_for_axes).index(pv)]
+        return None if pv else ax0
+
+    def _draw_ref_lines(self, ax0, axes, pvs_for_axes, fsize):
+        from matplotlib.transforms import blended_transform_factory as _btf
+        self._ref_line_artists = []
+        for rl in self._ref_lines:
+            ax_r = self._ref_axis_for(rl.get("pv"), ax0, axes, pvs_for_axes)
+            if ax_r is None:
+                continue          # tied to a signal that is hidden or has no data
+            color = rl.get("color") or "#000000"
+            style = _REF_LINE_STYLES.get(rl.get("style", "dashed"), "--")
+            try:
+                width = max(0.2, float(rl.get("width", 1.2)))
+            except (TypeError, ValueError):
+                width = 1.2
+            ln = ax_r.axhline(y=rl["y"], color=color, linewidth=width,
+                              linestyle=style, zorder=8)
+            self._ref_line_artists.append(ln)
+            # The Graph tab draws no legend, so the name is written next to the
+            # line itself — otherwise a reference line is anonymous.
+            label = (rl.get("label") or "").strip()
+            txt = f"{label} {_fmt_cursor_value(rl['y'])}".strip() if label \
+                else _fmt_cursor_value(rl["y"])
+            ann = ax_r.text(0.004, rl["y"], txt, ha="left", va="bottom",
+                            fontsize=max(5, fsize - 2), color=color, zorder=9,
+                            transform=_btf(ax_r.transAxes, ax_r.transData),
+                            clip_on=True)
+            self._ref_line_artists.append(ann)
+
+    # ── Placing a reference line by clicking in the graph ────────────────────
+
+    def _run_ref_pick(self):
+        """Two guided clicks: first the signal, then the height.
+
+        Returns the new reference-line record, or None if the user backed out.
+        Runs its own event loop so the Reference lines window can simply wait.
+        """
+        if not self._mpl_canvas or not self._graph_pvs:
+            QMessageBox.information(self, "Reference lines",
+                                    "Plot the graph first — there is nothing to click on yet.")
+            return None
+        # The graph can be floating in its own window (F11); only switch tabs
+        # when it is actually still one of the tabs.
+        if self._notebook.indexOf(self._tab_graph) >= 0:
+            self._notebook.setCurrentWidget(self._tab_graph)
+
+        loop_holder = {"result": None}
+        self._ref_pick = {"stage": 1, "pv": None, "holder": loop_holder}
+
+        # A click must not also start a statistics span or a zoom.
+        for sel in (getattr(self, "_span_selector", None),
+                    getattr(self, "_zoom_selector", None)):
+            if sel is not None:
+                try:
+                    sel.set_active(False)
+                except Exception:
+                    pass
+
+        canvas = self._mpl_canvas
+        canvas.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        canvas.setFocus()
+        self._ref_pick["cids"] = [
+            canvas.mpl_connect("button_press_event", self._on_ref_pick_click),
+            canvas.mpl_connect("key_press_event", self._on_ref_pick_key),
+        ]
+        self._set_ref_pick_step(1)
+
+        from PySide6.QtCore import QEventLoop
+        loop = QEventLoop(self)
+        self._ref_pick["loop"] = loop
+        loop.exec()
+        return loop_holder["result"]
+
+    _REF_PICK_HINTS = {
+        1: ("Step 1 of 2 — click the Y axis of the signal you want "
+            "(or click its curve).   Esc cancels."),
+        2: ("Step 2 of 2 — now click in the graph at the height the line "
+            "should sit.   Esc cancels."),
+    }
+
+    def _set_ref_pick_step(self, stage):
+        """Show the instruction for this step and grey out everything the user is
+        NOT supposed to click, so it is obvious where the next click goes."""
+        if not self._ref_pick:
+            return
+        self._ref_pick["stage"] = stage
+        hint = self._REF_PICK_HINTS[stage]
+        if stage == 2 and self._ref_pick.get("pv"):
+            pv   = self._ref_pick["pv"]
+            name = self._pv_settings.get(pv, {}).get("display_name", shorten_pv_name(pv))
+            hint += f"      Signal: {name}"
+        self._lbl_pick_hint.setText(hint)
+        self._pick_bar.setVisible(True)
+        # Step 1 dims the plot and leaves the Y-axis columns bright; step 2 does
+        # the opposite. This is a plain overlay rectangle on top of the figure —
+        # no real curve, tick or crosshair is touched, so nothing can break.
+        self._clear_ref_pick_dim()
+        fig = self._mpl_figure
+        if fig is None:
+            return
+        from matplotlib.patches import Rectangle
+        try:
+            box = self._graph_axes[0].get_position()
+        except Exception:
+            return
+        if stage == 1:
+            rects = [(box.x0, box.y0, box.width, box.height)]      # dim the plot
+        else:
+            rects = [(0.0, 0.0, max(0.0, box.x0), 1.0)]            # dim the axis strip
+        self._ref_pick["dim"] = []
+        for x, y, w, h in rects:
+            if w <= 0 or h <= 0:
+                continue
+            patch = Rectangle((x, y), w, h, transform=fig.transFigure,
+                              facecolor="white", alpha=0.62, edgecolor="none",
+                              zorder=50)
+            fig.add_artist(patch)
+            self._ref_pick["dim"].append(patch)
+        self._mpl_canvas.draw_idle()
+
+    def _clear_ref_pick_dim(self):
+        for patch in (self._ref_pick or {}).get("dim", []) or []:
+            try:
+                patch.remove()
+            except Exception:
+                pass
+        if self._ref_pick:
+            self._ref_pick["dim"] = []
+
+    def _end_ref_pick(self, result=None):
+        """Leave pick mode, whatever the reason, and put the graph back exactly
+        as it was — overlay gone, span and zoom working again."""
+        pick = self._ref_pick
+        if not pick:
+            return
+        self._clear_ref_pick_dim()
+        self._ref_pick = None
+        canvas = self._mpl_canvas
+        for cid in pick.get("cids", []):
+            try:
+                canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+        for sel in (getattr(self, "_span_selector", None),
+                    getattr(self, "_zoom_selector", None)):
+            if sel is not None:
+                try:
+                    sel.set_active(True)
+                except Exception:
+                    pass
+        self._pick_bar.setVisible(False)
+        if canvas is not None:
+            canvas.draw_idle()
+        pick["holder"]["result"] = result
+        loop = pick.get("loop")
+        if loop is not None:
+            loop.quit()
+
+    def _cancel_ref_pick(self):
+        self._end_ref_pick(None)
+
+    def _on_ref_pick_key(self, event):
+        if event.key == "escape":
+            self._cancel_ref_pick()
+
+    def _on_ref_pick_click(self, event):
+        if not self._ref_pick or event.button != 1:
+            return
+        if event.x is None or event.y is None:
+            return
+        if self._ref_pick["stage"] == 1:
+            pv = self._pv_at_click(event.x, event.y)
+            if pv is None:
+                return                       # missed everything — stay on step 1
+            self._ref_pick["pv"] = pv
+            self._set_ref_pick_step(2)
+            return
+        pv = self._ref_pick["pv"]
+        try:
+            gi = self._graph_pvs.index(pv)
+            ax = self._graph_axes[gi]
+            y  = float(ax.transData.inverted().transform((event.x, event.y))[1])
+        except Exception:
+            self._cancel_ref_pick()
+            return
+        name = self._pv_settings.get(pv, {}).get("display_name", shorten_pv_name(pv))
+        self._end_ref_pick({"label": name, "pv": pv, "y": y,
+                            "color": "#000000", "style": "dashed", "width": 1.2})
+
+    def _pv_at_click(self, px, py):
+        """Which signal did this click mean?
+
+        Left of the plot the answer is the nearest Y axis; inside the plot it is
+        the nearest curve, compared in screen height so signals on wildly
+        different scales compete fairly.
+        """
+        axes = getattr(self, "_graph_axes", []) or []
+        pvs  = getattr(self, "_graph_pvs", []) or []
+        if not axes or not pvs:
+            return None
+        try:
+            box = axes[0].get_window_extent()
+        except Exception:
+            return None
+
+        if px < box.x0:                       # the stacked Y-axis columns
+            best, best_d = None, None
+            for i, ax in enumerate(axes):
+                if i >= len(pvs):
+                    break
+                try:
+                    sx = float(ax.transAxes.transform(
+                        (self._graph_spine_xpos[i][0], 0.0))[0])
+                except Exception:
+                    continue
+                d = abs(px - sx)
+                if best_d is None or d < best_d:
+                    best, best_d = pvs[i], d
+            return best
+
+        raw_np = getattr(self, "_graph_raw_np", []) or []
+        best, best_d = None, None
+        for i, ax in enumerate(axes):
+            if i >= len(pvs) or i >= len(raw_np):
+                break
+            if not self._pv_settings.get(pvs[i], {}).get("show", True):
+                continue
+            arr, vals = raw_np[i]
+            if not len(arr):
+                continue
+            try:
+                x_data = float(ax.transData.inverted().transform((px, py))[0])
+            except Exception:
+                continue
+            # steps-post: the sample at or before the cursor is the one drawn.
+            pos = int(np.searchsorted(arr, x_data, side="right"))
+            idx = pos - 1 if pos > 0 else 0
+            try:
+                y_px = float(ax.transData.transform((arr[idx], vals[idx]))[1])
+            except Exception:
+                continue
+            d = abs(py - y_px)
+            if best_d is None or d < best_d:
+                best, best_d = pvs[i], d
+        # A click nowhere near any curve is a miss, not a silent wrong guess.
+        if best_d is not None and best_d > 60:
+            return None
+        return best
+
 
     # ── Custom PV dialog ─────────────────────────────────────────────────────
 
@@ -5458,15 +6995,39 @@ class _ConditionsDialog(QDialog):
 # ── Reference Lines Dialog ──────────────────────────────────────────────────
 
 class _RefLinesDialog(QDialog):
-    def __init__(self, ref_lines, parent=None):
+    """Horizontal reference lines: name, which signal they belong to, height,
+    colour, style and thickness — plus reordering, deleting, and placing one by
+    clicking in the graph."""
+
+    _NO_PV = "— no signal (first Y scale) —"
+
+    def __init__(self, ref_lines, pv_choices=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Reference Lines")
-        self.resize(440, 300)
+        self.resize(900, 360)
         self._rows: list = []
+        self._pv_choices = list(pv_choices or [])
         self.result_lines: list = []
+        # Set to True when the user asks to place a line by clicking; the caller
+        # then closes this window, runs the two clicks and re-opens it.
+        self.pick_request = None
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Add horizontal reference lines to the graph:"))
+        lay.addWidget(QLabel(
+            "A line tied to a signal is drawn on that signal's own Y scale, so it "
+            "keeps its meaning even though every signal has its own scale."))
+
+        heads = QHBoxLayout()
+        heads.setContentsMargins(0, 0, 0, 0)
+        for text, width in (("", 52), ("Label", 140), ("Signal", 210),
+                            ("Y value", 90), ("", 30), ("Colour", 40),
+                            ("Style", 100), ("Width", 60), ("", 26)):
+            h = QLabel(text)
+            h.setFixedWidth(width)
+            h.setStyleSheet("font-weight:700;color:#1565C0;")
+            heads.addWidget(h)
+        heads.addStretch()
+        lay.addLayout(heads)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         inner  = QWidget()
@@ -5481,7 +7042,13 @@ class _RefLinesDialog(QDialog):
 
         ctrl = QHBoxLayout()
         b_add = QPushButton("+ Add line"); b_add.clicked.connect(lambda: self._add_row())
-        ctrl.addWidget(b_add); ctrl.addStretch()
+        ctrl.addWidget(b_add)
+        b_pick = QPushButton("+ Add by clicking in the graph")
+        b_pick.setToolTip("Close this window, click the signal's Y axis, then click "
+                          "the height. The line comes back here to be named.")
+        b_pick.clicked.connect(self._request_pick)
+        ctrl.addWidget(b_pick)
+        ctrl.addStretch()
         lay.addLayout(ctrl)
 
         buttons = QDialogButtonBox(
@@ -5490,22 +7057,65 @@ class _RefLinesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
 
+    # ── rows ────────────────────────────────────────────────────────────────
+
     def _add_row(self, existing=None):
+        existing = existing or {}
         row_w = QWidget()
-        rl    = QHBoxLayout(row_w); rl.setContentsMargins(0,0,0,0)
-        lbl_e = QLineEdit(existing.get("label","") if existing else ""); lbl_e.setFixedWidth(120)
+        rl    = QHBoxLayout(row_w); rl.setContentsMargins(0, 0, 0, 0)
+
+        b_up = QToolButton(); b_up.setText("▲"); b_up.setFixedWidth(24)
+        b_up.setToolTip("Move up")
+        b_dn = QToolButton(); b_dn.setText("▼"); b_dn.setFixedWidth(24)
+        b_dn.setToolTip("Move down")
+
+        lbl_e = QLineEdit(existing.get("label", "")); lbl_e.setFixedWidth(140)
         lbl_e.setPlaceholderText("Label")
-        y_e   = QLineEdit(str(existing.get("y","")) if existing else ""); y_e.setFixedWidth(80)
+
+        pv_cb = QComboBox(); pv_cb.setFixedWidth(210)
+        pv_cb.addItem(self._NO_PV)
+        pv_cb.addItems(self._pv_choices)
+        pv = existing.get("pv")
+        if pv:
+            i = pv_cb.findText(pv)
+            if i < 0:                       # a signal that is no longer loaded
+                pv_cb.addItem(pv); i = pv_cb.count() - 1
+            pv_cb.setCurrentIndex(i)
+
+        y_val = existing.get("y", "")
+        y_e   = QLineEdit("" if y_val == "" else str(y_val)); y_e.setFixedWidth(90)
         y_e.setPlaceholderText("Y value")
+
+        b_pick = QToolButton(); b_pick.setText("⊹"); b_pick.setFixedWidth(26)
+        b_pick.setToolTip("Pick this line's signal and height by clicking in the graph")
+
         col_btn = QPushButton(); col_btn.setFixedWidth(36)
-        col_hex = existing.get("color","#FF5722") if existing else "#FF5722"
-        col_btn.setStyleSheet(f"background:{col_hex};border-radius:3px;")
-        col_btn.clicked.connect(lambda: self._pick_color(col_btn, rec))
+        col_hex = existing.get("color") or "#000000"
+
+        style_cb = QComboBox(); style_cb.setFixedWidth(100)
+        style_cb.addItems(list(_REF_LINE_STYLES))
+        si = style_cb.findText(str(existing.get("style", "dashed")))
+        style_cb.setCurrentIndex(si if si >= 0 else style_cb.findText("dashed"))
+
+        w_e = QLineEdit(str(existing.get("width", 1.2))); w_e.setFixedWidth(60)
+        w_e.setPlaceholderText("Width")
+
         b_del = QPushButton("✕"); b_del.setFixedWidth(26)
         b_del.setStyleSheet("QPushButton{background:#B71C1C;color:white;border-radius:3px;}")
+
+        for w in (b_up, b_dn, lbl_e, pv_cb, y_e, b_pick, col_btn, style_cb, w_e, b_del):
+            rl.addWidget(w)
+        rl.addStretch()
+
+        rec = {"widget": row_w, "label": lbl_e, "pv": pv_cb, "y": y_e,
+               "color": col_hex, "btn": col_btn, "style": style_cb, "width": w_e}
+        col_btn.setStyleSheet(f"background:{col_hex};border-radius:3px;")
+        col_btn.clicked.connect(lambda: self._pick_color(col_btn, rec))
         b_del.clicked.connect(lambda: self._remove_row(row_w, rec))
-        rl.addWidget(lbl_e); rl.addWidget(y_e); rl.addWidget(col_btn); rl.addWidget(b_del)
-        rec = {"widget": row_w, "label": lbl_e, "y": y_e, "color": col_hex, "btn": col_btn}
+        b_up.clicked.connect(lambda: self._move_row(rec, -1))
+        b_dn.clicked.connect(lambda: self._move_row(rec, +1))
+        b_pick.clicked.connect(self._request_pick)
+
         self._rows.append(rec)
         self._inner_lay.insertWidget(self._inner_lay.count() - 1, row_w)
 
@@ -5517,17 +7127,60 @@ class _RefLinesDialog(QDialog):
 
     def _remove_row(self, row_w, rec):
         self._rows.remove(rec)
+        self._inner_lay.removeWidget(row_w)
+        row_w.setParent(None)
         row_w.deleteLater()
 
-    def _accept(self):
-        result = []
-        for rec in self._rows:
-            try:
-                y = float(rec["y"].text())
-            except ValueError:
+    def _move_row(self, rec, delta):
+        i = self._rows.index(rec)
+        j = i + delta
+        if not (0 <= j < len(self._rows)):
+            return
+        self._rows[i], self._rows[j] = self._rows[j], self._rows[i]
+        # Re-stack the widgets in the new order (the stretch stays last).
+        for w in [r["widget"] for r in self._rows]:
+            self._inner_lay.removeWidget(w)
+        for k, r in enumerate(self._rows):
+            self._inner_lay.insertWidget(k, r["widget"])
+
+    def _request_pick(self):
+        """Hand back what is typed so far and ask the caller to run the two
+        clicks in the graph."""
+        self.pick_request = True
+        self.result_lines = self._collect()[0]
+        self.reject()
+
+    # ── result ──────────────────────────────────────────────────────────────
+
+    def _collect(self):
+        result, bad = [], []
+        for n, rec in enumerate(self._rows, start=1):
+            y = CSSLoggerWidget._safe_float(rec["y"].text())
+            if y is None:
+                if rec["y"].text().strip() or rec["label"].text().strip():
+                    bad.append(n)
                 continue
-            result.append({"label": rec["label"].text().strip(),
-                           "y": y, "color": rec["color"]})
+            pv = rec["pv"].currentText()
+            width = CSSLoggerWidget._safe_float(rec["width"].text(), 1.2)
+            result.append({
+                "label": rec["label"].text().strip(),
+                "pv":    None if pv == self._NO_PV else pv,
+                "y":     y,
+                "color": rec["color"] or "#000000",
+                "style": rec["style"].currentText(),
+                "width": max(0.2, width if width else 1.2),
+            })
+        return result, bad
+
+    def _accept(self):
+        result, bad = self._collect()
+        if bad:
+            # Silently dropping a row the user filled in is how a reference line
+            # "disappears for no reason" — say which one instead.
+            QMessageBox.warning(
+                self, "Reference Lines",
+                "These lines have no usable Y value and will be dropped:\n"
+                + ", ".join(f"line {n}" for n in bad))
         self.result_lines = result
         self.accept()
 
@@ -5666,6 +7319,23 @@ class _GraphSettingsDialog(QDialog):
         _group("Cursor & performance", [("Value boxes at cursor", self.w_boxes),
                                         ("…up to this many PVs", self.w_bmax),
                                         ("Point markers", self.w_marks)], right)
+
+        # Live speed. Kept as three separate numbers on purpose: the graph refresh
+        # is cheap and the table rebuild is not, and tying them together is what
+        # made both of them wait for the slower one.
+        self.w_poll   = _spin(50, 5000, o.get("live_poll_ms", 300), "ms", step=50,
+                              tip="How often the archive is asked for new values")
+        self.w_gmin   = _spin(50, 5000, o.get("live_graph_min_ms", 300), "ms", step=50,
+                              tip="Shortest gap between graph refreshes. The graph "
+                                  "slows itself down on its own if the computer "
+                                  "cannot keep up.")
+        self.w_tabms  = _spin(200, 20000, o.get("live_table_ms", 1500), "ms", step=250,
+                              tip="Shortest gap between table rebuilds. Rebuilding "
+                                  "the table is the expensive part, so it is kept "
+                                  "slower than the graph.")
+        _group("Live speed", [("Ask archive every", self.w_poll),
+                              ("Graph refresh, at most every", self.w_gmin),
+                              ("Table refresh, at most every", self.w_tabms)], right)
         right.addStretch()
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
@@ -5705,6 +7375,9 @@ class _GraphSettingsDialog(QDialog):
             "cursor_value_boxes": self.w_boxes.isChecked(),
             "cursor_boxes_max":   self.w_bmax.value(),
             "line_markers":       self.w_marks.isChecked(),
+            "live_poll_ms":       self.w_poll.value(),
+            "live_graph_min_ms":  self.w_gmin.value(),
+            "live_table_ms":      self.w_tabms.value(),
         }
 
     def _restore_defaults(self):
@@ -5728,6 +7401,9 @@ class _GraphSettingsDialog(QDialog):
         self.w_boxes.setChecked(d["cursor_value_boxes"])
         self.w_bmax.setValue(d["cursor_boxes_max"])
         self.w_marks.setChecked(d["line_markers"])
+        self.w_poll.setValue(d["live_poll_ms"])
+        self.w_gmin.setValue(d["live_graph_min_ms"])
+        self.w_tabms.setValue(d["live_table_ms"])
         self._emit_apply()
 
     def _accept(self):
@@ -6024,6 +7700,19 @@ def _icon_file():
 # icon, so Qt's setWindowIcon is already sufficient. The real bug was that
 # _HERE is not frozen-aware, so the frozen build never found icon.ico at all.
 
+# Windows keeps a cached taskbar icon per AppUserModelID, and it does not
+# refresh it when the app's icon changes. This app ran for months as
+# "ELI.CSSLogger" without an icon.ico, so that identity is stuck on the
+# placeholder Windows cached back then: the exe's icon, the title bar and every
+# WM_GETICON slot show the LOG icon, while the taskbar button shows a generic
+# window. Measured with a discriminating experiment on 2026-08-21 — two
+# processes, same icon file, only the id different: the old id drew the generic
+# window, a fresh id drew LOG. So the fix is a new id, not more icon code.
+# Bump the suffix whenever icon.ico changes and the taskbar keeps the old
+# picture. Nothing else depends on the string: the app registers no shortcut,
+# so a new id only starts a new taskbar group.
+_APP_ID = "ELI.CSSLogger.2"
+
 
 # ── Combined main window ─────────────────────────────────────────────────────
 
@@ -6094,6 +7783,12 @@ class CPVASuiteWindow(QMainWindow):
             self._css_logger._save_runtime_state()
         except Exception:
             pass
+        # Stop live streaming and any analysis still fetching, so the background
+        # threads are not left running while the window goes away.
+        try:
+            self._spectra.cancel_scan()
+        except Exception:
+            pass
         try:
             cfg = load_config()
             g   = self.geometry()
@@ -6109,7 +7804,7 @@ class CPVASuiteWindow(QMainWindow):
 def _run():
     try:
         import ctypes as _ct
-        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.CSSLogger")
+        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_APP_ID)
     except Exception:
         pass
     app = QApplication.instance() or QApplication(sys.argv)

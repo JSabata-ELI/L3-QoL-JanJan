@@ -114,6 +114,16 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         _wk = _load_module("workshop", "wk_t.py")
     except Exception as e:
         raise RuntimeError(f"wk_t.py error: {e}") from e
+    # One Moment is loaded last: it borrows the Slider's PV and camera pickers, the
+    # Shot Finder's frame resolver and the Workshop's painted icons, so all three must
+    # already be in sys.modules. It keeps its own try because it is the newest tab and
+    # a failure in it must not take the other four down with it.
+    _om_error = ""
+    try:
+        _om = _load_module("one_moment", "om_t.py")
+    except Exception as e:
+        _om = None
+        _om_error = str(e)
     ShotFinderWidget  = _sf.ShotFinderWidget
     ImageFinderWidget = _if.ImageFinderWidget
     Viewer            = _is.Viewer
@@ -140,9 +150,32 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     workshop = WorkshopWidget()
     viewer.setWindowTitle("")    # title is handled by main window
 
+    # The Finder's job is comparing ONE camera across MANY days — the transpose of the
+    # Slider, which compares many cameras at one moment. The tab keeps the name the
+    # operators know it by: "Image Finder".
     tabs.addTab(finder, "Image Finder")
     tabs.addTab(viewer, "Image Slider")
     tabs.addTab(shot_finder, "Shot Finder")
+
+    # One Moment — everything at ONE time, the transpose of the Slider.
+    one_moment = None
+    if _om is not None:
+        try:
+            one_moment = _om.OneMomentWidget()
+            tabs.addTab(one_moment, "One Moment")
+        except Exception as e:
+            one_moment = None
+            _om_error = str(e)
+    if one_moment is None:
+        # Say so on a tab of its own rather than quietly offering four tabs: a missing
+        # tab reads as "this version does not have it" and sends the operator looking
+        # for a newer build that does not exist.
+        _broken = QLabel("One Moment could not be loaded:\n\n" + (_om_error or "?"))
+        _broken.setWordWrap(True)
+        _broken.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _broken.setStyleSheet("color: #b00020; padding: 24px;")
+        tabs.addTab(_broken, "One Moment (unavailable)")
+
     tabs.addTab(workshop, "Workshop")
 
     # Wire up the integration: finder can switch to slider tab and load folder
@@ -161,6 +194,10 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     viewer._workshop_tab_idx  = workshop_idx
     shot_finder._workshop_ref     = workshop
     shot_finder._workshop_tab_idx = workshop_idx
+    if one_moment is not None:
+        one_moment._workshop_ref     = workshop
+        one_moment._workshop_tab_idx = workshop_idx
+        one_moment._tab_widget       = tabs
 
     # ...and the way back: "Show in Image Slider" opens the folder a Workshop frame
     # came from. Only the folder — the Slider browses files on the share, so an edited
@@ -194,6 +231,9 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
             shot_finder._prog.setVisible(False)
             shot_finder._result_lbl.setText("Stopped.")
         except Exception: pass
+        if one_moment is not None:
+            try: one_moment.cancel_scan()
+            except Exception: pass
 
     btn_stop_all.clicked.connect(_stop_all)
 

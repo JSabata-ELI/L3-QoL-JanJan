@@ -1,10 +1,12 @@
 # b_t.py
+import ast
 import json
 import sys as _sys
 import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -1146,6 +1148,96 @@ class BuilderUI(ttk.Frame):
         except Exception as e:
             return False, f"ERROR: {e}"
 
+    # Folders and files that are never a program module: build output, caches,
+    # dev-only helpers.
+    _MODULE_SCAN_SKIP_DIRS = {"_internal", "__pycache__", ".git", "dist", "build",
+                              "archive", "testing", "tests", "DataRepository"}
+
+    def _module_homes(self) -> dict[str, list[Path]]:
+        """Map module name -> every program folder that has a .py with that name.
+
+        Only the top level of each program folder is scanned, because that is
+        exactly what PyInstaller sees: the builder passes the program folder as
+        the only --paths entry."""
+        homes: dict[str, list[Path]] = {}
+        try:
+            folders = [d for d in self.root_folder.iterdir()
+                       if d.is_dir() and d.name not in self._MODULE_SCAN_SKIP_DIRS
+                       and not d.name.startswith(".")]
+        except Exception:
+            return homes
+        for d in folders:
+            for f in d.glob("*.py"):
+                if f.name.startswith(("test_", "_verify")):
+                    continue
+                homes.setdefault(f.stem, []).append(f)
+        return homes
+
+    def _check_module_homes(self, p: Path, py_files: list[Path],
+                            live_log=None) -> tuple[bool, str]:
+        """Refuse to build when a module the program imports is not in its folder.
+
+        The build only ever sees the program's own folder, so a module reached
+        at runtime through a sys.path detour (or a second copy kept in another
+        program folder) produces a build that silently runs *different* code
+        than the source tree. That happened to the Spectra tab: sp_t.py was
+        developed in Spectra/ while a five-week-old copy in CSS Logger/ was the
+        one bundled, with no error anywhere. See INFRASTRUCTURE.md §7."""
+        homes = self._module_homes()
+        if not homes:
+            return True, ""
+        # Real imports only — parsed, not grepped. A prose line inside a
+        # docstring ("from a build under C:\\Dev\\dist") matches the regex the
+        # --collect-all detection uses and would fail the build for nothing.
+        imported: set[str] = set()
+        for f in py_files:
+            try:
+                tree = ast.parse(f.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level == 0 and node.module:
+                        imported.add(node.module.split(".")[0])
+        own = {f.stem for f in py_files}
+        problems: list[str] = []
+        for mod in sorted(imported):
+            where = homes.get(mod)
+            if not where:
+                continue                      # third-party or stdlib
+            elsewhere = [f for f in where if f.parent != p]
+            if mod not in own:
+                problems.append(
+                    f"  '{mod}' is imported but there is no {mod}.py in this folder.\n"
+                    f"    It lives in: " + ", ".join(str(f.parent.name) for f in elsewhere) +
+                    f"\n    Move {mod}.py into '{p.name}' - the build cannot reach it "
+                    "anywhere else."
+                )
+            elif elsewhere:
+                mine = p / f"{mod}.py"
+                lines = [f"  '{mod}.py' exists in more than one folder - the build "
+                         f"uses the one in '{p.name}':"]
+                for f in [mine] + elsewhere:
+                    try:
+                        stamp = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                        size = f.stat().st_size
+                    except Exception:
+                        stamp, size = "?", 0
+                    lines.append(f"    {f}  ({size} B, {stamp})")
+                lines.append("    Keep one copy only, or the build will drift from "
+                             "what you edit.")
+                problems.append("\n".join(lines))
+        if not problems:
+            return True, ""
+        msg = ("Module home check failed for '" + p.name + "':\n"
+               + "\n".join(problems))
+        if live_log:
+            for line in msg.splitlines():
+                live_log(line)
+        return False, msg
+
     def _build_one_project(self, p: Path, ver: str, live_log=None) -> tuple[bool, str]:
         """Postaví projekt pomocí PyInstalleru do dist/<projekt>/vX.X.X/."""
         name = p.name
@@ -1206,6 +1298,13 @@ class BuilderUI(ttk.Frame):
             x.resolve() for x in p.glob("*.py")
             if x.name != main_path.name and not x.name.startswith("test_")
         ]
+
+        # Every module must live in this folder — a copy elsewhere, or a module
+        # reached through sys.path, builds code that is not what you edited.
+        ok, why = self._check_module_homes(p, [main_path.resolve()] + extra_py_files,
+                                          live_log)
+        if not ok:
+            return False, why
 
         build_cfg = load_json(p / "build_config.json", {})
         extra_collect_all: list[str]     = list(build_cfg.get("collect_all", []))

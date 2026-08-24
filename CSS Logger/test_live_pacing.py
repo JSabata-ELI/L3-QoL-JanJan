@@ -217,7 +217,7 @@ def test_table_reuses_its_items():
     _Recorder(n=20).install()
     w = _new_widget()
     w._on_load_clicked()
-    assert _pump(15.0, lambda: w._btn_load.isEnabled() and w._table_rows)
+    assert _pump(15.0, lambda: (not w._load_in_flight) and w._table_rows)
     assert w._table_widget.rowCount() > 0
     first = w._table_widget.item(0, 0)
     w._populate_table()

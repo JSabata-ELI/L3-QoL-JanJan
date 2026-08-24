@@ -165,9 +165,15 @@ appear on the buttons, so they are worth ten lines of explanation.
 
     Clearing the box completely means something specific: "do not
     save anything, just send up what was already saved". If you do
-    that while you have changed files, Commit + Push tells you the
-    changed files were left behind, rather than reporting nothing to
-    do.
+    that while you have changed files, you are asked first, because
+    it is almost never what you meant — answer No and type a note.
+    Should you go ahead anyway, Commit + Push tells you the changed
+    files were left behind, rather than reporting nothing to do.
+
+    The box is only refilled with a fresh date after a run that
+    really saved something. After a run that saved nothing it keeps
+    exactly what it had, so an empty box stays visibly empty instead
+    of looking filled in afterwards.
 
 3.5 ACTIONS
     Pull             bring your line of work up to date from the

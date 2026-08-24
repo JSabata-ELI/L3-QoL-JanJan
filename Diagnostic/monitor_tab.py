@@ -4948,12 +4948,15 @@ class MonitorWidget(QWidget):
         self._gate_values: dict[str, Optional[float]] = {}
         self._poll_gen = 0
         self._poll_inflight = False
+        self._poll_started_ns = 0   # when the in-flight pass was dispatched
+        self._poll_zombies = 0      # passes written off by the watchdog
         # Oldest archive timestamp the graph backfill has already fetched (0 =
         # nothing fetched yet). Launch only covers the visible graph window;
         # anything older is fetched on request, and this marks where that
         # on-request fetch has to start so nothing is downloaded twice.
         self._backfill_start_ns = 0
         self._backfill_inflight = False
+        self._backfill_started_ns = 0   # when the in-flight fetch was dispatched
         # Extra minutes to fetch once the first (visible-window) pass is drawn.
         self._backfill_followup_min = 0.0
         self._monitoring = False
@@ -5888,6 +5891,12 @@ class MonitorWidget(QWidget):
         if on:
             self._log("Monitoring started — thresholds are now evaluated and "
                       "alerts will be sent.")
+            # Pressing Stop then Start is what anyone tries first when the
+            # values look stuck, so let it actually cure a wedged pass instead
+            # of waiting out the watchdog in _start_poll. A pass that really is
+            # still running is discarded by the generation check, so at worst
+            # this costs one duplicate fetch.
+            self._poll_inflight = False
             self._backfill_history()
             self._start_poll()
         else:
@@ -5959,6 +5968,7 @@ class MonitorWidget(QWidget):
 
     def poll_now(self):
         self._log("Manual poll.")
+        self._poll_inflight = False   # an explicit poll must never be skipped
         self._start_poll()
 
     # --- graph history backfill ----------------------------------------
@@ -6010,9 +6020,17 @@ class MonitorWidget(QWidget):
         if not names:
             return
         if self._backfill_inflight:
-            self._log("Archive history is still being fetched — wait for it "
-                      "to finish.")
-            return
+            # Same watchdog as _start_poll: a fetch that never reports back
+            # would wedge this flag True forever, and from then on the graph
+            # could never load history again — every attempt would only repeat
+            # the line below. A full history fetch is chunked by the hour and
+            # can legitimately run for minutes, so the cut-off is generous.
+            if api.now_ns() - self._backfill_started_ns < int(600e9):
+                self._log("Archive history is still being fetched — wait for "
+                          "it to finish.")
+                return
+            self._log("⚠ Archive history fetch stalled — starting a fresh one.")
+            self._backfill_inflight = False
         # Never keep more than the history buffer can hold.
         minutes = min(float(minutes), float(self.settings["history_minutes"]))
         end = api.now_ns()
@@ -6031,6 +6049,7 @@ class MonitorWidget(QWidget):
         sig.done.connect(self._on_backfill)
         self._backfill_sig = sig           # keep signals alive while running
         self._backfill_inflight = True
+        self._backfill_started_ns = api.now_ns()
         self._backfill_start_ns = min(start, self._backfill_start_ns or start)
         QThreadPool.globalInstance().start(_BackfillWorker(
             sig, names, start, end, float(self.settings["http_timeout_s"]),
@@ -6083,9 +6102,31 @@ class MonitorWidget(QWidget):
         # invalidating it — otherwise a pass slower than the poll interval
         # means no result ever lands and the table stays on "no data".
         if self._poll_inflight:
-            self._log("Previous poll still fetching — skipping this tick "
-                      "(raise Concurrent fetches or the poll interval).")
-            return
+            # Watchdog — same failure and the same cure as the Webex command
+            # listener (see _poll_commands). A pass that never reports back
+            # (thread-pool starvation, a network stall over a screen lock or
+            # a sleeping WiFi link) wedges this flag True forever: every tick
+            # from then on only logs the skip below, the table and the graph
+            # stay on the last good pass, and /status keeps repeating those
+            # stale numbers. Stop/Start monitoring does not clear the flag, so
+            # without this there is no way back short of restarting the app.
+            # Once the in-flight pass has outlived any plausible completion
+            # time, write it off and start a fresh one; the generation bump a
+            # few lines down discards the lost pass if it ever does land.
+            timeout = float(self.settings.get("http_timeout_s", 10.0))
+            poll_s = max(1, int(self.settings.get("poll_interval_s", 30)))
+            max_wait_ns = int(max(poll_s * 5, timeout * 3 + 15) * 1e9)
+            waited_s = (api.now_ns() - self._poll_started_ns) / 1e9
+            if api.now_ns() - self._poll_started_ns < max_wait_ns:
+                self._log("Previous poll still fetching — skipping this tick "
+                          "(raise Concurrent fetches or the poll interval).")
+                return
+            self._poll_zombies += 1
+            self._log(f"⚠ PV poll stalled for {waited_s:.0f}s — starting a "
+                      f"fresh one (self-healing; {self._poll_zombies} pass(es) "
+                      f"lost since launch). If this keeps repeating, the "
+                      f"archiver or the network is not answering.")
+            self._poll_inflight = False
         # Also fetch any gate PV that isn't already monitored, so its value is
         # available this pass to switch state-dependent thresholds.
         names += [g for g in sorted(self._gate_pv_names()) if g not in monitored]
@@ -6093,6 +6134,7 @@ class MonitorWidget(QWidget):
         self._poll_gen += 1
         gen = self._poll_gen
         self._poll_inflight = True
+        self._poll_started_ns = api.now_ns()
         sig = _PollSignals(self)
         # Every poll makes one of these, and a poll happens for as long as the
         # app is open. Parented to the widget they would ALL still be alive a
@@ -6522,9 +6564,14 @@ class MonitorWidget(QWidget):
         QThreadPool.globalInstance().start(_MeIdWorker(sig, self.hub.webex))
 
     def _on_bot_id(self, bot_id, gen):
+        # Released before the staleness check on purpose. The command-poll
+        # watchdog bumps _cmd_gen while a resolve may still be in flight; if
+        # the flag were only cleared on the fresh-generation path, that resolve
+        # would leave it True forever and _resolve_bot_id would return
+        # immediately from then on — the bot id would never resolve again.
+        self._cmd_bot_id_inflight = False
         if gen != self._cmd_gen:
             return   # listener was restarted/stopped since this request was sent
-        self._cmd_bot_id_inflight = False
         self._cmd_bot_id = bot_id
         if not bot_id:
             self._log("⚠ Failed to get bot's personId; will retry on next poll. "
@@ -6775,13 +6822,15 @@ class MonitorWidget(QWidget):
                 # "unknown command" to it — so with the listener not running,
                 # the only reply /run ever got was an error message, even
                 # though the app was up and tracking. Answering here means the
-                # app being open is itself the answer. Czech, to match the
-                # listener's replies to the same command.
+                # app being open is itself the answer. Same wording as the
+                # listener uses for the same command.
                 if self._monitoring:
-                    self._reply("ℹ️ Diagnostika už běží a trackuje.")
+                    self._reply("ℹ️ Diagnostic is already running and tracking.")
                 else:
-                    self._reply("ℹ️ Diagnostika už běží, ale netrackuje — "
-                                "pošli /start.")
+                    self._reply(
+                        "ℹ️ Diagnostic is already running, but not "
+                        "tracking — send `@Diagnostics /start` to arm it "
+                        "(or use the Start monitoring button).")
             else:
                 self._reply(f"❓ Unknown command {cmd}. Try /help.")
         except bot_commands.CommandError as e:

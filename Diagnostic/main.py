@@ -352,13 +352,31 @@ def main():
 
     # Give the taskbar button its own identity instead of grouping under the
     # generic host process, and hand it our icon.
+    #
+    # Windows caches the taskbar icon per AppUserModelID. "ELI.Diagnostic" was
+    # in use while the app had no icon.ico, so that id is stuck on the generic
+    # placeholder no matter what icon the window carries (measured 2026-08-24:
+    # identical probe, only the id changed → old id generic, fresh id correct).
+    # Clearing the icon cache would have to be repeated on every PC, so the fix
+    # is to bump the id string instead. Bump it again if this ever recurs.
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Diagnostic")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Diagnostic.2")
     except Exception:
         pass
 
     app = QApplication(sys.argv)
+    # Every background job in the app (PV polls, graph backfill, Webex polls,
+    # channel lists, chart rendering) is a QRunnable on this one shared pool,
+    # and Qt sizes it to the number of CPU cores. A runnable cannot be
+    # cancelled, so any job that hangs on a network read holds its slot for the
+    # rest of the session. On a small machine a handful of such zombies is
+    # enough to leave no slot free, at which point every new job only queues
+    # and the whole app looks frozen while the window still responds. Give the
+    # pool plenty of headroom so a few stuck jobs stay harmless.
+    from PySide6.QtCore import QThreadPool
+    QThreadPool.globalInstance().setMaxThreadCount(
+        max(32, QThreadPool.globalInstance().maxThreadCount()))
     _ico = _icon_file()
     if _ico:
         from PySide6.QtGui import QIcon

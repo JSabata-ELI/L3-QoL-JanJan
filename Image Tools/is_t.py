@@ -3,6 +3,7 @@
 import math
 import os
 import re
+import html as _html
 import bisect
 import shutil
 import time
@@ -30,11 +31,12 @@ except Exception:
 
 from PySide6.QtCore import (
     Qt, QTimer, QRunnable, QThreadPool, QObject, Signal, QSize, QRect, QPoint, QPointF, QDate,
-    QModelIndex, QTime, QLocale, QBuffer, QByteArray, QEvent
+    QModelIndex, QTime, QLocale, QBuffer, QByteArray, QEvent,
+    QRegularExpression
 )
 from PySide6.QtGui import (
     QPixmap, QImageReader, QPainter, QFontMetrics, QFont, QImage, QColor, QPen, QBrush, QGuiApplication,
-    QTextCharFormat, QPalette
+    QTextCharFormat, QPalette, QRegularExpressionValidator
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QDoubleSpinBox, QScrollArea,
@@ -432,6 +434,19 @@ PV_LABELS: dict[str, str] = {}
 # GUI thread only (picker accepted / saved state restored).
 PV_DERIVED: list[dict] = []
 
+# Operator-set alarm limits: PV name → (low, high), either of which may be None.
+# A value below `low` or above `high` is a TRIP — it flashes on the overlay and lands
+# in the trip list with the timestamp of the shot it happened on (see
+# Viewer._pv_check_limits). Absent from the dict, or (None, None), means "not watched".
+#
+# Raw comparison on purpose — no deadband, no hysteresis. Repeat trips are collapsed
+# where the trip is RECORDED, not where the number is compared, so the operator sees
+# the same threshold they typed.
+#
+# Module-level alongside PV_LABELS so the picker, the Slider and the Image Finder all
+# read one set of limits. Written on the GUI thread only.
+PV_LIMITS: dict[str, tuple] = {}
+
 # Channel letters used as variables in a derived-PV expression. The lookarounds
 # keep the tokens away from anything that only LOOKS like one: the E in 1E5, and
 # the lowercase safe names (math, abs, min, max, round) exposed to eval.
@@ -456,11 +471,38 @@ PV_REGISTRY_PATH = (Path(os.environ.get("APPDATA", Path.home()))
                     / "ELI_ImageTools" / "pv_registry.json")
 
 
+def _coerce_limit(v) -> "float | None":
+    """One threshold, or None for "not watched".
+
+    Accepts a number or the text of one, because the box in the picker hands over
+    whatever was typed and a config file may have been edited by hand. A blank, a
+    word, or a not-a-number reads as no limit rather than as a limit of zero — a
+    threshold nobody set must never flash."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(str(v).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def pv_limits_for(name: str) -> "tuple":
+    """(low, high) for a PV — either or both None when it is not watched."""
+    lo, hi = PV_LIMITS.get(name, (None, None))
+    return lo, hi
+
+
 def pv_registry_to_dict() -> dict:
     return {"pv_custom": dict(PV_CUSTOM_CHANNELS),
             "pv_derived": [dict(d) for d in PV_DERIVED],
             "pv_labels": dict(PV_LABELS),
-            "pv_units": dict(PV_CUSTOM_UNITS)}
+            "pv_units": dict(PV_CUSTOM_UNITS),
+            # Written as a two-key object rather than a pair, so a file edited by hand
+            # can set only one side without having to spell a null.
+            "pv_limits": {n: {"min": lo, "max": hi}
+                          for n, (lo, hi) in PV_LIMITS.items()
+                          if lo is not None or hi is not None}}
 
 
 def pv_registry_from_dict(data: dict) -> None:
@@ -521,6 +563,23 @@ def pv_registry_from_dict(data: dict) -> None:
         for _n, _u in _units.items():
             if isinstance(_u, str) and _u.strip() and str(_n) in PV_CUSTOM_CHANNELS:
                 PV_CUSTOM_UNITS[str(_n)] = _u.strip()
+
+    # Alarm limits. Formulas are included (unlike labels): a formula is exactly the
+    # kind of PV somebody wants a limit on. A limit is dropped when its PV no longer
+    # exists, or a threshold left behind by a deleted channel would start flashing at
+    # whatever later took its name. A missing key leaves the limits untouched, so a
+    # registry written by an older version keeps loading.
+    _limits = data.get("pv_limits")
+    if isinstance(_limits, dict):
+        PV_LIMITS.clear()
+        _lim_known = (set(PV_CHANNEL_MAP) | set(PV_CUSTOM_CHANNELS)
+                      | {str(_d.get("name") or "") for _d in PV_DERIVED})
+        for _n, _lim in _limits.items():
+            if str(_n) not in _lim_known or not isinstance(_lim, dict):
+                continue
+            _lo, _hi = _coerce_limit(_lim.get("min")), _coerce_limit(_lim.get("max"))
+            if _lo is not None or _hi is not None:
+                PV_LIMITS[str(_n)] = (_lo, _hi)
 
 
 def pv_registry_save() -> None:
@@ -950,6 +1009,19 @@ PV_FETCH_WATCHDOG_S = 120.0
 PV_KEEPALIVE_S = 60.0
 # How often the two guards above are checked.
 PV_HEALTH_TICK_MS = 5_000
+
+# ── alarm limits and trips (see PV_LIMITS, _Trip, Viewer._pv_check_limits) ──────
+# One step of the out-of-limits flash. Slower than the 600 ms live dot on purpose: the
+# dot pulses to say "alive", this one has to read as an alarm, and at the dot's rate
+# the two blinked together and neither meant anything.
+TRIP_BLINK_MS = 450
+# How many trips are kept. A shift can produce a lot of them; what matters is being
+# able to go back to the recent ones, and an unbounded list would eventually be a list
+# nobody reads. Oldest go first.
+TRIPS_MAX = 50
+# A PV that answers "ERR" for this long is a trip of its own. Not on the first failure:
+# one failed archiver read is normal and the next fetch usually has it.
+PV_ERROR_TRIP_S = 15.0
 
 
 def _pv_last_known_ex(channel: str, ts_ns: int) -> "tuple[float | None, str]":
@@ -1473,7 +1545,11 @@ GRADIENTS: dict[str, np.ndarray | None] = {
     "Binary":          _make_ni_binary_lut(),
     "False Colors":    _make_lut(_FALSE_COLORS_STOPS),
     "Rainbow":         _make_lut(_RAINBOW_STOPS),
-    "Hot":             _make_lut([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
+    # Red and yellow pulled down (0.33/0.66 -> 0.27/0.53) with a pale-yellow stop added
+    # at 0.78, so the dim cameras' beam climbs out of the black-to-red leg instead of
+    # spending the whole picture in it. White stays at the top of the scale, and only
+    # there — a fully white pixel still means a fully exposed one.
+    "Hot":             _make_lut([(0,(0,0,0)),(0.27,(255,0,0)),(0.53,(255,255,0)),(0.78,(255,255,190)),(1,(255,255,255))]),
     "Black and White": _make_binary_lut(),
     "Viridis":         _make_lut([(0,(68,1,84)),(0.25,(59,82,139)),(0.5,(33,145,140)),(0.75,(94,201,98)),(1,(253,231,37))]),
     "Plasma":          _make_lut([(0,(13,8,135)),(0.25,(126,3,168)),(0.5,(204,71,120)),(0.75,(248,149,64)),(1,(240,249,33))]),
@@ -5769,9 +5845,12 @@ class DatePickerDialog(QDialog):
 
     def __init__(self, start_folder=None, hour_from_init=None, hour_to_init=None,
                  parent=None, min_from_init=None, min_to_init=None,
-                 init_date=None, init_segments=None):
+                 init_date=None, init_segments=None, allow_live: bool = True):
         super().__init__(parent)
         self.setWindowTitle("Time window")
+        # A caller with no live mode (One Moment) passes allow_live=False: a tick that
+        # does nothing reads as a broken tick, and the tab ignores it anyway.
+        self._allow_live = bool(allow_live)
         self._camera_mode = False              # set to True by open_folder
         self._segments: "list[PickSeg]" = []   # one window per selected day
         # date -> (h_from, m_from, h_to, m_to) set through the per-day ⚙ editor.
@@ -5848,6 +5927,7 @@ class DatePickerDialog(QDialog):
             "Off = the window is loaded once and nothing follows live.")
         self.cb_now.setStyleSheet(_cb_style)
         self.cb_now.stateChanged.connect(self._on_now_changed)
+        self.cb_now.setVisible(self._allow_live)
 
         # ── Multi-day mode ────────────────────────────────────────────────────
         self.cb_multi = QCheckBox("Multiple days")
@@ -6947,6 +7027,29 @@ class CamLayoutConfig:
     entries: list = _field(default_factory=list)  # list[CamLayoutEntry]
 
 
+def _entries_from_tiles(cam_names: list, tiles: list,
+                        cam_order: "list | None" = None) -> "CamLayoutConfig | None":
+    """Turn a stored arrangement (tiles as canvas fractions + the camera order they
+    were written in) into a CamLayoutConfig ordered by `cam_names`. Returns None when
+    the stored shape does not describe this camera set. Both the layout store
+    (cam_layouts.json) and a preset that carries its arrangement (cam_presets.json)
+    keep the same shape, so they read it through this one function."""
+    if not tiles or len(tiles) != len(cam_names):
+        return None
+    order = list(cam_order) if cam_order and len(cam_order) == len(cam_names) \
+        else list(cam_names)
+    name_to_tile = dict(zip(order, tiles))
+    entries = []
+    for n in cam_names:
+        t = name_to_tile.get(n)
+        if t is not None and len(t) >= 4:
+            entries.append(CamLayoutEntry(x=float(t[0]), y=float(t[1]),
+                                          w=float(t[2]), h=float(t[3])))
+        else:
+            entries.append(CamLayoutEntry())
+    return CamLayoutConfig(entries=entries)
+
+
 def _entry_rect(x: float, y: float, w: float, h: float, W: int, H: int,
                 min_w: int = 20, min_h: int = 20) -> QRect:
     """Pixel rectangle of one layout tile. BOTH edges are rounded from their own
@@ -7053,6 +7156,18 @@ def _justified_rows_layout(aspects: list, canvas_w: float, canvas_h: float,
 # the canvas are not, which is why the search exists.
 _LAYOUT_SEARCH_MAX_CAMS = 12   # above this the search costs more than it is worth
 _LAYOUT_CACHE: dict = {}       # (aspects, weights, label px, canvas) → tile tuples
+# Set ELI_LAYOUT_DIAG=1 to have every computed arrangement written to
+# image_tools_diag.log with the aspect used per camera and how much of each tile
+# its frame fills. That percentage is the only honest way to judge an arrangement
+# — by eye a wide grey band and a wrongly learned aspect look the same. Off by
+# default: the layout is recomputed on every resize, and it would flood the log.
+_DIAG_LAYOUT = bool(os.environ.get("ELI_LAYOUT_DIAG"))
+# How much smaller the smallest frame may come out (as a share of its area) if that
+# buys more picture on screen overall. 1.0 is strict leximin — best smallest frame
+# whatever it costs the rest, which is how three landscape cameras ended up in one
+# row with two thirds of the canvas empty. 0.90 is a frame about 5 % shorter in each
+# direction, which is not something the eye picks up, while the canvas filling up is.
+_LAYOUT_SMALLEST_TOL = 0.90
 
 
 def _cam_layout_weight(name: str) -> float:
@@ -7128,24 +7243,111 @@ def _layout_trees(order: list, aspects: list, label_px: float, weights: list,
     return cand[(0, n)]
 
 
-def _place_layout_tree(node: tuple, x: float, y: float, w: float, h: float,
-                       out: dict):
-    """Cut (x, y, w, h) up the way `node` says, writing each camera's tile rect
-    into `out` keyed by camera index. The child sizes come straight out of the
-    stored size relation, so the two pieces meet exactly."""
+# ── Placing a tree, and handing out the leftover ────────────────────────────
+# The packing above is exact: every tile comes out hugging its own frame, and the
+# block it forms fills the canvas in ONE direction only. The leftover in the other
+# direction has to go somewhere, because the tiles must stay a seamless partition
+# of the canvas — every edge shared with its neighbour, columns and rows lined up.
+# Handing it out in proportion to tile size (what a plain uniform stretch does)
+# gives it to tiles that cannot turn it into picture, so it comes out as a grey
+# band. So it is offered first to the tiles whose frame would actually grow, and
+# only what nobody can use is split by size.
+
+def _usable_extra(node: tuple, w: float, h: float, aspects: list,
+                  label_px: float, axis: str) -> float:
+    """How much more room along `axis` ('x' = width, 'y' = height) this subtree can
+    still turn into picture, given it currently occupies w × h. A frame stops
+    growing once its image region matches its aspect."""
     kind = node[0]
     if kind == 'leaf':
-        out[node[3]] = (x, y, w, h)
+        a = aspects[node[3]]
+        if a <= 0.0:
+            return 0.0
+        if axis == 'y':
+            return max(0.0, (w / a + label_px) - h)
+        return max(0.0, a * max(0.0, h - label_px) - w)
+    t1, t2 = node[3]
+    if kind == 'h':
+        w1 = min(max(t1[1] * (h - t1[2]), 0.0), w)
+        u1 = _usable_extra(t1, w1, h, aspects, label_px, axis)
+        u2 = _usable_extra(t2, w - w1, h, aspects, label_px, axis)
+        # Side by side: the two share one height, so extra HEIGHT reaches both and
+        # is worth having as long as either can use it; extra WIDTH is split.
+        return max(u1, u2) if axis == 'y' else u1 + u2
+    h1 = min(max(w / t1[1] + t1[2], 0.0), h)
+    u1 = _usable_extra(t1, w, h1, aspects, label_px, axis)
+    u2 = _usable_extra(t2, w, h - h1, aspects, label_px, axis)
+    # Stacked: one shared width, split height — the other way round.
+    return u1 + u2 if axis == 'y' else max(u1, u2)
+
+
+def _split_extra(extra: float, u1: float, u2: float,
+                 s1: float, s2: float) -> tuple:
+    """Divide `extra` between two siblings. What each can turn into picture (u1, u2)
+    comes first; the rest is split in proportion to their current size (s1, s2).
+    The two shares always add up to `extra`, so the partition stays gap-free."""
+    if extra <= 0.0:
+        return 0.0, 0.0
+    usable = min(extra, u1 + u2)
+    if usable > 0.0 and (u1 + u2) > 0.0:
+        e1 = usable * u1 / (u1 + u2)
+    else:
+        e1 = 0.0
+    e2 = usable - e1
+    rest = extra - usable
+    if rest > 0.0:
+        if s1 + s2 > 0.0:
+            r1 = rest * s1 / (s1 + s2)
+        else:
+            r1 = rest * 0.5
+        e1 += r1
+        e2 += rest - r1
+    return e1, e2
+
+
+def _place_with_slack(node: tuple, x: float, y: float, w: float, h: float,
+                      extra: float, aspects: list, label_px: float, axis: str,
+                      out: dict):
+    """Cut (x, y, w, h) up the way `node` says, writing each camera's tile rect into
+    `out` keyed by camera index. The child sizes come straight out of the stored size
+    relation, so the two pieces meet exactly. The rectangle may be `extra` larger
+    along `axis` than the packing asked for; that surplus is handed down the tree by
+    _split_extra. Cut positions stay shared between the two sides, so the tiles remain
+    one seamless partition — no gaps, no overlaps. With extra = 0 this is just the
+    plain placement."""
+    kind = node[0]
+    if kind == 'leaf':
+        if axis == 'y':
+            out[node[3]] = (x, y, w, h + extra)
+        else:
+            out[node[3]] = (x, y, w + extra, h)
         return
     t1, t2 = node[3]
     if kind == 'h':
         w1 = min(max(t1[1] * (h - t1[2]), 0.0), w)
-        _place_layout_tree(t1, x, y, w1, h, out)
-        _place_layout_tree(t2, x + w1, y, w - w1, h, out)
-    else:
-        h1 = min(max(w / t1[1] + t1[2], 0.0), h)
-        _place_layout_tree(t1, x, y, w, h1, out)
-        _place_layout_tree(t2, x, y + h1, w, h - h1, out)
+        w2 = w - w1
+        if axis == 'y':
+            # One shared height: both sides grow by the whole surplus.
+            _place_with_slack(t1, x, y, w1, h, extra, aspects, label_px, axis, out)
+            _place_with_slack(t2, x + w1, y, w2, h, extra, aspects, label_px, axis, out)
+            return
+        u1 = _usable_extra(t1, w1, h, aspects, label_px, axis)
+        u2 = _usable_extra(t2, w2, h, aspects, label_px, axis)
+        e1, e2 = _split_extra(extra, u1, u2, w1, w2)
+        _place_with_slack(t1, x, y, w1, h, e1, aspects, label_px, axis, out)
+        _place_with_slack(t2, x + w1 + e1, y, w2, h, e2, aspects, label_px, axis, out)
+        return
+    h1 = min(max(w / t1[1] + t1[2], 0.0), h)
+    h2 = h - h1
+    if axis == 'x':
+        _place_with_slack(t1, x, y, w, h1, extra, aspects, label_px, axis, out)
+        _place_with_slack(t2, x, y + h1, w, h2, extra, aspects, label_px, axis, out)
+        return
+    u1 = _usable_extra(t1, w, h1, aspects, label_px, axis)
+    u2 = _usable_extra(t2, w, h2, aspects, label_px, axis)
+    e1, e2 = _split_extra(extra, u1, u2, h1, h2)
+    _place_with_slack(t1, x, y, w, h1, e1, aspects, label_px, axis, out)
+    _place_with_slack(t2, x, y + h1 + e1, w, h2, e2, aspects, label_px, axis, out)
 
 
 def compute_camera_layout(aspects: list, canvas_w: float, canvas_h: float,
@@ -7205,24 +7407,28 @@ def compute_camera_layout(aspects: list, canvas_w: float, canvas_h: float,
             trees.extend(_layout_trees(o, a, L, wt, prune, res))
 
         quant = 4096.0 / (W * H)   # ignore area differences too small to see
-        best = None
+        cands = []
         for node in trees:
             A, B = node[1], node[2]
             bw, bh = W, W / A + B
+            axis = 'y'                      # leftover is height
             if bh > H:                      # too tall for the canvas → fit by height
                 bh, bw = H, A * (H - B)
+                axis = 'x'                  # leftover is width
             if bw <= 0.0 or bh <= 0.0:
                 continue
+            # The packing is exact — every tile hugs its own frame — but it fills the
+            # canvas in one direction only. The leftover is handed out here, to the
+            # tiles that can turn it into picture first (see _place_with_slack), and
+            # the tiles are scored as they will actually be drawn.
+            extra = (H - bh) if axis == 'y' else (W - bw)
             tiles = {}
-            _place_layout_tree(node, 0.0, 0.0, bw, bh, tiles)
-            # The packing is exact but only fills the canvas in one direction; the
-            # leftover is shared out between the tiles (see below), so it never
-            # changes which frame size a candidate reaches — only where the tiles sit.
-            sx, sy = W / bw, H / bh
+            _place_with_slack(node, 0.0, 0.0, bw, bh, max(0.0, extra),
+                              a, L, axis, tiles)
             ratios, total = [], 0.0
             for i in range(n):
                 tile = tiles[i]
-                ar = _tile_image_area(tile[2] * sx, tile[3] * sy, a[i], L)
+                ar = _tile_image_area(tile[2], tile[3], a[i], L)
                 if ar <= 0.0:
                     break
                 ratios.append(ar / wt[i])
@@ -7230,26 +7436,53 @@ def compute_camera_layout(aspects: list, canvas_w: float, canvas_h: float,
             if len(ratios) < n:
                 continue
             ratios.sort()
-            score = (tuple(int(r * quant) for r in ratios), int(total * quant))
+            # How alike the tiles come out. Used as the last key, to settle on the
+            # tidier of two arrangements that are equally good otherwise.
+            mw = sum(tiles[i][2] for i in range(n)) / n
+            mh = sum(tiles[i][3] for i in range(n)) / n
+            spread = sum(abs(tiles[i][2] - mw) + abs(tiles[i][3] - mh)
+                         for i in range(n))
+            cands.append((ratios, total, spread, tiles))
+        if not cands:
+            return _justified_rows_layout(a, W, H, L)
+        # Pick in two passes. First find the largest the SMALLEST frame can be — that
+        # is what stops one lucky camera from taking the canvas and leaving the rest
+        # postage stamps. Then, among the arrangements that keep the smallest frame
+        # within _LAYOUT_SMALLEST_TOL of it, take the one that puts the most picture
+        # on screen in total. Plain leximin (best smallest frame, full stop) would
+        # rather grow one frame by a few percent than fill the canvas: three
+        # landscape cameras came out as a single row across the top with two thirds
+        # of the canvas empty, when two columns show far more picture for a frame
+        # barely smaller. The floor is what keeps that from turning into
+        # sum-maximising, which starves the small cameras.
+        floor_small = max(c[0][0] for c in cands) * _LAYOUT_SMALLEST_TOL
+        best = None
+        for ratios, total, spread, tiles in cands:
+            if ratios[0] < floor_small - 1e-9:
+                continue
+            score = (int(total * quant), -int(spread * 64.0 / (W + H)),
+                     tuple(int(r * quant) for r in ratios))
             if best is None or score > best[0]:   # ties keep the earlier order
-                best = (score, tiles, sx, sy)
+                best = (score, tiles)
         if best is None:
             return _justified_rows_layout(a, W, H, L)
-        _, tiles, sx, sy = best
-        # The packed block fills the canvas in one direction only; the slack from the
-        # other one is stretched INTO the tiles, keeping them a seamless partition of
-        # the canvas. Every tile edge is then shared with its neighbour — columns and
-        # rows line up to the pixel — and the leftover appears as the grey area around
-        # the frame inside the window, which is what the live grid draws anyway.
-        # Centring each tile in its own slack was tried instead and is what made the
-        # cameras look randomly strewn across the canvas with the columns out of line.
+        _, tiles = best
         hit = []
         for i in range(n):
             tx, ty, tw, th = tiles[i]
-            hit.append((tx * sx / W, ty * sy / H, tw * sx / W, th * sy / H))
+            hit.append((tx / W, ty / H, tw / W, th / H))
         if len(_LAYOUT_CACHE) > 128:
             _LAYOUT_CACHE.clear()
         _LAYOUT_CACHE[key] = hit
+        if _DIAG_LAYOUT:
+            fills = []
+            for i in range(n):
+                tw, th = tiles[i][2], tiles[i][3]
+                area = max(1.0, tw * th)
+                fills.append(f"{a[i]:.2f}:{100.0 * _tile_image_area(tw, th, a[i], L) / area:.0f}%")
+            diag_note(f"layout n={n} canvas={int(W)}x{int(H)} label={int(L)} "
+                      f"aspect:fill {' '.join(fills)} "
+                      f"tiles={[(round(t[0], 3), round(t[1], 3), round(t[2], 3), round(t[3], 3)) for t in hit]}")
     return [CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3]) for t in hit]
 
 
@@ -7368,8 +7601,8 @@ class _LayoutCanvasWidget(QWidget):
 
     def _image_rect_in(self, r: QRect, aspect: float) -> QRect:
         """Sub-rectangle of tile r the camera frame actually fills: below the label
-        bar (self._label_px), then KeepAspectRatio, anchored top, centred
-        horizontally — mirrors the live CameraView (label header + ImageView)."""
+        bar (self._label_px), then KeepAspectRatio, centred in both directions —
+        mirrors the live CameraView (label header + ImageView._img_rect)."""
         L = min(self._label_px, max(0, r.height() - 1))
         rx, ry = r.left(), r.top() + L
         rw, rh = r.width(), r.height() - L
@@ -7380,7 +7613,8 @@ class _LayoutCanvasWidget(QWidget):
         else:                       # width-limited
             iw = rw; ih = max(1, int(rw / aspect))
         x0 = rx + (rw - iw) // 2
-        return QRect(x0, ry, iw, ih)
+        y0 = ry + (rh - ih) // 2
+        return QRect(x0, y0, iw, ih)
 
     def _hit_test(self, pos) -> tuple:
         for i in range(len(self._tiles) - 1, -1, -1):
@@ -7866,19 +8100,8 @@ class LayoutConfigDialog(QDialog):
                 # auto as well. Either way: no fixed layout, let the grid arrange.
                 if saved.get("auto", True):
                     return None
-                if saved and "tiles" in saved and len(saved["tiles"]) == len(cam_names):
-                    cam_order = saved.get("cam_order", list(cam_names))
-                    if len(cam_order) != len(cam_names):
-                        cam_order = list(cam_names)
-                    name_to_tile = dict(zip(cam_order, saved["tiles"]))
-                    entries = []
-                    for n in cam_names:
-                        t = name_to_tile.get(n)
-                        if t is not None:
-                            entries.append(CamLayoutEntry(x=t[0], y=t[1], w=t[2], h=t[3]))
-                        else:
-                            entries.append(CamLayoutEntry())
-                    return CamLayoutConfig(entries=entries)
+                return _entries_from_tiles(cam_names, saved.get("tiles"),
+                                           saved.get("cam_order"))
         except Exception:
             pass
         return None
@@ -7964,7 +8187,7 @@ class CameraPickerDialog(QDialog):
         # Every window of the pick (one per day/segment). The camera list is the
         # UNION over all of them, so an empty day cannot hide the cameras.
         self._windows = list(windows) if windows else None
-        self._presets: dict[str, list[str]] = self._load_presets()
+        self._presets: dict[str, dict] = self._load_presets()
         self._multi_grid = multi_grid
 
         lay = QVBoxLayout(self)
@@ -8015,6 +8238,9 @@ class CameraPickerDialog(QDialog):
         right.addWidget(self._preset_list, 1)
 
         btn_save   = QPushButton("Save")
+        btn_save.setToolTip("Save the selected cameras AND the arrangement they are in "
+                            "right now — each camera's place and size come back with "
+                            "the preset")
         btn_rename = QPushButton("Rename")
         btn_delete = QPushButton("Delete")
         for b in (btn_save, btn_rename, btn_delete):
@@ -8080,13 +8306,73 @@ class CameraPickerDialog(QDialog):
         self._refresh_sel_table()
 
     # ── Presets ───────────────────────────────────────────────────────────────
+    # A preset carries the camera list AND, optionally, the arrangement those
+    # cameras were saved in:
+    #   {"cameras": [...], "auto": false, "cam_order": [...], "tiles": [[x,y,w,h], ...]}
+    # `auto: true` means "arrange these automatically" — the grid recomputes the
+    # arrangement for whatever window it is opened in. Presets written before this
+    # existed are a bare list of camera names and are read as auto.
     def _load_presets(self) -> dict:
+        raw = {}
         try:
             if self._PRESETS_PATH.exists():
-                return json.loads(self._PRESETS_PATH.read_text(encoding="utf-8"))
+                raw = json.loads(self._PRESETS_PATH.read_text(encoding="utf-8"))
         except Exception:
-            pass
-        return {}
+            raw = {}
+        out = {}
+        for name, val in (raw or {}).items():
+            if isinstance(val, list):
+                out[name] = {"cameras": [str(c) for c in val], "auto": True}
+            elif isinstance(val, dict):
+                entry = dict(val)
+                entry["cameras"] = [str(c) for c in entry.get("cameras", [])]
+                out[name] = entry
+        return out
+
+    def _preset_cameras(self, name: str) -> list:
+        p = self._presets.get(name) or {}
+        return list(p.get("cameras", []))
+
+    def _preset_layout(self, name: str, cam_names: list) -> "CamLayoutConfig | None":
+        """Arrangement stored in this preset, ordered for `cam_names`. None when the
+        preset says auto or carries nothing usable."""
+        p = self._presets.get(name) or {}
+        if p.get("auto", True):
+            return None
+        return _entries_from_tiles(cam_names, p.get("tiles"), p.get("cam_order"))
+
+    def _capture_current_layout(self) -> dict:
+        """The arrangement to store alongside the camera list, read off the running
+        grid. Only the cameras that are actually on screen can be captured, and an
+        automatic arrangement is stored as `auto` rather than frozen into fixed
+        fractions — those fractions belong to the window it was computed for, and a
+        preset may well be opened in a differently shaped one."""
+        grid = self._multi_grid
+        names = list(self._selected_names)
+        if not names:
+            return {"auto": True}
+        # The layout editor was used in this session — that is the arrangement.
+        if self._layout_chosen and self._layout_config is not None \
+                and len(self._layout_config.entries) == len(names):
+            return {"auto": False, "cam_order": names,
+                    "tiles": [[e.x, e.y, e.w, e.h] for e in self._layout_config.entries]}
+        if self._layout_chosen and self._layout_config is None:
+            return {"auto": True}     # editor left on auto-arrange
+        if grid is None:
+            return {"auto": True}
+        on_screen = list(getattr(grid, '_cam_names_list', []) or [])
+        if sorted(on_screen) != sorted(names):
+            return {"auto": True}     # a different set is picked than is displayed
+        # Still arranging itself? Then there is nothing hand-made to remember.
+        container = getattr(grid, '_reg_container', None)
+        if getattr(grid, '_layout_config', None) is None and \
+                getattr(container, '_manual', None) is None:
+            return {"auto": True}
+        entries = grid.get_current_layout_entries(names)
+        if len(entries) != len(names):
+            return {"auto": True}
+        return {"auto": False, "cam_order": names,
+                "tiles": [[e.x, e.y, e.w, e.h] for e in entries]}
 
     def _save_presets(self):
         try:
@@ -8111,7 +8397,12 @@ class CameraPickerDialog(QDialog):
         name = self._selected_preset_name()
         if not name or name not in self._presets:
             return
-        self._selected_names = list(self._presets[name])
+        self._selected_names = self._preset_cameras(name)
+        # The preset decides the arrangement too: its own if it carries one,
+        # otherwise automatic. Either way the choice is made here, so _on_accept
+        # must not fall back to the layout remembered for this camera set.
+        self._layout_config = self._preset_layout(name, self._selected_names)
+        self._layout_chosen = True
         self._refresh_sel_table()
         self._highlight_selected()
 
@@ -8122,7 +8413,10 @@ class CameraPickerDialog(QDialog):
         if not ok or not name.strip():
             return
         name = name.strip()
-        self._presets[name] = list(self._selected_names)
+        # Camera list AND the arrangement they are in right now.
+        entry = {"cameras": list(self._selected_names)}
+        entry.update(self._capture_current_layout())
+        self._presets[name] = entry
         self._save_presets()
         self._refresh_preset_list()
         # select the just-saved preset
@@ -8307,6 +8601,13 @@ class CameraPickerDialog(QDialog):
         if not self._selected_names:
             QMessageBox.warning(self, "No camera", "Please select at least one camera.")
             return
+        # A layout picked earlier (editor or preset) describes the camera set it was
+        # picked for. Adding or removing a camera afterwards invalidates it — keeping
+        # it would place the remaining cameras by another set's rectangles.
+        if (self._layout_config is not None
+                and len(self._layout_config.entries) != len(self._selected_names)):
+            self._layout_config = None
+            self._layout_chosen = False
         # If user didn't explicitly configure layout this session, auto-load any saved
         # HAND-MADE layout; without one the grid arranges the cameras itself.
         if (self._layout_config is None and not self._layout_chosen
@@ -8524,8 +8825,12 @@ class ImageView(QWidget):
             return None
         lbh = self._label_bar_h()
         x0 = (self.width() - self._scaled.width()) // 2
-        # Image starts immediately below the label strip; any leftover space is at the bottom.
-        y0 = lbh
+        # Centred in the space below the label strip, the same way it is centred
+        # horizontally. Anchoring it to the top put the whole leftover height into one
+        # band under the frame — the "cameras along the top edge with the bottom
+        # stretched to the floor" look. The leftover is the same, it is just split
+        # above and below now, so what is left over reads as an even margin.
+        y0 = lbh + max(0, self.height() - lbh - self._scaled.height()) // 2
         return QRect(x0, y0, self._scaled.width(), self._scaled.height())
 
     def _handle_radius(self) -> int:
@@ -8828,11 +9133,13 @@ class ImageView(QWidget):
             p.end(); return
 
         pm = self._scaled
-        lbh = self._label_bar_h()
-        x0 = (self.width() - pm.width()) // 2
-        y0 = lbh  # image starts immediately below label bar; leftover space at bottom
-        p.drawPixmap(x0, y0, pm)
-        img_rect = QRect(x0, y0, pm.width(), pm.height())
+        # One source of truth for where the frame sits: _img_rect. This used to
+        # compute the position again here, so centring the frame in the window only
+        # moved the overlays and left the picture itself hanging off the label bar.
+        img_rect = self._img_rect()
+        if img_rect is None:
+            p.end(); return
+        p.drawPixmap(img_rect.x(), img_rect.y(), pm)
         # Rámeček kolem obrázku
         border_pen = QPen(QColor(80, 80, 80, 160))
         border_pen.setWidth(1)
@@ -9425,7 +9732,12 @@ class CameraView(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(3, 3, 3, 3)
+        # A wider TOP margin than the other three: the tile's top border is the only
+        # one that has the label strip immediately below it, and the label strip is the
+        # handle the tile is MOVED by. The extra pixels here are the frame the top
+        # border (and the two top corners) is grabbed by, so resizing upwards never has
+        # to steal room from the label. See _tile_drag_mode.
+        lay.setContentsMargins(3, 6, 3, 3)
         lay.setSpacing(2)
 
         # Top row: camera name | timestamp (above image)
@@ -9626,11 +9938,17 @@ class CameraView(QWidget):
         super().mouseReleaseEvent(event)
 
     # ── Moving and resizing the tile itself ──────────────────────────────────
-    TILE_EDGE_PX = 9         # border zone that starts a resize drag
-    # The top border gets a narrower zone than the others: the name bar sits 3 px below
-    # it and is the handle the tile is MOVED by, so a 9 px top zone swallowed most of
-    # that handle and dragging the label resized the tile instead of moving it.
-    TILE_TOP_EDGE_PX = 4
+    TILE_EDGE_PX = 9         # border zone that starts a one-way resize drag
+    # The top border gets a narrower zone than the others: the label strip sits right
+    # below it and is the handle the tile is MOVED by, so a 9 px top zone swallowed most
+    # of that handle and dragging the label resized the tile instead of moving it. The
+    # layout keeps a 6 px top margin so this band lies on the frame, not on the label.
+    TILE_TOP_EDGE_PX = 6
+    # How far along the neighbouring side a corner still counts. A corner is the two
+    # border bands' meeting point stretched to this reach along both of them, which is
+    # what makes a two-way resize possible to hit without the reach ever leaving the
+    # frame and eating into the picture or the label.
+    TILE_CORNER_PX = 22
 
     _TILE_CURSORS = {
         'move':         Qt.CursorShape.SizeAllCursor,
@@ -9655,37 +9973,57 @@ class CameraView(QWidget):
         return p if len(getattr(p, '_views', ())) > 1 else None
 
     def _header_bottom(self) -> int:
+        """Bottom of the whole label strip. EVERYTHING above the picture belongs to it —
+        the camera name, the timestamp, the refresh dot, the reference badge and the gaps
+        between and around them — so the tile can be picked up anywhere on it. Measuring
+        the name label alone was what left only a few working spots: the strip is as tall
+        as its tallest item (the dot grows on the main camera), the layout adds spacing of
+        its own, and a right-aligned timestamp label is shorter than the row it sits in."""
         b = self._name_lbl.geometry().bottom()
         if self._ref_lbl.isVisible():
             b = max(b, self._ref_lbl.geometry().bottom())
+        g = self.img_view.geometry()
+        if g.height() > 0:
+            b = max(b, g.top() - 1)
         return b
 
     def _tile_drag_mode(self, pos) -> str:
-        """What a press at `pos` (tile coordinates) starts: an edge or corner name
-        within TILE_EDGE_PX of the border, 'move' on the name bar, and '' anywhere else
-        — the image area keeps its own mouse handling (cross, circle, square,
-        right-click zoom), which must not be stolen from it."""
-        e = self.TILE_EDGE_PX
+        """What a press at `pos` (tile coordinates) starts:
+
+          corner — in one border band and within TILE_CORNER_PX of the neighbouring
+                   one: resizes in BOTH directions of that corner
+          edge   — anywhere else along a border band: resizes that one direction
+          'move' — anywhere on the label strip: moves the whole tile
+          ''     — the picture, which keeps its own mouse handling (cross, circle,
+                   square, right-click zoom) and must not have it stolen.
+        """
         w, h = self.width(), self.height()
-        left, right = pos.x() <= e, pos.x() >= w - e
-        top, bottom = pos.y() <= self.TILE_TOP_EDGE_PX, pos.y() >= h - e
-        if top and left:
+        e, et = self.TILE_EDGE_PX, self.TILE_TOP_EDGE_PX
+        # On a small tile the corner reach must not swallow a whole side, or the one-way
+        # edge resize would have nowhere left to be grabbed.
+        c = max(e, min(self.TILE_CORNER_PX, w // 3, h // 3))
+        x, y = pos.x(), pos.y()
+        on_l,   on_r   = x < e, x >= w - e
+        on_t,   on_b   = y < et, y >= h - e
+        near_l, near_r = x < c, x >= w - c
+        near_t, near_b = y < c, y >= h - c
+        if (on_t and near_l) or (on_l and near_t):
             return 'top-left'
-        if top and right:
+        if (on_t and near_r) or (on_r and near_t):
             return 'top-right'
-        if bottom and left:
+        if (on_b and near_l) or (on_l and near_b):
             return 'bottom-left'
-        if bottom and right:
+        if (on_b and near_r) or (on_r and near_b):
             return 'bottom-right'
-        if left:
+        if on_l:
             return 'left'
-        if right:
+        if on_r:
             return 'right'
-        if top:
+        if on_t:
             return 'top'
-        if bottom:
+        if on_b:
             return 'bottom'
-        if pos.y() <= self._header_bottom():
+        if y <= self._header_bottom():
             return 'move'
         return ''
 
@@ -10078,6 +10416,11 @@ class MultiCameraGrid(QWidget):
     def setup_cameras(self, cam_names: list[str], layout_config=None):
         """Vytvoří/překreslí kamery podle seznamu jmen."""
         self._layout_config = layout_config  # CamLayoutConfig or None
+        # The arrangement these cameras were OPENED with — the preset's own, or the one
+        # remembered for this camera set, or None for automatic. Kept apart from
+        # _layout_config, which every tile drag overwrites, so "Reset layout" has
+        # something to come back to.
+        self._layout_opened = layout_config
         # Ulož overlay stav stávajících kamer před zničením
         for cv in self._cam_views:
             self._overlay_store[cv.cam_name] = self._save_iv_overlay(cv.img_view)
@@ -10174,6 +10517,34 @@ class MultiCameraGrid(QWidget):
         names = getattr(self, '_cam_names_list', [])
         if len(names) == len(entries):
             LayoutConfigDialog.save_manual_entries(names, entries)
+
+    def reset_layout(self):
+        """Undo the dragging: put the cameras back the way they were when this set was
+        opened. That is the preset's own arrangement or the one remembered for these
+        cameras if there was one, and the automatic arrangement if there was not —
+        exactly what a fresh open would show. The store is rewritten to match, so the
+        next open agrees with what is on screen now.
+
+        Returns the description of where it landed ("saved" / "auto"), or "" when there
+        is nothing to reset."""
+        if not self._cam_views:
+            return ""
+        names = list(getattr(self, '_cam_names_list', []))
+        base = getattr(self, '_layout_opened', None)
+        if base is not None and len(base.entries) != len(self._cam_views):
+            base = None
+        self._layout_config = CamLayoutConfig(entries=list(base.entries)) \
+            if base is not None else None
+        if names:
+            if base is not None:
+                LayoutConfigDialog.save_manual_entries(names, base.entries)
+            else:
+                LayoutConfigDialog.forget_saved(names)
+        c = self._reg_container
+        if c is not None and getattr(c, '_manual', None) is not None:
+            c._manual = None
+        self._rebuild_grid()
+        return "saved" if base is not None else "auto"
 
     def reset_layout_to_auto(self):
         """Throw the hand-made arrangement away — this window's and the stored one — and
@@ -11525,19 +11896,35 @@ class PvConfigDialog(QDialog):
     # Column widths, in px, shared by both tables so their columns line up even though
     # they are two independent grids. Only the PV column stretches.
     _W_SHOW, _W_LETTER, _W_NAME, _W_UNIT, _W_KIND, _W_DEL = 42, 20, 128, 46, 92, 22
-    _COL_TITLES = ("Show", "", "PV", "Displayed name", "Unit", "What it is", "")
+    # Alarm thresholds. Narrow on purpose — these hold a number like 0.3, and a wide
+    # box here would come out of the PV column, which is the one genuinely long thing
+    # in the table.
+    _W_LIMIT = 54
+    _COL_TITLES = ("Show", "", "PV", "Displayed name", "Unit",
+                   "Min", "Max", "What it is", "")
+
+    # What the two threshold boxes are for, in the operator's words. On the header and
+    # on every box, because a bare "Min" over an empty field says nothing about what
+    # happens when the number goes past it.
+    _LIMIT_TIP = ("Alarm limit. The value flashes over the picture, and lands in the\n"
+                  "trip list with the timestamp of the shot it happened on, when it\n"
+                  "goes below Min or above Max.\n"
+                  "Leave empty for no limit — an empty box is never watched.")
 
     def __init__(self, enabled: "list[str]", custom: "dict[str, str]",
                  derived: "list[dict] | None" = None,
                  labels: "dict[str, str] | None" = None,
                  hidden: "set[str] | list[str] | None" = None,
-                 units: "dict[str, str] | None" = None, parent=None):
+                 units: "dict[str, str] | None" = None,
+                 limits: "dict[str, tuple] | None" = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select PV channels")
-        # Wider than the old 620: the picked list is a six-column table now, and the
-        # channel names it prints are long. Still grows only where the operator fills
-        # it in (the two tables and the formulas share the spare height).
-        self.resize(700, 640)
+        # Wider than the old 620: the picked list is a multi-column table now, and the
+        # channel names it prints are long. The extra width over 700 is the two alarm
+        # threshold columns — without it they came straight out of the PV column, which
+        # is the one column here that genuinely needs the room. Still grows only where
+        # the operator fills it in (the two tables and the formulas share the height).
+        self.resize(820, 640)
 
         hidden = {str(n) for n in (hidden or ())}
         # A preset is in the list exactly when it was picked. No second tick anywhere.
@@ -11553,6 +11940,12 @@ class PvConfigDialog(QDialog):
         self._labels: "dict[str, str]" = {k: v for k, v in (labels or {}).items() if v}
         # name → unit typed for a user-added PV (see PV_CUSTOM_UNITS).
         self._units: "dict[str, str]" = {k: v for k, v in (units or {}).items() if v}
+        # name → (low, high) alarm thresholds (see PV_LIMITS). Either side may be None.
+        self._limits: "dict[str, tuple]" = {
+            k: (_coerce_limit(v[0]), _coerce_limit(v[1]))
+            for k, v in (limits or {}).items()
+            if isinstance(v, (tuple, list)) and len(v) == 2
+            and (_coerce_limit(v[0]) is not None or _coerce_limit(v[1]) is not None)}
         self._all_channels: "list[str]" = []
         self._loading = True
         self._load_err = ""
@@ -11781,6 +12174,18 @@ class PvConfigDialog(QDialog):
         return {n: u for n, u in self._units.items()
                 if u and n in self._custom}
 
+    def limits(self) -> "dict[str, tuple]":
+        """PV name → (low, high) alarm thresholds. Only the PVs that have one.
+
+        Deliberately NOT filtered to the picked list, the same as labels(): unticking a
+        preset takes it off this tab, it does not delete it, and a limit that vanished
+        because the other tab happened to have that PV switched off would be a threshold
+        the operator set and then silently lost. ✕ is what removes a PV, and _remove_pv
+        drops the limit with it."""
+        self._sync_row_state()
+        return {n: v for n, v in self._limits.items()
+                if v[0] is not None or v[1] is not None}
+
     def derived_defs(self) -> "list[dict]":
         """Every formula, ticked or not, in row order: {name, expr, unit,
         bindings}. Unticking a formula must not delete it, and the order is what
@@ -11932,6 +12337,33 @@ class PvConfigDialog(QDialog):
         self._rebuild_picked_tables()
         self._search.setFocus()
 
+    def _normalise_limit_box(self, box: QLineEdit):
+        """Show, in the box itself, what the limit actually came out as.
+
+        A half-typed "-" or "1e" is a box with something in it that means no limit at
+        all, and a threshold the operator believes is set but is not is the one failure
+        this feature must not have. Rewriting the box makes the stored value the
+        visible one; an entry that cannot be read at all is left alone and marked."""
+        try:
+            txt = box.text().strip()
+        except RuntimeError:
+            return
+        if not txt:
+            box.setStyleSheet("")
+            box.setToolTip(self._LIMIT_TIP)
+            return
+        v = _coerce_limit(txt)
+        if v is None:
+            box.setStyleSheet("background: #ffe0e0;")
+            box.setToolTip("This is not a number, so it is NOT being used as a limit.\n\n"
+                           + self._LIMIT_TIP)
+            return
+        box.setStyleSheet("")
+        box.setToolTip(self._LIMIT_TIP)
+        shown = f"{v:g}"
+        if shown != txt:
+            box.setText(shown)
+
     def _remove_pv(self, ent: dict):
         """✕ — this PV stops being read at all. The one way out of the list, so it is
         also the only place its name, unit and eye state are dropped."""
@@ -11948,6 +12380,7 @@ class PvConfigDialog(QDialog):
         self._shown.pop(name, None)
         self._labels.pop(name, None)
         self._units.pop(name, None)
+        self._limits.pop(name, None)
         self._rebuild_picked_tables()
 
     def _remove_channel(self, name: str):
@@ -11957,6 +12390,7 @@ class PvConfigDialog(QDialog):
         self._shown.pop(name, None)
         self._labels.pop(name, None)
         self._units.pop(name, None)
+        self._limits.pop(name, None)
         self._rebuild_picked_tables()
 
     def _sync_row_state(self):
@@ -12003,6 +12437,20 @@ class PvConfigDialog(QDialog):
                         self._units[name] = txt
                     else:
                         self._units.pop(name, None)
+            # Both threshold boxes are read as one pair: they are stored as one entry,
+            # and reading them separately would let a half-typed Max drop a Min that is
+            # already set.
+            me, xe = row.get("min_edit"), row.get("max_edit")
+            if me is not None and xe is not None:
+                try:
+                    lo = _coerce_limit(me.text())
+                    hi = _coerce_limit(xe.text())
+                except RuntimeError:
+                    continue
+                if lo is None and hi is None:
+                    self._limits.pop(name, None)
+                else:
+                    self._limits[name] = (lo, hi)
 
     # ── the two picked-PV tables ─────────────────────────────────────────────
     @staticmethod
@@ -12015,7 +12463,8 @@ class PvConfigDialog(QDialog):
     def _prepare_grid(self, grid: QGridLayout):
         """Fix the column widths and stretch so the two grids line up as one table."""
         widths = (self._W_SHOW, self._W_LETTER, 0, self._W_NAME,
-                  self._W_UNIT, self._W_KIND, self._W_DEL)
+                  self._W_UNIT, self._W_LIMIT, self._W_LIMIT,
+                  self._W_KIND, self._W_DEL)
         for c, w in enumerate(widths):
             if w:
                 grid.setColumnMinimumWidth(c, w)
@@ -12029,6 +12478,8 @@ class PvConfigDialog(QDialog):
                 continue
             lbl = QLabel(title)
             lbl.setStyleSheet("font-size: 9px; font-weight: 700; color: #666;")
+            if title in ("Min", "Max"):
+                lbl.setToolTip(self._LIMIT_TIP)
             grid.addWidget(lbl, 0, c)
 
     def _rebuild_picked_tables(self):
@@ -12139,6 +12590,26 @@ class PvConfigDialog(QDialog):
                          else "Typed in the formula row below")
             grid.addWidget(u, row, 4)
 
+        # Alarm thresholds. Every kind of PV gets them, formulas included — a formula
+        # (a ratio, a difference) is exactly the sort of number somebody wants watched.
+        lo, hi = self._limits.get(name, (None, None))
+        lim_edits = []
+        for col, val, ph in ((5, lo, "min"), (6, hi, "max")):
+            e = QLineEdit("" if val is None else f"{val:g}")
+            e.setPlaceholderText(ph)
+            e.setToolTip(self._LIMIT_TIP)
+            e.setMaximumWidth(self._W_LIMIT)
+            # A comma is accepted as the decimal mark as well as a dot — this keyboard
+            # types a comma — and normalised on the way in (see _coerce_limit). Letters
+            # are refused outright rather than being quietly read as "no limit".
+            e.setValidator(QRegularExpressionValidator(
+                QRegularExpression(r"[+-]?[0-9]{0,12}([.,][0-9]{0,6})?([eE][+-]?[0-9]{0,3})?"),
+                e))
+            e.editingFinished.connect(
+                lambda w=e: self._normalise_limit_box(w))
+            grid.addWidget(e, row, col)
+            lim_edits.append(e)
+
         kind_lbl = QLabel({"preset": "preset", "own": "archiver PV",
                            "formula": "formula"}[kind])
         kind_lbl.setStyleSheet("font-size: 10px; color: #666;")
@@ -12147,7 +12618,7 @@ class PvConfigDialog(QDialog):
             "own": "An archiver PV you added by search or by name.",
             "formula": "Computed from other PVs, not read from the archiver.",
         }[kind])
-        grid.addWidget(kind_lbl, row, 5)
+        grid.addWidget(kind_lbl, row, 7)
 
         btn = QPushButton("✕")
         btn.setFixedSize(self._W_DEL, self._W_DEL)
@@ -12157,10 +12628,11 @@ class PvConfigDialog(QDialog):
             "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
         btn.clicked.connect(lambda _=False, e=ent: self._later(
             lambda: self._remove_pv(e)))
-        grid.addWidget(btn, row, 6)
+        grid.addWidget(btn, row, 8)
 
         self._rows.append({"ent": ent, "chk": chk, "letter": letter,
-                           "name_edit": name_edit, "unit_edit": unit_edit})
+                           "name_edit": name_edit, "unit_edit": unit_edit,
+                           "min_edit": lim_edits[0], "max_edit": lim_edits[1]})
 
     # ── formulas ─────────────────────────────────────────────────────────────
     def _pending_names(self) -> "list[str]":
@@ -12232,6 +12704,10 @@ class PvConfigDialog(QDialog):
         self._rebuild_picked_tables()
 
     def _remove_derived_row(self, rec: dict):
+        try:
+            self._limits.pop(rec["name"].text().strip(), None)
+        except RuntimeError:
+            pass                      # the row's widgets are already gone
         self._derived_rows.remove(rec)
         rec["widget"].setParent(None)
         rec["widget"].deleteLater()
@@ -12522,10 +12998,16 @@ class PvValueTable(QTableWidget):
             return True
         return super().eventFilter(obj, event)
 
-    def refresh(self, names: "list[str]", hidden: "set[str]", value_of):
+    def refresh(self, names: "list[str]", hidden: "set[str]", value_of,
+                alarm: "set[str] | None" = None):
         """Repaint the whole list. `names` is the picked list in canonical order,
         `hidden` the PVs that are off the picture, `value_of(name)` the host's
-        (text, grey, tooltip) for one row."""
+        (text, grey, tooltip) for one row.
+
+        `alarm` is the PVs that are outside their limits on the shot being shown; they
+        are printed red and bold. Optional and defaulting to nothing so a host with no
+        limits (the Image Finder) needs no change at all."""
+        alarm = alarm or set()
         self._names = list(names)
         self.setRowCount(len(self._names))
         self.setMaximumHeight(self.ROW_H * max(len(self._names), 1) + 26)
@@ -12555,12 +13037,244 @@ class PvValueTable(QTableWidget):
             val_item = QTableWidgetItem(text)
             if grey:
                 val_item.setForeground(QColor("#888888"))
+            if name in alarm:
+                # Out of limits wins over "held value" grey: which shot the number
+                # came from is a qualifier, being past the threshold is the message.
+                # Not blinked here — a table row flashing in the corner of the eye is
+                # noise; the overlay over the picture is what flashes.
+                val_item.setForeground(QColor("#cc0000"))
+                _f = val_item.font()
+                _f.setBold(True)
+                val_item.setFont(_f)
+                name_item.setForeground(QColor("#cc0000"))
             if tip:
                 val_item.setToolTip(tip)
             self.setItem(i, 0, eye_item)
             self.setItem(i, 1, name_item)
             self.setItem(i, 2, val_item)
             self.setRowHeight(i, self.ROW_H)
+
+class _Trip:
+    """One thing that went wrong, and the shot it went wrong on.
+
+    Two kinds, deliberately in one list: a PV outside its limits, and a camera the live
+    watchdog calls faulted. The operator's question is the same for both — "something
+    happened, where?" — and the answer is the same button.
+
+    `key` is what makes a repeat the SAME trip: the PV name, or the camera. Live mode
+    runs at a few frames a second, so a back reflection that stays high for ten seconds
+    is one trip with a count on it, never thirty entries. The count is the only thing a
+    repeat changes; `ts_ns` keeps naming the FIRST shot, which is the one worth looking
+    at.
+    """
+
+    __slots__ = ("kind", "key", "ts_ns", "text", "detail", "count", "open", "acked")
+
+    def __init__(self, kind: str, key: str, ts_ns: int, text: str, detail: str = ""):
+        self.kind = kind            # "pv" | "image"
+        self.key = key              # PV name, or "cam<i>"
+        self.ts_ns = int(ts_ns)     # the shot it happened on
+        self.text = text            # one line, for the 275 px panel
+        self.detail = detail        # the whole story, for the tooltip
+        self.count = 1              # shots it has gone on for
+        self.open = True            # still going wrong right now
+        self.acked = False          # the operator has been to look
+
+    def head(self) -> str:
+        """The clock time of the shot — "—" when the fault produced no frame."""
+        return fmt_hhmmss_ms_from_ns(self.ts_ns)[:8] if self.ts_ns else "—"
+
+    def tail(self) -> str:
+        """How many shots it has gone on for, blank for a one-off."""
+        return f" ×{self.count}" if self.count > 1 else ""
+
+    def line(self) -> str:
+        return f"{self.head()}  {self.text}{self.tail()}"
+
+    def tip(self) -> str:
+        when = (fmt_prague_full_from_ns(self.ts_ns) if self.ts_ns
+                else "no timestamp — the frame it happened on is not known")
+        parts = [self.text, f"Shot: {when}"]
+        if self.count > 1:
+            parts.append(f"It has gone on for {self.count} shots — the time above is "
+                         f"the first of them.")
+        if self.detail:
+            parts.append(self.detail)
+        parts.append("Still happening." if self.open else "Over now.")
+        parts.append("\"See trip\" puts the picture on that shot: every camera at that "
+                     "moment, and the PV values read again for it.")
+        return "\n\n".join(parts)
+
+
+class _TripLabel(QLabel):
+    """One trip line: a clock time, the wording, and the repeat count.
+
+    It elides ITSELF, and it never asks the layout for more width than it is given.
+    Both halves of that matter in a 275 px panel: a plain non-wrapping QLabel reports
+    its full text as its minimum width, which pushed the row to 650 px and carried the
+    "See trip" button clean off the side of a box that does not scroll sideways. And
+    the elide has to be redone on every resize, or it is computed once against a width
+    the label did not have yet.
+
+    The time and the count are held out of the elide. Eliding the whole line from the
+    right threw the count away first, and "it has happened 39 times" is the part of a
+    trip line worth reading — not the tail of its wording.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Preferred)
+        self._head = self._body = self._tail = ""
+
+    def set_parts(self, head: str, body: str, tail: str):
+        self._head, self._body, self._tail = head, body, tail
+        self._relayout()
+
+    def _relayout(self):
+        fm = QFontMetrics(self.font())
+        room = self.width() - fm.horizontalAdvance(self._head + self._tail)
+        body = fm.elidedText(self._body, Qt.TextElideMode.ElideRight, max(30, room))
+        QLabel.setText(self, self._head + body + self._tail)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout()
+
+
+class _TripBox(QWidget):
+    """The trip list, at the very top of the Info panel.
+
+    Invisible until something trips, so a normal session never sees it. Each row is one
+    trip and one button; the list scrolls rather than growing, because the Info panel is
+    275 px wide and anchored above everything else in the left column — a box that grew
+    with the number of trips would push the whole column down at the worst moment.
+    """
+
+    see_trip    = Signal(object)     # the _Trip whose "See trip" was pressed
+    clear_trips = Signal()
+
+    _MAX_H = 96                      # about four rows before it scrolls
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 2)
+        lay.setSpacing(2)
+
+        head = QHBoxLayout()
+        head.setSpacing(4)
+        self._title = QLabel("")
+        self._title.setStyleSheet(
+            "font-size: 11px; font-weight: 700; color: #c00; padding: 1px 0;")
+        head.addWidget(self._title)
+        head.addStretch(1)
+        self._btn_clear = QPushButton("Clear trips")
+        self._btn_clear.setStyleSheet(
+            "QPushButton { font-size: 10px; padding: 1px 5px; }")
+        self._btn_clear.setToolTip(
+            "Forget every trip listed here and stop the warning flashing.\n"
+            "It does not change anything about the images or the PV limits — the next "
+            "value past its limit starts a new trip.")
+        self._btn_clear.clicked.connect(self.clear_trips)
+        head.addWidget(self._btn_clear)
+        lay.addLayout(head)
+
+        self._area = QScrollArea()
+        self._area.setWidgetResizable(True)
+        self._area.setFrameShape(QFrame.Shape.NoFrame)
+        self._area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._area.setMaximumHeight(self._MAX_H)
+        self._body = QWidget()
+        self._blay = QVBoxLayout(self._body)
+        self._blay.setContentsMargins(0, 0, 0, 0)
+        self._blay.setSpacing(1)
+        self._blay.addStretch(1)
+        self._area.setWidget(self._body)
+        lay.addWidget(self._area)
+        # The live rows, newest first: [(trip, label, button)]. Kept so a repeat can be
+        # written into the existing widgets instead of replacing them — see refresh.
+        self._rows: list = []
+        self.setVisible(False)
+
+    def refresh(self, trips: "list"):
+        """Bring the list up to date, newest first.
+
+        Rows are REUSED whenever the same trips are still in the same order, and only
+        rebuilt when the list itself changes. Not an optimisation: a trip that repeats
+        is refreshed on every shot, so rebuilding here would destroy the "See trip"
+        button under the operator's cursor twice a second — and deleting a widget from
+        inside its own click is how this crashes."""
+        if not trips:
+            self._discard_rows()
+            self.setVisible(False)
+            return
+
+        n_new = sum(1 for t in trips if not t.acked)
+        self._title.setText(f"⚠ {len(trips)} trip{'s' if len(trips) != 1 else ''}"
+                            + (f" · {n_new} not seen" if n_new else ""))
+        order = list(reversed(trips))
+        if [r[0] for r in self._rows] != order:
+            self._discard_rows()
+            row_h = 0
+            for t in order:
+                w = self._make_row(t)
+                # sizeHint, not the laid-out height: the rows have only just been added
+                # and have no geometry yet. A per-row CONSTANT was worse still — it was
+                # a guess at the font's line height, and it left the last row cut in half.
+                row_h = max(row_h, w.sizeHint().height())
+                self._blay.addWidget(w)
+            self._blay.addStretch(1)
+            # Only as tall as it needs to be, up to the cap: two trips should not
+            # reserve four rows of the panel.
+            need = (row_h + self._blay.spacing()) * len(order) + 4
+            self._area.setMaximumHeight(min(self._MAX_H, max(row_h + 4, need)))
+        for t, lbl, btn in self._rows:
+            self._paint_row(t, lbl, btn)
+        self.setVisible(True)
+
+    def _discard_rows(self):
+        self._rows = []
+        while self._blay.count():
+            it = self._blay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _paint_row(self, t: "_Trip", lbl: "_TripLabel", btn: QPushButton):
+        """Everything about a row that can change without the list changing: the
+        repeat count, whether it is still happening, whether it has been seen."""
+        lbl.setStyleSheet("font-size: 10px; padding: 0;"
+                          + ("color: #888;" if t.acked else "color: #a00;"))
+        lbl.set_parts(t.head() + "  ", t.text, t.tail())
+        lbl.setToolTip(t.tip())
+        btn.setToolTip(t.tip())
+
+    def _make_row(self, t: "_Trip") -> QWidget:
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+        lbl = _TripLabel()
+        rl.addWidget(lbl, 1)
+        # "See", not "See trip": the panel is 275 px wide and every pixel the button
+        # takes comes straight off the trip line next to it, which is the part that
+        # says what happened. The tooltip carries the whole sentence.
+        btn = QPushButton("See")
+        btn.setStyleSheet("QPushButton { font-size: 10px; padding: 1px 4px; }")
+        # Emitted once the click has been delivered, not from inside it: the handler
+        # marks the trip as seen and refreshes the box, and in the case where that does
+        # rebuild the rows it would be tearing down this very button.
+        btn.clicked.connect(lambda _=False, tr=t: QTimer.singleShot(
+            0, lambda: self.see_trip.emit(tr)))
+        rl.addWidget(btn)
+        self._rows.append((t, lbl, btn))
+        self._paint_row(t, lbl, btn)
+        return row
+
 
 class _PvOverlayPanel(QWidget):
     """
@@ -12593,6 +13307,13 @@ class _PvOverlayPanel(QWidget):
     # cannot be this shot's — see Viewer._pv_arm_wait_retry. Distinct from "older
     # shot": the panel is waiting and the values will complete themselves.
     _BADGE_WAIT    = "no data yet"
+
+    # The alarm colours. Red for a value past its limit; white for the text on the
+    # red-background step, because the panel's own text colour is black by default and
+    # black on red is the one combination this feature must never produce.
+    _ALARM_FG = "#d40000"
+    _ALARM_BG = QColor("#d40000")
+    _ALARM_ON_BG = "#ffffff"
 
     # What each marker means, in the words the operator uses. Shown as the panel's
     # tooltip, because a two-word corner marker can only say WHICH state it is in,
@@ -12628,6 +13349,12 @@ class _PvOverlayPanel(QWidget):
         # font changes, i.e. whenever "the same content" stops meaning the same thing.
         self._row_names: list[str] = []
         self._width_hwm: int = 0
+        # Rows that are outside their limits, by the name printed in the row, and the
+        # step of the flash: 0 = normal, 1 = red value, 2 = red panel with white text.
+        # Only the phase changes on the blink timer — the row text is not rebuilt, so
+        # flashing cannot resize the panel or move it under the cursor.
+        self._alarm: "set[str]" = set()
+        self._alarm_phase: int = 0
 
         # Configurable display settings
         self.font_size_px: int = 24
@@ -12642,7 +13369,10 @@ class _PvOverlayPanel(QWidget):
         lay.setSpacing(0)
 
         self._content = QLabel()
-        self._content.setTextFormat(Qt.TextFormat.PlainText)
+        # Rich text, not plain: one row has to be able to go red while the others stay
+        # as they are, and a QLabel has exactly one QSS colour. Everything put in it is
+        # escaped — a PV name is archiver text, not markup.
+        self._content.setTextFormat(Qt.TextFormat.RichText)
         # Clicks on the text must reach the panel itself (which owns the drag),
         # not get swallowed by the child label.
         self._content.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -12671,9 +13401,19 @@ class _PvOverlayPanel(QWidget):
         return max(fm.horizontalAdvance(t) for t in
                    (self._BADGE_PENDING, self._BADGE_WAIT, self._BADGE_HELD)) + 16
 
+    def _text_color_hex(self) -> str:
+        """The colour the rows are printed in right now. White while the panel itself
+        is red — the default value colour is black, and black on red is unreadable."""
+        return (self._ALARM_ON_BG if self._alarm_phase == 2
+                else self.font_color.name())
+
     def _apply_style(self):
         alpha = int(self.bg_opacity / 100 * 255)
         self._bg_color = QColor(self.bg_color.red(), self.bg_color.green(), self.bg_color.blue(), alpha)
+        # The base colour only: every row carries its own colour in the markup, so a
+        # flash never touches the stylesheet. It must not — _apply_style resets the
+        # width high-water mark and re-sizes the panel, and doing that twice a second
+        # is exactly the hopping the mark exists to prevent.
         color_hex = self.font_color.name()
         style = (
             f"QLabel {{ color: {color_hex}; font-size: {self.font_size_px}px; font-weight: 700; "
@@ -12700,14 +13440,47 @@ class _PvOverlayPanel(QWidget):
             self.bg_color = bg_color
         self._apply_style()
 
+    def _render_rows(self):
+        """Print the rows at the current flash step.
+
+        Text only — never a size, a weight or a row count. Everything that could change
+        the panel's measured width is settled in update_values, so the flash cannot
+        move the panel a pixel."""
+        base = self._text_color_hex()
+        alarm_col = (self._ALARM_ON_BG if self._alarm_phase == 2
+                     else self._ALARM_FG if self._alarm_phase == 1
+                     else base)
+        lines = []
+        for n, v in self._rows:
+            col = alarm_col if n in self._alarm else base
+            lines.append(f'<span style="color:{col};">'
+                         f'{_html.escape(n)}: {_html.escape(v)}</span>')
+        self._content.setText("<br>".join(lines))
+
+    def set_alarm_phase(self, phase: int):
+        """0 = normal, 1 = the out-of-limits values in red, 2 = the whole panel red
+        with white text. Called from the blink timer; a no-op when nothing changed, so
+        the timer can run without repainting an idle panel."""
+        phase = int(phase)
+        if phase == self._alarm_phase:
+            return
+        self._alarm_phase = phase
+        if self._rows:
+            self._render_rows()
+        self.update()
+
     def update_values(self, rows: "list[tuple[str,str]]", *,
                       pending: bool = False, held: bool = False,
-                      waiting: bool = False):
+                      waiting: bool = False, alarm: "set[str] | None" = None):
         """rows = list of (name, formatted_value_with_units), WITHOUT status markers.
 
         pending / waiting / held drive the corner badge instead — see the class
-        docstring for why they must not reach the row text."""
+        docstring for why they must not reach the row text.
+
+        `alarm` holds the ROW NAMES (as printed, i.e. after pv_label_for) that are
+        outside their limits on this shot."""
         self._rows = rows
+        self._alarm = set(alarm or ())
         if not rows:
             self.setVisible(False)
             return
@@ -12723,7 +13496,7 @@ class _PvOverlayPanel(QWidget):
             self._row_names = names
             self._width_hwm = 0
             self._content.setMinimumWidth(0)
-        self._content.setText("\n".join(f"{n}: {v}" for n, v in rows))
+        self._render_rows()
         w = self._content.sizeHint().width()
         if w > self._width_hwm:
             self._width_hwm = w
@@ -12765,6 +13538,10 @@ class _PvOverlayPanel(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         bg = getattr(self, "_bg_color", QColor(30, 30, 30, 204))
+        if self._alarm_phase == 2:
+            # Fully opaque on purpose: this step exists to be impossible to miss, and
+            # a see-through red over a bright picture is not.
+            bg = self._ALARM_BG
         p.setBrush(QBrush(bg))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(self.rect(), 6, 6)
@@ -12778,7 +13555,8 @@ class _PvOverlayPanel(QWidget):
         p.setFont(f)
         # Same colour as the values: the background is user-configurable, so a
         # separate badge colour cannot be guaranteed to stay readable against it.
-        p.setPen(QPen(self.font_color))
+        # That includes the red flash step, where the values go white and so must this.
+        p.setPen(QPen(QColor(self._text_color_hex())))
         fm = QFontMetrics(f)
         line_h = self._badge_strip_h()
         r = QRect(8, self.height() - 4 - line_h, max(0, self.width() - 16), line_h)
@@ -13350,6 +14128,38 @@ class Viewer(QWidget):
         self._pv_overlay: "_PvOverlayPanel | None" = None   # created in _build_ui
         self._pv_overlay_multi: "_PvOverlayPanel | None" = None   # created in _build_ui
 
+        # ── alarm limits and the trip list (see PV_LIMITS, _pv_check_limits) ──
+        # The numbers behind the last fetch's text, name → float. Only real readings
+        # land here; a held or errored value is absent, and an absent value is never
+        # measured against a limit.
+        self._pv_numbers: dict = {}
+        # PVs outside their limits ON THE SHOT ON SCREEN. Emptied by every fetch and
+        # refilled from it, which is what makes the flashing stop by itself when the
+        # next shot comes in — the operator asked for the value to stop shouting once
+        # the moment has passed, while the trip in the list stays.
+        self._pv_alarm_names: set = set()
+        # Open PV trips, PV name → _Trip. A PV is in here exactly while it is over its
+        # limit, so a trip is opened on the CROSSING and not on every fetch.
+        self._pv_over: dict = {}
+        # Open camera trips, "cam<i>" → _Trip. Same idea against _live_health.
+        self._cam_fault_trip: dict = {}
+        # PV name → when it first answered "ERR" (monotonic). See _pv_check_read_errors.
+        self._pv_err_since: dict = {}
+        self._pv_alarm_step: int = 0
+        # Every trip, oldest first, capped at TRIPS_MAX.
+        self._trips: list = []
+        # How an out-of-limits value asks to be noticed: "text" flashes the value,
+        # "text+bg" flashes the whole panel red after it. Restored from the UI state.
+        self._pv_alarm_style: str = "text"
+        self._pv_alarm_phase: int = 0
+        self._pv_alarm_timer = QTimer(self)
+        self._pv_alarm_timer.setInterval(TRIP_BLINK_MS)
+        # Precise: a default Qt timer is coarse on Windows and a flash that drifts
+        # reads as a stutter rather than as a rhythm.
+        self._pv_alarm_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._pv_alarm_timer.timeout.connect(self._on_alarm_blink)
+        self._trip_box: "_TripBox | None" = None            # created in _build_ui
+
         # Timeline position to land on when the next scan finishes, instead of the
         # newest frame. Set by open_folder() when only the CAMERA SET changed, so
         # adding or removing a camera keeps the moment the user was looking at.
@@ -13650,6 +14460,12 @@ class Viewer(QWidget):
             _saved_pv = {str(n) for n in _saved_pv}
             self._pv_enabled = [n for n in pv_all_names() if n in _saved_pv]
 
+        # How an out-of-limits value flashes. Restored here rather than in the settings
+        # dialog because the dialog is only opened to CHANGE it — a setting that reset
+        # itself every restart would be one the operator has to set again every morning.
+        if self._ui_state.get("pv_alarm_style") in ("text", "text+bg"):
+            self._pv_alarm_style = self._ui_state["pv_alarm_style"]
+
         def _add_section(key, title, default_expanded, accent=None):
             expanded = bool(self._ui_state.get(key, default_expanded))
             sec = CollapsibleSection(title, key, expanded, accent=accent)
@@ -13709,6 +14525,14 @@ class Viewer(QWidget):
         row_follow = QHBoxLayout()
         row_follow.addWidget(self._btn_auto_follow)
         s_src.body_layout.addLayout(row_follow)
+        # Sending the frame on to Workshop is a "where does this image go next" step,
+        # not a save-to-disk option, so it lives with the source pickers rather than
+        # among the Save switches.
+        self.btn_send_workshop = QPushButton("➤ Workshop")
+        self.btn_send_workshop.setEnabled(False)
+        self.btn_send_workshop.setToolTip("Send current image to Workshop tab for editing")
+        self.btn_send_workshop.clicked.connect(self._send_to_workshop)
+        s_src.body_layout.addWidget(self.btn_send_workshop)
 
         # ══════════════════ Section: TIMELINE & RANGE ═════════════
         self.btn_prev = QPushButton("◀"); self.btn_prev.setToolTip("Previous image (←)"); self.btn_prev.setEnabled(False)
@@ -13827,11 +14651,6 @@ class Viewer(QWidget):
         row2a.addWidget(self.btn_save)
         row2a.addWidget(self.btn_save_range)
         s_save.body_layout.addLayout(row2a)
-        self.btn_send_workshop = QPushButton("➤ Workshop")
-        self.btn_send_workshop.setEnabled(False)
-        self.btn_send_workshop.setToolTip("Send current image to Workshop tab for editing")
-        self.btn_send_workshop.clicked.connect(self._send_to_workshop)
-        s_save.body_layout.addWidget(self.btn_send_workshop)
         row2c = QHBoxLayout()
         self.cb_save_overlay = QCheckBox("Save with overlay")
         self.cb_save_overlay.setToolTip("When saving, burn overlays (cross/circle/square) and PV values into the image")
@@ -14049,6 +14868,15 @@ class Viewer(QWidget):
         self.btn_reset_zoom.setToolTip("Reset zoom to full image (right-click drag to zoom in)")
         self.btn_reset_zoom.clicked.connect(self._on_reset_zoom)
         s_disp.body_layout.addWidget(self.btn_reset_zoom)
+        # Undo tile dragging. Only multi-camera has an arrangement, so the button is
+        # enabled by _switch_to_multi_view and greyed out again for one camera.
+        self.btn_reset_layout = QPushButton("⛶ Reset layout")
+        self.btn_reset_layout.setToolTip(
+            "Put the cameras back the way this set was opened: the arrangement saved\n"
+            "for these cameras, or the automatic one if none is saved")
+        self.btn_reset_layout.setEnabled(False)
+        self.btn_reset_layout.clicked.connect(self._on_reset_layout)
+        s_disp.body_layout.addWidget(self.btn_reset_layout)
         # camera label size (moved here from old Camera Labels Settings group)
         row_cam_font = QHBoxLayout()
         row_cam_font.addWidget(QLabel("Label size:"))
@@ -14652,6 +15480,15 @@ class Viewer(QWidget):
         info_title_row.addWidget(self._online_dot_top)
         ilay.addLayout(info_title_row)
 
+        # Trips, at the very top of the panel and above everything else in the left
+        # column: a value past its limit, or a camera that stopped delivering, with the
+        # button that takes the picture back to the shot it happened on. Invisible
+        # until something trips.
+        self._trip_box = _TripBox()
+        self._trip_box.see_trip.connect(self._goto_trip)
+        self._trip_box.clear_trips.connect(self._trip_clear_all)
+        ilay.addWidget(self._trip_box)
+
         # Date / Range table — one row per picked day, so a multi-day selection costs
         # one line per day instead of one wrapped paragraph. See _set_range_display.
         self._range_table = QWidget()
@@ -14837,6 +15674,13 @@ class Viewer(QWidget):
         else:
             self.img_view.reset_zoom()
 
+    def _on_reset_layout(self):
+        """Back to the arrangement this camera set was opened with — its saved one if it
+        has one, the automatic one if not. Nothing to do with one camera."""
+        if not self._is_multi_cam():
+            return
+        self._multi_grid.reset_layout()
+
     def _toggle_draw_mode(self, mode: str):
         iv = self._active_img_view()
         iv.set_draw_mode("" if iv._draw_mode == mode else mode)
@@ -14987,7 +15831,7 @@ class Viewer(QWidget):
     def _open_pv_config(self):
         dlg = PvConfigDialog(self._pv_enabled, PV_CUSTOM_CHANNELS, PV_DERIVED,
                              PV_LABELS, hidden=self._pv_hidden,
-                             units=PV_CUSTOM_UNITS, parent=self)
+                             units=PV_CUSTOM_UNITS, limits=PV_LIMITS, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         PV_CUSTOM_CHANNELS.clear()
@@ -14997,6 +15841,8 @@ class Viewer(QWidget):
         PV_LABELS.update(dlg.labels())
         PV_CUSTOM_UNITS.clear()
         PV_CUSTOM_UNITS.update(dlg.custom_units())
+        PV_LIMITS.clear()
+        PV_LIMITS.update(dlg.limits())
         self._pv_enabled = dlg.selected_names()
         # The eye now has TWO editors — this dialog's Show column and the sidebar
         # table — over one state. The dialog is authoritative on the way out.
@@ -15011,6 +15857,16 @@ class Viewer(QWidget):
         self._pv_last_good_ts = {}
         self._pv_no_sample = set()
         self._pv_awaiting = set()
+        # The limits may have just changed under the alarm. An "over" flag left from the
+        # old threshold would either keep flashing at a limit nobody set any more, or
+        # swallow the first crossing of the new one.
+        self._pv_numbers = {}
+        self._pv_alarm_names = set()
+        self._pv_err_since = {}
+        for _t in list(self._pv_over.values()):
+            self._trip_close(_t)
+        self._pv_over = {}
+        self._alarm_sync_timer()
         # Persist. The REGISTRY (added PVs, formulas, names, units) goes to the shared
         # store — the Image Finder edits the same one — while what stays here is this
         # tab's own selection and eye state. An added PV or a typed formula is kept even
@@ -15048,7 +15904,8 @@ class Viewer(QWidget):
         self._pv_no_pv_lbl.setVisible(not has)
         if not has:
             return
-        self._pv_table.refresh(self._pv_enabled, self._pv_hidden, self._pv_row_value)
+        self._pv_table.refresh(self._pv_enabled, self._pv_hidden, self._pv_row_value,
+                               alarm=self._pv_alarm_names)
 
     def _pv_row_value(self, name: str) -> "tuple[str, bool, str]":
         """(text, grey, tooltip) for one row of the PV table.
@@ -15351,6 +16208,12 @@ class Viewer(QWidget):
             results: dict[str, str] = {}
             raw: dict = {}
             sts: dict = {}
+            # The NUMBERS behind the text, for the alarm limits. The panel is handed
+            # finished strings on purpose (units, held-value flags, quantised steps),
+            # and re-reading a threshold out of one of those would compare a number to
+            # a label. Only names that were asked for, and only when a real reading
+            # came back — a held or errored value must not be measured against a limit.
+            nums: dict = {}
             try:
                 with ThreadPoolExecutor(
                         max_workers=min(len(sources), PV_FETCH_MAX_WORKERS)) as ex:
@@ -15361,6 +16224,8 @@ class Viewer(QWidget):
                             raw[name], sts[name] = val, status
                             if name in names:
                                 results[name] = txt
+                                if val is not None and status in ("ok", "approx"):
+                                    nums[name] = val
                         except Exception:
                             nm = futs[fut]
                             raw[nm], sts[nm] = None, "error"
@@ -15373,10 +16238,15 @@ class Viewer(QWidget):
                                        else cpva.PV_TEXT_NOT_FOUND)
                     else:
                         results[nm] = _pv_decorate(pv_format_value(nm, val), status)
+                        if status in ("ok", "approx"):
+                            nums[nm] = val
             finally:
                 # ALWAYS emit — _pv_on_result must clear the in-flight flag,
                 # otherwise one crashed fetch would freeze the overlay forever.
-                self._pv_signals.result.emit(gen, results)
+                # The pair (text, numbers) travels as one object: the signal has one
+                # producer and one consumer, and a second signal for the numbers could
+                # arrive out of step with the text they belong to.
+                self._pv_signals.result.emit(gen, (results, nums))
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -15398,7 +16268,14 @@ class Viewer(QWidget):
             cpva.invalidate_lookback()
         self._pv_trigger_fetch()
 
-    def _pv_on_result(self, gen: int, results: dict):
+    def _pv_on_result(self, gen: int, payload):
+        # payload is (text, numbers) — see the emit in _pv_trigger_fetch_now. Unpacked
+        # tolerantly so a plain dict (an older in-flight fetch across a reload) still
+        # applies its values instead of raising on the GUI thread.
+        if isinstance(payload, tuple) and len(payload) == 2:
+            results, nums = payload
+        else:
+            results, nums = payload, {}
         # A fetch the watchdog already wrote off (PV_FETCH_WATCHDOG_S) may still come
         # back minutes later. Ignore it completely: a newer fetch owns the panel by
         # now, and clearing the in-flight flag or applying these numbers would put
@@ -15415,6 +16292,11 @@ class Viewer(QWidget):
             # it when the displayed frame has moved on since.
             self._pv_values_ts = getattr(self, "_pv_fetch_ts", None)
             self._pv_values.update(self._pv_apply_last_good(results))
+            # Before the table and the overlay are rebuilt: the alarm decides which
+            # rows are painted red, so it has to be settled first or every trip would
+            # show one refresh late.
+            self._pv_numbers = dict(nums)
+            self._pv_check_limits(self._pv_values_ts, nums, results)
             self._pv_rebuild_table()
             self._pv_update_overlay()
         if getattr(self, "_pv_fetch_dirty", False):
@@ -15700,6 +16582,220 @@ class Viewer(QWidget):
             if _ov is not None and _ov.is_popped_out():
                 _ov.parentWidget().setVisible(_ov.isVisible())
 
+    # ─────────────────────────────────── trips (limits, failed reads) ──────────
+    def _trip_add(self, kind: str, key: str, ts_ns: "int | None",
+                  text: str, detail: str = "") -> "_Trip | None":
+        """Open a trip, or count one more shot onto the one already open for `key`.
+
+        Coalescing is HERE and not in the caller: both callers run per shot (a PV fetch,
+        a 600 ms health tick), and a fault that lasts ten seconds must be one line in
+        the panel with a count, not thirty lines nobody can read."""
+        openmap = self._pv_over if kind == "pv" else self._cam_fault_trip
+        cur = openmap.get(key)
+        if cur is not None and cur.open:
+            cur.count += 1
+            self._trip_refresh_ui()
+            return cur
+        t = _Trip(kind, key, int(ts_ns or 0), text, detail)
+        self._trips.append(t)
+        openmap[key] = t
+        if len(self._trips) > TRIPS_MAX:
+            # Oldest go first, and any of them that were still open lose their slot in
+            # the open-trip maps too — otherwise the next repeat would count onto a
+            # trip that is no longer in the list.
+            for gone in self._trips[:-TRIPS_MAX]:
+                for m in (self._pv_over, self._cam_fault_trip):
+                    if m.get(gone.key) is gone:
+                        m.pop(gone.key, None)
+            del self._trips[:-TRIPS_MAX]
+        diag_note(f"TRIP {kind} {key}: {text} @ "
+                  f"{fmt_prague_full_from_ns(t.ts_ns) if t.ts_ns else 'no frame'}")
+        self._trip_refresh_ui()
+        return t
+
+    def _trip_close(self, trip: "_Trip | None"):
+        """The thing that was going wrong has stopped. The entry stays — it is the
+        record of a shot worth looking at, and it is still worth looking at afterwards."""
+        if trip is not None and trip.open:
+            trip.open = False
+            self._trip_refresh_ui()
+
+    def _trip_clear_all(self):
+        """Clear trips: forget the lot and stop the warning flashing.
+
+        The open-trip maps go with the list, so a value that is STILL over its limit
+        opens a fresh trip on the next fetch rather than silently counting onto an
+        entry the operator has just thrown away."""
+        self._trips = []
+        self._pv_over = {}
+        self._cam_fault_trip = {}
+        self._trip_refresh_ui()
+
+    def _trips_unseen(self) -> bool:
+        """True while some trip has not been looked at. This is what keeps the panel
+        flashing after the shot has passed."""
+        return any(not t.acked for t in self._trips)
+
+    def _trip_refresh_ui(self):
+        if self._trip_box is not None:
+            self._trip_box.refresh(self._trips)
+        self._alarm_sync_timer()
+
+    def _goto_trip(self, trip: "_Trip"):
+        """See trip — put the picture on the shot this trip happened on."""
+        trip.acked = True
+        if not self.items or not trip.ts_ns:
+            # Nothing loaded, or a fault with no frame behind it (an unreadable folder
+            # never produced one). Say so rather than jumping somewhere arbitrary.
+            self._trip_refresh_ui()
+            self.lbl_ts_status.setText(
+                "That trip has no frame to jump to — nothing was read at the time.")
+            return
+        # Live mode drags the slider to the newest frame on every arrival, so it has to
+        # go first or the shot would be on screen for a fraction of a second.
+        if getattr(self, "_auto_follow", False):
+            self._btn_auto_follow.setChecked(False)
+        if trip.kind == "image" and self._is_multi_cam():
+            # The tile that failed may still be cached as the frame that could not be
+            # read. Drop it and the coalescing gate so the jump really goes back to
+            # the share for it.
+            try:
+                cam_i = int(trip.key[3:])
+            except ValueError:
+                cam_i = -1
+            if 0 <= cam_i < len(self._cam_items):
+                self._invalidate_cam_ckeys(cam_i)
+            self._reset_cam_pipeline()
+        self._jump_to_saved_ts(trip.ts_ns, f"trip — {trip.text}")
+        # Read the values again for that moment: what is in the panel came from
+        # wherever the timeline was a second ago.
+        self._pv_force_refresh()
+        self._trip_refresh_ui()
+
+    # ─────────────────────────────────── the out-of-limits flash ───────────────
+    def _alarm_blink_steps(self) -> tuple:
+        """The flash cycle as it stands: which panel states it walks through.
+
+        Two independent reasons to flash, and they are deliberately not the same
+        lifetime. The VALUE flashes only while the shot that tripped is on screen —
+        the operator asked for it to stop by itself when the next shot arrives. The
+        PANEL flashes while a trip has not been looked at, which outlives the shot,
+        and only if that style was chosen."""
+        text_on = bool(self._pv_alarm_names)
+        bg_on = (self._pv_alarm_style == "text+bg") and self._trips_unseen()
+        if text_on and bg_on:
+            return (0, 1, 2)
+        if bg_on:
+            return (0, 2)
+        if text_on:
+            return (0, 1)
+        return ()
+
+    def _alarm_sync_timer(self):
+        """Run the blink timer only while there is something to blink."""
+        steps = self._alarm_blink_steps()
+        if steps:
+            if not self._pv_alarm_timer.isActive():
+                self._pv_alarm_step = 0
+                self._pv_alarm_timer.start()
+        else:
+            if self._pv_alarm_timer.isActive():
+                self._pv_alarm_timer.stop()
+            self._pv_alarm_phase = 0
+            self._alarm_push_phase(0)
+
+    def _alarm_push_phase(self, phase: int):
+        for ov in (getattr(self, "_pv_overlay", None),
+                   getattr(self, "_pv_overlay_multi", None)):
+            if ov is not None:
+                ov.set_alarm_phase(phase)
+
+    def _on_alarm_blink(self):
+        steps = self._alarm_blink_steps()
+        if not steps:
+            self._alarm_sync_timer()
+            return
+        self._pv_alarm_step = (getattr(self, "_pv_alarm_step", 0) + 1) % len(steps)
+        self._pv_alarm_phase = steps[self._pv_alarm_step]
+        self._alarm_push_phase(self._pv_alarm_phase)
+
+    def _pv_check_read_errors(self, texts: dict):
+        """A PV the archiver will not answer for is its own trip.
+
+        Not on the first failure: one failed read is ordinary and the next fetch
+        usually has it. Only once a PV has been failing for PV_ERROR_TRIP_S — by then
+        it is a channel that has stopped, not a hiccup, and the panel has been showing
+        a held number all that time.
+
+        Monotonic clock throughout: this PC's clock runs ~25 s ahead of the facility's,
+        so anything measured against the wall clock here would be wrong from the start."""
+        errs = getattr(self, "_pv_err_since", None)
+        if errs is None:
+            errs = self._pv_err_since = {}
+        now = time.monotonic()
+        for name, txt in texts.items():
+            if txt == cpva.PV_TEXT_ERROR:
+                first = errs.setdefault(name, now)
+                if (now - first) >= PV_ERROR_TRIP_S:
+                    self._trip_add(
+                        "pv", f"err:{name}", self._pv_values_ts,
+                        f"{pv_label_for(name)} cannot be read",
+                        detail=("The archiver has been refusing this channel for "
+                                f"{now - first:.0f} s. The panel is showing the last "
+                                "number it did get, if there was one."))
+            elif name in errs:
+                errs.pop(name, None)
+                self._trip_close(self._pv_over.pop(f"err:{name}", None))
+
+    def _pv_limit_wording(self, name: str, v: float, lo, hi) -> str:
+        """The trip line for one PV, in the words on the screen: the operator's own
+        name for it, the number as the panel prints it, and the limit it passed."""
+        shown = self._pv_display_text(name, flag=False)
+        if hi is not None and v > hi:
+            edge = f"above {hi:g}"
+        elif lo is not None and v < lo:
+            edge = f"below {lo:g}"
+        else:
+            edge = "out of limits"
+        return f"{pv_label_for(name)} {shown} — {edge}"
+
+    def _pv_check_limits(self, ts_ns: "int | None", nums: dict,
+                         texts: "dict | None" = None):
+        """Measure this fetch's numbers against the limits and keep the trip list up
+        to date. Runs on the GUI thread, once per completed fetch.
+
+        `texts` is the fetch's RAW result strings, before the last-good substitution —
+        the only place a PV that could not be read at all still says so."""
+        self._pv_check_read_errors(texts or {})
+        alarm: set = set()
+        for name in self._pv_enabled:
+            lo, hi = pv_limits_for(name)
+            if lo is None and hi is None:
+                # The limit was taken away while a trip was open on it: close it, or a
+                # PV nobody is watching any more would keep the panel flashing.
+                self._trip_close(self._pv_over.pop(name, None))
+                continue
+            v = nums.get(name)
+            # No reading for THIS shot is not the same as being back inside the limits.
+            # An errored, unpublished or held-over value is no evidence either way, so
+            # an open trip is left exactly as it is.
+            if v is None or self._pv_is_held(name):
+                continue
+            if (lo is not None and v < lo) or (hi is not None and v > hi):
+                alarm.add(name)
+                self._trip_add("pv", name, ts_ns,
+                               self._pv_limit_wording(name, v, lo, hi),
+                               detail=("Limit: "
+                                       + " and ".join(
+                                           x for x in (
+                                               f"not below {lo:g}" if lo is not None else "",
+                                               f"not above {hi:g}" if hi is not None else "")
+                                           if x)))
+            else:
+                self._trip_close(self._pv_over.pop(name, None))
+        self._pv_alarm_names = alarm
+        self._alarm_sync_timer()
+
     def _pv_update_overlay(self):
         """Refresh the floating PV overlay panel."""
         overlay = getattr(self, "_pv_overlay", None)
@@ -15733,13 +16829,16 @@ class Viewer(QWidget):
         # is named after its channel, which is far too long to read over a picture.
         rows = [(pv_label_for(name), self._pv_display_text(name, flag=False))
                 for name in shown]
+        # The panel is handed finished text and knows nothing about PVs, so the alarm
+        # travels in the same currency as the rows: the names AS PRINTED.
+        alarm = {pv_label_for(n) for n in shown if n in self._pv_alarm_names}
 
         if is_multi:
             if overlay is not None:
                 overlay.setVisible(False)
             if overlay_multi is not None:
                 overlay_multi.update_values(rows, pending=pending, held=held,
-                                            waiting=waiting)
+                                            waiting=waiting, alarm=alarm)
                 overlay_multi.ensure_inside_parent()
                 overlay_multi.raise_()
                 overlay_multi.setVisible(True)
@@ -15748,7 +16847,7 @@ class Viewer(QWidget):
                 overlay_multi.setVisible(False)
             if overlay is not None:
                 overlay.update_values(rows, pending=pending, held=held,
-                                      waiting=waiting)
+                                      waiting=waiting, alarm=alarm)
                 overlay.ensure_inside_parent()
                 overlay.setVisible(True)
         self._pv_sync_popout_visibility()
@@ -15818,11 +16917,26 @@ class Viewer(QWidget):
                     ov.apply_settings(font_sb.value(), font_cb.currentText(),
                                       opacity_sl.value(), _font_color[0], _bg_color[0])
 
+        # How an out-of-limits value asks to be noticed. The limits themselves are set
+        # per PV in "Select PV channels"; this is only what the panel does about them.
+        alarm_cb = QComboBox()
+        alarm_cb.addItem("Flash the value", "text")
+        alarm_cb.addItem("Flash the value, then the whole panel", "text+bg")
+        _ai = alarm_cb.findData(self._pv_alarm_style)
+        alarm_cb.setCurrentIndex(_ai if _ai >= 0 else 0)
+        alarm_cb.setToolTip(
+            "What happens when a PV goes past the Min or Max set for it in\n"
+            "\"Select PV channels\".\n\n"
+            "The value stops flashing by itself as soon as the next shot comes in.\n"
+            "The whole-panel flash keeps going until you press \"Clear trips\" in the\n"
+            "Info panel, so a trip cannot pass unnoticed while you are looking away.")
+
         lay.addRow("Font size (px):", font_sb)
         lay.addRow("Font:", font_cb)
         lay.addRow("Background opacity:", opacity_row)
         lay.addRow("Font color:", fc_btn)
         lay.addRow("Background color:", bc_btn)
+        lay.addRow("Out of limits:", alarm_cb)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -15834,6 +16948,16 @@ class Viewer(QWidget):
             for ov in [overlay, overlay2]:
                 if ov is not None:
                     ov.apply_settings(orig_fs, orig_ff, orig_op, orig_fc, orig_bc)
+            return
+        self._pv_alarm_style = alarm_cb.currentData() or "text"
+        # Switching away from the whole-panel flash has to take the red off NOW, not at
+        # the next tick — the timer may not even be running any more.
+        self._alarm_sync_timer()
+        self._pv_save_overlay_style()
+
+    def _pv_save_overlay_style(self):
+        self._ui_state["pv_alarm_style"] = self._pv_alarm_style
+        self._save_ui_state()
 
     def _pv_text(self) -> str:
         """Return a formatted single-line PV string for burn-in under saved images.
@@ -16041,11 +17165,13 @@ class Viewer(QWidget):
         self.pointing_panel.setVisible(False)
         self._img_pointing_row.setStretch(self._img_pointing_row.indexOf(self._multi_grid), 1)
         self._multi_grid.setVisible(True)
+        self.btn_reset_layout.setEnabled(True)
         QTimer.singleShot(0, self._pv_update_overlay)
 
     def _switch_to_single_view(self):
         self._single_wrapper.setVisible(True)
         self._multi_grid.setVisible(False)
+        self.btn_reset_layout.setEnabled(False)
         self._per_cam_scroll.setVisible(False)
         self.slider.setVisible(True)
         self._slider_pad_row.setVisible(True)
@@ -17698,6 +18824,13 @@ class Viewer(QWidget):
         _live_health, where it belongs."""
         self._online_blink_state = not self._online_blink_state
         state, tip, _reason = self._live_health_summary()
+        if not self._is_multi_cam():
+            # Single-cam has no tile dots, so _on_cam_dot_blink returns before it can
+            # record anything. This is the only loop that evaluates the verdict here,
+            # so the trip has to be raised from it. Multi-cam is left alone — there the
+            # per-tile loop names WHICH camera, and doing it twice would open a second
+            # entry for the same fault.
+            self._note_cam_fault_trip(0, state, tip, _reason)
         if state == "fault":
             color = "#cc2222" if self._online_blink_state else "#660000"
         elif state == "active":
@@ -22526,6 +23659,56 @@ class Viewer(QWidget):
             return False
         return abs(shown - master_ts) > SLAVE_SYNC_MAX_NS
 
+    def _note_cam_fault_trip(self, cam_i: int, state: str, tip: str, reason: str):
+        """Turn the live-health verdict for one camera into a trip.
+
+        Driven off _live_health rather than off the failures themselves, deliberately:
+        that verdict is already latched over 8 s and already knows the difference
+        between a frame caught mid-write and a pipeline that has stopped. Counting raw
+        failures here would fill the list with frames the program had already recovered
+        from by the next tick.
+
+        This runs every 600 ms, so nothing here may open a second entry while the same
+        fault is still going — that is what the open-trip map is for."""
+        key = f"cam{cam_i}"
+        if state != "fault":
+            self._trip_close(self._cam_fault_trip.pop(key, None))
+            return
+        # The frame it happened on: the one that could not be read when there is one,
+        # otherwise the newest the camera knows about. A folder that cannot be listed
+        # has neither, and the trip then simply has no shot to jump to.
+        ts = _at(getattr(self, "_cam_read_fail_ts", []), cam_i, 0) or \
+             _at(getattr(self, "_cam_arrived_ts_ns", []), cam_i, 0)
+        if not self._is_multi_cam():
+            # One camera on screen — naming it by its slot ("camera 1") says nothing,
+            # and _cam_names can still hold the names of a previous multi-cam session.
+            name = "Camera"
+        elif cam_i < len(getattr(self, "_cam_names", [])):
+            name = _strip_cam_name(self._cam_names[cam_i])
+        else:
+            name = f"camera {cam_i + 1}"
+        # The tooltip's first line is already the fault in the operator's words; the
+        # panel is 275 px wide, so only that line goes in the row.
+        head = (tip or "not refreshing").split("\n")[0]
+        head = head.replace("NOT REFRESHING: ", "")
+        cur = self._cam_fault_trip.get(key)
+        if cur is not None and cur.open:
+            # Read failures have a real count (frames that would not decode). The other
+            # four faults do not — counting 600 ms ticks would print "×340" for a fault
+            # that is one event lasting three minutes.
+            if reason == "read":
+                n = max(cur.count, _at(self._cam_read_fail, cam_i, 1) or 1)
+                # Only when the number actually moved. This runs every 600 ms for as
+                # long as the fault lasts, and repainting the box on every tick would
+                # be work nobody can see.
+                if n != cur.count:
+                    cur.count = n
+                    self._trip_refresh_ui()
+            return
+        t = self._trip_add("image", key, ts, f"{name} — {head}", detail=tip or "")
+        if t is not None and reason == "read":
+            t.count = max(1, _at(self._cam_read_fail, cam_i, 1) or 1)
+
     def _on_cam_dot_blink(self):
         """Per-camera refresh dots, every 600 ms.
 
@@ -22553,6 +23736,7 @@ class Viewer(QWidget):
             state, tip, _reason = self._live_health(i, now)
             cv.pulse_refresh_dot(self._cam_dot_blink_state,
                                  is_main=(i == master_i), state=state, tip=tip)
+            self._note_cam_fault_trip(i, state, tip, _reason)
 
     def _request_display_target(self, idx, axis_time_ns, update_slider):
         max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0

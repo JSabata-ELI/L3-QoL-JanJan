@@ -40,7 +40,10 @@ THE WINDOW, TOP TO BOTTOM
 
   Commit message    A short note about what you changed. It comes
                     prefilled with today's date, which is a valid
-                    note on its own. "More" opens a bigger box.
+                    note on its own. "More" opens a bigger box. An
+                    empty box means "save nothing, just send up what
+                    was already saved" — with changed files waiting
+                    you are asked before that happens.
 
   Actions           Pull, Commit + Push, Merge into main, Sync,
                     Restore stash.

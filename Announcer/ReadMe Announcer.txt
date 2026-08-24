@@ -6,56 +6,83 @@ Bugs / suggestions: jan.moucka@eli-laser.eu
 Detailed version: ReadMe_Announcer_Full.txt  ("Details" button)
 -----------------------------------------------------------------
 
-THE PROGRAM DOES TWO SEPARATE JOBS AT ONCE
+WHAT IT WATCHES
 
-  1. It watches a rectangle of the screen you draw yourself, and
-     raises an alarm — a flashing image or colour, plus a sound — as
-     soon as what is drawn there changes. Good for a camera window,
-     a status display, or any indicator you cannot sit and stare at.
+  You give it a list of conditions — things that have to stay true.
+  While it is watching, it checks all of them twice a second, and the
+  moment one of them stops being true it raises the alarm: a flashing
+  image or colour, a sound, and the sentence you wrote for that
+  condition.
 
-  2. While it is watching, it also reads eight machine values twice
-     a second and shows a coloured badge for each one that is out of
-     range: the helium pressure, the Alpha voltage, and how far each
-     of the six chillers is from its setpoint. There is nothing to
-     set up for this half — but note that it only runs while the
-     screen watch is running. Press Start and the badges start
-     working; stop watching and they go away.
+  A condition is one of two things:
 
+    Screen area   a rectangle of a screen still looks the way it did
+                  when you took its reference picture. Good for a
+                  status box, a warning lamp, a number, a camera
+                  window — anything drawn on a screen.
+    Value         a machine value stays under its limit. Two limits:
+                  the first only shows a warning badge, the second
+                  raises the alarm.
 
-HOW THE SCREEN WATCH WORKS
-
-  It takes a picture of your rectangle, keeps it as the reference,
-  and then takes another one twice a second. If the average
-  difference between the new picture and the reference is bigger than
-  the threshold, that counts as a change and the alarm goes off.
-
-  So it does not understand what it is looking at. It only knows that
-  the picture is no longer the same one. That is what makes it work
-  on anything.
+  It also shows badges for eight machine values that are out of
+  range — the helium pressure, the Alpha voltage, and how far each of
+  the six chillers is from its setpoint. Nothing to set up for those,
+  but they are only read while it is watching.
 
 
-SETTING IT UP
+HOW THE SCREEN AREA CHECK WORKS
 
-  1. Pick the monitor from the dropdown. "Identify" puts a number on
-     each screen for three seconds so you can tell which is which.
-  2. Press "Set reference". The screen dims; drag out the rectangle
-     you want watched and let go. Esc cancels.
-  3. Press Start. The circle turns green.
+  It keeps the reference picture and takes a new one twice a second.
+  If the average difference between them is bigger than the number
+  you set, that counts as a change.
 
-  The arrow button re-takes the reference picture without asking you
-  to draw the rectangle again — use it when the thing you are
-  watching has legitimately changed and you want the new state to
-  count as normal.
+  So it does not understand what it is looking at. It only knows the
+  picture is no longer the same one. That is what makes it work on
+  anything.
 
-  "Preview region" shows you what is inside the rectangle right now.
+
+SETTING UP A CONDITION
+
+  Screen area:
+  1. Press "Add screen area" and give it a name and the sentence you
+     want to see when it fires.
+  2. Pick the monitor and press "Draw area". The screen dims; drag
+     out the rectangle and let go. Esc cancels. The reference picture
+     is taken straight away and shown underneath.
+  3. Save. Tick it in the On column.
+
+  Value:
+  1. Press "Add value". The back-reflection energy is filled in for
+     you; any other PV name can be typed instead.
+  2. "Read now" shows what that value has been doing over the last
+     minute, so you can pick the two limits from a real number
+     instead of guessing.
+  3. Fill in "Warn over" and "Trip over" and save. Leave a box empty
+     to switch that level off.
+
+  The arrow button under the list re-takes the reference picture of
+  the selected screen condition — use it when what you are watching
+  has changed for a good reason and the new state should count as
+  normal.
+
+  A value condition needs no rectangle at all: with only value
+  conditions in the list, Start still works.
+
+
+THE OLD SINGLE-RECTANGLE WATCH
+
+  "Set reference" at the top still draws one quick rectangle without
+  giving it a name, and "Preview region" shows what is inside it. It
+  is watched alongside the conditions. Use it for a one-off; use a
+  condition for anything you want to keep.
 
 
 THE CIRCLE IS THE WHOLE STATE
 
-  Grey     no rectangle set yet
-  Orange   rectangle set, not watching
+  Grey     nothing to watch yet
+  Orange   ready, not watching
   Green    watching
-  Red      a change was detected, the alarm is up
+  Red      something fired, the alarm is up
 
 
 WHEN THE ALARM GOES OFF
@@ -64,8 +91,17 @@ WHEN THE ALARM GOES OFF
   chosen colour or just the chosen image, and a sound plays.
   Watching stops by itself, so it does not keep re-alarming.
 
+  The sentence you wrote for that condition appears as a red badge on
+  the small overlay and in the message log, so it is still readable
+  after the flashing has been dismissed.
+
   Click the flashing area, or press Esc, to dismiss it and come back
   to the control window.
+
+  A value that cannot be read never fires the alarm — the reason goes
+  into the message log instead. A condition that cannot fire at all
+  (a screen area with no reference, a value with no trip limit) says
+  so in the log when you press Start.
 
 
 THE MACHINE VALUE BADGES
@@ -88,7 +124,10 @@ THE MACHINE VALUE BADGES
 
 THINGS THAT SAVE YOU WORK
 
-  - Region presets: save the rectangle under a name and load it
+  - The conditions, their reference pictures and their limits are all
+    kept in the settings file next to the program, so they are there
+    again next time.
+  - Region presets: save the quick rectangle under a name and load it
     again instead of drawing it.
   - Window positions are remembered, either globally or per preset,
     and they are recorded by dragging the window where you want it —

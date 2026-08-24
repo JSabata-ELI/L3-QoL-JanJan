@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-20  (remote_launcher.py, 464 lines)
+Verified against source: 2026-08-20  (remote_launcher.py, 491 lines)
 -----------------------------------------------------------------
 Short version: ReadMe_Diagnostic Webex listener.txt ("ReadMe" button)
 Code map:      STRUCTURE.md  (in the Diagnostic folder)
@@ -105,7 +105,8 @@ Diagnostic is not.
                                      names the version, or "source"
   ✅ Done — runs and tracks           confirmed from the program itself
   ℹ️ Already runs                     nothing was started
-  ℹ️ Already runs, but not tracking   press Start monitoring in the app
+  ℹ️ Already runs, but not tracking   send @Diagnostics /start (or press
+                                      Start monitoring in the app)
   ⛔ Not allowed                      the sender is not on the allowlist
   ❌ Could not be started             no build, no Python, or the launch
                                      itself failed — the reason is in
@@ -113,7 +114,8 @@ Diagnostic is not.
   ❌ Ended right after starting       it started and died; the exit code
                                      is in the message
   ⚠️ Runs, but monitoring did not
-     switch itself on                 use the Start monitoring button
+     switch itself on                 send @Diagnostics /start, or use
+                                      the Start monitoring button
   ⚠️ Runs, but does not report its
      state                            that build is older than this
                                       feature — rebuild Diagnostic

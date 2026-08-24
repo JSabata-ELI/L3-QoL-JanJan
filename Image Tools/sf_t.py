@@ -33,7 +33,7 @@ except ImportError:
     PRAGUE = None
 
 from PySide6.QtCore import Qt, QDate, QObject, Signal, QTimer, QEvent
-from PySide6.QtGui import QColor, QTextCharFormat, QPixmap
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QLineEdit,
@@ -119,7 +119,8 @@ SF_GRADIENTS: dict = {
     "Binary":          _make_ni_binary_lut_sf(),
     "False Colors":    _make_lut_sf(_FALSE_COLORS_STOPS_SF),
     "Rainbow":         _make_lut_sf(_RAINBOW_STOPS_SF),
-    "Hot":             _make_lut_sf([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
+    # Red / yellow lowered, pale yellow added, white kept at the top; see is_t.py.
+    "Hot":             _make_lut_sf([(0,(0,0,0)),(0.27,(255,0,0)),(0.53,(255,255,0)),(0.78,(255,255,190)),(1,(255,255,255))]),
     "Black and White": _make_binary_lut_sf(),
     "Viridis":         _make_lut_sf([(0,(68,1,84)),(0.25,(59,82,139)),(0.5,(33,145,140)),(0.75,(94,201,98)),(1,(253,231,37))]),
     "Plasma":          _make_lut_sf([(0,(13,8,135)),(0.25,(126,3,168)),(0.5,(204,71,120)),(0.75,(248,149,64)),(1,(240,249,33))]),
@@ -165,11 +166,11 @@ _PV_NAME_FONT_PX = 10          # keep in sync with _CHECKBOX_STYLE_SM's font-siz
 _CHECKBOX_STYLE_SM = _CHECKBOX_STYLE + f"QCheckBox {{ font-size: {_PV_NAME_FONT_PX}px; }}"
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-IMAGES_ROOT_OPTIONS = {
-    "Lab":    Path(r"//users-L3.tier0.lcs.local/cpva-image-2026"),
-    "Office": Path(r"\\users-L3.tier0.lcs.local\cpva-image-2026"),
-}
-IMAGES_ROOT = IMAGES_ROOT_OPTIONS["Lab"]   # default; overridden by UI combo
+# One archive, one path. A Lab / Office switch used to sit on the panel, but both of
+# its entries named the SAME share (only the slash style differed), the images are
+# reached the same way from the lab and from the office, and the CSV fallback below is
+# dormant — so the switch could only ever be set wrong, never usefully.
+IMAGES_ROOT = Path(r"//users-L3.tier0.lcs.local/cpva-image-2026")
 
 
 def _images_root_for_year(images_root: Path, year: int) -> Path:
@@ -186,12 +187,8 @@ def _images_root_for_year(images_root: Path, year: int) -> Path:
 # this fallback yields nothing for recent days — energy comes from the CPVA archiver
 # alone. Kept wired up on purpose: historical days still have their CSV, and the
 # fallback costs nothing until the archiver answers a day with no samples.
-ENERGY_CSV_ROOT_OPTIONS = {
-    "Lab":    r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata",
-    "Office": r"Z:\Salvation\2026_alldata",
-}
 # CSV fallback — same root / format as Image Finder
-ENERGY_CSV_ROOT     = ENERGY_CSV_ROOT_OPTIONS["Lab"]
+ENERGY_CSV_ROOT     = r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata"
 ENERGY_CSV_NAME_FMT = "dataof%Y%b_%d"   # e.g. dataof2026Mar_24
 # Tolerance for closest-timestamp extra-column matching (seconds).
 # PV channels (esp. Back_Ref / waveplate) are sampled sparsely, so a too-tight
@@ -903,52 +900,6 @@ class _PreviewSignals(QObject):
 class _ChannelSignals(QObject):
     loaded = Signal(list)  # archiver channel names
 
-# ── CALENDAR DELEGATE ─────────────────────────────────────────────────────────
-
-class _WeekendDelegate(QStyledItemDelegate):
-    def initStyleOption(self, option, index):
-        super().initStyleOption(option, index)
-        col = index.column()
-        if col < 1:
-            return
-        date_val = index.data(Qt.ItemDataRole.UserRole)
-        if isinstance(date_val, QDate) and date_val.isValid():
-            if date_val.dayOfWeek() in (6, 7):
-                option.palette.setColor(option.palette.ColorRole.Text, QColor("#cc0000"))
-                option.palette.setColor(option.palette.ColorRole.ButtonText, QColor("#cc0000"))
-            return
-        if col in (6, 7):
-            option.palette.setColor(option.palette.ColorRole.Text, QColor("#cc0000"))
-            option.palette.setColor(option.palette.ColorRole.ButtonText, QColor("#cc0000"))
-
-
-class _NoScrollCalendar(QCalendarWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._noscroll_installed = set()
-
-    def _install_on_all_children(self):
-        from PySide6.QtWidgets import QAbstractScrollArea
-        for child in self.findChildren(QAbstractScrollArea):
-            if id(child) not in self._noscroll_installed:
-                child.installEventFilter(self)
-                child.viewport().installEventFilter(self)
-                self._noscroll_installed.add(id(child))
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._install_on_all_children()
-
-    def wheelEvent(self, event):
-        event.accept()
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.Wheel:
-            event.accept()
-            return True
-        return super().eventFilter(obj, event)
-
-
 class _NoScrollComboBox(QComboBox):
     def wheelEvent(self, event):
         event.ignore()
@@ -971,6 +922,23 @@ def _group_label(text: str) -> QLabel:
         "letter-spacing: 1px; padding-top: 2px;"
     )
     return lbl
+
+
+# Panel group boxes: the Image Slider's own CollapsibleSection, so a group here has
+# the same coloured header, the same click-to-fold behaviour and the same pale wash
+# of the header colour behind its controls as the groups in the Slider and Workshop.
+_SECTION_ACCENTS = {
+    "time":    "#2f6fd0",   # blue
+    "pv":      "#1a9e9e",   # teal
+    "cameras": "#2e9e5b",   # green
+    "search":  "#c0392b",   # red
+    "display": "#7a4fc0",   # purple
+    "log":     "#5a5f8f",   # slate
+}
+
+
+def _section_cls():
+    return _get_slider_module().CollapsibleSection
 
 
 # ── RESULT DATA ───────────────────────────────────────────────────────────────
@@ -1077,50 +1045,34 @@ class _TimeWindowDialog(QDialog):
         if end_dt is None:
             end_dt = now
 
-        def _make_cal(init_date: datetime) -> _NoScrollCalendar:
-            cal = _NoScrollCalendar()
-            cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-            cal.setGridVisible(True)
-            cal.setNavigationBarVisible(True)
-            cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-            view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-            if view:
-                view.setItemDelegate(_WeekendDelegate(view))
-            hf = QTextCharFormat()
-            hf.setForeground(QColor("#111111"))
-            cal.setHeaderTextFormat(hf)
-            wf = QTextCharFormat()
-            wf.setForeground(QColor("#111111"))
-            for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                        Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-                cal.setWeekdayTextFormat(day, wf)
-            wf_we = QTextCharFormat()
-            wf_we.setForeground(QColor("#cc0000"))
-            for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-                cal.setWeekdayTextFormat(day, wf_we)
-            cal.setStyleSheet("""
-            QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
-            QCalendarWidget QAbstractItemView {
-                background: #fcfcfc; color: #111;
-                selection-background-color: #2d7dff; selection-color: #fff;
-                alternate-background-color: #f2f2f2; gridline-color: #d8d8d8; }
-            QCalendarWidget QTableView {
-                background: #fcfcfc;
-                selection-background-color: #2d7dff; selection-color: #fff;
-                gridline-color: #d8d8d8; outline: 0; }
-            QCalendarWidget QToolButton {
-                background: #efefef; border: 1px solid #c8c8c8;
-                padding: 3px 6px; border-radius: 4px; color: #111; }
-            QCalendarWidget QWidget#qt_calendar_navigationbar { background: #efefef; }
-            QCalendarWidget QAbstractItemView:enabled { color: #111; }
-            """)
-            cal.setSelectedDate(QDate(init_date.year, init_date.month, init_date.day))
-            return cal
+        def _make_cal(init_date: datetime) -> "tuple[QFrame, QCalendarWidget]":
+            """One calendar in the house style — literally the Image Slider's widget
+            (Monday first, gray day-name header, red weekends, white cells, month
+            button + year box instead of Qt's own nav bar), so a day looks and clicks
+            the same in every tab.
+
+            The Slider's delegate paints the selection itself, so the picked day has
+            to be handed to it — Qt's own highlight is stripped from every other cell.
+            Returns (frame_to_add, cal); the frame carries the header and nav row."""
+            frame, cal = _get_slider_module()._make_multiselect_calendar(
+                QDate(init_date.year, init_date.month, init_date.day))
+            cal.setMinimumWidth(238)
+
+            def _paint_one(d: QDate):
+                dele = getattr(cal, "_wk_delegate", None)
+                if dele is not None:
+                    dele.set_selected([d])
+                    dele.set_focus_date(d)
+
+            cal.clicked.connect(_paint_one)
+            cal._paint_one = _paint_one      # so "Now" can repaint after jumping
+            _paint_one(cal.selectedDate())
+            return frame, cal
 
         # Start section
         grp_start = QGroupBox("Start point")
         start_lay = QVBoxLayout(grp_start)
-        self._cal_start = _make_cal(start_dt)
+        self._cal_start_frame, self._cal_start = _make_cal(start_dt)
         self._hour_start = QSpinBox()
         self._hour_start.setRange(0, 23)
         self._hour_start.setValue(start_dt.hour)
@@ -1129,13 +1081,13 @@ class _TimeWindowDialog(QDialog):
         hr_start_row.addWidget(QLabel("Hour:"))
         hr_start_row.addWidget(self._hour_start)
         hr_start_row.addStretch(1)
-        start_lay.addWidget(self._cal_start)
+        start_lay.addWidget(self._cal_start_frame)
         start_lay.addLayout(hr_start_row)
 
         # End section
         grp_end = QGroupBox("End point")
         end_lay = QVBoxLayout(grp_end)
-        self._cal_end = _make_cal(end_dt)
+        self._cal_end_frame, self._cal_end = _make_cal(end_dt)
         self._hour_end = QSpinBox()
         self._hour_end.setRange(0, 23)
         self._hour_end.setValue(end_dt.hour)
@@ -1148,7 +1100,7 @@ class _TimeWindowDialog(QDialog):
         btn_now.clicked.connect(self._go_to_now)
         hr_end_row.addWidget(btn_now)
         hr_end_row.addStretch(1)
-        end_lay.addWidget(self._cal_end)
+        end_lay.addWidget(self._cal_end_frame)
         end_lay.addLayout(hr_end_row)
 
         btns = QDialogButtonBox(
@@ -1166,7 +1118,14 @@ class _TimeWindowDialog(QDialog):
 
     def _go_to_now(self):
         now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        self._cal_end.setSelectedDate(QDate(now.year, now.month, now.day))
+        qd = QDate(now.year, now.month, now.day)
+        self._cal_end.setSelectedDate(qd)
+        self._cal_end.setCurrentPage(qd.year(), qd.month())
+        # setSelectedDate does not go through clicked(), so repaint by hand or the
+        # blue day stays on the day the dialog opened on.
+        paint = getattr(self._cal_end, "_paint_one", None)
+        if paint is not None:
+            paint(qd)
         self._hour_end.setValue(now.hour)
 
     def _on_accept(self):
@@ -1231,8 +1190,8 @@ class ShotFinderWidget(QWidget):
         self._selected_cameras: list[tuple[str, str]] = []
         self._active_cam: str | None = None
 
-        self._images_root: Path = IMAGES_ROOT_OPTIONS["Lab"]
-        self._energy_csv_root: str = ENERGY_CSV_ROOT_OPTIONS["Lab"]
+        self._images_root: Path = IMAGES_ROOT
+        self._energy_csv_root: str = ENERGY_CSV_ROOT
         # The picked PVs, the names given to them and their scale factors are
         # restored HERE, before _build_ui — which must therefore not clear them.
         self._pv_cfg: list[dict] = []
@@ -1260,11 +1219,11 @@ class ShotFinderWidget(QWidget):
         super().hideEvent(event)
         # Floating Tool-window dropdowns stay on top of every other tab unless
         # they are explicitly hidden with the widget.
-        for name in ("_cam_dropdown", "_pv_dropdown"):
+        for name in ("_pv_dropdown",):
             dd = getattr(self, name, None)
             if dd is not None:
                 dd.hide()
-        for name in ("_cam_search", "_pv_search"):
+        for name in ("_pv_search",):
             le = getattr(self, name, None)
             if le is not None:
                 le.clear()
@@ -1346,23 +1305,6 @@ class ShotFinderWidget(QWidget):
                     self._btn_clear_results]:
             btn.setEnabled(not busy)
     
-    def _on_csv_source_changed(self, name: str):
-        self._energy_csv_root = ENERGY_CSV_ROOT_OPTIONS.get(name, ENERGY_CSV_ROOT_OPTIONS["Lab"])
-        self._images_root = IMAGES_ROOT_OPTIONS.get(name, IMAGES_ROOT_OPTIONS["Lab"])
-        self._log(f"Source -> {name}: images={self._images_root}  csv={self._energy_csv_root}")
-        self._all_cameras = []
-        if hasattr(self, "_cam_status_lbl"):
-            self._cam_status_lbl.setText("No cameras loaded.")
-        self._load_cameras()
-
-    def _on_source_changed(self, name: str):
-        self._images_root = IMAGES_ROOT_OPTIONS.get(name, IMAGES_ROOT_OPTIONS["Lab"])
-        self._log(f"Images source -> {name}: {self._images_root}")
-        self._all_cameras = []
-        if hasattr(self, "_cam_status_lbl"):
-            self._cam_status_lbl.setText("No cameras loaded.")
-        self._load_cameras()
-
     def _log(self, msg: str):
         if hasattr(self, "_log_box"):
             self._log_box.appendPlainText(str(msg))
@@ -1390,34 +1332,67 @@ class ShotFinderWidget(QWidget):
         ll = QVBoxLayout(lw)
         ll.setContentsMargins(0, 0, 4, 0)
         ll.setSpacing(4)
+        # The panel layout the groups themselves sit in. `ll` below is re-pointed at
+        # each group's body in turn, so everything after a group banner lands inside
+        # that group.
+        panel_lay = ll
 
-        # Time window + Source
-        ll.addWidget(_group_label("Time window & source"))
-        tw_row = QHBoxLayout()
+        # ── Collapsible groups ───────────────────────────────────────────────
+        # Same groups, same colours and the same remembered open/closed state as the
+        # Image Slider, Workshop and Image Finder panels. Which groups are open is
+        # kept in this tab's own state file next to the PV list.
+        self._sections: dict = {}
+
+        def _add_section(key, title, default_expanded=True):
+            cls = _section_cls()
+            sec = cls(title, key,
+                      bool(self._ui_state.get(f"sec_{key}", default_expanded)),
+                      accent=_SECTION_ACCENTS.get(key, "#4a78c0"))
+            sec.toggled.connect(self._on_section_toggled)
+            self._sections[key] = sec
+            panel_lay.addWidget(sec)
+            return sec
+
+        _exp_row = QHBoxLayout()
+        _exp_row.setSpacing(4)
+        _btn_exp = QPushButton("Expand all")
+        _btn_exp.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+        _btn_exp.clicked.connect(lambda: self._set_all_sections(True))
+        _btn_col = QPushButton("Collapse all")
+        _btn_col.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+        _btn_col.clicked.connect(lambda: self._set_all_sections(False))
+        _exp_row.addWidget(_btn_exp)
+        _exp_row.addWidget(_btn_col)
+        panel_lay.addLayout(_exp_row)
+
+        s_time = _add_section("time",    "Source",               True)
+        s_pv   = _add_section("pv",      "PVs",                  True)
+        s_cam  = _add_section("cameras", "Cameras",              True)
+        s_srch = _add_section("search",  "Search & Results",     True)
+        s_disp = _add_section("display", "Image / Display",      False)
+        s_log  = _add_section("log",     "Log",                  False)
+
+        # ══════════════════ Group: SOURCE ════════════════════════════════════
+        # What the search runs over: WHEN, and WHICH cameras. Two buttons, the way
+        # the Image Slider has it. The Lab / Office picker that used to sit here is
+        # gone — see IMAGES_ROOT.
+        ll = s_time.body_layout
         self._btn_time_window = QPushButton("📅  Time window")
         self._btn_time_window.setToolTip("Pick start and end date/hour for the search")
         self._btn_time_window.clicked.connect(self._open_time_window)
-        tw_row.addWidget(self._btn_time_window)
-        # Keep self._source_combo as hidden attribute for backward compat
-        self._source_combo = QComboBox()
-        for name in IMAGES_ROOT_OPTIONS:
-            self._source_combo.addItem(name)
-        self._source_combo.setVisible(False)
-        # Primary visible combo — drives both images root and CSV root
-        self._csv_source_combo = _NoScrollComboBox()
-        self._csv_source_combo.setToolTip(
-            "Root path for camera images AND energy CSV files\n"
-            "(Lab = network share, Office = mapped drive Z:)")
-        for name in ENERGY_CSV_ROOT_OPTIONS:
-            self._csv_source_combo.addItem(name)
-        self._csv_source_combo.currentTextChanged.connect(self._on_csv_source_changed)
-        tw_row.addWidget(self._csv_source_combo)
-        ll.addLayout(tw_row)
+        ll.addWidget(self._btn_time_window)
+
+        self._btn_cameras = QPushButton("📷  Cameras…")
+        self._btn_cameras.setToolTip(
+            "Choose which cameras to search — the same picker (and the same saved "
+            "presets) as the Image Slider.\n"
+            "The list is the cameras found in the picked time window.")
+        self._btn_cameras.clicked.connect(self._open_camera_picker)
+        ll.addWidget(self._btn_cameras)
 
         self._date_info_lbl = QLabel("")
         self._date_info_lbl.setStyleSheet("font-size: 10px; color: #555;")
         ll.addWidget(self._date_info_lbl)
-        ll.addWidget(_hsep())
 
         # ── PV search state ───────────────────────────────────────────────
         # ONE ordered list of picked PVs. Each entry carries its own "filter"
@@ -1432,8 +1407,9 @@ class ShotFinderWidget(QWidget):
         self._pv_suggestions: list[tuple[str, str]] = []  # (display, col_key)
         self._rebuild_pv_suggestions()
 
+        # ══════════════════ Group: PVs ══════════════════════════════════════
         # PV selection — one search box for every PV, presets and archiver alike
-        ll.addWidget(_group_label("PVs"))
+        ll = s_pv.body_layout
         self._pv_search = QLineEdit()
         self._pv_search.setPlaceholderText("search PV, or type a channel name…")
         self._pv_search.setToolTip(
@@ -1473,37 +1449,11 @@ class ShotFinderWidget(QWidget):
         self._tol_sb.setVisible(False)
         self._tol_unit_lbl = QLabel("J")
         self._tol_unit_lbl.setVisible(False)
-        ll.addWidget(_hsep())
 
-        # Camera selection
-        ll.addWidget(_group_label("Cameras"))
-        self._cam_search = QLineEdit()
-        self._cam_search.setPlaceholderText("search cameras… (e.g. PT)")
-        self._cam_search.textEdited.connect(self._on_cam_search_changed)
-        ll.addWidget(self._cam_search)
-
-        # Dropdown — Tool window místo Popup (nezabírá focus)
-        self._cam_dropdown = QTableWidget(0, 2)
-        self._cam_dropdown.setHorizontalHeaderLabels(["#", "Camera"])
-        self._cam_dropdown.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents)
-        self._cam_dropdown.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
-        self._cam_dropdown.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._cam_dropdown.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._cam_dropdown.verticalHeader().setVisible(False)
-        self._cam_dropdown.setWindowFlags(
-            Qt.WindowType.Tool |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint)
-        self._cam_dropdown.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._cam_dropdown.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self._cam_dropdown.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._cam_dropdown.clicked.connect(self._on_cam_dropdown_clicked)
-        self._cam_dropdown.setStyleSheet(
-            "QTableWidget { border: 1px solid #2d7dff; background: #fff; }"
-            "QTableWidget::item:selected { background: #2d7dff; color: #fff; }")
-
+        # ══════════════════ Group: CAMERAS ══════════════════════════════════
+        # The search box + floating suggestion list that used to sit here are what
+        # the Cameras… button now opens; the panel keeps only the picked cameras.
+        ll = s_cam.body_layout
         ll.addWidget(QLabel("Selected cameras:"))
         self._cam_selected = QTableWidget(0, 2)
         self._cam_selected.setHorizontalHeaderLabels(["#", "Camera"])
@@ -1529,7 +1479,9 @@ class ShotFinderWidget(QWidget):
         self._cam_status_lbl = QLabel("No cameras loaded.")
         self._cam_status_lbl.setStyleSheet("font-size: 10px; color: #555;")
         ll.addWidget(self._cam_status_lbl)
-        ll.addWidget(_hsep())
+
+        # ══════════════════ Group: SEARCH & RESULTS ═════════════════════════
+        ll = s_srch.body_layout
 
         # Search button
         self._btn_search = QPushButton("🔍  Search")
@@ -1571,6 +1523,9 @@ class ShotFinderWidget(QWidget):
         self._btn_send_workshop.setToolTip("Send currently previewed image to Workshop tab for editing")
         self._btn_send_workshop.clicked.connect(self._send_to_workshop)
         ll.addWidget(self._btn_send_workshop)
+
+        # ══════════════════ Group: IMAGE / DISPLAY ══════════════════════════
+        ll = s_disp.body_layout
 
         grad_row = QHBoxLayout()
         grad_row.addWidget(QLabel("Gradient:"))
@@ -1719,10 +1674,8 @@ class ShotFinderWidget(QWidget):
         self._scale_note_lbl.setWordWrap(True)
         ll.addWidget(self._scale_note_lbl)
 
-        ll.addWidget(_hsep())
-
-        # Log
-        ll.addWidget(_group_label("Log"))
+        # ══════════════════ Group: LOG ══════════════════════════════════════
+        ll = s_log.body_layout
         self._log_box = QPlainTextEdit()
         self._log_box.setReadOnly(True)
         self._log_box.setMaximumHeight(140)
@@ -1730,7 +1683,7 @@ class ShotFinderWidget(QWidget):
         self._log_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         ll.addWidget(self._log_box)
 
-        ll.addStretch(1)
+        panel_lay.addStretch(1)
         left_scroll.setWidget(lw)
 
         # ════ RIGHT PANEL ═════════════════════════════════════════════════════
@@ -2210,43 +2163,6 @@ class ShotFinderWidget(QWidget):
         if self._table.selectedIndexes():
             self._on_selection_changed()
 
-    def _setup_calendar(self, cal: _NoScrollCalendar):
-        cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-        cal.setGridVisible(True)
-        cal.setNavigationBarVisible(True)
-        cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-        view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if view:
-            view.setItemDelegate(_WeekendDelegate(view))
-        hf = QTextCharFormat()
-        hf.setForeground(QColor("#111111"))
-        cal.setHeaderTextFormat(hf)
-        wf = QTextCharFormat()
-        wf.setForeground(QColor("#111111"))
-        for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                    Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-            cal.setWeekdayTextFormat(day, wf)
-        wf_we = QTextCharFormat()
-        wf_we.setForeground(QColor("#cc0000"))
-        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-            cal.setWeekdayTextFormat(day, wf_we)
-        cal.setStyleSheet("""
-        QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
-        QCalendarWidget QAbstractItemView {
-            background: #fcfcfc; color: #111;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            alternate-background-color: #f2f2f2; gridline-color: #d8d8d8; }
-        QCalendarWidget QTableView {
-            background: #fcfcfc;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            gridline-color: #d8d8d8; outline: 0; }
-        QCalendarWidget QToolButton {
-            background: #efefef; border: 1px solid #c8c8c8;
-            padding: 3px 6px; border-radius: 4px; color: #111; }
-        QCalendarWidget QWidget#qt_calendar_navigationbar { background: #efefef; }
-        QCalendarWidget QAbstractItemView:enabled { color: #111; }
-        """)
-
     # ── EVENTS ────────────────────────────────────────────────────────────────
 
     def _on_date_changed(self):
@@ -2566,10 +2482,45 @@ class ShotFinderWidget(QWidget):
     _UI_STATE_PATH = (Path(os.environ.get("APPDATA", Path.home()))
                       / "ELI_ImageTools" / "shotfinder_ui_state.json")
 
-    def _load_pv_state(self):
+    def _read_ui_state_file(self) -> dict:
         try:
             data = json.loads(self._UI_STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except Exception:
+            return {}
+
+    def _write_ui_state_file(self, updates: dict):
+        """Merge into the state file rather than replacing it. The PV list and the
+        open/closed panel groups share one document, so a writer that rewrites the whole
+        thing silently throws away the other one's half."""
+        data = self._read_ui_state_file()
+        data.update(updates)
+        try:
+            self._UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._UI_STATE_PATH.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _on_section_toggled(self, key: str, expanded: bool):
+        self._ui_state[f"sec_{key}"] = bool(expanded)
+        self._write_ui_state_file({f"sec_{key}": bool(expanded)})
+
+    def _set_all_sections(self, expanded: bool):
+        """Expand all / Collapse all — one write for the whole panel."""
+        upd = {}
+        for key, sec in getattr(self, "_sections", {}).items():
+            sec.set_expanded(expanded)
+            self._ui_state[f"sec_{key}"] = bool(expanded)
+            upd[f"sec_{key}"] = bool(expanded)
+        self._write_ui_state_file(upd)
+
+    def _load_pv_state(self):
+        # The whole state document, kept so the panel can ask it which groups were
+        # left open while it is being built.
+        self._ui_state = self._read_ui_state_file()
+        data = self._ui_state
+        if not data:
             return                  # no state yet, or unreadable — start empty
         labels = data.get("pv_labels")
         if isinstance(labels, dict):
@@ -2599,17 +2550,14 @@ class ShotFinderWidget(QWidget):
                                  "filter": bool(e.get("filter", True))})
 
     def _save_pv_state(self):
-        try:
-            self._UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            self._UI_STATE_PATH.write_text(json.dumps(
-                {"pv_cfg": [dict(c) for c in self._pv_cfg],
-                 # Only names that differ from the PV's own: storing a label equal to
-                 # the preset label would freeze today's wording into the saved state.
-                 "pv_labels": {k: v for k, v in self._custom_labels.items()
-                               if v and v != k and v != PV_COLUMNS.get(k)}},
-                indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass                    # a remembered list is a convenience, never a must
+        # A remembered list is a convenience, never a must — _write_ui_state_file
+        # swallows a failed write.
+        self._write_ui_state_file(
+            {"pv_cfg": [dict(c) for c in self._pv_cfg],
+             # Only names that differ from the PV's own: storing a label equal to
+             # the preset label would freeze today's wording into the saved state.
+             "pv_labels": {k: v for k, v in self._custom_labels.items()
+                           if v and v != k and v != PV_COLUMNS.get(k)}})
 
     def _make_remove_btn(self, slot) -> QPushButton:
         btn = QPushButton("✕")
@@ -3153,7 +3101,7 @@ class ShotFinderWidget(QWidget):
         self._cam_scan_days = len(scan_days)
         self._cam_loading = True
         # What this scan covers, so a retry cannot re-walk a window that already
-        # answered (see _on_cam_search_changed).
+        # answered (see _open_camera_picker).
         self._cam_scan_pending_key = (str(images_root), scan_days[0], scan_days[-1])
         if hasattr(self, "_cam_status_lbl"):
             self._cam_status_lbl.setText("Loading cameras…")
@@ -3239,85 +3187,72 @@ class ShotFinderWidget(QWidget):
             self._cam_status_lbl.setText(
                 f"No cameras found (last {getattr(self, '_cam_scan_days', 1)} "
                 "day(s) of the range).")
-        # A name typed while the scan was running matched an empty list; redo it now.
-        if self._cam_search.text().strip():
-            self._on_cam_search_changed(self._cam_search.text())
+        self._sync_cameras_button()
 
-    def _on_cam_search_changed(self, text: str):
-        """textEdited — volá se jen při skutečném psaní, ne programaticky.
+    # ── CAMERA PICKER ─────────────────────────────────────────────────────────
+    def _cam_num_for(self, name: str) -> str:
+        for num, n in self._all_cameras:
+            if n == name:
+                return num
+        m = _re.match(r"^C\d{2}-(\d{2,3})-", name)
+        return m.group(1) if m else ""
 
-        Cameras are matched against the archiver's image folder names found in the
-        picked Time window (self._all_cameras), NOT against the PV channel list. Same
-        multi-token rule as the PV box: "023 nf" needs both parts, any order."""
-        tokens = self._split_query(text)
-        self._cam_dropdown.hide()
-        self._cam_dropdown.setRowCount(0)
-        if not tokens:
-            return
-        # The scan may have failed, or never run for this range. Retry instead of
-        # matching against an empty list for the rest of the session -- that silence is
-        # what made "add a camera to a search I already ran" look impossible.
+    def _open_camera_picker(self):
+        """The Cameras… button — the Image Slider's own picker, over the cameras
+        found in the picked time window. Presets are shared with the Slider, so a
+        camera set saved in one tab is offered in the other."""
+        # A scan may never have run for this range (or have failed): let the dialog
+        # do its own, so the list is never silently empty.
         if (not self._all_cameras and not getattr(self, "_cam_loading", False)
                 and getattr(self, "_cam_scanned_key", None) != self._cam_scan_key()):
             self._load_cameras()
 
-        matches = [(num, name) for num, name in self._all_cameras
-                   if all(t in name.lower() or t in num.lower() for t in tokens)]
-        for num, name in matches[:30]:
-            r = self._cam_dropdown.rowCount()
-            self._cam_dropdown.insertRow(r)
-            self._cam_dropdown.setItem(r, 0, QTableWidgetItem(num))
-            item = QTableWidgetItem(name)
-            # Only rows carrying the camera name in UserRole are selectable; the hint
-            # row below has none, so it cannot be added as a camera.
-            item.setData(Qt.ItemDataRole.UserRole, name)
-            self._cam_dropdown.setItem(r, 1, item)
-
-        if not matches:
-            if not getattr(self, "_cam_loading", False):
-                return
-            # An empty box while the share is still being scanned reads as "this camera
-            # does not exist"; _on_cameras_loaded re-runs the query when the scan lands.
-            r = self._cam_dropdown.rowCount()
-            self._cam_dropdown.insertRow(r)
-            hint = QTableWidgetItem("scanning the archive for cameras…")
-            hint.setForeground(QColor("#777"))
-            self._cam_dropdown.setItem(r, 1, hint)
-
-        n_rows = max(self._cam_dropdown.rowCount(), 1)
-        row_h = max(24, self._cam_dropdown.verticalHeader().defaultSectionSize())
-        header_h = self._cam_dropdown.horizontalHeader().height()
-        popup_h = min(n_rows * row_h + header_h + 6, 400)
-        popup_w = max(320, self._cam_search.width() + 20)
-
-        pos = self._cam_search.mapToGlobal(self._cam_search.rect().bottomLeft())
-        self._cam_dropdown.setGeometry(pos.x(), pos.y(), popup_w, popup_h)
-        self._cam_dropdown.show()
-        self._cam_dropdown.raise_()
-        # Tool window nezabírá focus — textfield zůstane aktivní
-        QTimer.singleShot(0, self._cam_search.setFocus)
-
-    def _on_cam_dropdown_clicked(self, index):
-        r = index.row()
-        num_item  = self._cam_dropdown.item(r, 0)
-        name_item = self._cam_dropdown.item(r, 1)
-        if not name_item:
+        days = self._selected_days()
+        day_obj = days[-1] if days else (datetime.now(PRAGUE) if PRAGUE else datetime.now()).date()
+        slider = _get_slider_module()
+        dlg = slider.CameraPickerDialog(
+            day_obj, 0, 23,
+            [n for _num, n in self._selected_cameras],
+            parent=self,
+            preloaded_cameras=list(self._all_cameras))
+        # The Slider configures its multi-camera grid from this dialog; the Shot
+        # Finder has no grid, so that button would lead nowhere.
+        btn_layout = getattr(dlg, "_btn_layout", None)
+        if btn_layout is not None:
+            btn_layout.setVisible(False)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        name = name_item.data(Qt.ItemDataRole.UserRole)
-        if not name:            # hint row ("scanning…") -- not a camera
-            return
-        num  = num_item.text() if num_item else ""
-        self._cam_dropdown.hide()
-        self._cam_search.clear()
-        if any(n == name for _, n in self._selected_cameras):
-            return
-        self._selected_cameras.append((num, name))
-        row = self._cam_selected.rowCount()
-        self._cam_selected.insertRow(row)
-        self._cam_selected.setItem(row, 0, QTableWidgetItem(num))
-        self._cam_selected.setItem(row, 1, QTableWidgetItem(name))
-        self._cam_selected.selectRow(row)
-        self._active_cam = name
+        self._set_selected_cameras(dlg.selected_camera_names())
+        self._log(f"Cameras: {len(self._selected_cameras)} selected")
+
+    def _set_selected_cameras(self, names: list):
+        """Replace the picked cameras (and the list that shows them)."""
+        seen: set = set()
+        picked: "list[tuple[str, str]]" = []
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            picked.append((self._cam_num_for(name), name))
+        self._selected_cameras = picked
+        self._cam_selected.setRowCount(0)
+        for num, name in picked:
+            r = self._cam_selected.rowCount()
+            self._cam_selected.insertRow(r)
+            self._cam_selected.setItem(r, 0, QTableWidgetItem(num))
+            self._cam_selected.setItem(r, 1, QTableWidgetItem(name))
+        if picked:
+            self._cam_selected.selectRow(0)
+            self._active_cam = picked[0][1]
+        else:
+            self._active_cam = None
+        self._sync_cameras_button()
+
+    def _sync_cameras_button(self):
+        n = len(self._selected_cameras)
+        total = len(self._all_cameras)
+        self._btn_cameras.setText(
+            f"📷  Cameras…  ({n}/{total})" if total else "📷  Cameras…")
 
     def _on_cam_selected_clicked(self, index):
         r = index.row()
@@ -3327,17 +3262,11 @@ class ShotFinderWidget(QWidget):
 
     def _on_cam_remove(self):
         r = self._cam_selected.currentRow()
-        if r < 0:
+        if r < 0 or r >= len(self._selected_cameras):
             return
-        self._cam_selected.removeRow(r)
-        if r < len(self._selected_cameras):
-            self._selected_cameras.pop(r)
-        if self._cam_selected.rowCount() > 0:
-            self._cam_selected.selectRow(0)
-            item = self._cam_selected.item(0, 1)
-            self._active_cam = item.text() if item else None
-        else:
-            self._active_cam = None
+        names = [n for _num, n in self._selected_cameras]
+        del names[r]
+        self._set_selected_cameras(names)
 
     # ── SEARCH ────────────────────────────────────────────────────────────────
 

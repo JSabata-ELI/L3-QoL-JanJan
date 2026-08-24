@@ -19,11 +19,10 @@ about what crosses folder boundaries.
 | `Screenshots` | Camera frames + monitor shots into one folder | Scripts | tkinter | yes |
 | `Time Converter` | Rename archive files to readable timestamps | Scripts | tkinter | yes |
 | `Announcer` | Screen-region watch + PV badges | Scripts | tkinter | yes |
-| `CSS Logger` | Archive explorer / logger (hosts **Spectra** as a tab) | Scripts | PySide6 | yes |
+| `CSS Logger` | Archive explorer / logger (**Spectra** is its second tab, `sp_t.py`) | Scripts | PySide6 | yes |
 | `Chiller Log` | Long-term chiller flow/temperature trend | Scripts | tkinter | not yet |
 | `Diagnostic` | Live PV monitoring, alerting, Webex bot | External¹ | PySide6 | yes (+ helper exe) |
 | `Pulser Monitor` | Diode-array pulser analysis from camera frames | External¹ | PySide6 | yes |
-| `Spectra` | Spectrometer analysis — **a tab of CSS Logger**, not standalone | — | PySide6 | inside CSS Logger |
 | `Shift planner` | Fill your availability into the shift spreadsheet | External¹ | tkinter | yes |
 | `Calibrations` | Energy-detector calibration | In progress | PySide6 | yes |
 | `Launcher` | Starts everything else | Parts | tkinter | yes |
@@ -34,6 +33,9 @@ about what crosses folder boundaries.
 
 ¹ **Not classified in the Launcher.** `Launcher/l.py` lists the group membership in
 `SCRIPTS` / `PARTS` / `IN_PROGRESS` / `NOT_WORKING_CORRECTLY` / `PERSONAL`; anything
+listed in `SUBSUMED` (Image Finder, Image Slider, Shot finder, Spectra, Builder,
+Copy manager) is skipped entirely, because each is now a tab of a bigger program and
+the folder on the share only holds an old standalone build of it; anything
 absent falls into **External**. Diagnostic, Pulser Monitor, Shift planner and
 Extractor are currently absent, so they show up there. That is a gap in the list, not
 a statement about the programs — right-clicking a card moves it per user, but the
@@ -49,7 +51,7 @@ Chiller Log will appear under Scripts as soon as it is built.
 | Announcer, CSS Logger, Diagnostic, Image Tools, Internal Builder | yes | yes |
 | Calibrations, Chiller Log, Dev Tools, Git Work, Launcher, Screenshots, Shift planner, Time Converter | yes | no (none needed) |
 | Pulser Monitor | **no** | yes |
-| Extractor, Spectra | no | no (neither is built on its own) |
+| Extractor | no | no (not built on its own) |
 
 Pulser Monitor is the one program that would benefit from an icon and does not have
 one: both the Launcher card and the built exe use it.
@@ -337,18 +339,31 @@ program, so a change to it needs a build and a publish like any other.
 ## 7. Shared code and conventions
 
 There is no shared library — each program is self-contained on purpose, so one can be
-rebuilt without touching the others. What is duplicated deliberately:
+rebuilt without touching the others.
+
+**A module has exactly one home: the folder of the program that ships it.** Never keep
+a second copy of a `.py` elsewhere and never add another folder to `sys.path` to reach
+one. The builder passes only the program's own folder to PyInstaller and copies every
+`.py` from it next to the exe, so a `sys.path` detour is followed when you run from
+source and ignored in the build: the build silently uses the copy in the program
+folder. `sp_t.py` lived like that (`Spectra/` on `sys.path`, a July copy in
+`CSS Logger/`) and the built Spectra tab was five weeks behind the source for a month
+without any error message. Need the same code in two programs? Copy it deliberately
+and write it in the table below, or keep one program the owner and let the other stay
+without it.
+
+What is duplicated deliberately:
 
 | Pattern | Appears in | Note |
 |---------|-----------|------|
 | `set_app_icon(win, ico, app_id)` | every tkinter program | tkinter's `iconbitmap` only sets the title bar; the Windows 11 taskbar reads the small-icon slots and the window-class icon. Must be **frozen-aware** — in a build `__file__` does not point next to the exe. |
 | `get_app_dir()` / `_app_dir()` | every program | exe folder when frozen, source folder otherwise. Every path resolves through it. |
 | Hour-chunked archiver fetch | Chiller Log, CSS Logger, Image Tools | the one-hour limit from §2 |
-| The house calendar | Spectra, CSS Logger, Pulser Monitor, Chiller Log, Calibrations | Monday-first, grey header, red weekends, white cells. Weekends must be detected from the cell's **date**, never its column index. |
+| The house calendar | CSS Logger (both tabs), Pulser Monitor, Chiller Log, Calibrations | Monday-first, grey header, red weekends, white cells. Weekends must be detected from the cell's **date**, never its column index. |
 | Checkbox styling | the Qt programs | QSS on `::indicator` only — never a border on `QCheckBox {}` |
 | Matplotlib toolbar | Pulser Monitor (`_make_mpl_toolbar`) | build it so the icons are **not** tinted; under the dark palette a tinted toolbar goes invisible |
-| PV-name search | Image Slider (reference), Spectra, CSS Logger | words are tokens, AND-matched anywhere in the name, order honoured, ranked, camera channels last, empty query returns nothing |
-| Identity-keyed colours | Spectra, Chiller Log, Diagnostic | a colour that names an item comes from the **item**, never from its index in the list being drawn — otherwise a missing item silently recolours everything else |
+| PV-name search | Image Slider (reference), CSS Logger (both tabs) | words are tokens, AND-matched anywhere in the name, order honoured, ranked, camera channels last, empty query returns nothing |
+| Identity-keyed colours | CSS Logger (Spectra tab), Chiller Log, Diagnostic | a colour that names an item comes from the **item**, never from its index in the list being drawn — otherwise a missing item silently recolours everything else |
 | Precise Qt timers | Image Tools | a default `QTimer` at 33 ms fires at 21 Hz on Windows; animation and playback need `PreciseTimer` |
 | Brightness vs contrast | Image Tools, Screenshots | brightness = additive offset, contrast = multiplicative gain. Never swapped, in code or in labels. An Auto checkbox parks its slider on the value it computed. |
 

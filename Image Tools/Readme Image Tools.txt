@@ -8,29 +8,51 @@ Detailed version: ReadMe_Image Tools_Full.txt  ("Details" button)
 
 WHAT IT IS
 
-  Everything to do with the camera images, in one window with four
+  Everything to do with the camera images, in one window with five
   tabs. Find them, watch them, search them by machine value, and
   measure and mark them up.
 
-      Image Finder   which images exist, and what the machine was
-                     doing when each one was taken
+      Image Finder   one camera across many days, side by side, to
+                     see what changed
       Image Slider   play a sequence like a film, one camera or
                      several side by side, recorded or live
       Shot Finder    find the shots where a value was what you want
+      One Moment     pick a moment in the graph and see every
+                     camera at that moment  (under construction)
       Workshop       look at one image properly: measure it, mark
                      it, export it
 
   The tabs hand images to each other. Anything you find in the first
-  three can be sent to Workshop with one button.
+  four can be sent to Workshop with one button.
 
 
-THE FOUR TABS
+THE FIVE TABS
 
-  IMAGE FINDER
-    Pick a day and an hour and see what was recorded. Each image is
-    listed with the shot energy and any machine values you asked
-    for. From here you can preview an image, open its folder, or
-    send it to Workshop.
+  COMPARE DAYS
+    Click "Time window" to pick the days in the calendar and
+    "Cameras..." to choose the cameras — the two buttons sit side by
+    side, as in the Image Slider — and the days come up next to each
+    other, so a change shows itself. The camera picker keeps presets,
+    the same ones the Image Slider offers. Every day is drawn on the SAME scale, and one set
+    of brightness and contrast controls applies to all of them —
+    otherwise the comparison would lie.
+
+    The cameras you picked are listed under the Workshop button.
+    Click one to look at it, double-click it to take it out again.
+
+    Pick one day as the reference and the others show how far they
+    differ from it. That is the quickest way to see when something
+    drifted. Right-click a day to make it the reference, or drop it
+    again.
+
+    "Save comparison" writes the whole wall as ONE picture with the
+    days labelled, ready to put in a report. Click a day to look at
+    that one frame closely, and "One frame" / "Days side by side"
+    switches between the two.
+
+    You can also pick a day and an hour and see what was recorded,
+    with the shot energy and any machine values you asked for, and
+    send anything on to Workshop or the Image Slider.
 
   IMAGE SLIDER
     The one used most. Choose a period and one or more cameras, and
@@ -49,16 +71,72 @@ THE FOUR TABS
 
     With several cameras open, the program sizes their windows so
     that even the smallest picture comes out as large as the screen
-    allows. To arrange them yourself, drag a camera by its name bar
-    to move it and by its border to resize it, while the pictures
-    keep playing. Right-click the name bar and choose "Auto-arrange
-    cameras" to hand the arrangement back to the program.
+    allows, and then, among the arrangements that are as good as that,
+    picks the one showing the most picture altogether. Any room left
+    over is an even grey margin around the picture.
+
+    To arrange them yourself, drag a camera by its name bar to move it
+    and by its border to resize it, while the pictures keep playing.
+    Right-click the name bar and choose "Auto-arrange cameras" to hand
+    the arrangement back to the program.
+
+    Your arrangement can be saved: open "Cameras...", type a name and
+    press Save next to the list of saved sets. The preset then holds
+    the cameras AND where each one sits, so it comes back exactly as
+    you left it.
 
   SHOT FINDER
     Give a value and a tolerance — an energy, a waveplate angle —
     and it finds every shot in a date range that matches, across
     several conditions at once. The results can be opened, previewed
     or sent to Workshop.
+
+    Two buttons say what is searched: "Time window" for the period
+    and "Cameras..." for the cameras. The camera list is the same
+    one the Image Slider uses, saved sets included, and the cameras
+    you picked stay listed on the panel.
+
+  ONE MOMENT   (under construction)
+    The other way round from every other tab. They show one thing
+    over time; this one shows everything at one time.
+
+    All the settings are in the panel down the left, as in the Image
+    Slider. "Time window" picks the day and the From/To times,
+    "Camera" picks the cameras, "Search / select PVs..." picks the
+    machine values — the same search and the same list as everywhere
+    else in the program. "Load" then draws them, ALL IN ONE GRAPH:
+    values in the same unit share a scale, values in different units
+    each get a scale of their own, and nothing is stretched to fit
+    anything else. ("Stacked" gives a separate graph per value, for
+    when a single one gets too busy.)
+
+    Then two things you can do on the graph:
+      - CLICK a moment. The frame from every camera you picked comes
+        up on the right, and the left panel says what each value was
+        at that moment. "prev" / "next" step from shot to shot.
+      - DRAG across a stretch. "Range statistics" then gives the
+        average, the spread and the count for each value; hover a row
+        for the smallest, the largest and the peak-to-peak.
+
+    A click lands on the nearest real reading of the value chosen in
+    "Snap to", because a moment between two readings has no shot
+    behind it. Each frame is captioned with the camera and its own
+    time; hover it for how far it is from the moment you asked for —
+    a frame is stored only about every 35 seconds, so a few seconds'
+    difference is normal.
+
+    "Image / Display" changes how the frames look: contrast,
+    brightness, gamma, palette and size, with the same meanings as in
+    the Image Slider. Changing them redraws the frames without
+    reading them from the share again.
+
+    The eye next to a value takes it off the graph without unpicking
+    it. Click a frame to send it to Workshop. "Pop out the frames"
+    opens the same frames in a window of their own.
+
+    Still unfinished: a value you built from a formula is listed but
+    not drawn, and nothing on this tab is remembered when you close
+    the program.
 
   WORKSHOP
     One image at a time, properly. Zoom and pan, non-destructive
@@ -97,7 +175,9 @@ ABOUT BRIGHTNESS — THE ONE THING WORTH READING
 
 GENERAL
 
-  - Two data sources: the lab network path, or the office drive.
+  - The images come from one network path, the same one from the lab
+    and from the office. Nothing to choose: the Shot Finder used to
+    show a Lab / Office switch whose two entries were the same path.
   - Everything slow runs in the background. The red "Stop All"
     button in the status bar stops all of it.
   - A very busy day holds more samples than the archive will answer

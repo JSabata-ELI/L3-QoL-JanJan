@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-19  (a.py, 1798 lines)
+Verified against source: 2026-08-24  (a.py, 2902 lines)
 -----------------------------------------------------------------
 Short version: ReadMe Announcer.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -10,71 +10,116 @@ Code map:      STRUCTURE.md
 
 
 =================================================================
-1. TWO JOBS IN ONE WINDOW
+1. WHAT THE PROGRAM DOES
 =================================================================
 
-1.1 THE SCREEN WATCH
+1.1 CONDITIONS
 
-    You draw a rectangle anywhere on any monitor. The program takes
-    a picture of it, keeps that as the reference, and then takes
-    another picture twice a second. When the new picture differs
-    from the reference by more than the threshold, that counts as a
-    change and the alarm goes off.
+    A condition is one thing that has to stay true while the program
+    is watching. You keep a list of them; all of them are checked
+    twice a second, and the first one that stops being true raises
+    the alarm and says what needs doing.
 
-    It does not understand what it is looking at, and that is the
-    whole point: it works on a camera window, a control-system
-    screen, a warning lamp, a number, a graph, a web page — anything
-    that is drawn on a screen.
+    Two kinds:
 
-1.2 THE MACHINE VALUE BADGES
+      Screen area   a rectangle of a screen still looks the way it
+                    did when its reference picture was taken
+      Value         a machine value stays under its limit
+
+    Each one has a name and a sentence of your own — that sentence is
+    what appears when it fires, so it can say "check the L3BT
+    alignment in HP" rather than "change detected".
+
+    The screen check does not understand what it is looking at, and
+    that is the whole point: it works on a camera window, a
+    control-system screen, a warning lamp, a number, a graph, a web
+    page — anything that is drawn on a screen.
+
+1.2 THE QUICK RECTANGLE
+
+    "Set reference" at the top draws one rectangle without giving it
+    a name, exactly as the program has always worked. It is watched
+    alongside the conditions and it is not remembered as a condition.
+    Use it for a one-off, and a condition for anything you want to
+    keep.
+
+1.3 THE MACHINE VALUE BADGES
 
     Eight values from the machine, read twice a second, each shown
     as a coloured badge only when it is outside its limits. Nothing
     to configure and nothing to draw.
 
-    IMPORTANT: this half only runs while the screen watch is
-    running. Pressing Start turns both on; stopping turns both off,
-    and the badges disappear with it. If you want the badges, leave
-    the program watching something — even a rectangle over a corner
-    of the desktop that never changes will do.
+    IMPORTANT: this half only runs while the program is watching.
+    Pressing Start turns it on; stopping turns it off and the badges
+    disappear with it.
 
 
 =================================================================
-2. SETTING UP THE SCREEN WATCH
+2. SETTING UP
 =================================================================
 
-  1. MONITOR
-     Pick the target monitor in the dropdown. "Identify" flashes a
-     big number on each screen for three seconds, so you do not
-     have to guess which one Windows calls number 2.
+2.1 A SCREEN AREA CONDITION
 
-  2. THE RECTANGLE
-     Press "Set reference". The chosen screen dims under a
-     see-through overlay; drag out the rectangle you want watched
-     and let go. Esc cancels without changing anything. The
-     coordinates then appear in the status line.
+  1. "Add screen area" in the Conditions panel.
+  2. NAME, and the sentence to show when it fires.
+  3. MONITOR, then "Draw area". The chosen screen dims under a
+     see-through overlay; drag out the rectangle and let go. Esc
+     cancels without changing anything.
 
      The overlay is deliberately built from two windows: a dim one
      over the screen, and a solid red frame for the border. A border
      drawn on the see-through window would be see-through too, and
      invisible against a bright display.
 
-  3. START
-     Press Start. The circle goes green and the control panel
-     collapses into a small see-through overlay.
+  4. The reference picture is taken as soon as you let go, and shown
+     in the dialog. "Take reference" takes it again — use it if the
+     screen was mid-change at that moment.
+  5. FIRES ON A CHANGE OVER — the sensitivity, section 5.
+  6. Save, and tick the condition in the On column.
 
-  RE-TAKING THE REFERENCE
-     The arrow button takes a fresh picture of the same rectangle
-     and makes that the new reference. Use it when what you are
-     watching has changed for a legitimate reason and you want the
-     new state to count as normal — it saves re-drawing the
-     rectangle.
+  "Identify" at the top flashes a big number on each screen for three
+  seconds, so you do not have to guess which one Windows calls number
+  2.
 
-  PREVIEW
-     Hover "Preview region" for a thumbnail of what is inside the
-     rectangle right now, up to 640 by 400. Click to pin it open.
-     This is the quick way to check you drew the rectangle where you
-     thought you did.
+2.2 A VALUE CONDITION
+
+  1. "Add value". The back-reflection energy (L3-PM03-023:Energy) is
+     filled in for you; any other PV name can be typed instead.
+  2. "Read now" reads that value for the last minute and shows what
+     it is doing now and its highest and lowest — pick the limits
+     from that, rather than guessing.
+  3. WARN OVER   past this, an orange badge appears and nothing else
+                 happens.
+     TRIP OVER   past this, the alarm goes off.
+     Leaving a box empty switches that level off. Empty is not zero:
+     a limit of zero on an energy would fire the moment the laser
+     runs.
+  4. UNIT is only used in the text of the badge.
+
+  A value condition needs no rectangle: with only value conditions in
+  the list, Start works and nothing has to be drawn.
+
+2.3 THE LIST ITSELF
+
+  On            click the box to switch a condition on or off; it is
+                saved at once
+  Add / Edit    Edit, or a double-click, opens the same dialog again
+  Delete        removes it, after asking
+  arrow (↺)     re-takes the reference picture of the selected screen
+                condition — for when what you watch has changed for a
+                good reason and the new state should count as normal
+
+  The list, the reference pictures and the limits all live in the
+  settings file next to the program, so they come back next time.
+
+  The rectangle is remembered as a position on the desktop, so a
+  condition belongs to the computer it was made on and to that
+  computer's monitor arrangement. Move the monitors around and the
+  area has to be drawn again.
+
+  PREVIEW: hover "Preview region" for a thumbnail of what is inside
+  the quick rectangle right now, up to 640 by 400. Click to pin it
+  open.
 
 
 =================================================================
@@ -84,26 +129,46 @@ Code map:      STRUCTURE.md
 The coloured circle is the entire state of the program in one
 glance:
 
-  grey     no rectangle set yet
-  orange   rectangle set, not watching
+  grey     nothing to watch yet
+  orange   ready, not watching
   green    watching
-  red      a change was detected and the alarm is up
+  red      something fired and the alarm is up
 
 Nothing else needs to be read to know where you are.
 
 
 =================================================================
-4. WHEN A CHANGE IS DETECTED
+4. WHEN SOMETHING FIRES
 =================================================================
 
   - The alarm window flashes, in one of two modes (section 6).
   - A sound plays, if sound is switched on.
+  - The sentence belonging to that condition appears as a red badge
+    on the overlay and as a line in the message log, so it can still
+    be read after the flashing is gone.
   - Watching stops by itself. That is deliberate: whatever changed
     has now changed, and re-alarming every half second would be
     useless.
   - Click the flashing area, or press Esc, to dismiss the alarm.
     The control panel comes back and the circle goes orange, ready
     to start again.
+
+Two things never raise the alarm:
+
+  - A value that could not be read at all. The reason goes into the
+    message log in plain words instead; a missing reading is not a
+    good reading, and it is not a bad one either.
+  - A condition that cannot fire: a screen area with no reference
+    picture, or a value with no trip limit. Pressing Start writes a
+    line in the log for each of those, so a condition cannot sit
+    there ticked and silently do nothing.
+
+One case is worth knowing about: if the screen resolution or the
+display scaling changes while watching, the new picture no longer has
+the same size as the reference and the two cannot be compared. That
+counts as the condition failing, and the badge says both sizes. The
+alternative — quietly reporting that everything is fine — is the one
+wrong answer.
 
 In "Image only" mode the clickable area is the image itself, and it
 stays clickable through the dark half of the blink. (This is why the
@@ -118,7 +183,9 @@ impossible to dismiss at the wrong moment.)
 
 The comparison is the average difference per pixel, on a scale where
 0 means identical and 255 means black against white. The threshold
-is that average, and it defaults to 2.
+is that average, and it defaults to 2. Each screen condition has its
+own — a noisy camera picture and a line of text need different
+numbers — and the one in Settings belongs to the quick rectangle.
 
 What that means in practice:
 
@@ -175,8 +242,9 @@ a deployment that loses them has to be redone.
 7. REGION PRESETS AND WINDOW POSITIONS
 =================================================================
 
-A preset stores the watched rectangle under a name, so a routine you
-do every week does not have to be drawn again.
+A preset stores the QUICK rectangle under a name, so a routine you do
+every week does not have to be drawn again. Conditions keep their own
+rectangles and need no preset.
 
   Load          use the selected preset
   Save region   store the current rectangle under a name
@@ -283,7 +351,32 @@ settings.
     Only the badges that are actually alerting are shown, and they
     vary in width, so they are laid out by hand and wrapped onto
     another line when they run out of room. The result is that none
-    of them is ever cut off, however many are up at once.
+    of them is ever cut off, however many are up at once. The badges
+    belonging to conditions are laid out in the same row.
+
+8.6 HOW A VALUE CONDITION IS JUDGED
+
+    Not on an average, unlike the eight badges above: on the HIGHEST
+    sample of the last ten seconds. One shot over the limit is the
+    whole event — an average over a minute of shots would hide
+    exactly the thing you asked to be told about.
+
+    The archiver only writes a sample when the value changes, so a
+    value that jumped over the limit and then sat perfectly still
+    produces nothing recent at all. In that case the newest sample of
+    the last minute is used, because that is the value the machine is
+    still holding. Only when there is nothing at all is no judgement
+    made.
+
+    Two consequences worth knowing:
+
+      - The reading comes from the archiver, which publishes about a
+        second late, so the alarm is a second or two behind the
+        machine. This is not a program to protect hardware with; it
+        is a program that tells a person to go and look.
+      - A spike that has already passed can still fire, if it is
+        inside the last ten seconds. That is the intended behaviour:
+        you want to be told that it happened.
 
 
 =================================================================
@@ -314,6 +407,30 @@ and without being in the way of the mouse.
       (shrink the rectangle around the thing that matters), or the
       threshold is too high, or watching was stopped by a previous
       alarm and never restarted — check the circle.
+
+  A condition is ticked but nothing ever happens
+      Press Start and read the message log. A screen area with no
+      reference picture and a value with no trip limit both say so
+      there, and both are silent by design.
+
+  Start does nothing at all
+      There is nothing to watch: no quick rectangle and no condition
+      switched on. The status line says so.
+
+  A screen condition fires the moment watching starts
+      The screens have been rearranged or the display scaling
+      changed, so the area is not where the reference was taken. The
+      badge says both sizes when that is the cause. Draw the area
+      again.
+
+  A value condition will not stop firing
+      The value is still over the limit, or it went over inside the
+      last ten seconds. Check with "Read now" in the condition,
+      which shows what it has actually been doing.
+
+  The reference picture is refused as too big
+      The picture is kept inside the settings file, so it has to stay
+      small. Draw the box that changes, not a whole screen.
 
   The alarm flashes but I hear nothing
       Sound is switched off, or the chosen .wav is missing from the
