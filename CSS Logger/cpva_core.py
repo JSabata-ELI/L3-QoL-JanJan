@@ -7,7 +7,6 @@ PySide6 app (main.py) and from headless tests.
 
 Extracted from the former tkinter `cssl.py` (now removed).
 """
-import fnmatch
 import json
 import os
 import re
@@ -77,6 +76,16 @@ PV_TO_RAMPING = {pv: short for short, pv in RAMPING_PV_MAP.items()}
 
 _SESSION = requests.Session()
 _SESSION.verify = False
+# The fetch pools run up to 16 requests at once. requests' default adapter only
+# keeps 10 pooled connections, so anything above that reopens a fresh HTTPS
+# connection (full TLS handshake) per request and logs "connection pool is full,
+# discarding connection" — a big hidden cost on the first (many-chunk) load.
+# Size the pool above the worker cap so every concurrent request reuses a
+# keep-alive connection instead.
+from requests.adapters import HTTPAdapter as _HTTPAdapter
+_ADAPTER = _HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+_SESSION.mount("https://", _ADAPTER)
+_SESSION.mount("http://", _ADAPTER)
 
 
 def safe_divide(a, b):
@@ -313,10 +322,28 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
     return results
 
 
+def _is_cancelled(cancel_fn) -> bool:
+    """True when the caller has stopped caring about this fetch.
+
+    A pool of (channel × 1-hour-chunk) requests used to run to completion even
+    after the GUI had moved on: pressing "Stop Live" left the whole queue
+    hammering the archiver and holding the GIL, so the app kept stuttering long
+    after it looked idle. Passing a ``cancel_fn`` lets the pool drop every
+    request it has not started yet (in-flight ones still finish).
+    """
+    if cancel_fn is None:
+        return False
+    try:
+        return bool(cancel_fn())
+    except Exception:        # a broken predicate must not abort the fetch
+        return False
+
+
 def cpva_fetch_many_chunked(channels: list[str], start_ns: int, end_ns: int,
                             timeout: float = CPVA_HTTP_TIMEOUT,
                             max_workers: int = 16,
-                            progress_fn=None):
+                            progress_fn=None,
+                            cancel_fn=None):
     """Fetch several channels over [start_ns, end_ns) using ONE shared thread pool.
 
     All (channel, 1-hour-chunk) requests compete for the same pool, so the load
@@ -326,6 +353,7 @@ def cpva_fetch_many_chunked(channels: list[str], start_ns: int, end_ns: int,
     first error string encountered (that channel's data may be partial/empty).
 
     ``progress_fn(done, total)`` is called from worker threads as chunks finish.
+    ``cancel_fn()`` is polled between chunks — see :func:`_is_cancelled`.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -350,20 +378,32 @@ def cpva_fetch_many_chunked(channels: list[str], start_ns: int, end_ns: int,
 
     done = 0
     workers = min(max_workers, total)
+
+    def _run(ch, cs, ce):
+        if _is_cancelled(cancel_fn):
+            return None                         # queued but no longer wanted
+        return cpva_fetch_samples(ch, cs, ce, timeout)
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(cpva_fetch_samples, ch, cs, ce, timeout): (ch, idx)
+            ex.submit(_run, ch, cs, ce): (ch, idx)
             for ch, idx, cs, ce in tasks
         }
         for fut in as_completed(futures):
             ch, idx = futures[fut]
             try:
-                results_map[ch][idx] = fut.result()
+                res = fut.result()
             except Exception as exc:            # keep other channels/chunks alive
                 errors.setdefault(ch, str(exc))
+            else:
+                if res is not None:
+                    results_map[ch][idx] = res
             done += 1
             if progress_fn:
                 progress_fn(done, total)
+            if _is_cancelled(cancel_fn):
+                ex.shutdown(wait=False, cancel_futures=True)
+                break
 
     out = {}
     for ch in channels:
@@ -378,7 +418,8 @@ def cpva_fetch_many_optimized(channels: list[str], start_ns: int, end_ns: int,
                               count: int,
                               timeout: float = CPVA_HTTP_TIMEOUT,
                               max_workers: int = 16,
-                              progress_fn=None):
+                              progress_fn=None,
+                              cancel_fn=None):
     """Fetch several channels using server-side decimation (one request each).
 
     Each channel is fetched with a single request over the whole window, passing
@@ -400,20 +441,29 @@ def cpva_fetch_many_optimized(channels: list[str], start_ns: int, end_ns: int,
 
     done = 0
     workers = min(max_workers, total)
+
+    def _run(ch):
+        if _is_cancelled(cancel_fn):
+            return None                         # queued but no longer wanted
+        return cpva_fetch_samples(ch, start_ns, end_ns, timeout, count)
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(cpva_fetch_samples, ch, start_ns, end_ns, timeout, count): ch
-            for ch in channels
-        }
+        futures = {ex.submit(_run, ch): ch for ch in channels}
         for fut in as_completed(futures):
             ch = futures[fut]
             try:
-                results[ch] = fut.result()
+                res = fut.result()
             except Exception as exc:
                 errors.setdefault(ch, str(exc))
+            else:
+                if res is not None:
+                    results[ch] = res
             done += 1
             if progress_fn:
                 progress_fn(done, total)
+            if _is_cancelled(cancel_fn):
+                ex.shutdown(wait=False, cancel_futures=True)
+                break
     return results, errors
 
 
@@ -428,15 +478,20 @@ _LAST_BEFORE_STEPS_S = (3600, 6 * 3600, 24 * 3600,
 
 
 def cpva_fetch_last_before(channel: str, before_ns: int,
-                           timeout: float = CPVA_HTTP_TIMEOUT):
+                           timeout: float = CPVA_HTTP_TIMEOUT,
+                           cancel_fn=None):
     """Return the most recent sample dict strictly before `before_ns`, or None.
 
     Scans expanding 1-hour-chunked rings back to ~30 days and stops at the first
     ring that holds data, so a PV whose last update predates the requested
     window can still be carried forward instead of leaving a gap in the plot.
+    ``cancel_fn`` is polled before every ring, since the deepest scan is the
+    single longest thing the initial load does.
     """
     hi = before_ns
     for step_s in _LAST_BEFORE_STEPS_S:
+        if _is_cancelled(cancel_fn):
+            return None
         lo = max(0, before_ns - int(step_s * 1e9))
         if lo >= hi:
             break
@@ -451,6 +506,47 @@ def cpva_fetch_last_before(channel: str, before_ns: int,
         if lo == 0:
             break
     return None
+
+
+def cpva_fetch_last_before_many(channels: list[str], before_ns: int,
+                                timeout: float = CPVA_HTTP_TIMEOUT,
+                                max_workers: int = 8,
+                                progress_fn=None,
+                                cancel_fn=None):
+    """Parallel :func:`cpva_fetch_last_before` for several channels at once.
+
+    The initial load previously hunted each PV's carry-forward value one after
+    another; a PV with no recent data scans expanding rings back to ~30 days, so
+    a handful of stale PVs alone could dominate the whole load time. Running them
+    in a shared pool collapses that into a single wave. Returns ``{channel:
+    sample_dict}`` only for channels that actually had a prior sample.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    out: dict[str, dict] = {}
+    if not channels:
+        return out
+    workers = min(max_workers, len(channels))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(cpva_fetch_last_before, ch, before_ns, timeout, cancel_fn): ch
+            for ch in channels
+        }
+        for fut in as_completed(futures):
+            ch = futures[fut]
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
+            if res:
+                out[ch] = res
+            done += 1
+            if progress_fn:
+                progress_fn(done, len(channels))
+            if _is_cancelled(cancel_fn):
+                ex.shutdown(wait=False, cancel_futures=True)
+                break
+    return out
 
 
 def cpva_decode_value(sample: dict):
@@ -583,15 +679,31 @@ def shorten_pv_name(full_name: str) -> str:
 # Wildcard filter
 # ---------------------------------------------------------------------------
 
+def make_pv_query_matcher(query: str):
+    """Compile `query` into a predicate that tests one PV name.
+
+    Every whitespace-separated token must occur in the name, in the order given
+    — "023 l3" behaves exactly like "*023*l3*", without having to type the
+    asterisks. Explicit "*" / "?" inside a token still work (and "*" is what
+    lets a token match across a gap in the middle of a word).
+
+    Compiled once per query, then called for every channel — the archiver lists
+    ~10 000 of them and this runs on each keystroke.
+    """
+    tokens = (query or "").strip().lower().split()
+    if not tokens:
+        return lambda _text: True
+    parts = []
+    for tok in tokens:
+        parts.append("".join(
+            ".*" if ch == "*" else "." if ch == "?" else re.escape(ch)
+            for ch in tok))
+    rx = re.compile(".*".join(parts))
+    return lambda text: rx.search(text.lower()) is not None
+
+
 def _matches_wildcard(text: str, pattern: str) -> bool:
-    pattern = pattern.strip()
-    if not pattern:
-        return True
-    tl = text.lower()
-    pl = pattern.lower()
-    if "*" in pl:
-        return fnmatch.fnmatch(tl, pl)
-    return all(t in tl for t in pl.split())
+    return make_pv_query_matcher(pattern)(text)
 
 
 # ---------------------------------------------------------------------------

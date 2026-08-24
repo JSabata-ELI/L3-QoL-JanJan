@@ -13,7 +13,64 @@ import json
 from PIL import Image, ImageTk
 
 # ---------------- CONFIG ----------------
-_ONEDRIVE = Path.home() / "OneDrive - ELI Beamlines"
+def _onedrive_root() -> Path:
+    """This machine's OneDrive folder.
+
+    The name is per tenant ("OneDrive - ELI Beamlines", "OneDrive - ELI ERIC", …)
+    and a PC can have more than one of them, so a hard-coded name resolves to a
+    real but WRONG folder instead of failing visibly. Order: the environment
+    (what Windows itself says), then any OneDrive folder that actually holds the
+    sources, then the historical name so nothing regresses.
+    """
+    env = os.environ.get("ONEDRIVE") or os.environ.get("ONEDRIVECOMMERCIAL")
+    tail = Path("ELI Beamlines") / "Python" / "programy"
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    try:
+        candidates.extend(sorted(d for d in Path.home().iterdir()
+                                 if d.is_dir() and d.name.lower().startswith("onedrive")))
+    except OSError:
+        pass
+    for c in candidates:
+        if (c / tail).is_dir():
+            return c
+    return candidates[0] if candidates else Path.home() / "OneDrive - ELI Beamlines"
+
+
+_ONEDRIVE = _onedrive_root()
+
+
+def _devtools_dist_root() -> "Path | None":
+    """Where Dev Tools puts its builds, from its own config.
+
+    That file is the single source of truth for the build output (it is set in
+    Dev Tools' "Set paths" dialog and is usually outside OneDrive, so a build does
+    not churn the sync). Reading it here means a developer run of the Launcher
+    lists exactly what has been built locally, instead of nothing.
+    """
+    cfg = Path(os.environ.get("APPDATA", "~")) / "DevTools" / "config.json"
+    try:
+        root = json.loads(cfg.read_text(encoding="utf-8")).get("dist_root")
+    except Exception:
+        return None
+    if not root:
+        return None
+    p = Path(root)
+    return p if p.is_dir() else None
+
+
+def _programs_root() -> Path:
+    """The folder whose sub-folders are programs.
+
+    Program folders live in the git repository (`…/programy/L3-QoL-JanJan`), while
+    the build output stays beside it (`…/programy/dist`). Pointing the scan at
+    `programy` found Archive / Icons / Matlab and no programs, so the repo level is
+    used when it is there.
+    """
+    base = _ONEDRIVE / "ELI Beamlines" / "Python" / "programy"
+    repo = base / "L3-QoL-JanJan"
+    return repo if repo.is_dir() else base
 CONFIG_PATH = Path(os.environ.get("APPDATA", "~")) / "Launcher" / "config.json"
 
 def _load_config() -> dict:
@@ -35,7 +92,7 @@ ROOT_OPTIONS = [
     ("Lab - Scratch",      Path(r"\\hapls-share.lcs.local\scratch\Software"), False),
     ("Office - Scratch",   None,                                               True),
     ("Office - Sharepoint",None,                                               True),
-    ("Office - Programs",  _ONEDRIVE / "ELI Beamlines" / "Python" / "programy", False),
+    ("Office - Programs",  _programs_root(),                                   False),
 ]
 # Třetí hodnota = True znamená "cesta je z configu, lze nastavit přes UI"
 
@@ -56,6 +113,17 @@ def _apply_config_to_root_options(cfg: dict) -> list:
 
 IGNORE_DIR_NAMES = {"archive", "dist"}  # program\archive is ignored
 
+# Two cards to a row, always: never one, never three. The window is kept wide
+# enough for two of the widest cards instead (see _fit_two_columns).
+GROUP_COLS = 2
+MIN_WINDOW_H = 430
+# The cards get less than the canvas is wide: the grid is packed with padx=8
+# inside a frame packed with padx=6, on both sides. Measuring this live reads
+# the previous size while a resize is still on its way and then the second
+# column lands past the right edge, so it is taken from the two pack() calls in
+# _rebuild_buttons_inner — change it there and change it here.
+GRID_PAD_PX = 2 * (8 + 6)
+
 NOTES_LAB    = Path(r"\\hapls-share.lcs.local\scratch\Software\notes.txt")
 NOTES_OFFICE = Path(r"\\hapls-share.cs.eli-beams.eu\scratch\Software\notes.txt")
 
@@ -63,6 +131,15 @@ VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)$")
 
 ARCHIVE_EXE_RE = re.compile(
     r"^.+\s+v(\d+)\.(\d+)\.(\d+)__\d{8}_\d{6}\.exe$",
+    re.IGNORECASE
+)
+
+# Normalized archived exe — Dev Tools strips the "__YYYYMMDD_HHMMSS" suffix off
+# files inside vX.Y.Z/ folders so a snapshot is runnable as-is. An optional
+# " (2)" dedup suffix may trail the version.
+#   "Image Tools v2.5.4.exe", "Image Tools v2.4.0 (2).exe"
+ARCHIVE_EXE_PLAIN_RE = re.compile(
+    r"^.+\s+v(\d+)\.(\d+)\.(\d+)(?:\s+\(\d+\))?\.exe$",
     re.IGNORECASE
 )
 
@@ -74,56 +151,78 @@ TIMESTAMPED_EXE_RE = re.compile(
 _ARCHIVE_VER_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)__(\d{8})_(\d{6})", re.IGNORECASE)
 _ARCHIVE_LABEL_RE = re.compile(r"(v\d+\.\d+\.\d+)__(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
 _VER_ANYWHERE_RE = re.compile(r"(v\d+\.\d+\.\d+)", re.IGNORECASE)
+_VER_NUM_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)", re.IGNORECASE)
 
-def _archive_exe_version(p: Path) -> tuple:
+def _archive_exe_version(p: Path, folder_ver: tuple | None = None) -> tuple:
+    """Sort key (maj, min, patch, date, time). Timestamped names keep full
+    granularity; normalized names fall back to the version folder / filename
+    with a (0, 0) timestamp so they still sort by version."""
     m = _ARCHIVE_VER_RE.search(p.stem)
     if m:
         return tuple(map(int, m.groups()))
-    return (0, 0, 0, 0, 0)
+    base = folder_ver
+    if base is None:
+        vm = _VER_NUM_RE.search(p.stem)
+        base = tuple(map(int, vm.groups())) if vm else (0, 0, 0)
+    return base + (0, 0)
 
-def _archive_exe_label(p: Path) -> str:
+def _archive_exe_label(p: Path, folder_ver: tuple | None = None) -> str:
     m = _ARCHIVE_LABEL_RE.search(p.stem)
     if m:
         ver = m.group(1)
         date = f"{m.group(2)}-{m.group(3)}-{m.group(4)}"
         time_ = f"{m.group(5)}:{m.group(6)}:{m.group(7)}"
         return f"{ver}  ({date}  {time_})"
+    # Normalized name (no timestamp) — label from the version folder or filename.
+    if folder_ver:
+        return _ver_str(folder_ver)
+    vm = _VER_NUM_RE.search(p.stem)
+    if vm:
+        return "v" + ".".join(vm.groups())
     return p.stem
 
 def _find_versioned_py(version_dir: Path, exe_path: Path) -> Path | None:
     """Najde hlavní .py soubor pro danou verzi (stejný název jako exe, nebo první nalezený s verzí)."""
-    py_stem = exe_path.stem  # e.g. "Image Tools v1.2.1__20260511_125840"
+    py_stem = exe_path.stem  # e.g. "Image Tools v1.2.1__20260511_125840" or "Image Tools v2.5.4"
     candidate = version_dir / (py_stem + ".py")
     if candidate.exists():
         return candidate
-    # Fallback: first .py file in the folder with version in name
+    # Fallback: first .py file in the folder with version in name (timestamped or normalized)
     for f in version_dir.glob("*.py"):
-        if ARCHIVE_EXE_RE.match(f.name.replace(".py", ".exe")):
+        exe_like = f.name[:-3] + ".exe"
+        if ARCHIVE_EXE_RE.match(exe_like) or ARCHIVE_EXE_PLAIN_RE.match(exe_like):
             return f
     return None
 
 
 def scan_archive_versions(program_dir: Path) -> list[dict]:
     """Vrátí seznam archivních verzí seřazených od nejnovější.
-    Podporuje novou strukturu archive/vX.Y.Z/*.exe i starou plochou archive/*.exe."""
+    Podporuje novou strukturu archive/vX.Y.Z/*.exe (s timestampou i normalizovanou
+    bez timestampy) i starou plochou archive/*.exe."""
     archive_dir = program_dir / "archive"
     if not archive_dir.exists():
         return []
 
     entries = []
 
-    # Nová struktura: archive/vX.Y.Z/*.exe
+    # Nová struktura: archive/vX.Y.Z/*.exe — jeden záznam na složku verze.
     for version_subdir in archive_dir.iterdir():
         if not version_subdir.is_dir():
             continue
-        for exe in version_subdir.glob("*.exe"):
-            if ARCHIVE_EXE_RE.match(exe.name):
-                py_path = _find_versioned_py(version_subdir, exe)
-                entries.append({
-                    "exe_path": exe,
-                    "py_path": py_path,
-                    "label": _archive_exe_label(exe),
-                })
+        folder_ver = parse_version(version_subdir.name)  # (maj, min, patch) | None
+        # Prefer the canonical name over " (2)" dedup copies.
+        exes = sorted(version_subdir.glob("*.exe"),
+                      key=lambda p: (" (" in p.stem, p.name.lower()))
+        for exe in exes:
+            if not (ARCHIVE_EXE_RE.match(exe.name) or ARCHIVE_EXE_PLAIN_RE.match(exe.name)):
+                continue
+            entries.append({
+                "exe_path": exe,
+                "py_path": _find_versioned_py(version_subdir, exe),
+                "label": _archive_exe_label(exe, folder_ver),
+                "_ver": _archive_exe_version(exe, folder_ver),
+            })
+            break  # one exe per version folder
 
     # Stará flat struktura: archive/*.exe (zpětná kompatibilita)
     for exe in archive_dir.glob("*.exe"):
@@ -132,9 +231,12 @@ def scan_archive_versions(program_dir: Path) -> list[dict]:
                 "exe_path": exe,
                 "py_path": None,
                 "label": _archive_exe_label(exe),
+                "_ver": _archive_exe_version(exe),
             })
 
-    entries.sort(key=lambda e: _archive_exe_version(e["exe_path"]), reverse=True)
+    entries.sort(key=lambda e: e["_ver"], reverse=True)
+    for e in entries:
+        e.pop("_ver", None)
     return entries
 
 README_PREFIX = "readme_"  # case-insensitive
@@ -216,6 +318,32 @@ def find_readme_or_none(program_dir: Path, program_name: str) -> Path | None:
     return None
 
 
+def find_readme_full_or_none(program_dir: Path, program_name: str) -> Path | None:
+    """
+    Long/detailed companion document, shown as the extra "Details" button.
+    Accepts (case / separators / extension ignored):
+      ReadMe_<ProgramName>_Full
+      ReadMe_<ProgramName>_Details
+      Manual_<ProgramName>
+    """
+    targets = {
+        _norm("readme_" + program_name + "_full"),
+        _norm("readme_" + program_name + "_details"),
+        _norm("manual_" + program_name),
+    }
+
+    try:
+        for f in program_dir.iterdir():
+            if not f.is_file():
+                continue
+            if _norm(f.stem) in targets or _norm(f.name) in targets:
+                return f
+    except Exception:
+        return None
+
+    return None
+
+
 # ---------------- GROUPING CONFIG ----------------
 # Global rules (same for ALL roots).
 # Everything else (not listed) becomes "External".
@@ -225,17 +353,27 @@ SCRIPTS = {
     "Image Tools",
     "Screenshots",
     "Time Converter",
-    "Dev Tools",
     "Announcer",
     "CSS Logger",
     "Chiller log",
 }
 
 PARTS = {
-    "Image Finder",
-    "Image Slider",
-    "Shot finder",
     "Launcher",
+}
+
+# Programs that are no longer programs: their whole feature now lives inside a
+# bigger one, and the folder left on the share only offers an old build of it.
+# They are dropped in scan_programs(), so they appear in no group at all — a
+# card here would just be a way to start last spring's version by mistake.
+# Matched through _norm(), so spelling and spacing of the folder do not matter.
+SUBSUMED = {
+    "Image Finder":  "Image Tools",
+    "Image Slider":  "Image Tools",
+    "Shot finder":   "Image Tools",
+    "Spectra":       "CSS Logger",
+    "Builder":       "Dev Tools",
+    "Copy manager":  "Dev Tools",
 }
 
 IN_PROGRESS = {
@@ -250,6 +388,8 @@ PERSONAL = {
     "Copy Manager",
     "Builder",
     "Internal Builder",
+    "Dev Tools",
+    "Git Work",
 }
 
 GROUP_ORDER = [
@@ -269,6 +409,7 @@ def _norm_set(values: set[str]) -> set[str]:
 # pre-normalize once
 SCRIPTS_N = _norm_set(set(SCRIPTS))
 PARTS_N = _norm_set(set(PARTS))
+SUBSUMED_N = {_norm(k): v for k, v in SUBSUMED.items()}
 PERSONAL_N = _norm_set(set(PERSONAL))
 IN_PROGRESS_N = _norm_set(set(IN_PROGRESS))
 NOT_WORKING_CORRECTLY_N = _norm_set(set(NOT_WORKING_CORRECTLY))
@@ -311,6 +452,7 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
     """Scan a single program directory. Returns (name, info) or None."""
     program_name = program_dir.name
     readme = find_readme_or_none(program_dir, program_name)
+    readme_full = find_readme_full_or_none(program_dir, program_name)
 
     # A) scratch layout: exe přímo ve složce programu
     exes_root = list(program_dir.glob("*.exe"))
@@ -321,6 +463,7 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
         return (program_name, {
             "exe_path": exe,
             "readme_path": readme,
+            "readme_full_path": readme_full,
             "label": program_name,
             "program_dir": program_dir,
             "icon_path": find_icon_for_program(program_dir, exe),
@@ -328,8 +471,19 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
         })
 
     # B) programy layout: ROOT\dist\<Program>\vX.Y.Z\*.exe
-    dist_dir = root / "dist" / program_name
-    vf = newest_version_folder(dist_dir)
+    # The sources sit in the repo while `dist` stays next to it, so a dist folder
+    # beside the scan root counts too — otherwise scanning the repo finds sources
+    # with no exe and reports nothing.
+    vf = None
+    _dist_candidates = [root / "dist" / program_name,
+                        root.parent / "dist" / program_name]
+    _dt_dist = _devtools_dist_root()
+    if _dt_dist is not None:
+        _dist_candidates.append(_dt_dist / program_name)
+    for dist_dir in _dist_candidates:
+        vf = newest_version_folder(dist_dir)
+        if vf:
+            break
     if not vf:
         return None
     exes_v = list(vf.glob("*.exe"))
@@ -341,6 +495,7 @@ def _scan_one_program(program_dir: Path, root: Path) -> "tuple[str, dict] | None
     return (program_name, {
         "exe_path": exe,
         "readme_path": readme,
+        "readme_full_path": readme_full,
         "label": program_name,
         "program_dir": program_dir,
         "icon_path": find_icon_for_program(program_dir, exe),
@@ -355,6 +510,7 @@ def scan_programs(root: Path) -> dict[str, dict]:
     dirs = [
         p for p in root.iterdir()
         if p.is_dir() and p.name.lower() not in IGNORE_DIR_NAMES
+        and _norm(p.name) not in SUBSUMED_N
     ]
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -622,6 +778,30 @@ def prompt_restore_swap_state(parent: tk.Tk, stuck: list[tuple[str, Path, Path]]
         )
 
 # ---------------- APP ----------------
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 def set_app_icon(win, ico_path, app_id=None):
     """Apply icon.ico to the title bar AND the Windows taskbar button.
 
@@ -630,9 +810,10 @@ def set_app_icon(win, ico_path, app_id=None):
     default feather. We force every slot from icon.ico via Win32.
     """
     import ctypes
-    if app_id:
+    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
+    if _aumid:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
     try:
@@ -677,9 +858,23 @@ class Launcher(tk.Tk):
 
         # Jednotná typografie
         self.option_add("*Font", "SegoeUI 10")
-        # --- fixed cell sizing + dynamic columns ---
-        self._group_cols = 2
-        self._group_min_cell_px = 260  # min šířka jedné "dlaždice" (uprav si)
+        # --- two columns, window sized to the cards ---
+        self._group_cols = GROUP_COLS
+        # How wide the widest card on screen really is. Nothing is guessed: a
+        # guess goes stale the moment a card gains a button, and a stale guess is
+        # what let two columns be drawn into the space for one.
+        self._measured_cell_px = None
+        # A card is not the same width in every group (the ReadMe+Details pair
+        # makes it narrower than the archive dropdown does), so one measured
+        # width re-taken per group used to bounce between two values and each
+        # bounce booked another rebuild — the window flickered between one and
+        # two columns for ever. Now the width is taken from the widest card on
+        # screen and may only GROW inside one relayout chain, and the chain is
+        # capped, so it always settles.
+        self._relayouts = 0
+        self._btn_chars_used: int | None = None
+        self._chrome_px: int | None = None   # window width that is not card space
+        self._doc_btn_px = None
 
         # Jemnější buttony
         # Program button style (hover effect)
@@ -717,9 +912,13 @@ class Launcher(tk.Tk):
         )
 
         self.style.configure("Info.TButton", padding=(5, 2), font=("Segoe UI", 8))
+        # The two doc buttons sit side by side, so they get tighter padding than
+        # the other small buttons. The font stays at 8 — legibility first; the
+        # width is bought back from the program button instead.
+        self.style.configure("Doc.TButton", padding=(3, 2), font=("Segoe UI", 8))
         self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         self.style.configure("TLabel", font=("Segoe UI", 10))
-        self.title("Software Launcher")
+        self.title("Launcher")
         if getattr(sys, "frozen", False):
             _base = Path(sys.executable).resolve().parent
         else:
@@ -768,14 +967,14 @@ class Launcher(tk.Tk):
             self.refresh()
 
     def _calc_group_cols(self) -> int:
-        # kolik sloupců se vejde do aktuální šířky okna
-        w = self.sf.canvas.winfo_width()
-        if w <= 50:
-            return self._group_cols
+        """Always two columns of program buttons.
 
-        cols = max(1, w // self._group_min_cell_px)
-        # nechceme extrém; 4 bohatě stačí
-        return max(2, min(int(cols), 4))
+        The count used to follow the window width, which is what let the layout
+        flip between one and two columns while the cards were being measured.
+        The window is now sized to the cards instead (`_fit_two_columns`), so
+        this is a constant and a resize never re-flows the grid.
+        """
+        return GROUP_COLS
 
     def _build_ui(self):
         root = ttk.Frame(self, padding=10)
@@ -823,6 +1022,8 @@ class Launcher(tk.Tk):
         self.status.pack(fill="x", pady=(8, 0))
 
     def _refresh_cols_and_rebuild(self):
+        if getattr(self, "_in_rebuild", False):
+            return
         new_cols = self._calc_group_cols()
         if new_cols != getattr(self, "_group_cols", 2):
             self._group_cols = new_cols
@@ -875,6 +1076,12 @@ class Launcher(tk.Tk):
         self.current_root_path = selected_root
         self._update_available.clear()
         self._pending_updates.clear()
+        # A new scan can bring different names and different cards, so the card
+        # width is measured again from scratch instead of keeping the widest one
+        # some earlier source happened to have.
+        self._measured_cell_px = None
+        self._btn_chars_used = None
+        self._relayouts = 0
         # Startup check: flag programs whose on-disk version differs from last acknowledged
         for name, info in self.programs.items():
             ack_ver = self._acknowledged.get(name)
@@ -908,6 +1115,21 @@ class Launcher(tk.Tk):
             prompt_restore_swap_state(self, stuck)
 
     def _rebuild_buttons(self):
+        # Measuring a card runs Tk's pending idle work, and one of those idle
+        # jobs is the column check — which would call this again from inside
+        # itself, on widgets that are being replaced. One rebuild at a time.
+        if getattr(self, "_in_rebuild", False):
+            return
+        self._in_rebuild = True
+        try:
+            self._rebuild_buttons_inner()
+        finally:
+            self._in_rebuild = False
+
+    def _rebuild_buttons_inner(self):
+        # One column count for the whole rebuild: asking again per group is what
+        # let two groups be drawn to two different layouts in the same pass.
+        self._group_cols = self._calc_group_cols()
         for w in self.sf.inner.winfo_children():
             w.destroy()
 
@@ -955,6 +1177,16 @@ class Launcher(tk.Tk):
         self._group_headers: dict[str, ttk.Frame] = {}  # header widget per group, for pack(after=)
         self._group_items: dict[str, list] = {}         # items per group for lazy build
 
+        # Fill the item lists for EVERY group first. The button width is taken
+        # from them, and the first group used to be built while the later groups
+        # were still missing — so it got sized to its own longest name only.
+        for _title, _gkey in GROUP_ORDER:
+            if grouped.get(_gkey):
+                self._group_items[_gkey] = grouped[_gkey]
+                # Default: Scripts expanded, everything else collapsed
+                if _gkey not in self._group_expanded:
+                    self._group_expanded[_gkey] = (_gkey == "scripts")
+
         any_group_shown = False
         for title, gkey in GROUP_ORDER:
             group_items = grouped.get(gkey, [])
@@ -962,10 +1194,6 @@ class Launcher(tk.Tk):
                 continue
 
             any_group_shown = True
-
-            # Default: Scripts expanded, everything else collapsed
-            if gkey not in self._group_expanded:
-                self._group_expanded[gkey] = (gkey == "scripts")
 
             expanded = self._group_expanded[gkey]
             arrow = "▼" if expanded else "▶"
@@ -996,13 +1224,134 @@ class Launcher(tk.Tk):
 
         if not any_group_shown:
             ttk.Label(self.sf.inner, text="No programs to show.").pack(anchor="w", padx=8, pady=8)
+            return
+
+        self._sync_cell_width()
+
+    def _shown_group_keys(self) -> list:
+        """Groups that are open right now — the only ones the sizes come from."""
+        return [g for g, items in self._group_items.items()
+                if items and self._group_expanded.get(g)]
+
+    def _prog_btn_chars(self) -> int:
+        """Width of the program buttons, in characters.
+
+        Sized to the longest name in the groups that are OPEN, so every card on
+        screen gets the same button and they line up column to column. A name
+        hidden in a collapsed group does not stretch them: at a fixed 18 the
+        widest label ("Internal Builder") left 28 px of empty button, and that
+        slack is exactly what the second doc button needs.
+        """
+        longest = 0
+        shown = self._shown_group_keys()
+        for gkey in (shown or list(self._group_items)):
+            for _name, info in self._group_items.get(gkey, []):
+                longest = max(longest, len(ui_label(info.get("label", ""))))
+        return max(10, min(longest, 22))
+
+    def _sync_cell_width(self, allow_shrink: bool = False):
+        """Re-flow the grid if the widest card on screen does not fit the layout.
+
+        The width may only grow while a relayout chain is running, so it cannot
+        bounce between the two card sizes; `allow_shrink` is for the one case
+        where a card really did get narrower — a group was just closed — and it
+        is only ever asked for by a click, never from inside a chain.
+        """
+        widest = 0
+        for gkey in self._shown_group_keys():
+            grid = self._group_grids.get(gkey)
+            if grid is None:
+                continue
+            try:
+                grid.update_idletasks()
+                for cell in grid.winfo_children():
+                    widest = max(widest, cell.winfo_reqwidth() + 12)
+            except Exception:
+                return          # widgets went away under us — nothing to size
+        if widest <= 50:
+            return
+
+        if allow_shrink:
+            changed = widest != self._measured_cell_px
+        else:
+            changed = self._measured_cell_px is None or widest > self._measured_cell_px
+        if changed:
+            self._measured_cell_px = widest
+
+        self._fit_two_columns()
+
+        if self._calc_group_cols() != self._group_cols and self._relayouts < 3:
+            self._relayouts += 1
+            self.after(0, self._rebuild_buttons)
+        else:
+            self._relayouts = 0
+
+    def _fit_two_columns(self):
+        """Keep the window wide enough for two of the widest cards side by side.
+
+        Opening a group can bring wider cards, and two of those no longer fit in
+        the window the user left the last group in — the second column would be
+        drawn past the right edge. So the minimum width follows the cards, and a
+        window that is already too narrow is widened once. It is never made
+        narrower again: the size the user chose is theirs to keep.
+        """
+        cell = self._measured_cell_px
+        if not cell:
+            return          # no real card measured yet — nothing to size to
+        try:
+            win_w, win_h = self.winfo_width(), self.winfo_height()
+            canvas_w = self.sf.canvas.winfo_width()
+            # The scrollbar takes its share of the width as soon as the list is
+            # long enough, so count it even while it is hidden. A scrollbar that
+            # was never mapped asks for far more than it takes (69 px measured),
+            # hence the cap — otherwise the window jumps wider than it needs.
+            vsb_w = 0 if self.sf.vsb.winfo_ismapped() else min(self.sf.vsb.winfo_reqwidth(), 24)
+        except Exception:
+            return
+        if win_w <= 1 or canvas_w <= 1:
+            return
+
+        # Everything the window spends on itself: padding, border, scrollbar.
+        # Measured right after a resize the canvas is still the old size, which
+        # makes this look bigger than it is — and it is a property of the window,
+        # not of the moment, so keep the smallest reading rather than the latest.
+        chrome = max(0, win_w - canvas_w) + max(0, vsb_w)
+        if self._chrome_px is None or chrome < self._chrome_px:
+            self._chrome_px = chrome
+        needed = GROUP_COLS * cell + self._chrome_px + GRID_PAD_PX
+        self.minsize(needed, MIN_WINDOW_H)
+        if win_w < needed:
+            self.geometry(f"{needed}x{max(win_h, MIN_WINDOW_H)}")
+
+    def _doc_btn_width_px(self) -> int:
+        """
+        Width of one doc button ("ReadMe" / "Details"), measured once.
+
+        Both halves of a card's button area get this as a minimum, so a card
+        without a "Details" button keeps the exact geometry of one that has it.
+        Without the minimum those two halves shrink to the small icon buttons
+        underneath, the lone "ReadMe" shrinks with them, and the whole card is
+        pulled narrower than its neighbours.
+        """
+        if self._doc_btn_px is None:
+            probe = ttk.Button(self, text="Details", style="Doc.TButton", width=7)
+            try:
+                probe.update_idletasks()
+                self._doc_btn_px = max(40, probe.winfo_reqwidth())
+            except Exception:
+                self._doc_btn_px = 56
+            finally:
+                probe.destroy()
+        return self._doc_btn_px
 
     def _build_group_content(self, gkey: str):
         grid = self._group_grids.get(gkey)
         group_items = self._group_items.get(gkey, [])
         if grid is None or not group_items:
             return
-        cols = self._calc_group_cols()
+        cols = self._group_cols
+        prog_chars = self._prog_btn_chars()
+        self._btn_chars_used = prog_chars
         for i, (name, info) in enumerate(group_items):
             r = i // cols
             c = i % cols
@@ -1032,14 +1381,17 @@ class Launcher(tk.Tk):
                 img = self._icon_cache.get(key)
 
             btn_style = "Update.Prog.TButton" if name in self._update_available else "Prog.TButton"
-            btn_text = ui_label(info["label"])
+            # The button is as wide as the longest name in the open groups, but
+            # not wider than the cap — a name over the cap ends in "..." instead
+            # of being cut off mid-word at the edge of the button.
+            btn_text = clamp_label(ui_label(info["label"]), prog_chars)
             btn = ttk.Button(
                 cell,
                 text=btn_text,
                 image=img,
                 compound="left",
                 style=btn_style,
-                width=18,
+                width=prog_chars,
                 command=lambda n=name: self.launch(n),
             )
             btn.grid(row=0, column=0, rowspan=2, sticky="nsw", padx=(0, 6))
@@ -1048,17 +1400,41 @@ class Launcher(tk.Tk):
 
             sub = ttk.Frame(cell)
             sub.grid(row=0, column=1, rowspan=2, sticky="nsew")
-            sub.grid_columnconfigure(0, weight=1)
-            sub.grid_columnconfigure(1, weight=1)
+            doc_px = self._doc_btn_width_px()
+            # +2 on the left half is the gap the two doc buttons sit apart with.
+            sub.grid_columnconfigure(0, weight=1, minsize=doc_px + 2)
+            sub.grid_columnconfigure(1, weight=1, minsize=doc_px)
             sub.grid_rowconfigure(0, weight=0)
             sub.grid_rowconfigure(1, weight=0)
 
-            if info.get("readme_path"):
-                info_btn = ttk.Button(
-                    sub, text="ReadMe", style="Info.TButton",
-                    command=lambda n=name: self.open_readme(n),
-                )
-                info_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+            has_readme = bool(info.get("readme_path"))
+            has_full = bool(info.get("readme_full_path"))
+            # width=7 is not the label length — a ttk button with no explicit
+            # width takes the theme's minimum (69-80 px here) however short its
+            # text is, and two of those is what made the card 86 px too wide.
+            # At width=7 with padding (3,2) the button is 56 px and holds
+            # "Details" (35 px) and "ReadMe" (42 px) with room to spare.
+            if has_readme or has_full:
+                if has_readme:
+                    info_btn = ttk.Button(
+                        sub, text="ReadMe", style="Doc.TButton", width=7,
+                        command=lambda n=name: self.open_readme(n),
+                    )
+                    info_btn.grid(
+                        row=0, column=0,
+                        columnspan=1 if has_full else 2,
+                        sticky="ew", pady=(0, 2), padx=(0, 2) if has_full else 0,
+                    )
+                if has_full:
+                    full_btn = ttk.Button(
+                        sub, text="Details", style="Doc.TButton", width=7,
+                        command=lambda n=name: self.open_readme_full(n),
+                    )
+                    full_btn.grid(
+                        row=0, column=1 if has_readme else 0,
+                        columnspan=1 if has_readme else 2,
+                        sticky="ew", pady=(0, 2),
+                    )
             else:
                 ttk.Frame(sub, height=1).grid(row=0, column=0, columnspan=2)
 
@@ -1088,6 +1464,18 @@ class Launcher(tk.Tk):
     def _toggle_group(self, gkey: str):
         expanded = not self._group_expanded.get(gkey, False)
         self._group_expanded[gkey] = expanded
+        self._relayouts = 0          # a click starts a fresh relayout chain
+
+        # The buttons are as wide as the longest name in the OPEN groups, so a
+        # group that brings a longer (or takes away the longest) name resizes
+        # every card — that needs the whole grid built again, not just this one.
+        if self._prog_btn_chars() != self._btn_chars_used:
+            self._rebuild_buttons()
+            # The rebuild itself may only widen the cards; this click may also
+            # narrow them, so the columns come back after closing a group.
+            self._sync_cell_width(allow_shrink=True)
+            return
+
         frame = self._group_frames.get(gkey)
         btn = self._group_toggle_btns.get(gkey)
         if frame:
@@ -1107,6 +1495,12 @@ class Launcher(tk.Tk):
             current = btn.cget("text")
             arrow = "▼" if expanded else "▶"
             btn.configure(text=arrow + current[1:])
+
+        # Opening a group can bring a wider card; closing one can take the
+        # widest away, and then the cards may fit in more columns again. A click
+        # is allowed to make the cards narrower again; a rebuild it starts is
+        # not, so the two card sizes can never take turns.
+        self._sync_cell_width(allow_shrink=True)
 
     def _show_group_menu(self, event, program_name: str):
         current_gkey = self._custom_groups.get(
@@ -1483,6 +1877,22 @@ class Launcher(tk.Tk):
             os.startfile(str(readme_path))
         except Exception as e:
             messagebox.showerror("ReadMe open failed", f"{program_name}\n\n{e}")
+
+    def open_readme_full(self, program_name: str):
+        info = self.programs.get(program_name)
+        if not info:
+            messagebox.showerror("Not found", f"Program not found: {program_name}")
+            return
+
+        path = info.get("readme_full_path")
+        if not path:
+            messagebox.showinfo("Details", f"No detailed ReadMe found for: {program_name}")
+            return
+
+        try:
+            os.startfile(str(path))
+        except Exception as e:
+            messagebox.showerror("Details open failed", f"{program_name}\n\n{e}")
 
 
 if __name__ == "__main__":

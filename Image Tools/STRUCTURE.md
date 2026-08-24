@@ -1,367 +1,2108 @@
-# Image Tools — STRUCTURE
+﻿# Image Tools — STRUCTURE
 
-## Soubory
+> Verified against source: 2026-08-24 · `main.py` 351 L · `if_t.py` 9133 L ·
+> `is_t.py` 26400 L · `sf_t.py` 4901 L · `wk_t.py` 7879 L · `om_t.py` 3455 L ·
+> `cpva_client.py` 1335 L · `img_scale.py` 760 L
+>
+> The `om_t.py` (One Moment) and `sf_t.py` (Shot Finder) sections are current as of
+> 2026-08-24. The rest of this document was last verified on 2026-08-19 and the older
+> modules have grown since — treat their line references as approximate.
 
-| Soubor | Popis |
-|--------|-------|
-| `main.py` | Entry point. Spouští `QApplication`, buildí hlavní okno s `QTabWidget` (záložky: Image Finder, Image Slider, Shot Finder, Workshop). Detekuje verzi z názvu exe. |
-| `is_t.py` | **Image Slider** — prohlížeč časových sérií snímků z kamer. Scrubbing, pointing, SC, multi-cam, online mode. |
-| `if_t.py` | **Image Finder** — výběr kamer a snímků pro daný den, anotace energetickými daty z CPVA API + CSV. |
-| `sf_t.py` | **Shot Finder** — hledání snímků podle hodnoty PV (energie, waveplate…) v CPVA archiveru. |
-| `wk_t.py` | **Workshop** — editor obrázků přijatých z ostatních záložek. Jas/kontrast, palety, ořez, kreslení (brush/line/rect/text/eraser), diff vůči referenci, undo/redo, uložení PNG/TIFF. |
-| `sp_t.py` | ⚠️ **Není součástí aplikace** — `main.py` ho neimportuje a nikde se nereferencuje. Osiřelá kopie programu Spectra; lze smazat nebo přesunout do Archive. |
+User-facing documentation: `Readme Image Tools.txt` (short, the Launcher's **ReadMe**
+button) and `ReadMe_Image Tools_Full.txt` (detailed, the Launcher's **Details** button).
+Shared infrastructure — paths, the build/deploy chain, where settings live:
+`../INFRASTRUCTURE.md`.
 
-> **Aktuální velikosti (2026-06-19):** main.py 255 ř. · if_t.py 6624 ř. · is_t.py 11238 ř. · sf_t.py 2682 ř. · wk_t.py 1283 ř. Detailní line-by-line mapa je v `image_tools_structure.md`.
+## Files
+
+| File | Description |
+|------|-------------|
+| `main.py` | Entry point. Starts `QApplication`, builds the main window with a `QTabWidget` (Image Finder, Image Slider, Shot Finder, One Moment, Workshop). Detects the version from the exe name. `om_t.py` is loaded LAST and inside its own `try` — it borrows from `image_slider`, `shot_finder` and `workshop` (the painted button icons), so all three must already be in `sys.modules`, and a failure in the newest tab must not take the other four down with it. When it does fail, a tab titled "One Moment (unavailable)" carries the error instead of the tab quietly not being there (a missing tab reads as "this version does not have it"). |
+| `if_t.py` | **Image Finder** — one camera across many days, side by side on one shared scale. Also picks the frames: for a day, for a range of days, by PV conditions, or with no target at all. |
+| `is_t.py` | **Image Slider** — time-series viewer. Scrubbing, playback, pointing, spatial contrast, multi-cam, live mode. |
+| `sf_t.py` | **Shot Finder** — finds frames by PV value (energy, waveplate…) in the CPVA archive. |
+| `om_t.py` | **One Moment** — the transpose of the other tabs: the picked PVs over the picked time window in ONE graph (an axis per unit), click a moment → every picked camera's frame at that moment plus each PV's value there, drag → per-PV statistics. A picked formula (derived PV) is fetched, computed over the window and drawn like any other curve. Settings live in a left panel of collapsible sections, as in the Slider, and are remembered in `one_moment_ui_state.json`. Owns no resolver, no registry, no renderer and no icon set of its own: the time-window and camera pickers, the PV list and its picker, the panel section, the image renderer (`load_image_scaled` — palette, contrast, brightness, gamma), the share root and the short camera label come from `image_slider`, the frame-for-a-timestamp resolver from `shot_finder`, the painted button icons from `workshop`, the day cache from `cpva_client` and the absolute scale from `img_scale`. What it does own is the TIME BASE a formula is evaluated on. A moment looked at twice costs nothing: the resolved file per (camera, moment) and the rendered picture per (file, display settings) are both kept in RAM under a byte ceiling. `Send to Image Slider` hands the moment and the picked cameras to `is_t.Viewer.open_moment`, which opens the Slider on a window around that moment and lands on it. |
+| `wk_t.py` | **Workshop** — look at, measure and annotate images handed over from the other tabs. Magnify to a chosen spot, non-destructive brightness/contrast/gamma/palette, histogram (as a picture and as numbers), several measuring regions with a results table and CSV export, profiles with FWHM / 1-e² / Gaussian fit, beam width and roundness, radial profile and encircled energy, vector annotations incl. angle and a calibrated scale bar, filters (median / blur / sharpen / edges / background removal), rotate-any-angle / straighten / bin / crop / resize, reference subtraction, combining several images (average / max / sum / min, red-green merge), comparison views, PNG / TIFF / JPEG export, a 16-bit data TIFF of the measured values, animated GIF / PNG / WebP, and a session file for the drawing. |
+| | Inside `wk_t.py`, above the tab and Qt-free: **PIXEL OPERATIONS** — neighbourhood filters (median / Gaussian / unsharp / Sobel, scipy when present, numpy fallback always), background maps (percentile / plane / quadratic surface / morphological rolling ball), projections across frames, red-green merge, arbitrary rotation with the matching annotation point map (Pillow's own matrix, reproduced so the two cannot disagree by a pixel), binning, animation writer, 16-bit data TIFF writer — and **BEAM MEASUREMENTS** — FWHM and 1/e² widths by interpolated level crossing, Gaussian fit with r² (scipy refines, moments stand in), D4σ with principal axes / tilt / roundness, radial profile, encircled energy. |
+| `cpva_client.py` | Shared CPVA archiver client: day cache, warming, nearest-sample and look-back lookups, tri-state results. |
+| `img_scale.py` | **What an intensity means** — the ONE owner of the absolute scale (`to_absolute_u8` / `to_u8`), the gamma curve (`gamma_from_slider` / `auto_gamma` / `gamma_for_median`), the explicit per-frame stretch (`stretch_u8`, `percentile_window`), raw-counts recovery (`derive_factor` / `to_counts`) and the frame metadata behind the readout (`meta_from_info`, `FrameMeta.scale_note`). Pure numpy/PIL, no Qt; every tab loads it through the `_import_img_scale()` sibling-import so all five share one instance. |
+| `testing/test_one_moment.py` | The One Moment tab end to end, offscreen, no network and no share. `%APPDATA%` is pointed at `%TEMP%` before the first widget is built, or running the tests would rewrite the operator's own remembered window and PV pick. Part 1 injects PV series by hand and pins the logic: a fresh tab opening on the Gradient palette, one graph with an axis per unit, the tick formatter landing on the axes whose ticks are actually painted, EVERY GRAPH-TOOLBAR ICON COMING OUT DARK (walked pixel by pixel — the one check that would have caught the white-on-white buttons), a click snapping onto a REAL sample, stepping shot by shot and stopping at the ends, THE ARROWS SAVING NOTHING while `Save` puts the moment they walked to on the list (and greys out once it is there), the marked-range statistics, a zero-width drag being a click and not a range, a range with no sample of a PV in it holding the last value forward (and saying `held`, with n = 0) while a range before the channel's first sample invents nothing, a PV with no sample in the whole window still being listed with its window-start seed, the left and right selectors being bound to one button each, a right drag zooming without touching the marked range and a right click walking back out, the eye taking a PV off the graph without unpicking it, a picked formula being computed, drawn on an axis of its own, read at the moment and counted in the statistics (and a formula that CANNOT be computed printing the reason where its number would be), the Auto ticks and the Default palette greying out the sliders they outrank, and a rebuild replacing the graph instead of stacking canvases. Part 1b takes the formula-over-time helpers on their own: the held sample, the 137 ms merge collapsing a shot's two writes into one point, the vectorise veto and the shape test that catches a reduction, VECTORISED AND PER-POINT GIVING THE SAME NUMBERS AS `is_t.pv_eval_derived` DOES, a division by zero leaving one break marker instead of an infinity, a hold not crossing a two-hour hole unless the channel is a step channel, worst-of status, a formula chained on a formula, and `_PvLoadTask.run()` called straight with `cpva.get_day` monkeypatched. Part 1c is what the tab remembers: a second widget comes back with the same window (to the minute), cameras, PVs, eye, sliders, saved moments and open sections, reads NOTHING from the share doing it, drops a PV that has left the shared registry, and after a fresh load the moment, the frame title and prev/next are cleared instead of left lying — while the saved-moments list is deliberately left alone. Part 2 writes a real `…/cpva-image-YYYY/Y/M/D/H/CAM/<unix_ns>.png` tree to `%TEMP%` (16-bit frames with a `MaxValue` tEXt chunk, unpadded folders, UTC hours), points `container_root_for_year` at it and checks what only a real tree can show: the NEAREST frame is the one picked rather than the first found, a camera with nothing near the moment is reported instead of dropped, a frame peaking at 255 counts stays dark next to one peaking at 4000 (the absolute scale), the caption carries the camera and the time while the offset from the moment is in the tooltip, the picture area is exactly as wide as the picture (no black gutter), a display control re-renders WITHOUT walking the share again, a second click REPLACES the tiles, a real Ctrl+wheel event over the pane resizes the frames (and a plain wheel does not), going back to a saved moment brings its frames back without duplicating its row, A MOMENT ALREADY LOOKED AT COMING BACK WITH NO EVENT LOOP AT ALL (both caches hit — the proof that a revisit costs neither a share walk nor a worker thread), and the panel's buttons carry painted icons rather than text glyphs. The fake tree goes to `%TEMP%` and not next to the test because the archive path plus a deep working directory passes Windows' 260-character limit and `mkdir` then fails as if the folder were missing. Not shipped (`test_` prefix). |
+| `testing/test_settle_native.py` | Drives a real 6-camera archive grid offscreen: drag, release, then measure. Asserts the tiles reach `HQ_SIDE` (`_diag_hq > 0` and every `_cam_shown_key` at `HQ_SIDE`) and that an idle panel stops repainting. Guards the `_refine_current_frame` → `_display_multicam_index` → `_proxy_try_paint_cam` → `_schedule_refine` loop, which pinned every tile at preview resolution and burned 30 repaints/s. Synthetic local frames, no share. Not shipped (`test_` prefix). |
+| `testing/test_scale_invariance.py` | Checks the archive's storage rule on real frames: `stored_max / MaxValue` → a `65535/(2**bits-1)` factor, that same bracket predicted from `MaxValue` alone (`bits_from_max_value`, the rule the preview layer relies on), and unsaturated frames exist, and that no bracket is deeper than `SENSOR_BITS`. Also reports which cameras straddle a bracket (i.e. would flicker without the fixed range) and which `Camera type` models are present — a second model is the other way `SENSOR_BITS` could stop being true. Run it from the lab against a camera-hour or a day; exit 1 on a violation. Not shipped (`test_` prefix). |
+| `build_config.json`, `icon.ico` | Dev Tools build settings and the app icon. |
+| `image_tools_diag.log` | Diagnostic log written by the Slider (`Viewer._diag_log`), not part of the app. Also carries `dots=G../R..:<reason>` and the `cpva …` counters, so a transient red dot or a missing PV leaves evidence behind. |
+| `testing/bench_drag.py`, `testing/bench_play.py`, `testing/bench_live_dot.py`, `testing/bench_pv_wait.py`, `testing/bench_pv_live_multi.py`, `testing/bench_master_sync.py`, `testing/bench_live_slave_refresh.py`, `testing/bench_live_pv_load.py`, `testing/test_pv_resilience.py`, `testing/bench_common.py` | Headless offscreen harnesses driving a real `Viewer`: the PV panel surviving a wedged archiver fetch and a dead trigger chain (`testing/test_pv_resilience.py` — the freeze that used to need a restart), drag scheduling, playback, the live refresh-dot verdict, the PV panel waiting for the archiver instead of trailing the picture by a shot (single-cam, then the same promise in **live multi-cam**, fake transport, no network), every per-camera slider handle following the master, **every camera repainting on every shot in live mode** (mismatched cadences, the toggle, and the one camera that must stay put), and whether the PV panel starves the PICTURES under a live load (both the 145 ms share read and a 250 ms archiver round-trip simulated — with neither, nothing can starve anything). Not shipped. |
+| `testing/bench_live_rollover.py` | The one live fault none of the others can reach: **following the archive across a UTC hour rollover**. Every case in `testing/bench_live_dot.py` lives in one flat folder, so `poll_scan_folders` picking the newest hour and the `_probe_hour_folder` discovery of the next one are never exercised. A rollover failure is **silent** — nothing raises, nothing hangs, and `_live_health` reads "no new images" as a healthy idle source — so the dot stays green while the app has stopped following the archive. Uses the real …/YYYY/M/D/H/CAM layout with unpadded names; opens on the previous UTC hour and creates the current one, because `_probe_hour_folder` refuses a candidate whose hour is still in the future. `--cams 3` runs the multi-cam grid path. |
+| `testing/test_day_split.py` | Pins `cpva_client.fetch_samples_split`: an oversize window is halved until it fits and `get_day` still returns **every** sample; an error splitting cannot fix (4xx, bad JSON) is raised at once, with no split storm; a window already at the floor is not split; `CpvaBusyError` (our own pool, archiver never reached) is never split. Fake transport — no network, no share. |
+| `sort_by_camera.py` | Standalone utility, not part of the app: takes the per-shot folders the camera screenshot tool writes (`<source>/DDMMYYYY_HHMMSS/`) and re-files them into `<source>/final/<CAMERA>/`, one folder per camera. |
+| `HANDOFF_02072026.md` | Historical hand-over note from 2026-07-02. Kept for context; `STRUCTURE.md` and `image_tools_structure.md` are the current documents. |
+
+> The stray `sp_t.py` copy of the Spectra program is gone — nothing here imports it.
+> A line-by-line map lives in `image_tools_structure.md`.
 
 ---
 
-## Sdílené konstanty a konvence
+## Shared constants and conventions
 
-- Timezone: `PRAGUE = ZoneInfo("Europe/Prague")` — ve všech třech modulech
-- CPVA archiver: `https://10.78.0.57:8443/api/1.0/cpva` — SSL bez ověření certifikátu
-- Timestamp v názvech souborů: UTC nanoseconds (`extract_ns_from_stem`)
-- Síťové cesty: UNC `//server/share` (Lab) nebo `Z:\` (Office)
-- Checkboxy: `_CHECKBOX_STYLE` / `_CHECKBOX_STYLE_SM` — jednotné QSS (`::indicator` only, nikdy border na `QCheckBox {}`)
+- Timezone: `PRAGUE` / `TZ_PRAGUE` = `ZoneInfo("Europe/Prague")` in every module
+- CPVA archiver: `https://10.78.0.57:8443/api/1.0/cpva` — SSL without certificate
+  verification; all access goes through `cpva_client`
+- Filename timestamps: UTC nanoseconds (`extract_ns_from_stem` /
+  `parse_unix_ns_from_name`)
+- Network paths: UNC `//users-L3.tier0.lcs.local` (Lab) or `Z:\` (Office); the
+  archive tree is **UTC**
+- Checkboxes: `_CHECKBOX_STYLE` / `_CHECKBOX_STYLE_SM` — QSS on `::indicator` only,
+  never a border on `QCheckBox {}`
+- **Intensity scale (all four tabs, `img_scale.py`).** The archiver stores
+  `stored = raw_counts × 65535/(2**bits − 1)` — a factor that is fixed *within* a frame,
+  not a per-frame normalisation onto the full range. Measured on the PD reference frames:
+  a warmup frame with `MaxValue` 3378 stores a maximum of 54061 (= 3378 × 16.0037), not
+  65535, and dividing back returns exactly 3378.
+  **`bits` is NOT the camera's — it is the power-of-two bracket of that frame's own peak**,
+  `ceil(log2(MaxValue+1))` (`bits_from_max_value`). Measured 2026-08-18 on 150 frames from
+  six cameras: the bracket predicted from `MaxValue` alone matches the factor recovered
+  from the pixels on every frame, 0 exceptions. So `value / 65535` is **not** a stable
+  scale: C03-081-PCW3NF peaks on 1023/1024 counts and flipped ×64.06 / ×32.02 every few
+  seconds, which doubled and halved its picture (dark orange ↔ green) at unchanged shot
+  energy while the frames were identical in counts (median 68, p99.9 ≈ 685).
+  The display therefore renders `counts / (2**SENSOR_BITS − 1)` = `counts / 4095`
+  (`reference_bits`, `full_scale_for_frame`, `full_scale_for_pil`). **`SENSOR_BITS` is a
+  constant, not learned.** Measured 2026-08-20 over one whole day: all 88 camera folders
+  report `Camera type = 'Basler acA1600-20gm'`, one 12-bit model with no exceptions, and
+  no frame anywhere reports a `MaxValue` above 4095. So the denominator comes out of each
+  frame's own metadata and is the same for every frame of every camera — nothing is
+  remembered between sessions, and no single frame can move it.
+  This replaced a per-camera "largest bracket ever seen", learned into
+  `%APPDATA%\ELI_ImageTools\cam_depths.json`. That was wrong both ways: a camera seen only
+  while dim was rendered against its dim bracket, and one frame with a high `MaxValue`
+  darkened a camera permanently and invisibly — C03-081-PCW3NF ended up recorded at 16
+  bits and painted codes 0..3 of 255 (black) on ordinary pictures. Delete the leftover
+  file; nothing reads it.
+  It is expressed as a denominator, not as pixel arithmetic:
+  `display_full_scale(frame_bits)` is **exactly 65535** on a frame the archiver bracketed
+  at the sensor's own depth, i.e. a saturated one, and larger for a dimmer frame — which
+  is the point, a dim frame IS darker. It never goes below the frame's own bracket, so a
+  deeper camera added later widens the range on its own.
+  The factor is also what prints counts, recovered per frame as `stored_max / MaxValue`
+  (`derive_factor`).
+  `MaxValue` (PNG tEXt) is the **peak of that frame in raw counts**, not the sensor's
+  range — it reads 4095 only when the sensor is genuinely saturated. Never divide by it.
+  Verify the rule with `testing/test_scale_invariance.py` after any archiver change; it also
+  reports which cameras straddle a bracket.
+  Measured 2026-08-17 on `2026/8/14/12` (`testing/test_scale_invariance.py`, 0 violations):
+  **PFM13NF = 8-bit, PAM10NF = 11-bit, PASF1NF = 10-bit** — three cameras, three depths,
+  none of them 12-bit, all on the same fixed-factor rule. That is why the old
+  `MaxValue`-based path was not a cosmetic bug: it rendered PFM13 at mean code **3 of
+  255** (pure black) where the absolute scale gives 55, PASF1 at 5 instead of 21, PAM10
+  at 29 instead of 58. Do not assume 12-bit anywhere.
+- **We do NOT match the lab (IMAQ/LabVIEW) display, on purpose** — settled 2026-08-17 by
+  comparing the three cameras above against the lab screens. The lab divides by each
+  camera's *configured* depth, and the configuration has drifted: it agrees with our
+  absolute scale on PASF1 (correctly configured), renders PAM10 ~2× too dark, and PFM13
+  **~16× too dark** (configured 12-bit, sensor running 8-bit — a frame peaking at 83 % of
+  its own full scale arrives on the lab screen as mean code 3 of 255).
+  No static per-camera depth setting can be right, because the depth changes between
+  frames of the same camera; we derive it per frame instead. So where we differ from the
+  lab, the lab is the one throwing the picture away — matching it would mean reproducing
+  a stale config and giving up "one palette colour = one intensity". The readout under
+  the preview names the depth, so a discrepancy against a lab screen is explainable
+  rather than mysterious.
+- **Gamma** (`img_scale.to_absolute_u8(..., gamma=)`) is the answer to "the absolute scale
+  is right but the frame is dark" that does NOT cost comparability: `code = 255 ×
+  (value/65535) ** gamma` depends only on the pixel value, so one colour is still one
+  intensity — the mapping stays a monotone bijection of the absolute value, just not a
+  straight line. What it costs is that equal count differences stop *looking* equally big,
+  which is why anything other than 1.00 is named in the readout. Slider units are integer
+  percent (100 = linear) so the value is exact in a cache key; `0` is the Auto sentinel.
+  Present in all three tabs (`Gamma` slider + `Auto` + `↺`), default 1.00. Working point
+  on these cameras is 0.50 (PFM13/PAM10/PASF1 mean code 55/58/21 → 116/120/73).
+  `Auto gamma` lands the frame's MEDIAN at `AUTO_GAMMA_TARGET` (45 %) — per-frame, so it
+  gives up comparability like Auto contrast does, and the value it picked is parked on the
+  greyed-out slider.
+- Per-frame mapping happens in exactly five places, all deliberate and all visible: the
+  `Auto` contrast / brightness / gamma switches in the Finder / Shot Finder / Slider,
+  `Auto contrast` / `Auto brightness` in the Slider, the Workshop's Auto-BC button, and
+  the `Binary` (min..max) / `False Colors` (p0.5..p99.5) palettes. Everything else is
+  absolute.
+- Auto contrast and gamma are mutually exclusive by design: the percentile stretch already
+  sets both ends of the frame, so gamma would be a second correction fighting over the
+  same pixels. `_bc()` drops gamma and `_sync_bc_controls_enabled` greys the whole row.
+- matplotlib toolbars are built through `_make_mpl_toolbar` so the dark palette does
+  not tint the icons away
+
+---
+
+## cpva_client.py — shared archiver client
+
+| Symbol | Purpose |
+|--------|---------|
+| `fetch_samples` / `parse_samples` / `fetch_values` / `fetch_values_ex` / `fetch_channels` | raw REST access (`_request_json`, one pooled HTTPS connection). `fetch_values_ex` also returns **which** name produced the samples — the bare channel or its `.value` alias — and `_Entry.src_channel` carries it, so the incremental tail query of an alias-only channel does not come back empty forever |
+| `fetch_samples_split` / `_is_splittable_error` / `STATS["range_splits"]` | **the archiver cannot serve an arbitrarily large window**: past roughly 110 k samples `/samples` answers HTTP 500 (`L3-SBW4-PM311:Energy`: 2026-08-06 = 108 078 samples is served, 2026-08-05 = 116 223 and 2026-08-01 = 122 410 are not; each half of a failing day comes back in ~5 s). A response-size limit, not a timeout and not missing data. The ceiling belongs to the server and no client can know a count before the answer arrives, so nothing keys off a sample count — the 500 IS the signal, and the window is halved and re-asked (sequentially, so a pool of 8 is not multiplied) down to a 1 h floor / depth 3. Only 5xx and timeouts are split; a 4xx or bad JSON would fail identically eight times, and `CpvaBusyError` means our own pool was full, not the window. `fetch_values_ex` routes through it, so `get_day` (whole days) and `value_at_or_before` (multi-day look-back) inherit it. Before this, a Shot Finder search over one busy day returned an empty table. Pinned by `testing/test_day_split.py` |
+| `CHANNEL_MAP` / `SBW4_CHANNEL` | the ONE name→channel map; the Slider derives its display names from it (`PV_DISPLAY_TO_COL`) instead of keeping a second copy that drifted (`pcm2` used to differ per tab). `sbw4` was renamed to `L3-SBW4-PM311:Energy` on 2026-08-14 — earlier dates live under the old `HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy`. `if_t.CPVA_SBW4_CHANNEL` is an alias of `SBW4_CHANNEL`, not a second literal |
+| `fetch_channels_cached(pattern)` | the `"**"` listing is ~9700 names and every PV picker wants the same one — cached process-wide with single-flight; an empty/failed listing is never cached |
+| `split_query` / `tokens_in_order` / `rank_pv_match` / `best_pv_match` | the ONE PV-search implementation, used by the Shot Finder rows and the Slider's PV picker. Tokens are AND-matched with implicit wildcards (`hapls sbw4` = `*hapls*sbw4*`), in-order hits rank above scrambled ones, and camera channels (`CAM_CHANNEL_RE`, ~40 % of the listing) sink to the bottom so they cannot fill the result list |
+| `grid_step` / `on_grid` / `quantize` / `QUANTIZED_CHANNELS` | value-grid rule: the waveplate (`L3-PFWP6-MTR03-1:RawPos`) is only ever commanded to multiples of `WAVEPLATE_STEP` = 1000, so every value passes through `quantize`, and one snapped from off-grid (the motor caught mid-move) is reported `exact=False` → rendered `~350000`. `GRID_TOL_FRACTION` = 0.005 is the tolerance `CSS Logger/main.py` already uses on this PV |
+| `CpvaBusyError` / `_POOL_WAIT_S` / `_WARM_MAX_WORKERS` | the local pool running out is not an archiver fault: it no longer arms `ERROR_BACKOFF_S`, the wait is sized against the longest another caller can hold a slot (`2 × FULL_DAY_TIMEOUT`, not the waiter's own timeout), the pool is 8 wide (the Slider's PV panel is the widest fan-out), and background warm-up may take at most half of it |
+| `STATS` / `stats_line()` | request / 5xx / timeout / busy / max-pool-wait / dropped-sample / abandoned-record counters, appended to `image_tools_diag.log` by `is_t._diag_log` (which adds the PV panel's own `pvFetch` / `pvLastVal` / `pvWait` / `pvStall` fields) |
+| `best_shot_ns(start, end)` | timestamp of the strongest shot in a window |
+| `date_key_for_ns` / `prev_date_key` / `next_date_key` / `day_bounds_ns` / `today_key` | day keys |
+| `get_day(channel, date_key)` → `DayResult` | whole-day sample cache with status + age; today's entry is refreshed with a short TTL and merged (`_merge_tail`), concurrent callers share one in-flight fetch (`_InFlight`). **The share is time-bounded** (`_INFLIGHT_MAX_WAIT_S`): a fetcher that vanishes after registering its record used to leave every later caller waiting on an event nobody would set — an unbounded wait on a worker thread, i.e. the Slider's PV panel frozen (single-flight flag never cleared) until the program was restarted. Past the bound the record is dropped (`STATS["takeovers"]`) and the waiter fetches for itself; `_finish_inflight` takes the record it is completing so a late fetcher cannot publish its stale answer into somebody else's newer one, and nothing between registering and publishing sits outside an exception handler. Pinned by `testing/test_pv_resilience.py` |
+| `warm_days` / `peek_day` / `invalidate` | pre-warm, cache-only read, drop |
+| `nearest_sample` / `nearest_sample_ex` / `_match_score` | nearest sample to a timestamp, with a preference direction |
+| `LookupResult` / `format_lookup` | tri-state result: real value (including a genuine 0) / `n/a` (no sample) / `ERR` (fetch failed, retryable), plus `no data yet` (`pending` — the moment asked about has not been published yet, see below). `head_ts_ns` carries the archiver's newest readable sample for that day. The display words are `PV_TEXT_*`: they name the STATE the operator is in (`no data yet`, ` (older shot)`), not what the program is doing (`wait`, ` (old)`) |
+| `head_ts_ns(channel)` | the published head for today, cache-only (no network, safe on the GUI thread). Compare it with a FRAME's timestamp, never with the local clock |
+| `value_at_or_before` / `_value_before_day` / `_last_at_or_before` / `invalidate_lookback` | step PVs (e.g. the waveplate `RawPos`) are archived only on change, so they are resolved by bisecting the day of the timestamp (+ previous days). The look-back cache is keyed by "last sample before the START of a day", a key fully determined by its query. |
+| `lookup_near(channel, ts_ns)` | the entry point used by every tab: energy PVs match inside a ±window (the Slider passes **±0.3 s** — `_PV_WINDOW_NS`; ±30 s is only the function's default and matched a neighbouring shot for 43 % of frames), `STEP_CHANNELS` fall back to `value_at_or_before` |
+
+**Error status is per-day, not collapsed.** `lookup_near` returns a hit with the status of
+the day it came from, so a *neighbouring* day failing can no longer label a good value
+`ERR`; and a no-hit answer is `error` only when the day that actually contains `ts_ns`
+failed — a clean but empty day is `n/a`. `value_at_or_before` no longer aborts on the first
+errored day either: it treats it as empty, degrades to `stale` and keeps walking, which
+matters because a step PV's own day usually holds no samples at all. Negative look-back
+results now expire (`_BEFORE_NEG_TTL_S` = 600 s) instead of pinning `n/a` for the session,
+and one `.value` alias probe runs before an absence is recorded.
+
+**The archiver publishes about a second late, and that is not "no data".**
+`lookup_near(pending_if_uncovered=True)` answers `pending` instead of `not_found` when
+nothing matched *and* today's data does not reach past `ts_ns + window_ns` — i.e. the
+channel's published head is still before the moment being asked about, so the sample may
+yet arrive. Measured 2026-08-14 on `PTM1` (95 samples, polled 4×/s, every observation
+stamped with the **server's** clock from the HTTP `Date` header): a sample becomes
+readable ≈ 0.2–2.5 s after its own timestamp, p50 0.9 s. An image, by contrast, is on the
+share ~0.02 s after its timestamp. Only *today* can pend — a finished day cannot grow.
+
+⚠ **Never measure that lag against the local clock.** The workstation this was measured on
+runs ~25 s **ahead** of both the archiver server and the image file server (`Date` header
+and `net time` agree; the PC itself is correctly synced to `czow-lsrdc01.eli-laser.eu`, so
+it is the facility side that differs). Any "how old is this frame?" test taken from
+`time.time()` therefore reads ~25 s on a frame that was just taken. Frame-vs-sample
+matching is unaffected — both timestamps come from the facility side — but every freshness
+decision has to be either archiver-timestamp vs archiver-timestamp, or `time.monotonic()`
+elapsed.
 
 ---
 
 ## if_t.py — Image Finder
 
-### Konstanty
-| Konstanta | Hodnota / popis |
-|-----------|-----------------|
-| `IMAGES_ROOT_BASE` | `//users-L3.tier0.lcs.local` — kořen archívu kamer |
-| `RAMPING_CANDIDATES` | `[("Lab", "//hapls-share…/2026_alldata"), ("Office", "Z:\…")]` |
-| `DEFAULT_RAMPING_SOURCE` | `0` (Lab) |
-| `ENERGY_CSV_ROOT` | `//hapls-share…/scratch/Salvation/2026_alldata` |
-| `ENERGY_CSV_NAME_FMT` | `"dataof%Y%b_%d"` → `dataof2026Mar_24.csv` |
-| `ENERGY_COLUMNS_AVAILABLE` | Všechny sloupce dostupné k výběru v dialogu |
-| `ENERGY_COLUMNS_DEFAULT` | `[]` — defaultně žádné nevybrané |
-| `ENERGY_COLUMNS_DISPLAY` | Dict `col → zobrazené jméno` v UI a na anotacích |
-| `ENERGY_MATCH_TOL_S` | `0.55` s — tolerance shody timestamp obrázek ↔ PV |
-| `CPVA_BASE_URL` | `https://10.78.0.57:8443/api/1.0/cpva` |
-| `CPVA_HTTP_TIMEOUT` | `10.0` s |
-| `CPVA_SHOT_CHANNEL` | `HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy` |
-| `CPVA_CHANNEL_MAP` | Dict `col → channel`: ptm1, pcm2, pcm4, pap1, sbw4, Back_Ref (`L3-PM03-023:Energy`), waveplate (`L3-PFWP6-MTR03-1:RawPos`) |
-| `MAX_SCAN_FILES` | `2000` — max stat() volání na síťové složce |
-| `MIN_FULL_FILES` | `1` — min podsložek, aby byla hodina použita |
+### What this tab is for
 
-### Pomocné funkce (module-level)
-| Funkce | Popis |
-|--------|-------|
-| `extract_ns_from_stem(stem)` | Parsuje UTC ns timestamp z názvu souboru |
-| `extract_display_label(name)` | Zkrácený label pro kameru z názvu složky |
-| `extract_folder_number(name)` | Číslo kamery z názvu složky |
-| `is_valid_image_file(name)` | Kontrola přípony obrázku |
-| `build_new_name(stem, use_prague_time)` | Přejmenuje soubor na čitelný timestamp |
-| `_energy_csv_path(dt)` | Sestaví cestu k dennímu CSV souboru |
-| `_load_energy_csv(csv_path)` | Načte CSV → `list[_EnergyRow]` |
-| `_energy_api_for_day(dt, cols, csv_root, log)` | Dotáže CPVA API pro daný den a sloupce → `list[_EnergyRow]`; fallback na CSV per sloupec |
-| `_find_energy_match(rows, img_ts_ns, tol_s)` | Binárním hledáním najde nejbližší řádek |
-| `_cpva_ssl_ctx()` | SSL kontext bez ověření certifikátu |
-| `_cpva_fetch_samples(channel, start_ns, end_ns)` | HTTP GET na CPVA archiver, vrátí list dicts |
-| `_cpva_best_shot_ns(start_ns, end_ns)` | Najde timestamp nejsilnějšího shotu |
-| `_annotate_image_with_energy(src, dst, match, before, after, ts_ns, cols)` | Přidá bílý proužek s PV hodnotami pod obrázek |
+**One camera, many days, side by side.** It is the *transpose* of the Image Slider: the
+Slider tiles many cameras at ONE moment, this tiles many days of ONE camera. Neither of
+the other tabs can do it — the Slider needs a single moment, and the Shot Finder produces
+a table it previews one row at a time, so it never puts two days next to each other.
 
-### Datové struktury
-```python
-class _EnergyRow:
-    ts_dt: datetime   # Prague-naive
-    values: dict[str, str]   # col → hodnota jako string
+The tab used to be a fourth viewer with a search bolted on, which is what made it feel
+redundant: its own single preview with no memory of what it had read (a re-read of the
+share on every window resize), its own palette copy, three near-identical caption-bar
+routines, and its own camera discovery beside a better one in the Slider. What only it
+can do is *pick* frames — including with **no target at all** (highest-energy shot of the
+hour, the `TotalPower` window with the highest mean, or purely file sizes and time gaps
+when the archiver is unreachable). The Shot Finder cannot answer without a number: it
+refuses to search without one (`sf_t.py`, "Tick at least one PV to search by"), because
+its engine minimises a distance to a target and without a target there is nothing to
+minimise.
 
-class _LoadSignals(QObject):
-    done      = Signal(list, dict, int)   # subfolders, saved_sel, gen
-    not_found = Signal(object)
-    error     = Signal(str)
-    log_msg   = Signal(str)              # thread-safe log z load workeru
+### `_DayWall` — the comparison wall
 
-class _CollectSignals(QObject):
-    done = Signal(list)
+Borrows the Slider's packer through `_get_slider_module()` rather than carrying a second
+one: `compute_camera_layout` is already generic over a list of aspect ratios, so it is fed
+one aspect per **day**, and `_entry_rect` keeps shared edges on the same pixel. Tiles are a
+seamless partition of the canvas.
 
-class _AutoHourSignals(QObject):
-    apply   = Signal(str, int, int, bool)  # msg, ui_hour, day_shift, use_lab
-    log_msg = Signal(str)
+**ONE display setting drives EVERY tile** — deliberately the opposite of the Slider's rule
+(where a control hits only the cameras selected when it was moved). The whole point of the
+view is that one colour means one intensity in every day, so a per-tile setting would make
+the comparison lie.
 
-class _LogSignals(QObject):
-    msg = Signal(str)   # thread-safe log — veškeré background logy jdou přes tento signal
-```
+**Why the comparison is honest, and the two ways it was not.** The archive does not store
+camera counts: it stretches each frame's own power-of-two bracket up into the 16-bit
+container, so a dim day and a bright one can BOTH sit near 51 000 in the file. Rendering
+`stored / 65535` shows every day at almost the same brightness. Measured on three frames of
+400 / 1600 / 3200 counts: stored peaks 51299 / 51224 / 51212, naive codes **199 / 199 /
+199** — useless — against the wall's **24 / 99 / 199**, which is the true counts ratio.
+Two bugs of exactly that shape were found and fixed here, both by converting to one common
+range *before* combining:
 
-### ImageFinderWidget(QWidget)
+* `_shared_auto_pair` pooled the **stored** values of every day to take one percentile
+  window, mixing units; the pair that came out (contrast 127, the maximum) saturated every
+  brighter day to white — 94 / 255 / 255.
+* the deviation from a reference day subtracted the **stored** arrays, so |day3 − day1| was
+  code 0, a black tile, while the real difference was 2800 counts (code 173).
 
-**Inicializace:**
-- `_user_has_selected_day` — False dokud uživatel (nebo `_auto_select_today`) nevybere den
-- `_load_gen` — generace pro rušení starých load workerů
-- `_load_sig` — aktuální `_LoadSignals` objekt; vždy se zachytí jako `_sig` před spawnem vlákna (GC ochrana)
-- `_log_sig` — `_LogSignals` pro thread-safe logování z background vláken
-- `_energy_cache` — `{date_str: list[_EnergyRow]}` — cache po dnech
-- `_energy_selected_cols` — list vybraných sloupců (z `EnergyColumnDialog`)
-- `RAMPING_ROOT` — aktuální cesta k CSV (Lab nebo Office)
-- `_auto_hour_last_day` — zabrání opakovanému spuštění auto-hour pro stejný den
-- `_DEFAULT_HOUR = 14` — výchozí hodina při startu nebo když CSV chybí
+Auto never runs per tile — `img_scale.stretch_u8` says of itself "NOT comparable between
+frames". It is resolved to one shared (contrast, offset) pair over the whole wall and
+applied through the ordinary absolute path, so Auto still brightens a dim camera without
+measuring any day against itself. The pair is resolved *before* the tile cache key is
+built, or it would invalidate the cache on the next tile and re-render on every repaint.
 
-**Startup flow (výběr dne):**
-1. `QTimer.singleShot(0, _auto_select_today)` — ihned po buildu UI nastaví `_user_has_selected_day = True` a zavolá `_apply_auto_hour_for_selected_day()`
-2. `_apply_auto_hour_for_selected_day()` — okamžitě nastaví hodinu na `_DEFAULT_HOUR` (14) a spustí `load_folders()`; zároveň v background vlákně zkusí CSV auto-hour (timeout 1 s); pokud CSV vrátí jinou hodinu → reload
-3. `load_folders()` — background worker scanuje síťovou složku přes `os.scandir`; výsledek doručen přes `_load_sig.done` na main thread
+Right-click a tile sets / clears the reference day; left-click opens that frame in the
+close-up view (`_set_view_mode`, a `QStackedWidget` — the wall and the old single preview).
+`composite_image` writes the whole wall as one picture with the days captioned, which
+neither other tab can do (both save frames singly).
 
-**Thread-safety pravidlo:**
-- Všechny background vlákna volají `self._log_safe()` (ne `self._log()`)
-- `_log_safe` emituje `_log_sig.msg` → main thread volá `_log()`
-- Load worker logguje přes `_sig.log_msg.emit()`
+Pinned by `testing/test_day_wall.py`.
 
-**Klíčové metody:**
-| Metoda | Popis |
-|--------|-------|
-| `_auto_select_today()` | Startup — nastaví `_user_has_selected_day`, spustí auto-hour |
-| `_on_calendar_selected()` | Klik na den v kalendáři → auto-hour |
-| `_apply_auto_hour_for_selected_day()` | Ihned: hodina 14 + load. Na pozadí: CSV auto-hour |
-| `_apply_auto_hour_ui(msg, hour, shift, use_lab)` | Slot — aplikuje CSV výsledek; reload jen pokud se hodina změnila |
-| `load_folders()` | Spustí background worker pro scan kamer |
-| `_on_load_done(subfolders, saved_sel, gen)` | Vyplní tabulku kamer na main thread |
-| `_get_energy_rows_for_dt(dt)` | API first → CSV fallback; cachuje per-den |
-| `_lookup_energy_for_files(files)` | Pro každý soubor najde matching `_EnergyRow` |
-| `_run_energy_lookup_async(files, on_done)` | Background energy lookup; `_sig` zachycen jako lokální proměnná |
-| `view_primary_files()` | Collect → energy lookup → annotate → `os.startfile` |
-| `_collect_primary_files_now(jobs)` | Paralelní sken složek (ThreadPoolExecutor, max 8 workerů) |
-| `_collect_primary_files_async(on_done)` | Async obal `_collect_primary_files_now` |
-| `select_images_from_folder(folder, how_many, ...)` | Vybere N representativních snímků (segmentace + rovnoměrný výběr) |
-| `_get_items_cached(folder, ...)` | Scandir bez stat + sampled stat; cache v `_namecache` |
-| `_pick_best_block_real_hour(day)` | Analyzuje ramping CSV, vrátí nejlepší hodinu; bez dat → hodina 14 |
-| `_get_ramping_for_day_cached(day)` | Načte ramping CSV s timeoutem 1 s (probe na síti); cachuje |
-| `_select_by_totalpower(folder, qty, ...)` | Najde best shot přes CPVA API; po nalezení `best_shot_ns` přepočítá správnou hodinovou složku (oprava: `load_folders` ukládá první nalezenou hodinu, ale best shot může být v jiné hodině) |
+### Handoff to the Slider
 
-**Energie — flow:**
-1. Uživatel vybere sloupce v `EnergyColumnDialog` (waveplate, ptm1, Back_Ref…)
-2. `view_primary_files()` → `_run_energy_lookup_async(files)` → background vlákno volá `_lookup_energy_for_files`
-3. Pro každý soubor: `_get_energy_rows_for_dt(dt)` → `_energy_api_for_day(dt, cols)` (CPVA API) → fallback CSV
-4. `_find_energy_match(rows, ts_ns)` → nejbližší `_EnergyRow` do 0.55 s
-5. `_annotate_image_with_energy(src, dst, match, ...)` → přidá bílý proužek s hodnotami
+`open_in_slider` → `_push_cells_to_slider` hands over the frames actually picked, through
+the Slider's own public `receive_external_folder(..., energy_map, discrete=True)` — the
+same route the Shot Finder uses, which clears a multi-cam grid, an armed live mode, a
+subtraction reference and focus mode first. It used to open the FIRST checked folder WHOLE
+and log that it was ignoring the rest: the tab did all the work of picking a frame per day
+and threw the selection away at the door. Each caption is carried next to its own file, not
+looked up by index, so a day without a picture cannot shift every later caption onto the
+wrong frame. The temp folder **keeps the camera folder name**, because
+`img_scale.camera_from_path` reads the camera off the PARENT folder — a flat temp folder
+would strip it and the Slider would fall back to the plain 65535 range, showing the same
+frame ~16× darker than the wall it was compared on.
+
+### Constants
+| Constant | Value / meaning |
+|----------|-----------------|
+| `_IS_LAB` | hostname-based lab detection (`_detect_is_lab`) |
+| `IMAGES_ROOT_BASE` | `//users-L3.tier0.lcs.local` |
+| `RAMPING_CANDIDATES` / `DEFAULT_RAMPING_SOURCE` | Lab / Office ramping CSV roots |
+| `ENERGY_CSV_ROOT` / `ENERGY_CSV_NAME_FMT` | `dataof%Y%b_%d` → `dataof2026Mar_24.csv` |
+| `ENERGY_COLUMNS_AVAILABLE` / `_DEFAULT` (`[]`) / `_DISPLAY` | column picker data |
+| `ENERGY_MATCH_TOL_S` = 120 · `ENERGY_MATCH_TOL_API_S` = 30 | CSV vs API match tolerance |
+| `CPVA_SHOT_CHANNEL` / `CPVA_SBW4_CHANNEL` (= `cpva.SBW4_CHANNEL`) / `CPVA_CHANNEL_MAP` | best-shot + per-column channels |
+| `MAX_SCAN_FILES` = 2000 | cap on `stat()` calls per folder |
+| `ACT_MAX_GAP_S`, `MIN_SEG_ROWS`, `MIN_SEG_DURATION_S` | ramping-segment analysis |
+| `CAM_33HZ` | camera numbers running at 33 Hz |
+| `ENERGY_BAR_*` | the white annotation bar (height, font, colours) |
+| `EMPTY_IMG_MAX_THRESHOLD` / `EMPTY_IMG_CONTRAST_MIN` | empty-frame detection |
+| `GRADIENTS` / `GRADIENT_NAMES` | LUT palettes |
+
+### Module-level helpers
+| Function | Purpose |
+|----------|---------|
+| `_import_cpva_client()` / `_import_img_scale()` / `_get_slider_module()` | lazy imports (frozen-aware) |
+| `_cpva_fetch_samples` / `_cpva_active_windows_ns` | archiver access + merged "beam active" windows from `:TotalPower`. The best-shot lookup is `cpva.best_shot_ns` — shared, and it splits an oversize window instead of losing the whole answer to one HTTP 500. |
+| `_cam_totalpower_channel(cam)` | folder name → `:TotalPower` channel |
+| `_read_img_max_value(path)` | the frame's PEAK in raw counts (`MaxValue` tEXt, looked up by NAME via `img_scale.read_max_value`). Used only by the empty-frame test — the display scale does not need it |
+| `_image_is_nonempty(path)` | frame peak first, pixel-contrast fallback |
+| `_render_u8(arr, auto, full_scale, gamma, contrast, offset, out)` | the ONE render step for this tab — delegates to `img_scale.render_u8`: absolute (or the explicit Auto contrast stretch), then gamma, then the manual Contrast / Brightness pair. `full_scale` comes from the decoded image's MODE, never from `arr.max()`; `out` reports what the Auto passes applied |
+| `_scale_note(info, arr, auto, full_scale)` | the line under the preview: peak counts, % of full scale, bit depth, which mapping. Takes an already-open image's `.info` — never re-opens the file (130–160 ms on the share) |
+| `is_valid_image_file` / `extract_display_label` / `extract_folder_number` / `extract_ns_from_stem` / `convert_timestamp` / `build_new_name` | filename helpers |
+| `_energy_csv_path` / `_load_energy_csv` | daily CSV → `list[_EnergyRow]` |
+| `_energy_api_for_day(dt, cols, …)` | CPVA per column (thread pool) + CSV fallback |
+| `_find_energy_match` / `_find_closest_per_col_value` / `_build_per_col_from_rows` | timestamp matching |
+| `_format_energy_value` / `_format_energy_diff_s` | units (J, mJ for `Back_Ref` / `PAP1`, the waveplate's count grid) and the ± time offset. Keyed by REGISTRY NAME now, and it no longer multiplies SBW4 by 0.749: this tab used to print the compressed energy under the name of the channel that reads the uncompressed one, so its SBW4 matched no other tab and no archiver query. The only factor left is the registry's own, for an entry that exists to BE a conversion (`Compressed SBW4`) |
+| `_annotate_image_with_energy` / `_write_annotated_with_text` / `_write_annotated_from_pil` | the white PV bar under a frame |
+| `_make_lut` / `_make_binary_lut` / `_make_stepped_lut` | palettes |
+| `_style_calendar` / `_make_multiselect_calendar` / `_make_mpl_toolbar` / `_hsep` / `_group_label` / `_section_label` | UI helpers |
+
+### Classes
+| Class | Purpose |
+|-------|---------|
+| `_WeekendDelegate` / `_CalBorderDelegate` / `_NoScrollCalendar` / `_MultiSelectDelegate` / `_NoScrollComboBox` | house calendar style (Monday-first, grey header, red weekends), wheel blocking, multi-select painting. `_MultiSelectDelegate` is the Image Slider's version: it reads each cell's real date from the model (`UserRole`) with the MinimumDayOffset correction behind it, and paints a blue outline on the focus day — the primary day of a multi-day selection |
+| `_CameraPickDialog` | the Cameras… picker: token search over number + label + folder name, click to add or remove, Select all / Clear, the picked list with a ✕ per row, and a **presets** panel over the SAME `%APPDATA%/ELI_ImageTools/cam_presets.json` the Slider's `CameraPickerDialog` writes — so a saved set is offered in both tabs. Loading a preset keeps only the cameras the picked days actually recorded and says how many were missing; saving over a Slider preset preserves its stored arrangement only while the camera set is unchanged (otherwise those tiles belong to nothing and it reverts to `auto`) |
+| `_EnergyRow` | one CSV/API row (`ts_dt`, `values`) |
+| `_ThumbView` | thumbnail + circle/square/cross overlay; emits `overlay_changing` / `overlay_edited`, carries `key` / `native_size` |
+| `_EnergyLoadSignals` / `_EnergyLoadTask` / `EnergyColumnDialog` | energy column picker |
+| `_LoadSignals` / `_CollectSignals` / `_CompareSignals` / `_AutoHourSignals` / `_LogSignals` / `_PreviewSignals` / `_TryAgainSignals` | thread-safe signal carriers |
+| **`ImageFinderWidget`** | the tab itself |
+| `_MultiDaySetupDialog` | multi-day range / camera / hour picker (weekday default Mon–Fri) |
+| `_PVBrowseDialog` / `PVRegionSearchDialog` | browse archiver channels, and search a day for time regions where PVs satisfy given conditions (`_PV_REGION_COLORS` paints the regions) |
+| `MultiDayPreviewWindow` | result grid with palette / overlay / save / try-again |
+
+### ImageFinderWidget — behaviour worth knowing
+
+- **PVs** — the same picker and the same table as the Image Slider, over the same
+  registry: `_pick_energy_columns` opens `is_t.PvConfigDialog` and the sidebar list is
+  `is_t.PvValueTable` (both borrowed through the `_get_slider_module()` loader this tab
+  already used for the palettes). What this replaced was `EnergyColumnDialog`, a fixed
+  list of the twelve Salvation CSV columns as tick boxes — no search, no PV of your own,
+  and a second label table beside the Slider's.
+  - `_energy_selected_cols` now holds **registry names** ("SBW4", "Compressed SBW4", an
+    added channel's own name, a formula's name), not CSV column names. `_pv_channel_for`
+    resolves one to its channel and — this is the change that makes an arbitrary PV work
+    at all — falls back to the NAME ITSELF; it used to be `CPVA_CHANNEL_MAP.get(col)`
+    alone, so anything outside the eight presets resolved to `None` and fell straight
+    through to a CSV that had never heard of it. `_pv_csv_col` is the reverse for the
+    daily CSV, and it is also what keeps the CSV-only columns (`CampOn`, `E2..E5 Open`)
+    reachable: type the column name into the picker and the fallback finds it.
+  - `_pv_visible_cols` (the eye) governs every PRINTED line — the info panel, the bar
+    under the preview, a burned-in save — while `_pv_fetch_cols` is what is READ: every
+    picked channel plus `pv_source_names` of every picked formula, so a formula built on
+    a PV that is not itself shown does not read `n/a`.
+  - Formulas are evaluated in `_pv_values_for_ns` through `pv_eval_derived`, the same
+    evaluator the Slider uses, from the numbers just resolved for that frame.
+  - **No hidden conversion**: `_format_energy_value` used to multiply SBW4 by 0.749, so
+    this tab printed the compressed energy under the name of the channel that reads the
+    uncompressed one. Gone; `Compressed SBW4` is a named registry entry instead.
+  - The selection is persisted in `%APPDATA%/ELI_ImageTools/finder_ui_state.json`
+    (`pv_selected` + `pv_hidden`) and restored at the end of `_build_ui`; the PVs
+    themselves come from the shared registry. Changing the selection clears the day
+    caches, or a PV added a moment ago would read `n/a` until a day happened to be
+    re-fetched for some other reason.
+- **Source group** (section key stays `time`, so saved fold state survives the rename)
+  — the Slider's Source layout: **Time window** and **Cameras…** side by
+  side, **PV Search…** under them, then one line saying what is picked (day or day
+  count, hour, which clock) with the scan dot beside it, and **Load data**
+  (`self._btn_view` → `view_primary_files`) closing the group: the read belongs to the
+  pickers above it, not to the things you do with the result. **Actions** is the next
+  group down. The calendar, the hour combo,
+  the Lab-time switch and the weekday gate are built into `self._time_pane`, a pane with
+  no parent that `_open_time_window` drops into a modeless dialog on first use — every
+  widget keeps its name (`self._cal`, `self._hour_cb`, `self._lab_time_cb`,
+  `self._wd_checks`), so none of the day/hour logic had to move. The dialog has only a
+  Close button because a click already takes effect; `self._status_dot` stays in the
+  PANEL, since "is the camera list for these days ready" must be readable with the
+  calendar shut. `_sync_time_summary` writes the line, called from
+  `_apply_day_selection`, `_log_selected_datetime_preview` and the auto-hour default.
+- **Cameras** — a **Cameras…** button (`_CameraPickDialog`) next to **Time window** —
+  the same "when + which cameras" pair the Slider's Source group
+  asks — and the list of picked cameras under the Workshop button in Actions. No group,
+  no banner, no count line and (since the presets landed) no count on the button either:
+  `0/92` named a total nobody can act on, because which cameras a day holds is not
+  knowable from the panel. `self._cams` is the single source of
+  truth: one dict per camera found by the day scan (`path`, `name`, `num`, `label`,
+  `hz33`, `qty`, `checked`), read by `_picked_cams` / `_snapshot_collect_jobs` /
+  `_checked_cameras` / `_capture_selection_state` (which is what carries the selection
+  across a re-scan). What this replaced was a 5-column table (`[ ]`, `Cam #`,
+  `# of imgs`, `3.3+Hz?`, `Label`) filling a whole column of the tab for a list that
+  only matters while choosing — with the sorting, searching, master-checkbox and
+  row-reordering code that a table needs and a dialog does not. Two of its columns are
+  gone from the UI but not from the scan: `hz33` is still computed from `CAM_33HZ`, and
+  `qty` (frames per camera, always 1) is still honoured by the collect path — so either
+  can come back without re-deriving it. The picked list previews a camera on click and
+  unpicks it on double-click; the log box now spans the tab, since under a 268 px panel
+  it would be a column of wrapped text.
+- `_user_has_selected_day`, `_load_gen` (generation token that cancels stale load
+  workers), `_load_sig` captured as a local `_sig` before spawning a thread (GC
+  protection), `_energy_cache` per day, `_energy_selected_cols`, `_auto_hour_last_day`,
+  `_DEFAULT_HOUR = 14`
+- **Startup:** `QTimer.singleShot(0, _auto_select_today)` → `_apply_auto_hour_for_selected_day()`
+  sets hour 14 and loads immediately, while a background thread refines the hour from
+  the ramping CSV (1 s timeout) and reloads only if the hour actually changed
+- **Thread-safety rule:** background threads log through `_log_safe()` (signal to the
+  main thread), never `_log()`; the load worker uses `_sig.log_msg.emit()`
+- Scanning: `load_folders()` scans all 24 hour folders in a pool, `_get_items_cached`
+  keeps a `scandir` + sampled-`stat` cache, `_nearest_file_for_ns` probes ns offsets
+- Selection: `select_images_from_folder` (size/segment based),
+  `_select_by_totalpower` (energy-anchored; recomputes the correct hour folder once
+  the best shot is known), `_find_image_for_day_cam`
+- Energy flow: pick columns → `_run_energy_lookup_async` → `_get_energy_rows_for_dt`
+  (API first, CSV fallback, cached per day) → `_find_energy_match` →
+  `_annotate_image_with_energy`
+- Try-again: background `_try_again_run` worker, energy-anchored candidates,
+  empty-frame validation, cancel button, per-cell attempt log
+- `_mirror_overlay_from` live-mirrors an overlay edit to every selected thumbnail
+  with centre-preserving scaling
+- A/B compare: `_compare_memory` / `_align_images` / `_show_compare_window`
+- **Intensity scale:** `Con:` / `Bri:` / `Gam:` rows under the Gradient combo, each with an `Auto` box (default all off =
+  absolute), a `Gamma` slider + `Auto` + `↺` under it (`_gamma_arg`,
+  `_sync_gamma_enabled`), and the `_preview_scale_lbl` readout under the preview (peak
+  counts, % of full scale, bit depth, mapping, gamma). Every render path — preview thread,
+  `_apply_gradient_to_image`, Save As, `_send_to_workshop`, `_ThumbView._load_raw` —
+  goes through `_render_u8`. The worker paths take `auto` and `gamma` as arguments,
+  snapshotted with `grad_name` on the main thread; `_load_raw` deliberately caches the
+  ABSOLUTE render with no gamma, because that dialog applies its own `_auto_bright` later
+  and the cache is shared by every setting.
 
 ---
 
 ## sf_t.py — Shot Finder
 
-### Konstanty
-| Konstanta | Hodnota / popis |
-|-----------|-----------------|
-| `IMAGES_ROOT_OPTIONS` | `{"Lab": Path("//users-L3…/cpva-image-2026"), "Office": Path("\\\\users-L3…")}` |
-| `ENERGY_CSV_ROOT_OPTIONS` | `{"Lab": "//hapls-share…/2026_alldata", "Office": "Z:\\…"}` |
-| `ENERGY_CSV_NAME_FMT` | `"dataof%Y%b_%d"` |
-| `EXTRA_COL_MATCH_TOL_S` | `5.0` s — tolerance pro extra sloupce (waveplate…) |
-| `CPVA_BASE_URL` | `https://10.78.0.57:8443/api/1.0/cpva` |
-| `CPVA_HTTP_TIMEOUT` | `15.0` s |
-| `CPVA_CHANNEL_MAP` | Dict `col → channel`: ptm1, pcm2, pcm4, pap1, sbw4, Back_Ref (`L3-PM03-023:Energy`), waveplate (`L3-PFWP6-MTR03-1:RawPos`) |
-| `PV_COLUMNS` | Dict `col → label` pro UI |
-| `MJ_COLUMNS` | `{"Back_Ref", "pap1"}` — hodnoty jsou v mJ (zobrazeny ×1000) |
-| `SBW4_TRANSMISSION` | `0.749` |
+### Constants
+| Constant | Value / meaning |
+|----------|-----------------|
+| `IMAGES_ROOT` / `ENERGY_CSV_ROOT` | one archive path, one CSV path (`_images_root_for_year` picks the year folder). The Lab / Office pair they replace named the SAME share for images (only the slash style differed), the archiver answers the same from either place and the CSV fallback is dormant, so the switch could only ever be set wrong |
+| `EXTRA_COL_MATCH_TOL_S` = 30 | tolerance for the extra (non-search) columns |
+| `IMG_MATCH_TOL_NS` = 30 s | how far a frame may sit from the matched shot |
+| `CPVA_HTTP_TIMEOUT` = 15 | per-channel request timeout |
+| `PV_COLUMNS` / `MJ_COLUMNS` (`Back_Ref`, `pap1`) | UI labels, mJ display |
+| `SBW4_WARNING_THRESHOLD_J` = 0.5 | default tolerance |
+| *(no conversion factor)* | SBW4 used to be multiplied by 0.749 (the L3 compressor transmission) everywhere this tab printed a value, so "SBW4" here meant a different number than the channel called SBW4 does elsewhere. A picked PV reports the archiver reading and nothing else — the only conversions left are the mJ display and the waveplate grid snap. Anything derived from a PV belongs in the Slider's picker (named entries such as "Compressed SBW4", and formulas) |
+| `_CAM_CHANNEL_RE` | camera-channel name pattern |
 
-### Pomocné funkce (module-level)
-| Funkce | Popis |
-|--------|-------|
-| `_cpva_ssl_ctx()` | SSL kontext bez ověření |
-| `_cpva_fetch_samples(channel, start_ns, end_ns)` | HTTP GET CPVA API → `(list[dict], url)` |
-| `_load_csv_for_day(day, cols, csv_root)` | Načte denní CSV → `(merged_rows, per_col_rows)` |
-| `_load_api_for_day(day, cols, log, csv_root)` | API first per-sloupec → fallback CSV → merge → `(merged_rows, per_col_rows)` |
-| `_find_closest_col_value(per_col, col, target_ns, tol_s)` | Nearest-neighbour v čase pro extra sloupec |
+### Module-level helpers
+`_load_csv_for_day`, `_load_api_for_day` (per-column API with CSV fallback; returns
+`(merged, per_col, col_meta)` and does **not** silently fall back to CSV on an API
+*error*, which used to mix sources), `_find_closest_col_value`, `_lookup_col_value`
+(tri-state via `cpva.lookup_near`), `_format_value_state` / `_format_value` /
+`_format_diff`, `_quantize_col` / `_quantize_col_ex` (the value-grid snap — applied by
+the tolerance filter, the best-match search, the ranking among in-tolerance rows AND the
+displayed Δ, so all four agree; the filter alone used to skip it and a day could read
+"✓ match, Δ 0" while the shot list behind it said "no shots within tolerance". A reading
+snapped from OFF the grid — the waveplate motor caught mid-travel — is shown as `~350000`
+so it cannot pass for a settled position), `_find_best_match`,
+`_folder_hour_from_prague`, `_day_image_folder`
+(day archived at all? — distinct from `_find_hour_folder` returning None, or a day with
+pictures from 08:00 to 18:00 gets told it has none), `_find_hour_folder`,
+`_find_image_for_ts`, `_find_image_in_day` (the ONE resolver: the shot's own hour plus
+its neighbours, `hour_cache` keyed by hour), `_image_problem` (a file that exists but
+cannot be looked at — 0 bytes, all-zero frame, undecodable — is "no image", the same
+disappointment as no file), `_make_lut_sf` and friends, plus `_render_u8` /
+`_full_scale_for_mode` — the tab's single render step (absolute, or the explicit
+the `Con:` Auto box), sharing `img_scale` with the Finder and the Slider. The old
+`_read_img_max_value` is gone: its only callers were the render paths, and they do not
+need the metadata at all. `_ns_to_prague` turns archive nanoseconds into the lab wall
+clock as a **naive** datetime, like every sample row's own `_dt` — matplotlib plots a
+tz-aware datetime in ITS timezone, and the day graph came out two hours out.
+`_TABLE_QSS` is the house table look, and `_get_finder_module()` borrows `if_t`'s
+`_make_mpl_toolbar` the same way `_get_slider_module()` borrows the Slider's helpers.
 
-### ShotFinderWidget(QWidget)
-
-**UI sekce (levý panel):**
-- **Search criteria** — PV checkboxy (sbw4, ptm1, pcm2, pcm4, pap1, Back_Ref, waveplate), target hodnota, tolerance ±
-- **Also show** — extra PV sloupce zobrazené v tabulce výsledků (bez vlivu na vyhledávání)
-- **Network source** — combo Images (Lab/Office) + combo Ramping (Lab/Office)
-- **Date range** — kalendář, weekday filtry (Po–Ne)
-- **Cameras** — scroll-list kamer z daného dne; filter textbox s dropdown
-
-**UI sekce (pravý panel):**
-- Tabulka výsledků (den, čas, hodnota PV, extra sloupce, náhled)
-- Log box
-
-**Klíčové metody:**
-| Metoda | Popis |
-|--------|-------|
-| `_load_cameras()` | Scanuje všech 24 hodin vybraného dne, deduplicates kamer přes `seen: set` |
-| `_find_hour_folder(day, images_root)` | Najde složku pro daný den/hodinu |
-| `_load_api_for_day(day, cols, log, csv_root)` | Wrapper na module-level funkci |
-| `_start_search()` | Zachytí `images_root` a `csv_root` z self před spawnem vlákna |
-| `_on_source_changed()` / `_on_csv_source_changed()` | Aktualizuje `_images_root` / `_energy_csv_root` |
-| `hideEvent()` | Vymaže cam filter text a skryje dropdown při přepnutí záložky |
-
-**Vyhledávací worker:**
-- Pro každý vybraný den: `_load_api_for_day(day, search_cols + extra_cols)` → najde shot s hodnotou nejblíže targetu → `_find_closest_col_value` pro extra sloupce
-- Výsledky emitovány přes signal na main thread
+### ShotFinderWidget
+- **Search criteria** — one row per picked PV (`_rebuild_pv_rows`): ticked = filter
+  (target ± tolerance), unticked = show only. PVs are added from a searchable
+  dropdown over the archiver channel list (`_fetch_channel_list`,
+  `_populate_pv_dropdown`; `_rank_pv_match` / `_tokens_in_order` / `_split_query` are
+  aliases of the shared `cpva.*` implementation — typed words are AND-matched, in
+  order first), or removed with the per-row ✕.
+- **Custom PVs** — the same three things the Slider's picker offers, minus the formulas:
+  - **add by name**: a single bare word gets a `➕ add "…" as an archiver channel name`
+    row in the dropdown (and Enter does the same). That is the only way in when the
+    channel list is down or does not carry the PV. `_register_col` /
+    `_preset_for_channel` map a name that a preset already reads back onto the preset,
+    so one channel can never occupy two rows under two units.
+  - **rename / copy channel name / remove**: right-click a PV row
+    (`_on_pv_row_menu`). A name (`_custom_labels`) is display only — the col stays the
+    identity, so a rename cannot repoint a column at other data.
+  - **persistence**: the list and the names are saved to
+    `%APPDATA%/ELI_ImageTools/shotfinder_ui_state.json` (`_load_pv_state` in `__init__`,
+    `_save_pv_state` on add / remove / rename, on search and on tab hide). Only
+    `col` / `target` / `tol` / `filter` are read back, so a `scale` left in a file
+    written by the short-lived scale-factor version cannot revive as a hidden factor.
+    SBW4 is the FIRST-RUN default only — the end of `_build_ui` falls back to it instead
+    of assigning it, which used to throw the restored list away.
+- **Source group** — **Time window** and **Cameras** side by side (one row, as in the
+  Image Slider), the picked days under them, then **Load data** with the progress bar.
+  The Lab / Office combo that used to sit here is gone (see `IMAGES_ROOT`). The action
+  lives with what it acts on: the days, the hours and the cameras are all right above
+  it. Neither button carries a count — `picked/available` named a total nobody can act
+  on, and it made the label longer than the button beside it.
+- **Time window** — the Image Slider's own `DatePickerDialog` (`_open_time_window`,
+  `allow_live=False` because this tab has no live mode, as in One Moment). One
+  calendar, From/To to the minute, a **Multiple days** mode and a ⚙ per-day window —
+  so a day looks, clicks and remembers the same in every tab, and **the days need not
+  be contiguous** (Monday + Thursday is a legal search). What it replaced was
+  `_TimeWindowDialog`, this tab's own Start point / End point pair of calendars with
+  whole-hour spin boxes, i.e. a second time picker to keep in step with the Slider's.
+  - The selection is `self._tw_windows`: one `(start_ns, end_ns)` per picked day, the
+    **end EXCLUSIVE** (`is_t.seg_bounds_ns`) — the old single pair was inclusive to
+    `:59:59`. `_day_windows()` is the day → window map, `_selected_days()` its keys,
+    and `_start_search` clips **each day's** candidate shots to **that day's own**
+    window. `_tw_times` / `_tw_day` / `_tw_segments` exist only so the dialog reopens
+    on the previous pick. `per_col` is deliberately NOT clipped — it only serves value
+    look-ups around a shot.
+  - `_cam_scan_key` keys off the whole day tuple, not a first/last pair: two different
+    day sets can share their ends.
+- **Cameras** — the **Cameras** button opens the Image Slider's own
+  `CameraPickerDialog` (`_open_camera_picker`), fed the already-scanned list as
+  `preloaded_cameras`, so the search box, the highlighting and the saved presets are
+  literally the Slider's — a camera set saved in one tab is offered in the other. Its
+  **Layout…** button is hidden here: it configures the Slider's multi-camera grid, and
+  the Shot Finder has no grid. The panel keeps only the picked list
+  (`_set_selected_cameras` rebuilds it, `_cam_num_for` resolves the `#` column from the
+  scan or from the folder name itself).
+  The scanned list comes from `_load_cameras` (all 24 hours of a day, deduplicating, walking the window
+  newest day first until `CAM_SCAN_DAYS_WITH_DATA` days have answered — at most
+  `CAM_SCAN_MAX_DAYS`, so a 48-day range costs the share no more than a couple of days).
+  It used to scan the FIRST day of the range only: a long range starting on a weekend or
+  any day the archiver wrote nothing gave "No cameras found", and the list matched
+  nothing for the rest of the session, so a range that searched perfectly well could
+  never have a camera added to it. Opening the picker also retries a scan that came back
+  empty (`_cam_loading` and `_cam_scanned_key` guard it, so one window is walked once),
+  and the dialog runs its own scan when the preload is empty — it is never stuck on an
+  empty list. **Every picked camera is searched**, each into its own
+  results tab (`_rebuild_result_tabs`, tab label = `_clean_cam_for_filename`); the tab
+  bar hides itself at one camera, so the ordinary case still looks like a plain table.
+  `_active_cam` is now only which row of the list is highlighted — it used to be the
+  only camera a search ever looked at, which made the list itself pointless. The PV data
+  is fetched once per day and only the picture is resolved per camera.
+  `_table` / `_day_results` are read-only views onto the tab in front, so preview, save,
+  send-to-Slider and the shot dialog need no notion of tabs — and the row index → result
+  index alignment they depend on stays inside one camera (`_tab_for` routes an arriving
+  result by ITS camera, never by which tab happens to be in front). `_all_results()` is
+  the across-tabs view, used only for the summary line.
+- **Every searched day gets exactly one row per camera** (`_DayResult.status`): `ok` = a shot AND a
+  usable picture, `no_image` = real values but nothing to look at, `no_data` = nothing to
+  search (archiver outage, no samples, no numeric values, or the day threw). The last two
+  are red rows carrying the reason, built by `_add_failed_row`; only `ok` rows can be
+  previewed, saved or sent on, and `_on_search_done` counts them separately from the row
+  total. Emitting nothing for such a day is what let a search over one busy day (the
+  archiver refuses a whole day above ~110 k samples, see `fetch_samples_split`) show an
+  empty table whose only explanation was one line in the Log box.
+- **Results** — one row per camera × day: values, extra columns, matched image path,
+  preview (`_on_selection_changed` → `_load_and_show_preview`). A cell click reveals
+  the file (`explorer /select,`), a double-click opens that day's shots in the panel
+  under the table (see below). Each `_DayResult` persists its search-time state (`search_cols`,
+  `extra_cols`, `criteria_csv`, `cam`, `col_meta`, `img_path`) so previews, saving and
+  open-in-slider read the search, not the live UI.
+- **The opened day** (`_build_day_panel`, `_show_day_panel`, `_fill_day_table`,
+  `_show_day_shot`) — double-clicking a day row lists that day's in-tolerance shots in a
+  second, shorter table under the day table, both halves of a vertical `QSplitter`
+  (60/40 on the first open, the user's own drag kept afterwards). The picked shot is drawn
+  in the **panel preview on the right**, the same place a day row's picture appears, and
+  each shot is resolved through `_find_image_for_shot`, which probes the hour folder of
+  that shot's own time instead of `dr.hour_folder` (the hour of the day's best shot only).
+  This was a modal dialog carrying a second `_PreviewWidget`, i.e. its own copy of the
+  table and of the picture, on top of the results it came from. Everything the panel needs
+  is captured when the day is opened (`_day_dr`, `_day_rows`, `_day_cam`,
+  `_day_hour_cache`), so a later edit of the left panel or of the camera list cannot
+  re-aim it — and it closes itself (`_hide_day_panel`) on a new day-row selection
+  (`_on_main_selection_changed`) and a new search, because a shot
+  list outliving its own day row describes a day that is no longer selected. A redraw
+  asked for by Gradient / Contrast / Brightness / Gamma goes through `_refresh_preview`,
+  which re-renders the **picked shot** when the panel is open and the day row otherwise
+  (it tests `isHidden()`, not `isVisible()`: the whole tab is invisible whenever another
+  Image Tools tab is in front). It carries no Open / Save buttons of its own — those
+  exist once, in the panel's **Save & Send** group (see **Export** below).
+  - **A camera-tab change no longer drops it.** `_focus_day` / `_focus_shot_ns` /
+    `_focus_panel_open` (guarded by `_restoring_focus`) are the day and the shot the
+    operator is looking at, and `_on_result_tab_changed` re-establishes both in the tab
+    that comes to the front: the row of the same day is selected, the shot list is
+    reopened and `_select_day_shot_by_ns` picks the shot with the same timestamp
+    (nearest wins). The list is PV-derived, so its timestamps are identical in every
+    camera's tab. Order matters — the day row is selected FIRST (that fires
+    `_on_main_selection_changed`, which closes the panel), only then is the panel
+    reopened. A camera with no row for that day keeps the day selected instead of
+    jumping somewhere else. Before this, switching camera left an empty preview and
+    the day had to be found and double-clicked again.
+  - **Image column** (`_day_img_col`, `_day_set_image_cell`, `_on_day_cell_clicked`) —
+    the frame belonging to each shot, clicked to reveal it in Explorer, like the day
+    table's Folder cell. **Nothing is resolved per row**: a day can hold tens of
+    thousands of shots (36 147 was measured) and every path is an SMB probe, so a cell
+    is filled in only when its shot is previewed (`_show_day_shot` already resolves
+    that one on a worker thread and reports it through `_PreviewSignals.day_img`) or
+    when it is clicked. The column Stretches, so the file name cannot end up behind a
+    horizontal scrollbar.
+  - **The day's PV curve** (`_ensure_day_graph`, `_draw_day_graph`, `_move_day_marker`,
+    `_on_day_graph_click`) — beside the shot list in a horizontal `QSplitter` (55/45 on
+    the first open), answering "where in the day is this shot?". One line per searched
+    PV over the WHOLE day, in the units the table prints (`_diff_ui_value`, values
+    snapped with `_quantize_col`, so the curve and the cells cannot disagree), a second
+    unit on its own right-hand axis, the target ± tolerance as a dashed line and a
+    band, a red dot on every shot in range, the picked hours shaded, and a black
+    vertical line on the shot selected. Left-click picks the nearest shot, so the graph
+    and the table drive each other; the toolbar owns every other button.
+    - The data is `dr.per_col`, captured at search time — **no day is read again**.
+    - matplotlib is imported on the FIRST day opened, never at startup, and the
+      toolbar comes from `if_t._make_mpl_toolbar` (via a `_get_finder_module()` loader
+      that mirrors `_get_slider_module()`) — the one factory that also repaints the
+      icons dark. A plain `NavigationToolbar2QT` draws them white on white here.
+    - `_ns_to_prague` returns a **naive** Prague datetime, like every sample row's
+      `_dt`: matplotlib plots a tz-aware datetime in ITS own timezone, which moved the
+      whole curve two hours. `_on_day_graph_click` therefore *replaces* the tz
+      `num2date` hands back rather than converting it.
+    - Only the vertical line moves when another shot is picked — replotting 36 000
+      points per click is not a thing the panel does.
+- **Clear table** (`_clear_results`, in the Results header) empties the table and drops
+  its camera tabs back to a single empty one, clearing the preview with the rows it
+  belonged to. The Time window, the PV list and the camera selection are kept — a search
+  used to be the only way back to a clean table, so the tab could be left holding rows
+  that no longer described what the left panel was set to.
+- **Export** — the **Save & Send** group (formerly "Search & Results"; the section KEY
+  is still `search`, so the remembered open/closed state survived the rename). It holds
+  an **Act on** selector and the three buttons: `_save_results` (annotated PNGs),
+  `_open_in_slider`, `_send_to_workshop`.
+  - **Act on** (`_scope_cb`, `_export_scope`, `_sync_scope_selector`) — *Whole day(s)*
+    (the selected day rows, all of them when nothing is selected) or *Selected shot*
+    (the one picked in the day detail). `_on_send_to_slider` / `_on_save_images` route
+    to `_day_open_in_slider` / `_day_save_image` for the shot scope — the same two
+    methods the day detail's own buttons used to call. The shot scope is only enabled
+    while a detail is open, and the two button labels name what they will act on, so
+    the choice is readable without opening the selector.
+  - All three act on the camera tab in front and are enabled by `_sync_export_buttons`
+    from what THAT tab holds. File names and the Slider's `cam_name` come from the row's
+    own `dr.cam` (the camera the search ran with): saving used to refuse outright once
+    the camera was removed from the list, and to name files after whichever camera was
+    highlighted rather than the one in the picture. **Send to Image Slider** is hidden,
+    not merely disabled, when there is no Slider to send to — it used to be
+    `setVisible(False)` at build time and never shown again, i.e. dead in every session.
+    All three render through `_render_u8` with the current Contrast / Brightness / Gamma
+    state, so a saved or handed-over frame looks like the one that was on screen.
+    `_open_in_slider` carries each file's `_DayResult` next to it
+    (`list[tuple[Path, _DayResult]]`) instead of an index into a parallel list: one
+    skipped day used to shift every later caption onto the wrong picture.
+- **Progress** (`_SearchSignals.stage`, `_on_progress`, `_on_stage`, `_sync_prog_text`)
+  — the bar under **Load data** prints what is being read, how far along it is, how many
+  matches are in and roughly how long is left (`time.monotonic`, not the wall clock).
+  One step is one (day, camera) pair — with several cameras the bar used to stand still
+  for a whole day of picture look-ups and then jump — and every code path that ends a
+  day bumps the counter exactly once, including the failed-day and exception paths
+  (`cams_done` stops a throw halfway through the camera loop counting twice).
+- **Tables** — `_TABLE_QSS` (the same values as `wk_t._TABLE_QSS`, spelled out because
+  `wk_t` loads after this tab) on the results tables AND the day-detail table. Left
+  unstyled, `setAlternatingRowColors(True)` takes the alternate colour from the app
+  palette and paints every second row dark red-brown. The per-row pastel backgrounds
+  (`#f8d7da` / `#fff3cd` / `#d4edda`) are deliberate status colours and stay.
+- **Intensity scale** — the `Con:` / `Bri:` / `Gam:` rows (default off = absolute), the `Gamma`
+  slider + `Auto` + `↺` (`_gamma_arg`, `_sync_gamma_enabled`), and the `_scale_note_lbl`
+  readout: peak in raw counts, % of full scale, bit depth, mapping, gamma.
+  `auto` and `gamma` are passed INTO `_load_and_show_preview`, never read from the widgets
+  there — that method runs on a worker thread.
 
 ---
 
 ## is_t.py — Image Slider
 
-### Konstanty a globální data
-- `IMG_EXT` — povolené přípony obrázků
-- `_CHECKBOX_STYLE` — QSS pro checkboxy (border pouze na `::indicator`)
-- `GRADIENTS` — barevné palety; `None` = Grayscale, jinak RGB LUT `np.array(256×3)`
-- `DEFAULT_OPEN_DIR` / `DEFAULT_OPEN_ROOT` — síťová cesta k archívu kamer
-- `DEFAULT_SAVE_DIR` — výchozí cesta pro ukládání
-- `ONE_HOUR_NS`, `SLIDER_MAX`, `CACHE_SIZE`, `SCRUB_MAX_SIDE` — provozní konstanty
-- `TZ_PRAGUE` — `ZoneInfo("Europe/Prague")`
+### Constants (selection)
+- Sizing / pacing: `SLIDER_MAX`, `SCRUB_INTERVAL_MS`, `SCRUB_MAX_SIDE`,
+  `FAST_SCRUB_MAX_SIDE`, `PLAY_MAX_SIDE_SLOW/FAST`, `FULL_RES_SIDE`, `CACHE_SIZE`,
+  `NATIVE_CACHE_KEEP`, `PREFETCH_RADIUS_IDLE`, `PREFETCH_AHEAD_PLAY`,
+  `TICK_STEP_MINUTES`, `PLAY_TICK_MS`, `AXIS_TOLERANCE_S`,
+  `PLAY_EXACT_PCT_PER_S_THRESHOLD`, `SAVE_RANGE_WARN_COUNT`
+- Preview layer: `PROXY_MAX_SIDE`, `PROXY_MAX_FRAMES`, `PROXY_BATCH`,
+  `PROXY_WORKERS` (16), `PROXY_DRAG_WORKERS` (2, reads allowed to run during a drag),
+  `PROXY_FOCUS_GRID`, `PROXY_MOTION_TOL_MAX`, `PROXY_DRAG_MS`, `PROXY_REFINE_MS`,
+  `PROXY_TOPUP_MS`
+- Settle tiers, in order after a release: `PROXY_REFINE_MS` (200 ms,
+  `_refine_current_frame` — single-cam to `REFINE_MAX_SIDE`, multi-cam back to full tile
+  size) then `HQ_SETTLE_MS` (500 ms, `_hq_upgrade_tiles` — every tile to `HQ_SIDE`, i.e.
+  native). **The 200 ms pass must not re-arm itself.** `_schedule_refine` also restarts the
+  HQ tier, and a preview repaint calls `_schedule_refine`, so a refine that repainted the
+  tiles from the preview kept pushing the 500 ms deadline out 200 ms at a time: `hq=0`
+  forever, tiles pinned at preview resolution, and ~`n_cams x 5` wasted repaints a second
+  on an idle panel (measured in the diag log as `prev≈1750/min` with `prox=100%` on a
+  6-camera archive window). `_display_multicam_index(from_refine=True)` is what breaks it;
+  `testing/test_settle_native.py` fails on a regression. Live mode never had the loop — it
+  re-arms from arriving frames instead.
+- Live mode: `ONLINE_MAX_ITEMS` (per camera), `ONLINE_ACTIVE_FOLDER_COUNT` = 2,
+  `ONLINE_POLL_MIN/MAX_INTERVAL_S` (0.5–5 s, `ONLINE_POLL_BACKOFF`),
+  `ONLINE_WATCHER_POLL_INTERVAL_S` = 3, `WATCHER_SUSPECT_STRIKES` = 2,
+  `WATCHER_RESTART_COOLDOWN_S` = 30, `CAM_LOAD_WATCHDOG_S`, `CAM_PIPELINE_GRACE_S`
+- Refresh dot: `CAM_DOT_FRESH_S` = 5 (green *wording* only), `CAM_UNDISPLAYED_RED_S` = 8,
+  `CAM_FOLDER_ERR_RED_S` = 6, `CAM_POLL_HUNG_S` = 15, `ONLINE_STALL_RED_S` = 5,
+  `LIVE_START_GRACE_S` = 10, `CAM_READ_FAIL_RED_N` = 1 — see the refresh-dot section below
+- Palettes: `GRADIENTS`, `GRADIENT_ID_DEFAULT` = 0 (original colours),
+  `GRADIENT_ID_GRAYSCALE` = 1. `gradient_id` is a positional index into
+  `GRADIENT_NAMES`, so a reorder re-maps every selection made from an index —
+  the order is Default, Grayscale, Gradient, Binary, False Colors, Rainbow, then
+  the rest, and it is mirrored in `if_t.py`, `sf_t.py`, `wk_t.py` (the last two have
+  no *Default*). *Binary* and *Rainbow* are the NI Vision palettes of those names:
+  - *Rainbow*: blue → red with a prominent green middle, 0 black and 255 white. Jet
+    and Turbo also run blue→red but have neither the black start, the white top, nor
+    the wide greens.
+  - *Binary*: **measured**, not guessed (`_NI_BINARY_CYCLE`, `NI_BINARY_BAND`,
+    `_ni_binary_rgb`, `_make_ni_binary_lut`). The rule, in the stored 16-bit units the
+    archive uses (after the frame is put on its camera's reference range — see the
+    intensity-scale note, or the bands move when the archiver's bracket changes):
+    `band = stored // 1024`; black if `band == 0`, else `_NI_BINARY_CYCLE[(band-1) % 15]`.
+    **15** colours, not 16, and black is NOT part of the cycle — it is the single bottom
+    band. The colours are exactly 0/127/255 per channel: red, green, blue, yellow,
+    magenta, cyan, orange, rose, chartreuse, violet, azure, spring green, light red,
+    light green, light blue. No white and no grey anywhere.
+  - How it was measured, since the same method is the only way to settle the remaining
+    palettes: the NI viewer here shows the live camera only and cannot open a ramp probe,
+    so the palette was read out of a screenshot instead. A screenshot of an NI window and
+    the archive PNG of the frame it shows are the same picture rendered twice, so pairing
+    them pixel by pixel gives value → colour. Done on C03-041_PASF1_NF and
+    C03-042_PASF2_NF (2026-08-14); the two cameras have very different value ranges and
+    produced the same rule, which is the part that cannot happen by accident. The app's
+    own render now matches the NI window on **98.3 % / 98.2 %** of pixels (±2 per channel
+    for the screenshot's rounding); the rest is the archive frame being 5 s off the one
+    on screen, because the archiver stores only about one frame per 35 s. The tooling is
+    in the session scratchpad (`ni_lut_extract.py`, `binary_scan.py`, `binary_fine.py`,
+    `verify_binary_end_to_end.py`).
+  - Rules that fell out of the measurement and are easy to reintroduce by accident:
+    the bands are **absolute**, so Binary is view-only (`_is_view_only_palette` covers it
+    alongside Default) and takes an exact 16-bit path in `load_image_scaled` that skips
+    the 8-bit step entirely — 8 bits quantise to 257 stored units against a 1024-unit
+    band, so a pixel near an edge would come out the wrong colour. The LUT in `GRADIENTS`
+    is the same rule at 8-bit resolution and serves only the subtraction path, which has
+    no 16-bit data left. The old min→max stretch (`FULL_RANGE_PALETTES`) is gone: it made
+    the colours mean something different in every frame.
+  - *False Colors* is the dark-blue → violet → purple → magenta → pink → white ramp
+    with the stops crowded at the bottom (~4× the colour change per count at low
+    intensities than mid-scale). It stays inside one colour family on purpose: a full
+    spectrum was tried here and only duplicated Gradient / Jet / Turbo. It is the one
+    palette in `ADAPTIVE_PALETTES`: spread over the frame's own p0.5..p99.5
+    (`_palette_normalize`) instead of the absolute scale, because a beam strong enough
+    to see by eye still sits in the bottom tenth of that scale on these cameras. With
+    Auto on, the window is already 0..255 and it is a no-op. `_proxy_render` applies
+    the same rules so preview and refined render agree.
+  - A banded/posterizing "Binary (bands)" variant existed briefly and was removed on
+    request; the NI palette is the only Binary.
+  - `CYCLIC_PALETTES` — the palettes whose colour repeats with the value (*Binary*).
+    Nothing may resample their output with interpolation, because the average of two
+    cycle colours is a third, unrelated one: fitting a 2560×2160 frame into a tile is
+    about a 6× shrink, which box-filtered the saturated confetti into pastel grey mush
+    and was the visible difference against the NI viewer. `palette_is_cyclic(gid)` +
+    `set_pixel_exact_scaling(bool)` flip every `ImageView` to `FastTransformation`;
+    `_on_gradient_changed` → `_apply_pixel_exact_scaling` drives it and drops the
+    scaled copies the views hold (`_ensure_scaled` only re-scales on a size change).
+    The flag is module state, not per-view: one palette combo drives the single-cam
+    view and every tile, and `CamGrid.setup_cameras` creates and destroys tiles at
+    runtime, so a per-view flag would need re-pushing at each site.
+    `_proxy_usable` refuses the preview layer for these for the same reason (the
+    proxy's downscale and its 8-bit quantisation both change the band index).
+- Circle calibration: `CIRCLE_*`
+- Paths: `DEFAULT_OPEN_DIR`, `DEFAULT_OPEN_ROOT`, `DEFAULT_SAVE_DIR`,
+  `IMAGES_ROOT_BASE`, `container_root_for_year(year)`
 
-### Datové struktury
+### Data structures
 ```python
-Item(path, ts_ns)     # frozen dataclass — jeden snímek
-PixCache(max_items)   # LRU cache QPixmap
+Item(path, ts_ns)                     # frozen dataclass — one frame
+PixCache(max_items, native_keep)      # LRU QPixmap cache; native renders capped
+_ProxyTrack()                         # preview frames of one timeline, keyed by ts_ns
+_RenderBC(offset, contrast, auto)     # the render params passed through the pipeline
+Pdxm1GridConfig / CamLayoutConfig     # persisted overlay grid / multi-cam layout
 ```
 
-### Worker třídy (QRunnable)
-| Třída | Signály | Účel |
-|-------|---------|------|
-| `LoadTask` | `LoaderSignals` | Načte a zdekóduje jeden snímek |
-| `ScanTask` | `ScanSignals` | Projde složky, sestaví seznam `Item` |
-| `RefreshScanTask` | `RefreshScanSignals` | Inkrementální refresh (nové snímky) |
-| `SaveRangeTask` | `SaveRangeSignals` | Batch save A→B |
-| `PointingAnalysisTask` | `PointingAnalysisSignals` | Centroid pro každý snímek |
-| `_SCTask` | `_SCSignals` | Spatial Contrast pro jeden snímek |
-| `_SCHistogramWidget` | — | matplotlib histogram SC hodnot (embedded v dialogu) |
-| `_CamPollTask` | `_CamPollSignals` | Polling nových snímků (online multi-cam) |
+### Image pipeline
+`load_image_scaled(path, max_side, brighten, gradient_id, brightness_offset,
+ref_image, sub_threshold, contrast, auto_bright, sub_offset, stats_out)` is the core
+decode → scale → auto-stretch → reference-diff → brightness/contrast → palette path.
+The enhancement chain is shared by **every** palette including `Default`: that branch
+used to `return` right after the 16-bit normalization, which silently made both Auto
+checkboxes and both sliders dead controls there while the preview layer still applied
+them. Around it:
 
-### Pomocné funkce
-- `load_image_scaled(path, max_side, brighten, gradient_id, ...)` — načte, zdekóduje, aplikuje paletu
-- `_apply_lut(img, lut)` — RGB LUT na Grayscale8
-- `_autostretch_gray(img)` — percentilový stretch
-- `_apply_brightness_offset(img, offset)` — offset jasu
-- `_copy_metadata_into_png(src, dst, save_txt)` — přenese PNG/TIFF metadata
-- `fmt_prague_full_from_ns(ns)` / `fmt_hhmmss_ms_from_ns(ns)` — formátování ts
-- `parse_unix_ns_from_name(path)` — timestamp z názvu souboru
+- `_read_image_max_sample` / `_read_tiff_max_sample` — declared maximum sample value.
+  No call sites left; the display scale does not consult metadata for the RANGE — see
+  `_frame_scale` for the one thing it does read.
+- `_norm16_to8_full_scale` — 16-bit → 8-bit on `value / full_scale`, delegating to
+  `img_scale.to_absolute_u8` so the Finder and Shot Finder render through the same
+  function. It replaced the `MaxValue`-tEXt × `/4095` scaling, which was only right for
+  12-bit cameras and rendered the 6–9 bit diode cams almost black.
+- `_frame_scale(path, reader)` — the frame's `(full_scale, camera, frame_bits)`, read off
+  the `QImageReader`'s tEXt. **Must be called BEFORE `reader.read()`**: Qt serves tEXt out
+  of the header it parses on the way in, and after the read `text()` returns empty and
+  libpng logs a read error. Called first it costs ~1.4 ms and the pixels are bit-identical.
+  `load_proxy_gray` stores `(camera, frame_bits)` with the frame instead of the resolved
+  range, and `_proxy_render` resolves it at PAINT time — freezing it at decode would leave
+  every frame of a preview sweep on whatever reference was known before the camera first
+  showed its bigger bracket.
+- `_ni_binary_rgb(arr16, full_scale)` — the cyclic NI Binary palette bands absolute stored
+  values, so it takes the same range: a frame bracketed a step lower would otherwise cross
+  twice as many band edges and come out a different set of colours.
+- Gamma rides in `_RenderBC.gamma` (slider percent, `0` = Auto), so it lands in every
+  render cache key for free. It is applied at the THREE places the absolute scale is
+  applied — `load_image_scaled`'s 16-bit branch and both `_proxy_render` paths — because a
+  preview paint and the refined render of the same frame must not disagree about the tones.
+  `_proxy_gamma` resolves Auto for the proxy: the stored 8-bit codes are a monotone remap
+  of the real values, so the median CODE maps through the ramp LUT to the median value
+  (order statistics survive a monotone LUT), which is why the two agree to ~0.001 instead
+  of merely looking similar.
+- `_stretch_arr_f` / `_apply_stretch` (alias `_autostretch_gray`) — percentile stretch
+  (Auto contrast). This is the pass that reproduces what an auto-scaling viewer such as
+  ImageJ shows; the default absolute scale is deliberately darker.
+- `_apply_bc` — manual contrast, then Auto brightness **or** a manual offset, in one
+  buffer round-trip. Wrapped by `_apply_contrast` / `_apply_auto_brightness` /
+  `_apply_brightness_offset` for the individual call sites. The MANUAL controls keep the
+  usual split: brightness is an additive offset, contrast a multiplicative gain — never
+  the other way round.
+  - contrast pivots on the frame's **black level** (`_BLACK_PCT`), not mid-grey. With
+    the mid-grey pivot a frame sitting at code ~29 went black at contrast +20, one nudge
+    of the slider.
+  - Auto brightness is an auto **level** (`_bc_auto_level`), not a shift: p0.5..p99.5
+    onto 0..255, i.e. what ImageJ's auto display range does. Both additive rules tried
+    before failed on real frames — parking p99.5 at 255 added +190 and clipped the frame
+    to a white rectangle; parking the median at mid-grey lifted the whole picture into a
+    flat light field (measured on C03-051-WRT2DPNF: p0.5..p99.5 of 2..53 → 126..177) with
+    its contrast untouched. A narrow range can only be spread by a gain.
+  - Auto contrast and Auto brightness therefore share ONE auto-level pass:
+    `load_image_scaled` and `_proxy_render` run it when either is ticked and then call
+    `_apply_bc` with `auto_bright=0`, so a frame is never levelled twice. `_apply_bc`'s
+    own `auto_bright` branch is the 8-bit fallback for subtraction frames.
+- `_img_planes` / `_img_from_planes` — extract/insert for the above; colour images are
+  handled as RGB32 with the percentile anchors taken from the luma, so `Default` keeps
+  RGB sources in colour and still honours the controls.
+- `_stat_sample` — percentile anchors come from a strided ~250k-pixel subsample; the
+  exact percentile on a native-resolution frame costs more than the whole scrub budget.
+- `_gain_to_contrast_slider`, `_auto_bc_put` / `_auto_bc_get` — the side channel that
+  parks the greyed-out Auto sliders on the value actually used. **Display only for both**:
+  switching an Auto checkbox off restores the user's own value (`_contrast_manual`,
+  `_brightness_manual`) rather than keeping what Auto put there. Contrast could not be
+  handed over anyway (the slider's gain tops out at ~3.9× while a dim frame needs 5×+, so
+  the parked number pins at +127); brightness could, but baking Auto's offset into the
+  manual control made the checkbox impossible to undo.
+- `_apply_reference_diff` + `_diff_stats_put` / `_get` — subtraction with statistics
+- `_apply_lut` — RGB LUT onto Grayscale8
+- `load_proxy_gray` — small grayscale array for the preview layer, returned as
+  `(u8, lo, hi, mx)`: 8-bit codes on a **two-segment ramp** plus the 16-bit levels needed
+  to invert it (see the proxy section below)
 
-### Widgety
+### Whole-window preview (proxy) layer
+With live mode off the tool preloads the **entire loaded window** at
+`PROXY_MAX_SIDE` in the background, so dragging the slider repaints from memory
+instead of one share read + decode per position; the frame the user stops on is then
+re-rendered at native resolution.
 
-#### `ImageView(QWidget)`
-Zobrazuje snímek + overlaye v `paintEvent`:
-- cross, circle, square (normalizované souřadnice)
-- `sc_topn_points_norm` — top-N SC body (oranžové kroužky)
-- energy bar (bílý proužek dole s PV hodnotami)
-- cam label + timestamp
+`_proxy_kick` / `_proxy_start` / `_proxy_cancel(drop)` / `_proxy_plan` (samples the
+window coarse → fine) / `_proxy_focus_jobs` / `_proxy_next_batch` / `_proxy_pump` →
+`_proxy_dispatch` / `_on_proxy_batch` / `_proxy_render` / `_proxy_motion_tol` /
+`_proxy_try_paint(_cam)` / `_proxy_status_text` / `_schedule_refine` →
+`_refine_current_frame`. Frames are keyed by `ts_ns`, not list index, so a Refresh or
+a live backfill does not invalidate what is preloaded. Painting from the preview is
+skipped while zoomed in or while Subtraction is on.
 
-#### `CameraView(QWidget)`
-Obal jedné kamery v multi-cam gridu. `img_view` + label.
+#### Preview storage: 8-bit codes on a two-segment ramp
+`load_proxy_gray` stores **1 byte per pixel** and carries `(lo, hi, mx)` with each frame:
+codes `0..PROXY_KNEE_CODE` span p0.1..p99.9 of the real 16-bit pixels, codes above the knee
+span p99.9..max. `_proxy_render` inverts both segments with a 256-entry LUT and then applies
+the **same two mappings in the same order** as `load_image_scaled`'s 16-bit branch
+(`_stretch_arr_f` with Auto on, `_norm16_to8_full_scale` without), so a preview paint and
+the refined render of the same frame agree.
 
-#### `MultiCameraGrid(QWidget)`
-Grid `CameraView`. Signal `camera_selected(int)`.
-- `setup_cameras(names, folders)` — zachovává overlay stav přes `_overlay_store`
-- `selected_cam_index()` / `selected_cam_indices()` / `selected_img_view()`
+Three things had to be true at once, and each rules out a simpler scheme:
 
-#### `PointingPanel(QWidget)`
-Matplotlib scatter + histogram pointing. Signal `point_clicked(int)`.
-- `plot(cx_urad, cy_urad, n_shots, ts_ns, ts_ns_int)`
-- `set_replay_ts(ts_ns)` — live replay při scrubování
+- **Auto contrast must stretch the real data.** Keeping raw uint16 (what this used to do)
+  achieved that but cost 2 bytes/px, so `PROXY_RAM_BUDGET_MB` bought half as many frames —
+  a 4-camera 4-hour window could only ever hold every 2nd or 3rd frame, and a drag
+  therefore could not show what it was dragged across however fast the rest of the pipeline
+  became. Taking the percentiles at decode time, in the worker, gives the same result at
+  half the size — and takes ~1 ms per tile per tick off the GUI thread (at 12 cameras that
+  was ~12 ms of a 33 ms budget spent recomputing a constant).
+- **One linear scale over 0..65535 is unusable.** These frames run p0.1..p99.9 ≈ 1536..2868
+  out of 65535, so the picture would be about five codes wide — the harsh posterized banding
+  (7 distinct greys on a PFM frame) that the uint16 storage was introduced to avoid.
+- **Saturation must stay visible.** Simply clipping at p99.9 rendered a saturated spot at
+  the p99.9 *level*, i.e. dark — measured 11 instead of 253, so a saturated spot read as a
+  dim one for the whole drag. On a laser diagnostic that is a wrong reading, not a quality
+  trade. A single reserved "≥ p99.9" code fixes the darkness but renders every pixel above
+  the knee at the frame maximum (measured 234 codes too bright), so mild and saturated
+  pixels become indistinguishable. Hence a ramp for the tail as well.
 
-#### `TickBar(QWidget)`
-Časová osa pod sliderem. Ticky, značky A/B, date labels při multi-day.
-- `_draw_date_label` — `dd.mm` label s bílým pozadím na midnight crossings
+Measured against the full-resolution render of the same frame: Auto on within **1 code**;
+Auto off within **1 code** across 99.9 % of pixels and within 15 in the highlight tail
+(16 codes covering 2868..65000); saturated pixels render 252 vs 252. `PROXY_STORE_8BIT =
+False` reverts to raw uint16.
 
-#### Dialogy
-- `DatePickerDialog` — kalendář + hodina + Now checkbox + Multi-day (end date, `adjustSize()` při toggle)
-- `CameraPickerDialog` — výběr kamer pro multi-cam
-- `FolderPickerDialog` — lazy tree síťové složky
-- `_SCHistogramDialog` / `_SCExclusionEditor` — SC threshold + exkluzní regiony
+#### Budget: RAM *and* sweep time
+`_proxy_budget_per_track` takes the smaller of the RAM budget and
+`PROXY_SWEEP_BUDGET_S × PROXY_SWEEP_FPS_EST`. Sweep time is usually the binding limit: a
+preview frame costs a whole file read (`setScaledSize` saves decode CPU, not I/O) at ~100
+frames/s, so 27k frames is 4.5 minutes and 180k is half an hour at *any* RAM figure.
+The step is then **snapped** (`PROXY_STEP_SNAP_SLACK`) — it is `ceil(want/per)`, so being a
+handful of frames over budget jumped it from 2 to 3 and left a third of the RAM unused
+(measured: 846 of 1200 MB at 1-in-3, when 1-in-2 was affordable). `_proxy_side` also drops
+the decoded side for many cameras (224 / 160 / 128 px at ≤4 / ≤8 / 9+), justified by the app
+itself: at 12 cameras `_cam_tile_side` renders 180 px during a fast drag anyway.
 
-### Hlavní widget: `Viewer(QWidget)`
+Result: 4 cameras × 6712 frames (4 h) → **step 1, every frame, ~1.2 GB, 268 s sweep**.
 
-**Stav:**
-- `self.items` / `self.ts_list` — snímky + timestamps
-- `self.current_idx`, `self._gen`
-- `self._last_save_dir`
+`_diag_log` writes one line a minute to `image_tools_diag.log` with the paint counters
+`prev` / `cach` / `miss` / `load` (preview, pixmap cache, preview refused, share read),
+`refuse` = miss/(miss+prev), `prox` = how much of the preview is decoded, `proxMB` /
+`renderMB` = what it costs, `step` per track and `tolS` = the current accepted distance.
+`rss` finally works — it returned -1 on every line of every run because
+`GetCurrentProcess` had no `restype`, so the `(HANDLE)-1` pseudo-handle marshalled as
+`0x00000000FFFFFFFF` and `GetProcessMemoryInfo` failed with `ERROR_INVALID_HANDLE`; see
+`_rss_mb`. Reproduce headlessly with `testing/bench_drag.py` / `testing/bench_play.py` (real offscreen
+`Viewer`, real signals) — they stop `_diag_timer` themselves, and they need
+`--latency-ms` (default 145) because a local PNG read is ~1 ms and at that speed none of
+the concurrency limits are visible at all.
 
-**Klíčové metody:**
-| Metoda | Popis |
-|--------|-------|
-| `_start_scan(folders, ...)` | Spustí ScanTask |
-| `_display_exact_index(idx, ts, ...)` | Zobrazí snímek |
-| `_set_info_for(idx, axis_time_ns)` | Info panel + live replay pointing |
-| `_on_auto_follow_toggled(checked)` | Online mode + skok na poslední |
-| `_start_online_mode()` / `_stop_online_mode()` | Online polling |
-| `_run_spatial_contrast()` | Spustí _SCTask |
-| `save_current()` / `save_around_current()` / `save_range()` | Ukládání |
+Two rules decide whether a drag is served from RAM or falls back to one share read per
+camera (the "a frame a second" case):
 
-**Palety:** index 0 = Default (orig.), index 1 = Grayscale, 2+ = LUT
+- **Accepted distance.** `_ProxyTrack.nearest(ts, tol)` refuses a frame further than the
+  tolerance. Standing still that is `ts_gap` — the spacing of the *finished* plan. While
+  the user is moving it is `_proxy_motion_tol`: the spacing actually decoded so far
+  (`_ProxyTrack.current_gap`), capped by **both** `PROXY_MOTION_TOL_MAX × ts_gap` and
+  `PROXY_MOTION_TOL_MAX_S` seconds. The wall-clock cap is the one that matters: the
+  multiple scales with the plan, so on a coarse plan it grew without limit — measured on a
+  real 4-camera session at `prox=4 %`, a drag painted frames **5.4 minutes** from the
+  requested moment. Whatever tolerance is used to *accept* a frame is also the one passed
+  to `_cam_note_painted` and used to *judge* it. Those were two different numbers, which is
+  why every tile sat red permanently: accepted under minutes, judged against seconds.
+- **What is read first.** `_proxy_focus_jobs` hands out the plan's grid points outwards
+  from `_proxy_cursor_ts_ns` (recorded in `_set_info_for`, in `_per_cam_display_one` which
+  does not go through it, **and seeded in `_proxy_start`** — it returns nothing while the
+  cursor is 0, which is exactly the state a freshly opened window is in, so the opening
+  seconds of every sweep used to get no cursor-first ordering at all). `_proxy_next_batch`
+  **alternates** that with the global coarse → fine walk when idle, so a coarse layer grows
+  everywhere; **while moving it gives cursor-first strict priority**, because only frames
+  within a second or two of the handle can be painted in the next few hundred ms. Each call
+  examines at most `PROXY_FOCUS_SCAN_MAX` grid points — the scan is on the GUI thread inside
+  the tick.
 
-**Ukládání:** Default → `shutil.copy2`; ostatní → `load_image_scaled` + save; vždy `_copy_metadata_into_png`
+`_proxy_pump` keeps `PROXY_DRAG_WORKERS` reads running through a drag rather than standing
+down: from the diag log of a real session, a drag asked the share for **0.9 loads/s** on a
+share that does 204/s, so throttling the sweep 15× protected half a percent of capacity —
+and the sweep is the only thing that frees that capacity up, so the preview never got built,
+the drag fell back to loads, and the throttle looked justified. The idle grace is now set at
+the interaction **edges** (`_proxy_idle_grace`, called from the release handlers and
+`stop()`); it used to be re-armed from inside the dragging branch every 60 ms, so a user who
+drags in bursts never accumulated enough quiet for the full sweep to run at all, and
+`_on_slider_released`'s "let it run" pump was a no-op. `_proxy_covered` needs
+`PROXY_COVERED_TRACK_FRAC` of *cameras* covered and discounts `_ProxyTrack.failed`
+(frames that will never decode), because requiring all of them let one slow or partly
+unreadable camera hold every other tile in the not-covered state — big scrub renders and a
+tight load cap — indefinitely.
+
+The axis cursor (the big blue timestamp under the slider) is moved from
+`_on_slider_changed`, i.e. from the slider itself, not from the render pipeline. Driving
+it from `_apply_scrub` meant it only advanced on the 33 ms scrub tick and not at all when
+that tick bailed out early (same index, or the in-flight cap reached), so it lagged the
+handle and froze whenever the loader was saturated. It is set from the **snapped frame's
+own** `ts_ns`, so it always reads the same moment as the label burned into the frame.
+The same handler arms `_keynav_debounce`, which is what renders slider moves that never
+emit `sliderPressed` / `sliderReleased` — mouse wheel, arrow keys, a click on the groove.
+Those used to update `pending_slider` and nothing else.
+
+`play_timer`, `scrub_timer` and `_nav_timer` are `PreciseTimer`s. Qt's default coarse timer
+snaps to the Windows 15.625 ms scheduler tick, so their 33 ms interval really fired every
+46.9 ms — 21 ticks/s instead of 30, i.e. a third of every drag's and every playback's frames
+were lost before any image work started.
+
+### The live refresh dot: health of OUR pipeline, not liveness of the source
+
+`_live_health(cam_i, now) -> (state, tooltip, reason)` is the single verdict behind both
+indicators — the per-tile dots (`_on_cam_dot_blink` → `CameraView.pulse_refresh_dot`) and the
+Info-panel dot (`_on_online_blink` → `_live_health_summary`, the worst camera). Three states:
+blinking bright green = **active** (images arriving and being shown), steady dim green =
+**idle** (source quiet, nothing wrong), blinking red = **fault**. Grey = live mode off, which
+is also what auto-follow off and any multi-cam scrub produce, because both call
+`_stop_online_mode`.
+
+**Green is the default and needs no evidence.** It used to be conditional on an arrival
+within `CAM_DOT_FRESH_S`, so five seconds after a run ended every camera went red while
+nothing was wrong — an unchanged picture is the correct display of a source that is not
+shooting. `CAM_DOT_FRESH_S` now only picks active-vs-idle. Red requires a **named** fault:
+
+| reason | test |
+|---|---|
+| `stall` | `_online_last_poll_mono` (monotonic, so an NTP step cannot fake it) older than `ONLINE_STALL_RED_S` — the GUI thread was blocked, so nothing was displayed whatever the folders say. Global: it reddens every dot |
+| `folder` | `_cam_folder_err[i]` set for `CAM_FOLDER_ERR_RED_S`. The message is built **in the poll worker** by `_oserror_message` from the `OSError` its own `os.listdir` raised — no extra `stat()` on a share that is already failing. One folder listing successfully clears it, which is what keeps hour rollover from reading as a failure |
+| `poll` | the listing has been outstanding for `CAM_POLL_HUNG_S` (`_poll_hung_age`). An unplugged share **blocks** rather than raising, so nothing else detects the commonest case |
+| `read` / `lag` | the same test, different tooltip: a frame we know about is not on screen |
+
+The lag test is a **latch**, not an age: `_cam_lag_since[i]` records when the tile *first*
+fell behind and is cleared the moment it catches up. An arrival clock never fires on a wedged
+tile under a live stream (arrivals keep resetting it) and a paint clock fires falsely on the
+first arrival after an idle gap. "Behind" is `_cam_arrived_ts_ns[i] - _cam_shown_ts_ns[i] >
+LIVE_PAINT_TOL_NS` — **the same 1.5 s the paint path accepts**, which is what keeps the dot
+and the timestamp label from contradicting each other (a red label implies the latch is set;
+an idle source has `arrived == shown` and therefore neither). Repeated read failures
+(`CAM_READ_FAIL_RED_N`) bypass the tolerance, because a failed decode is evidence rather than
+a timing estimate: at 3.3 Hz one undecodable frame sits only 0.3 s ahead of the one on screen,
+so without this the most literal form of the fault — "a new file appeared and cannot be read"
+— never turned the dot red. The threshold is **1**, and the hysteresis is the 8 s latch: a
+higher count is unreachable anyway, since `_on_cam_loaded` relaunches through a `_cam_want`
+the finished load has already consumed, so a single bad frame fails exactly twice.
+`_cam_read_fail_ts` records *which* frame failed, so a successful decode of an older one
+(single-cam idle prefetch does exactly that) cannot clear it.
+
+Faults are observable at all only because three things stopped being swallowed:
+`_CamPollTask.run` / `_PollTask.run` now classify their `OSError` instead of
+`except Exception: pass` (carried on `_CamPollSignals.found`'s fourth argument); the load
+handlers stopped conflating a stale generation with `img.isNull()`; and the single-camera view
+gained a paint choke point, `_paint_single`, so something finally knows which frame is on its
+screen rather than only which was requested. `LIVE_START_GRACE_S` suppresses the verdict while
+live mode's opening burst (12 cameras repainting at native resolution at once) settles.
+
+**Known cost of the new rule:** a camera pointed at a readable but empty folder, or whose
+hour-folder discovery fails, is now green. Without knowing each camera's expected rate that is
+unavoidable once "no new files must be green"; the green tooltip reports the silence age, so
+hovering distinguishes "idle 2 s" from "idle 47 min".
+
+`testing/bench_live_dot.py` asserts all of it offscreen against synthetic files in under a minute —
+run it with `--cams 2` and `--cams 1`. Case 1 (an idle source stays green) is the reported
+bug and must never be allowed to regress.
+
+### Per-camera navigation: `_nav_timer`
+In multi-cam the shared slider is **hidden**; the user drags the master per-camera slider.
+That path had no throttle at all: `_on_per_cam_value_changed` was called straight from
+`QSlider.valueChanged` — once per mouse-move, up to ~125/s — and rendered every camera
+synchronously on the GUI thread, each render ending in its own `_cam_refresh_stale_marks`
+pass over all tiles and its own diff-stats relayout, i.e. **O(cameras²) label work per mouse
+move**.
+
+Now a move only *records* (`_nav_request` → `_nav_pending` / `_nav_frame`) and
+`_per_cam_nav_tick` renders once per `NAV_TICK_MS`, resolving the slaves once
+(`_per_cam_slave_targets`) and flushing the labels and diff stats once for the whole pass
+(`_per_cam_display_one(defer_labels=True)`). The master slider, the slave sync, the arrows
+and per-camera playback all go through it. It self-stops, which is also what makes it cover
+wheel / arrow / groove moves on a per-camera row — those emit `valueChanged` with no
+`sliderPressed`, so nothing would ever stop a timer started on their behalf.
+
+It is deliberately **not** the shared `scrub_timer` / `_apply_scrub`: that drives off
+`pending_slider` (the hidden slider), its multi-cam branch calls `_display_multicam_index`
+which snaps every camera to one merged moment while `_per_cam_slave_targets` deliberately
+leaves a slave alone when it has no frame within `SLAVE_SYNC_MAX_NS`, independent mode has
+no merged position at all, and it coalesces on `idx == self.current_idx` — which
+`_per_cam_display_one` writes itself, so the second tick of any drag would return early.
+
+**Where a row sits is resolved to the NEAREST frame** (`_per_cam_row_frame`).
+`_per_cam_ts_to_slider` *truncates* a timestamp to a slider step, so mapping the step back
+lands a few microseconds **before** the frame the handle was placed on, and a "newest frame
+at or before" resolve then names the *previous* one. Three paths did exactly that and each
+stepped one frame back: pressing the handle without moving it, releasing a drag, and
+`_on_per_cam_master_chosen`, which synced every slave to a moment the new master itself was
+not showing. They now resolve the handle to the **nearest** frame, which is stable under
+that truncation.
+
+The answer must stay a **timestamp**. Answering from a remembered frame *index*
+(`_nav_frame` / `_cam_current_idx`) is worse than the bug it cures: `_on_per_cam_pressed`
+kicks `_restore_full_history()`, which merges the whole window back **on the scan pool** and
+therefore lands mid-drag, so by the release the same index names a far older moment —
+measured at **18 s backwards**, 20 live frames restored to 56. `_restore_full_history` states
+the rule in its own comment: *remember the moment being watched, not the index*. Nothing
+re-places `_nav_frame` after that merge (`_display_multicam_index` moves the handles, not the
+index map), which is exactly why only the handle can be trusted. `_setup_multi_cam` still
+clears `_nav_frame` / `_nav_pending`: both are keyed by camera SLOT and `_per_cam_step` steps
+relative to them, so a leftover entry belongs to whoever held that slot before.
+
+Pinned by `testing/bench_master_sync.py` — all six ways the master moves (drag, release, arrows,
+master switch, playback, live arrival) plus independent mode, checking every slave
+**handle**, not just its picture, against what `_per_cam_slave_targets` resolves — and by
+`testing/bench_live_pv_load.py`, which grabs a slider *in live mode* and asserts the moment survives
+the history merge.
+
+`_on_per_cam_pressed` also sets **`_is_scrubbing`**, which nothing on this path did before.
+`_cam_tile_side` and `_current_decode_side` read it, so the motion downscale and every other
+"the user is moving" optimisation were dead on the path the user actually drags.
+`_navigating()` is that predicate; `_proxy_is_moving()` is the sweep's version and includes
+`_per_cam_scrubbing_cam`.
+
+### Live mode: every camera refreshes on every shot
+The master stays the clock — its arrivals decide *which moment* the grid is on — but that
+rule used to be implemented as "only the master's arrivals paint anything", and two whole
+classes of tile then stopped updating:
+
+* **A slave's own arrival painted nothing.** `_live_advance_cam` returned immediately for
+  any camera that was not the master. One shot writes N files and they do not land in the
+  same instant, so the slave's frame — merged into the timeline, counted for the refresh
+  dot — stayed invisible until the master's *next* arrival.
+* **A slave the master had run away from froze for good.** `_per_cam_slave_targets` skips a
+  camera with no frame within `SLAVE_SYNC_MAX_NS` (3 s), which is right for scrubbing (do
+  not drag a slave to a distant neighbour the user never asked for) and wrong at the live
+  edge: a camera whose cadence never lined up with the master's inside 3 s never repainted
+  again, however much it was shooting. Measured minutes wide in the field — a grid at
+  08:31:32 next to five tiles frozen at 08:08:02.
+
+`_live_slave_target(cam, master_ts)` is the live-edge resolver, and it answers in three
+cases: the nearest frame within `SLAVE_SYNC_MAX_NS` (unchanged, so a camera keeping up is
+unaffected); else the newest frame **at or before the master's moment** if that is newer
+than the tile's current picture (never past the master — the grid must not show the future
+relative to its own clock); else `None`, which is the one case a frozen tile is the truth:
+the camera really received nothing new.
+
+`_per_cam_sync_slaves(..., live_edge=True)` resolves through it; `_per_cam_slave_targets`
+itself is unchanged, so drag / release / arrows / master switch / playback keep the old
+rule. `_live_sync_one_slave` is the single-tile version, called from `_live_advance_cam`
+when a slave arrives — one tile per arrival, because re-syncing the whole grid on every
+slave frame would multiply the share reads by the camera count.
+
+A tile that is advanced away from the master's moment reads its own time, so it must not
+look current: `_cam_off_master` is checked alongside `_cam_is_stale` both on the paint path
+(`_cam_note_painted`) and on the 600 ms dot tick (`_cam_refresh_stale_marks`).
+`_cam_is_stale` alone cannot see it — that test only compares a tile against its own last
+request, and an advanced tile got exactly the frame it was asked for.
+
+**The live toggle reloads the whole grid.** `_on_auto_follow_toggled` used to re-display
+nothing at all when live mode went *off*, so the tiles kept the live decode size and
+whatever moments they were left on. Both directions now resolve a moment per camera
+(`_cam_toggle_ts` — the frame *on screen*, since `_cam_current_idx` is written at request
+time) and re-render **every** tile, including the ones whose moment did not change: the two
+modes decode at different sizes (`_cam_live_side`), and `_hq_cancel()` + `_schedule_hq()`
+re-arm the native tier, which otherwise waits for an arrival that never comes with the
+laser off.
+
+Pinned by `testing/bench_live_slave_refresh.py`: a master at 3.3 Hz, a healthy slave arriving 54 ms
+later, a slave writing once every 40 s, and a camera given nothing at all — asserting that
+each tile *and its handle* land on every frame that camera received, that the quiet one
+never moves, and that toggling live off and on repaints all four.
+
+The per-camera line in `image_tools_diag.log` (`cams=0:1234+7/b0.4,…`) is what separates
+the two ways a tile can sit on an old picture: frames **known** per camera and how many
+arrived in the last 60 s, against `b` = arrived − shown in seconds. Discovery stopping
+(`+0` while the laser runs) is a poll/watcher problem — a different fix in different code
+from anything above.
+
+### Per-camera load concurrency
+`_cam_inflight_at[cam]` is `{req_id: launch_monotonic}` and `_cam_inflight_depth()` bounds
+it. This replaced a **boolean** `_cam_busy[cam]`: one read at a time per camera, and at
+130-160 ms per read that is a hard ceiling of ~7 frames/s per tile however idle the machine
+is — the real reason the cameras appeared to take turns. Depth 4 gives ~27/s. All tiles now
+share **one** `_cam_pool` of `CAM_POOL_THREADS`, created once; it used to be one 2-thread
+pool per camera rebuilt on every camera (re)load, so pools and worker threads accumulated
+for the life of the process and a slow camera's threads sat idle while its neighbour's queue
+grew. Fairness is the depth cap, not a partition of the threads. `_reset_cam_pipeline` and
+`_cam_load_watchdog` release by **per-load age** — with one boolean per camera a healthy new
+load protected a hung old one indefinitely.
+
+`_on_cam_loaded`'s non-live paint test is `key[0] == want_key[0]` ("is this still the frame
+the tile wants?"). It was `idx >= self._cam_current_idx[cam]`, and `_cam_current_idx` is
+written at *request* time, so during a drag the request always ran ahead of a 145 ms load
+and nearly every finished decode was paid for and thrown away; dragging **backwards** was
+worse, since the correct frame has a lower index and was rejected outright. A superseded
+frame is still painted when it lies *between* what is on screen and the target, which is
+what makes a tile animate through a drag rather than jump — with depth > 1 several
+consecutive positions decode at once and do not finish in order. The live auto-follow branch
+keeps its monotonic rule.
+
+Measured with `testing/bench_drag.py` (4 cameras × 900 frames, `--latency-ms 145`, one pass over the
+whole window, cold preview) — `shown/asked` is distinct dragged-through frames that actually
+reached the screen:
+
+| | before | after |
+|---|---|---|
+| paints/s per camera | 5.0 | 8.5 (cold) / every requested position (warm) |
+| **frames shown of frames dragged across** | **12 %** (one camera 2 %) | **88 %** cold, **100 %** warm |
+| painted-vs-requested, p95 | 18.5 s | 4.8 s cold, **0.000 s** warm |
+| painted-vs-requested, worst | 259 s | 9.4 s cold, **0.000 s** warm |
+| tiles marked stale (red) | ~30 of 33 paints | 0 warm |
+| per-camera spread | 94 % | 98-100 % |
+
+Playback (`testing/bench_play.py`, 4 × 600, 0.5 / 1 / 5 %/s): 16 ms tick, spread 100 %, zero
+refusals, zero stale, stride below 1 at every offered speed so nothing is skipped.
+
+### Workers (QRunnable / Thread)
+| Class | Signals | Purpose |
+|-------|---------|---------|
+| `LoadTask` | `LoaderSignals` | decode one frame |
+| `ScanTask` | `ScanSignals` | walk folders → `Item` list |
+| `RefreshScanTask` | `RefreshScanSignals` | incremental rescan |
+| `SaveRangeTask` | `SaveRangeSignals` | batch save A→B with overlay + PV bar |
+| `PointingAnalysisTask` | `PointingAnalysisSignals` | centroid per frame |
+| `_SCTask` | `_SCSignals` | spatial contrast for one frame |
+| `_ProxyTask` | `_ProxySignals` | one batch of preview frames |
+| `_CamPollTask` | `_CamPollSignals` | poll one camera's folders (live) |
+| `_DirWatcher` | `_DirWatchSignals` | Win32 `ReadDirectoryChangesW` watcher |
+
+### Time / folder helpers
+`parse_unix_ns_from_name`, `_dt_from_sec` / `_dt_from_ns`, `fmt_hhmm_from_ns`,
+`fmt_hhmmss_ms_from_ns`, `fmt_prague_full_from_ns`, `prague_stamp_for_filename`,
+`replace_unix_ns_with_prague_in_filename`, `ns_from_dt`, `floor_to_hour`,
+`axis_from_hour_folder_exact` / `axis_from_any_folder`,
+`folder_hour_from_prague_hour`, `_cam_folder_time_key`, `active_scan_folders`,
+`poll_scan_folders`, `_is_dir_quiet` / `_dir_access_error` /
+`_camera_folder_problem` / `_probe_hour_folder`, `_strip_cam_name` /
+`_cam_short_label` / `_cam_aspect_hint`.
+
+**Window model:** a pick is a list of `PickSeg`; `seg_bounds_ns` treats **To as the
+EXCLUSIVE end** (12:00–13:00 is exactly one hour and touches only the 12 h folder),
+`hour_end_hm` builds that end, `utc_hour_cells_for_window` / `hour_dirs_for_windows`
+translate a Prague window into UTC hour folders (Prague 00:30 → the previous day's
+22/23 folder), and `cameras_for_windows` returns the camera **union over every
+hour folder of every window** (listed in parallel — a camera that ran only 18:00–19:00
+appears next to a different set recorded at 17:00) plus a status (`""` / `no_data` /
+`error`).
+
+### Widgets and dialogs
+| Class | Purpose |
+|-------|---------|
+| `ImageView` | frame display, overlays (cross/circle/square, SC top-N points, PV bar, cam label + timestamp, green `Ref:` badge via `cam_ref_text`), zoom, calibration |
+| `CameraView` / `MultiCameraGrid` | one camera tile / the multi-cam grid; `_FreeLayoutContainer` and `_AutoLayoutContainer` are the two layout backends |
+| `_TileDragHost` (+ `CameraView._tile_mouse` / `_tile_drag_mode`, `MultiCameraGrid.on_tile_layout_edited` / `reset_layout_to_auto`) | moving and resizing the tiles **on the running grid** — the editor's gesture, but on live pictures. Both containers mix it in and hold the arrangement in `_manual` as canvas fractions, which is what survives a resize; an auto container freezes its current on-screen geometry into `_manual` on the first drag and then only places it, since otherwise the next resize would recompute the layout and undo the drag. Mouse events are caught in an event filter on the CHILDREN (the image widget covers everything but the header and a 3 px margin, and has mouse handling of its own) and in `CameraView`'s own handlers for that margin — one code path, `_tile_mouse`. The name bar moves, the border resizes, and the top zone is narrower than the others because a 9 px one swallowed the name bar and turned every move into a resize. Edges snap to the neighbouring tile and to the canvas borders/centre (Alt disables it) so tiles butt up instead of leaving the ragged gaps a free drag always leaves; a press that never leaves the dead zone is reported back as a plain click, so the name bar still selects the camera. A finished drag is stored through `LayoutConfigDialog.save_manual_entries` under the same key and shape the editor writes, and right-click → *Auto-arrange cameras* (`forget_saved`) is the way back — reachable where the arrangement was made, not only in the picker. The **⛶ Reset layout** button in *Display* is the softer way back (`MultiCameraGrid.reset_layout`): it restores the arrangement the set was OPENED with — `_layout_opened`, kept apart from `_layout_config` precisely because every drag overwrites the latter — which is the preset's own layout or the one remembered for these cameras, and auto when there was none; the store is rewritten to match so the next open agrees with the screen |
+| `compute_camera_layout` (+ `_cam_layout_weight`, `_layout_trees`, `_usable_extra` / `_split_extra` / `_place_with_slack`, `_justified_rows_layout`) + `CamLayoutEntry` / `CamLayoutConfig` / `LayoutConfigDialog` / `_LayoutCanvasWidget` | camera auto-layout plus a drag-and-drop free layout editor. A layout is a split tree (each cut puts two tiles side by side or stacks them), which is why the whole thing is searchable: a subtree behaves like one tile obeying `height = width/A + B`, so it is built bottom-up in two floats and placed back exactly. Candidates are picked in **two passes**: first the largest the SMALLEST frame can be — that is what stops one lucky camera taking the canvas and leaving the rest postage stamps — then, among the arrangements that keep the smallest frame within `_LAYOUT_SMALLEST_TOL` (0.90) of it, the one showing the most picture in total, with the tidiest tile sizes as the last tie-break. Strict leximin was the earlier rule and would rather grow one frame a few percent than fill the canvas: three landscape cameras came out as one row across the top with two thirds of the canvas empty, where two columns show twice the picture for a frame 4 % shorter. The floor is what keeps the relaxation from turning into sum-maximising. Equal-length rows (`_justified_rows_layout`, still the fallback above 12 cameras) waste half the canvas the moment one camera is portrait. Diode arrays ask for twice the area (`_cam_layout_weight`). Each tile reserves the label bar so the frame fills its image region; the packing only fills the canvas in one direction, and the leftover in the other is handed down the tree by `_place_with_slack` — offered first to the tiles whose frame would actually grow (`_usable_extra`), and only what nobody can use is split by tile size. Either way the tiles stay a seamless partition of the canvas — every tile edge shared with its neighbour, columns and rows lined up to the pixel — and what is left over shows up as the grey margin around the frame inside each window, **centred** now (`ImageView._img_rect`, `_LayoutCanvasWidget._image_rect_in`): anchoring the frame under the label bar put the entire leftover height into one band below it, which is what "the cameras sit along the top edge and the bottom is stretched to the floor" was. Centring each whole TILE in its own slack instead (an older attempt) is a different thing and is what made the cameras look randomly strewn about with the columns out of line. Set `ELI_LAYOUT_DIAG=1` to have every computed arrangement logged with the aspect used per camera and how much of its tile each frame fills — by eye a grey band and a wrongly learned aspect look identical. Tile colours in the editor are keyed by camera name, not by list position: dragging a tile brings it to the front of the list, and an index-keyed palette recoloured every camera on a single click. Results are cached per canvas size, since every resize event recomputes them. The editor draws on a board with the LIVE camera area's aspect (`_board`), so its preview is the arrangement the grid will actually produce, and an untouched/auto-arranged editor returns `is_auto()` — the picker then keeps the grid on auto (saved as `"auto": true` in `cam_layouts.json`) instead of freezing editor-sized fractions into a free layout. Only a hand-dragged layout is stored as fixed; entries without the flag are legacy frozen previews and are ignored |
+| `remember_cam_aspect` / `_cam_aspect_hint` (`cam_aspects.json`) | per-camera frame aspect, learned from the first frame and persisted. The packing needs an aspect *before* any frame is loaded; the name hint only knows "portrait diode array vs square", so a rebuild — every time-window rescan recreates all tiles — used to pack for square tiles and the layout visibly jumped when the frames arrived. `ImageView.frame_aspect_changed` re-runs the packing when a camera's real aspect turns out different; overhead changes (label font, `Ref:` badge) go through `MultiCameraGrid.refresh_auto_layout` |
+| `Pdxm1GridConfig` / `Pdxm1GridConfigDialog` / `_GridPreviewWidget` / `get_pdxm1_grid_config` / `_cam_type_key` | the PDxM1/PDxM2 diode grid overlay; line positions are stored as absolute image fractions so each line is independent, and PD cameras of the same type share one config |
+| `PointingPanel` | matplotlib scatter + histogram + path, click-to-jump, live replay, click/region delete with per-operation undo. The Beam-path colour bar carries a draggable time cursor: it snaps to the nearest shot, shows `HH:MM` beside the bar, moves a lime dot along the path and drives the image viewer (throttled through `_cursor_nav_timer`, one share read is ~130-160 ms). The bar's own axes are explicit (`cax`), so a multi-day analysis can draw a line at every local midnight and write the date beside each day's segment — `HH:MM` alone would be ambiguous. Cursor, readout and dot are Qt children of the canvas, so `Save Plot` writes the figure without them, while the day markers (matplotlib artists) are included |
+| `_SCHistogramWidget` / `_SCHistogramDialog` / `_SCExclusionEditor` / `_SCExclusionCanvas` / `_SCValueLabel` / `_SCPreviewLabel` | spatial-contrast threshold, exclusion regions, preview |
+| `TickBar` | time axis under the slider — ticks, A/B marks, `dd.mm` labels at midnight crossings. A multi-day pick glues its windows together and **alternates the label rows** window by window (hours above the baseline / date at the bottom, then swapped, …), so the two hours meeting at a seam never fight for the same pixels |
+| `DatePickerDialog` + `_DayTimeDialog` + `_make_multiselect_calendar` | see below |
+| `CameraPickerDialog` (+ `_CamLoaderSignals`, `_capture_current_layout` / `_preset_cameras` / `_preset_layout`) | camera selection + presets; the list is the union over every window of the pick. A preset in `cam_presets.json` carries the ARRANGEMENT as well as the camera list — `{"cameras": [...], "auto": false, "cam_order": [...], "tiles": [[x,y,w,h], …]}`, the same shape `cam_layouts.json` uses, read through the shared `_entries_from_tiles`. **Save** captures whatever is on screen right now; a grid still arranging itself is stored as `"auto": true` rather than frozen into fixed fractions, because those fractions belong to the window they were computed for and a preset gets opened in another one (the same rule as `LayoutConfigDialog.is_auto()`). Loading a preset therefore decides the arrangement too and sets `_layout_chosen`, so `_on_accept` does not fall back to the layout remembered for that camera set; `_on_accept` also drops a layout whose camera count no longer matches, or a preset followed by adding one camera would place the rest by another set's rectangles. Presets written before this are a bare list of names and read as auto. Right-click → *Auto-arrange cameras* clears only this window's layout and the `cam_layouts.json` entry, never the preset's own copy — re-loading the preset brings the arrangement back, which is the point of naming it. The Shot Finder reuses the dialog with no grid, so it saves camera lists only |
+| `LazyDirModel` / `_DirItem` / `FolderPickerDialog` | lazy network folder tree |
+| `CollapsibleSection` | the sidebar's collapsible sections (accent stripe + ▾/▸), state persisted. The body carries the accent's left stripe (`_shade(accent, 1.35)`) **and** a near-white wash of it (`_shade(accent, 1.93)`) so each group reads as one coloured block; the tint stops there because black control text has to stay comfortably legible on it |
+| `_CamSliderRow` | per-camera master radio + slider |
+| `_PvOverlayPanel` | floating, draggable PV panel. Its rows are **rich text**, one `<span>` per row (everything escaped — a PV name is archiver text, not markup), because a value past its limit has to go red while the others do not and a `QLabel` has exactly one QSS colour. `update_values(..., alarm=<row names as printed>)` states which rows are over their limits; `set_alarm_phase(0/1/2)` is the flash — 0 normal, 1 the alarm rows red, 2 the whole panel red with **every** row white (the default value colour is black, and black on red is the one combination this feature must never produce; the corner badge follows the same `_text_color_hex`, and the red fill is fully opaque because a see-through red over a bright picture is not a warning). The phase changes **text colour only**: it never touches the stylesheet (`_apply_style` resets the width high-water mark and re-sizes the panel — doing that twice a second is exactly the hopping the mark exists to prevent) and never the row set, weight or count, so a flash cannot move the panel a pixel under the cursor. Driven by `Viewer._pv_alarm_timer` / `_on_alarm_blink` |
+| `_Trip` | one thing that went wrong, and the shot it went wrong on: `kind` (`pv` / `image`), `key`, `ts_ns`, `text`, `detail`, `count`, `open`, `acked`. Two kinds in ONE list on purpose — the operator's question is the same for both ("something happened, where?") and so is the answer. `key` is what makes a repeat the SAME trip (the PV name, or `cam<i>`): live mode runs at a few shots a second, so a back reflection high for ten seconds is one entry with a count, never thirty. `ts_ns` keeps naming the FIRST offending shot, which is the one worth looking at. `head()` / `tail()` exist so the row can hold the clock time and the count **out** of the elide |
+| `_TripLabel` | one trip line that elides itself and never asks the layout for more width than it is given. Both halves matter in a 275 px panel: a plain non-wrapping `QLabel` reports its full text as its minimum width, which pushed the row to 650 px and carried the **See** button clean off the side of a box that does not scroll sideways (`QSizePolicy.Ignored` horizontally fixes that), and the elide has to be redone on every `resizeEvent` or it is computed once against a width the label did not have yet. Time and count are outside the elide — eliding the whole line from the right threw the count away first, and "it has happened 39 times" is the part worth reading |
+| `_TripBox` | the trip list, at the very top of the anchored Info panel (above `_range_table`), invisible until something trips. Header = `⚠ N trips · M not seen` + **Clear trips**; then one row per trip, newest first, in a scroll area. `refresh(trips)` **reuses** the rows whenever the same trips are still in the same order and only rebuilds when the list itself changes — not an optimisation: a repeating trip is refreshed on every shot, so rebuilding would destroy the **See** button under the cursor twice a second, and deleting a widget from inside its own click is how this crashes (the click is also emitted through `QTimer.singleShot(0, …)` for the case where the list *does* change). Rows are a **fixed** `_ROW_H` = 20 (the same as `PvValueTable.ROW_H`): the scroll area resizes its body to the viewport, and with rows free to shrink twenty trips were squeezed into 3 px each instead of the list scrolling. The area is `setFixedHeight(min(_MAX_H, …))`, not merely capped — a `QScrollArea`'s own size hint has nothing to do with its contents, so with only a maximum it settled at one row and hid the rest behind a scrollbar for no reason |
+| `PvConfigDialog` | "Select PV channels" — the ONE PV picker, opened from the Slider (`_open_pv_config`) and from the Image Finder (`if_t._pick_energy_columns`). **One meaning per control**: a PV *being in the list* is what makes it READ (✕ is the only way out), and the **Show** column is the *eye* — the value is printed over the frame and burned into a saved image. The two tables **are** that split: *On the picture* and *Read, not on the picture*, `_rebuild_picked_tables` putting each row in one or the other. What this replaced was four states over the same PVs — a grid of preset tick boxes, per-row tick boxes for added PVs, a tick per formula, and the sidebar's eye — where "picked" had two owners that could disagree. Columns: **Show · Letter · PV · Displayed name · Unit · Min · Max · What it is · ✕**, both grids sharing `_W_*` widths so they line up as one table; only the PV column stretches. Each table is **really drawn as a table** (`_make_table` / `_cell` / `_TABLE_QSS`): a `QFrame#pvTable` for the outer border, every control in its own `QFrame#pvCell` carrying a right and bottom rule, zero grid spacing so those rules meet instead of doubling, and the column names **once at the top** — `_grid_header` is now called only for a table that has rows, because a header was previously built for the empty second table as well and, with its title hidden, that left a bare row of column names under the first table, reading as a footer of the list above it. The cells set **no background**: they take the dialog's own, so the text keeps the palette's colour — a painted white cell printed light text on white the moment the dialog came up under a dark palette and the whole PV column went invisible. Every rule is scoped by object name, or an unqualified `border` on the frame would cascade into every box and button inside it (Qt style sheets apply to children too) (the dialog is 820 wide rather than 700 because the two limit columns otherwise come straight out of that one). **PV** is the archiver channel (the expression for a formula) because that is what the row actually reads; **Displayed name** writes `PV_LABELS` and is display only — the PV name stays the key for selection, eye state, letters, formula bindings and the saved state, so naming a PV cannot repoint a formula or hide which channel is read; a formula has no box (its name is typed in the formula row). **Unit** is only ever filled when it can be defended: `PV_UNITS` for a preset, `cpva.CHANNEL_UNITS` when the archiver's own listing carried one (usually it does not), `pv_unit_guess` for a fixed-meaning channel suffix, or what the operator types for an added PV (`PV_CUSTOM_UNITS`) — unknown stays blank rather than guessed. Presets are a strip of **tick boxes** (`_preset_boxes`, `_on_preset_toggled`): ticked *is* in the list, unticking is the same as that row's ✕, and `_sync_preset_boxes` reads the list back onto them with signals blocked (it runs from the rebuild the tick itself asked for, so an unblocked box would toggle the preset straight back off) — one state read two ways rather than the button-that-greys-out it replaced, which could only ever add. `PV_PRESET_RECIPES` makes a preset that is **not a channel** but a recipe: ticking `Compressed SBW4` runs `_add_recipe` → add the source preset (`SBW4`), add the formula `SBW4 × 0.749` under the recipe's name and unit, and take the source off the picture (`hide_source`), so only the converted number is printed while the raw channel is still read — which the formula needs. `_remove_recipe` deletes the formula and gives the source its eye back, or unticking the only thing being printed would leave a list with nothing on the picture at all. This retired the last `PV_SCALE` entry: `Compressed SBW4` used to be a `PV_DISPLAY_TO_COL` name pointing at the SBW4 channel with the 0.749 applied out of sight, so the picker showed a PV whose printed number matched no archiver reading and no calculation the operator could see; the factor is now an ordinary formula row that can be read, edited and unticked. `pv_migrate_preset_recipes` converts an older state file's selection on load (source + formula + hidden source) and is idempotent, or an existing installation would come up with that PV silently gone. `_set_shown` is what moves a source's eye: the live row's tick box has to move with the state, because every rebuild reads the boxes back first (`_sync_row_state`) and would otherwise overwrite the change with the stale tick. Anything else comes from the search box over the whole archiver listing (`cpva.fetch_channels_cached` on a worker thread → `_PvChannelListSignals`, ranked by `cpva.rank_pv_match`), or is typed in full and taken literally by Enter. A channel that a preset already reads adds **the preset**, never a second row reading the same PV under no unit. `_sync_row_state` reads every live row back before each rebuild — one method, because forgetting one of the three it used to be was how a preset toggle wiped a name typed a second earlier — and the Show box and ✕ defer their rebuild through `_later`, since a rebuild deletes the very widget whose signal is being delivered. Every row carries its **channel letter**, and the formula rows at the bottom define **derived PVs** (`PV_DERIVED`) as Python expressions in those letters. Letters are numbered over `_pending_names()` (every preset, picked or not), NOT over the two tables, so clicking an eye cannot move them; `_refresh_letters` re-renders each formula from its stored `bindings` (letter → PV name) after every add / remove / rename, and a binding whose PV was deleted is parked on a letter past the end of the list rather than left where another PV has moved in, the row warning instead of silently repointing. `_on_accept` refuses to close on a nameless, duplicate or unparsable formula. **Min / Max** are the alarm limits (`PV_LIMITS`), one `QLineEdit` each, **empty = not watched** — never a limit of zero. Formulas get them too: a ratio or a difference is exactly the sort of number somebody wants watched. A comma is accepted as the decimal mark as well as a dot (this keyboard types a comma) and `_normalise_limit_box` rewrites the box to `f"{v:g}"` on `editingFinished` so the stored value is the visible one, marking the box pink when what is in it is not a number at all — a threshold the operator believes is set but is not is the one failure this must not have. The pair is read back as a pair in `_sync_row_state`, or a half-typed Max would drop a Min that is already set. Results out: `selected_names` (canonical order = letter order), `hidden_names` (the eye), `custom_channels`, `labels`, `custom_units`, `derived_defs`, `limits`. `limits()` is deliberately **not** filtered to the picked list (the same as `labels()`): unticking a preset takes it off this tab, it does not delete it, and a limit that vanished because the *other* tab had that PV switched off would be a threshold the operator set and then silently lost — ✕ (`_remove_pv` / `_remove_channel` / `_remove_derived_row`) is what drops a limit |
+| `PvValueTable` | The PV panel's list — eye · PV · value — as one widget for **both** tabs that report PV values, so two tabs over one registry cannot end up with two different tables. `refresh(names, hidden, value_of, alarm=None)`: the host supplies only the numbers, since how a value is fetched and how "this shot" is told from "an older shot" is a per-tab matter while what a row looks like is not. `alarm` (optional, so the Image Finder needs no change at all) names the PVs outside their limits on the shot on screen; they print red and bold, and red **wins over** the held-value grey — which shot a number came from is a qualifier, being past the threshold is the message. The table does not blink: a row flashing in the corner of the eye is noise, and the overlay over the picture is what has to be seen. `eye_clicked` carries the PV **by name**, not by row index. Column 0 has no title on purpose: at 24 px a word would elide to "…", i.e. the one control in the table would be its unreadable part. Its own `eventFilter` shows the value tooltips through `_show_long_tip` |
+| `PV_REGISTRY_PATH` · `pv_registry_load/save/to_dict/from_dict` | The registry — added PVs, formulas, names, units, **alarm limits** (`pv_limits`, written as `{"min": …, "max": …}` so a hand-edited file can set one side without spelling a null; a missing key leaves the limits alone, so an older registry keeps loading, and `_coerce_limit` refuses anything that is not a finite number rather than reading it as zero) — lives in `%APPDATA%/ELI_ImageTools/pv_registry.json`, NOT in either tab's own state file: the picker is opened from two tabs and whichever saved last would otherwise decide whether a PV the other one added still exists tomorrow. What stays per tab is only the SELECTION (`pv_enabled` + `pv_hidden` in `slider_ui_state.json`, `pv_selected` + `pv_hidden` in `finder_ui_state.json`). `pv_registry_load(fallback=…)` reads the Slider's old `pv_custom` / `pv_derived` / `pv_labels` keys when there is no registry file yet, so an existing installation keeps its PVs on the first run of this version. `pv_registry_from_dict` is where every entry is validated — a formula whose name clashes with a read PV, a label for a PV nothing on screen can edit, a unit left behind by a removed channel: each of those reads as "the programme shows the wrong number", never as a bad config file |
+| `PopupBelowComboBox` | combo whose popup always opens below |
+
+**`DatePickerDialog`** — one house-style multi-select calendar plus `QTimeEdit`
+From/To (minute resolution) and ONE multi-day mode: tick "Multiple days" and every
+calendar click adds a day (a click on a picked day removes it again). The single
+From/To window applies to every picked day — `_on_times_changed` → `_rebuild_segments`
+moves them all at once. It opens in **Now** mode (today, `hh:00`–`hh+1:00`);
+`_apply_now_window()` is the Live-mode checkbox's, while the **Now button only moves
+the calendar to today** — it must never change a mode, a window or the day list.
+From/To can never collide — `_on_times_changed` pushes the other field by an hour.
+The ⚙ column opens `_DayTimeDialog` for one day; that override lives in
+`_day_overrides`, survives rebuilds and global From/To changes, and is marked `*`.
+
+### Viewer(QWidget) — method groups
+| Group | Methods |
+|-------|---------|
+| init / UI | `__init__`, `_build_ui`, `_load_ui_state` / `_save_ui_state`, `_on_section_toggled` / `_set_all_sections`, `_diag_log`, `resizeEvent`, `_set_busy` |
+| overlays | `_on_reset_zoom`, `_toggle_draw_mode`, `_refresh_draw_btns`, `_remove_all_overlays`, `_open_overlay_settings` / `_apply_overlay_settings`, `calibrate_circle/cross/square`, `_sync_overlay_checkboxes_from_iv`, `_on_overlay_changed` |
+| PV | `_open_pv_config` (→ `PvConfigDialog`), `_pv_rebuild_table` (→ `PvValueTable.refresh`, the host supplying `_pv_row_value`), `_pv_visible_names`, `_pv_toggle_eye`, `_pv_trigger_fetch(_now)`, `_pv_current_ts`, `_pv_is_pending`, `_pv_force_refresh`, `_pv_on_result`, `_pv_update_overlay`, `_open_pv_overlay_settings`, `_pv_text`. The table lists **every** selected PV and its first column is an **eye** (`_pv_hidden`): it removes that PV from the on-image overlay and from the burn-in, never from the reading — a hidden PV keeps its number in the table and may still be a formula's source. `_pv_trigger_fetch_now` asks the archiver for `pv_source_names(...)`, i.e. the ticked PVs **plus** every formula's inputs, and evaluates `pv_eval_derived` on the worker thread so the derived values reach `_pv_values` as ordinary names (held-value / stale handling then applies to them unchanged). The **selection** is persisted in `slider_ui_state.json` (`pv_enabled` + `pv_hidden`) and the **registry** in the shared `pv_registry.json` (see `pv_registry_save`) — the selection used to live only in memory, so every restart came up reading no PV at all until the user re-opened the dialog, and the registry used to live in this tab's file, where the Image Finder could not add to it. `_pv_current_ts` returns `None` rather than falling back to another camera's moment, and `_reset_ui_for_new_scan` clears `_pv_values` (greying the previous dataset's numbers still read as this one's). Fan-out is capped at `PV_FETCH_MAX_WORKERS` = 4 so the panel cannot exhaust the shared cpva pool. **The panel waits for the archiver** (`_pv_awaiting`, `_pv_arm_wait_retry`, `_pv_held_age_s`, `_pv_head_behind_s`): a value the archiver has not published yet is `pending`, not `n/a`, and the panel re-asks (400 ms, doubling to 2 s, giving up after `PV_ARCHIVER_MAX_WAIT_S` = 20 s of **monotonic** waiting) until it lands — so the numbers for the frame on screen arrive on their own. Before this, a fetch was only ever triggered by a frame change, and since it fires on the *leading* edge (a few ms after the image appears, ~1 s before its sample is readable) the panel kept the previous shot's numbers and nothing ever asked again: with one frame per shot it stayed **one shot behind the picture**. A held number now also says how far back it comes from (`12.95 J (-28 s)`, not a quiet `(old)`), and the overlay badge distinguishes `no data yet` (the archiver has not published this frame) from `older shot` (this number was read for an earlier frame) and `⟳` (our own refresh is in flight). The markers share **one line along the bottom edge**, joined by `·` and elided (never wrapped) when the panel is narrow, and hovering the panel explains every lit marker (`_BADGE_HELP` / `_badge_tip`). They used to be stacked in a strip down the right-hand side, reserved at the width of `no data yet` whether or not anything was lit, which left a third of the overlay empty beside every number; height is what this panel has to spare, not width. The reservation itself stays constant (`_badge_strip_h`, plus `_badge_min_w` so one marker always fits), because that is what stops a lit marker resizing the panel. Those explanations — and the value column's tooltips — go through `_show_long_tip`, because Qt hides its own tooltip after ~10 s and then refuses to show it again until the pointer has left the widget and come back, i.e. it disappears mid-sentence on exactly the text that needs reading. **Above ~1 shot/s** the frame on screen is *always* younger than the publication delay, so `_pv_pick_fetch_ts` deliberately aims the fetch at the newest frame the archiver has published — the frame at or before `cpva.head_ts_ns` (never newer: that would be matched against a neighbour's sample) and at most `PV_RETARGET_MAX_BACK_S` = 3 s back, so a value from a quiet stretch is never dragged in. The numbers then skip a shot and say so (`(-0.6 s)`, tooltip naming that frame's time) while the images still show every frame; the retry keeps running and snaps onto the displayed frame the moment its own sample lands. `_pv_is_held` therefore treats "read for a different frame" as its primary test, and `_pv_is_pending` (⟳) is measured against the fetch TARGET, not the screen, so a deliberate offset does not light it. Nothing changes away from the live edge — scrubbing, archive browsing and the burn-in still resolve every shot exactly. Pinned by `testing/bench_pv_wait.py`. **A paint is a trigger of its own** (`_note_cam_shown`): in multi-cam `_pv_current_ts` answers from `_cam_shown_ts_ns`, the frame actually *painted* on the master tile, while every other trigger fires at *request* time — a live frame triggers its fetch ~150 ms before the share read that paints it finishes, so that fetch still described the **previous** frame and nothing asked again (the retry compares against the same request-time frame and sees nothing wrong). The panel therefore sat one shot behind in live multi-cam even with everything above in place; `testing/bench_pv_live_multi.py` measured it (shot 2 reading shot 1's energy) and now pins the fix. `_pv_cam_index` is the one place that decides which camera the panel describes, so the fetch and the paint that re-triggers it can never disagree. **The panel heals itself** (`_pv_health_tick`, every `PV_HEALTH_TICK_MS`): single-flight means one fetch that never returns freezes the values for the rest of the session (reported as "the PV overlay stopped loading, a restart fixed it"), so a fetch still in flight after `PV_FETCH_WATCHDOG_S` = 120 s is written off — its generation goes into `_pv_abandoned_gen` so a late result can never come back and put an old frame's numbers under the current picture — and a fresh one starts; and because every normal refresh rides on a frame change or a paint, `PV_KEEPALIVE_S` = 60 s re-asks on its own when nothing has triggered one. `_diag_log` records both (`pvFetch` / `pvLastVal` / `pvStall`). Pinned by `testing/test_pv_resilience.py`. **ALARM LIMITS AND TRIPS** (`PV_LIMITS`, `_pv_check_limits`, `_Trip` / `_TripBox`, `_goto_trip`): a value past the Min/Max set for it in the picker flashes over the picture and leaves a line in the trip list naming the shot it happened on. **LIVE MODE ONLY** — `_pv_check_limits` and `_note_cam_fault_trip` both return early unless `_online_mode`, and `_stop_online_mode` calls `_end_live_trips` (stop flashing, close what was open, keep the lines). This is the scope of the feature, not a limitation to be lifted: it watches the shots as they arrive, and browsing is not shooting. Scrubbing a day would otherwise raise a trip for every frame the slider landed on, dated by when the operator dragged past it — and it *still* would not answer "was BR ever over 0.3 today", because only the frames actually looked at are ever read. Answering that is a different feature: a sweep of the day's archived samples, not a check of the frame on screen. Camera faults have a second reason of their own — outside live mode the poll timer is stopped, so `_live_health`'s stall test would call every camera faulted the moment browsing started. Closing the open trips on the way out is what stops a new live run counting its shots onto a trip dated in the previous one. The fetch already had the number and threw it away — the panel is handed finished strings (units, held-value flags, quantised steps) and re-reading a threshold out of one of those would compare a number to a label — so `_pv_trigger_fetch_now` now emits the pair `(text, numbers)` through the one signal it has (one producer, one consumer; a second signal for the numbers could arrive out of step with the text it belongs to), and only `ok`/`approx` readings go into `numbers`. `_pv_check_limits` runs **before** `_pv_rebuild_table` / `_pv_update_overlay`, or every trip would show one refresh late. Only a real reading for THIS shot can trip: `v is None or _pv_is_held(name)` skips, and skipping is *not* recovery either — a missing reading is no evidence in either direction, so an open trip is left exactly as it is. Comparison is the raw threshold, no deadband; **coalescing lives in `_trip_add`, not in the comparison** — `_pv_over` holds the currently-offending PVs so a trip opens on the OK→over CROSSING only, counts further shots, and closes on the way back; at 3 Hz anything else would be a trip per shot. Two independent flash lifetimes (`_alarm_blink_steps`): `_pv_alarm_names` is refilled by every fetch, so the VALUE stops flashing by itself when the next shot lands (what the operator asked for), while the PANEL step is offered only under the `text+bg` style and lasts while `_trips_unseen()`, i.e. past the shot, until every trip has been looked at or **Clear trips**. `_alarm_sync_timer` runs `_pv_alarm_timer` (`TRIP_BLINK_MS` = 450, `PreciseTimer` — a default Qt timer is coarse on Windows and a drifting flash reads as a stutter) only while there is something to blink. Image faults come off the SAME detector as the red refresh dot — `_note_cam_fault_trip` on the not-fault→fault transition inside `_on_cam_dot_blink` (and inside `_on_online_blink` for single-cam, which has no tile dots) — so `_live_health`'s 8 s latch is what keeps a frame caught mid-write out of the list; the row carries a short phrase per reason (`_CAM_FAULT_SHORT`) because the tooltip's own first line elided to "a new image arrived but…" in 275 px, and only a `read` fault has a real count (failed frames) since counting 600 ms ticks would print `×340` for one event lasting three minutes. `_pv_check_read_errors` adds a trip for a PV the archiver refuses for `PV_ERROR_TRIP_S`, monotonic (this PC's clock runs ~25 s ahead of the facility's). `_goto_trip` switches live mode off FIRST (the next arriving frame would drag the slider straight back off the shot), drops the cached tile and the coalescing gate for an image trip (`_invalidate_cam_ckeys` + `_reset_cam_pipeline`, so the frame is read from the share again rather than re-served), reuses `_jump_to_saved_ts`, and re-reads the values for that moment with `_pv_force_refresh`. **No new retry loop was added** — `_on_cam_loaded` and `_cam_load_watchdog` already relaunch failed and stuck loads, and the ask was for the program to keep going rather than fight a bad frame. `_open_pv_config` clears the alarm state as well as the values, or an "over" flag from the old threshold would either keep flashing at a limit nobody set or swallow the first crossing of the new one. `_diag_log` adds `trips=<listed>/<open> pvOver=<n>`, and each trip writes its own `diag_note` line when it opens |
+| live health | `_live_health`, `_live_health_summary`, `_reset_live_health`, `_note_cam_frames`, `_note_cam_read_fail` / `_ok`, `_note_cam_folder_status`, `_set_lag_since`, `_poll_hung_age`, `_paint_single` |
+| multi-cam | `_is_multi_cam`, `_switch_to_multi/single_view`, `_build_per_cam_sliders`, `_on_per_cam_*`, `_per_cam_display_one`, `_per_cam_row_frame`, `_start_cam_load`, `_reset_cam_pipeline`, `_cam_load_watchdog`, `_per_cam_sync_slaves`, `_live_slave_target`, `_live_sync_one_slave`, `_cam_off_master`, `_cam_toggle_ts`, `_per_cam_step`, `_live_advance_cam`, `_setup_multi_cam`, `_on_multicam_selected`, `_redraw_cam_in_place` |
+| live mode | `_on_auto_follow_toggled`, `_ensure_dir_watcher` / `_watcher_strike` / `_stop_dir_watchers` / `_prune_dir_watchers` / `_on_dir_watch_new_file`, `_start/_stop_online_mode`, `_online_poll`, `_online_poll_single_bg` / `_multi`, `_merge_single_new_items`, `_merge_items_by_ts`, `_extend_axis_to_items`, `_restore_full_history` / `_merge_restored_history`, `_rebuild_shared_items_from_cams`, `_extend_shared_timeline_from_cams`, `_on_online_blink` |
+| open / scan | `open_folder`, `_start_multi_cam_scan`, `_on_multi_scan_all_done`, `open_by_date`, `_reload_with_last_cameras`, `auto_start_online`, `open_moment` (One Moment's hand-over: a window of `PUSHED_MOMENT_PAD_MIN` around a pushed timestamp, landing ON it via `_pending_restore_ts_ns`), `open_folder_path`, `receive_external_folder`, `open_file_list`, `refresh_folder`, `_refresh_multi_cam`, `_start_scan`, `cancel_scan`, `_on_scan_*`, `_choose_axis`, `_in_ts_windows` / `_filter_to_ts_windows`, `_hard_reset_runtime`, `_reset_ui_for_new_scan` |
+| brightness / subtract | `_bc`, `_refresh_auto_bc_sliders`, `_sync_bc_value_labels` / `_set_gamma_label` (the "Con:/Bri:/Gam:" rows' numeric readouts — driven off the sliders, and called from the Auto parking too, which blocks signals), `_bc_value_label` / `_bc_value_set_auto` (those readouts' two states: black = a setting the user made, grey italic = a value Auto measured, and in multi-cam the MASTER camera's alone — switched from `_sync_bc_controls_enabled`), `_on_brightness_slider_changed`, `_on_contrast_slider_changed`, `_on_contrast_auto_changed`, `_on_bright_auto_changed`, `_apply_brightness_debounced`, `_load_raw_arr`, `_ref_arr_for` / `_cam_ref_arr_for`, `_set_reference_frame`, `_has_reference`, `_set_ref_status` / `_refresh_ref_warning`, `_on_subtract_changed`, `_update_diff_stats` / `_update_cam_diff_stats`, `_on_gradient_changed` |
+| slider ↔ time | `_slider_to_time_ns`, `_slider_to_index`, `_index_to_slider_value`, `_time_to_slider_value`, `_time_to_nearest_index`, `_set_info_for` |
+| display / load | `_on_slider_pressed/changed/released`, `_apply_scrub`, `_load_or_cache`, `_adaptive_index_step`, `_display_index`, `_display_exact_index`, `_display_multicam_at_time` / `_index`, `_on_cam_loaded`, `_request_display_target`, `_drain_deferred_display`, `_request_pixmap`, `_prefetch_idle` / `_playish`, `_on_loaded` |
+| playback | `play`, `stop`, `_autoplay_step`, `_play_show`, `step_frame`, `keyPressEvent`, `_current_play_pct_per_s`, `_play_is_exact`, `_update_motion_speed`, `_adaptive_stride`, `_current_decode_side` |
+| focus / watcher | `_toggle_focus_mode` (F11 — hides everything but the image, title bar removed via Win32 so the HWND survives), `_toggle_watcher_mode` (Ctrl+F11 — edge-to-edge wall display), `_win32_set_title_bar`, `eventFilter` |
+| focus-mode window shape | `_focus_mask_rects` / `_focus_apply_mask` / `_iv_content_rect` / `_focus_edge_rect`. Focus mode must show the cameras and *nothing* else, but the tiles never fill their area exactly, so the window used to be a large grey rectangle with the frames somewhere inside it — covering the program underneath. `setMask` of the union of the camera cards (header band + the frame actually drawn, per `ImageView._img_rect`) plus any floating PV overlay solves both halves at once: on Windows the masked-away pixels are neither painted nor hit-tested, so the gaps are see-through *and* clicks land on the window behind. Re-applied on a 200 ms timer because the frame rect follows the layout, the label bar and the image aspect and there is no one signal for all three; identical regions are skipped so nothing flickers. Since the window's real edges can be masked off (a click there never arrives), the resize hot zone is taken from the mask's bounding rect — `_focus_edge_rect` |
+| timestamps | `_save_current_timestamp`, `_goto_saved_timestamp`, `_clear_timestamps` |
+| pointing | `run_pointing_analysis`, `_cancel_pointing`, `_on_pointing_progress/cancelled/finished`, `_on_pointing_live_toggled`, `_start/_stop_pointing_replay`, `_pointing_replay_step`, `_save_pointing_plot`, `_toggle_pointing_path`, `_toggle_pointing_select`, `_on_pointing_region_deleted`, `_restore_pointing_points`, `_on_pointing_point_clicked` |
+| spatial contrast | `_sc_set_enabled`, `_on_sc_threshold_changed`, `_run_sc_auto_threshold`, `_open_sc_histogram`, `_open_sc_exclusion_editor`, `_on_sc_exclusion_set`, `_run_spatial_contrast`, `_on_sc_preview` / `_update_sc_preview`, `_on_sc_finished`, `_on_sc_topn_changed`, `_on_sc_marker_style_changed`, `_update_sc_topn_overlay` |
+| marks / save | `set_mark_a/b`, `clear_marks`, `_apply_marks_to_tickbar`, `_update_range_ui`, `save_around_current`, `save_current_with_overlay`, `_get_cam_frame_for_save`, `_render_cam_frame`, `_save_multicam_current`, `_send_to_workshop`, `save_current`, `_save_multicam_range`, `save_range`, `_show_save_range_progress_dialog`, `_on_save_progress/finished`, `_pv_text_for_ts` / `_pv_prefetch_texts` / `_pv_save_append_bar` |
+
+**Palettes:** index 0 = Default (original colours), 1 = Grayscale, 2+ = LUT.
+**Saving:** Default → `shutil.copy2`; anything else → `load_image_scaled` + save;
+always `_copy_metadata_into_png`.
 
 ---
+
+## om_t.py — One Moment
+
+### What this tab is for
+
+The transpose of everything else here. The Slider plays one camera set forward in
+time, the Image Finder puts many days of one camera side by side, the Shot Finder
+gives a table of shots matching a number — all of them "one thing over time". This
+one answers **"everything at one time"**: pick a moment out of the window's graph and
+see what every camera saw then, with the machine values that go with it.
+
+### Why a module and not a mode of the Slider
+
+The Slider's state is *a scan of folders for a camera set over a time window*; this
+tab's state is *a set of PV series plus ONE timestamp*. Bolting the second onto the
+first would have given a second meaning to every one of the Slider's members.
+
+### The screen: settings left, graph and frames right
+
+The same shape as the Slider, and for the same reason — a setting is looked for in one
+place in this program. A 300 px scrollable column of `CollapsibleSection`s (the
+Slider's own widget) holds **Source** (the window picker · the camera picker · Load),
+**PV channels** (the picker and the `PvValueTable`), **The moment** (the timestamp,
+previous/next shot, *Send to Image Slider*, the saved-moments list with Save / Forget /
+Clear), **Range statistics** and **Image / Display**. The order is the order of the
+work — the window and the cameras, then the values read over them, then the moment
+picked out of the graph they draw; **PV channels** sat below **The moment** for a
+while, which put the last step above the one that makes it possible. Section order is
+creation order in `_build_left_panel`, so moving a group means moving its `_sec()`
+call. The graph-mode and snap-PV combos that used to sit in **PV
+channels** are gone: the graph is always one plot, and a click snaps onto the first PV
+drawn. Progress bar and status line sit *below* every section and outside
+all of them: they report on whatever is running, and a collapsed section must not be
+able to hide the one line that says why nothing is happening. The right side is a
+vertical splitter, graph over frames.
+
+**Each picker says on its own button what it is set to** — `24.08.  07:00–19:00`,
+`4 camera(s)` — instead of a grey caption underneath it. A 300 px column has no room
+for a caption per button, and the long form (with the total span) is the button's
+tooltip. The splitter is given explicit sizes and `setChildrenCollapsible(False)`: the
+graph is built LATER (on the first Load), so when the splitter first lays itself out
+the top pane holds a one-line placeholder — and the handle stays where that put it,
+which opened the graph about 90 px tall, too short for its own axis labels.
+
+**The splitter handle is a control, so it looks like one.** 10 px wide, a `#d7dbe0` bar
+with darker edges, a hover and a pressed colour, and a drawn 72×4 grip in the middle of
+it. A default handle is 5 px of the background colour: invisible, and the only way to
+find it was to sweep the mouse until the cursor changed. The grip carries
+`WA_TransparentForMouseEvents` — a widget parked on the handle otherwise eats the press
+and the handle stops dragging.
+
+**The buttons carry painted icons, not text glyphs** — `workshop.action_icon`, the
+same factory the Workshop's own tool strip uses, reached through `_load_sibling`
+("workshop" is already in `sys.modules`; `main.py` loads it before this tab). Six
+recipes were added there for this tab (`play`, `step_prev`, `step_next`, `popout`,
+`calendar`, `camera`), because one painted-icon vocabulary for the program is the
+point of that factory. `_icon_btn` falls back to the old text symbol when the Workshop
+cannot be loaded, so `python om_t.py` still runs on its own. The Load button's
+DISABLED background is muted blue rather than pale blue: `action_icon` paints the
+disabled state grey, and grey on pale blue is the one control on the panel nobody can
+see.
+
+### It owns nothing it could get from a sibling
+
+This is the point of the module. Every piece of shared behaviour is borrowed by name,
+so it cannot drift:
+
+| Borrowed | From | Why it matters |
+|---|---|---|
+| `PvConfigDialog`, `PvValueTable`, `PV_CUSTOM_CHANNELS` / `PV_DERIVED` / `PV_LABELS` / `PV_CUSTOM_UNITS` / `PV_LIMITS`, `pv_registry_load` / `pv_registry_save`, `pv_channel_for`, `pv_label_for`, `pv_units_for`, `pv_limits_for`, `pv_is_derived`, `PV_SCALE` (empty now — see `PV_PRESET_RECIPES`) | `image_slider` | ONE shared PV registry, ONE PV search, ONE list widget for the whole program. A PV added or named here is added or named in the Slider and the Finder too; only the SELECTION is this tab's own. Because the picker is shared, `_pick_energy_columns` has to hand `limits=sl.PV_LIMITS` in and take `dlg.limits()` back out like every other registry key — opening it without them would show empty Min/Max boxes for PVs that DO have a limit and wipe them on OK. Only the Slider acts on the limits (it is the tab with the live overlay); the Finder just carries them through. |
+| `pv_eval_derived`, `pv_source_names`, `pv_derived_def`, `pv_expr_vars`, `_PV_EVAL_ENV`, `_PV_EXPR_CACHE` | `image_slider` | **one answer to what a formula MEANS.** Both evaluation paths here run inside the registry's own sandbox and are checked against this very function, so a formula cannot mean one thing on this graph and another in the Slider's overlay or the Finder's table. |
+| `DatePickerDialog` | `image_slider` | one time-window picker: the same calendar (Monday-first, grey header, red weekends, white cells), the same minute-resolution From/To, the same multi-day mode. Opened with `allow_live=False` — this tab has no live mode, and a tick that does nothing reads as a broken tick. The flag defaults to True, so the Slider is unchanged. |
+| `CameraPickerDialog` | `image_slider` | the same camera list, the same saved sets, the same search |
+| `CollapsibleSection` | `image_slider` | one panel section, so the left column looks and behaves like the Slider's |
+| `load_image_scaled` (with `GRADIENT_NAMES`, `GRADIENT_ID_*`, `palette_is_cyclic`) | `image_slider` | **one renderer.** Palette, Contrast, Brightness, Gamma and their Auto ticks mean exactly what they mean in the Slider, and a frame here is the frame there. It also reads the file's bytes first — a decoder pointed at a UNC path holds the GIL through the network wait and freezes the whole application. |
+| `container_root_for_year`, `parse_unix_ns_from_name`, `_cam_short_label` | `image_slider` | one share root, one filename rule, one tile caption |
+| `_find_image_in_day` | `shot_finder` | the ONE frame-for-a-timestamp resolver: the hour folder the moment falls in **plus its neighbours** (the archive rolls a frame over the hour edge, and a camera does not record every hour), with the 30 s window deciding the match. A frame found here is the frame the Shot Finder finds. |
+| `get_day`, `day_bounds_ns`, `FULL_DAY_TIMEOUT` | `cpva_client` | the day cache, so re-picking a day costs nothing |
+| `full_scale_for_pil`, `render_u8`, `gamma_from_slider`, `GAMMA_SLIDER_*` | `img_scale` | the absolute scale, and the plain mapping the Workshop hand-off uses |
+
+Sibling imports go through `_load_sibling`, registered in `sys.modules` **before**
+`exec_module` — the same re-entrancy-safe idiom `sf_t` / `if_t` use, so `is_t.py` is
+never executed a second time. `_sl()` / `_sf()` are lazy so the module can also be
+run on its own (`python om_t.py`), and `pv_registry_load()` is called in `__init__`
+because whichever tab is built first has to load the shared registry.
+
+### The window, not the day
+
+`_windows` is a list of `(start_ns, end_ns)` — exactly what `DatePickerDialog`
+returns, so a single day, an hour of it, or a whole multi-day pick are one state.
+`_date_keys_for_windows` lists every Prague day any window touches (a window may cross
+midnight), the fetch asks the archiver day by day, and `_mask_to_windows` then throws
+away the samples outside the pick — without that step a 10:00–11:00 window would still
+draw the whole day, because the archiver is only queryable a day at a time.
+
+`_axis_t0_ns` is Prague midnight of the window's FIRST day and x is seconds from it,
+not matplotlib date numbers: the axis ↔ timestamp conversion is then one multiplication
+in both directions, which is what click handling and cursor drawing need. Tick labels
+come back as `HH:MM:SS`, or `DD.MM. HH:MM` once the pick spans more than one day.
+
+Tick SPACING comes from `_tick_step_s`: the smallest clock-shaped step (…15 s, 30 s,
+1 min … 3 h, 6 h, 12 h, whole days) that keeps the axis under ten labels, applied as a
+`MultipleLocator`. Because x = 0 is midnight, whole multiples of that step land on the
+half hour, the hour, noon. Left to itself matplotlib divides the span into round
+NUMBERS of seconds and labels a time axis `00:00:00 · 02:46:40 · 05:33:20` — ten
+thousand seconds apart, which nobody reads as a time.
+
+### The graph: ONE plot, an axis per unit
+
+The default is a single plot with every picked PV in it. Grouping by **unit** is what
+makes that honest: two energies share an axis and read against each other, while an
+energy and a motor position get an axis each (the second on the right spine, further
+ones on outward-offset spines at 46 px steps) and neither is rescaled to fit the other.
+Nothing is normalised — every number on an axis is a number that was archived.
+
+There is no second mode. `Stacked` (one plot per PV, `sharex=True`) was offered for a
+while and never used — the eye already answers "this PV is in the way" — so the combo
+and `_draw_stacked` are both gone.
+
+Grouping is by `_unit_key_of`, not by the unit itself: a formula with NO unit gets an
+axis of its own, because a ratio around 1.5 and a motor count around 20 000 are both
+"no unit" and sharing one axis flattens the ratio onto the x axis. The printed label
+still uses the plain unit, so no axis is ever labelled `ƒRatio`.
+
+Two consequences of twin axes that the code depends on:
+
+* `twinx` hides the new axes' x axis, so the tick formatter and the x label go on
+  `_ax_x` — the base axes. Formatting "the last axes" silently formatted nothing.
+* a twin draws no background of its own, so the cursor line and the marked range are
+  painted **once**, on `_axes_paint` (the base axes alone), and show through every twin.
+* every twin shares the base axes' x, so `set_xlim` on `_axes[0]` is what zooming does.
+
+A PV's colour comes from its position in the PICKED list, never from its position among
+the ones being drawn — hiding one PV must not repaint the others. The eye in the PV
+list is exactly that: `_pv_hidden` takes a PV off the graph while its samples stay
+loaded and its value stays listed, so reading seven of eight PVs costs no re-read.
+
+### A formula over time
+
+`pv_eval_derived` answers "what is this formula worth AT ONE MOMENT" and is the whole
+program's answer to what a formula means. A graph needs that answer at every moment of
+the window, which needs two things the scalar evaluator does not do: a time base to
+evaluate ON, and a way to do it twenty thousand times without freezing the window. Both
+live in this module; the MEANING still does not.
+
+**The sources are fetched even when they are not picked.** `_load_day` splits the pick
+into `read` (real channels the user ticked) and `helpers` (`pv_source_names` of the
+formulas, minus those) and marks each entry's `role`. Without the helpers a formula
+built on an unticked PV silently reads n/a — the same rule `if_t` follows. Helpers need
+no filtering in the graph or the tables (both iterate `_pv_selected`); the one place
+that must skip them is the "no samples in this window" line in `_on_pv_done`, which
+would otherwise name a PV that is not on the panel at all.
+
+**The time base is the union of the formula's own leaf sources**, near-simultaneous
+samples merged, each source held forward — and one base **per window**, so a held value
+never crosses a stretch the user deliberately cut out of the pick:
+
+| Piece | Rule, and why |
+|---|---|
+| `_merge_base_ts` | samples within `_DERIVED_MERGE_GAP_NS` = **137 ms** collapse onto the LAST of the group. Two per-shot channels write the same shot tens of ms apart; without this the union holds two points per shot and the first of each pair pairs the new value of one source with the OLD value of the other — a sawtooth that is an artefact of the fetch. 137 ms is the CSS Logger's own `SAMPLE_HOLD_MIN_GAP_MS` over these very channels, so both programs group a shot the same way. |
+| `_hold_index` | `searchsorted(…, "right") - 1`, i.e. the last sample at or before each base point; -1 before the source's first one. None of `cpva_client`'s look-back helpers takes an array — `value_at_or_before` is one query per timestamp, and it is the right tool for exactly one job, the SEED before each window. |
+| `_hold_limit_ns` | a sample stands in for 20 × the source's own median spacing, clamped to 30 s … 1 h — unless the channel is in `cpva.STEP_CHANNELS`, where the record IS a step function and the last sample is the true value however old. One constant for both would either blank an hourly sensor or carry a dead 1 Hz channel across an hour the laser was off. |
+| `_break_gaps` | the points with no value are dropped, but ONE NaN is left standing per run of them: that NaN is what breaks the line instead of drawing it straight across a dead hour. The marker is written as NaN whatever it was — a division by zero comes back ±inf, and one inf pushes matplotlib's y limits to infinity and flattens every real curve on that axis. |
+| `good` | the index list of the finite points, stored with the series. `_nearest_index` and `_step_moment` use it, so a click or a next-shot cannot land on a gap marker. |
+
+**Evaluation is vectorised first and per-point as the fallback**, both inside
+`is_t._PV_EVAL_ENV`, never a numpy-flavoured copy of it. The vector path is abandoned
+when: a token veto hits (`min(` / `max(` / `round(` / `if` / `[` / `.attr`, which
+covers `math.*` — every one of these either raises or silently REDUCES on an array), or
+the expression is chained onto another formula (only the per-point evaluator recomputes
+a chain from its leaves), or `eval` raised, or the result is not a float array of
+exactly *n* points, or a three-point parity check against the per-point path disagrees.
+**The shape test, not the veto, is what catches a reduction** like `min(A)` collapsing
+into a perfectly straight, perfectly wrong line. A base over `_DERIVED_MAX_POINTS`
+(200 000) is refused with a written reason rather than thinned: a decimated formula
+next to full-rate channels is a different curve, and one drawn without saying so is
+worse than one not drawn.
+
+All of it runs **in the load worker**, at the end of `_PvLoadTask.run()` — the
+per-point path can cost most of a second, the seeds need the network, and `_on_series`
+already delivers the finished dict under the existing generation guard. The loop looks
+at the stop flag every 512 points, so Stop All is not left burning a shared thread.
+The `plan` (`derived_plan`) is a SNAPSHOT taken on the GUI thread: `PV_DERIVED` is
+written only by the picker, and a picker accepted mid-load must not change what is
+already being computed.
+
+Status is the worst of the sources (`error > pending > stale > approx > ok`), mirroring
+`pv_eval_derived`'s own rule that a number derived from a stale reading is itself
+stale. A formula that cannot be computed at all carries a `reason` instead of an empty
+series, and the left panel prints that reason where the number would be — an empty cell
+reads as a bug in the tab.
+
+### The mouse: left READS the graph, right LOOKS CLOSER at it
+
+Four gestures, and no two of them mean the same thing:
+
+| Gesture | Does |
+|---|---|
+| left click | picks that moment — frames, values, and a row on the saved-moments list |
+| left drag | marks a time range → `Range statistics` |
+| right drag | zooms the time axis into that stretch |
+| right click | steps back out one zoom level, then to the whole window |
+
+**Two** `SpanSelector`s sit on **every** axes — one built with `button=1` reporting to
+`_on_span`, one with `button=3` reporting to `_on_zoom_span`. One per axes because with
+twins, which one gets the event is not something to depend on; bound to one button each
+because a selector left on its default `button=None` listens to **all** of them, which
+is how a right-drag meant to zoom used to mark a range instead.
+
+A click is caught separately (`button_press_event` / `button_release_event`), remembers
+which button was pressed, and is a click only if the mouse travelled less than
+`_CLICK_SLOP_PX` (5 px). `_is_drag` applies the same 5 px test **in pixel space** (a
+day-wide axis is thousands of seconds per pixel, so a threshold in seconds would swallow
+real drags) and both `onselect` handlers ignore anything below it, so the release of a
+plain click cannot also mark a range or zoom. Everything bails out while the toolbar's
+zoom or pan mode is active — otherwise finishing a toolbar zoom would move the moment.
+
+A bare click cannot be read off a `SpanSelector`: with `minspan=0` its `onselect` fires
+for a zero-width span only if a selection already existed. So `minspan` is left at 0 and
+the click decision is made here, in `_on_release`, rather than depending on it.
+
+Zooming **does not touch the selection**. `_on_zoom_span` pushes the limits it is
+leaving onto `_xlim_stack` and calls `set_xlim` on `_axes[0]` (every twin shares its x);
+`_zoom_out` pops that stack and falls back to `_full_xlim`, recorded at rebuild time. A
+statistic that changed every time the axis moved would be unreadable.
+
+### Why a click SNAPS to a sample
+
+A click lands wherever the mouse was, and a time between two readings has no shot
+behind it — the frames shown for it would be an arbitrary pick. `_set_moment_from_x`
+therefore snaps to the nearest real sample of `_snap_pv()` — the first PV DRAWN, i.e.
+the topmost picked one that has samples and is not hidden by its eye. (There used to be
+a **Snap to** combo for this; it was never touched, and "the first PV in the list" is a
+rule the list itself shows.) `_nearest_index` compares BOTH neighbours of the insertion
+point: bisect alone names the sample *after* the timestamp, which is the wrong one half
+the time. The same index walk is what `_step_moment` uses for previous/next shot,
+clamped at the first and last sample.
+
+### A moment worth keeping is kept — but only that one
+
+Finding an interesting shot in a day of readings is the expensive part of this tab, so
+`_apply_moment` — the ONE door every moment comes through — takes a `remember` flag and
+calls `_remember_moment` when it is set. That appends to `_moments` (deduplicated,
+capped at `_MOMENTS_MAX` = 60, oldest dropped first), persists it, and rebuilds the
+list newest-first with the current moment selected.
+
+**A graph click remembers, an arrow step does not.** `_step_moment` passes
+`remember=False`: walking through a stretch of the day shot by shot used to put every
+step on the list, which pushed the moments somebody had actually gone looking for off
+the end of it. The un-remembered path still calls `_refresh_moments_list`, because the
+list's HIGHLIGHT has to follow the moment on screen — otherwise **Forget** takes away a
+row nobody is looking at. What does reach the list: a graph click, a pick off the list,
+and the **Save** button (`_save_moment`).
+
+`_sync_moment_buttons` is the single place the two moment buttons are greyed. **Save**
+dies when its moment is already on the list, so the button also says whether it is;
+**Send to Image Slider** needs a moment, at least one camera and `_slider_ref`. It is
+called from `_refresh_moments_list` (the moment changed) and from `_refresh_pick_labels`
+(the cameras changed).
+
+`_on_moment_picked` re-applies a row (and returns early if it is already the
+current one, so revisiting costs no share read); `_drop_moment` and `_clear_moments`
+tidy the list without touching the frames on screen. The list is persisted, so a saved
+moment survives a restart and can be clicked with no graph loaded at all — a timestamp
+needs no series to resolve frames from.
+
+The list's selected row is styled explicitly (`#2f6fb5` on white): left to the style it
+came out white on near-black, which reads as a broken widget next to the rest of the
+panel.
+
+### The numbers, in the left panel
+
+Two tables, both narrow on purpose — a ten-column table in a 300 px column is a table
+nobody can read:
+
+* **PV channels** — the Slider's `PvValueTable` (eye · PV · value). The value is this
+  PV's reading AT THE MOMENT, with how far its nearest sample is from the moment in the
+  tooltip; before a moment is picked it shows how many samples the window holds. A
+  formula behaves like any other row; one that has not been loaded says so with its
+  expression in the tooltip, and one that could not be computed prints `n/a` with the
+  reason.
+* **Range statistics** — PV · mean · ±std · n for the marked range, with n, mean, std,
+  min, max and peak-to-peak spelled out in the row's tooltip. Mean and spread are what
+  a range is marked for; the extremes are one hover away. Non-finite samples are
+  dropped before the arithmetic: a formula's series carries one NaN per gap, and one
+  NaN poisons a mean.
+
+#### A range with no sample in it still has a value
+
+A setpoint-shaped channel — a waveplate angle, a motor position — is archived when it
+**moves**, so a range can easily hold not one sample of it while the value was perfectly
+well defined throughout. Three em dashes there read as "this channel is broken", which
+is the wrong conclusion about a healthy machine.
+
+So `_fill_held_row` falls back to `_last_before`: the newest finite sample at or before
+the range start, carried forward. The row shows that value as the mean, `held` where the
+spread would be, `n = 0`, all three in amber, and the tooltip gives the timestamp it came
+from, its age, and why it is legitimate. A held value passed off as a real mean would be
+worse than a blank one.
+
+`_last_before` has a second fallback, `_seed_of`. `_PvLoadTask._seed_before` asks
+`cpva.value_at_or_before(channel, window_start - 1)` for **every** read channel at load
+time — one query each, cached per day boundary — so a range at the start of the window,
+before the channel's first in-window sample, is covered too. `_has_numbers` is what puts
+such a PV on the table at all: a channel with no sample in the whole window used to be
+dropped from the statistics silently, which is exactly the case the user hit. The same
+seed is `_value_at`'s fallback, so the PV list shows the held reading (flagged old by its
+large negative offset) instead of `n/a`.
+
+### The frames: resolve once, render many times
+
+Two tasks, not one, because they answer different questions:
+
+| Task | Does | Runs when |
+|---|---|---|
+| `_ResolveTask` | walks the share for the file holding each camera's frame at the moment (`_find_image_in_day`), 8 workers — a share read is ~150 ms and one per camera | the moment or the camera set changes |
+| `_RenderTask` | turns those files into pictures through `load_image_scaled`, 8 workers | every display control, after a `_RENDER_SETTLE_MS` = 220 ms settle |
+
+That split is what makes the Contrast slider usable: moving it re-renders what is
+already found instead of walking the share again for each of twenty cameras. The
+settle timer is why a drag costs one render and not one per pixel of travel.
+
+`load_image_scaled` returns a `QImage` over a buffer it does not own, so the render
+task copies it before it crosses the thread boundary.
+
+### …and a moment looked at twice is free
+
+Both halves of that cost are cached, so going back to a moment — off the list, with the
+arrows, or by clicking the same place on the graph again — puts the wall back up out of
+RAM. Two dicts used as LRUs (a hit is re-inserted at the back, so what falls off the
+front is what has not been looked at):
+
+| Cache | Key → value | Notes |
+|---|---|---|
+| `_res_cache` | `(camera, moment ns)` → the resolved item | capped at `_RES_CACHE_MAX` = 6000 entries; a few hundred bytes each |
+| `_img_cache` | `(file, opts key)` → `QImage` | capped at `_IMG_CACHE_MB` = 192 MB of pixels, counted with `sizeInBytes()` |
+
+`_opts_key` is every display setting that changes a pixel — the Auto ticks included,
+because each of them is computed from THIS file alone and so gives the same answer every
+time for the same file. That is also why a display setting you go back to is instant.
+
+Both stages are cache-first and neither waits for the other's stragglers:
+`_resolve_frames` walks the share only for the cameras it has no file for (and calls
+`_on_resolve_done` itself when there are none), `_render_frames` puts every picture it
+already has on the wall through `_on_tile` and hands only the rest to `_RenderTask`
+(calling `_on_tiles_done` itself when there is no rest).
+
+**A miss is only cached once it can no longer change.** `path is None` ("this camera has
+nothing near this moment") is remembered only for a moment older than
+`_MISS_CACHE_MIN_AGE_S` = 10 min — the day being looked at can be today, the archiver
+publishes about a second late and this PC's clock runs ~25 s ahead of the facility. It
+matters because **the wall waits for its slowest camera**: without caching old misses,
+one camera that was off all day would cost every single revisit a share walk.
+
+The ceiling is in BYTES rather than in pictures because one 700 px tile is five 280 px
+ones — and because it is the COMMIT charge, not the RAM, that runs out on these PCs.
+
+### A tile is a picture with two labels
+
+The camera and the frame's own time, and nothing else — the same pair the Slider puts
+over each of its camera panels. What the caption leaves out is in the tooltip: the
+offset from the moment asked for (a frame is stored only about every 35 s, so a few
+seconds is normal), and the file it came from.
+
+The picture area is `setFixedSize` to the picture. That is the fix for the first
+version's black gutter: a stretched label painted its dark background across the whole
+grid cell, so a 16:9 frame sat in a letterbox the width of the widest tile in the row.
+
+Name and time sit side by side while both fit and one over the other when they do not;
+the time is never shortened, and on a tile too narrow even for that the name is elided
+against **its own measured width**, one character at a time. A font metric taken before
+the stylesheet is applied measures a different font, and being eight pixels out is a
+clipped last letter.
+
+**A tile is built once.** `_tiles` maps camera → its `_Tile`; `_on_tile` builds the one
+tile whose picture just arrived (replacing that camera's previous one on a re-render),
+and `_place_tiles` only RE-PLACES the existing widgets — moving a widget inside a
+`QGridLayout` is a pointer move. Rebuilding the whole wall per arrival is what made
+twenty cameras cost 210 tile widgets and a visible flicker down the wall, and it made
+a resize as expensive as a new moment.
+
+`_cols_for` decides the column count from the viewport width, and `_place_in_grid` does
+the placing. The slack goes into a trailing row and column, and the stretch of the
+column the previous layout used is taken away by hand: a `QGridLayout` never gives a
+column back, and a leftover stretch keeps pushing the wall to the right.
+
+**Ctrl + wheel over the wall resizes the frames in place.** `_TilesArea` is a
+`QScrollArea` whose `wheelEvent` emits `zoomed(notches)` and ACCEPTS the event when Ctrl
+is held, so the pane does not also scroll — a zoom that runs away down the wall cannot
+be aimed. A wheel event on a tile is not handled by the tile (a `QLabel` has no use for
+one) so it arrives at the area on its own, with no filter on every child. `_zoom_tiles`
+then moves the **Size slider** rather than a size of its own, multiplicatively
+(`_TILE_ZOOM_STEP`) and clamped, so the slider always shows where the wheel got to and
+the two can never disagree. The window and the graph above it do not move.
+
+There is no pop-out window any more. It duplicated the wall, and the wall grows into
+whatever room the splitter gives it.
+
+### Nothing is left lying on screen
+
+`_invalidate_moment` is the one place that says "there is no picked moment any more":
+it clears the moment and the tiles, resets the timestamp to `—`, the frame title to
+"The frames" and the hint, and switches prev / next off. Clearing the state alone used
+to leave the OLD timestamp on the panel, the old "The frames at …" title over an empty
+wall, and prev/next enabled over nothing.
+
+It deliberately does NOT touch the **saved moments**: a timestamp keeps its meaning
+whatever the PV list does, and emptying that list is the one thing having it was meant
+to prevent.
+
+`_abandon_load` is its counterpart for the fetch: bumping `_pv_gen` and installing a
+fresh stop flag whenever the window or the PV list changes. Without it a load already
+in flight passes its generation guard and repopulates the series with the PREVIOUS
+pick — a PV (or a formula) taken out a moment ago arrives and is drawn.
+
+### What is remembered
+
+`one_moment_ui_state.json` beside every other tab's state file, through the merging
+read/write pair `if_t` uses (`_read_state_file` / `_write_state_file`) rather than the
+Slider's whole-file replace. It holds the window (segments, day, From/To to the
+minute), the cameras, the PV pick and eye state, the saved moments, the display sliders
+with their Auto ticks, the palette, the tile size and which sections are open.
+
+Three rules:
+
+* **Written on every change**, never on close: a tab inside the main window is not told
+  the program is quitting, so anything saved "on the way out" is saved never. The write
+  is coalesced through a 400 ms timer (`_save_state` arms it, `_save_state_now` does it)
+  — a slider is dragged, and one file write per pixel of travel is a hundred writes for
+  one adjustment.
+* **`_state_ready` gates every write.** Restoring sets a dozen controls, and a handler
+  firing halfway through `_build_ui` would save a half-built document over the real
+  one. Restored values are set with signals blocked for the same reason.
+* **Restoring reads nothing.** No share, no archiver, and no camera scan at startup —
+  Load stays a deliberate press. A PV that has since left the shared registry is
+  dropped rather than carried as a name nothing can read.
+
+### Deliberate limits
+
+* Tiles use a plain equal-cell grid, not the Slider's `compute_camera_layout`.
+* The Workshop hand-off deliberately sends the plain absolute mapping, never this tab's
+  display settings — the Workshop measures the picture it is given, and a display curve
+  measured as data is a wrong number.
+
+### The way out: Send to Image Slider
+
+`_send_to_slider` hands the moment on screen, plus the cameras picked here, to
+`Viewer.open_moment(ts_ns, cam_names)` and then switches to that tab (`_slider_ref` /
+`_slider_tab_idx`, wired in `main.py` next to the Workshop refs). This tab finds the
+shot; the Slider is where it gets looked at — full size, with the subtraction, the
+overlays and the profile tools.
+
+`open_moment` lives in `is_t.py` beside `receive_external_folder`, and it is the Slider's
+own machinery rather than a second way in: it fills the `last_pick_*` fields exactly as
+`open_by_date` would, then delegates to `_reload_with_last_cameras`. What it does
+differently:
+
+* the window is `PUSHED_MOMENT_PAD_MIN` = 15 minutes on either side of the moment,
+  **clamped to the moment's own Prague day** — one picked day is one `PickSeg` here, and
+  a segment cannot cross midnight (a "to" of 23:59 is the way "to midnight" is spelled,
+  which `seg_bounds_ns` stretches back out);
+* it lands ON the moment: `_pending_restore_ts_ns = ts_ns` with
+  `_land_at_window_start = False`, the same single-use hint the camera picker uses;
+* live mode, focus mode and the watcher are put down first (the reasons
+  `receive_external_folder` lists — live mode would drag the view to the newest frame,
+  focus mode would hide the slider itself);
+* `_preloaded_cameras` is emptied: the camera picker never opens on this path, and a
+  preload from an earlier window must not stand in for this one's camera set;
+* the reload is queued with `singleShot(0)`, because the caller is a button in another
+  tab that is about to switch to this one — and because the queued reload bumps `_gen`
+  before the cancelled scan's own signal arrives, so that signal cannot clear the
+  landing hint on its way out.
+
+It returns False only when no camera was given; the button is greyed for that case
+anyway.
+
+### Traps already paid for
+
+* **The matplotlib toolbar host must outlive the call that builds it.** matplotlib
+  tints the toolbar icons at construction and only under a dark palette, so the
+  toolbar is built with a light-palette parent to skip the tinting — but a *local*
+  parent is collected as soon as the helper returns and takes the toolbar's C++ object
+  with it (`RuntimeError: Internal C++ object (NavigationToolbar2QT) already deleted`).
+  `_tb_host` is therefore built once in `__init__` and kept.
+* **One signals object per widget, not per task.** `_PvLoadSignals`, `_ResolveSignals`
+  and `_RenderSignals` are created in `__init__` and reused; generation counters
+  (`_pv_gen`, `_res_gen`, `_rnd_gen`) discard results from a superseded run. A fresh
+  `QObject` per worker is the never-collected ~3 KB-per-run leak this program has been
+  bitten by elsewhere.
+* **A rebuild must tear the old canvas down.** A stale `SpanSelector` holding a dead
+  axes keeps firing and would set moments on a graph nobody can see. A rebuild also
+  restores the moment and the marked range afterwards, so hiding a PV does not lose
+  where the user was.
+* **A combo's `setCurrentIndex` fires its signal.** Every control is connected AFTER
+  its initial value is set, or the palette combo would call a handler that reads
+  widgets the builder has not created yet.
 
 ## wk_t.py — Workshop
 
-### Datové struktury
+**The one rule of this tab: display settings never change pixels.** Brightness,
+contrast, gamma, the display window and the palette live in `_ViewSettings` and are
+re-applied by `render_view` on every render, so any of them can be undone by moving the
+control back. Only the Filters and Edit sections (crop, rotate, flip, resize, arbitrary
+rotation, straighten, bin, median / blur / sharpen / edges / background removal,
+reference subtraction) touch `base`, and every one of those is undoable. Saving writes a
+NEW file and refuses a target equal to `source_path`.
+
+**The second rule: a filter changes the counts the same way it changes the picture.**
+`_apply_to_both(fn, message)` runs one operation over `base` AND `raw`, or drops `raw`
+with a note. Filtering only what is on screen would leave the Measure panel reporting
+numbers from a picture nobody is looking at.
+
+### Three parts in one file
+| Block | Holds | Uses Qt |
+|---|---|---|
+| PIXEL OPERATIONS | filters, background maps, projections, red/green merge, arbitrary rotation (+ its point map), binning, animation and 16-bit data TIFF writers | no |
+| BEAM MEASUREMENTS | FWHM / 1/e² widths, Gaussian fit, D4σ and principal axes, radial profile, encircled energy | no |
+| the tab | canvas, panel, dialogs, undo, hand-off | yes |
+
+The first two blocks are **deliberately Qt-free**, which is what makes them checkable
+against a synthetic Gaussian: `beam_stats` on a known σ returns D4σ within 0.3 % and the
+tilt within 0.1°, and `rotate_point_map` puts an annotation within 0.1 px of where
+Pillow actually moved the pixel.
+
+The panel calls them through the names `wk_ops` and `wk_beam`, which are both bound to
+this module (`sys.modules[__name__]`). That is not decoration: it says at every call site
+which group a function belongs to, and it means the two blocks can be lifted back out
+into sibling files — the shape they were written in — without touching a single caller.
+The `_OPS_ERROR` / `_BEAM_ERROR` strings and the `wk_ops is not None` guards are the
+remains of that split and are what `_update_enabled` greys buttons out on, so they stay.
+
+### Three layers per slot
 ```python
-class _WorkshopSlot:
-    source: np.ndarray        # originální zdrojový obrázek (pro Reset to Source)
-    current: np.ndarray       # aktuálně upravená verze
-    label: str                # název pro UI combobox
-    source_path: Path | None  # cesta ke zdrojovému souboru (pokud existuje)
-    undo_stack / redo_stack   # list[np.ndarray] — undo/redo historie
-
-class WorkshopCanvas(QWidget):
-    # Interaktivní canvas pro zobrazení a editaci jednoho slotu
-    TOOL_NONE / TOOL_BRUSH / TOOL_ERASER / TOOL_LINE / TOOL_RECT
-    TOOL_TEXT / TOOL_CROP / TOOL_EYEDROPPER
+@dataclass _WorkshopSlot:
+    base        # uint8 picture being shown and edited (what the sender rendered)
+    source_base # base as it arrived, for "↺ Original"
+    raw / source_raw / full_scale / camera / raw_note
+                # native counts re-read from source_path — MEASUREMENT ONLY, kept
+                # geometrically in step with base; measure_arr() falls back to base
+    view        # _ViewSettings — display only
+    annots      # list[_Annot] in image coordinates
+    px_per_mm   # always set: 1000 / px_um. What every length divides by
+    px_um       # how much one pixel covers, in µm — the number the operator sets
+                # (starts at BASLER_PIXEL_UM = 4.4, remembered in the UI state file)
+    px_um_measured             # True when a ruler produced px_um, for the wording
+    zoom / offset / fitted     # per-slot view position
+    undo_stack / redo_stack    # capped by _SLOT_UNDO_LIMIT = 30
 ```
+**The scale is never off.** Every slot is born with a pixel size (`_apply_default_sensor_scale`,
+called from `receive_image` and `_add_derived_slot`), and every length is reported in
+pixels AND in real size side by side — ruler caption, results table, beam report. That is
+what removed the old on/off tick: with both numbers always present, a scale can only add
+information, while a switch adds a way to read the wrong number. `_set_pixel_size` is the
+one way in, so `px_um` and `px_per_mm` cannot drift apart and every change lands in the
+undo history. `_set_scale` (ruler of known length) computes `px_um = mm * 1000 / px` and
+sets `px_um_measured`, so the Scale line can say "measured with a ruler" rather than
+"camera pixel size" — 4.4 µm is true at the SENSOR, and any lens in front changes what a
+pixel covers on the object. Binning and resizing scale `px_per_mm` by `(sx+sy)/2` and
+`px_um` by its inverse: joining pixels makes each one cover more.
 
-### WorkshopWidget(QWidget)
-Hlavní widget záložky — přijímá obrázky z ostatních záložek přes `receive_image()`.
+`BASLER_PIXEL_UM` is 4.4, not the 4.5 the older MATLAB analysis scripts use. The frames
+carry the number themselves: NI Vision writes `Unit length` and a `Measurements` JSON
+block (`Sensor Calibration` → `Pixel Width (um)`) into every archived PNG, and both say
+4.4 — the acA1600-20gm pitch. Two things the default still does NOT know, both readable
+from that same metadata if it is ever wired up: **camera binning** (`Picture Size` → `X`/
+`Y Binning`; OM1NF acquires 2×2, so one stored pixel covers 8.8 µm and a frame measured
+at 4.4 comes out half size), and the **optics in front of the sensor**, which is what
+would turn a size on the chip into the beam size in the experiment. NI's own `ROI Area`
+gets the binning wrong too, so it is no help as a cross-check.
 
-**Levý panel (200 px, scrollovatelný):**
-- Info label (název souboru, rozměry)
-- Combo výběru aktivního slotu + Remove / Clear All
-- Selektor nástrojů (Pan, Brush, Eraser, Line, Rect, Text, Crop, Eyedropper)
-- Výběr barvy kreslení + velikost brush / tloušťka čáry
-- Jas / Kontrast (slidery + Reset + Auto B/C + Apply)
-- Palety (Default, Grayscale, Inferno, Plasma, Viridis, Hot, Binary…)
-- Reference diff: Load ref from file, Subtract ref, Abs diff ref
-- Undo / Redo / Reset to Source
-- Save PNG / Save TIFF
+`_state()` shares array references instead of copying: `base` and `raw` are never
+modified in place, every edit builds a new array, so 30 history steps cost nothing.
+The state is `(base, raw, annots, px_per_mm, full_scale, px_um, px_um_measured)` — `full_scale` is in there
+because binning with "Sum" multiplies it, and an undo that put the pixels back but left
+the scale four times too big made every "% of full scale" and the histogram axis wrong
+with nothing on screen to show why.
 
-**Klíčové metody:**
-| Metoda | Popis |
-|--------|-------|
-| `receive_image(arr, label, source_path)` | Vstupní bod z ostatních záložek — přidá nový slot a aktivuje ho |
-| `_activate_slot(idx)` | Přepne aktivní slot, synchronizuje canvas a ovládací prvky |
-| `_do_diff(absolute)` | Pixel-by-pixel odečtení referenčního snímku (relativní nebo absolutní) |
-| `_apply_bright_contrast()` | Aplikuje brightness/contrast posun na aktuální canvas array |
-| `_auto_bright_contrast()` | Automatické nastavení B/C (percentilový stretch) |
-| `_on_palette_changed(name)` | Aplikuje barevnou LUT paletu na grayscale obraz |
-| `_save(fmt)` | Uloží aktuální slot jako PNG nebo TIFF přes Pillow |
+`_RawLoadTask` (a `QRunnable`) re-opens `source_path` in the background and reads the
+native array plus `img_scale.full_scale_for_pil` / `camera_from_path`. This is why the
+hand-off contract `receive_image(arr, label, source_path)` did **not** have to change
+for is_t / if_t / sf_t: the senders keep handing over 8-bit, and the Workshop fetches
+the counts itself. `receive_image` also accepts `raw=`, `full_scale=`, `camera=` for a
+sender that wants to pass them directly. Statistics say which of the two they came from
+(`unit_name()` → `UNIT_RAW` "pixel intensity" / `UNIT_CODE` "8-bit intensity") — never
+silently. `unit_key()` is the same distinction without spaces, for CSV column names.
+
+### Rendering
+`render_view(base, view)` — display window → manual contrast → gamma → brightness →
+palette. Contrast is a gain pivoted on the frame's own BLACK LEVEL, matching
+`is_t._apply_bc`; `_contrast_gain` is the same curve so a number means the same thing in
+both tabs. Cyclic palettes (NI Binary) bypass the whole chain, and the panel greys the
+controls they ignore. `WorkshopCanvas._ensure_image` caches the result per
+(base, shape, view key).
+
+### Borrowed, not copied
+`_import_img_scale()` and `_get_slider_module()` (both lifted from `if_t.py`) bring in
+`img_scale` and the Image Slider's `GRADIENTS` / `ADAPTIVE_PALETTES` /
+`CYCLIC_PALETTES` / `CollapsibleSection`. `_load_palettes()` keeps a five-entry local
+fallback so the file still opens standalone; `_FallbackSection` does the same for the
+panel. Palettes are looked up **by name**, because is_t's list starts with `Default`
+and persists selections by index.
+
+### Tools (`WorkshopCanvas`)
+`TOOL_PAN / ZOOM / SELECT / BRUSH / LINE / ARROW / RECT / ELLIPSE / POLY / TEXT /
+CROP / EYEDROP / ERASER / RULER / ANGLE / ROI_RECT / ROI_ELLIPSE / PROFILE / CROSS`
+
+**Angle** is clicked out in three presses (arm end → corner → arm end) with the shape
+following the cursor in between, the same in-progress-object pattern as the polygon;
+right-click or Escape throws a half-finished one away, and `set_tool` does too rather
+than inventing an angle from two points. `angle_between` always reports the inner
+angle — a protractor reading of 250° is the same corner measured the long way round.
+
+**Magnify** is a mode, not a pair of buttons: left click zooms in *at the click point*,
+right click zooms out, and a drag past `_DRAG_DEAD_PX` = 6 rubber-bands a rectangle that
+`zoom_to_rect` blows up to fill the canvas. The wheel magnifies under the cursor in every
+tool. `_zoom_at` keeps the point under the cursor fixed; `resizeEvent` keeps the image
+point at the canvas centre where it was (it used to call `fit_to_view()` unconditionally,
+so every window resize threw the zoom away). Above `_PIXEL_VALUE_ZOOM` = 24× the value is
+written inside each pixel, ImageJ-style.
+
+### Button icons
+Every symbol on a Workshop button is **drawn**, never typed. One `_ico_*` recipe per
+symbol paints into a 20×20 grid; `_render_icon_pixmap(name, px, ink)` scales the painter
+to any size, and `tool_icon(tool)` / `action_icon(name, ink)` cache the finished `QIcon`.
+`_ipen` is the single pen helper, so the whole set shares one weight vocabulary
+(2.0 px primary, 1.7–1.8 px detail, round caps except on rectilinear forms).
+
+This replaced Unicode glyphs, which put three typefaces in one row: `✋🔍📏💧` came from
+Segoe UI Emoji as colour bitmaps that **ignore the stylesheet's `color:`** — so they
+stayed colourful on the blue checked background while their neighbours turned white —
+`▭◯⬠〰⧉` came from Segoe UI Symbol as hairline outlines, and `⬠`/`⧉` are not guaranteed
+to exist at all. At the 13 px font size the strip used, that left about 9 px of ink.
+
+Three rules the factory depends on:
+- **Every `QIcon` mode is spelled out.** Left to itself Qt fades its own disabled variant
+  to near-invisible and keeps dark artwork on the checked blue. Both are the
+  "can't see it" failure this replaced.
+- **Each icon is added at 20, 30 and 40 px** so `QIcon` can pick per monitor scaling.
+  Do not pre-multiply by one screen's `devicePixelRatio`.
+- **Nothing is built at import time** — `QPixmap` needs a live `QGuiApplication`.
+
+Checked blue is `#2f6fb5`, not `#3a7ebf`: white on the old blue was 4.3 : 1 and read as
+washed out; the new one is 5.2 : 1. Buttons are 32 × 30 px with `padding: 0`.
+`180°` and `Resize…` keep plain text — a third turning arrow beside Undo and Original
+would be one too many to tell apart.
+
+### Annotations
+`_Annot(kind, pts, colour, width, filled, text, font_size, label, value)` — geometry in image
+coordinates, painted at draw time by the shared `paint_annots(painter, annots, to_widget,
+scale)`. Save calls the same function with an identity mapping, so a saved copy is what
+was on screen. Being geometry is what makes them selectable, movable and resizable after
+the fact (`_BOX_KINDS` get eight handles, `_SEG_KINDS` two endpoints), keeps them crisp
+at 6400 %, and keeps the drawing colour out of the palette LUT. The Eraser deletes an
+item rather than restoring pixels. Geometry edits (rotate / flip / resize / crop / bin /
+arbitrary rotation) transform the annotation coordinates too, so nothing detaches from
+the feature it marks. `value` is the one numeric payload a shape may carry — only the
+scale bar uses it so far — and it is a field rather than a subclass so that undo, the
+session file and `copy()` need no special case. `to_dict` / `from_dict` are the session
+form.
+
+**Shift while dragging** squares a box (`_BOX_KINDS`, in `set_handle`) and straightens a
+segment (`_SEG_KINDS`, via `snap_direction` at `_SNAP_STEP_DEG = 45°`). While drawing it
+snaps against the fixed first point; while dragging an end point of a finished line it
+snaps against the OTHER end, so an existing ruler can be squared up without redrawing.
+The directions are the picture's own — the thing actually wanted is a line parallel to
+the BEAM, which needs the beam's edge found first (the second-moment long axis is already
+there in `wk_beam.beam_stats`, and the edges of a top-hat could be fitted); those angles
+would be offered from the same helper.
+
+**Captions carry everything.** `_region_caption` writes three lines — values (min / max /
+mean / sd), the region's size in pixels AND real units, then pixel count, area, sum and
+centre — and `_draw_caption` grows its plate per line. A tooltip promising "min, max, mean
+and more" over a caption showing two of them is what this replaced. Same rule for the
+ruler: `"511.0 px  =  2.3 mm"`, never one or the other.
+
+**Scale bar** (`A_SCALEBAR`) is an annotation, not a display setting, which is what
+gets it burn-in, undo and dragging for free. Its `value` is the length in **millimetres**
+and `update_labels` recomputes its pixel length from `px_per_mm` on every refresh, so
+changing the scale moves the bar instead of leaving a bar that lies. `set_handle` ignores
+it — a calibrated bar must not be resizable by mouse. It is drawn on a dark plate like
+the measurement captions: a bar that vanishes into a saturated spot is worse than none,
+because the reader still believes the picture is calibrated.
+
+### Measurement
+`region_stats` (min / max / mean / std / sum / count + moment centroid),
+`_region_mask` (rectangle or ellipse), `line_profile(arr, p0, p1, width)`. All measured
+on `measure_arr()`, i.e. **before** the view transform. `_HistogramWidget` and
+`_PlotWidget` are painted by hand on purpose — a matplotlib toolbar would have to go
+through the Finder's icon-tinting workaround, and neither of these needs one.
+
+`line_profile`'s `width` averages that many pixels ACROSS the line, as ImageJ's line
+width does: on a noisy frame a one-pixel profile is mostly noise, and averaging 9 rows
+cuts that by three without moving the peak, so the FWHM read off it stops jumping.
+
+**Several regions.** `WorkshopCanvas.keep_regions` (the "Keep several regions" box)
+decides whether `add_annot` purges the previous measuring region. Off — the default —
+because the panel's cells show exactly one region and two on screen under one set of
+numbers is a trap. On, the cells follow the selection and `_measure_table` is where they
+are all read.
+
+**Tables.** One `_TableDialog` (headers + rows + Copy + Save CSV, all colours stated
+explicitly so the header row cannot come out grey-on-grey) serves three things:
+`_measure_table` (one row per region / ruler / angle / point / profile, plus the whole
+image on the first row so there is always something to compare against),
+`_show_histogram_numbers` (the same 256 buckets and the same source as the histogram
+picture, so the two cannot disagree) and `_show_beam_report`. `_write_csv` is the single
+CSV writer — through the `csv` module, because a camera name contains commas.
+
+### Beam measurements
+`beam_stats(arr, mask, baseline_pct)` returns centre of mass, D4σ across / down, D4σ on
+the principal axes with the tilt and the roundness, and FWHM / 1/e² widths read off the
+row and column through the centre of mass. `radial_profile` and `encircled_energy` plot
+into `_CurveDialog`; `profile_metrics` and `gaussian_fit` feed the line-profile window,
+which draws the half-maximum and 1/e² levels, marks both crossings, and overlays the fit
+with its r² so "is this spot Gaussian" is answered rather than assumed.
+
+**A baseline is subtracted before any moment is taken, and the value used is reported
+with the result.** Every second-moment width weights a pixel by its value times its
+distance squared, so a background of a few counts spread over a whole frame outweighs the
+spot and D4σ comes out as roughly the frame size. The panel's "Background" spinbox is
+that percentile (5 % by default; 0 % measures the values as they are). A width without
+its baseline is not a measurement.
+
+### Keyboard shortcuts
+`_shortcut_table()` is the single source: group, key, what it does, what to call, and the
+button whose tooltip should name the key. `_install_shortcuts` builds the `QShortcut`s
+from it, `_annotate_shortcut_tooltips` writes the key into that button's tooltip, and
+`_shortcut_groups` / `_show_shortcuts` (F1, or the `Shortcuts` button) list them in a
+window. Nothing is spelled out twice, so a new key cannot appear in one place only.
+
+Two decisions worth keeping:
+- **Window scope, switched off while hidden.** The keys are `WindowShortcut` and
+  `showEvent` / `hideEvent` enable and disable them, so they work right after clicking
+  the tab — when the focus still sits on the tab bar, outside this widget — yet never
+  fire from another tab, and never *swallow* a key there either (a disabled shortcut
+  passes the key on; a `WindowShortcut` guarded only inside its callback would eat
+  Ctrl+Z from every text field in the window). The two `setShortcut` calls on the Undo
+  and Redo buttons were exactly that bug and are gone.
+- **Tool letters live in `WorkshopCanvas.keyPressEvent`, not in a shortcut.** Shortcuts
+  are matched before `keyPressEvent`, so `H E L P` as window shortcuts would steal the
+  letters from a text annotation being typed. Inside `keyPressEvent` the `_text_active`
+  branch returns first, and `_TOOL_KEYS` is only consulted afterwards; the canvas then
+  emits `tool_requested` so the strip's button follows.
+
+### WorkshopWidget layout
+Tool strip — three rows: the tool buttons, then colour + Line/Brush sliders with their
+numbers and `_StrokePreview` samples + text size + Fill, then the zoom slider with its
+percentage + ＋ − Fit 1:1 + undo/redo/clear/original/shortcuts. Line and Brush are
+`_line_sl` / `_brush_sl`; `_refresh_stroke_samples` is the one place that repaints the
+numbers and the samples, and the eyedropper (`_on_color_picked`) has to call it too
+because it changes the colour without going through `_on_style_changed`. Above the
+`_StrokePreview` range the little sample has to squeeze its stroke, so each slider also
+owns a `_StrokeZoomPopup` (`_line_zoom` / `_brush_zoom`) — a `Qt.ToolTip` window big
+enough to draw the stroke at true thickness, shown on `sliderPressed` and hidden on
+`sliderReleased`. `_refresh_stroke_samples` keeps a visible popup in step with the drag
+(`isSliderDown`) and gives an arrow-key change a 1.2 s self-hiding one (`hasFocus`),
+and `hideEvent` drops both — a separate window would otherwise outlive the tab. The zoom
+slider is spaced by ratio (`_zoom_pct_to_slider` / `_zoom_slider_to_pct`, 1000 steps
+over 2 %-6400 %), so a linear handle gives an even feel across the whole range;
+`_on_zoom_changed` leaves the handle alone while it is held down, and
+`_on_zoom_slider` puts it back only when the canvas refused the zoom (no picture
+loaded). Over a
+`QSplitter` of a collapsible panel and the canvas, with a status line underneath showing
+the cursor position, its value in counts and % of full scale, the image size and the
+zoom. Sections and accents: Images `#2f6fd0`, Display `#7a4fc0`, Measure `#b0396b`,
+Beam `#0f7f8f`, Filters `#4d7a2a`, Edit `#2e9e5b`, Combine `#5a5f8f`,
+Compare `#d08a1e`, Save `#c0392b`; expanded state persists in
+`%APPDATA%/ELI_ImageTools/workshop_ui_state.json`.
+
+Key methods: `receive_image`, `open_files` (also drag-and-drop), `_add_derived_slot`
+(for an image the Workshop MADE — no source file to read counts back from, so
+deliberately not `receive_image`), `_duplicate_slot`, `_paste_clipboard`,
+`_activate_slot`, `_on_view_control` / `_apply_view_now` / `_sync_view_controls` (one
+guarded place that parks every Auto value on its control), `_refresh_measure`,
+`_measure_table`, `_set_scale` / `_add_scale_bar`, `_show_profile`, `_beam_stats` and the
+three beam windows, `_apply_to_both` + the `_filter_*` methods, `_rotate` / `_flip` /
+`_resize_dialog` / `_rotate_arbitrary` / `_straighten` / `_bin_dialog` / `_do_diff`,
+`_do_project` / `_do_merge`, `_update_compare`, `_render_for_save` / `_save` /
+`_save_data_tiff` / `_save_all` / `_save_animation` / `_copy_clipboard`,
+`_save_session` / `_load_session`, `_canvas_menu`, `_shortcut_table` /
+`_install_shortcuts` / `_show_shortcuts`, `_after_change` (the
+single place that re-reads everything derived from the active slot, so no button is left
+stale) and `_update_enabled` (the single place that decides what is greyed out).
+
+**Two TIFF buttons, and both are needed.** "Save TIFF…" writes what is on SCREEN — the
+display stretch, the palette and the drawing baked into 8-bit RGB, which is what a report
+wants. "Save the values as TIFF…" writes what was MEASURED, as a plain single-channel
+16-bit file with no palette and no annotations, which is what ImageJ or a script wants.
+Before this existed, TIFF was the screen version only, so anyone saving a TIFF to keep
+the data silently kept 8 bits of it.
+
+**Writing runs off the GUI thread.** `_WriteTask` / `_start_write(fn, busy_message)` take
+a callable holding plain arrays and paths — nothing Qt owns crosses the thread — and
+`_on_write_done` reports back. Save all and the animation export both go through it; they
+used to encode on the GUI thread and the window simply stopped responding.
+
+**Right-click menu.** `WorkshopCanvas.contextMenuEvent` calls back into
+`_canvas_menu(global_pos, image_point)`, which builds the menu fresh each time so what is
+greyed out is right for that moment, and includes the value under the cursor. It stands
+down under Magnify and while a polygon or an angle is being clicked out, because
+right-click already means "zoom out" and "finish the shape" there.
+
+**Session file** (`_save_session` / `_load_session`) stores the drawing, the regions, the
+scale, the display settings and where each image came from — not the pixels. That keeps it
+tiny and means it can never disagree with the archive; the cost is that an image handed
+over without a file behind it cannot come back, and both the count of those and any file
+that has changed size since are reported rather than quietly mis-placed.
+
+**Back to the Slider.** `_show_in_slider` opens the source frame's FOLDER through
+`is_t.receive_external_folder` (the same public handoff the Finder and Shot Finder use, so
+the Slider clears its online mode, its reference frame and its multi-camera grid first).
+The Workshop cannot push edited pixels back — the Slider browses files on the share.
+`main.py` wires `workshop._slider_ref` / `_slider_tab_idx` / `_tab_widget`.
 
 ---
 
-## Závislosti
-- `PySide6` — Qt widgets, signals, threading
-- `numpy`, `Pillow` (PIL) — image processing
-- `matplotlib` — PointingPanel, SC histogram
-- `scipy` — SC hole-filling (volitelné)
+## Dependencies
+- `PySide6` — widgets, signals, threading
+- `numpy`, `Pillow` — image processing
+- `matplotlib` — PointingPanel, SC histogram (always via `_make_mpl_toolbar`)
+- `scipy` — SC hole filling; Workshop filters and morphology (`wk_ops`) and the Gaussian
+  fit (`wk_beam`). Optional everywhere: each of those has a numpy fallback, so a build
+  without scipy loses accuracy and speed, not features.
 - `zoneinfo` — Prague timezone
-- `ssl`, `urllib` — CPVA archiver API (bez ověření certifikátu)
+- `ssl`, `urllib` / `http.client` — CPVA archiver (no certificate verification)
 
 ---
 
-## KNOWN ISSUES (review 2026-06-19 — ověřeno ve zdroji)
+## KNOWN ISSUES
 
-### Funkční bugy
-1. ✅ **OPRAVENO (if_t.py)** — odstraněna redundantní funkce `_NoScrollCalendar`, která překrývala wheel-blocking třídu z L539. Kalendáře teď opět ignorují kolečko.
-2. ✅ **OPRAVENO (if_t.py L4710)** — except větev v `_compare_memory` nyní emituje `self._compare_sig.error`.
-3. ✅ **OPRAVENO (sf_t.py L391 `_find_best_match`)** — odstraněno druhé dělení 0.749; `target` už přichází v CSV jednotkách z `_to_csv_units`.
-4. **wk_t.py L936** — `rgb.astype(np.uint8)` bez škálování ořezává 16bit data; `_redo` (L1067) není napojen na žádné tlačítko ani zkratku (celá redo logika nedosažitelná z UI). *(neopraveno)*
-5. **wk_t.py L107** — `_TZ_PRAGUE` natvrdo +2h → v zimě (CET=+1) jsou timestampy v názvech uložených souborů o hodinu posunuté. *(neopraveno)*
+### Functional
+- **wk_t** — a Compare view is read-only: the picture on screen is a composition of two
+  slots, so drawing and measuring are refused while one is shown. Every pixel operation
+  in the panel now refuses too (`_editing_blocked`); they used to go ahead invisibly,
+  leaving the next measurement to be taken off a frame nobody had looked at.
+- **wk_t** — the "Rolling ball" background is a morphological opening plus a smooth, not
+  ImageJ's shrink-and-roll, so its numbers will not match ImageJ's to the count.
+- **wk_t** — an arbitrary rotation fills the corners it grows into with black, and those
+  are real pixels: leave them out of a region or they drag the mean down. The status line
+  says so after every such rotation.
 
-### Efektivita / responzivita
-- **Síťové IO a PNG enkódování na hlavním vlákně** v save / try-again / open-in-slider cestách (if_t `_try_again_*`/`_save_items`, sf_t `_save_results`/`_open_in_slider`/`_on_day_result`) → zamrzání UI na pomalém síťovém disku. Patří do worker vlákna se signály.
-- **`open_folder`/`_reload_with_last_cameras` (is_t)** busy-wait s `processEvents()` + `sleep` blokuje GUI až 3 s a hrozí re-entrancí.
-- **Žádná cache výpisu adresářů** — if_t `load_folders` i sf_t `_load_cameras` skenují všech 24 hodinových složek znovu při každé změně hodiny/zdroje/data.
-- **`_cpva_fetch_samples` serializuje vše přes jeden zámek/spojení** (if_t L149) — per-column ThreadPool tím pádem neběží paralelně.
-- **Bez cancel/generation tokenu** u sf_t search a camera-load workerů → výsledky zastaralých běhů přepíšou tabulku.
+### Efficiency / responsiveness
+- Network IO and PNG encoding still run on the main thread in some if_t / sf_t
+  save / try-again / open-in-slider paths → the UI freezes on a slow share.
+- No cached directory listing: `if_t.load_folders` and `sf_t._load_cameras` rescan
+  all 24 hour folders. (`if_t` no longer rescans on a change of HOUR — `_on_hour_change`
+  does not reload, a search starts only from View — and `_on_gradient_changed` no longer
+  throws the listing cache away, which used to cost a share re-read for a palette change.)
+- `if_t.load_folders` / `_scan_hour` still duplicate `is_t.cameras_for_windows`, which
+  does the same walk better (union over every hour folder of every window, plus search
+  and presets in `CameraPickerDialog`). Replacing it is the next cleanup here.
+- The sf_t search and camera-load workers have no cancel/generation token, so a
+  stale run can still overwrite the table.
 
-### Duplikace / mrtvý kód
-- if_t: třída `_NoScrollCalendar` (L539, mrtvá), `MIN_FULL_FILES`, `_range_gen`, ignorované parametry `select_images_from_folder`, 3× anotační font/wrap rutina, `_get_csv_best_hour_for_day` (pravděpodobně mrtvá).
-- is_t: `_LazyDirModel` stub, overlay-draw kód 4× kopírovaný, camera-scan worker 3× kopírovaný.
-- sf_t: `_setup_calendar` (dup `_make_cal`), `GRADIENTS_SF`, legacy skryté widgety.
-
-### Ostatní
-- Časté `except Exception: pass` napříč všemi moduly skrývá reálné chyby (zejm. `ScanTask.run` v is_t obaluje celý sken).
-- Míchání češtiny a angličtiny v komentářích — viz pravidlo English-only.
+### Duplication / dead code
+- The palette LUT tables and `_lut_pixels` are still defined three times
+  (`if_t.GRADIENTS`, `sf_t.SF_GRADIENTS`, `is_t.GRADIENTS`) with the same stops copied
+  by hand. The intensity SCALE now has one owner (`img_scale.py`); the palettes are the
+  remaining copy-paste, and the two per-frame ones (`Binary`, `False Colors`) have to
+  stay in step across all three. `wk_t` no longer has a copy — it borrows `is_t`'s
+  through `_get_slider_module()`, which is the pattern the other two should follow.
+- if_t: `MIN_FULL_FILES`, `_range_gen`, ignored `select_images_from_folder`
+  parameters, three near-duplicate annotation font/wrap routines.
+- is_t: `_LazyDirModel` stub (`pass`), overlay-draw code copied per view.
+- sf_t: `_setup_calendar` duplicates the calendar factory; legacy hidden widgets.
+- Frequent `except Exception: pass` hides real errors (notably `ScanTask.run`,
+  which wraps the whole scan).

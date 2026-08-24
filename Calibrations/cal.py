@@ -20,6 +20,46 @@ except Exception:
     xlwt = None
 
 
+def _icon_file():
+    """icon.ico sits next to the exe. __file__ points into the bundle in a
+    frozen build, which is not where the builder puts the icon."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+    cands.append(Path(__file__).resolve().parent / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 DEFAULT_INFO_TEXT = """\
 Calibration tool (Python replica of Calibrations2.xlsx logic)
 
@@ -191,9 +231,9 @@ class CalibrationTable(QMainWindow):
         self.setWindowTitle("Calibrations")
         self.resize(1320, 760)
         try:
-            _base = (Path(sys.executable).parent if getattr(sys, "frozen", False)
-                     else Path(__file__).parent)
-            self.setWindowIcon(QIcon(str(_base / "icon.ico")))
+            _ico = _icon_file()
+            if _ico:
+                self.setWindowIcon(QIcon(str(_ico)))
         except Exception:
             pass
 
@@ -1041,14 +1081,21 @@ QTableWidget::item:selected:!active {
 
 
 def main():
-    try:
-        import ctypes as _ct
-        _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Calibrations")
-    except Exception:
-        pass
+    # Before QApplication: Windows reads the identity when the first taskbar
+    # button is created. See _icon_app_id() for the content tag.
+    _aumid = _icon_app_id("ELI.Calibrations", _icon_file())
+    if _aumid:
+        try:
+            import ctypes as _ct
+            _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    _ico = _icon_file()
+    if _ico:
+        app.setWindowIcon(QIcon(str(_ico)))
     win = CalibrationTable()
-    win.show()
+    win.showMaximized()   # start maximized
     sys.exit(app.exec())
 
 

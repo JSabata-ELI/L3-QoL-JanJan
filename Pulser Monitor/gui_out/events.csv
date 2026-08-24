@@ -1,0 +1,4 @@
+array,pulser,kind,start,recovery,duration_s,dark_frames,nodata_frames,array_fell,restarts,ended_by
+PD1M1,C4,dropout,2026-06-24 08:10:59,2026-06-24 08:11:04,5,1,0,0,0,recovered
+PD1M1,C4,fault,2026-06-24 08:12:19,2026-06-24 08:12:49,30,6,0,0,0,recovered
+PD1M1,C4,trip,2026-06-24 08:14:04,2026-06-24 08:17:04,180,6,12,1,0,recovered

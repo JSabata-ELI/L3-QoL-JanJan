@@ -21,7 +21,7 @@ if getattr(sys, "frozen", False):
         with open(Path(sys.executable).resolve().parent / "debug_pil.txt", "w") as _f:
             _f.write(f"PIL import error: {e}\n")
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton, QLabel, QStatusBar
+from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton, QLabel
 from PySide6.QtCore import Qt, QTimer
 
 # ── version from exe name ─────────────────────────────────────────────────────
@@ -42,10 +42,123 @@ APP_VERSION = _detect_version()
 APP_TITLE   = f"Image Tools {APP_VERSION}".strip()
 
 
+# ── icon helpers ──────────────────────────────────────────────────────────────
+def _icon_file() -> Path | None:
+    """Locate icon.ico next to the exe (frozen) or the script, with a
+    PyInstaller _MEIPASS fallback for one-file builds."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(Path(sys.executable).resolve().parent / "icon.ico")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            cands.append(Path(meipass) / "icon.ico")
+    else:
+        cands.append(Path(__file__).resolve().parent / "icon.ico")
+    for p in cands:
+        if p.exists():
+            return p
+    return None
+
+
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
+# Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
+# here. Measured on Win11: with the window icon and the window-class icon
+# deliberately set to two different images, the taskbar draws the *window*
+# icon, so Qt's setWindowIcon is already sufficient and forcing the class icon
+# changes nothing. (That helper is only needed for the Tk apps, where
+# iconbitmap leaves the small slots on Tk's default feather.)
+
+
+# ── wheel guard ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so a settings panel still
+    scrolls when the pointer happens to pass over a field on the way down. A
+    control that is meant to take the wheel at any time carries the "wheelAlways"
+    property — the frame sliders of the Slider tab use it, because stepping
+    through shots with the wheel is the whole point of them.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `_import_img_scale` is copied into each tab).
+    """
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QApplication, QComboBox,
+                                   QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     """
-    Build and return the main window.
+    Build and return the main window.že to 
     Separated from main() so it can be called from tests or other scripts.
     """
     # if.py and is.py cannot be imported with normal 'import' because
@@ -88,6 +201,16 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         _wk = _load_module("workshop", "wk_t.py")
     except Exception as e:
         raise RuntimeError(f"wk_t.py error: {e}") from e
+    # One Moment is loaded last: it borrows the Slider's PV and camera pickers, the
+    # Shot Finder's frame resolver and the Workshop's painted icons, so all three must
+    # already be in sys.modules. It keeps its own try because it is the newest tab and
+    # a failure in it must not take the other four down with it.
+    _om_error = ""
+    try:
+        _om = _load_module("one_moment", "om_t.py")
+    except Exception as e:
+        _om = None
+        _om_error = str(e)
     ShotFinderWidget  = _sf.ShotFinderWidget
     ImageFinderWidget = _if.ImageFinderWidget
     Viewer            = _is.Viewer
@@ -97,12 +220,8 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     win.setWindowTitle(APP_TITLE)
     try:
         from PySide6.QtGui import QIcon
-        if getattr(sys, "frozen", False):
-            _base = Path(sys.executable).resolve().parent
-        else:
-            _base = Path(__file__).resolve().parent
-        _icon_path = _base / "icon.ico"
-        if _icon_path.exists():
+        _icon_path = _icon_file()
+        if _icon_path:
             win.setWindowIcon(QIcon(str(_icon_path)))
     except Exception:
         pass
@@ -118,9 +237,32 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     workshop = WorkshopWidget()
     viewer.setWindowTitle("")    # title is handled by main window
 
+    # The Finder's job is comparing ONE camera across MANY days — the transpose of the
+    # Slider, which compares many cameras at one moment. The tab keeps the name the
+    # operators know it by: "Image Finder".
     tabs.addTab(finder, "Image Finder")
     tabs.addTab(viewer, "Image Slider")
     tabs.addTab(shot_finder, "Shot Finder")
+
+    # One Moment — everything at ONE time, the transpose of the Slider.
+    one_moment = None
+    if _om is not None:
+        try:
+            one_moment = _om.OneMomentWidget()
+            tabs.addTab(one_moment, "One Moment")
+        except Exception as e:
+            one_moment = None
+            _om_error = str(e)
+    if one_moment is None:
+        # Say so on a tab of its own rather than quietly offering four tabs: a missing
+        # tab reads as "this version does not have it" and sends the operator looking
+        # for a newer build that does not exist.
+        _broken = QLabel("One Moment could not be loaded:\n\n" + (_om_error or "?"))
+        _broken.setWordWrap(True)
+        _broken.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _broken.setStyleSheet("color: #b00020; padding: 24px;")
+        tabs.addTab(_broken, "One Moment (unavailable)")
+
     tabs.addTab(workshop, "Workshop")
 
     # Wire up the integration: finder can switch to slider tab and load folder
@@ -139,19 +281,33 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     viewer._workshop_tab_idx  = workshop_idx
     shot_finder._workshop_ref     = workshop
     shot_finder._workshop_tab_idx = workshop_idx
+    if one_moment is not None:
+        one_moment._workshop_ref     = workshop
+        one_moment._workshop_tab_idx = workshop_idx
+        one_moment._tab_widget       = tabs
+        # ...and "Send to Image Slider": One Moment finds the shot, the Slider is
+        # where it gets looked at (viewer.open_moment).
+        one_moment._slider_ref       = viewer
+        one_moment._slider_tab_idx   = tabs.indexOf(viewer)
+
+    # ...and the way back: "Show in Image Slider" opens the folder a Workshop frame
+    # came from. Only the folder — the Slider browses files on the share, so an edited
+    # picture is not something it can be handed.
+    workshop._slider_ref     = viewer
+    workshop._slider_tab_idx = tabs.indexOf(viewer)
+    workshop._tab_widget     = tabs
 
     win.setCentralWidget(tabs)
 
-    # Stop All tlačítko ve status baru
-    status_bar = QStatusBar()
-    win.setStatusBar(status_bar)
-
+    # Stop All tlačítko v řádku záložek (corner widget) — status bar se nepoužívá,
+    # takže tabs vyplní celou výšku okna až po spodní hranu.
     btn_stop_all = QPushButton("⏹ Stop All")
     btn_stop_all.setToolTip("Stop all running background operations")
     btn_stop_all.setStyleSheet(
         "QPushButton { background: #cc3300; color: #fff; font-weight: 700; "
         "padding: 3px 12px; border-radius: 3px; margin: 2px; }"
         "QPushButton:hover { background: #aa2200; }")
+    tabs.setCornerWidget(btn_stop_all, Qt.Corner.TopRightCorner)
 
     def _stop_all():
         try: finder.cancel_scan()
@@ -166,9 +322,11 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
             shot_finder._prog.setVisible(False)
             shot_finder._result_lbl.setText("Stopped.")
         except Exception: pass
+        if one_moment is not None:
+            try: one_moment.cancel_scan()
+            except Exception: pass
 
     btn_stop_all.clicked.connect(_stop_all)
-    status_bar.addPermanentWidget(btn_stop_all)
 
     if folder_arg is not None:
         QTimer.singleShot(200, lambda: _open_folder_in_slider(viewer, tabs, folder_arg))
@@ -206,24 +364,23 @@ def main():
 
     # Nastav AppUserModelID před vytvořením QApplication — Windows použije
     # toto ID pro groupování v taskbaru a zobrazení správné ikony.
-    try:
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "ELIBeamlines.ImageTools"
-        )
-    except Exception:
-        pass
+    # See _icon_app_id() for why the id carries a hash of the icon.
+    _aumid = _icon_app_id("ELIBeamlines.ImageTools", _icon_file())
+    if _aumid:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
+        except Exception:
+            pass
 
     app = QApplication.instance() or QApplication(sys.argv)
+    install_wheel_guard(app)
 
     # Nastav ikonu na úrovni aplikace — platí pro taskbar i alt-tab
+    _ico = _icon_file()
     try:
         from PySide6.QtGui import QIcon
-        _here = (Path(sys.executable).resolve().parent
-                 if getattr(sys, "frozen", False)
-                 else Path(__file__).resolve().parent)
-        _ico = _here / "icon.ico"
-        if _ico.exists():
+        if _ico:
             app.setWindowIcon(QIcon(str(_ico)))
     except Exception:
         pass

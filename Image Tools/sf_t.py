@@ -15,16 +15,14 @@ import csv
 import json
 import os
 import re as _re
-import ssl
 import sys as _sys
 import shutil
 import subprocess
 import tempfile
 import atexit
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, date, timezone
 from pathlib import Path
 from PySide6.QtGui import QIcon
@@ -36,15 +34,16 @@ except ImportError:
     PRAGUE = None
 
 from PySide6.QtCore import Qt, QDate, QObject, Signal, QTimer, QEvent
-from PySide6.QtGui import QColor, QTextCharFormat, QPixmap
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QLineEdit,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QCalendarWidget,
+    QHeaderView, QAbstractItemView,
     QMessageBox, QMainWindow, QStyledItemDelegate, QSizePolicy,
     QProgressBar, QPlainTextEdit, QRadioButton, QButtonGroup,
-    QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QGroupBox,
+    QSpinBox, QCheckBox, QDialog, QDialogButtonBox, QGroupBox, QSlider,
+    QFileDialog, QMenu, QInputDialog, QSplitter,
 )
 
 # ── GRADIENTS (kopie z is_t.py) ───────────────────────────────────────────────
@@ -79,11 +78,50 @@ def _make_stepped_lut_sf(stops):
         lut[i] = color
     return lut
 
+# NI Vision "Binary", measured off the real viewer — same table and rule as in is_t.py,
+# where how it was measured is written down. 15 colours, black below the first band, one
+# colour per 1024 stored 16-bit units. No white and no grey anywhere in the cycle.
+_NI_BINARY_CYCLE_SF = [
+    (255,0,0), (0,255,0), (0,0,255), (255,255,0), (255,0,255), (0,255,255),
+    (255,127,0), (255,0,127), (127,255,0), (127,0,255), (0,127,255), (0,255,127),
+    (255,127,127), (127,255,127), (127,127,255),
+]
+
+def _make_ni_binary_lut_sf():
+    """The NI Binary rule as a 256-entry LUT over the ABSOLUTE 8-bit scale.
+
+    This tab renders from 8-bit images, so unlike the Image Slider it cannot take the
+    exact 16-bit path: one code is 257 stored units against a 1024-unit band."""
+    table = _np_grad.array([(0, 0, 0)] + _NI_BINARY_CYCLE_SF, dtype=_np_grad.uint8)
+    band = (_np_grad.arange(256, dtype=_np_grad.int64) * 257) // 1024
+    return table[_np_grad.where(band <= 0, 0, (band - 1) % 15 + 1)]
+
+# "False Colors" (same definition as in is_t.py): dark blue → violet → purple →
+# magenta → pink → white, with the stops crowded at the bottom so faint detail gets
+# most of the colour range.
+_FALSE_COLORS_STOPS_SF = [
+    (0.00, (0,0,0)), (0.03, (25,0,70)), (0.07, (45,0,120)), (0.12, (70,0,160)),
+    (0.20, (100,0,180)), (0.30, (130,5,185)), (0.42, (160,20,180)),
+    (0.55, (190,40,175)), (0.68, (215,70,170)), (0.80, (235,105,170)),
+    (0.90, (247,150,185)), (0.96, (252,200,215)), (1.00, (255,255,255)),
+]
+
+# "Rainbow" (same definition as in is_t.py): the NI Vision palette — blue to red with
+# a prominent green middle, 0 black and 255 white.
+_RAINBOW_STOPS_SF = [
+    (0.00, (0,0,0)), (0.04, (0,0,200)), (0.14, (0,40,255)), (0.26, (0,150,255)),
+    (0.36, (0,230,180)), (0.46, (0,255,80)), (0.56, (90,255,0)), (0.66, (190,255,0)),
+    (0.76, (255,220,0)), (0.86, (255,120,0)), (0.94, (255,0,0)), (1.00, (255,255,255)),
+]
+
 SF_GRADIENTS: dict = {
     "Grayscale":       None,
     "Gradient":        _make_lut_sf([(0,(0,0,0)),(0.15,(255,0,0)),(0.30,(255,200,0)),(0.45,(255,255,0)),(0.58,(0,255,0)),(0.68,(0,220,255)),(0.92,(255,255,255)),(1,(255,255,255))]),
-    "Hot":             _make_lut_sf([(0,(0,0,0)),(0.33,(255,0,0)),(0.66,(255,255,0)),(1,(255,255,255))]),
-    "Binary":          _make_stepped_lut_sf([(0,(0,0,0)),(0.17,(255,0,0)),(0.33,(255,165,0)),(0.5,(255,255,0)),(0.67,(0,255,0)),(0.83,(0,200,255)),(0.92,(0,0,255)),(1,(255,255,255))]),
+    "Binary":          _make_ni_binary_lut_sf(),
+    "False Colors":    _make_lut_sf(_FALSE_COLORS_STOPS_SF),
+    "Rainbow":         _make_lut_sf(_RAINBOW_STOPS_SF),
+    # Red / yellow lowered, pale yellow added, white kept at the top; see is_t.py.
+    "Hot":             _make_lut_sf([(0,(0,0,0)),(0.27,(255,0,0)),(0.53,(255,255,0)),(0.78,(255,255,190)),(1,(255,255,255))]),
     "Black and White": _make_binary_lut_sf(),
     "Viridis":         _make_lut_sf([(0,(68,1,84)),(0.25,(59,82,139)),(0.5,(33,145,140)),(0.75,(94,201,98)),(1,(253,231,37))]),
     "Plasma":          _make_lut_sf([(0,(13,8,135)),(0.25,(126,3,168)),(0.5,(204,71,120)),(0.75,(248,149,64)),(1,(240,249,33))]),
@@ -91,6 +129,31 @@ SF_GRADIENTS: dict = {
     "Jet":             _make_lut_sf([(0,(0,0,128)),(0.125,(0,0,255)),(0.375,(0,255,255)),(0.625,(255,255,0)),(0.875,(255,0,0)),(1,(128,0,0))]),
     "Turbo":           _make_lut_sf([(0,(48,18,59)),(0.2,(70,131,193)),(0.4,(48,210,142)),(0.6,(194,228,59)),(0.8,(244,117,22)),(1,(122,4,3))]),
 }
+
+# Palettes mapped onto the frame's own p0.5..p99.5 window — see is_t.ADAPTIVE_PALETTES.
+ADAPTIVE_PALETTES_SF = frozenset({"False Colors"})
+# Cyclic palettes are ABSOLUTE: NI's Binary bands are fixed and do not follow the frame,
+# so no stretch may run first (see is_t.CYCLIC_PALETTES).
+CYCLIC_PALETTES_SF = frozenset({"Binary"})
+
+
+def _lut_pixels_sf(lut, arr, name: str):
+    """RGB pixels for `arr` under `lut`.
+
+    The adaptive palettes are spread over p0.5..p99.5; everything else, cyclic palettes
+    included, is the raw absolute scale."""
+    if name not in ADAPTIVE_PALETTES_SF:
+        return lut[arr]
+    s = arr if arr.size <= 250_000 else _np_grad.ravel(arr)[::(arr.size // 250_000) | 1]
+    lo = float(_np_grad.percentile(s, 0.5))
+    hi = float(_np_grad.percentile(s, 99.5))
+    if hi <= lo:
+        lo, hi = float(arr.min()), float(arr.max())
+    if hi <= lo:
+        return lut[arr]
+    scaled = _np_grad.clip((arr.astype(_np_grad.float32) - lo) * (255.0 / (hi - lo)),
+                           0, 255).astype(_np_grad.uint8)
+    return lut[scaled]
 
 _CHECKBOX_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
@@ -100,21 +163,33 @@ QCheckBox::indicator:hover { border: 2px solid #2d7dff; background: #f4f8ff; }
 QCheckBox::indicator:checked { border: 2px solid #2d7dff; background: #2d7dff; }
 """
 
-_CHECKBOX_STYLE_SM = _CHECKBOX_STYLE + "QCheckBox { font-size: 10px; }"
+_PV_NAME_FONT_PX = 10          # keep in sync with _CHECKBOX_STYLE_SM's font-size
+_CHECKBOX_STYLE_SM = _CHECKBOX_STYLE + f"QCheckBox {{ font-size: {_PV_NAME_FONT_PX}px; }}"
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-IMAGES_ROOT_OPTIONS = {
-    "Lab":    Path(r"//users-L3.tier0.lcs.local/cpva-image-2026"),
-    "Office": Path(r"\\users-L3.tier0.lcs.local\cpva-image-2026"),
-}
-IMAGES_ROOT = IMAGES_ROOT_OPTIONS["Lab"]   # default; overridden by UI combo
+# One archive, one path. A Lab / Office switch used to sit on the panel, but both of
+# its entries named the SAME share (only the slash style differed), the images are
+# reached the same way from the lab and from the office, and the CSV fallback below is
+# dormant — so the switch could only ever be set wrong, never usefully.
+IMAGES_ROOT = Path(r"//users-L3.tier0.lcs.local/cpva-image-2026")
 
-ENERGY_CSV_ROOT_OPTIONS = {
-    "Lab":    r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata",
-    "Office": r"Z:\Salvation\2026_alldata",
-}
+
+def _images_root_for_year(images_root: Path, year: int) -> Path:
+    """Return the images root with its share pointing at the given year.
+
+    Each year lives in its own share (cpva-image-<year>). The Lab/Office root
+    only fixes the host + slash style, so swap just the year in the share name
+    (Path.parent cannot be used: on a UNC path the share is part of the anchor).
+    """
+    swapped, n = _re.subn(r"cpva-image-\d{4}", f"cpva-image-{year}", str(images_root), count=1)
+    return Path(swapped) if n else images_root / f"cpva-image-{year}"
+
+# Salvation is NOT running (as of 2026-08-19), so no new daily CSV is written and
+# this fallback yields nothing for recent days — energy comes from the CPVA archiver
+# alone. Kept wired up on purpose: historical days still have their CSV, and the
+# fallback costs nothing until the archiver answers a day with no samples.
 # CSV fallback — same root / format as Image Finder
-ENERGY_CSV_ROOT     = ENERGY_CSV_ROOT_OPTIONS["Lab"]
+ENERGY_CSV_ROOT     = r"//hapls-share.cs.eli-beams.eu/scratch/Salvation/2026_alldata"
 ENERGY_CSV_NAME_FMT = "dataof%Y%b_%d"   # e.g. dataof2026Mar_24
 # Tolerance for closest-timestamp extra-column matching (seconds).
 # PV channels (esp. Back_Ref / waveplate) are sampled sparsely, so a too-tight
@@ -124,6 +199,24 @@ EXTRA_COL_MATCH_TOL_S = 30.0
 # Widened from 10 s — per-day clock drift between archiver and camera filenames
 # could exceed 10 s and blank the preview.
 IMG_MATCH_TOL_NS = 30_000_000_000
+# How far the camera scan goes into the picked Time window. The camera list is the
+# union over the days it scans, newest first, and it stops once this many days have
+# actually answered with folders -- see _load_cameras for why one day is not enough.
+CAM_SCAN_MAX_DAYS       = 10
+CAM_SCAN_DAYS_WITH_DATA = 2
+
+_CAM_IMG_MARK_RE = _re.compile(r"[-_]+IMG(?=$|[-_])", _re.IGNORECASE)
+_CAM_CONTAINER_RE = _re.compile(r"^C\d{2}[-_]", _re.IGNORECASE)
+
+def _clean_cam_for_filename(cam: str) -> str:
+    """Camera token as it should appear in a saved file name:
+    'C03-040-PFM13NF-_-IMG' -> '040-PFM13NF'.
+
+    The '-IMG' marker and the leading container code carry no information for the
+    person looking at the file. Cameras without a 'Cxx-' prefix keep whatever
+    they have."""
+    s = _CAM_IMG_MARK_RE.sub("", cam).strip("-_")
+    return _CAM_CONTAINER_RE.sub("", s, count=1).strip("-_")
 
 # ── CPVA ARCHIVER API ─────────────────────────────────────────────────────────
 def _import_cpva_client():
@@ -143,6 +236,24 @@ def _import_cpva_client():
 
 
 cpva = _import_cpva_client()
+
+
+def _import_img_scale():
+    """Load the shared intensity-scale helper (sibling img_scale.py) the same way
+    as cpva_client: one instance per process, registered before exec."""
+    import importlib.util as _ilu
+    mod = _sys.modules.get("img_scale")
+    if mod is not None:
+        return mod
+    p = Path(__file__).resolve().parent / "img_scale.py"
+    spec = _ilu.spec_from_file_location("img_scale", p)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules["img_scale"] = mod     # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+img_scale = _import_img_scale()
 
 CPVA_BASE_URL     = cpva.CPVA_BASE_URL
 CPVA_HTTP_TIMEOUT = 15.0   # seconds per channel request
@@ -170,6 +281,28 @@ def _get_slider_module():
         _SLIDER_MOD = mod
     return _SLIDER_MOD
 
+
+_FINDER_MOD = None
+
+
+def _get_finder_module():
+    """Borrow the Image Finder's `_make_mpl_toolbar` — the one graph toolbar factory
+    that also REPAINTS the icons, without which matplotlib draws them white on this
+    app's palette. Same one-instance rule as _get_slider_module."""
+    global _FINDER_MOD
+    mod = _sys.modules.get("image_finder")
+    if mod is not None:
+        return mod
+    if _FINDER_MOD is None:
+        import importlib.util as _ilu
+        p = Path(__file__).resolve().parent / "if_t.py"
+        spec = _ilu.spec_from_file_location("if_t_helpers", p)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FINDER_MOD = mod
+    return _FINDER_MOD
+
+
 PV_COLUMNS: dict[str, str] = {
     "sbw4":      "SBW4 [J]",
     "ptm1":      "PTM1 [J]",
@@ -182,52 +315,102 @@ PV_COLUMNS: dict[str, str] = {
 
 MJ_COLUMNS = {"Back_Ref", "pap1"}
 
-SBW4_TRANSMISSION        = 0.749
+# PV-search ranking lives in cpva_client so the Shot Finder and the Image Slider
+# picker cannot drift apart (see cpva.rank_pv_match).
+_CAM_CHANNEL_RE = cpva.CAM_CHANNEL_RE
+
 SBW4_WARNING_THRESHOLD_J = 0.5
+
+# NO column is converted here. SBW4 used to be multiplied by 0.749 (the L3 compressor
+# transmission) everywhere this tab printed a value, which made it the only place where
+# "SBW4" did not mean the channel's own reading. A picked PV reports what the archiver
+# holds — nothing else. Anything derived from a PV belongs in the Slider's PV picker,
+# which has named entries ("Compressed SBW4") and formulas for it.
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
-def _read_img_max_value(path: Path) -> "float | None":
-    """Read imgMaxValue from PNG tEXt metadata — physical maximum pixel value
-    recorded by the camera (equivalent to Matlab imgMeta.OtherText{12,2}).
-    Returns float or None if not found."""
-    if path.suffix.lower() != ".png":
-        return None
-    try:
-        from PIL import Image as _PilImg
-        with _PilImg.open(str(path)) as pil:
-            info = pil.info
-            chunks = [(k, v) for k, v in info.items() if isinstance(v, str)]
-            if len(chunks) >= 12:
-                v = chunks[11][1]
-                try:
-                    return float(v)
-                except (ValueError, TypeError):
-                    pass
-            for k, v in chunks:
-                try:
-                    f = float(v)
-                    if 0 < f <= 65535:
-                        return f
-                except (ValueError, TypeError):
-                    pass
-    except Exception:
-        pass
-    return None
+# The `MaxValue` tEXt reader that used to live here is gone: its only callers were the
+# three render paths below, and they do not need it. It is the frame's PEAK in raw
+# counts (not the sensor's range — it reads 4095 only because a saturated 12-bit frame's
+# peak IS 4095), it identified the tag by POSITION (tEXt chunk 12, the Matlab
+# `imgMeta.OtherText{12,2}` idiom), and it cost one extra open of a file on the share
+# per rendered frame. `img_scale.read_max_value` is the name-based reader if the number
+# is ever wanted again.
 
 
-def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
-                        timeout: float = CPVA_HTTP_TIMEOUT) -> "tuple[list[dict], str]":
-    """Fetch archiver samples via the shared pooled client (keep-alive, retry).
-    Returns (samples_list, url_used). Raises cpva.CpvaError."""
-    url = f"{CPVA_BASE_URL}/samples?channelName={urllib.parse.quote(channel)}"
-    return cpva.fetch_samples(channel, start_ns, end_ns, timeout=timeout), url
+# ── Contrast / Brightness / Gamma rows ─────────────────────────────────────
+# Built exactly like the Image Slider's block, down to the short names and the readout
+# widths: the same three controls with the same rule (an Auto checkbox overrides its own
+# row's slider) have to look the same in both tabs, or the operator learns them twice.
+# The names are shortened to Con / Bri / Gam so a numeric readout of the value actually
+# in use fits on the same row — acceptable only because the full name and the meaning
+# are one hover away: the tooltip sits on the name label, the slider AND the readout.
+_BC_NAME_W = 34          # room for "Con:" / "Bri:" / "Gam:" so the three sliders align
+_BC_VALUE_W = 38         # room for "-127", "-255", "0.10" without the row jittering
+
+_TT_CONTRAST = (
+    "Contrast (-127 to +127) — multiplicative gain around the frame's own black level.\n"
+    "0 = untouched; positive spreads the values apart, negative squeezes them together.")
+_TT_BRIGHTNESS = (
+    "Brightness (-255 to +255) — additive offset: the number is added to every pixel.\n"
+    "0 = untouched; positive lifts the whole frame, negative darkens it.")
+_TT_GAMMA = (
+    f"Gamma ({img_scale.GAMMA_MIN:.2f}–{img_scale.GAMMA_MAX:.2f}) — the number shown is "
+    "the exponent of the display curve.\n"
+    "1.00 = linear absolute scale. Below 1 lifts the dark end (0.50 is the usable "
+    "working point on these cameras); above 1 darkens.\n"
+    "Comparability survives — the same pixel value always gives the same colour. "
+    "What changes is that equal count differences stop looking equally big.")
+
+
+def _bc_value_label(text: str, tooltip: str) -> QLabel:
+    """Read-only numeric readout for a Contrast/Brightness/Gamma row."""
+    lbl = QLabel(text)
+    lbl.setFixedWidth(_BC_VALUE_W)
+    lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    lbl.setToolTip(tooltip)
+    lbl.setStyleSheet(
+        "QLabel { font-weight: 700; color: #111; }"
+        "QLabel:disabled { color: #9a9a9a; }")
+    return lbl
+
+
+def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None,
+               contrast: int = 0, offset: int = 0, out: "dict | None" = None):
+    """Decoded frame → uint8 for display. Every render path in this tab goes through
+    here, so the Shot Finder cannot drift from the Finder or the Slider.
+
+    Absolute unless Auto contrast is ticked — see img_scale.render_u8. `gamma` is in
+    slider units and bends the absolute curve without costing comparability;
+    `contrast` / `offset` are the manual pair applied on top. What this replaced was
+    `MaxValue * arr / arr.max()` then `/4095`: right only for 12-bit cameras, near-black
+    on the 6–11 bit diode cameras, and all-white when the tEXt chunk was missing."""
+    if full_scale is None:
+        full_scale = img_scale.FULL_SCALE_16
+    return img_scale.render_u8(arr, auto, full_scale, gamma, contrast, offset, out)
+
+
+def _full_scale_for_mode(mode: str, path=None, info: dict = None) -> float:
+    """Absolute range of a decoded frame, from the PIL MODE — never from arr.max(): a
+    genuinely dark 16-bit frame can hold nothing above 255 and would be brightened
+    257× by a value-based guess.
+
+    With `path` and the open image's `.info`, a 16-bit frame goes on its CAMERA's
+    reference range instead of a flat 65535 — the archiver's stretch factor is a bracket
+    of each frame's own peak, so a camera sitting on a power of two otherwise doubles and
+    halves in brightness between frames (see img_scale)."""
+    if mode not in ("I", "I;16"):
+        return 255.0
+    if path is None:
+        return img_scale.FULL_SCALE_16
+    return img_scale.full_scale_for_pil(path, info or {}, mode)
 
 
 def _cpva_fetch_channels(pattern: str = "**",
                          timeout: float = CPVA_HTTP_TIMEOUT) -> "list[str]":
-    """Return all archiver channel names matching `pattern` (default: all)."""
-    return cpva.fetch_channels(pattern, timeout=timeout)
+    """Return all archiver channel names matching `pattern` (default: all).
+    Cached process-wide, so opening a second picker costs nothing."""
+    return cpva.fetch_channels_cached(pattern, timeout=timeout)
 
 
 def _load_csv_for_day(day: date, cols: "list[str]",
@@ -288,17 +471,34 @@ def _load_csv_for_day(day: date, cols: "list[str]",
     return merged, per_col
 
 
+def _ns_to_prague(t_ns: int) -> datetime:
+    """UTC nanoseconds → lab (Prague) wall clock. The archive is UTC, everything the
+    operator reads is Prague — see the shared timezone rule.
+
+    Returned NAIVE, like the `_dt` field of every sample row: matplotlib plots a
+    tz-aware datetime in ITS own timezone (UTC by default), which shifted the whole
+    day's curve two hours to the left."""
+    if PRAGUE is not None:
+        return (datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc)
+                .astimezone(PRAGUE).replace(tzinfo=None))
+    return datetime.fromtimestamp(t_ns / 1e9, tz=timezone.utc).replace(tzinfo=None)
+
+
 def _load_api_for_day(day: date, cols: "list[str]",
                       log=None,
-                      csv_root: "str | None" = None) -> "tuple[list[dict], dict[str, list[dict]]]":
+                      csv_root: "str | None" = None
+                      ) -> "tuple[list[dict], dict[str, list[dict]], dict[str, dict]]":
     """
     Query the CPVA archiver for all requested PV columns over the full day.
-    Falls back to CSV if API returns no data for a column.
+    Falls back to CSV only when the API answered successfully with no samples —
+    an API fetch FAILURE must not be papered over with possibly-zero CSV values
+    (that silent source mixing produced alternating real/0 values day to day).
 
-    Returns (merged_rows, per_col_rows) where:
+    Returns (merged_rows, per_col_rows, col_meta) where:
       - merged_rows: list of row dicts merged by timestamp across all channels
       - per_col_rows: dict mapping col → sorted list of single-col row dicts
         (used for closest-timestamp extra-column matching)
+      - col_meta: col → {"source": "api"|"csv"|"none", "status": "ok"|"stale"|"error"|"empty"}
 
     Each row dict has:
       "_dt" : datetime (Prague-naive)
@@ -309,31 +509,26 @@ def _load_api_for_day(day: date, cols: "list[str]",
         if log is not None:
             log(msg)
 
-    if PRAGUE is None:
-        day_start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc)
-    else:
-        day_start = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=PRAGUE)
-        day_end   = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=PRAGUE)
-
-    start_ns = int(day_start.timestamp() * 1_000_000_000)
-    end_ns   = int(day_end.timestamp()   * 1_000_000_000)
-
     # Per-column sample lists (API first, CSV fallback per column)
     per_col: dict[str, list[dict]] = {}
+    col_meta: dict[str, dict] = {}
 
-    def _fetch_one_col(col: str) -> tuple[str, list[dict]]:
+    def _fetch_one_col(col: str) -> "tuple[str, list[dict], dict]":
         # Preset cols map to a friendly channel; arbitrary cols ARE the channel.
         channel = CPVA_CHANNEL_MAP.get(col, col)
         col_rows: list[dict] = []
+        meta = {"source": "none", "status": "empty"}
         if channel:
             date_key = day.strftime("%Y-%m-%d")
             # Shared day cache: repeat searches over the same days are served
             # from memory; the ".value" channel-suffix retry happens inside.
             res = cpva.get_day(channel, date_key, timeout=CPVA_HTTP_TIMEOUT)
+            meta["status"] = res.status
             if res.status == "error":
-                _log(f"  API {col} ({channel}) FETCH FAILED (will retry) — falling back to CSV")
-            elif res.status == "stale":
+                _log(f"  API {col} ({channel}) FETCH FAILED — shown as ERR "
+                     f"(no CSV fallback: mixing sources hides the outage)")
+                return col, [], meta
+            if res.status == "stale":
                 _log(f"  API {col} ({channel}): fetch failed, using "
                      f"{len(res.samples)} samples from {res.age_s:.0f}s ago")
             for t_ns, v in res.samples:
@@ -344,6 +539,7 @@ def _load_api_for_day(day: date, cols: "list[str]",
                     dt_local = datetime.utcfromtimestamp(t_ns / 1e9)
                 col_rows.append({"_dt": dt_local, "_ns": t_ns, col: str(v)})
             if col_rows:
+                meta["source"] = "api"
                 _log(f"  API {col} ({channel}): {len(col_rows)} samples")
         else:
             _log(f"  {col}: no CPVA channel mapping, trying CSV only")
@@ -351,20 +547,26 @@ def _load_api_for_day(day: date, cols: "list[str]",
             _, csv_per = _load_csv_for_day(day, [col], csv_root=csv_root)
             col_rows = csv_per.get(col, [])
             if col_rows:
+                meta["source"] = "csv"
+                meta["status"] = "ok"
                 _log(f"  CSV fallback {col}: {len(col_rows)} rows")
             else:
                 _log(f"  CSV fallback {col}: no data")
-        return col, col_rows
+        return col, col_rows, meta
 
     with ThreadPoolExecutor(max_workers=max(1, len(cols))) as _aex:
         _col_futs = {_aex.submit(_fetch_one_col, c): c for c in cols}
         for _fut in as_completed(_col_futs):
             try:
-                _col, _col_rows = _fut.result()
+                _col, _col_rows, _meta = _fut.result()
+                col_meta[_col] = _meta
                 if _col_rows:
                     per_col[_col] = _col_rows
             except Exception as exc:
                 _log(f"  col fetch ERROR: {type(exc).__name__}: {exc}")
+
+    for c in cols:
+        col_meta.setdefault(c, {"source": "none", "status": "error"})
 
     # Merge all per-col rows into a single list keyed by _ns
     by_ts: dict[int, dict] = {}
@@ -380,51 +582,139 @@ def _load_api_for_day(day: date, cols: "list[str]",
     _log(f"  {day}: merged {len(merged)} rows; samples per col: {counts}")
     for c in cols:
         if not per_col.get(c):
-            _log(f"  ⚠ {day}: NO data for '{c}' (API+CSV both empty)")
-    return merged, per_col
+            st = col_meta[c]["status"]
+            _log(f"  ⚠ {day}: NO data for '{c}' "
+                 f"({'fetch FAILED' if st == 'error' else 'API+CSV both empty'})")
+    return merged, per_col, col_meta
 
 
 def _find_closest_col_value(per_col: "dict[str, list[dict]]", col: str,
                              target_ns: int, tol_s: float = EXTRA_COL_MATCH_TOL_S,
                              log=None) -> str:
+    """Compat wrapper around _lookup_col_value — formatted-ish raw value or "—"."""
+    raw, state = _lookup_col_value(per_col, {}, col, target_ns, tol_s=tol_s,
+                                   allow_network=False, log=log)
+    return raw if state == "ok" else "—"
+
+
+def _lookup_col_value(per_col: "dict[str, list[dict]]", col_meta: "dict[str, dict]",
+                      col: str, target_ns: int,
+                      tol_s: float = EXTRA_COL_MATCH_TOL_S,
+                      allow_network: bool = True,
+                      log=None) -> "tuple[str, str]":
     """
-    Find the closest-timestamp value for `col` within tol_s seconds of target_ns.
-    Returns formatted value string or "—" if no match.
+    Resolve the value of `col` at target_ns. Returns (raw_value, state):
+      state "ok"        — sample within tol_s (or slow-PV look-back hit); raw is valid
+      state "error"     — the fetch for this column FAILED (display "ERR")
+      state "not_found" — data loaded fine but no sample matches (display "n/a")
+
+    Slow PVs (waveplate — archived on-change, so the last sample can be days
+    old) fall back to the archiver's last-at-or-before lookup. Fast energy PVs
+    never do: a value from a different shot minutes away would be wrong.
+    allow_network=False (UI thread) still serves look-back cache hits.
     """
+    meta = col_meta.get(col, {})
     rows = per_col.get(col)
-    if not rows:
-        if log is not None:
-            log(f"  closest '{col}': no samples loaded → —")
-        return "—"
-    ts_list = [r["_ns"] for r in rows]
-    idx = bisect.bisect_left(ts_list, target_ns)
     best = None
     best_diff = float("inf")
-    for i in [idx - 1, idx]:
-        if 0 <= i < len(rows):
-            diff = abs(rows[i]["_ns"] - target_ns)
-            if diff < best_diff:
-                best_diff = diff
-                best = rows[i]
-    tol_ns = int(tol_s * 1_000_000_000)
-    if best is not None and best_diff <= tol_ns:
-        return best.get(col, "—")
-    if log is not None and best is not None:
-        log(f"  closest '{col}': nearest sample {best_diff/1e9:.1f}s away "
-            f"(> {tol_s:.0f}s window) → —")
-    return "—"
+    if rows:
+        ts_list = [r["_ns"] for r in rows]
+        idx = bisect.bisect_left(ts_list, target_ns)
+        for i in [idx - 1, idx]:
+            if 0 <= i < len(rows):
+                diff = abs(rows[i]["_ns"] - target_ns)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = rows[i]
+        tol_ns = int(tol_s * 1_000_000_000)
+        if best is not None and best_diff <= tol_ns:
+            return best.get(col, ""), "ok"
+
+    # No sample in window — slow PVs look back for the last known value.
+    channel = CPVA_CHANNEL_MAP.get(col, col)
+    if channel in cpva.FORWARD_CHANNELS:
+        res = cpva.value_at_or_before(channel, int(target_ns),
+                                      timeout=CPVA_HTTP_TIMEOUT,
+                                      network_ok=allow_network)
+        if res.value is not None:
+            if log is not None:
+                log(f"  '{col}': look-back hit (last change "
+                    f"{(target_ns - (res.ts_ns or target_ns)) / 1e9 / 3600:.1f} h before)")
+            return str(res.value), "ok"
+        if res.status == "error":
+            return "", "error"
+
+    if not rows and meta.get("status") == "error":
+        return "", "error"
+    if log is not None:
+        if best is not None:
+            log(f"  closest '{col}': nearest sample {best_diff/1e9:.1f}s away "
+                f"(> {tol_s:.0f}s window) → n/a")
+        else:
+            log(f"  closest '{col}': no samples loaded → n/a")
+    return "", "not_found"
+
+
+def _format_value_state(col: str, raw: str, state: str) -> str:
+    """Tri-state display: real value (incl. genuine 0) / "ERR" / "n/a"."""
+    if state == "error":
+        return cpva.PV_TEXT_ERROR
+    if state != "ok" or raw == "":
+        return cpva.PV_TEXT_NOT_FOUND
+    return _format_value(col, raw)
+
+
+def _quantize_col(col: str, v: float) -> float:
+    """Snap a column's value onto its channel value grid, if it has one.
+
+    Only the waveplate does today (multiples of 1000). Applied BEFORE any
+    arithmetic, not just before display: a mid-move readback of 350 437 otherwise
+    produces a Δ of 437 against a target of 350 000, i.e. a difference between a
+    real setting and a position that never existed.
+
+    EVERY comparison in this tab goes through here — matching, the tolerance filter and
+    the displayed Δ alike. When the filter alone skipped it, a day could be headed
+    "✓ match, Δ 0" while the shot list behind it said "no shots within tolerance": the
+    same reading counted as 350 000 in one place and as 350 437 in the other."""
+    return _quantize_col_ex(col, v)[0]
+
+
+def _quantize_col_ex(col: str, v: float) -> "tuple[float, bool]":
+    """(snapped value, was it already on the grid). An off-grid reading is the motor
+    caught mid-travel; it is still reported as the position it was heading to, but the
+    flag lets the display mark it so it cannot be mistaken for a settled one."""
+    return cpva.quantize(CPVA_CHANNEL_MAP.get(col, col), v)
+
+
+def _diff_ui_value(col: str, diff_csv: float) -> float:
+    """|value − target| in the units the row PRINTS. The tolerance is compared against
+    this, so it has to follow _format_diff exactly — they used to be two copies of the
+    same arithmetic and a column could be marked off-target while its own Δ cell said
+    it was inside."""
+    return diff_csv * 1000 if col in MJ_COLUMNS else diff_csv
+
+
+def _format_diff(col: str, diff_csv: float) -> str:
+    """Format a |value − target| difference (CSV units) in the column's UI units."""
+    d = _diff_ui_value(col, diff_csv)
+    if col in MJ_COLUMNS:
+        return f"{d:.2f} mJ"
+    if col == "waveplate":
+        return f"{d:.0f}"
+    if col in PV_COLUMNS:
+        return f"{d:.4f} J"
+    return f"{d:.4g}"
 
 
 def _find_best_match(rows: list[dict], col: str, target: float) -> dict | None:
-    # NOTE: `target` is already in CSV units (callers pass target_csv, i.e.
-    # the sbw4/0.749 and mJ conversions are applied upstream in _to_csv_units).
-    # Do NOT re-convert here, or sbw4 would be divided by 0.749 twice.
+    # NOTE: `target` is already in CSV units (callers pass target_csv, i.e. the mJ
+    # conversion is applied upstream in _to_csv_units). Do NOT re-convert here.
     best = None
     best_diff = float("inf")
     for row in rows:
         raw = row.get(col, "")
         try:
-            val = float(raw)
+            val = _quantize_col(col, float(raw))
         except (ValueError, TypeError):
             continue
         diff = abs(val - target)
@@ -443,10 +733,25 @@ def _folder_hour_from_prague(prague_hour: int, ref_date: date) -> int:
     return (prague_hour - 1) % 24
 
 
+def _day_image_folder(day: date, images_root: "Path | None" = None) -> Path | None:
+    """The day's folder on the image share, or None when the day was never archived.
+
+    Worth its own answer: "the whole day is missing" and "that HOUR is missing" look the
+    same from _find_hour_folder, and telling an operator "no images for this day" about a
+    day that has pictures from 08:00 to 18:00 is simply wrong."""
+    root = images_root if images_root is not None else IMAGES_ROOT
+    base = (_images_root_for_year(root, day.year)
+            / str(day.year) / str(day.month) / str(day.day))
+    try:
+        return base if base.is_dir() else None
+    except Exception:
+        return None
+
+
 def _find_hour_folder(day: date, hour_utc: int,
                       images_root: "Path | None" = None) -> Path | None:
     root = images_root if images_root is not None else IMAGES_ROOT
-    base = root / str(day.year) / str(day.month) / str(day.day)
+    base = _images_root_for_year(root, day.year) / str(day.year) / str(day.month) / str(day.day)
     for delta in [0, -1, 1, -2, 2]:
         h = (hour_utc + delta) % 24
         candidate = base / str(h)
@@ -455,6 +760,22 @@ def _find_hour_folder(day: date, hour_utc: int,
                 return candidate
         except Exception:
             pass
+    return None
+
+
+def _resolve_cam_folder(hour_folder: "Path | None", cam: str) -> Path | None:
+    """Camera sub-folder inside an hour folder, matched case-insensitively."""
+    if hour_folder is None or not cam:
+        return None
+    try:
+        cf = hour_folder / cam
+        if cf.exists() and cf.is_dir():
+            return cf
+        for sub in hour_folder.iterdir():
+            if sub.is_dir() and sub.name.lower() == cam.lower():
+                return sub
+    except Exception:
+        pass
     return None
 
 
@@ -509,15 +830,85 @@ def _find_image_for_ts(cam_folder: Path, ts_dt: datetime,
     return None
 
 
+def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None",
+                       hour_cache: dict, images_root: "Path | None" = None,
+                       day_dir: "Path | None" = None
+                       ) -> "tuple[Path | None, Path | None]":
+    """(matched image, camera folder it was looked for in) for ONE shot.
+
+    The single image resolver for this tab. A shot is looked for in the hour folder its
+    Prague time falls in AND in the neighbouring hours, because the archive rolls a frame
+    over the hour edge and because a camera is not necessarily recording every hour of
+    the day (2026-08-17 held 92 cameras, only 27 of them in every hour). The 30 s window
+    inside _find_image_for_ts is what actually decides the match — a neighbouring hour
+    can only ever contribute a frame from just across the boundary.
+
+    hour_cache maps hour → camera folder, so resolving many shots of one day does not
+    re-probe the share. Call from a worker thread: os.scandir over SMB blocks ~150 ms."""
+    if dt_obj is None or not cam:
+        return None, None
+    hour_utc = _folder_hour_from_prague(dt_obj.hour, day)
+    if day_dir is None:
+        hf = _find_hour_folder(day, hour_utc, images_root=images_root)
+        if hf is None:
+            return None, None
+        day_dir = hf.parent
+    first_folder = None
+    for delta in (0, -1, 1, -2, 2):
+        h = (hour_utc + delta) % 24
+        if h in hour_cache:
+            cam_folder = hour_cache[h]
+        else:
+            cam_folder = _resolve_cam_folder(day_dir / str(h), cam)
+            hour_cache[h] = cam_folder
+        if cam_folder is None:
+            continue
+        if first_folder is None:
+            first_folder = cam_folder
+        img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns)
+        if img is not None:
+            return img, cam_folder
+    return None, first_folder
+
+
+def _image_problem(path: "Path | None") -> "str | None":
+    """None when `path` is a picture worth offering, else why it is not.
+
+    A row that points at a file nobody can look at is the same disappointment as a row
+    that points at nothing, so an empty file and an all-zero frame count as "no image"
+    (the operator asked for this explicitly). Reads the file once, cheapest test first."""
+    if path is None:
+        return f"no image within {IMG_MATCH_TOL_NS / 1e9:.0f} s of the shot"
+    try:
+        if path.stat().st_size == 0:
+            return "image file is empty"
+    except OSError as exc:
+        return f"image file unreadable ({type(exc).__name__})"
+    try:
+        from PIL import Image as _PilImg
+        import numpy as _np
+        with _PilImg.open(str(path)) as im:
+            arr = _np.asarray(im)
+    except Exception as exc:
+        return f"image cannot be decoded ({type(exc).__name__})"
+    if arr.size == 0 or not bool(arr.max() > 0):
+        return "image is blank (all zero)"
+    return None
+
+
 def _format_value(col: str, raw: str) -> str:
     try:
         v = float(raw)
+        if col == "waveplate":
+            # Snap onto the 1000-count grid: the waveplate is only ever commanded to
+            # whole multiples of 1000, so any other reading is the motor caught
+            # mid-travel. "%.0f" alone still printed a position it was never set to.
+            # A snapped-from-off-grid value is prefixed "~": it reads as the setting it
+            # belongs to, and still admits the shot was taken while it was moving.
+            v_q, exact = _quantize_col_ex(col, v)
+            return f"{'' if exact else '~'}{v_q:.0f}"
         if col in MJ_COLUMNS:
             return f"{v * 1000:.2f} mJ"
-        if col == "sbw4":
-            return f"{v * SBW4_TRANSMISSION:.4f} J"
-        if col == "waveplate":
-            return f"{v:.0f}"
         if col in PV_COLUMNS:          # known energy preset
             return f"{v:.4f} J"
         return f"{v:.4g}"             # arbitrary channel — raw, no unit assumption
@@ -532,6 +923,9 @@ class _SearchSignals(QObject):
     done     = Signal()
     log_msg  = Signal(str)
     progress = Signal(int)
+    # What is being read right now — printed on the progress bar, so a long search
+    # says where it is instead of showing a bar with no words on it.
+    stage    = Signal(str)
 
 
 class _CamLoadSignals(QObject):
@@ -541,55 +935,12 @@ class _CamLoadSignals(QObject):
 class _PreviewSignals(QObject):
     show    = Signal(object, str, int)  # (QImage | None, energy_text, gen)
     log_msg = Signal(str)
+    # (row of the shot list, image path or "", why there is none) — the Image column
+    # of the opened day is filled in from worker threads.
+    day_img = Signal(int, str, str)
 
 class _ChannelSignals(QObject):
     loaded = Signal(list)  # archiver channel names
-
-# ── CALENDAR DELEGATE ─────────────────────────────────────────────────────────
-
-class _WeekendDelegate(QStyledItemDelegate):
-    def initStyleOption(self, option, index):
-        super().initStyleOption(option, index)
-        col = index.column()
-        if col < 1:
-            return
-        date_val = index.data(Qt.ItemDataRole.UserRole)
-        if isinstance(date_val, QDate) and date_val.isValid():
-            if date_val.dayOfWeek() in (6, 7):
-                option.palette.setColor(option.palette.ColorRole.Text, QColor("#cc0000"))
-                option.palette.setColor(option.palette.ColorRole.ButtonText, QColor("#cc0000"))
-            return
-        if col in (6, 7):
-            option.palette.setColor(option.palette.ColorRole.Text, QColor("#cc0000"))
-            option.palette.setColor(option.palette.ColorRole.ButtonText, QColor("#cc0000"))
-
-
-class _NoScrollCalendar(QCalendarWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._noscroll_installed = set()
-
-    def _install_on_all_children(self):
-        from PySide6.QtWidgets import QAbstractScrollArea
-        for child in self.findChildren(QAbstractScrollArea):
-            if id(child) not in self._noscroll_installed:
-                child.installEventFilter(self)
-                child.viewport().installEventFilter(self)
-                self._noscroll_installed.add(id(child))
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._install_on_all_children()
-
-    def wheelEvent(self, event):
-        event.accept()
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.Wheel:
-            event.accept()
-            return True
-        return super().eventFilter(obj, event)
-
 
 class _NoScrollComboBox(QComboBox):
     def wheelEvent(self, event):
@@ -597,6 +948,20 @@ class _NoScrollComboBox(QComboBox):
 
 
 # ── UI HELPERS ────────────────────────────────────────────────────────────────
+
+# House table look — the same values the Workshop's tables use (wk_t._TABLE_QSS).
+# Spelled out here rather than imported: wk_t is loaded AFTER this tab, and a table
+# left unstyled takes its alternate row colour from the app palette, which paints
+# every second row dark red-brown.
+_TABLE_QSS = (
+    "QTableWidget { background: #ffffff; alternate-background-color: #f5f7fa;"
+    " color: #16202c; gridline-color: #dfe4ea; font-size: 11px;"
+    " selection-background-color: #cfe0f7; selection-color: #10243c; }"
+    "QHeaderView::section { background: #eef1f5; color: #16202c; font-weight: 600;"
+    " border: 0px; border-right: 1px solid #dfe4ea;"
+    " border-bottom: 1px solid #cfd6de; padding: 4px 6px; }"
+    "QTableCornerButton::section { background: #eef1f5; border: 0px; }"
+)
 
 def _hsep() -> QFrame:
     f = QFrame()
@@ -615,15 +980,48 @@ def _group_label(text: str) -> QLabel:
     return lbl
 
 
+# Panel group boxes: the Image Slider's own CollapsibleSection, so a group here has
+# the same coloured header, the same click-to-fold behaviour and the same pale wash
+# of the header colour behind its controls as the groups in the Slider and Workshop.
+_SECTION_ACCENTS = {
+    "time":    "#2f6fd0",   # blue
+    "pv":      "#1a9e9e",   # teal
+    "cameras": "#2e9e5b",   # green
+    "search":  "#c0392b",   # red
+    "display": "#7a4fc0",   # purple
+    "log":     "#5a5f8f",   # slate
+}
+
+
+def _section_cls():
+    return _get_slider_module().CollapsibleSection
+
+
 # ── RESULT DATA ───────────────────────────────────────────────────────────────
 
 class _DayResult:
-    def __init__(self, day: date, best_row: dict, col: str,
+    # status of one day in the results table:
+    #   "ok"       — a shot AND a usable picture were found
+    #   "no_data"  — the archiver gave nothing to search (outage, or no samples)
+    #   "no_image" — a shot was found but no picture goes with it
+    # Every searched day produces one of these, so a day can never quietly vanish from
+    # the table; only "ok" days can be previewed, saved or sent to the Slider.
+    def __init__(self, day: date, best_row: "dict | None", col: str,
                  actual, diff, target_csv: float, hour_folder,
                  rows_in_tol: "list | None" = None,
-                 per_col: "dict | None" = None):
+                 per_col: "dict | None" = None,
+                 search_cols: "list | None" = None,
+                 extra_cols: "list | None" = None,
+                 criteria_csv: "list | None" = None,
+                 cam: "str | None" = None,
+                 col_meta: "dict | None" = None,
+                 img_path=None,
+                 status: str = "ok",
+                 reason: str = ""):
         self.day          = day
-        self.best_row     = best_row
+        self.best_row     = best_row if best_row is not None else {}
+        self.status       = status
+        self.reason       = reason
         self.col          = col
         self.actual       = actual
         self.diff         = diff
@@ -631,11 +1029,20 @@ class _DayResult:
         self.hour_folder  = hour_folder
         self.rows_in_tol  = rows_in_tol or []
         self.per_col      = per_col or {}
+        # Search-time state, persisted so later UI (double-click dialog, save,
+        # open-in-slider) reflects what was actually searched — not whatever
+        # the left panel happens to show now.
+        self.search_cols  = search_cols or [col]
+        self.extra_cols   = extra_cols or []
+        self.criteria_csv = criteria_csv or []
+        self.cam          = cam
+        self.col_meta     = col_meta or {}
+        self.img_path     = img_path   # matched image file (resolved in worker)
         # Prefer exact UTC ns from API rows; fall back to Prague-naive datetime
-        if best_row.get("_ns") is not None:
-            self.ts_ns = int(best_row["_ns"])
+        if self.best_row.get("_ns") is not None:
+            self.ts_ns = int(self.best_row["_ns"])
         else:
-            dt_obj: datetime = best_row.get("_dt")
+            dt_obj: datetime = self.best_row.get("_dt")
             if dt_obj is not None and PRAGUE is not None:
                 ts_aware = dt_obj.replace(tzinfo=PRAGUE)
                 self.ts_ns = int(ts_aware.timestamp() * 1_000_000_000)
@@ -678,146 +1085,6 @@ class _PreviewWidget(QWidget):
         p.drawPixmap(x, y, scaled)
         p.end()
 
-# ── TIME WINDOW DIALOG ────────────────────────────────────────────────────────
-
-class _TimeWindowDialog(QDialog):
-    """Pick start and end datetime (date + hour) for Shot Finder."""
-
-    def __init__(self, start_dt: datetime | None = None, end_dt: datetime | None = None,
-                 parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Time window")
-
-        now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        if start_dt is None:
-            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        if end_dt is None:
-            end_dt = now
-
-        def _make_cal(init_date: datetime) -> _NoScrollCalendar:
-            cal = _NoScrollCalendar()
-            cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-            cal.setGridVisible(True)
-            cal.setNavigationBarVisible(True)
-            cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-            view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-            if view:
-                view.setItemDelegate(_WeekendDelegate(view))
-            hf = QTextCharFormat()
-            hf.setForeground(QColor("#111111"))
-            cal.setHeaderTextFormat(hf)
-            wf = QTextCharFormat()
-            wf.setForeground(QColor("#111111"))
-            for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                        Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-                cal.setWeekdayTextFormat(day, wf)
-            wf_we = QTextCharFormat()
-            wf_we.setForeground(QColor("#cc0000"))
-            for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-                cal.setWeekdayTextFormat(day, wf_we)
-            cal.setStyleSheet("""
-            QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
-            QCalendarWidget QAbstractItemView {
-                background: #fcfcfc; color: #111;
-                selection-background-color: #2d7dff; selection-color: #fff;
-                alternate-background-color: #f2f2f2; gridline-color: #d8d8d8; }
-            QCalendarWidget QTableView {
-                background: #fcfcfc;
-                selection-background-color: #2d7dff; selection-color: #fff;
-                gridline-color: #d8d8d8; outline: 0; }
-            QCalendarWidget QToolButton {
-                background: #efefef; border: 1px solid #c8c8c8;
-                padding: 3px 6px; border-radius: 4px; color: #111; }
-            QCalendarWidget QWidget#qt_calendar_navigationbar { background: #efefef; }
-            QCalendarWidget QAbstractItemView:enabled { color: #111; }
-            """)
-            cal.setSelectedDate(QDate(init_date.year, init_date.month, init_date.day))
-            return cal
-
-        # Start section
-        grp_start = QGroupBox("Start point")
-        start_lay = QVBoxLayout(grp_start)
-        self._cal_start = _make_cal(start_dt)
-        self._hour_start = QSpinBox()
-        self._hour_start.setRange(0, 23)
-        self._hour_start.setValue(start_dt.hour)
-        self._hour_start.setFixedWidth(70)
-        hr_start_row = QHBoxLayout()
-        hr_start_row.addWidget(QLabel("Hour:"))
-        hr_start_row.addWidget(self._hour_start)
-        hr_start_row.addStretch(1)
-        start_lay.addWidget(self._cal_start)
-        start_lay.addLayout(hr_start_row)
-
-        # End section
-        grp_end = QGroupBox("End point")
-        end_lay = QVBoxLayout(grp_end)
-        self._cal_end = _make_cal(end_dt)
-        self._hour_end = QSpinBox()
-        self._hour_end.setRange(0, 23)
-        self._hour_end.setValue(end_dt.hour)
-        self._hour_end.setFixedWidth(70)
-        hr_end_row = QHBoxLayout()
-        hr_end_row.addWidget(QLabel("Hour:"))
-        hr_end_row.addWidget(self._hour_end)
-        btn_now = QPushButton("Now")
-        btn_now.setFixedWidth(48)
-        btn_now.clicked.connect(self._go_to_now)
-        hr_end_row.addWidget(btn_now)
-        hr_end_row.addStretch(1)
-        end_lay.addWidget(self._cal_end)
-        end_lay.addLayout(hr_end_row)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
-        btns.accepted.connect(self._on_accept)
-        btns.rejected.connect(self.reject)
-
-        cals_row = QHBoxLayout()
-        cals_row.addWidget(grp_start)
-        cals_row.addWidget(grp_end)
-
-        main_lay = QVBoxLayout(self)
-        main_lay.addLayout(cals_row)
-        main_lay.addWidget(btns)
-
-    def _go_to_now(self):
-        now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        self._cal_end.setSelectedDate(QDate(now.year, now.month, now.day))
-        self._hour_end.setValue(now.hour)
-
-    def _on_accept(self):
-        start = self._selected_start()
-        end = self._selected_end()
-        if end < start:
-            QMessageBox.warning(self, "Invalid range", "End must be after start.")
-            return
-        self.accept()
-
-    def _selected_start(self) -> datetime:
-        d = self._cal_start.selectedDate()
-        tz = PRAGUE if PRAGUE else timezone.utc
-        return datetime(d.year(), d.month(), d.day(), self._hour_start.value(), 0, 0, tzinfo=tz)
-
-    def _selected_end(self) -> datetime:
-        d = self._cal_end.selectedDate()
-        tz = PRAGUE if PRAGUE else timezone.utc
-        return datetime(d.year(), d.month(), d.day(), self._hour_end.value(), 59, 59, tzinfo=tz)
-
-    def selected_range(self) -> tuple[datetime, datetime]:
-        return self._selected_start(), self._selected_end()
-
-    def selected_days(self) -> list[date]:
-        start = self._selected_start().date()
-        end = self._selected_end().date()
-        days = []
-        cur = start
-        while cur <= end:
-            days.append(cur)
-            cur += timedelta(days=1)
-        return days
-
-
 # ── MAIN WIDGET ───────────────────────────────────────────────────────────────
 
 class ShotFinderWidget(QWidget):
@@ -829,20 +1096,57 @@ class ShotFinderWidget(QWidget):
         self._tab_widget = None
 
         self._search_running = False
-        self._day_results: list[_DayResult] = []
+        # Results live per camera tab — see _rebuild_result_tabs. `_day_results` and
+        # `_table` are read-only views onto whichever tab is in front.
+        self._cam_order: "list[str | None]" = [None]
+        self._cam_tables: "dict[str | None, QTableWidget]" = {}
+        self._cam_results: "dict[str | None, list[_DayResult]]" = {}
+
+        # The day expanded under the results table (see _build_day_panel). Everything
+        # it needs is captured when the day is opened, so a later change of the left
+        # panel or of the camera list cannot re-aim it.
+        self._day_dr = None
+        self._day_rows: "list[dict]" = []
+        self._day_cam: "str | None" = None
+        self._day_hour_cache: dict = {}
+        self._day_split_sized = False
+        self._day_img_col = -1          # index of the Image column, -1 = not built
+        self._day_reveal_row = -1       # row whose click is waiting for its path
+        self._day_canvas = None         # matplotlib canvas (built on first open)
+        self._day_toolbar = None
+        self._day_ax = None
+        self._day_marker = None         # the vertical line on the picked shot
+        self._day_plot_ns: "list[int]" = []   # shot timestamps, for click-to-pick
+
+        # The day and the shot to come back to when another camera's tab is brought
+        # to the front. Without them, switching camera dropped both.
+        self._focus_day = None
+        self._focus_shot_ns = None
+        self._focus_panel_open = False
+        self._restoring_focus = False
 
         self._all_cameras: list[tuple[str, str]] = []
         self._selected_cameras: list[tuple[str, str]] = []
         self._active_cam: str | None = None
 
-        self._images_root: Path = IMAGES_ROOT_OPTIONS["Lab"]
-        self._energy_csv_root: str = ENERGY_CSV_ROOT_OPTIONS["Lab"]
-        self._criteria: list[dict] = []
-        self._criteria_rows: list[dict] = []
+        self._images_root: Path = IMAGES_ROOT
+        self._energy_csv_root: str = ENERGY_CSV_ROOT
+        # The picked PVs, the names given to them and their scale factors are
+        # restored HERE, before _build_ui — which must therefore not clear them.
+        self._pv_cfg: list[dict] = []
+        self._pv_rows: list[dict] = []
+        self._custom_labels: dict[str, str] = {}   # col → name to display
+        self._load_pv_state()
 
+        # The picked time window — the Image Slider's own picker fills these in.
+        # `_tw_windows` is ONE (start_ns, end_ns) per picked day, the END EXCLUSIVE
+        # (see is_t.seg_bounds_ns); a day set need not be contiguous.
         _now = datetime.now(PRAGUE) if PRAGUE else datetime.now()
-        self._tw_start: datetime = _now.replace(hour=0, minute=0, second=0, microsecond=0)
-        self._tw_end: datetime = _now
+        self._tw_windows: "list[tuple[int, int]]" = []
+        self._tw_segments = None            # so the dialog reopens on the last pick
+        self._tw_day = _now.date()
+        self._tw_times = (0, 0, 23, 59)     # h_from, m_from, h_to, m_to
+        self._set_time_window_from_times()
 
         self._temp_dir: str | None = None
         self._preview_pixmap_orig = None
@@ -851,6 +1155,7 @@ class ShotFinderWidget(QWidget):
         self._current_preview_path: "Path | None" = None
         self._preview_sig.show.connect(self._on_preview_ready)
         self._preview_sig.log_msg.connect(self._log)
+        self._preview_sig.day_img.connect(self._on_day_img_resolved)
         atexit.register(self._cleanup_temp)
         self._last_save_dir: "Path | None" = None
 
@@ -858,10 +1163,19 @@ class ShotFinderWidget(QWidget):
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        if hasattr(self, "_cam_dropdown"):
-            self._cam_dropdown.hide()
-        if hasattr(self, "_cam_search"):
-            self._cam_search.clear()
+        # Floating Tool-window dropdowns stay on top of every other tab unless
+        # they are explicitly hidden with the widget.
+        for name in ("_pv_dropdown",):
+            dd = getattr(self, name, None)
+            if dd is not None:
+                dd.hide()
+        for name in ("_pv_search",):
+            le = getattr(self, name, None)
+            if le is not None:
+                le.clear()
+        # Target / tolerance live in the spin boxes until something asks for them.
+        self._sync_pv_cfg_from_rows()
+        self._save_pv_state()
 
     def _cleanup_temp(self):
         if self._temp_dir:
@@ -882,7 +1196,12 @@ class ShotFinderWidget(QWidget):
         if out_img is None:
             self._preview_pixmap_orig = None
             self._preview_widget.set_pixmap(None)
+            self._scale_note_lbl.setText("")
             return
+        self._scale_note_lbl.setText(getattr(self, "_scale_note", ""))
+        # Park the greyed-out sliders on what the Auto passes actually applied to this
+        # frame — a value you cannot name is a value you cannot reproduce.
+        self._park_auto_bc(getattr(self, "_bc_applied", None))
         from PySide6.QtGui import QPixmap, QPainter, QFont, QColor, QFontMetrics
         from PySide6.QtCore import QRect
         pm = QPixmap.fromImage(out_img)
@@ -928,26 +1247,10 @@ class ShotFinderWidget(QWidget):
 
     def _set_busy(self, busy: bool):
         for btn in [self._btn_search, self._btn_open_slider, self._btn_save_results,
-                    self._gradient_cb, self._btn_time_window]:
+                    self._gradient_cb, self._btn_time_window,
+                    self._btn_clear_results]:
             btn.setEnabled(not busy)
     
-    def _on_csv_source_changed(self, name: str):
-        self._energy_csv_root = ENERGY_CSV_ROOT_OPTIONS.get(name, ENERGY_CSV_ROOT_OPTIONS["Lab"])
-        self._images_root = IMAGES_ROOT_OPTIONS.get(name, IMAGES_ROOT_OPTIONS["Lab"])
-        self._log(f"Source -> {name}: images={self._images_root}  csv={self._energy_csv_root}")
-        self._all_cameras = []
-        if hasattr(self, "_cam_status_lbl"):
-            self._cam_status_lbl.setText("No cameras loaded.")
-        self._load_cameras()
-
-    def _on_source_changed(self, name: str):
-        self._images_root = IMAGES_ROOT_OPTIONS.get(name, IMAGES_ROOT_OPTIONS["Lab"])
-        self._log(f"Images source -> {name}: {self._images_root}")
-        self._all_cameras = []
-        if hasattr(self, "_cam_status_lbl"):
-            self._cam_status_lbl.setText("No cameras loaded.")
-        self._load_cameras()
-
     def _log(self, msg: str):
         if hasattr(self, "_log_box"):
             self._log_box.appendPlainText(str(msg))
@@ -975,75 +1278,144 @@ class ShotFinderWidget(QWidget):
         ll = QVBoxLayout(lw)
         ll.setContentsMargins(0, 0, 4, 0)
         ll.setSpacing(4)
+        # The panel layout the groups themselves sit in. `ll` below is re-pointed at
+        # each group's body in turn, so everything after a group banner lands inside
+        # that group.
+        panel_lay = ll
 
-        # Time window + Source
-        ll.addWidget(_group_label("Time window & source"))
-        tw_row = QHBoxLayout()
+        # ── Collapsible groups ───────────────────────────────────────────────
+        # Same groups, same colours and the same remembered open/closed state as the
+        # Image Slider, Workshop and Image Finder panels. Which groups are open is
+        # kept in this tab's own state file next to the PV list.
+        self._sections: dict = {}
+
+        def _add_section(key, title, default_expanded=True):
+            cls = _section_cls()
+            sec = cls(title, key,
+                      bool(self._ui_state.get(f"sec_{key}", default_expanded)),
+                      accent=_SECTION_ACCENTS.get(key, "#4a78c0"))
+            sec.toggled.connect(self._on_section_toggled)
+            self._sections[key] = sec
+            panel_lay.addWidget(sec)
+            return sec
+
+        _exp_row = QHBoxLayout()
+        _exp_row.setSpacing(4)
+        _btn_exp = QPushButton("Expand all")
+        _btn_exp.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+        _btn_exp.clicked.connect(lambda: self._set_all_sections(True))
+        _btn_col = QPushButton("Collapse all")
+        _btn_col.setStyleSheet("QPushButton { font-size: 10px; padding: 2px 4px; }")
+        _btn_col.clicked.connect(lambda: self._set_all_sections(False))
+        _exp_row.addWidget(_btn_exp)
+        _exp_row.addWidget(_btn_col)
+        panel_lay.addLayout(_exp_row)
+
+        s_time = _add_section("time",    "Source",               True)
+        s_pv   = _add_section("pv",      "PVs",                  True)
+        s_cam  = _add_section("cameras", "Cameras",              True)
+        # Same key as before ("search"), so the remembered open/closed state of this
+        # section survives the rename.
+        s_srch = _add_section("search",  "Save & Send",          True)
+        s_disp = _add_section("display", "Image / Display",      False)
+        s_log  = _add_section("log",     "Log",                  False)
+
+        # ══════════════════ Group: SOURCE ════════════════════════════════════
+        # What the search runs over: WHEN, and WHICH cameras. Two buttons, the way
+        # the Image Slider has it. The Lab / Office picker that used to sit here is
+        # gone — see IMAGES_ROOT.
+        ll = s_time.body_layout
+        # Side by side, the way the Image Slider's Source group asks the same pair of
+        # questions: WHEN, and WHICH cameras.
+        src_row = QHBoxLayout()
+        src_row.setSpacing(4)
         self._btn_time_window = QPushButton("📅  Time window")
-        self._btn_time_window.setToolTip("Pick start and end date/hour for the search")
+        self._btn_time_window.setToolTip(
+            "Pick the days and the time window to search — the Image Slider's own "
+            "picker,\nso a day looks and clicks the same in every tab.")
         self._btn_time_window.clicked.connect(self._open_time_window)
-        tw_row.addWidget(self._btn_time_window)
-        # Keep self._source_combo as hidden attribute for backward compat
-        self._source_combo = QComboBox()
-        for name in IMAGES_ROOT_OPTIONS:
-            self._source_combo.addItem(name)
-        self._source_combo.setVisible(False)
-        # Primary visible combo — drives both images root and CSV root
-        self._csv_source_combo = _NoScrollComboBox()
-        self._csv_source_combo.setToolTip(
-            "Root path for camera images AND energy CSV files\n"
-            "(Lab = network share, Office = mapped drive Z:)")
-        for name in ENERGY_CSV_ROOT_OPTIONS:
-            self._csv_source_combo.addItem(name)
-        self._csv_source_combo.currentTextChanged.connect(self._on_csv_source_changed)
-        tw_row.addWidget(self._csv_source_combo)
-        ll.addLayout(tw_row)
+        src_row.addWidget(self._btn_time_window, 1)
+
+        self._btn_cameras = QPushButton("📷  Cameras")
+        self._btn_cameras.setToolTip(
+            "Choose which cameras to search — the same picker (and the same saved "
+            "presets) as the Image Slider.\n"
+            "The list is the cameras found in the picked time window.")
+        self._btn_cameras.clicked.connect(self._open_camera_picker)
+        src_row.addWidget(self._btn_cameras, 1)
+        ll.addLayout(src_row)
 
         self._date_info_lbl = QLabel("")
         self._date_info_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        self._date_info_lbl.setWordWrap(True)
         ll.addWidget(self._date_info_lbl)
-        ll.addWidget(_hsep())
+
+        # ── Load data ─────────────────────────────────────────────────────
+        # The action belongs with what it acts on: the days, the hours and the
+        # cameras are all right above it.
+        self._btn_search = QPushButton("🔍  Load data")
+        self._btn_search.setFixedHeight(32)
+        self._btn_search.setStyleSheet(
+            "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
+            "border-radius: 4px; font-size: 13px; }"
+            "QPushButton:hover { background: #1a6aee; }"
+            "QPushButton:disabled { background: #aaa; }")
+        self._btn_search.setToolTip(
+            "Read the PV data for the picked days and find the matching frames.")
+        self._btn_search.clicked.connect(self._start_search)
+        ll.addWidget(self._btn_search)
+
+        # The bar says what is being read right now, how far along it is and roughly
+        # how much is left — a search over many days and cameras is minutes long.
+        self._prog = QProgressBar()
+        self._prog.setVisible(False)
+        self._prog.setTextVisible(True)
+        self._prog.setFormat("")
+        self._prog.setRange(0, 0)
+        self._prog.setStyleSheet(
+            "QProgressBar { border: 1px solid #c3cbd6; border-radius: 3px; "
+            "background: #ffffff; color: #16202c; font-size: 10px; "
+            "text-align: center; }"
+            "QProgressBar::chunk { background: #9fc4f5; }")
+        ll.addWidget(self._prog)
 
         # ── PV search state ───────────────────────────────────────────────
-        # Ordered lists of selected columns (preset key or raw channel name).
-        self._criteria_cols: list[str] = []   # PVs to search by
-        self._extra_cols_sel: list[str] = []  # PVs to also show
-        self._custom_labels: dict[str, str] = {}  # custom col → display label
+        # ONE ordered list of picked PVs. Each entry carries its own "filter"
+        # flag: checked = the search filters on it (target ± tolerance),
+        # unchecked = its value is only displayed on the results/images.
+        # _pv_cfg [{col, target, tol, filter, scale}] and _custom_labels are set up
+        # (and restored from the saved state) in __init__ — clearing them here would
+        # throw the operator's PV list away on every restart.
+        self._pv_rows: list[dict] = []            # widgets, parallel to _pv_cfg
         self._all_pv_channels: list[str] = []     # fetched archiver channels
+        self._chan_loading = False
         self._pv_suggestions: list[tuple[str, str]] = []  # (display, col_key)
         self._rebuild_pv_suggestions()
 
-        # PV search — search criteria
-        ll.addWidget(_group_label("Search criteria"))
+        # ══════════════════ Group: PVs ══════════════════════════════════════
+        # PV selection — one search box for every PV, presets and archiver alike
+        ll = s_pv.body_layout
         self._pv_search = QLineEdit()
-        self._pv_search.setPlaceholderText("search PV to add… (e.g. SBW4, Energy)")
+        self._pv_search.setPlaceholderText("search PV, or type a channel name…")
+        self._pv_search.setToolTip(
+            "Add any archiver PV: type fragments to search the channel list, or type a\n"
+            "channel name in full and take the ➕ row (or press Enter) to add it as it\n"
+            "stands — that also works for a PV the fetched list does not carry.\n"
+            "Tick a PV to search by it (target ± tolerance); leave it unticked to only\n"
+            "show its value in the results and on the images.\n"
+            "Right-click a PV row to rename it, give it a scale factor, copy its\n"
+            "archiver channel name or remove it.")
         self._pv_search.textEdited.connect(self._on_pv_search_changed)
         self._pv_search.returnPressed.connect(self._on_pv_search_return)
         ll.addWidget(self._pv_search)
         self._pv_dropdown = self._make_pv_dropdown(self._on_pv_dropdown_clicked)
 
-        # Criteria container — dynamic rows, one per selected search PV
-        self._criteria: list[dict] = []  # [{col, target, tol}, ...]
-        self._criteria_container = QWidget()
-        self._criteria_container_layout = QVBoxLayout(self._criteria_container)
-        self._criteria_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._criteria_container_layout.setSpacing(2)
-        ll.addWidget(self._criteria_container)
-
-        # PV search — also show
-        ll.addWidget(QLabel("Also show:"))
-        self._extra_search = QLineEdit()
-        self._extra_search.setPlaceholderText("search PV to also show…")
-        self._extra_search.textEdited.connect(self._on_extra_search_changed)
-        self._extra_search.returnPressed.connect(self._on_extra_search_return)
-        ll.addWidget(self._extra_search)
-        self._extra_dropdown = self._make_pv_dropdown(self._on_extra_dropdown_clicked)
-
-        self._extra_container = QWidget()
-        self._extra_container_layout = QVBoxLayout(self._extra_container)
-        self._extra_container_layout.setContentsMargins(0, 0, 0, 0)
-        self._extra_container_layout.setSpacing(2)
-        ll.addWidget(self._extra_container)
+        # One dynamic row per picked PV
+        self._pv_container = QWidget()
+        self._pv_container_layout = QVBoxLayout(self._pv_container)
+        self._pv_container_layout.setContentsMargins(0, 0, 0, 0)
+        self._pv_container_layout.setSpacing(2)
+        ll.addWidget(self._pv_container)
 
         # Hidden legacy spinboxes — kept so existing code that references them still works
         self._target_sb = QDoubleSpinBox()
@@ -1062,37 +1434,11 @@ class ShotFinderWidget(QWidget):
         self._tol_sb.setVisible(False)
         self._tol_unit_lbl = QLabel("J")
         self._tol_unit_lbl.setVisible(False)
-        ll.addWidget(_hsep())
 
-        # Camera selection
-        ll.addWidget(_group_label("Cameras"))
-        self._cam_search = QLineEdit()
-        self._cam_search.setPlaceholderText("search cameras… (e.g. PT)")
-        self._cam_search.textEdited.connect(self._on_cam_search_changed)
-        ll.addWidget(self._cam_search)
-
-        # Dropdown — Tool window místo Popup (nezabírá focus)
-        self._cam_dropdown = QTableWidget(0, 2)
-        self._cam_dropdown.setHorizontalHeaderLabels(["#", "Camera"])
-        self._cam_dropdown.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents)
-        self._cam_dropdown.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch)
-        self._cam_dropdown.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._cam_dropdown.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._cam_dropdown.verticalHeader().setVisible(False)
-        self._cam_dropdown.setWindowFlags(
-            Qt.WindowType.Tool |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint)
-        self._cam_dropdown.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._cam_dropdown.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self._cam_dropdown.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._cam_dropdown.clicked.connect(self._on_cam_dropdown_clicked)
-        self._cam_dropdown.setStyleSheet(
-            "QTableWidget { border: 1px solid #2d7dff; background: #fff; }"
-            "QTableWidget::item:selected { background: #2d7dff; color: #fff; }")
-
+        # ══════════════════ Group: CAMERAS ══════════════════════════════════
+        # The search box + floating suggestion list that used to sit here are what
+        # the Cameras… button now opens; the panel keeps only the picked cameras.
+        ll = s_cam.body_layout
         ll.addWidget(QLabel("Selected cameras:"))
         self._cam_selected = QTableWidget(0, 2)
         self._cam_selected.setHorizontalHeaderLabels(["#", "Camera"])
@@ -1118,39 +1464,47 @@ class ShotFinderWidget(QWidget):
         self._cam_status_lbl = QLabel("No cameras loaded.")
         self._cam_status_lbl.setStyleSheet("font-size: 10px; color: #555;")
         ll.addWidget(self._cam_status_lbl)
-        ll.addWidget(_hsep())
 
-        # Search button
-        self._btn_search = QPushButton("🔍  Search")
-        self._btn_search.setFixedHeight(32)
-        self._btn_search.setStyleSheet(
-            "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
-            "border-radius: 4px; font-size: 13px; }"
-            "QPushButton:hover { background: #1a6aee; }"
-            "QPushButton:disabled { background: #aaa; }")
-        self._btn_search.clicked.connect(self._start_search)
-        ll.addWidget(self._btn_search)
+        # ══════════════════ Group: SAVE & SEND ══════════════════════════════
+        ll = s_srch.body_layout
 
-        self._prog = QProgressBar()
-        self._prog.setVisible(False)
-        self._prog.setTextVisible(False)
-        self._prog.setRange(0, 0)
-        ll.addWidget(self._prog)
+        # What the two buttons below act on. "Selected shot" is only reachable while
+        # the day detail under the table is open — it is the shot picked THERE. This
+        # is what the detail's own duplicate Open/Save buttons used to do.
+        scope_row = QHBoxLayout()
+        scope_row.setSpacing(4)
+        scope_row.addWidget(QLabel("Act on:"))
+        self._scope_cb = _NoScrollComboBox()
+        self._scope_cb.addItem("Whole day(s)", "day")
+        self._scope_cb.addItem("Selected shot", "shot")
+        self._scope_cb.setToolTip(
+            "Whole day(s) — the selected day rows (all of them when nothing is "
+            "selected).\n"
+            "Selected shot — only the shot picked in the day detail under the table; "
+            "available while that detail is open.")
+        # Ink spelled out, both states: left to the style a disabled combo comes out
+        # pale on pale and reads as a broken control.
+        self._scope_cb.setStyleSheet(
+            "QComboBox { padding: 3px 6px; background: #fff; color: #16202c; "
+            "border: 1px solid #ccc; border-radius: 4px; }"
+            "QComboBox:disabled { background: #ededed; color: #808890; }")
+        self._scope_cb.currentIndexChanged.connect(self._on_scope_changed)
+        scope_row.addWidget(self._scope_cb, 1)
+        ll.addLayout(scope_row)
 
-        # Open in Slider — hned pod Search
-        self._btn_open_slider = QPushButton("▶  Open in Image Slider")
+        self._btn_open_slider = QPushButton("➤  Send to Image Slider")
         self._btn_open_slider.setEnabled(False)
-        self._btn_open_slider.setVisible(False)
         self._btn_open_slider.setToolTip(
-            "Copy one matched image per day to temp folder and open in Slider.")
-        self._btn_open_slider.clicked.connect(self._open_in_slider)
+            "Send the matched images to the Image Slider — whatever the Slider "
+            "currently shows is replaced.")
+        self._btn_open_slider.clicked.connect(self._on_send_to_slider)
         ll.addWidget(self._btn_open_slider)
 
         self._btn_save_results = QPushButton("💾  Save images")
         self._btn_save_results.setEnabled(False)
         self._btn_save_results.setToolTip(
             "Save matched images to a selected folder.")
-        self._btn_save_results.clicked.connect(self._save_results)
+        self._btn_save_results.clicked.connect(self._on_save_images)
         ll.addWidget(self._btn_save_results)
 
         self._btn_send_workshop = QPushButton("➤ Workshop")
@@ -1160,12 +1514,15 @@ class ShotFinderWidget(QWidget):
         self._btn_send_workshop.clicked.connect(self._send_to_workshop)
         ll.addWidget(self._btn_send_workshop)
 
+        # ══════════════════ Group: IMAGE / DISPLAY ══════════════════════════
+        ll = s_disp.body_layout
+
         grad_row = QHBoxLayout()
         grad_row.addWidget(QLabel("Gradient:"))
         self._gradient_cb = _NoScrollComboBox()
         GRADIENT_NAMES = [
-            "Grayscale", "Gradient", "Hot", "Binary", "Black and White",
-            "Viridis", "Plasma", "Inferno", "Jet", "Turbo"
+            "Grayscale", "Gradient", "Binary", "False Colors", "Rainbow", "Hot",
+            "Black and White", "Viridis", "Plasma", "Inferno", "Jet", "Turbo"
         ]
         for name in GRADIENT_NAMES:
             self._gradient_cb.addItem(name)
@@ -1177,10 +1534,138 @@ class ShotFinderWidget(QWidget):
         grad_row.addWidget(self._gradient_cb, 1)
         ll.addLayout(grad_row)
 
-        ll.addWidget(_hsep())
+        # Contrast / Brightness / Gamma — the Image Slider's three-row block, control
+        # for control. Moving a slider re-renders the previewed frame, which is a read
+        # off the share, so the three of them share one debounce instead of firing on
+        # every pixel of a drag.
+        self._bc_debounce = QTimer(self)
+        self._bc_debounce.setSingleShot(True)
+        self._bc_debounce.setInterval(120)
+        self._bc_debounce.timeout.connect(self._reshow_preview)
 
-        # Log
-        ll.addWidget(_group_label("Log"))
+        # CONTRAST. Its Auto box is the percentile auto-stretch this tab used to show as
+        # a separate "Auto stretch" checkbox — the same operation, now sitting on the row
+        # it overrides, the way the Slider has always had it. Absolute scale stays the
+        # default (see img_scale): one palette colour = one intensity, so frames and
+        # cameras are comparable. Auto buys legibility on the dim cameras and pays with
+        # that comparability, which is why it is a visible switch and off by default.
+        row_con = QHBoxLayout()
+        self._lbl_contrast_name = QLabel("Con:")
+        self._lbl_contrast_name.setMinimumWidth(_BC_NAME_W)
+        self._lbl_contrast_name.setToolTip(_TT_CONTRAST)
+        row_con.addWidget(self._lbl_contrast_name)
+        self._contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self._contrast_slider.setRange(img_scale.CONTRAST_MIN, img_scale.CONTRAST_MAX)
+        self._contrast_slider.setValue(0)
+        self._contrast_slider.setToolTip(_TT_CONTRAST)
+        self._contrast_slider.valueChanged.connect(self._on_contrast_slider_changed)
+        # The manual value to come back to when Auto is switched off — the greyed-out
+        # slider is overwritten while Auto is on (see _park_auto_bc).
+        self._contrast_manual = 0
+        row_con.addWidget(self._contrast_slider, 1)
+        self._lbl_contrast_val = _bc_value_label("0", _TT_CONTRAST)
+        row_con.addWidget(self._lbl_contrast_val)
+        self._btn_contrast_reset = QPushButton("↺")
+        self._btn_contrast_reset.setFixedWidth(26)
+        self._btn_contrast_reset.setToolTip("Reset contrast")
+        self._btn_contrast_reset.clicked.connect(self._reset_contrast_slider)
+        row_con.addWidget(self._btn_contrast_reset)
+        self._cb_auto_stretch = QCheckBox("Auto")
+        self._cb_auto_stretch.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_auto_stretch.setToolTip(
+            "Auto contrast — stretch each frame over its own p0.5–p99.5 window. "
+            "Overrides the Contrast slider.\n"
+            "OFF: absolute scale — pixel value / camera full scale. Brightness is "
+            "comparable between frames and between cameras.\n"
+            "ON: a dim frame becomes readable, but colours no longer mean the same "
+            "intensity from frame to frame.\n"
+            "The Binary and False Colors palettes always map per frame, by design.")
+        self._cb_auto_stretch.toggled.connect(self._on_auto_stretch_toggled)
+        row_con.addWidget(self._cb_auto_stretch)
+        ll.addLayout(row_con)
+
+        # BRIGHTNESS — an additive offset, never a gain (that is what Contrast is).
+        # Its Auto box is the auto LEVEL: the same p0.5–p99.5 window as Auto contrast,
+        # placed on the data. No additive rule can do that job — a shift cannot spread a
+        # narrow range — which is why Auto brightness and Auto contrast are one pass and
+        # ticking both does not level the frame twice.
+        row_bri = QHBoxLayout()
+        self._lbl_bright_name = QLabel("Bri:")
+        self._lbl_bright_name.setMinimumWidth(_BC_NAME_W)
+        self._lbl_bright_name.setToolTip(_TT_BRIGHTNESS)
+        row_bri.addWidget(self._lbl_bright_name)
+        self._bright_slider = QSlider(Qt.Orientation.Horizontal)
+        self._bright_slider.setRange(img_scale.BRIGHTNESS_MIN, img_scale.BRIGHTNESS_MAX)
+        self._bright_slider.setValue(0)
+        self._bright_slider.setToolTip(_TT_BRIGHTNESS)
+        self._bright_slider.valueChanged.connect(self._on_bright_slider_changed)
+        self._bright_manual = 0
+        row_bri.addWidget(self._bright_slider, 1)
+        self._lbl_bright_val = _bc_value_label("0", _TT_BRIGHTNESS)
+        row_bri.addWidget(self._lbl_bright_val)
+        self._btn_bright_reset = QPushButton("↺")
+        self._btn_bright_reset.setFixedWidth(26)
+        self._btn_bright_reset.setToolTip("Reset brightness")
+        self._btn_bright_reset.clicked.connect(self._reset_bright_slider)
+        row_bri.addWidget(self._btn_bright_reset)
+        self._cb_bright_auto = QCheckBox("Auto")
+        self._cb_bright_auto.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_bright_auto.setToolTip(
+            "Auto brightness — auto level: the frame's p0.5–p99.5 window mapped onto "
+            "the full range. Overrides the Brightness slider.\n"
+            "Per-frame, so it gives up comparability the same way Auto contrast does.")
+        self._cb_bright_auto.toggled.connect(self._on_bright_auto_toggled)
+        row_bri.addWidget(self._cb_bright_auto)
+        ll.addLayout(row_bri)
+
+        # GAMMA — the third member of the pattern, and the only one that does NOT cost
+        # comparability: the curve depends on the pixel value alone, so one colour still
+        # means one intensity (see img_scale). It is the answer to "the absolute scale is
+        # right but the frame is dark" that Auto contrast answers by giving that up.
+        row_gam = QHBoxLayout()
+        self._lbl_gamma = QLabel("Gam:")
+        self._lbl_gamma.setMinimumWidth(_BC_NAME_W)
+        self._lbl_gamma.setToolTip(_TT_GAMMA)
+        row_gam.addWidget(self._lbl_gamma)
+        self._gamma_slider = QSlider(Qt.Orientation.Horizontal)
+        self._gamma_slider.setRange(img_scale.GAMMA_SLIDER_MIN, img_scale.GAMMA_SLIDER_MAX)
+        self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
+        self._gamma_slider.setToolTip(_TT_GAMMA)
+        self._gamma_slider.valueChanged.connect(self._on_gamma_slider_changed)
+        self._gamma_manual = img_scale.GAMMA_SLIDER_NEUTRAL
+        row_gam.addWidget(self._gamma_slider, 1)
+        self._lbl_gamma_val = _bc_value_label("1.00", _TT_GAMMA)
+        row_gam.addWidget(self._lbl_gamma_val)
+        self._btn_gamma_reset = QPushButton("↺")
+        self._btn_gamma_reset.setFixedWidth(26)
+        self._btn_gamma_reset.setToolTip("Reset gamma to 1.00 (linear)")
+        self._btn_gamma_reset.clicked.connect(self._reset_gamma_slider)
+        row_gam.addWidget(self._btn_gamma_reset)
+        self._cb_gamma_auto = QCheckBox("Auto")
+        self._cb_gamma_auto.setStyleSheet(_CHECKBOX_STYLE)
+        self._cb_gamma_auto.setToolTip(
+            "Auto gamma — the curve that lands THIS frame's median at "
+            f"{int(img_scale.AUTO_GAMMA_TARGET * 100)} % of the range.\n"
+            "Per-frame, so it overrides the slider and gives up comparability, same as "
+            "Auto contrast.")
+        self._cb_gamma_auto.toggled.connect(self._on_gamma_auto_toggled)
+        row_gam.addWidget(self._cb_gamma_auto)
+        ll.addLayout(row_gam)
+        # All three rows exist now, so put them in the state their checkboxes call for.
+        self._sync_bc_enabled()
+
+        # What the displayed intensities MEAN — peak in raw counts, how much of the
+        # camera's full scale that is, the sensor depth, and which mapping produced the
+        # picture. A dark frame is then readable as "3 % of full scale" instead of as a
+        # broken render.
+        self._scale_note_lbl = QLabel("")
+        self._scale_note_lbl.setStyleSheet(
+            "font-size: 10px; color: #666; padding: 1px 0; background: transparent;")
+        self._scale_note_lbl.setWordWrap(True)
+        ll.addWidget(self._scale_note_lbl)
+
+        # ══════════════════ Group: LOG ══════════════════════════════════════
+        ll = s_log.body_layout
         self._log_box = QPlainTextEdit()
         self._log_box.setReadOnly(True)
         self._log_box.setMaximumHeight(140)
@@ -1188,7 +1673,7 @@ class ShotFinderWidget(QWidget):
         self._log_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         ll.addWidget(self._log_box)
 
-        ll.addStretch(1)
+        panel_lay.addStretch(1)
         left_scroll.setWidget(lw)
 
         # ════ RIGHT PANEL ═════════════════════════════════════════════════════
@@ -1202,14 +1687,695 @@ class ShotFinderWidget(QWidget):
         self._result_lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
         hdr_row.addWidget(self._result_lbl)
         hdr_row.addStretch(1)
+        self._btn_clear_results = QPushButton("🗑  Clear table")
+        self._btn_clear_results.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+        self._btn_clear_results.setToolTip(
+            "Empty the results table and drop its camera tabs.\n"
+            "Time window, PV list and camera selection are kept.")
+        self._btn_clear_results.clicked.connect(self._clear_results)
+        hdr_row.addWidget(self._btn_clear_results)
         rl.addLayout(hdr_row)
 
-        # Results table — 7 sloupců
-        self._table = QTableWidget(0, 7)
-        self._table.setHorizontalHeaderLabels([
+        # One results tab per searched camera, each holding that camera's day rows.
+        # With a single camera the tab bar is hidden, so the common case looks exactly
+        # like the plain table it replaced.
+        self._results_tabs = QTabWidget()
+        self._results_tabs.setDocumentMode(True)
+        self._results_tabs.currentChanged.connect(self._on_result_tab_changed)
+
+        # Day rows on top, the shots of ONE opened day in a shorter table underneath.
+        # Both feed the SAME preview on the right — the opened day used to be a modal
+        # dialog carrying its own second copy of the picture, which covered the results.
+        self._results_split = QSplitter(Qt.Orientation.Vertical)
+        self._results_split.setChildrenCollapsible(False)
+        self._results_split.addWidget(self._results_tabs)
+        self._day_panel = self._build_day_panel()
+        self._results_split.addWidget(self._day_panel)
+        self._results_split.setStretchFactor(0, 3)
+        self._results_split.setStretchFactor(1, 2)
+        self._day_panel.setVisible(False)
+        rl.addWidget(self._results_split, 1)
+        self._rebuild_result_tabs([None])
+
+        root_layout.addWidget(left_scroll)
+        root_layout.addWidget(rw, 1)
+
+        # Preview panel
+        self._preview_widget = _PreviewWidget()
+        self._preview_widget.setMinimumHeight(200)
+        root_layout.addWidget(self._preview_widget, 1)
+
+        # Init — SBW4 is what a FIRST run starts with; a list restored from the saved
+        # state wins over it. This line used to assign unconditionally, which quietly
+        # threw the restored list away at the end of the build.
+        if not self._pv_cfg:
+            self._pv_cfg = [{"col": "sbw4", "target": 10.0, "tol": 0.0,
+                             "filter": True}]
+        self._rebuild_pv_rows()
+        self._update_date_info()
+        QTimer.singleShot(300, self._load_cameras)
+        QTimer.singleShot(400, self._fetch_channel_list)
+
+    # ── RESULT TABS (one per searched camera) ─────────────────────────────────
+    #
+    # A search runs over every camera in "Selected cameras", and each gets its own tab
+    # holding a row per searched day. The rest of the tab works on whichever one is in
+    # front: `_table` and `_day_results` resolve to the visible tab, so preview, save,
+    # send-to-Slider and the shot dialog need no notion of tabs at all — and the row
+    # index → result index alignment they rely on stays inside one camera.
+
+    # ── OPENED DAY (shots of one day, under the results table) ────────────────
+
+    def _build_day_panel(self) -> QWidget:
+        """The shot list of ONE opened day, shown under the day table.
+
+        The picture of the picked shot goes to the preview on the right — the same place
+        a day row uses — so opening a day never hides the results."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(3)
+
+        hdr = QHBoxLayout()
+        self._day_panel_lbl = QLabel("")
+        self._day_panel_lbl.setStyleSheet("font-weight: 700; font-size: 12px;")
+        hdr.addWidget(self._day_panel_lbl)
+        hdr.addStretch(1)
+        # No Open/Save buttons here — they exist once, in the panel's Save & Send
+        # group, where the "Act on" selector says whether they mean the day or the
+        # shot picked here.
+        btn_close = QPushButton("✕")
+        btn_close.setToolTip("Close the shot list")
+        btn_close.setFixedWidth(24)
+        btn_close.setStyleSheet("font-size: 11px; padding: 2px 0;")
+        btn_close.clicked.connect(self._hide_day_panel)
+        hdr.addWidget(btn_close)
+        lay.addLayout(hdr)
+
+        self._day_table = QTableWidget(0, 1)
+        self._day_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._day_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._day_table.setAlternatingRowColors(True)
+        self._day_table.setStyleSheet(_TABLE_QSS)
+        self._day_table.verticalHeader().setVisible(False)
+        self._day_table.selectionModel().selectionChanged.connect(self._show_day_shot)
+        self._day_table.cellClicked.connect(self._on_day_cell_clicked)
+
+        # The shot list is narrow (its columns fit their contents), so the rest of the
+        # width goes to the day's PV curve — where in the day this shot sits.
+        self._day_split = QSplitter(Qt.Orientation.Horizontal)
+        self._day_split.setChildrenCollapsible(False)
+        self._day_split.addWidget(self._day_table)
+        self._day_graph_host = QWidget()
+        self._day_graph_lay = QVBoxLayout(self._day_graph_host)
+        self._day_graph_lay.setContentsMargins(0, 0, 0, 0)
+        self._day_graph_lay.setSpacing(2)
+        self._day_graph_placeholder = QLabel("")
+        self._day_graph_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._day_graph_placeholder.setStyleSheet("color: #777; font-size: 11px;")
+        self._day_graph_lay.addWidget(self._day_graph_placeholder)
+        self._day_split.addWidget(self._day_graph_host)
+        self._day_split.setStretchFactor(0, 4)
+        self._day_split.setStretchFactor(1, 6)
+        # Sized for real on the first open (_show_day_panel) — a size hint alone
+        # leaves the table narrower than its own columns and hides the Image cell
+        # behind a scrollbar.
+        self._day_hsplit_sized = False
+        lay.addWidget(self._day_split, 1)
+        return w
+
+    def _hide_day_panel(self, *_a):
+        """Close the shot list and forget the day it belonged to."""
+        self._day_panel.setVisible(False)     # before clearing: the clear fires a
+        self._day_table.setRowCount(0)        # selection change that must be ignored
+        self._day_dr = None
+        self._day_rows = []
+        self._day_cam = None
+        self._day_hour_cache = {}
+        self._day_img_col = -1
+        self._clear_day_graph()
+        self._sync_scope_selector()
+
+    def _show_day_panel(self, dr):
+        self._day_dr = dr
+        self._day_rows = list(dr.rows_in_tol)
+        # Camera of the SEARCH, not of the live list — the rows were found with it.
+        self._day_cam = dr.cam or self._active_cam
+        self._day_hour_cache = {}
+        self._day_panel_lbl.setText(
+            f"{dr.day} — {len(self._day_rows)} shot(s) in range"
+            + (f"   ({self._day_cam})" if self._day_cam else ""))
+        self._fill_day_table(dr)
+        self._draw_day_graph(dr)
+        # After setVisible: the scope selector reads isHidden() to decide whether the
+        # "selected shot" scope is reachable at all.
+        self._day_panel.setVisible(True)
+        self._sync_scope_selector()
+        if not self._restoring_focus:
+            self._focus_day = dr.day
+            self._focus_panel_open = True
+        # First open gives the day rows the bigger half instead of an even split;
+        # after that the user's own drag of the divider is kept.
+        if not self._day_split_sized:
+            h = max(self._results_split.height(), 240)
+            self._results_split.setSizes([int(h * 0.6), int(h * 0.4)])
+            self._day_split_sized = True
+        # Same rule sideways: the shot list gets a bit over half so its columns fit,
+        # the curve gets the rest. The operator's own drag wins afterwards.
+        if not self._day_hsplit_sized:
+            w_px = max(self._day_split.width(), 480)
+            self._day_split.setSizes([int(w_px * 0.55), int(w_px * 0.45)])
+            self._day_hsplit_sized = True
+        if self._day_table.rowCount():
+            self._day_table.selectRow(0)
+
+    def _fill_day_table(self, dr):
+        """Columns come from the SEARCH-TIME state stored on dr — the left panel may
+        have changed since this search ran and must not affect old rows."""
+        criteria = dr.criteria_csv or [{"col": dr.col, "target_csv": dr.target_csv}]
+        extra_cols = [c for c in dr.extra_cols
+                      if c not in {cr["col"] for cr in criteria}]
+
+        headers = ["Prague Time"]
+        # Column headers carry the short label only; the archiver channel goes in
+        # the header tooltip so "SBW4" can be told apart from a HAPLS- twin.
+        header_tips = [""]
+        for cr in criteria:
+            short = self._col_short(cr["col"])
+            headers += [short, f"Δ {short}"]
+            chan = self._col_channel(cr["col"])
+            header_tips += [chan, chan]
+        for c in extra_cols:
+            headers.append(self._col_short(c))
+            header_tips.append(self._col_channel(c))
+        # Last column: the file, like the Folder column of the day table. It is filled
+        # in LAZILY — a day can hold tens of thousands of shots and every path is an
+        # SMB probe, so nothing is resolved until a shot is previewed or its cell is
+        # clicked.
+        headers.append("Image")
+        header_tips.append("The frame belonging to this shot")
+        self._day_img_col = len(headers) - 1
+
+        tbl = self._day_table
+        tbl.setRowCount(0)
+        tbl.setColumnCount(len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        for h_idx, tip in enumerate(header_tips):
+            hi = tbl.horizontalHeaderItem(h_idx)
+            if hi is not None and tip:
+                hi.setToolTip(tip)
+        hh = tbl.horizontalHeader()
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        for h_idx in range(len(headers)):
+            hh.setSectionResizeMode(h_idx, QHeaderView.ResizeMode.ResizeToContents)
+        # The file name takes whatever width is left, so the column cannot end up
+        # behind a horizontal scrollbar.
+        hh.setSectionResizeMode(self._day_img_col, QHeaderView.ResizeMode.Stretch)
+
+        def _row_col_value(row, cc, row_ns):
+            raw = row.get(cc, "")
+            if raw:
+                return raw, "ok"
+            return _lookup_col_value(dr.per_col, dr.col_meta, cc, row_ns,
+                                     tol_s=EXTRA_COL_MATCH_TOL_S,
+                                     allow_network=False)
+
+        for row in self._day_rows:
+            dt_obj = row.get("_dt")
+            row_ns = row.get("_ns", 0)
+            ts_str = dt_obj.strftime("%H:%M:%S.%f")[:-3] if dt_obj else "?"
+            r2 = tbl.rowCount()
+            tbl.insertRow(r2)
+            tbl.setItem(r2, 0, QTableWidgetItem(ts_str))
+            c_idx = 1
+            for cr in criteria:
+                cc = cr["col"]
+                raw_cc, state_cc = _row_col_value(row, cc, row_ns)
+                tbl.setItem(r2, c_idx, QTableWidgetItem(
+                    _format_value_state(cc, raw_cc, state_cc)))
+                try:
+                    diff_str = _format_diff(
+                        cc, abs(_quantize_col(cc, float(raw_cc)) - cr["target_csv"]))
+                except (ValueError, TypeError):
+                    diff_str = (cpva.PV_TEXT_ERROR if state_cc == "error"
+                                else cpva.PV_TEXT_NOT_FOUND)
+                tbl.setItem(r2, c_idx + 1, QTableWidgetItem(diff_str))
+                c_idx += 2
+            for ec in extra_cols:
+                raw_ec, state_ec = _row_col_value(row, ec, row_ns)
+                tbl.setItem(r2, c_idx, QTableWidgetItem(
+                    _format_value_state(ec, raw_ec, state_ec)))
+                c_idx += 1
+            img_item = QTableWidgetItem("")
+            img_item.setForeground(QColor("#2d7dff"))
+            img_item.setToolTip("Click to find this shot's frame and open the folder "
+                               "with it selected")
+            tbl.setItem(r2, self._day_img_col, img_item)
+
+    # ── the day's PV curve, next to the shot list ─────────────────────────────
+    #
+    # Answers "where in the day is this shot?" — the searched PV over the whole day,
+    # the target ± tolerance band, a dot on every shot in range and a line on the one
+    # picked. Everything it draws was captured at search time (dr.per_col), so no day
+    # is read from the archiver again.
+
+    def _ensure_day_graph(self) -> bool:
+        """Build the canvas on the FIRST day opened, not at startup — importing
+        matplotlib costs seconds on a cold cache. True when a canvas exists."""
+        if self._day_canvas is not None:
+            return True
+        try:
+            import matplotlib
+            matplotlib.use("QtAgg", force=False)
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from matplotlib.backends.backend_qtagg import (
+                NavigationToolbar2QT as _NavTb)
+            from matplotlib.figure import Figure
+        except Exception as exc:
+            self._day_graph_placeholder.setText(f"Graph unavailable: {exc}")
+            return False
+
+        fig = Figure(figsize=(4, 2.2), dpi=96)
+        fig.patch.set_facecolor("#ffffff")
+        self._day_fig = fig
+        self._day_ax = fig.add_subplot(111)
+        self._day_canvas = FigureCanvasQTAgg(fig)
+        self._day_canvas.setMinimumWidth(220)
+        # Through the shared helper: a plain NavigationToolbar comes out with white
+        # icons on a white bar under this app's palette.
+        self._day_toolbar = _get_finder_module()._make_mpl_toolbar(
+            _NavTb, self._day_canvas, self._day_graph_host)
+        self._day_canvas.mpl_connect("button_press_event", self._on_day_graph_click)
+        self._day_graph_placeholder.setVisible(False)
+        self._day_graph_lay.addWidget(self._day_toolbar)
+        self._day_graph_lay.addWidget(self._day_canvas, 1)
+        return True
+
+    def _clear_day_graph(self):
+        self._day_marker = None
+        self._day_plot_ns = []
+        if self._day_ax is not None:
+            self._day_ax.clear()
+            if self._day_canvas is not None:
+                self._day_canvas.draw_idle()
+
+    def _draw_day_graph(self, dr):
+        """One line per searched PV over the whole day, in the units the table
+        prints. A second unit gets its own right-hand axis."""
+        if not self._ensure_day_graph():
+            return
+        ax = self._day_ax
+        ax.clear()
+        for extra in getattr(self, "_day_ax_extra", []):
+            try:
+                extra.remove()
+            except Exception:
+                pass
+        self._day_ax_extra = []
+        self._day_marker = None
+
+        criteria = dr.criteria_csv or [{"col": dr.col, "target_csv": dr.target_csv,
+                                        "tol_ui": 0.0}]
+        # Shot timestamps, for click-to-pick and for the dots.
+        self._day_plot_ns = [int(r["_ns"]) for r in self._day_rows
+                             if r.get("_ns") is not None]
+
+        colors = ["#1f6fc0", "#c0521f", "#2e8b57", "#8b2e8b", "#8b8b2e"]
+        units_seen: "dict[str, object]" = {}
+        drawn = 0
+        missing = []
+        for k, crit in enumerate(criteria):
+            cc = crit["col"]
+            samples = dr.per_col.get(cc) or []
+            unit = self._col_unit(cc)
+            # One axis per unit: two energies share the left axis, a waveplate count
+            # gets its own on the right.
+            if unit in units_seen:
+                axis = units_seen[unit]
+            elif not units_seen:
+                axis = ax
+                units_seen[unit] = ax
+            else:
+                axis = ax.twinx()
+                units_seen[unit] = axis
+                self._day_ax_extra.append(axis)
+
+            colr = colors[k % len(colors)]
+            xs, ys = [], []
+            for s in samples:
+                try:
+                    v = _quantize_col(cc, float(s.get(cc, "")))
+                except (TypeError, ValueError):
+                    continue
+                xs.append(_ns_to_prague(int(s["_ns"])))
+                # Plot in the units the table prints, or the curve and the cells
+                # would disagree by a factor of 1000 on an mJ column.
+                ys.append(_diff_ui_value(cc, v))
+            short = self._col_short(cc)
+            if not xs:
+                missing.append(short)
+                continue
+            drawn += 1
+            axis.plot(xs, ys, "-", lw=0.8, color=colr, label=short)
+            axis.set_ylabel(f"{short}" + (f" [{unit}]" if unit and unit != "—" else ""),
+                            fontsize=8, color=colr)
+            axis.tick_params(axis="y", labelsize=7, colors=colr)
+
+            # Target ± tolerance, in the same units
+            tgt = _diff_ui_value(cc, crit.get("target_csv", 0.0))
+            tol = float(crit.get("tol_ui", 0.0) or 0.0)
+            axis.axhline(tgt, color=colr, lw=0.7, ls="--", alpha=0.7)
+            if tol > 0:
+                axis.axhspan(tgt - tol, tgt + tol, color=colr, alpha=0.10, lw=0)
+
+            # The shots that made it into the list
+            if k == 0 and self._day_plot_ns:
+                hit_x, hit_y = [], []
+                for r in self._day_rows:
+                    try:
+                        v = _quantize_col(cc, float(r.get(cc, "")))
+                    except (TypeError, ValueError):
+                        continue
+                    hit_x.append(_ns_to_prague(int(r["_ns"])))
+                    hit_y.append(_diff_ui_value(cc, v))
+                if hit_x:
+                    axis.plot(hit_x, hit_y, "o", ms=3, color="#d11", alpha=0.85,
+                              label="in range", zorder=5)
+
+        # The picked hours of this day, so a window narrower than the day is visible
+        win = self._day_windows().get(dr.day)
+        if win:
+            ax.axvspan(_ns_to_prague(win[0]), _ns_to_prague(win[1]),
+                       color="#2d7dff", alpha=0.06, lw=0)
+
+        ax.set_xlabel("Prague time", fontsize=8)
+        ax.tick_params(axis="x", labelsize=7)
+        # One day, so the date on every tick is noise — the title already names it.
+        try:
+            import matplotlib.dates as _mdates
+            ax.xaxis.set_major_formatter(_mdates.DateFormatter("%H:%M"))
+        except Exception:
+            pass
+        ax.grid(True, color="#e4e8ee", lw=0.6)
+        ax.set_title(f"{dr.day}" + (f"  ({dr.cam})" if dr.cam else ""), fontsize=8)
+        if not drawn:
+            ax.text(0.5, 0.5, "no samples for "
+                    + (", ".join(missing) if missing else "this day"),
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=9, color="#777")
+        elif missing:
+            ax.set_title(f"{dr.day} — no samples for {', '.join(missing)}",
+                         fontsize=8, color="#a11")
+        try:
+            self._day_fig.autofmt_xdate()
+            self._day_fig.tight_layout()
+        except Exception:
+            pass
+        self._day_canvas.draw_idle()
+
+    def _move_day_marker(self, ns):
+        """Move the vertical line to the picked shot without replotting — a day can
+        hold tens of thousands of samples and picking shot after shot would redraw
+        all of them."""
+        if self._day_ax is None or self._day_canvas is None or ns is None:
+            return
+        x = _ns_to_prague(int(ns))
+        if self._day_marker is not None:
+            try:
+                self._day_marker.set_xdata([x, x])
+                self._day_canvas.draw_idle()
+                return
+            except Exception:
+                self._day_marker = None
+        self._day_marker = self._day_ax.axvline(x, color="#111", lw=1.1, alpha=0.85)
+        self._day_canvas.draw_idle()
+
+    def _on_day_graph_click(self, event):
+        """Left-click in the graph picks the nearest shot of the list, so the graph
+        and the table drive each other. The toolbar owns every other button."""
+        if event.button != 1 or event.inaxes is None or event.xdata is None:
+            return
+        if not self._day_plot_ns:
+            return
+        try:
+            import matplotlib.dates as mdates
+            # The axis carries Prague wall clock as NAIVE datetimes (see
+            # _ns_to_prague), and num2date hands them back labelled UTC — so the
+            # tz has to be replaced, not converted.
+            clicked = mdates.num2date(event.xdata).replace(tzinfo=None)
+        except Exception:
+            return
+        tz = PRAGUE if PRAGUE else timezone.utc
+        want_ns = int(clicked.replace(tzinfo=tz).timestamp() * 1_000_000_000)
+        self._select_day_shot_by_ns(want_ns)
+
+    # ── the Image column of the shot list ─────────────────────────────────────
+
+    def _day_set_image_cell(self, row_idx: int, img, problem: str = ""):
+        """Fill one Image cell once the path is known (main thread only)."""
+        if self._day_dr is None or self._day_img_col < 0:
+            return
+        if row_idx < 0 or row_idx >= self._day_table.rowCount():
+            return
+        item = self._day_table.item(row_idx, self._day_img_col)
+        if item is None:
+            return
+        if img is None:
+            item.setText("no image")
+            item.setForeground(QColor("#cc0000"))
+            item.setToolTip(problem or "No frame found for this shot")
+            item.setData(Qt.ItemDataRole.UserRole, None)
+            return
+        p = Path(img)
+        item.setText(p.name)
+        item.setForeground(QColor("#2d7dff"))
+        item.setToolTip(f"{p}\nClick to open the folder with this frame selected")
+        item.setData(Qt.ItemDataRole.UserRole, str(p))
+
+    def _on_day_cell_clicked(self, row: int, col: int):
+        """Click the Image cell — reveal the frame in Explorer, resolving the path
+        first when it is not known yet (off the UI thread: it is an SMB probe)."""
+        if col != self._day_img_col or self._day_dr is None:
+            return
+        item = self._day_table.item(row, col)
+        if item is None:
+            return
+        known = item.data(Qt.ItemDataRole.UserRole)
+        if known:
+            self._reveal_in_explorer(known)
+            return
+        if row >= len(self._day_rows):
+            return
+        dr = self._day_dr
+        shot = self._day_rows[row]
+        dt_obj = shot.get("_dt")
+        cam = self._day_cam
+        if dt_obj is None or not cam:
+            self._day_set_image_cell(row, None, "no camera for these results")
+            return
+        item.setText("looking…")
+        item.setForeground(QColor("#777"))
+        cache = self._day_hour_cache
+        # This row asked to be revealed, not just filled in.
+        self._day_reveal_row = row
+
+        def _resolve():
+            img = self._find_image_for_shot(dr, cam, dt_obj, shot.get("_ns"), cache)
+            self._preview_sig.day_img.emit(row, str(img) if img else "",
+                                           "" if img else "no frame within "
+                                           f"{IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
+
+        threading.Thread(target=_resolve, daemon=True).start()
+
+    def _on_day_img_resolved(self, row_idx: int, img_str: str, problem: str):
+        """Worker → main thread: the Image cell of one shot, and reveal it if the
+        click is what asked for it."""
+        self._day_set_image_cell(row_idx, img_str or None, problem)
+        if img_str and self._day_reveal_row == row_idx:
+            self._reveal_in_explorer(img_str)
+        self._day_reveal_row = -1
+
+    def _reveal_in_explorer(self, img_path):
+        try:
+            # /select, and the path must stay ONE argument (comma included)
+            subprocess.Popen(f'explorer /select,"{img_path}"')
+            self._log(f"EXPLORER: select {img_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error",
+                                 f"Could not open folder:\n{type(e).__name__}: {e}")
+
+    def _day_selected_rows(self) -> "list[dict]":
+        idxs = sorted(set(i.row() for i in self._day_table.selectedIndexes()))
+        return [self._day_rows[i] for i in idxs if i < len(self._day_rows)]
+
+    def _show_day_shot(self, *_a):
+        """Picked shot of the opened day → the panel preview on the right."""
+        dr = self._day_dr
+        # isHidden(), not isVisible(): the tab itself is invisible whenever another
+        # Image Tools tab is in front, and a redraw asked for then still belongs to the
+        # opened day.
+        if dr is None or self._day_panel.isHidden():
+            return
+        sel = sorted(set(i.row() for i in self._day_table.selectedIndexes()))
+        rows = [self._day_rows[i] for i in sel if i < len(self._day_rows)]
+        if not rows:
+            return
+        row_idx = sel[0]
+        row = rows[0]
+        dt_obj = row.get("_dt")
+        if dt_obj is None:
+            return
+        cam = self._day_cam
+        # Full multi-PV caption (search + also-show), same as a day row
+        energy = self._build_energy_text(dr, row, row.get("_ns"))
+        self._preview_gen += 1
+        gen = self._preview_gen
+        gname = self._gradient_cb.currentText()
+        auto, gam, con, off = self._bc_args()
+        ns = row.get("_ns")
+        cache = self._day_hour_cache
+        # The shot to come back to on another camera's tab, and the line on the graph.
+        if not self._restoring_focus:
+            self._focus_day = dr.day
+            self._focus_shot_ns = ns
+            self._focus_panel_open = True
+        self._move_day_marker(ns)
+        if not cam:
+            self._log("No camera for these results — nothing to preview.")
+            self._current_preview_path = None
+            self._on_preview_ready(None, "", gen)
+            self._day_set_image_cell(row_idx, None, "no camera for these results")
+            return
+
+        def _resolve_and_load():
+            # Hour folders are resolved per shot on a worker thread: the shots in range
+            # span the whole day, and probing an SMB folder on the UI thread freezes it.
+            img = self._find_image_for_shot(dr, cam, dt_obj, ns, cache)
+            if gen != self._preview_gen:
+                return
+            if img is None:
+                self._preview_sig.log_msg.emit(
+                    f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s for "
+                    f"{dt_obj:%Y-%m-%d %H:%M:%S} ({cam})")
+                self._preview_sig.show.emit(None, "", gen)
+                self._preview_sig.day_img.emit(
+                    row_idx, "",
+                    f"no frame within {IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
+                return
+            self._current_preview_path = img
+            # The path is now known — the Image cell of this row can name it without
+            # a second walk of the share.
+            self._preview_sig.day_img.emit(row_idx, str(img), "")
+            self._load_and_show_preview(img, energy, gen, gname, auto, gam, con, off)
+
+        threading.Thread(target=_resolve_and_load, daemon=True).start()
+
+    def _day_save_image(self):
+        dr = self._day_dr
+        if dr is None:
+            return
+        rows = self._day_selected_rows()
+        if not rows:
+            QMessageBox.information(self, "No selection", "Select a shot in the list.")
+            return
+        cam = self._day_cam
+        if not cam:
+            QMessageBox.warning(self, "No camera", "No camera folder for these results.")
+            return
+        dt_obj = rows[0].get("_dt")
+        if dt_obj is None:
+            QMessageBox.warning(self, "No timestamp", "This shot has no timestamp.")
+            return
+        src = self._find_image_for_shot(dr, cam, dt_obj, rows[0].get("_ns"),
+                                        self._day_hour_cache)
+        if src is None:
+            QMessageBox.warning(self, "Image not found", "No image found for this shot.")
+            return
+        initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Save image", str(Path(initial_dir) / src.name),
+            "Images (*.png *.jpg *.tif *.tiff *.bmp);;All files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog)
+        if not dst:
+            return
+        dst_path = Path(dst)
+        self._last_save_dir = dst_path.parent
+        try:
+            shutil.copy2(src, dst_path)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Copy failed:\n{ex}")
+
+    def _day_open_in_slider(self):
+        """Send the picked shots (or the whole day when nothing is picked) to the
+        Image Slider tab as a discrete folder."""
+        dr = self._day_dr
+        if dr is None:
+            return
+        sel_rows = self._day_selected_rows() or list(self._day_rows)
+        cam = self._day_cam
+        if not cam:
+            QMessageBox.warning(self, "No camera", "Select a camera first.")
+            return
+
+        files = []
+        for row in sel_rows:
+            dt_obj = row.get("_dt")
+            if dt_obj is None:
+                continue
+            # Per-shot lookup: the shots in range span the whole day, not just
+            # the hour folder of the day's best shot.
+            img = self._find_image_for_shot(dr, cam, dt_obj, row.get("_ns"),
+                                            self._day_hour_cache)
+            if img:
+                files.append((img, row))
+
+        if not files:
+            QMessageBox.warning(self, "No images", "No matching images found.")
+            return
+
+        prev_temp_dir = self._temp_dir
+        self._temp_dir = tempfile.mkdtemp(prefix="SF_slider_")
+        temp_path = Path(self._temp_dir)
+
+        copied = 0
+        energy_map: dict[str, str] = {}
+        for src, row in files:
+            try:
+                dst = temp_path / src.name
+                if dst.exists():
+                    dst = temp_path / f"{src.stem}_{copied}{src.suffix}"
+                shutil.copy2(src, dst)
+                energy_map[dst.name] = self._build_energy_text(
+                    dr, row, row.get("_ns"))
+                copied += 1
+            except Exception as e:
+                self._log(f"Copy error: {e}")
+
+        if copied == 0:
+            QMessageBox.warning(self, "Copy failed", "No images copied.")
+            return
+
+        if self._tab_widget:
+            self._tab_widget.setCurrentIndex(1)
+        if self._slider_ref:
+            recv = getattr(self._slider_ref, "receive_external_folder", None)
+            if callable(recv):
+                recv(temp_path, energy_map=energy_map, discrete=True, cam_name=cam)
+            else:
+                self._slider_ref._sf_energy_map = energy_map
+                self._slider_ref.open_folder_path(temp_path)
+        if prev_temp_dir:
+            try:
+                shutil.rmtree(prev_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _make_results_table(self) -> QTableWidget:
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels([
             "Date", "Prague Time", "PV", "Value", "Δ from target", "Status", "Folder"
         ])
-        hh = self._table.horizontalHeader()
+        hh = table.horizontalHeader()
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for c, mode in enumerate([
             QHeaderView.ResizeMode.ResizeToContents,
@@ -1221,66 +2387,170 @@ class ShotFinderWidget(QWidget):
             QHeaderView.ResizeMode.Stretch,
         ]):
             hh.setSectionResizeMode(c, mode)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setAlternatingRowColors(True)
-        self._table.selectionModel().selectionChanged.connect(self._on_selection_changed)
-        self._table.doubleClicked.connect(self._on_table_double_clicked)
-        self._table.cellClicked.connect(self._on_table_cell_clicked)
-        rl.addWidget(self._table, 1)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(_TABLE_QSS)
+        table.selectionModel().selectionChanged.connect(self._on_main_selection_changed)
+        table.doubleClicked.connect(self._on_table_double_clicked)
+        table.cellClicked.connect(self._on_table_cell_clicked)
+        return table
 
-        root_layout.addWidget(left_scroll)
-        root_layout.addWidget(rw, 1)
+    def _rebuild_result_tabs(self, cams: "list"):
+        """One empty tab per camera of the search about to run (None = no camera)."""
+        # The opened day belongs to rows that are about to be thrown away.
+        self._hide_day_panel()
+        self._results_tabs.blockSignals(True)
+        while self._results_tabs.count():
+            w = self._results_tabs.widget(0)
+            self._results_tabs.removeTab(0)
+            # Cut the old table loose first: it is destroyed later by the event loop,
+            # and a selection signal arriving from a table that no longer has a tab
+            # would be answered with the NEW tab's rows.
+            try:
+                w.selectionModel().selectionChanged.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            w.deleteLater()
+        self._cam_tables = {}
+        self._cam_results = {}
+        self._cam_order = list(cams) if cams else [None]
+        # The remembered day/shot described rows that no longer exist.
+        self._focus_day = None
+        self._focus_shot_ns = None
+        self._focus_panel_open = False
+        for cam in self._cam_order:
+            table = self._make_results_table()
+            self._cam_tables[cam] = table
+            self._cam_results[cam] = []
+            label = _clean_cam_for_filename(cam) if cam else "no camera"
+            idx = self._results_tabs.addTab(table, label)
+            self._results_tabs.setTabToolTip(idx, cam or "No camera selected")
+        self._results_tabs.tabBar().setVisible(len(self._cam_order) > 1)
+        self._results_tabs.setCurrentIndex(0)
+        self._results_tabs.blockSignals(False)
 
-        # Preview panel
-        self._preview_widget = _PreviewWidget()
-        self._preview_widget.setMinimumHeight(200)
-        root_layout.addWidget(self._preview_widget, 1)
+    def _clear_results(self):
+        """Empty the results table and go back to a single, camera-less tab.
 
-        # Init
-        self._criteria_cols = ["sbw4"]       # default search PV
-        self._rebuild_criteria_rows()
-        self._rebuild_extra_rows()
-        self._update_date_info()
-        QTimer.singleShot(300, self._load_cameras)
-        QTimer.singleShot(400, self._fetch_channel_list)
+        A finished search leaves one tab per camera it ran with, and every export
+        button, the preview and the shot dialog read the tab in front -- so the only way
+        back to a clean table used to be running another search."""
+        if self._search_running:
+            return
+        self._rebuild_result_tabs([None])
+        self._result_lbl.setText("Results")
+        # Drop the picture with the rows it belonged to, or it keeps describing a shot
+        # that is no longer in the table.
+        self._preview_gen += 1
+        self._current_preview_path = None
+        self._on_preview_ready(None, "", self._preview_gen)
+        self._sync_export_buttons()
+        self._log("Results table cleared.")
 
-    def _setup_calendar(self, cal: _NoScrollCalendar):
-        cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-        cal.setGridVisible(True)
-        cal.setNavigationBarVisible(True)
-        cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-        view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if view:
-            view.setItemDelegate(_WeekendDelegate(view))
-        hf = QTextCharFormat()
-        hf.setForeground(QColor("#111111"))
-        cal.setHeaderTextFormat(hf)
-        wf = QTextCharFormat()
-        wf.setForeground(QColor("#111111"))
-        for day in [Qt.DayOfWeek.Monday, Qt.DayOfWeek.Tuesday, Qt.DayOfWeek.Wednesday,
-                    Qt.DayOfWeek.Thursday, Qt.DayOfWeek.Friday]:
-            cal.setWeekdayTextFormat(day, wf)
-        wf_we = QTextCharFormat()
-        wf_we.setForeground(QColor("#cc0000"))
-        for day in [Qt.DayOfWeek.Saturday, Qt.DayOfWeek.Sunday]:
-            cal.setWeekdayTextFormat(day, wf_we)
-        cal.setStyleSheet("""
-        QCalendarWidget QWidget { background: #f6f6f6; color: #111; }
-        QCalendarWidget QAbstractItemView {
-            background: #fcfcfc; color: #111;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            alternate-background-color: #f2f2f2; gridline-color: #d8d8d8; }
-        QCalendarWidget QTableView {
-            background: #fcfcfc;
-            selection-background-color: #2d7dff; selection-color: #fff;
-            gridline-color: #d8d8d8; outline: 0; }
-        QCalendarWidget QToolButton {
-            background: #efefef; border: 1px solid #c8c8c8;
-            padding: 3px 6px; border-radius: 4px; color: #111; }
-        QCalendarWidget QWidget#qt_calendar_navigationbar { background: #efefef; }
-        QCalendarWidget QAbstractItemView:enabled { color: #111; }
-        """)
+    def _current_cam_key(self):
+        """The camera whose tab is in front."""
+        idx = self._results_tabs.currentIndex()
+        if 0 <= idx < len(self._cam_order):
+            return self._cam_order[idx]
+        return self._cam_order[0] if self._cam_order else None
+
+    @property
+    def _table(self) -> QTableWidget:
+        return self._cam_tables[self._current_cam_key()]
+
+    @property
+    def _day_results(self) -> "list[_DayResult]":
+        return self._cam_results[self._current_cam_key()]
+
+    def _all_results(self) -> "list[_DayResult]":
+        return [dr for cam in self._cam_order for dr in self._cam_results[cam]]
+
+    def _on_result_tab_changed(self, _idx: int):
+        """Another camera's tab came to the front.
+
+        The day and the shot the operator was looking at are the SAME question asked of
+        another camera, so they are carried over: the row of that day is selected here
+        too, the shot list is reopened and the shot with the same timestamp is picked.
+        The shot list is PV-derived, so its timestamps are identical in every tab.
+        Before this, switching camera dropped both and left an empty preview."""
+        want_day = self._focus_day
+        want_ns = self._focus_shot_ns
+        want_panel = self._focus_panel_open
+        # The panel belongs to the tab we are leaving.
+        self._hide_day_panel()
+        if want_day is None:
+            self._on_selection_changed()
+            return
+
+        results = self._day_results
+        row = next((i for i, dr in enumerate(results) if dr.day == want_day), None)
+        if row is None:
+            # This camera has no row for that day — say nothing found rather than
+            # jumping to some other day.
+            self._on_selection_changed()
+            return
+
+        self._restoring_focus = True
+        try:
+            # Select the day row FIRST: that fires _on_main_selection_changed, which
+            # closes the panel. Only then may the panel be reopened.
+            self._table.selectRow(row)
+            dr = results[row]
+            if want_panel and dr.rows_in_tol:
+                self._show_day_panel(dr)
+                self._select_day_shot_by_ns(want_ns)
+        finally:
+            self._restoring_focus = False
+        # Restore left the remembered pick untouched; the preview/buttons still need
+        # to be brought in line with the tab that is now in front.
+        self._focus_day, self._focus_shot_ns = want_day, want_ns
+        self._focus_panel_open = want_panel and not self._day_panel.isHidden()
+        self._on_selection_changed()
+
+    def _select_day_shot_by_ns(self, want_ns):
+        """Pick the shot of the opened day whose timestamp matches — nearest wins, so
+        a camera whose day holds one shot fewer still lands next to the right one."""
+        if not self._day_rows:
+            return
+        if want_ns is None:
+            self._day_table.selectRow(0)
+            return
+        best_i, best_d = 0, None
+        for i, row in enumerate(self._day_rows):
+            ns = row.get("_ns")
+            if ns is None:
+                continue
+            d = abs(int(ns) - int(want_ns))
+            if best_d is None or d < best_d:
+                best_i, best_d = i, d
+        self._day_table.selectRow(best_i)
+        self._day_table.scrollToItem(self._day_table.item(best_i, 0))
+
+    def _on_main_selection_changed(self):
+        """A day row was picked in the results table.
+
+        The shot list underneath belongs to the day that was opened, so picking another
+        row (or clearing the selection) closes it instead of leaving it describing a day
+        that is no longer selected."""
+        if not self._restoring_focus:
+            rows = sorted(set(i.row() for i in self._table.selectedIndexes()))
+            results = self._day_results
+            r = rows[0] if rows else -1
+            self._focus_day = results[r].day if 0 <= r < len(results) else None
+            self._focus_shot_ns = None
+            self._focus_panel_open = False
+        self._hide_day_panel()
+        self._on_selection_changed()
+
+    def _refresh_preview(self):
+        """Re-render what is on screen with the current display settings: the shot
+        picked in the opened day list, otherwise the selected day row."""
+        if not self._day_panel.isHidden() and self._day_table.selectedIndexes():
+            self._show_day_shot()
+            return
+        if self._table.selectedIndexes():
+            self._on_selection_changed()
 
     # ── EVENTS ────────────────────────────────────────────────────────────────
 
@@ -1290,10 +2560,51 @@ class ShotFinderWidget(QWidget):
 
     # ── PV column helpers ─────────────────────────────────────────────────
     def _col_label(self, col: str) -> str:
-        return PV_COLUMNS.get(col) or self._custom_labels.get(col, col)
+        """A name typed in the Rename dialog wins over the preset label — wanting to
+        see a different name is the only reason that dialog would ever be used."""
+        return self._custom_labels.get(col) or PV_COLUMNS.get(col, col)
 
     def _col_short(self, col: str) -> str:
         return self._col_label(col).split(" [")[0]
+
+    def _col_channel(self, col: str) -> str:
+        """The archiver channel the column actually reads.
+
+        Preset labels ("SBW4 [J]") hide which beamline the channel belongs to —
+        SBW4 is L3-SBW4-PM311:Energy, PTM1 is a HAPLS- name — so every place the
+        user points at a PV must be able to show this name.  Arbitrary typed-in
+        channels are their own name."""
+        return CPVA_CHANNEL_MAP.get(col, col)
+
+    # ── SEARCH PROGRESS ───────────────────────────────────────────────────────
+
+    def _sync_prog_text(self, value: int):
+        """The words on the progress bar: what is being read, how far along, and
+        roughly how much is left. A bar with no text says nothing about a search
+        that runs for minutes."""
+        total = max(1, getattr(self, "_prog_total", 1))
+        parts = [getattr(self, "_prog_stage", "") or "working…",
+                 f"{value}/{total}"]
+        hits = getattr(self, "_prog_hits", 0)
+        if hits:
+            parts.append(f"{hits} found")
+        t0 = getattr(self, "_prog_t0", None)
+        if t0 is not None and value > 0 and value < total:
+            elapsed = time.monotonic() - t0
+            left = elapsed / value * (total - value)
+            if left >= 90:
+                parts.append(f"~{left / 60:.0f} min left")
+            else:
+                parts.append(f"~{max(1, int(left))} s left")
+        self._prog.setFormat("  ·  ".join(parts))
+
+    def _on_progress(self, value: int):
+        self._prog.setValue(value)
+        self._sync_prog_text(value)
+
+    def _on_stage(self, text: str):
+        self._prog_stage = text
+        self._sync_prog_text(self._prog.value())
 
     def _col_unit(self, col: str) -> str:
         if col in MJ_COLUMNS:
@@ -1322,8 +2633,9 @@ class ShotFinderWidget(QWidget):
         self._pv_suggestions = sugg
 
     def _fetch_channel_list(self):
-        if self._all_pv_channels:
+        if self._all_pv_channels or self._chan_loading:
             return
+        self._chan_loading = True
         sig = self._chan_sig = _ChannelSignals()
         sig.loaded.connect(self._on_channels_loaded)
 
@@ -1339,10 +2651,15 @@ class ShotFinderWidget(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_channels_loaded(self, chans: list):
+        self._chan_loading = False
         self._all_pv_channels = list(chans)
         self._rebuild_pv_suggestions()
         if chans:
             self._log(f"PV channels available: {len(chans)}")
+            # A query typed while the list was downloading matched presets only;
+            # redo it now that all channels are known.
+            if self._pv_search.text().strip():
+                self._on_pv_search_changed(self._pv_search.text())
         else:
             self._log(f"PV channel list unavailable ({self._chan_err or 'empty'}); "
                       "presets + free-typed channels still work.")
@@ -1367,25 +2684,81 @@ class ShotFinderWidget(QWidget):
             "QTableWidget::item:selected { background: #2d7dff; color: #fff; }")
         return dd
 
+    _PV_DROPDOWN_MAX = 200
+
+    # Query parsing + ranking are shared with the Image Slider's PV picker; these
+    # stay as thin aliases so the existing call sites read unchanged.
+    _split_query     = staticmethod(cpva.split_query)
+    _tokens_in_order = staticmethod(cpva.tokens_in_order)
+    _rank_pv_match   = staticmethod(cpva.rank_pv_match)
+
     def _populate_pv_dropdown(self, text, dropdown, anchor, exclude):
-        q = text.strip().lower()
+        tokens = self._split_query(text)
         dropdown.hide()
         dropdown.setRowCount(0)
-        if not q:
+        if not tokens:
             return
-        matches = [(disp, key) for disp, key in self._pv_suggestions
-                   if key not in exclude and (q in disp.lower() or q in key.lower())]
-        if not matches:
-            return
-        for disp, key in matches[:40]:
+        # The startup fetch may have failed or may still be in flight — retry so
+        # the search isn't stuck on presets for the rest of the session.
+        if not self._all_pv_channels:
+            self._fetch_channel_list()
+        scored = []
+        for i, (disp, key) in enumerate(self._pv_suggestions):
+            if key in exclude:
+                continue
+            s = self._rank_pv_match(disp, key, tokens)
+            if s is not None:
+                scored.append((s, i, disp, key))
+        scored.sort(key=lambda t: (t[0], t[1]))
+        shown = scored[:self._PV_DROPDOWN_MAX]
+
+        def _hint_row(txt: str) -> QTableWidgetItem:
+            r = dropdown.rowCount()
+            dropdown.insertRow(r)
+            it = QTableWidgetItem(txt)
+            it.setForeground(QColor("#777"))
+            dropdown.setItem(r, 0, it)
+            return it
+
+        for _s, _i, disp, key in shown:
             r = dropdown.rowCount()
             dropdown.insertRow(r)
             it = QTableWidgetItem(disp)
+            # Presets are listed under a short label ("SBW4 [J]") that does not
+            # say which beamline the channel is on — show the archiver name.
+            chan = self._col_channel(key)
+            if chan != disp:
+                it.setToolTip(chan)
             it.setData(Qt.ItemDataRole.UserRole, key)
             dropdown.setItem(r, 0, it)
-        n_rows = min(len(matches), 40)
+        if len(scored) > len(shown):
+            # No UserRole → _on_pv_dropdown_clicked ignores this hint row.
+            _hint_row(f"… {len(scored) - len(shown)} more matches — refine the search")
+
+        # "Add by name": a single bare word is offered as an archiver channel name of
+        # its own, so a PV the fetched list does not carry — or any PV at all while the
+        # list is down — can still be added. Same rule Enter follows: "023 l3" is a
+        # query, not a name, and is not offered.
+        literal = (text or "").strip()
+        if (len(tokens) != 1 or tokens[0] != literal.lower() or literal in exclude
+                or any(k == literal for _s, _i, _d, k in shown)):
+            literal = ""
+        if literal:
+            it = _hint_row(f'➕  add "{literal}" as an archiver channel name')
+            it.setForeground(QColor("#1a6aee"))
+            it.setToolTip("Takes the typed text as the channel name itself — for a PV "
+                          "that is not in the fetched list.")
+            it.setData(Qt.ItemDataRole.UserRole, literal)
+
+        if not dropdown.rowCount():
+            if not self._chan_loading:
+                return
+            # Without this the box looks empty-and-final while the ~9700 channel
+            # list is still downloading; _on_channels_loaded re-runs the query when
+            # it lands.
+            _hint_row("loading PV list…")
         row_h = max(22, dropdown.verticalHeader().defaultSectionSize())
-        popup_h = min(n_rows * row_h + 6, 360)
+        popup_h = min(dropdown.rowCount() * row_h + 6, 360)
         popup_w = max(300, anchor.width() + 20)
         pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
         dropdown.setGeometry(pos.x(), pos.y(), popup_w, popup_h)
@@ -1395,247 +2768,530 @@ class ShotFinderWidget(QWidget):
 
     def _on_pv_search_changed(self, text: str):
         self._populate_pv_dropdown(text, self._pv_dropdown, self._pv_search,
-                                   set(self._criteria_cols))
-
-    def _on_extra_search_changed(self, text: str):
-        self._populate_pv_dropdown(text, self._extra_dropdown, self._extra_search,
-                                   set(self._extra_cols_sel))
+                                   {c["col"] for c in self._pv_cfg})
 
     def _on_pv_dropdown_clicked(self, index):
         it = self._pv_dropdown.item(index.row(), 0)
         if it is None:
             return
-        key = it.data(Qt.ItemDataRole.UserRole) or it.text()
+        key = it.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return          # the "… N more matches" hint row
         self._pv_dropdown.hide()
         self._pv_search.clear()
-        self._add_criteria_col(key)
+        self._add_pv_col(key)
 
-    def _on_extra_dropdown_clicked(self, index):
-        it = self._extra_dropdown.item(index.row(), 0)
-        if it is None:
-            return
-        key = it.data(Qt.ItemDataRole.UserRole) or it.text()
-        self._extra_dropdown.hide()
-        self._extra_search.clear()
-        self._add_extra_col(key)
+    def _best_pv_match(self, tokens) -> "str | None":
+        """Channel key of the top-ranked suggestion for `tokens`, or None."""
+        exclude = {c["col"] for c in self._pv_cfg}
+        best = None
+        for i, (disp, key) in enumerate(self._pv_suggestions):
+            if key in exclude:
+                continue
+            s = self._rank_pv_match(disp, key, tokens)
+            if s is not None and (best is None or (s, i) < best[0]):
+                best = ((s, i), key)
+        return best[1] if best else None
 
     def _on_pv_search_return(self):
         txt = self._pv_search.text().strip()
-        if txt:
-            self._pv_dropdown.hide()
-            self._pv_search.clear()
-            self._add_criteria_col(txt)
+        if not txt:
+            return
+        tokens = self._split_query(txt)
+        if not tokens:
+            return
+        # A single bare word is still taken literally, so a channel that is not
+        # in the fetched list can be typed in by hand. "023 l3" / "*023*l3*" is a
+        # query though — Enter takes its best match instead of registering a PV
+        # by that name, which could never return data.
+        if len(tokens) != 1 or tokens[0] != txt.lower():
+            hit = self._best_pv_match(tokens)
+            if hit is None:
+                return
+            txt = hit
+        self._pv_dropdown.hide()
+        self._pv_search.clear()
+        self._add_pv_col(txt)
 
-    def _on_extra_search_return(self):
-        txt = self._extra_search.text().strip()
-        if txt:
-            self._extra_dropdown.hide()
-            self._extra_search.clear()
-            self._add_extra_col(txt)
+    def _preset_for_channel(self, channel: str) -> "str | None":
+        """The preset column that already reads `channel`, if there is one. A channel
+        name typed in full must not become a second column reading exactly what a
+        preset reads — two rows, one number, and only one of them carrying the
+        preset's unit."""
+        return next((c for c in PV_COLUMNS
+                     if CPVA_CHANNEL_MAP.get(c, c) == channel), None)
 
     def _register_col(self, col: str) -> str:
         col = (col or "").strip()
+        preset = self._preset_for_channel(col)
+        if preset is not None:
+            return preset
         if col and col not in PV_COLUMNS and col not in self._custom_labels:
             self._custom_labels[col] = col   # arbitrary channel; label == name
         return col
 
-    def _add_criteria_col(self, col: str):
+    def _add_pv_col(self, col: str, filter_by: bool = True):
+        """Add a PV to the list. New PVs are filter PVs by default — that is what
+        the search box is normally used for; untick the row to only show it."""
         col = self._register_col(col)
-        if not col or col in self._criteria_cols:
+        if not col:
             return
-        self._criteria_cols.append(col)
-        self._rebuild_criteria_rows()
-
-    def _remove_criteria_col(self, col: str):
-        if col in self._criteria_cols:
-            self._criteria_cols.remove(col)
-            self._rebuild_criteria_rows()
-
-    def _add_extra_col(self, col: str):
-        col = self._register_col(col)
-        if not col or col in self._extra_cols_sel:
+        if any(c["col"] == col for c in self._pv_cfg):
+            # Silence here read as "the click did nothing" — most often after typing
+            # a channel name that a preset already covers.
+            self._log(f"{self._col_short(col)} is already in the PV list.")
             return
-        self._extra_cols_sel.append(col)
-        self._rebuild_extra_rows()
+        self._sync_pv_cfg_from_rows()
+        self._pv_cfg.append({"col": col, "target": 10.0, "tol": 0.0,
+                             "filter": bool(filter_by)})
+        self._rebuild_pv_rows()
+        self._save_pv_state()
+        chan = self._col_channel(col)
+        short = self._col_short(col)
+        self._log(f"PV added: {short}" + (f"  ({chan})" if chan != short else ""))
 
-    def _remove_extra_col(self, col: str):
-        if col in self._extra_cols_sel:
-            self._extra_cols_sel.remove(col)
-            self._rebuild_extra_rows()
+    def _remove_pv_col(self, col: str):
+        self._sync_pv_cfg_from_rows()
+        self._pv_cfg = [c for c in self._pv_cfg if c["col"] != col]
+        self._rebuild_pv_rows()
+        self._save_pv_state()
+
+    # ── one PV's name and channel (right-click on its row) ─────────────────
+    def _on_pv_row_menu(self, col: str, pos):
+        w = self.sender()
+        menu = QMenu(self)
+        act_ren = menu.addAction("Rename…")
+        act_cpy = menu.addAction("Copy archiver channel name")
+        menu.addSeparator()
+        act_del = menu.addAction("Remove")
+        chosen = menu.exec((w if w is not None else self).mapToGlobal(pos))
+        if chosen is act_ren:
+            self._rename_pv_col(col)
+        elif chosen is act_cpy:
+            QApplication.clipboard().setText(self._col_channel(col))
+            self._log(f"Copied to clipboard: {self._col_channel(col)}")
+        elif chosen is act_del:
+            self._remove_pv_col(col)
+
+    def _rename_pv_col(self, col: str):
+        """Give a PV the name the operator wants to READ — a channel added by name is
+        called "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy", which is unreadable in a 280 px
+        row and over a picture. Display only: the channel stays the identity
+        everywhere, so a rename cannot repoint a column at different data."""
+        txt, ok = QInputDialog.getText(
+            self, "Rename PV", f"Name shown for\n{self._col_channel(col)}",
+            QLineEdit.EchoMode.Normal, self._col_label(col))
+        if not ok:
+            return
+        txt = txt.strip()
+        self._sync_pv_cfg_from_rows()
+        if txt and txt != PV_COLUMNS.get(col, col):
+            self._custom_labels[col] = txt
+        elif col in PV_COLUMNS:
+            self._custom_labels.pop(col, None)     # back to the preset label
+        else:
+            self._custom_labels[col] = col         # a channel is its own name
+        self._rebuild_pv_rows()
+        self._save_pv_state()
+
+    # ── saved PV list ─────────────────────────────────────────────────────
+    # The PV list is the one thing in this tab that is typed rather than picked off
+    # what is already on screen, so it is the one thing worth surviving a restart —
+    # the same reason the Slider persists its PV selection.
+    _UI_STATE_PATH = (Path(os.environ.get("APPDATA", Path.home()))
+                      / "ELI_ImageTools" / "shotfinder_ui_state.json")
+
+    def _read_ui_state_file(self) -> dict:
+        try:
+            data = json.loads(self._UI_STATE_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_ui_state_file(self, updates: dict):
+        """Merge into the state file rather than replacing it. The PV list and the
+        open/closed panel groups share one document, so a writer that rewrites the whole
+        thing silently throws away the other one's half."""
+        data = self._read_ui_state_file()
+        data.update(updates)
+        try:
+            self._UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._UI_STATE_PATH.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _on_section_toggled(self, key: str, expanded: bool):
+        self._ui_state[f"sec_{key}"] = bool(expanded)
+        self._write_ui_state_file({f"sec_{key}": bool(expanded)})
+
+    def _set_all_sections(self, expanded: bool):
+        """Expand all / Collapse all — one write for the whole panel."""
+        upd = {}
+        for key, sec in getattr(self, "_sections", {}).items():
+            sec.set_expanded(expanded)
+            self._ui_state[f"sec_{key}"] = bool(expanded)
+            upd[f"sec_{key}"] = bool(expanded)
+        self._write_ui_state_file(upd)
+
+    def _load_pv_state(self):
+        # The whole state document, kept so the panel can ask it which groups were
+        # left open while it is being built.
+        self._ui_state = self._read_ui_state_file()
+        data = self._ui_state
+        if not data:
+            return                  # no state yet, or unreadable — start empty
+        labels = data.get("pv_labels")
+        if isinstance(labels, dict):
+            for k, v in labels.items():
+                if isinstance(k, str) and isinstance(v, str) and v.strip():
+                    self._custom_labels[k] = v.strip()
+
+        def _num(entry, key, default):
+            try:
+                return float(entry.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        for e in (data.get("pv_cfg") or []):
+            if not isinstance(e, dict):
+                continue
+            col = str(e.get("col", "")).strip()
+            if not col or any(c["col"] == col for c in self._pv_cfg):
+                continue
+            if col not in PV_COLUMNS:
+                self._custom_labels.setdefault(col, col)
+            # Only these four keys are read back: a state file written by the version
+            # that had a per-PV "scale" must not resurrect it as a hidden factor.
+            self._pv_cfg.append({"col":    col,
+                                 "target": _num(e, "target", 10.0),
+                                 "tol":    _num(e, "tol", 0.0),
+                                 "filter": bool(e.get("filter", True))})
+
+    def _save_pv_state(self):
+        # A remembered list is a convenience, never a must — _write_ui_state_file
+        # swallows a failed write.
+        self._write_ui_state_file(
+            {"pv_cfg": [dict(c) for c in self._pv_cfg],
+             # Only names that differ from the PV's own: storing a label equal to
+             # the preset label would freeze today's wording into the saved state.
+             "pv_labels": {k: v for k, v in self._custom_labels.items()
+                           if v and v != k and v != PV_COLUMNS.get(k)}})
 
     def _make_remove_btn(self, slot) -> QPushButton:
         btn = QPushButton("✕")
-        btn.setFixedSize(20, 20)
+        btn.setFixedSize(26, 26)
         btn.setToolTip("Remove")
         btn.setStyleSheet(
-            "QPushButton { color: #cc0000; font-weight: 700; border: none; }"
+            "QPushButton { color: #cc0000; font-weight: 700; font-size: 15px; "
+            "border: none; padding: 0; }"
             "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
         btn.clicked.connect(slot)
         return btn
 
-    def _rebuild_criteria_rows(self):
-        """Rebuild the dynamic criteria rows to match self._criteria_cols."""
-        # Sync current spinbox values before destroying widgets
-        existing: dict = {d["col"]: d.copy() for d in self._criteria}
-        for r in getattr(self, "_criteria_rows", []):
-            existing[r["col"]] = {
-                "col":    r["col"],
-                "target": r["target_sb"].value(),
-                "tol":    r["tol_sb"].value(),
-            }
+    def _sync_pv_cfg_from_rows(self):
+        """Copy live widget values back into _pv_cfg (the single source of truth)."""
+        for r in getattr(self, "_pv_rows", []):
+            cfg = r["cfg"]
+            cfg["target"] = r["target_sb"].value()
+            cfg["tol"]    = r["tol_sb"].value()
+            cfg["filter"] = r["chk"].isChecked()
 
-        while self._criteria_container_layout.count():
-            item = self._criteria_container_layout.takeAt(0)
+    # Text budget for the PV name inside one row, in px: with the target/tol
+    # spinboxes shown the name gets what is left of the 280 px panel; unticked
+    # rows hide them and the name may run wide. Longer names are elided in the
+    # middle — the full archiver name stays in the tooltip.
+    _PV_NAME_W_FILTER = 68
+    _PV_NAME_W_SHOW   = 186
+
+    def _rebuild_pv_rows(self):
+        """Rebuild one single-line row per entry in self._pv_cfg:
+
+            [✓] PV NAME   T:<target> ±<tol> <unit>  ✕
+
+        The tick marks a PV the search filters on; unticked hides the target/tol
+        spinboxes (the name then gets their space) and the PV is only reported in
+        the results table + image caption."""
+        from PySide6.QtGui import QFontMetrics
+
+        while self._pv_container_layout.count():
+            item = self._pv_container_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
-        self._criteria_rows: list[dict] = []
-        for col in self._criteria_cols:
-            prev = existing.get(col, {})
-            prev_target = prev.get("target", 10.0)
-            prev_tol    = prev.get("tol", 0.0)
-
+        self._pv_rows = []
+        for cfg in self._pv_cfg:
+            col = cfg["col"]
             row_w = QWidget()
             row_l = QHBoxLayout(row_w)
             row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(3)
+            row_l.setSpacing(2)
 
-            lbl = QLabel(f"{self._col_short(col)}:")
-            lbl.setStyleSheet("font-size: 10px; font-weight: 600;")
-            lbl.setFixedWidth(64)
-            lbl.setToolTip(self._col_label(col))
-            row_l.addWidget(lbl)
+            chk = QCheckBox()
+            chk.setStyleSheet(_CHECKBOX_STYLE_SM)
+            chk.setChecked(bool(cfg["filter"]))
+            full_label = self._col_label(col)
+            short_label = self._col_short(col)
+            # Elide against the font the checkbox is actually PAINTED with:
+            # _CHECKBOX_STYLE_SM sets font-size:10px, and a stylesheet font wins
+            # over the widget font, so QFontMetrics(chk.font()) measured a larger
+            # font than the label renders in and cut names far shorter than needed.
+            name_font = chk.font()
+            name_font.setPixelSize(_PV_NAME_FONT_PX)
+            fm = QFontMetrics(name_font)
+            channel = self._col_channel(col)
+            chan_line = (f"\nArchiver channel: {channel}"
+                         if channel != full_label else "")
+            chk.setToolTip(
+                f"{full_label}{chan_line}\n"
+                "Ticked: search filters on this PV (target ± tolerance).\n"
+                "Unticked: value is only shown in the results and on the images.\n"
+                "Right-click: rename, copy channel name, remove.")
+            # The menu is hooked to the tick box as well as to the row: the box covers
+            # most of the row, and a policy set on the parent alone never sees the
+            # child's context-menu event.
+            for _w in (row_w, chk):
+                _w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                _w.customContextMenuRequested.connect(
+                    lambda pos, c=col: self._on_pv_row_menu(c, pos))
+            row_l.addWidget(chk)
+            row_l.addStretch(1)
 
-            row_l.addWidget(QLabel("T:"))
+            tgt_w = QWidget()
+            tgt_l = QHBoxLayout(tgt_w)
+            tgt_l.setContentsMargins(0, 0, 0, 0)
+            tgt_l.setSpacing(2)
+            t_lbl = QLabel("T:")
+            t_lbl.setStyleSheet("font-size: 10px;")
+            tgt_l.addWidget(t_lbl)
             t_sb = QDoubleSpinBox()
             t_sb.setRange(-1e9, 1e9)
             t_sb.setDecimals(3)
-            t_sb.setValue(prev_target)
-            t_sb.setFixedWidth(72)
-            row_l.addWidget(t_sb)
-
-            row_l.addWidget(QLabel("±"))
+            t_sb.setValue(cfg.get("target", 10.0))
+            t_sb.setFixedWidth(56)
+            t_sb.setToolTip(f"Target value for {full_label}\n{channel}")
+            tgt_l.addWidget(t_sb)
+            pm_lbl = QLabel("±")
+            pm_lbl.setStyleSheet("font-size: 10px;")
+            tgt_l.addWidget(pm_lbl)
             tol_sb = QDoubleSpinBox()
             tol_sb.setRange(0.0, 1e9)
             tol_sb.setDecimals(3)
-            tol_sb.setValue(prev_tol)
-            tol_sb.setFixedWidth(60)
-            row_l.addWidget(tol_sb)
-
-            row_l.addWidget(QLabel(self._col_unit(col)))
-            row_l.addStretch(1)
+            tol_sb.setValue(cfg.get("tol", 0.0))
+            tol_sb.setFixedWidth(50)
+            tol_sb.setToolTip(
+                f"Tolerance around the target for {full_label}\n{channel}")
+            tgt_l.addWidget(tol_sb)
+            unit = self._col_unit(col)
+            if unit:
+                u_lbl = QLabel(unit)
+                u_lbl.setStyleSheet("font-size: 10px;")
+                tgt_l.addWidget(u_lbl)
+            row_l.addWidget(tgt_w)
             row_l.addWidget(self._make_remove_btn(
-                lambda _=False, c=col: self._remove_criteria_col(c)))
+                lambda _=False, c=col: self._remove_pv_col(c)))
 
-            self._criteria_container_layout.addWidget(row_w)
-            self._criteria_rows.append({"col": col, "target_sb": t_sb, "tol_sb": tol_sb})
+            def _apply_filter_state(checked, _cfg=cfg, _tw=tgt_w, _chk=chk,
+                                    _fm=fm, _txt=short_label):
+                _cfg["filter"] = bool(checked)
+                _tw.setVisible(bool(checked))
+                budget = (self._PV_NAME_W_FILTER if checked
+                          else self._PV_NAME_W_SHOW)
+                _chk.setText(_fm.elidedText(
+                    _txt, Qt.TextElideMode.ElideMiddle, budget))
 
-        # Update self._criteria from current rows
-        self._criteria = [
-            {"col": r["col"], "target": r["target_sb"].value(), "tol": r["tol_sb"].value()}
-            for r in self._criteria_rows
-        ]
+            chk.toggled.connect(_apply_filter_state)
+            _apply_filter_state(chk.isChecked())
 
-    def _rebuild_extra_rows(self):
-        """Rebuild the 'also show' rows to match self._extra_cols_sel."""
-        while self._extra_container_layout.count():
-            item = self._extra_container_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        for col in self._extra_cols_sel:
-            row_w = QWidget()
-            row_l = QHBoxLayout(row_w)
-            row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(3)
-            lbl = QLabel(self._col_short(col))
-            lbl.setStyleSheet("font-size: 10px;")
-            lbl.setToolTip(self._col_label(col))
-            row_l.addWidget(lbl)
-            row_l.addStretch(1)
-            row_l.addWidget(self._make_remove_btn(
-                lambda _=False, c=col: self._remove_extra_col(c)))
-            self._extra_container_layout.addWidget(row_w)
+            self._pv_container_layout.addWidget(row_w)
+            self._pv_rows.append({"cfg": cfg, "col": col, "chk": chk,
+                                  "target_sb": t_sb, "tol_sb": tol_sb})
+
+    def _filter_cols(self) -> "list[str]":
+        """PVs the search filters on (ticked), in pick order."""
+        self._sync_pv_cfg_from_rows()
+        return [c["col"] for c in self._pv_cfg if c["filter"]]
+
+    def _show_cols(self) -> "list[str]":
+        """PVs that are only displayed (unticked), in pick order."""
+        self._sync_pv_cfg_from_rows()
+        return [c["col"] for c in self._pv_cfg if not c["filter"]]
 
     def _get_criteria(self) -> "list[dict]":
-        """Read current spinbox values and return list of {col, target, tol} dicts."""
-        result = []
-        if not hasattr(self, "_criteria_rows"):
-            return result
-        for r in self._criteria_rows:
-            result.append({
-                "col":    r["col"],
-                "target": r["target_sb"].value(),
-                "tol":    r["tol_sb"].value(),
-            })
-        return result
+        """Current filter criteria as [{col, target, tol}, …]."""
+        self._sync_pv_cfg_from_rows()
+        return [{"col": c["col"], "target": c["target"], "tol": c["tol"]}
+                for c in self._pv_cfg if c["filter"]]
 
     def _update_date_info(self):
-        days = self._selected_days()
-        n = len(days)
-        fmt = "%Y-%m-%d %H:%M"
-        start_s = self._tw_start.strftime(fmt) if hasattr(self._tw_start, "strftime") else "?"
-        end_s   = self._tw_end.strftime(fmt)   if hasattr(self._tw_end,   "strftime") else "?"
-        if n == 0:
-            self._date_info_lbl.setText(f"⚠ End before start\n{start_s}\n→ {end_s}")
-        elif n == 1:
-            self._date_info_lbl.setText(f"1 day  {start_s}\n→ {end_s}")
+        """The line under the two Source buttons: which days, and their hours.
+
+        Few days are named one per line with their own window, because a multi-day
+        pick can give every day a different one. Many days collapse to a count and
+        the span, or the line would push the whole panel down."""
+        wins = self._day_windows()
+        if not wins:
+            self._date_info_lbl.setText("⚠ No day picked")
+            return
+
+        def _txt(d, w):
+            s, e = w
+            s_dt, e_dt = _ns_to_prague(s), _ns_to_prague(e)
+            # The end is exclusive, so a whole day ends at the NEXT day's 00:00 —
+            # printed as 24:00, or the line reads "00:00 → 00:00".
+            e_txt = "24:00" if (e_dt.date() > d and e_dt.hour == 0
+                                and e_dt.minute == 0) else f"{e_dt:%H:%M}"
+            return f"{d:%Y-%m-%d}  {s_dt:%H:%M} → {e_txt}"
+
+        days = sorted(wins)
+        if len(days) <= 4:
+            self._date_info_lbl.setText("\n".join(_txt(d, wins[d]) for d in days))
         else:
-            self._date_info_lbl.setText(f"{n} days  {start_s}\n→ {end_s}")
+            self._date_info_lbl.setText(
+                f"{len(days)} days\n{days[0]:%Y-%m-%d} → {days[-1]:%Y-%m-%d}")
 
     def _build_energy_text(self, dr, row: dict, row_ns) -> str:
         """Multi-PV preview caption: search PVs + 'also show' PVs at this shot.
         Used by both the main-table preview and the per-shot dialog preview so
-        an expanded shot keeps the same backreflection / extra-PV info."""
-        search_cols = list(self._criteria_cols)
-        extra_cols = [c for c in self._extra_cols_sel if c not in search_cols]
+        an expanded shot keeps the same backreflection / extra-PV info.
+        Columns come from dr (search-time state), not the live left panel."""
+        search_cols = list(dr.search_cols)
+        extra_cols = [c for c in dr.extra_cols if c not in search_cols]
         parts = []
         for sc in search_cols + extra_cols:
-            raw = row.get(sc, "")
+            raw, state = row.get(sc, ""), "ok"
             if not raw and row_ns is not None:
-                raw = _find_closest_col_value(dr.per_col, sc, row_ns)
-            parts.append(f"{self._col_short(sc)}: {_format_value(sc, raw)}")
+                raw, state = _lookup_col_value(dr.per_col, dr.col_meta, sc, row_ns,
+                                               tol_s=EXTRA_COL_MATCH_TOL_S,
+                                               allow_network=False)
+            parts.append(f"{self._col_short(sc)}: {_format_value_state(sc, raw, state)}")
         return "  |  ".join(parts)
 
+    def _find_image_for_shot(self, dr, cam: str, dt_obj, ts_ns,
+                             hour_cache: dict) -> Path | None:
+        """Image belonging to ONE shot of a day result — see _find_image_in_day.
+
+        dr.hour_folder is the hour of that day's best shot only, while the shots in range
+        are spread over the whole day, so the day folder is taken from it and the hour is
+        resolved per shot. Using the SEARCH-TIME folder also means a later change of the
+        image source cannot send old rows to another share."""
+        day_dir = dr.hour_folder.parent if dr.hour_folder is not None else None
+        return _find_image_in_day(dr.day, cam, dt_obj, ts_ns, hour_cache,
+                                  images_root=self._images_root, day_dir=day_dir)[0]
+
+    # ── WHAT SEND / SAVE ACT ON ───────────────────────────────────────────────
+    #
+    # One pair of buttons for both scopes: the day rows, or the one shot picked in the
+    # day detail. The detail used to carry its own second Open / Save pair.
+
+    def _export_scope(self) -> str:
+        """"shot" only while the day detail is open AND it is what is asked for."""
+        if self._day_dr is None or self._day_panel.isHidden():
+            return "day"
+        return self._scope_cb.currentData() or "day"
+
+    def _sync_scope_selector(self):
+        """The shot scope is only reachable while a day detail is open; leaving it
+        selected on a closed detail would name something that is not there."""
+        cb = getattr(self, "_scope_cb", None)
+        if cb is None:
+            return
+        open_day = self._day_dr is not None and not self._day_panel.isHidden()
+        cb.setEnabled(open_day)
+        if not open_day and cb.currentData() != "day":
+            cb.blockSignals(True)
+            cb.setCurrentIndex(0)
+            cb.blockSignals(False)
+        self._sync_export_buttons()
+
+    def _on_scope_changed(self, _idx: int):
+        self._sync_export_buttons()
+
+    def _on_send_to_slider(self):
+        if self._export_scope() == "shot":
+            self._day_open_in_slider()
+        else:
+            self._open_in_slider()
+
+    def _on_save_images(self):
+        if self._export_scope() == "shot":
+            self._day_save_image()
+        else:
+            self._save_results()
+
+    def _sync_export_buttons(self):
+        """Send / save / Workshop act on the tab in front, so they follow ITS rows.
+
+        Sending works with no selection too (it then sends every row of the tab), so
+        they must not go dead the moment a selection is cleared — only when the tab
+        holds no picture at all."""
+        if not hasattr(self, "_scope_cb"):
+            return                      # still building the panel
+        if self._current_cam_key() not in self._cam_results:
+            return                      # mid-rebuild: the tabs do not exist yet
+        has_img = any(dr.status == "ok" for dr in self._day_results)
+        shot = self._export_scope() == "shot"
+        can_link = self._slider_ref is not None and self._tab_widget is not None
+        self._btn_open_slider.setEnabled(has_img and can_link)
+        self._btn_open_slider.setVisible(can_link)
+        self._btn_save_results.setEnabled(has_img)
+        self._btn_send_workshop.setEnabled(has_img)
+        self._btn_send_workshop.setVisible(has_img)
+        # The label names what the button will act on, so the choice is readable
+        # without opening the selector.
+        self._btn_open_slider.setText(
+            "➤  Send shot to Image Slider" if shot else "➤  Send to Image Slider")
+        self._btn_save_results.setText(
+            "💾  Save shot image" if shot else "💾  Save images")
+
     def _on_selection_changed(self):
-        has_sel = bool(self._table.selectedItems())
-        self._btn_open_slider.setEnabled(
-            has_sel and self._slider_ref is not None and self._tab_widget is not None
-            and bool(self._day_results))
+        self._sync_export_buttons()
 
         # Preview při kliknutí na řádek
+        def _clear_preview():
+            # Leaving the last picture up makes a row (or a camera tab) with no image
+            # of its own look like it has one.
+            self._preview_gen += 1
+            self._current_preview_path = None
+            self._on_preview_ready(None, "", self._preview_gen)
+
         rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
         if not rows or not self._day_results:
+            _clear_preview()
             return
         r = rows[0]
         if r >= len(self._day_results):
+            _clear_preview()
             return
         dr = self._day_results[r]
-        cam = self._active_cam
-        if not cam or dr.hour_folder is None:
-            return
+        cam = dr.cam or self._active_cam
         dt_obj = dr.best_row.get("_dt")
-        if dt_obj is None:
+        if dr.status != "ok" or not cam or dr.hour_folder is None or dt_obj is None:
+            _clear_preview()
             return
         ts_ns_direct = dr.best_row.get("_ns")
         self._preview_gen += 1
         gen = self._preview_gen
         gradient_name = self._gradient_cb.currentText()
+        auto, gamma, contrast, offset = self._bc_args()
 
         def _resolve_and_load():
             # Folder probing + _find_image_for_ts (os.scandir over SMB) used to
             # run on the UI thread — a row click froze the GUI on a slow share.
-            cam_folder = dr.hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    return
-            img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
+            if dr.img_path is not None:
+                img = Path(dr.img_path)
+            else:
+                cam_folder = dr.hour_folder / cam
+                if not cam_folder.exists():
+                    try:
+                        for sub in dr.hour_folder.iterdir():
+                            if sub.is_dir() and sub.name.lower() == cam.lower():
+                                cam_folder = sub
+                                break
+                    except Exception:
+                        return
+                img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns_direct)
             if gen != self._preview_gen:
                 return
             if img is None:
@@ -1646,12 +3302,18 @@ class ShotFinderWidget(QWidget):
                 return
             energy_text = self._build_energy_text(dr, dr.best_row, ts_ns_direct)
             self._current_preview_path = img
-            self._load_and_show_preview(img, energy_text, gen, gradient_name)
+            self._load_and_show_preview(img, energy_text, gen, gradient_name, auto,
+                                        gamma, contrast, offset)
 
         threading.Thread(target=_resolve_and_load, daemon=True).start()
 
-    def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int, gradient_name: str = ""):
-        """Background thread: load and process image into QImage; QPixmap conversion on main thread."""
+    def _load_and_show_preview(self, img_path: Path, energy_text: str, gen: int,
+                               gradient_name: str = "", auto: bool = False,
+                               gamma=None, contrast: int = 0, offset: int = 0):
+        """Background thread: load and process image into QImage; QPixmap conversion on main thread.
+
+        The display settings are passed in, not read from the widgets: this runs on a
+        worker thread (see _bc_args)."""
         if gen != self._preview_gen:
             return
         try:
@@ -1667,11 +3329,25 @@ class ShotFinderWidget(QWidget):
             else:
                 arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
 
-            img_max_val = _read_img_max_value(img_path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-            arr = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            full_scale = _full_scale_for_mode(pil.mode, img_path, pil.info)
+            # `bc_out` comes back with what the Auto passes actually applied, so the
+            # greyed-out sliders can be parked on it and Auto gamma costs no second
+            # median pass over the frame.
+            bc_out: dict = {}
+            arr = _render_u8(arr_f, auto, full_scale, gamma, contrast, offset, bc_out)
+            self._bc_applied = bc_out
+            g_applied = (bc_out.get("gamma")
+                         if (not auto and img_scale.is_auto_gamma(gamma)) else None)
+            # pil.info, not a second open of the same file: a share read is 130–160 ms.
+            # Branch on the MODE, not on full_scale: a 16-bit frame shown on its camera's
+            # reference range has a full_scale of its own and is not an 8-bit source.
+            self._scale_note = (
+                img_scale.meta_from_info(pil.info, arr_f).scale_note(
+                    auto, gamma, g_applied,
+                    img_scale.current_reference_bits(img_scale.camera_from_path(img_path)),
+                    contrast, offset)
+                if pil.mode in ("I", "I;16")
+                else f"8-bit source  ·  {'auto stretch' if auto else 'absolute scale'}")
 
             w, h = arr.shape[1], arr.shape[0]
 
@@ -1685,7 +3361,7 @@ class ShotFinderWidget(QWidget):
                 lut = SF_GRADIENTS.get(gradient_name, None)
 
             if lut is not None:
-                rgb = lut[arr]
+                rgb = _lut_pixels_sf(lut, arr, gradient_name)
                 out_img = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
             else:
                 out_img = QImage(arr.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
@@ -1705,51 +3381,268 @@ class ShotFinderWidget(QWidget):
         self._preview_widget.set_pixmap(self._preview_pixmap_orig)
 
     def _on_gradient_changed(self):
-        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
-        if rows:
-            self._on_selection_changed()
+        self._refresh_preview()
+
+    def _sync_bc_enabled(self):
+        """Enable/disable the Contrast, Brightness and Gamma controls. Every
+        enable/disable of them goes through here, so the rules cannot overwrite
+        each other:
+          - Auto on → that row's own slider and reset button are greyed out (the
+            app-wide 'checkbox beats slider' rule).
+          - Either Auto contrast or Auto brightness on → the whole Gamma row goes dead.
+            Both of them set the frame's two ends themselves, so gamma has nothing left
+            to bend and the render drops it (see img_scale.to_u8). The Slider tab keeps
+            its gamma row alive under Auto brightness because its subtraction mode still
+            uses it; this tab has no such mode, so a live-but-ignored slider would just
+            be a lie.
+        The name labels and the numeric readouts stay live either way: while Auto is on,
+        the readout is exactly what the user wants to see — the value Auto picked, put
+        there by _park_auto_bc."""
+        c_live = not self._cb_auto_stretch.isChecked()
+        b_live = not self._cb_bright_auto.isChecked()
+        self._contrast_slider.setEnabled(c_live)
+        self._btn_contrast_reset.setEnabled(c_live)
+        self._bright_slider.setEnabled(b_live)
+        self._btn_bright_reset.setEnabled(b_live)
+        gamma_usable = c_live and b_live
+        g_live = gamma_usable and not self._cb_gamma_auto.isChecked()
+        self._cb_gamma_auto.setEnabled(gamma_usable)
+        self._lbl_gamma.setEnabled(gamma_usable)
+        self._lbl_gamma_val.setEnabled(gamma_usable)
+        self._gamma_slider.setEnabled(g_live)
+        self._btn_gamma_reset.setEnabled(g_live)
+
+    def _bc_args(self):
+        """(auto, gamma, contrast, offset) for the render — read on the MAIN thread and
+        passed into the loader; never read a widget from a worker.
+
+        Honours the 'Auto checkbox overrides its own slider' rule of each pair, exactly
+        as the Slider tab does: Auto contrast zeroes the manual contrast, Auto brightness
+        zeroes the manual offset, and each leaves the other one live. Both Autos are the
+        same percentile pass (see img_scale.stretch_u8), so `auto` is set by either and
+        ticking both does not level the frame twice."""
+        auto_c = self._cb_auto_stretch.isChecked()
+        auto_b = self._cb_bright_auto.isChecked()
+        auto = auto_c or auto_b
+        if auto:
+            gamma = img_scale.GAMMA_SLIDER_NEUTRAL
+        elif self._cb_gamma_auto.isChecked():
+            gamma = img_scale.GAMMA_SLIDER_AUTO
+        else:
+            gamma = int(self._gamma_slider.value())
+        contrast = 0 if auto_c else int(self._contrast_slider.value())
+        offset = 0 if auto_b else int(self._bright_slider.value())
+        return auto, gamma, contrast, offset
+
+    def _sync_bc_value_labels(self):
+        """Write the three numeric readouts from the sliders themselves.
+
+        The sliders are the single source of truth for what is on screen — Auto
+        included, because the Auto pass parks its own value there (_park_auto_bc). That
+        parking blocks signals, so the handlers do not run and this is called instead."""
+        self._lbl_contrast_val.setText(str(int(self._contrast_slider.value())))
+        self._lbl_bright_val.setText(str(int(self._bright_slider.value())))
+        self._lbl_gamma_val.setText(
+            f"{img_scale.gamma_from_slider(int(self._gamma_slider.value())):.2f}")
+
+    def _park_auto_bc(self, applied: "dict | None"):
+        """Park each greyed-out slider on the value its Auto pass actually applied to the
+        previewed frame, instead of leaving it at 0 while the picture is clearly changed.
+        Signals are blocked: no reload.
+
+        DISPLAY ONLY. Unticking an Auto box restores the user's own value instead of
+        keeping what was parked (see the toggle handlers) — an Auto checkbox has to be
+        undoable, and the parked number is Auto's, not the user's."""
+        if not applied:
+            return
+        c = applied.get("contrast")
+        if c is not None and self._cb_auto_stretch.isChecked():
+            self._contrast_slider.blockSignals(True)
+            self._contrast_slider.setValue(int(c))
+            self._contrast_slider.blockSignals(False)
+        o = applied.get("offset")
+        if o is not None and self._cb_bright_auto.isChecked():
+            self._bright_slider.blockSignals(True)
+            self._bright_slider.setValue(int(o))
+            self._bright_slider.blockSignals(False)
+        g = applied.get("gamma")
+        if g is not None and self._cb_gamma_auto.isChecked():
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(img_scale.slider_from_gamma(float(g)))
+            self._gamma_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+
+    def _reshow_preview(self):
+        self._refresh_preview()
+
+    def _on_contrast_slider_changed(self, value: int):
+        # Only user moves reach this (_park_auto_bc blocks signals), so this is the value
+        # to come back to when Auto is switched off.
+        self._contrast_manual = int(value)
+        self._lbl_contrast_val.setText(str(int(value)))
+        self._bc_debounce.start()
+
+    def _reset_contrast_slider(self):
+        self._contrast_slider.setValue(0)
+
+    def _on_auto_stretch_toggled(self, on: bool):
+        self._log(f"CONTRAST -> {'auto stretch (per frame)' if on else 'absolute'}")
+        self._sync_bc_enabled()
+        if not on:
+            # Auto off → the slider is live again, so it must not be left on the number
+            # Auto parked there: the stretch of a dim frame needs a gain the slider
+            # cannot reach, so the parked value saturates and does not reproduce the
+            # picture.
+            self._contrast_slider.blockSignals(True)
+            self._contrast_slider.setValue(int(self._contrast_manual))
+            self._contrast_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+        self._reshow_preview()
+
+    def _on_bright_slider_changed(self, value: int):
+        self._bright_manual = int(value)
+        self._lbl_bright_val.setText(str(int(value)))
+        self._bc_debounce.start()
+
+    def _reset_bright_slider(self):
+        self._bright_slider.setValue(0)
+
+    def _on_bright_auto_toggled(self, on: bool):
+        self._log(f"BRIGHTNESS -> {'auto level (per frame)' if on else 'manual'}")
+        self._sync_bc_enabled()
+        if not on:
+            # Auto off → back to the user's own offset, not the black level Auto parked
+            # on the greyed-out slider. Same rule as contrast: an Auto checkbox has to be
+            # undoable.
+            self._bright_slider.blockSignals(True)
+            self._bright_slider.setValue(int(self._bright_manual))
+            self._bright_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+        self._reshow_preview()
+
+    def _on_gamma_slider_changed(self, value: int):
+        self._gamma_manual = int(value)
+        self._lbl_gamma_val.setText(f"{img_scale.gamma_from_slider(value):.2f}")
+        self._bc_debounce.start()
+
+    def _reset_gamma_slider(self):
+        self._gamma_slider.setValue(img_scale.GAMMA_SLIDER_NEUTRAL)
+
+    def _on_gamma_auto_toggled(self, on: bool):
+        self._log(f"GAMMA -> {'auto (per frame)' if on else 'manual'}")
+        self._sync_bc_enabled()
+        if not on:
+            # Auto off → the user's own value, not the one Auto parked on the greyed-out
+            # slider. An Auto checkbox has to be undoable.
+            self._gamma_slider.blockSignals(True)
+            self._gamma_slider.setValue(int(self._gamma_manual))
+            self._gamma_slider.blockSignals(False)
+        self._sync_bc_value_labels()
+        self._reshow_preview()
 
     # ── DATE HELPERS ──────────────────────────────────────────────────────────
 
     def _qdate_to_date(self, qd: QDate) -> date:
         return date(qd.year(), qd.month(), qd.day())
 
+    def _set_time_window_from_times(self):
+        """Rebuild `_tw_windows` from the remembered day + From/To times.
+
+        Used at startup and whenever the picker returns a single day: one window,
+        the same shape the multi-day path produces."""
+        h_f, m_f, h_t, m_t = self._tw_times
+        tz = PRAGUE if PRAGUE else timezone.utc
+        start = datetime(self._tw_day.year, self._tw_day.month, self._tw_day.day,
+                         h_f, m_f, tzinfo=tz)
+        # The end is EXCLUSIVE, and 23:59 means "to the end of the day" — the picker
+        # cannot express 24:00, so the last minute must not be lost.
+        end_day = self._tw_day
+        if (h_t, m_t) <= (h_f, m_f):
+            end_day = self._tw_day + timedelta(days=1)
+        end = datetime(end_day.year, end_day.month, end_day.day, h_t, m_t, tzinfo=tz)
+        if (h_t, m_t) == (23, 59):
+            end += timedelta(minutes=1)
+        self._tw_windows = [(int(start.timestamp() * 1_000_000_000),
+                             int(end.timestamp() * 1_000_000_000))]
+
     def _open_time_window(self):
-        dlg = _TimeWindowDialog(self._tw_start, self._tw_end, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._tw_start, self._tw_end = dlg.selected_range()
-            self._on_date_changed()
+        """The Image Slider's own time picker — one calendar, From/To to the minute,
+        and a Multiple days mode with an optional per-day window.
+
+        allow_live=False: this tab has no live mode, and a tick that does nothing
+        reads as a broken tick (One Moment passes the same)."""
+        slider = _get_slider_module()
+        h_f, m_f, h_t, m_t = self._tw_times
+        dlg = slider.DatePickerDialog(
+            hour_from_init=h_f, hour_to_init=h_t,
+            min_from_init=m_f, min_to_init=m_t,
+            init_date=self._tw_day, init_segments=self._tw_segments,
+            allow_live=False, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._tw_times = dlg.selected_times()
+        self._tw_day = dlg.selected_date_obj()
+        self._tw_segments = dlg.selected_segments()
+        # One (start_ns, end_ns) per picked day, end exclusive — the days need not be
+        # contiguous any more, so nothing may re-derive them from a first/last pair.
+        self._tw_windows = list(dlg.selected_windows())
+        self._on_date_changed()
+
+    def _day_windows(self) -> "dict[date, tuple[int, int]]":
+        """day → (start_ns, end_ns) of the window picked for it.
+
+        A day picked twice (two windows on one day) is merged into the span that
+        covers both, since a search reads whole days anyway."""
+        out: "dict[date, tuple[int, int]]" = {}
+        for s_ns, e_ns in self._tw_windows:
+            d = _ns_to_prague(s_ns).date()
+            if d in out:
+                out[d] = (min(out[d][0], s_ns), max(out[d][1], e_ns))
+            else:
+                out[d] = (s_ns, e_ns)
+        return out
 
     def _selected_days(self) -> list[date]:
-        d_from = self._tw_start.date() if hasattr(self._tw_start, "date") else self._tw_start
-        d_to   = self._tw_end.date()   if hasattr(self._tw_end,   "date") else self._tw_end
-        if d_to < d_from:
-            return []
-        days = []
-        d = d_from
-        while d <= d_to:
-            days.append(d)
-            d += timedelta(days=1)
-        return days
+        return sorted(self._day_windows())
 
     # ── CAMERA LOADING ────────────────────────────────────────────────────────
 
     def _load_cameras(self):
+        """Camera list for the picked Time window: the union over the days in it.
+
+        Only the FIRST day of the range used to be scanned. A long range that begins on
+        a weekend, a shutdown day or any day the archiver wrote nothing then gave "No
+        cameras found", and the camera search box matched nothing at all -- the range was
+        perfectly searchable, but no camera could be added to it. Days are scanned newest
+        first (the ones most likely to hold data) and the scan stops once
+        CAM_SCAN_DAYS_WITH_DATA of them have answered, so a 48-day range costs no more
+        share traffic than a couple of days."""
         days = self._selected_days()
         if not days:
             return
-        day = days[0]
+        scan_days = list(reversed(days))[:CAM_SCAN_MAX_DAYS]
         images_root = self._images_root
+        # A range change while a scan is in flight must not be answered by the old scan.
+        self._cam_load_gen = getattr(self, "_cam_load_gen", 0) + 1
+        gen = self._cam_load_gen
+        self._cam_scan_days = len(scan_days)
+        self._cam_loading = True
+        # What this scan covers, so a retry cannot re-walk a window that already
+        # answered (see _open_camera_picker).
+        self._cam_scan_pending_key = (str(images_root), scan_days[0], scan_days[-1])
         if hasattr(self, "_cam_status_lbl"):
             self._cam_status_lbl.setText("Loading cameras…")
+
+        sig = self._sig_cam = _CamLoadSignals()
+        sig.finished.connect(self._on_cameras_loaded)
+        sig.log_msg.connect(self._log)
 
         def worker():
             seen: set[str] = set()
             cameras: list[str] = []
-            base = images_root / str(day.year) / str(day.month) / str(day.day)
+            days_with_data = 0
 
-            def _scan_hour(h: int) -> list[str]:
-                hour_dir = base / str(h)
+            def _scan_hour(hour_dir) -> list[str]:
                 try:
                     if not hour_dir.exists() or not hour_dir.is_dir():
                         return []
@@ -1764,85 +3657,131 @@ class ShotFinderWidget(QWidget):
                     pass
                 return names
 
-            try:
-                with ThreadPoolExecutor(max_workers=12) as _hex:
-                    _futs = [_hex.submit(_scan_hour, h) for h in range(24)]
-                    for _fut in as_completed(_futs):
-                        try:
-                            for _name in _fut.result():
-                                if _name not in seen:
-                                    seen.add(_name)
-                                    cameras.append(_name)
-                        except Exception:
-                            pass
-            except Exception as exc:
-                self._sig_cam.log_msg.emit(f"Camera load error: {exc}")
+            for day in scan_days:
+                if gen != self._cam_load_gen:
+                    return                      # superseded -- its answer is stale
+                base = (_images_root_for_year(images_root, day.year)
+                        / str(day.year) / str(day.month) / str(day.day))
+                found_here = 0
+                try:
+                    with ThreadPoolExecutor(max_workers=12) as _hex:
+                        _futs = [_hex.submit(_scan_hour, base / str(h))
+                                 for h in range(24)]
+                        for _fut in as_completed(_futs):
+                            try:
+                                for _name in _fut.result():
+                                    found_here += 1
+                                    if _name not in seen:
+                                        seen.add(_name)
+                                        cameras.append(_name)
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    sig.log_msg.emit(f"Camera load error ({day}): {exc}")
+                if found_here:
+                    days_with_data += 1
+                    sig.log_msg.emit(f"Cameras from {day}: {found_here} folder(s), "
+                                     f"{len(cameras)} distinct so far")
+                    if days_with_data >= CAM_SCAN_DAYS_WITH_DATA:
+                        break
+            if gen != self._cam_load_gen:
+                return
             cameras.sort(key=str.lower)
-            self._sig_cam.finished.emit(cameras)
+            sig.finished.emit(cameras)
 
-        self._sig_cam = _CamLoadSignals()
-        self._sig_cam.finished.connect(self._on_cameras_loaded)
-        self._sig_cam.log_msg.connect(self._log)
         threading.Thread(target=worker, daemon=True).start()
 
+    def _cam_scan_key(self):
+        """Identity of the camera scan the current settings call for."""
+        days = self._selected_days()
+        if not days:
+            return None
+        # The whole day set, not a first/last pair: a multi-day pick can be any set
+        # of days, and two different sets can share their ends.
+        scan_days = list(reversed(days))[:CAM_SCAN_MAX_DAYS]
+        return (str(self._images_root), tuple(scan_days))
+
     def _on_cameras_loaded(self, camera_names: list):
+        self._cam_loading = False
+        self._cam_scanned_key = getattr(self, "_cam_scan_pending_key", None)
         self._all_cameras = []
         for name in camera_names:
             m = _re.match(r"^C\d{2}-(\d{2,3})-", name)
             num = m.group(1) if m else ""
             self._all_cameras.append((num, name))
         n = len(self._all_cameras)
-        self._cam_status_lbl.setText(f"{n} cameras available." if n else "No cameras found.")
+        if n:
+            self._cam_status_lbl.setText(f"{n} cameras available.")
+        else:
+            self._cam_status_lbl.setText(
+                f"No cameras found (last {getattr(self, '_cam_scan_days', 1)} "
+                "day(s) of the range).")
+        self._sync_cameras_button()
 
-    def _on_cam_search_changed(self, text: str):
-        """textEdited — volá se jen při skutečném psaní, ne programaticky."""
-        q = text.strip().lower()
-        self._cam_dropdown.hide()
-        self._cam_dropdown.setRowCount(0)
-        if not q or not self._all_cameras:
-            return
-        matches = [(num, name) for num, name in self._all_cameras
-                   if q in name.lower() or q in num.lower()]
-        if not matches:
-            return
-        for num, name in matches[:30]:
-            r = self._cam_dropdown.rowCount()
-            self._cam_dropdown.insertRow(r)
-            self._cam_dropdown.setItem(r, 0, QTableWidgetItem(num))
-            self._cam_dropdown.setItem(r, 1, QTableWidgetItem(name))
+    # ── CAMERA PICKER ─────────────────────────────────────────────────────────
+    def _cam_num_for(self, name: str) -> str:
+        for num, n in self._all_cameras:
+            if n == name:
+                return num
+        m = _re.match(r"^C\d{2}-(\d{2,3})-", name)
+        return m.group(1) if m else ""
 
-        n_rows = min(len(matches), 30)
-        row_h = max(24, self._cam_dropdown.verticalHeader().defaultSectionSize())
-        header_h = self._cam_dropdown.horizontalHeader().height()
-        popup_h = min(n_rows * row_h + header_h + 6, 400)
-        popup_w = max(320, self._cam_search.width() + 20)
+    def _open_camera_picker(self):
+        """The Cameras… button — the Image Slider's own picker, over the cameras
+        found in the picked time window. Presets are shared with the Slider, so a
+        camera set saved in one tab is offered in the other."""
+        # A scan may never have run for this range (or have failed): let the dialog
+        # do its own, so the list is never silently empty.
+        if (not self._all_cameras and not getattr(self, "_cam_loading", False)
+                and getattr(self, "_cam_scanned_key", None) != self._cam_scan_key()):
+            self._load_cameras()
 
-        pos = self._cam_search.mapToGlobal(self._cam_search.rect().bottomLeft())
-        self._cam_dropdown.setGeometry(pos.x(), pos.y(), popup_w, popup_h)
-        self._cam_dropdown.show()
-        self._cam_dropdown.raise_()
-        # Tool window nezabírá focus — textfield zůstane aktivní
-        QTimer.singleShot(0, self._cam_search.setFocus)
+        days = self._selected_days()
+        day_obj = days[-1] if days else (datetime.now(PRAGUE) if PRAGUE else datetime.now()).date()
+        slider = _get_slider_module()
+        dlg = slider.CameraPickerDialog(
+            day_obj, 0, 23,
+            [n for _num, n in self._selected_cameras],
+            parent=self,
+            preloaded_cameras=list(self._all_cameras))
+        # The Slider configures its multi-camera grid from this dialog; the Shot
+        # Finder has no grid, so that button would lead nowhere.
+        btn_layout = getattr(dlg, "_btn_layout", None)
+        if btn_layout is not None:
+            btn_layout.setVisible(False)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._set_selected_cameras(dlg.selected_camera_names())
+        self._log(f"Cameras: {len(self._selected_cameras)} selected")
 
-    def _on_cam_dropdown_clicked(self, index):
-        r = index.row()
-        num_item  = self._cam_dropdown.item(r, 0)
-        name_item = self._cam_dropdown.item(r, 1)
-        if not name_item:
-            return
-        num  = num_item.text() if num_item else ""
-        name = name_item.text()
-        self._cam_dropdown.hide()
-        self._cam_search.clear()
-        if any(n == name for _, n in self._selected_cameras):
-            return
-        self._selected_cameras.append((num, name))
-        row = self._cam_selected.rowCount()
-        self._cam_selected.insertRow(row)
-        self._cam_selected.setItem(row, 0, QTableWidgetItem(num))
-        self._cam_selected.setItem(row, 1, QTableWidgetItem(name))
-        self._cam_selected.selectRow(row)
-        self._active_cam = name
+    def _set_selected_cameras(self, names: list):
+        """Replace the picked cameras (and the list that shows them)."""
+        seen: set = set()
+        picked: "list[tuple[str, str]]" = []
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            picked.append((self._cam_num_for(name), name))
+        self._selected_cameras = picked
+        self._cam_selected.setRowCount(0)
+        for num, name in picked:
+            r = self._cam_selected.rowCount()
+            self._cam_selected.insertRow(r)
+            self._cam_selected.setItem(r, 0, QTableWidgetItem(num))
+            self._cam_selected.setItem(r, 1, QTableWidgetItem(name))
+        if picked:
+            self._cam_selected.selectRow(0)
+            self._active_cam = picked[0][1]
+        else:
+            self._active_cam = None
+        self._sync_cameras_button()
+
+    def _sync_cameras_button(self):
+        """The button is a plain name. It used to carry "…" and a picked/available
+        count, which named a total nobody can act on and made the label longer than
+        the button next to it — how many are picked is in the list right below."""
+        self._btn_cameras.setText("📷  Cameras")
 
     def _on_cam_selected_clicked(self, index):
         r = index.row()
@@ -1852,17 +3791,11 @@ class ShotFinderWidget(QWidget):
 
     def _on_cam_remove(self):
         r = self._cam_selected.currentRow()
-        if r < 0:
+        if r < 0 or r >= len(self._selected_cameras):
             return
-        self._cam_selected.removeRow(r)
-        if r < len(self._selected_cameras):
-            self._selected_cameras.pop(r)
-        if self._cam_selected.rowCount() > 0:
-            self._cam_selected.selectRow(0)
-            item = self._cam_selected.item(0, 1)
-            self._active_cam = item.text() if item else None
-        else:
-            self._active_cam = None
+        names = [n for _num, n in self._selected_cameras]
+        del names[r]
+        self._set_selected_cameras(names)
 
     # ── SEARCH ────────────────────────────────────────────────────────────────
 
@@ -1870,33 +3803,33 @@ class ShotFinderWidget(QWidget):
         if self._search_running:
             return
 
-        days = self._selected_days()
+        day_wins = self._day_windows()
+        days = sorted(day_wins)
         if not days:
-            QMessageBox.warning(self, "Date range", "From date must be ≤ To date.")
+            QMessageBox.warning(self, "No day picked",
+                                "Open Time window and pick at least one day.")
             return
 
-        # Read multi-criteria from dynamic UI rows
+        # Read the ticked (filter) PVs from the unified PV list
         criteria = self._get_criteria()
         if not criteria:
-            # Fallback: use selected search cols with legacy spinbox values
-            search_cols_fb = list(self._criteria_cols) or ["sbw4"]
-            criteria = []
-            for sc in search_cols_fb:
-                t_ui = self._target_sb.value()
-                tol_ui = self._tol_sb.value()
-                criteria.append({"col": sc, "target": t_ui, "tol": tol_ui})
+            QMessageBox.warning(self, "No search PV",
+                "Tick at least one PV to search by.\n\n"
+                "Unticked PVs are only displayed — they are not filtered on.")
+            return
+
+        # The list a search was actually run with is the one worth having back.
+        self._save_pv_state()
 
         search_cols = [c["col"] for c in criteria]
         col = search_cols[0]  # primary column
-        extra_cols = [c for c in self._extra_cols_sel if c not in search_cols]
+        extra_cols = [c for c in self._show_cols() if c not in search_cols]
 
-        # Convert UI-unit criteria to CSV units for each column
+        # Convert UI-unit criteria to CSV units for each column — the exact inverse
+        # of _format_value / _format_diff, or a target typed in the units the table
+        # prints would be compared against something else.
         def _to_csv_units(c_col, c_val):
-            if c_col == "sbw4":
-                return c_val / SBW4_TRANSMISSION
-            elif c_col in MJ_COLUMNS:
-                return c_val / 1000.0
-            return c_val
+            return c_val / 1000.0 if c_col in MJ_COLUMNS else c_val
 
         criteria_csv = []
         for crit in criteria:
@@ -1908,27 +3841,67 @@ class ShotFinderWidget(QWidget):
                 "tol_ui":     crit["tol"],
             })
 
-        self._day_results = []
-        self._table.setRowCount(0)
+        # Every camera in the list is searched, each into its own results tab. The list
+        # is the input; _active_cam is only which of its rows is highlighted, and used
+        # to be the ONLY camera a search ever looked at.
+        cams: "list[str | None]" = [name for _num, name in self._selected_cameras]
+        if not cams:
+            cams = [self._active_cam] if self._active_cam else [None]
+        self._rebuild_result_tabs(cams)
+
         self._btn_open_slider.setEnabled(False)
         self._set_busy(True)
+        # One step per (day, camera): with several cameras the bar used to stand still
+        # for a whole day's worth of picture look-ups and then jump.
+        self._prog_total = len(days) * max(1, len(cams))
+        self._prog_t0 = time.monotonic()
+        self._prog_stage = "starting…"
+        self._prog_hits = 0
         self._prog.setVisible(True)
-        self._prog.setRange(0, len(days))
+        self._prog.setRange(0, self._prog_total)
         self._prog.setValue(0)
+        self._sync_prog_text(0)
         self._search_running = True
-        self._result_lbl.setText(f"Searching {len(days)} days…")
+        self._result_lbl.setText(
+            f"Searching {len(days)} days…"
+            + (f" × {len(cams)} cameras" if len(cams) > 1 else ""))
 
         self._sig = _SearchSignals()
-        self._sig.progress.connect(self._prog.setValue)
+        self._sig.progress.connect(self._on_progress)
+        self._sig.stage.connect(self._on_stage)
         self._sig.result.connect(self._on_day_result)
         self._sig.done.connect(self._on_search_done)
         self._sig.log_msg.connect(self._log)
 
-        cam = self._active_cam
         images_root  = self._images_root
         csv_root     = self._energy_csv_root
 
+        # The hours of the Time window, not just its dates — and EACH DAY HAS ITS OWN
+        # window now (the picker's per-day ⚙ editor), so a single start/end pair could
+        # not express the selection. The end is exclusive (is_t.seg_bounds_ns).
+        tw_by_day = dict(day_wins)
+
         _emit_log = self._sig.log_msg.emit
+        _emit_stage = self._sig.stage.emit
+        n_cams = max(1, len(cams))
+
+        def _fail_days(day, reason: str) -> None:
+            """A day that produced no searchable result still gets a row — in EVERY
+            camera tab, because the archiver data it failed on is the same for all of
+            them. Dropping such a day is what made a whole search look empty."""
+            for _cam in cams:
+                self._sig.result.emit(
+                    {"day": day, "status": "no_data", "reason": reason,
+                     "search_cols": search_cols, "extra_cols": extra_cols,
+                     "criteria_csv": criteria_csv, "cam": _cam})
+
+        # Cumulative step counter — one step per (day, camera). The absolute value is
+        # emitted, so a step can never be counted twice by two code paths.
+        _done = [0]
+
+        def _bump(k: int = 1) -> None:
+            _done[0] += k
+            self._sig.progress.emit(_done[0])
 
         def worker():
             all_cols = list(search_cols) + [
@@ -1941,33 +3914,63 @@ class ShotFinderWidget(QWidget):
                 _dkeys = [d.strftime("%Y-%m-%d") for d in days]
                 if _chans and _dkeys:
                     _emit_log(f"Pre-warming {len(_chans)}×{len(_dkeys)} channel-days…")
+                    _emit_stage(f"reading {len(_chans)} PV(s) over {len(_dkeys)} day(s)")
                     cpva.warm_days(_chans, _dkeys, timeout=CPVA_HTTP_TIMEOUT)
             except Exception:
                 pass
             for i, day in enumerate(days):
+                # How many of this day's camera steps are already counted, so a throw
+                # halfway through the camera loop cannot count them a second time.
+                cams_done = 0
                 try:
                     _emit_log(f"{day}: querying API+CSV for cols={all_cols}")
-                    rows, per_col = _load_api_for_day(day, all_cols, log=_emit_log,
-                                                      csv_root=csv_root)
+                    _emit_stage(f"reading PV data · {day}")
+                    rows, per_col, col_meta = _load_api_for_day(
+                        day, all_cols, log=_emit_log, csv_root=csv_root)
                     if not rows:
-                        _emit_log(f"{day}: no data (API + CSV) — see lines above for details")
-                        self._sig.result.emit(None)
-                        self._sig.progress.emit(i + 1)
+                        st = col_meta.get(search_cols[0], {}).get("status")
+                        why = ("archiver did not answer for this day"
+                               if st == "error" else "no samples archived for this PV")
+                        _emit_log(f"{day}: no data (API + CSV) — {why}")
+                        _fail_days(day, why)
+                        _bump(n_cams)
                         continue
 
-                    self._sig.log_msg.emit(f"{day}: {len(rows)} samples")
+                    # Clip the candidate shots to THIS DAY's picked window. per_col is
+                    # left whole on purpose: it only serves value look-ups around a
+                    # shot, and a PV sampled just outside the window still describes a
+                    # shot inside it.
+                    d_start_ns, d_end_ns = tw_by_day.get(
+                        day, (rows[0].get("_ns", 0), rows[-1].get("_ns", 0) + 1))
+                    n_all = len(rows)
+                    rows = [r for r in rows
+                            if d_start_ns <= r.get("_ns", 0) < d_end_ns]
+                    if not rows:
+                        why = "no samples inside the chosen hours"
+                        _emit_log(f"{day}: {n_all} samples, none in the time window")
+                        _fail_days(day, why)
+                        _bump(n_cams)
+                        continue
+
+                    self._sig.log_msg.emit(
+                        f"{day}: {len(rows)} samples"
+                        + (f" (of {n_all}, rest outside the time window)"
+                           if len(rows) != n_all else ""))
 
                     primary_crit = criteria_csv[0]
                     day_col      = primary_crit["col"]
                     target_csv   = primary_crit["target_csv"]
                     day_tol_csv  = primary_crit["tol_csv"]
 
-                    # Rows in tolerance: primary col within tol, AND all other criteria match
+                    # Rows in tolerance: primary col within tol, AND all other criteria
+                    # match. Values go through _quantize_col first — the same snap the
+                    # displayed value and Δ use, or a row could be excluded here on a
+                    # number the table never shows.
                     rows_in_tol = []
                     for row in rows:
                         raw_primary = row.get(day_col, "")
                         try:
-                            v_primary = float(raw_primary)
+                            v_primary = _quantize_col(day_col, float(raw_primary))
                         except Exception:
                             continue
                         if abs(v_primary - target_csv) > day_tol_csv:
@@ -1982,11 +3985,14 @@ class ShotFinderWidget(QWidget):
                             # Try the merged row first
                             raw_sec = row.get(sec_col, "")
                             if not raw_sec:
-                                # Fallback: per-col closest-timestamp (5s window)
-                                raw_sec = _find_closest_col_value(
-                                    per_col, sec_col, row_ns, tol_s=5.0)
+                                # Fallback: per-col closest-timestamp (same window
+                                # the display uses — a shot must never qualify on
+                                # one value and show a different one)
+                                raw_sec, _sec_state = _lookup_col_value(
+                                    per_col, col_meta, sec_col, row_ns,
+                                    tol_s=EXTRA_COL_MATCH_TOL_S)
                             try:
-                                v_sec = float(raw_sec)
+                                v_sec = _quantize_col(sec_col, float(raw_sec))
                             except Exception:
                                 ok = False
                                 break
@@ -2001,16 +4007,19 @@ class ShotFinderWidget(QWidget):
                         best = _find_best_match(rows, day_col, target_csv)
                     else:
                         # Best = row with minimum sum of normalized distances across all criteria
-                        def _norm_dist(row, _crit_csv=criteria_csv, _pc=per_col):
+                        def _norm_dist(row, _crit_csv=criteria_csv, _pc=per_col,
+                                       _cm=col_meta):
                             total = 0.0
                             rn = row.get("_ns", 0)
                             for crit in _crit_csv:
                                 cc = crit["col"]; ct = crit["target_csv"]
                                 raw = row.get(cc, "")
                                 if not raw:
-                                    raw = _find_closest_col_value(_pc, cc, rn, tol_s=5.0)
+                                    raw, _st = _lookup_col_value(
+                                        _pc, _cm, cc, rn,
+                                        tol_s=EXTRA_COL_MATCH_TOL_S)
                                 try:
-                                    v = float(raw)
+                                    v = _quantize_col(cc, float(raw))
                                     total += abs(v - ct) / max(abs(ct), 1e-9)
                                 except Exception:
                                     total += 1e6
@@ -2018,14 +4027,15 @@ class ShotFinderWidget(QWidget):
                         best = min(rows_in_tol, key=_norm_dist)
 
                     if best is None:
-                        self._sig.log_msg.emit(f"{day}: no matching column found")
-                        self._sig.result.emit(None)
-                        self._sig.progress.emit(i + 1)
+                        why = f"'{self._col_short(day_col)}' has no numeric values here"
+                        self._sig.log_msg.emit(f"{day}: {why}")
+                        _fail_days(day, why)
+                        _bump(n_cams)
                         continue
 
                     raw_best = best.get(day_col, "")
                     try:
-                        actual_best = float(raw_best)
+                        actual_best = _quantize_col(day_col, float(raw_best))
                     except Exception:
                         actual_best = None
 
@@ -2034,52 +4044,165 @@ class ShotFinderWidget(QWidget):
                     # Hourová složka
                     dt_obj = best.get("_dt")
                     hour_folder = None
-                    if dt_obj is not None:
+                    day_dir = _day_image_folder(day, images_root)
+                    if dt_obj is not None and day_dir is not None:
                         hour_utc = _folder_hour_from_prague(dt_obj.hour, day)
                         hour_folder = _find_hour_folder(day, hour_utc, images_root=images_root)
 
-                    result = {
-                        "day":          day,
-                        "best_row":     best,
-                        "rows_in_tol":  rows_in_tol,
-                        "col":          day_col,
-                        "actual":       actual_best,
-                        "diff":         diff_best,
-                        "target_csv":   target_csv,
-                        "hour_folder":  hour_folder,
-                        "cam":          cam,
-                        "extra_cols":   extra_cols,
-                        "search_cols":  search_cols,
-                        "per_col":      per_col,
-                        "criteria_csv": criteria_csv,
-                    }
+                    # Display values for every searched + also-show PV at the best
+                    # shot — resolved HERE so the UI thread never hits the network
+                    # and the table shows exactly what the search matched on. The PVs
+                    # do not depend on the camera, so this is done once for all of them.
+                    best_ns = best.get("_ns")
+                    display_vals: dict = {}
+                    if best_ns is not None:
+                        for cc in dict.fromkeys(search_cols + extra_cols):
+                            raw_cc = best.get(cc, "")
+                            if raw_cc:
+                                display_vals[cc] = (raw_cc, "ok")
+                            else:
+                                display_vals[cc] = _lookup_col_value(
+                                    per_col, col_meta, cc, best_ns,
+                                    tol_s=EXTRA_COL_MATCH_TOL_S, log=_emit_log)
+
                     self._sig.log_msg.emit(
                         f"{day}: best={_format_value(day_col, raw_best)} "
                         f"in_tol={len(rows_in_tol)}")
-                    self._sig.result.emit(result)
+
+                    # One row per camera: same shot, its own picture. Resolved here on
+                    # the worker thread — SMB probing must stay off the UI thread — with
+                    # the same resolver every other place in this tab uses, so the
+                    # neighbouring hours are tried here too.
+                    for _ci, _cam in enumerate(cams):
+                        _emit_stage(
+                            f"looking for the frame · {day} · "
+                            f"{_clean_cam_for_filename(_cam) if _cam else 'no camera'}"
+                            + (f" ({_ci + 1}/{len(cams)})" if len(cams) > 1 else ""))
+                        folder_path = None
+                        img_path = None
+                        if not _cam:
+                            img_problem = "no camera selected"
+                        elif day_dir is None:
+                            img_problem = "no images archived for this day"
+                        else:
+                            img_path, cam_folder = _find_image_in_day(
+                                day, _cam, dt_obj, best_ns, {},
+                                images_root=images_root, day_dir=day_dir)
+                            folder_path = cam_folder
+                            if cam_folder is None:
+                                # Nothing of this camera in the shot's hour or its
+                                # neighbours — the day HAS pictures, this moment does not.
+                                img_problem = ("nothing was recorded at this time of day"
+                                               if hour_folder is None
+                                               else "this camera was not recording then")
+                            else:
+                                img_problem = _image_problem(img_path)
+                            if img_problem is not None:
+                                img_path = None
+                        if folder_path is None:
+                            folder_path = hour_folder
+                        if img_problem is not None:
+                            _emit_log(f"{day} {_cam or '(no camera)'}: {img_problem} "
+                                      f"({dt_obj.strftime('%H:%M:%S') if dt_obj else '?'})")
+
+                        self._sig.result.emit({
+                            "day":          day,
+                            "best_row":     best,
+                            "rows_in_tol":  rows_in_tol,
+                            "col":          day_col,
+                            "actual":       actual_best,
+                            "diff":         diff_best,
+                            "target_csv":   target_csv,
+                            "hour_folder":  hour_folder,
+                            "folder_path":  folder_path,
+                            "img_path":     img_path,
+                            "cam":          _cam,
+                            "extra_cols":   extra_cols,
+                            "search_cols":  search_cols,
+                            "per_col":      per_col,
+                            "col_meta":     col_meta,
+                            "criteria_csv": criteria_csv,
+                            "display_vals": display_vals,
+                            # A shot without a picture is still a result worth showing
+                            # (the values are real), it just cannot be sent on.
+                            "status":       "ok" if img_problem is None else "no_image",
+                            "reason":       img_problem or "",
+                        })
+                        cams_done += 1
+                        _bump()
 
                 except Exception as e:
                     self._sig.log_msg.emit(f"{day}: error — {e}")
-                    self._sig.result.emit(None)
-
-                self._sig.progress.emit(i + 1)
+                    _fail_days(day, f"search failed: {type(e).__name__}: {e}")
+                    _bump(max(0, n_cams - cams_done))
 
             self._sig.done.emit()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _tab_for(self, cam) -> "tuple[QTableWidget, list]":
+        """(table, results) of the tab a result belongs to.
+
+        Keyed by the camera the search ran with — never by which tab is in front, which
+        can be any of them while a multi-camera search is still filling them in."""
+        if cam not in self._cam_tables:
+            # A result for a camera no tab was built for should not exist; land it in
+            # the first tab rather than dropping it on the floor.
+            cam = self._cam_order[0] if self._cam_order else None
+        return self._cam_tables[cam], self._cam_results[cam]
+
+    def _add_failed_row(self, result: dict, day: date, col: str, reason: str):
+        """A red row for a day that yielded nothing searchable.
+
+        Every day of the range gets a row in every camera's tab, always. Emitting
+        nothing is what turned a search over one busy day (the archiver refuses a whole
+        day above ~110k samples) into an empty table with no explanation anywhere but
+        the Log box."""
+        criteria = result.get("criteria_csv") or []
+        pv_str = "\n".join(self._col_short(c["col"]) for c in criteria) \
+            or self._col_short(col)
+        table, results = self._tab_for(result.get("cam"))
+        dr = _DayResult(
+            day=day, best_row=None, col=col, actual=None, diff=None,
+            target_csv=0.0, hour_folder=None,
+            search_cols=result.get("search_cols"),
+            extra_cols=result.get("extra_cols"),
+            criteria_csv=criteria, cam=result.get("cam"),
+            status="no_data", reason=reason)
+        # Appended like any other result: within a tab the table row index IS the index
+        # into its result list, and every consumer of that list skips non-"ok" entries.
+        results.append(dr)
+
+        r = table.rowCount()
+        table.insertRow(r)
+        row_bg = QColor("#f8d7da")
+        for c, text in enumerate([day.strftime("%Y-%m-%d"), "—", pv_str, "—", "—",
+                                  "✕ " + reason, ""]):
+            item = QTableWidgetItem(text)
+            item.setBackground(row_bg)
+            if c == 5:
+                item.setForeground(QColor("#a11"))
+                item.setToolTip(reason)
+            table.setItem(r, c, item)
+        n_lines = max(pv_str.count("\n") + 1, 1)
+        if n_lines > 1:
+            table.setRowHeight(r, 18 * n_lines + 8)
 
     def _on_day_result(self, result):
         if result is None:
             return
 
         day: date         = result["day"]
-        best_row: dict    = result["best_row"]
-        rows_in_tol: list = result["rows_in_tol"]
-        col: str          = result["col"]
-        hour_folder       = result["hour_folder"]
-        cam               = result["cam"]
+        status: str       = result.get("status", "ok")
+        best_row: dict    = result.get("best_row") or {}
+        rows_in_tol: list = result.get("rows_in_tol") or []
+        col: str          = result.get("col") or (result.get("search_cols") or [""])[0]
+        hour_folder       = result.get("hour_folder")
+        cam               = result.get("cam")
         dt_obj: datetime = best_row.get("_dt")
-        if dt_obj is None:
+        if status == "no_data" or dt_obj is None:
+            self._add_failed_row(result, day, col,
+                                 result.get("reason") or "nothing found for this day")
             return
 
         per_col = result.get("per_col", {})
@@ -2087,28 +4210,23 @@ class ShotFinderWidget(QWidget):
             day=day, best_row=best_row, col=col,
             actual=result["actual"], diff=result["diff"],
             target_csv=result["target_csv"], hour_folder=hour_folder,
-            rows_in_tol=rows_in_tol, per_col=per_col)
-        self._day_results.append(dr)
+            rows_in_tol=rows_in_tol, per_col=per_col,
+            search_cols=result.get("search_cols"),
+            extra_cols=result.get("extra_cols"),
+            criteria_csv=result.get("criteria_csv"),
+            cam=cam,
+            col_meta=result.get("col_meta"),
+            img_path=result.get("img_path"),
+            status=status, reason=result.get("reason", ""))
+        table, results = self._tab_for(cam)
+        results.append(dr)
+        if status == "ok":
+            self._prog_hits = getattr(self, "_prog_hits", 0) + 1
 
-        # Folder path
-        folder_path = None
-        if hour_folder is not None:
-            if cam:
-                cam_folder = hour_folder / cam
-                if not cam_folder.exists():
-                    try:
-                        for sub in hour_folder.iterdir():
-                            if sub.is_dir() and sub.name.lower() == cam.lower():
-                                cam_folder = sub
-                                break
-                    except Exception:
-                        pass
-                if cam_folder.exists() and cam_folder.is_dir():
-                    folder_path = cam_folder
-            if folder_path is None:
-                folder_path = hour_folder
-
-        folder_str = str(folder_path) if folder_path else "Not found"
+        # Folder + matched image were resolved in the worker (SMB off UI thread)
+        folder_path = result.get("folder_path")
+        img_path    = result.get("img_path")
+        folder_str  = str(folder_path) if folder_path else "Not found"
 
         prague_str = dt_obj.strftime("%H:%M:%S.%f")[:-3]
         best_ns    = best_row.get("_ns")
@@ -2118,36 +4236,40 @@ class ShotFinderWidget(QWidget):
             criteria_csv_res = [{"col": col, "target_csv": result["target_csv"],
                                  "tol_ui": self._tol_sb.value()}]
 
+        display_vals = result.get("display_vals", {})
+
         def _val_at(cc):
+            """(raw, state) at the best shot — precomputed in the worker."""
+            hit = display_vals.get(cc)
+            if hit is not None:
+                return hit
             raw = best_row.get(cc, "")
-            if not raw and best_ns is not None:
-                raw = _find_closest_col_value(per_col, cc, best_ns)
-            return raw
+            return (raw, "ok") if raw else ("", "not_found")
 
         def _diff_ui(cc, target_csv):
             """Return (diff_in_ui_units, formatted_str)."""
+            raw, state = _val_at(cc)
             try:
-                v = float(_val_at(cc))
+                v = _quantize_col(cc, float(raw))
             except (ValueError, TypeError):
-                return None, "—"
+                return None, (cpva.PV_TEXT_ERROR if state == "error"
+                              else cpva.PV_TEXT_NOT_FOUND)
             d = abs(v - target_csv)
-            if cc == "sbw4":
-                return d * SBW4_TRANSMISSION, f"{d * SBW4_TRANSMISSION:.4f} J"
-            if cc in MJ_COLUMNS:
-                return d * 1000, f"{d * 1000:.2f} mJ"
-            if cc == "waveplate":
-                return d, f"{d:.0f}"
-            if cc in PV_COLUMNS:
-                return d, f"{d:.4f} J"
-            return d, f"{d:.4g}"
+            return _diff_ui_value(cc, d), _format_diff(cc, d)
 
-        # One line per search PV across the PV / Value / Δ columns
-        pv_lines, val_lines, diff_lines, off_pvs = [], [], [], []
+        # PV / Δ columns keep one line per search PV; the Value cell is a single
+        # combined line with EVERY searched PV (+ also-show extras).
+        pv_lines, val_parts, diff_lines, off_pvs = [], [], [], []
+        pv_tips = []
         for crit in criteria_csv_res:
             cc = crit["col"]
             short = self._col_short(cc)
             pv_lines.append(short)
-            val_lines.append(f"{short}: {_format_value(cc, _val_at(cc))}")
+            # The cell has room for the short name only — the channel it was read
+            # from goes in the tooltip.
+            pv_tips.append(f"{short} — {self._col_channel(cc)}")
+            raw_cc, state_cc = _val_at(cc)
+            val_parts.append(f"{short}: {_format_value_state(cc, raw_cc, state_cc)}")
             dval, dstr = _diff_ui(cc, crit["target_csv"])
             diff_lines.append(f"{short}: {dstr}")
             if dval is not None and dval > crit.get("tol_ui", 0.0):
@@ -2155,17 +4277,24 @@ class ShotFinderWidget(QWidget):
 
         # 'Also show' PVs appended to the Value cell
         extra_cols = result.get("extra_cols", [])
-        if best_ns is not None:
-            for ec in extra_cols:
-                raw_ec = _find_closest_col_value(per_col, ec, best_ns)
-                val_lines.append(f"{self._col_short(ec)}: {_format_value(ec, raw_ec)}")
+        for ec in extra_cols:
+            raw_ec, state_ec = _val_at(ec)
+            val_parts.append(f"{self._col_short(ec)}: {_format_value_state(ec, raw_ec, state_ec)}")
 
         pv_str   = "\n".join(pv_lines)
-        val_str  = "\n".join(val_lines)
+        val_str  = " | ".join(val_parts)
         diff_str = "\n".join(diff_lines)
 
         n_tol = len(rows_in_tol)
-        if off_pvs:
+        if status == "no_image":
+            # The numbers are real, the picture is not there — red, because the point of
+            # this tab is the picture. Any PV-off note is kept, the row still explains
+            # what was matched.
+            status_str   = "✕ " + "; ".join(
+                [result.get("reason") or "no image"] + off_pvs)
+            status_color = QColor("#a11")
+            row_bg       = QColor("#f8d7da")
+        elif off_pvs:
             status_str   = "⚠ " + "; ".join(off_pvs)
             status_color = QColor("#856404")
             row_bg       = QColor("#fff3cd")
@@ -2178,8 +4307,8 @@ class ShotFinderWidget(QWidget):
             status_color = QColor("#155724")
             row_bg       = None
 
-        r = self._table.rowCount()
-        self._table.insertRow(r)
+        r = table.rowCount()
+        table.insertRow(r)
         cells = [
             day.strftime("%Y-%m-%d"),
             prague_str,
@@ -2193,302 +4322,93 @@ class ShotFinderWidget(QWidget):
             item = QTableWidgetItem(text)
             if row_bg:
                 item.setBackground(row_bg)
+            if c == 2 and pv_tips:
+                item.setToolTip("\n".join(pv_tips))
             if c == 5:
                 item.setForeground(status_color)
             if c == 6:
                 if folder_path is not None:
                     item.setData(Qt.ItemDataRole.UserRole, str(folder_path))
+                    if img_path is not None:
+                        item.setData(Qt.ItemDataRole.UserRole + 1, str(img_path))
+                        item.setToolTip("Click to open the folder with the image selected")
+                    else:
+                        item.setToolTip("Click to open this folder in Explorer "
+                                        "(matched image not found)")
                     item.setForeground(QColor("#2d7dff"))
-                    item.setToolTip("Click to open this folder in Explorer")
                 else:
                     item.setForeground(QColor("#cc0000"))
-            self._table.setItem(r, c, item)
+                    item.setToolTip("Image folder not found on the share")
+            table.setItem(r, c, item)
         # Row height scales with the number of stacked lines
-        n_lines = max(len(pv_lines), len(val_lines), len(diff_lines), 1)
+        n_lines = max(len(pv_lines), len(diff_lines), 1)
         if n_lines > 1:
-            self._table.setRowHeight(r, 18 * n_lines + 8)
+            table.setRowHeight(r, 18 * n_lines + 8)
 
     def _on_table_cell_clicked(self, row: int, col: int):
-        """Click the Folder cell (col 6) to open that folder in Explorer."""
+        """Click the Folder cell (col 6): open Explorer with the matched image
+        selected; fall back to opening the folder when the image is unknown."""
         if col != 6:
             return
         item = self._table.item(row, col)
         if item is None:
             return
-        path = item.data(Qt.ItemDataRole.UserRole)
-        if not path:
+        folder = item.data(Qt.ItemDataRole.UserRole)
+        img = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not folder and not img:
+            self._log("EXPLORER: no folder resolved for this row")
             return
         try:
-            subprocess.Popen(["explorer", str(path)])
-            self._log(f"EXPLORER: {path}")
+            if img:
+                # /select, and the path must stay ONE argument (comma included)
+                subprocess.Popen(f'explorer /select,"{img}"')
+                self._log(f"EXPLORER: select {img}")
+            else:
+                subprocess.Popen(["explorer", str(folder)])
+                self._log(f"EXPLORER: {folder} (image not resolved — opening folder)")
         except Exception as e:
             QMessageBox.critical(self, "Error",
                                  f"Could not open folder:\n{type(e).__name__}: {e}")
 
     def _on_table_double_clicked(self, index):
-        """Double-click na řádek — zobraz všechny shoty daného dne v dialogu."""
+        """Double-click a day row — list that day's shots in the panel underneath.
+
+        The picked shot is drawn in the preview on the right, where the day row's own
+        picture already appears; this used to be a modal dialog carrying its own copy of
+        the table and of the picture."""
         r = index.row()
         if r < 0 or r >= len(self._day_results):
             return
         dr = self._day_results[r]
-
-        col = dr.col
-        rows_in_tol = dr.rows_in_tol
-        target_csv = dr.target_csv
-
-        if not rows_in_tol:
-            QMessageBox.information(self, "No shots",
-                f"No shots within tolerance for {dr.day}.")
+        if dr.status == "no_data":
+            QMessageBox.information(self, "Nothing to show", f"{dr.day}: {dr.reason}.")
             return
-
-        # Dialog se seznamem shotů
-        from PySide6.QtWidgets import QDialog, QDialogButtonBox
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Shots in range — {dr.day}")
-        dlg.resize(600, 300)
-        lay = QVBoxLayout(dlg)
-
-        lbl = QLabel(f"{len(rows_in_tol)} shot(s) in range on {dr.day}:")
-        lay.addWidget(lbl)
-
-        # Extra cols shown in dialog: secondary search PVs + 'also show' PVs +
-        # any other loaded PV — ordered, deduped, excluding the primary col.
-        extra_cols_in_tol: list[str] = []
-        for c in (list(self._criteria_cols) + list(self._extra_cols_sel)
-                  + list(dr.per_col.keys())):
-            if c != col and c in dr.per_col and c not in extra_cols_in_tol:
-                extra_cols_in_tol.append(c)
-        n_extra = len(extra_cols_in_tol)
-        tbl = QTableWidget(0, 3 + n_extra)
-        base_headers = ["Prague Time", "Value", "Δ from target"]
-        extra_headers = [self._col_short(c) for c in extra_cols_in_tol]
-        tbl.setHorizontalHeaderLabels(base_headers + extra_headers)
-        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        for ec_idx in range(n_extra):
-            tbl.horizontalHeader().setSectionResizeMode(
-                3 + ec_idx, QHeaderView.ResizeMode.ResizeToContents)
-        tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-
-        for row in rows_in_tol:
-            dt_obj = row.get("_dt")
-            raw_val = row.get(col, "")
-            ts_str = dt_obj.strftime("%H:%M:%S.%f")[:-3] if dt_obj else "?"
-            val_str = _format_value(col, raw_val)
-            try:
-                v = float(raw_val)
-                diff = abs(v - target_csv)
-                if col == "sbw4":
-                    diff_str = f"{diff * SBW4_TRANSMISSION:.4f} J"
-                elif col in MJ_COLUMNS:
-                    diff_str = f"{diff * 1000:.2f} mJ"
-                else:
-                    diff_str = f"{diff:.4f}"
-            except Exception:
-                diff_str = "—"
-            r2 = tbl.rowCount()
-            tbl.insertRow(r2)
-            tbl.setItem(r2, 0, QTableWidgetItem(ts_str))
-            tbl.setItem(r2, 1, QTableWidgetItem(val_str))
-            tbl.setItem(r2, 2, QTableWidgetItem(diff_str))
-            # Extra PV columns
-            row_ns = row.get("_ns", 0)
-            for ec_idx, ec in enumerate(extra_cols_in_tol):
-                raw_ec = _find_closest_col_value(dr.per_col, ec, row_ns)
-                ec_str = _format_value(ec, raw_ec)
-                tbl.setItem(r2, 3 + ec_idx, QTableWidgetItem(ec_str))
-
-        lay.addWidget(tbl, 1)
-
-        cam_folder_ref = [None]
-        # Zjisti cam_folder pro preview
-        cam = self._active_cam
-        if cam and dr.hour_folder is not None:
-            cf = dr.hour_folder / cam
-            if not cf.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cf = sub
-                            break
-                except Exception:
-                    pass
-            if cf.exists():
-                cam_folder_ref[0] = cf
-
-        def _on_dlg_row_selected():
-            sel = tbl.selectedIndexes()
-            if not sel or cam_folder_ref[0] is None:
-                return
-            i = sel[0].row()
-            if i >= len(rows_in_tol):
-                return
-            row = rows_in_tol[i]
-            dt_obj2 = row.get("_dt")
-            if dt_obj2 is None:
-                return
-            img2 = _find_image_for_ts(cam_folder_ref[0], dt_obj2,
-                                       ts_ns_override=row.get("_ns"))
-            if img2:
-                # Full multi-PV caption (search + also-show), same as main table
-                energy2 = self._build_energy_text(dr, row, row.get("_ns"))
-                _gen2 = self._preview_gen + 1
-                self._preview_gen = _gen2
-                _gname2 = self._gradient_cb.currentText()
-                threading.Thread(
-                    target=lambda p=img2, e=energy2, g=_gen2, gn=_gname2: self._load_and_show_preview(p, e, g, gn),
-                    daemon=True).start()
-
-        tbl.selectionModel().selectionChanged.connect(_on_dlg_row_selected)
-
-        btn_row = QHBoxLayout()
-        btn_open = QPushButton("▶ Open selected in Slider")
-        btn_open.setStyleSheet(
-            "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; "
-            "border-radius: 4px; padding: 5px 10px; }"
-            "QPushButton:hover { background: #1a6aee; }")
-        btn_save_img = QPushButton("Save image")
-        btn_close = QPushButton("Close")
-        btn_row.addWidget(btn_open)
-        btn_row.addWidget(btn_save_img)
-        btn_row.addStretch(1)
-        btn_row.addWidget(btn_close)
-        lay.addLayout(btn_row)
-
-        btn_close.clicked.connect(dlg.reject)
-
-        def save_selected_image():
-            sel = tbl.selectedIndexes()
-            if not sel:
-                QMessageBox.information(dlg, "No selection", "Vyberte řádek v tabulce.")
-                return
-            i = sel[0].row()
-            if i >= len(rows_in_tol):
-                return
-            if cam_folder_ref[0] is None:
-                QMessageBox.warning(dlg, "No camera", "Složka kamery není dostupná.")
-                return
-            row_s = rows_in_tol[i]
-            dt_obj_s = row_s.get("_dt")
-            if dt_obj_s is None:
-                QMessageBox.warning(dlg, "No timestamp", "Řádek nemá časové razítko.")
-                return
-            src = _find_image_for_ts(cam_folder_ref[0], dt_obj_s,
-                                      ts_ns_override=row_s.get("_ns"))
-            if src is None:
-                QMessageBox.warning(dlg, "Image not found", "Obrázek nebyl nalezen.")
-                return
-            initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
-            dst, _ = QFileDialog.getSaveFileName(
-                dlg, "Uložit obrázek", str(Path(initial_dir) / src.name),
-                "Images (*.png *.jpg *.tif *.tiff *.bmp);;All files (*)",
-                options=QFileDialog.Option.DontUseNativeDialog)
-            if not dst:
-                return
-            dst_path = Path(dst)
-            self._last_save_dir = dst_path.parent
-            try:
-                import shutil as _sh
-                _sh.copy2(src, dst_path)
-            except Exception as ex:
-                QMessageBox.critical(dlg, "Chyba", f"Kopírování selhalo:\n{ex}")
-
-        btn_save_img.clicked.connect(save_selected_image)
-
-        def open_selected():
-            selected_rows = tbl.selectedIndexes()
-            if not selected_rows:
-                sel_rows_in_tol = rows_in_tol
-            else:
-                idxs = sorted(set(i.row() for i in selected_rows))
-                sel_rows_in_tol = [rows_in_tol[i] for i in idxs]
-
-            cam = self._active_cam
-            if not cam:
-                QMessageBox.warning(dlg, "No camera", "Select a camera first.")
-                return
-
-            hour_folder = dr.hour_folder
-            if hour_folder is None:
-                QMessageBox.warning(dlg, "No folder", "Hour folder not found.")
-                return
-
-            cam_folder = hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    pass
-
-            if not cam_folder.exists():
-                QMessageBox.warning(dlg, "Camera not found",
-                    f"Camera folder '{cam}' not found.")
-                return
-
-            files = []
-            for row in sel_rows_in_tol:
-                dt_obj = row.get("_dt")
-                if dt_obj is None:
-                    continue
-                img = _find_image_for_ts(cam_folder, dt_obj,
-                                         ts_ns_override=row.get("_ns"))
-                if img:
-                    files.append(img)
-
-            if not files:
-                QMessageBox.warning(dlg, "No images", "No matching images found.")
-                return
-
-            if self._temp_dir is not None:
-                try:
-                    shutil.rmtree(self._temp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            self._temp_dir = tempfile.mkdtemp(prefix="SF_slider_")
-            temp_path = Path(self._temp_dir)
-
-            copied = 0
-            for src in files:
-                try:
-                    dst = temp_path / src.name
-                    if dst.exists():
-                        dst = temp_path / f"{src.stem}_{copied}{src.suffix}"
-                    shutil.copy2(src, dst)
-                    copied += 1
-                except Exception as e:
-                    self._log(f"Copy error: {e}")
-
-            if copied == 0:
-                QMessageBox.warning(dlg, "Copy failed", "No images copied.")
-                return
-
-            dlg.accept()
-            if self._tab_widget:
-                self._tab_widget.setCurrentIndex(1)
-            if self._slider_ref:
-                self._slider_ref.open_folder_path(temp_path)
-
-        btn_open.clicked.connect(open_selected)
-        dlg.exec()
+        if not dr.rows_in_tol:
+            QMessageBox.information(self, "No shots",
+                                    f"No shots within tolerance for {dr.day}.")
+            return
+        self._show_day_panel(dr)
 
     def _on_search_done(self):
         self._search_running = False
         self._set_busy(False)
         self._prog.setVisible(False)
-        n = self._table.rowCount()
-        self._result_lbl.setText(f"Results: {n} day(s) matched")
-        self._log(f"Search done — {n} results")
-        if n > 0 and self._slider_ref is not None:
-            self._btn_open_slider.setEnabled(True)
-        if n > 0:
-            self._btn_save_results.setEnabled(True)
-            self._btn_send_workshop.setEnabled(True)
-            self._btn_send_workshop.setVisible(True)
+        # Counted over every camera tab, not just the visible one: a search that filled
+        # three tabs must not report only the one in front.
+        all_results = self._all_results()
+        n = len(all_results)
+        # Rows that produced a picture vs rows that are only a red explanation.
+        # Reporting the row count alone would call a table full of failures a success.
+        n_ok = sum(1 for dr in all_results if dr.status == "ok")
+        n_cams = len(self._cam_order)
+        self._result_lbl.setText(
+            f"Results: {n_ok} with an image"
+            + (f", {n - n_ok} without" if n > n_ok else "")
+            + (f"  ({n_cams} cameras)" if n_cams > 1 else ""))
+        self._log(f"Search done — {n} row(s), {n_ok} with an image")
+        # _set_busy(False) re-enables every control, so the export buttons must be
+        # re-evaluated afterwards: they act on the tab in front, not on the whole search.
+        self._sync_export_buttons()
 
     # ── OPEN IN SLIDER ────────────────────────────────────────────────────────
 
@@ -2501,14 +4421,16 @@ class ShotFinderWidget(QWidget):
         if not self._day_results:
             return
 
+        # The camera picked at SEARCH time (dr.cam) is what the results belong to;
+        # self._active_cam is only a fallback for results that carry none. Sending
+        # must not fail just because the camera list was edited after the search.
         cam = self._active_cam
-        if not cam:
-            QMessageBox.warning(self, "No camera selected",
-                "Please select a camera first.")
-            return
 
-        # Jeden soubor za každý den
-        files_to_copy: list[Path] = []
+        # One file per day, each paired with the result it came from. The pairing is
+        # carried, not recomputed from a position: indexing results_to_open by the
+        # index into this list put every caption after a skipped day on the wrong
+        # picture.
+        files_to_copy: list[tuple[Path, _DayResult]] = []
         # Použij jen vybrané řádky, nebo všechny pokud nic není vybráno
         selected_rows = sorted(set(
             idx.row() for idx in self._table.selectedIndexes()
@@ -2520,32 +4442,33 @@ class ShotFinderWidget(QWidget):
             results_to_open = self._day_results
 
         for dr in results_to_open:
+            if dr.status != "ok":
+                self._log(f"{dr.day}: {dr.reason or 'nothing found'}, skipping")
+                continue
+
+            # Fast path: the search worker already resolved the matched image
+            if dr.img_path is not None:
+                files_to_copy.append((Path(dr.img_path), dr))
+                self._log(f"{dr.day}: ✓ {Path(dr.img_path).name}")
+                continue
+
             if dr.hour_folder is None:
                 self._log(f"{dr.day}: no hour folder, skipping")
                 continue
 
-            cam_folder = dr.hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    pass
-
-            if not cam_folder.exists():
-                self._log(f"{dr.day}: camera {cam} not found")
+            dr_cam = dr.cam or cam
+            if not dr_cam:
+                self._log(f"{dr.day}: no camera for this result, skipping")
                 continue
 
             dt_obj = dr.best_row.get("_dt")
             if dt_obj is None:
                 continue
 
-            img = _find_image_for_ts(cam_folder, dt_obj,
-                                     ts_ns_override=dr.best_row.get("_ns"))
+            img = self._find_image_for_shot(dr, dr_cam, dt_obj,
+                                            dr.best_row.get("_ns"), {})
             if img is not None:
-                files_to_copy.append(img)
+                files_to_copy.append((img, dr))
                 self._log(f"{dr.day}: ✓ {img.name}")
             else:
                 self._log(f"{dr.day}: no image near {dt_obj.strftime('%H:%M:%S')}")
@@ -2556,24 +4479,26 @@ class ShotFinderWidget(QWidget):
                 "Make sure the camera is correct and the data exists.")
             return
 
-        # Kopíruj do temp složky
-        if self._temp_dir is not None:
-            try:
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            except Exception:
-                pass
+        # Fresh temp folder per send. The PREVIOUS one is deleted only after the
+        # Slider has been pointed at the new one (below) — deleting it up front
+        # yanked the files out from under a Slider still showing the last send.
+        prev_temp_dir = self._temp_dir
         self._temp_dir = tempfile.mkdtemp(prefix="SF_slider_")
         temp_path = Path(self._temp_dir)
 
+        # Sestav energy map — filename -> text pro zobrazení v slideru.
+        # PVs come from the result the file actually came from (dr), never from a
+        # position in some other list, and never from the live left panel.
         copied = 0
-        copied_files: list[tuple[Path, Path, int]] = []  # (src, dst, dr_index)
-        for i, src in enumerate(files_to_copy):
+        energy_map: dict[str, str] = {}
+        for src, dr in files_to_copy:
             try:
                 dst = temp_path / src.name
                 if dst.exists():
                     dst = temp_path / f"{src.stem}_{copied}{src.suffix}"
                 shutil.copy2(src, dst)
-                copied_files.append((src, dst, i))
+                energy_map[dst.name] = self._build_energy_text(
+                    dr, dr.best_row, dr.best_row.get("_ns"))
                 copied += 1
             except Exception as e:
                 self._log(f"Copy error {src.name}: {e}")
@@ -2584,63 +4509,46 @@ class ShotFinderWidget(QWidget):
 
         self._log(f"Copied {copied} images → {self._temp_dir}")
 
-        # Sestav energy map — filename -> text pro zobrazení v slideru
-        energy_map: dict[str, str] = {}
-        search_cols_slider = list(self._criteria_cols)
-        search_cols_slider_set = set(search_cols_slider)
-        extra_cols = [c for c in self._extra_cols_sel
-                      if c not in search_cols_slider_set]
-
-        for src, dst, i in copied_files:
-            if i >= len(results_to_open):
-                continue
-            dr = results_to_open[i]
-            best_ns = dr.best_row.get("_ns")
-            parts = []
-            for sc in search_cols_slider:
-                if sc == dr.col:
-                    val = _format_value(sc, dr.best_row.get(sc, ""))
-                elif best_ns is not None:
-                    raw = _find_closest_col_value(dr.per_col, sc, best_ns)
-                    val = _format_value(sc, raw)
-                else:
-                    val = _format_value(sc, dr.best_row.get(sc, ""))
-                short = PV_COLUMNS.get(sc, sc).split(" [")[0]
-                parts.append(f"{short}: {val}")
-            if best_ns is not None:
-                for ec in extra_cols:
-                    raw_ec = _find_closest_col_value(dr.per_col, ec, best_ns)
-                    ev = _format_value(ec, raw_ec)
-                    short = PV_COLUMNS.get(ec, ec).split(" [")[0]
-                    parts.append(f"{short}: {ev}")
-            energy_map[dst.name] = "  |  ".join(parts)
-
+        # Hand over through receive_external_folder: it clears whatever the Slider
+        # was set to (multi-cam grid, live mode, subtraction reference, focus mode,
+        # a previous energy map) so the images always land. Falls back to the plain
+        # entry point when running against an older is_t.py.
+        send_cam = next((dr.cam for _src, dr in files_to_copy if dr.cam), cam)
         self._tab_widget.setCurrentIndex(1)
-        self._slider_ref._discrete_mode = True
-        self._slider_ref.open_folder_path(temp_path)
-
-        # Předej energy map AFTER open_folder_path — reset se už stalo
-        from PySide6.QtCore import QTimer
-        def _set_map():
+        recv = getattr(self._slider_ref, "receive_external_folder", None)
+        if callable(recv):
+            ok = recv(temp_path, energy_map=energy_map, discrete=True,
+                      cam_name=send_cam)
+            if not ok:
+                QMessageBox.warning(self, "Image Slider",
+                    f"Slider refused the folder:\n{temp_path}")
+                return
+        else:
+            self._slider_ref._discrete_mode = True
             self._slider_ref._sf_energy_map = energy_map
-            # Obnov zobrazení aktuálního snímku s energií
-            if self._slider_ref.current_idx is not None and self._slider_ref.items:
-                idx = self._slider_ref.current_idx
-                self._slider_ref._set_info_for(idx, self._slider_ref.items[idx].ts_ns)
-                self._slider_ref.img_view.update()
-        QTimer.singleShot(500, _set_map)
+            self._slider_ref.open_folder_path(temp_path)
+        self._log(f"Sent {copied} image(s) to Image Slider")
+
+        if prev_temp_dir:
+            try:
+                shutil.rmtree(prev_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     def _save_results(self):
         if not self._day_results:
             return
 
-        cam = self._active_cam
-        if not cam:
-            QMessageBox.warning(self, "No camera selected",
-                "Please select a camera first.")
+        # The camera these rows were SEARCHED with (this tab's), not whichever row of
+        # the camera list happens to be highlighted now: saving used to refuse outright
+        # once the camera was removed from the list, and to name the files after a
+        # different camera than the one in the picture as soon as another was clicked.
+        cam = self._current_cam_key() or self._active_cam
+        if not any(dr.status == "ok" for dr in self._day_results):
+            QMessageBox.warning(self, "Nothing to save",
+                "No row in this tab has an image.")
             return
 
-        from PySide6.QtWidgets import QFileDialog
         initial_dir = str(self._last_save_dir) if self._last_save_dir else str(Path.home())
         out_dir = QFileDialog.getExistingDirectory(self, "Select output folder", initial_dir)
         if not out_dir:
@@ -2657,41 +4565,33 @@ class ShotFinderWidget(QWidget):
         else:
             results_to_save = self._day_results
 
-        search_cols_save = list(self._criteria_cols)
-        search_cols_save_set = set(search_cols_save)
-        extra_cols = [c for c in self._extra_cols_sel
-                      if c not in search_cols_save_set]
-
         copied = 0
         errors = 0
         for dr in results_to_save:
-            if dr.hour_folder is None:
-                self._log(f"{dr.day}: no hour folder, skipping")
+            if dr.status != "ok":
+                self._log(f"{dr.day}: {dr.reason or 'nothing found'}, skipping")
                 errors += 1
                 continue
-
-            cam_folder = dr.hour_folder / cam
-            if not cam_folder.exists():
-                try:
-                    for sub in dr.hour_folder.iterdir():
-                        if sub.is_dir() and sub.name.lower() == cam.lower():
-                            cam_folder = sub
-                            break
-                except Exception:
-                    pass
-
-            if not cam_folder.exists():
-                self._log(f"{dr.day}: camera {cam} not found")
-                errors += 1
-                continue
-
             dt_obj = dr.best_row.get("_dt")
             if dt_obj is None:
                 errors += 1
                 continue
 
-            img = _find_image_for_ts(cam_folder, dt_obj,
-                                     ts_ns_override=dr.best_row.get("_ns"))
+            # Fast path: the search worker already resolved the matched image
+            img = Path(dr.img_path) if dr.img_path is not None else None
+            if img is None:
+                if dr.hour_folder is None:
+                    self._log(f"{dr.day}: no hour folder, skipping")
+                    errors += 1
+                    continue
+
+                dr_cam = dr.cam or cam
+                if not dr_cam:
+                    self._log(f"{dr.day}: no camera for this result, skipping")
+                    errors += 1
+                    continue
+                img = self._find_image_for_shot(dr, dr_cam, dt_obj,
+                                                dr.best_row.get("_ns"), {})
             if img is None:
                 self._log(f"{dr.day}: no image near {dt_obj.strftime('%H:%M:%S')}")
                 errors += 1
@@ -2700,7 +4600,8 @@ class ShotFinderWidget(QWidget):
             # Název souboru: camera_label + Prague timestamp + PV value
             val_str = _format_value(dr.col, dr.best_row.get(dr.col, "")).replace(" ", "").replace("/", "-")
             short = PV_COLUMNS.get(dr.col, dr.col).split(" [")[0]
-            _cam_label = _re.sub(r"[-_]+-IMG$", "", cam, flags=_re.IGNORECASE).rstrip("-_")
+            # The camera of THIS row — the picture came from it.
+            _cam_label = _clean_cam_for_filename(dr.cam or cam or "")
             _ns_best = dr.best_row.get("_ns")
             if _ns_best is not None and PRAGUE is not None:
                 _ts_sec = _ns_best // 1_000_000_000
@@ -2714,24 +4615,9 @@ class ShotFinderWidget(QWidget):
             dst = out_path / dst_name
 
             try:
-                # Sestav energy text pro anotaci
+                # Sestav energy text pro anotaci — from search-time state (dr)
                 _best_ns_save = dr.best_row.get("_ns")
-                parts = []
-                for sc in search_cols_save:
-                    if sc == dr.col:
-                        val = _format_value(sc, dr.best_row.get(sc, ""))
-                    elif _best_ns_save is not None:
-                        raw = _find_closest_col_value(dr.per_col, sc, _best_ns_save)
-                        val = _format_value(sc, raw)
-                    else:
-                        val = _format_value(sc, dr.best_row.get(sc, ""))
-                    short = PV_COLUMNS.get(sc, sc).split(" [")[0]
-                    parts.append(f"{short}: {val}")
-                for ec in extra_cols:
-                    ev = _format_value(ec, dr.best_row.get(ec, ""))
-                    short = PV_COLUMNS.get(ec, ec).split(" [")[0]
-                    parts.append(f"{short}: {ev}")
-                energy_text = "  |  ".join(parts)
+                energy_text = self._build_energy_text(dr, dr.best_row, _best_ns_save)
 
                 # Ulož s anotací jako PNG
                 dst = dst.with_suffix(".png")
@@ -2740,7 +4626,8 @@ class ShotFinderWidget(QWidget):
                 from PySide6.QtGui import QImage
                 from PySide6.QtCore import QSize
 
-                # Load via PIL to preserve 16-bit and apply imgMaxValue normalization
+                # Load via PIL to preserve 16 bits, then render on the same scale as the
+                # preview — a saved frame must look like what was on screen.
                 try:
                     _pil_raw = _PilImg.open(str(img))
                     if _pil_raw.mode in ("I", "I;16"):
@@ -2749,11 +4636,11 @@ class ShotFinderWidget(QWidget):
                         _arr_f = _np.array(_pil_raw.convert("L"), dtype=_np.float32)
                     else:
                         _arr_f = _np.array(_pil_raw.convert("L"), dtype=_np.float32)
-                    _img_max_val = _read_img_max_value(img)
-                    _arr_px_max = float(_arr_f.max())
-                    if _img_max_val is not None and _arr_px_max > 0:
-                        _arr_f = _img_max_val * _arr_f / _arr_px_max
-                    arr = _np.clip(_arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+                    _s_auto, _s_gam, _s_con, _s_off = self._bc_args()
+                    arr = _render_u8(_arr_f, _s_auto,
+                                     _full_scale_for_mode(_pil_raw.mode, img,
+                                                          _pil_raw.info),
+                                     _s_gam, _s_con, _s_off)
                     w, h = arr.shape[1], arr.shape[0]
                 except Exception:
                     shutil.copy2(img, dst)
@@ -2777,7 +4664,7 @@ class ShotFinderWidget(QWidget):
                     lut = SF_GRADIENTS.get(grad_name, None)
 
                 if lut is not None:
-                    rgb = lut[arr]
+                    rgb = _lut_pixels_sf(lut, arr, grad_name)
                     pil_img = _PilImg.fromarray(rgb, mode="RGB")
                 else:
                     pil_img = _PilImg.fromarray(arr).convert("RGB")
@@ -2901,11 +4788,12 @@ class ShotFinderWidget(QWidget):
             else:
                 arr_f = _np.array(pil.convert("L"), dtype=_np.float32)
 
-            img_max_val = _read_img_max_value(img_path)
-            arr_px_max = float(arr_f.max())
-            if img_max_val is not None and arr_px_max > 0:
-                arr_f = img_max_val * arr_f / arr_px_max
-            arr8 = _np.clip(arr_f / 4095.0 * 255.0, 0, 255).astype(_np.uint8)
+            # The Workshop measures and builds its histogram from the picture it is
+            # given, so it gets the plain absolute mapping — never this tab's Auto
+            # passes, Contrast, Brightness or Gamma, which would hand it a display curve
+            # instead of data.
+            arr8 = _render_u8(arr_f, False,
+                              _full_scale_for_mode(pil.mode, img_path, pil.info), None)
 
             cam_name = _re.sub(r"[-_]+IMG$", "", img_path.parent.name, flags=_re.IGNORECASE).rstrip("-_")
             label = f"{cam_name}  |  {img_path.name}"
@@ -2914,10 +4802,71 @@ class ShotFinderWidget(QWidget):
             QMessageBox.warning(self, "Workshop", f"Could not send image:\n{e}")
 
 
+# ── WHEEL GUARD ───────────────────────────────────────────────────────────────
+def install_wheel_guard(app):
+    """A value must never change just because the pointer crossed its control.
+
+    Number fields, drop-downs and setting sliders answer the mouse wheel only
+    once they have been CLICKED (i.e. they hold the keyboard focus). Until then
+    the notch goes to the panel behind them instead, so a settings panel still
+    scrolls when the pointer happens to pass over a field on the way down. A
+    control that is meant to take the wheel at any time carries the "wheelAlways"
+    property.
+
+    Scroll bars are left out: they are sliders too, and the wheel is how a pane
+    gets scrolled.
+
+    One app-wide filter, so a dialog built much later is covered as well. It is
+    spelled out in every entry point rather than imported once: each tab also
+    runs on its own, and a sibling module would have to survive the frozen build
+    (the same reason `_import_img_scale` is copied into each tab).
+    """
+    from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSlider,
+                                   QAbstractSpinBox, QScrollBar)
+
+    class _WheelGuard(QObject):
+        _GUARDED = (QAbstractSpinBox, QComboBox, QAbstractSlider)
+        # Focus the user asked for. The focus a freshly opened window HANDS to its
+        # first field (ActiveWindow / Other) does not count, or the top field of a
+        # panel would answer the wheel before it had ever been touched.
+        _EARNED = (Qt.FocusReason.MouseFocusReason, Qt.FocusReason.TabFocusReason,
+                   Qt.FocusReason.BacktabFocusReason,
+                   Qt.FocusReason.ShortcutFocusReason)
+        _GIVEN = (Qt.FocusReason.ActiveWindowFocusReason,
+                  Qt.FocusReason.OtherFocusReason)
+
+        def eventFilter(self, obj, ev):
+            t = ev.type()
+            if t == QEvent.Type.FocusIn and isinstance(obj, self._GUARDED):
+                # Popup and menu reasons are left as they are: closing a drop-down
+                # hands the focus back, which must not undo the click that opened it.
+                if ev.reason() in self._EARNED:
+                    obj.setProperty("wheelReady", True)
+                elif ev.reason() in self._GIVEN:
+                    obj.setProperty("wheelReady", False)
+                return False
+            if t != QEvent.Type.Wheel:
+                return False
+            if not isinstance(obj, self._GUARDED) or isinstance(obj, QScrollBar):
+                return False
+            if (obj.property("wheelAlways")
+                    or (obj.hasFocus() and obj.property("wheelReady"))):
+                return False
+            pane = obj.parentWidget()
+            while pane is not None and not isinstance(pane, QAbstractScrollArea):
+                pane = pane.parentWidget()
+            if pane is not None:
+                QApplication.sendEvent(pane.viewport(), ev)
+            return True
+
+    app.installEventFilter(_WheelGuard(app))
+
+
 # ── STANDALONE ENTRY POINT ────────────────────────────────────────────────────
 
 def main():
     app = QApplication.instance() or QApplication(_sys.argv)
+    install_wheel_guard(app)
     app.setStyle("Fusion")
     app.setStyleSheet("""
         QWidget     { background: #f3f3f3; color: #111; }

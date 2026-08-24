@@ -94,6 +94,40 @@ def _programs_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def find_helper_programs(program_dirs: list[Path]) -> dict[str, list[str]]:
+    """Helper exes per program folder, read from each folder's build_config.json.
+
+    Same source as the builder's expander (`extra_exes`), so nothing has to be
+    registered here: a program has helpers exactly when its build_config.json
+    lists them.
+
+    A helper is built into its OWN dist folder under its own name, which makes it
+    a program like any other as far as the copy is concerned — it only lacks a
+    source folder, and that is precisely why it never appeared on this list and
+    was reported as "NOT copied — not selected in Copy Manager".
+    """
+    out: dict[str, list[str]] = {}
+    for p in program_dirs:
+        cfg_path = p / "build_config.json"
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        names: list[str] = []
+        for spec in (cfg.get("extra_exes") or []):
+            if isinstance(spec, str):
+                spec = {"script": spec}
+            script = p / spec.get("script", "")
+            if not script.exists():
+                continue
+            name = (spec.get("name") or script.stem).strip()
+            if name and name not in names:
+                names.append(name)
+        if names:
+            out[p.name] = names
+    return out
+
+
 def _get_scratch_root() -> Path | None:
     cfg = _load_devtools_config()
     s = cfg.get("scratch")
@@ -133,6 +167,70 @@ def write_version_to_txt(program_name: str, version: str):
 INTERNAL_BUILDER_DIST = _internal_builder_dist()
 VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 _VERSION_LOOSE_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+# Archived-style exe name, e.g. "Image Tools v2.5.2__20260526_090829.exe"
+TIMESTAMPED_EXE_RE = re.compile(r"^.+__\d{8}_\d{6}\.exe$", re.IGNORECASE)
+
+# Folders an app reads at runtime from next to its exe (Announcer/images,
+# Announcer/sounds). Kept in sync with the auto-included list in b_t.py.
+# They are never deleted on a destination, and when a build does not carry them
+# the deploy takes them straight from the source tree instead.
+ASSET_DIR_NAMES = ("images", "sounds", "assets", "icons", "img", "audio",
+                   "fonts", "templates")
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Seconds as "4.5s" or "2m 38s" — the form used in every end-of-run report."""
+    if seconds >= 60:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+    return f"{seconds:.1f}s"
+
+
+def _dir_has_files(d: Path) -> bool:
+    """True if the folder holds at least one file (at any depth)."""
+    try:
+        return any(f.is_file() for f in d.rglob("*"))
+    except OSError:
+        return False
+
+
+def _merge_dir(src: Path, dst: Path) -> tuple[int, int, list[str]]:
+    """Copy src over dst file by file, WITHOUT deleting anything first.
+
+    The previous version deleted the destination folder and re-created it from
+    the build (rmtree + copytree). Two ways that lost data for good: a build
+    whose images/ was empty replaced a good folder with an empty one, and a copy
+    that failed half way left the folder wiped with nothing put back. Merging
+    can only add or overwrite, so the worst case is a stale leftover file.
+
+    Returns (copied, failed, error messages).
+    """
+    copied = failed = 0
+    errors: list[str] = []
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in sorted(src.rglob("*")):
+        rel = item.relative_to(src)
+        if any(part in ("__pycache__",) for part in rel.parts):
+            continue
+        target = dst / rel
+        try:
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if item.name.lower() == "thumbs.db":
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, target)
+            copied += 1
+        except Exception as e:
+            failed += 1
+            errors.append(f"{rel}: {e}")
+    return copied, failed, errors
+
+
+def _exe_version(p: Path) -> tuple[int, int, int]:
+    """Version tuple parsed from an exe filename, for sorting; (0,0,0) if none."""
+    m = VERSION_RE.search(p.stem)
+    return tuple(map(int, m.groups())) if m else (0, 0, 0)
 README_PREFIX = "ReadMe_"
 README_NAME = "ReadMe.txt"
 
@@ -147,6 +245,30 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
     """Apply icon.ico to the title bar AND the Windows taskbar button.
 
@@ -155,9 +277,10 @@ def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
     default feather. We force every slot from icon.ico via Win32.
     """
     import ctypes
-    if app_id:
+    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
+    if _aumid:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
     try:
@@ -482,6 +605,190 @@ def _fix_archive_dir(archive_dir: Path, log_fn=None):
         log_fn(f"[{program_name}]   archive OK")
 
 
+def _reunite_unknown_helpers(archive_dir: Path, log_fn=None):
+    """Move helper .py files stranded in archive/unknown/ back into their version folders.
+
+    Helper modules (if_t.py, is_t.py, …) carry no version in their filename, so the
+    deploy step used to drop every old copy into unknown/ (as 'if_t.py', 'if_t (2).py', …).
+    Each copy was logged in unknown/archive_log.txt with the timestamp of the deploy that
+    archived it; the matching version folder carries that same timestamp in its own
+    archive_log.txt. We rebuild that link and move each copy back — keeping the ORIGINAL
+    importable name so the version folder becomes a self-contained, runnable snapshot.
+
+    The Nth physical copy of a name (unique_path order: base, ' (2)', ' (3)', …) matches
+    the Nth timestamp for that name in chronological order.
+    """
+    from collections import defaultdict as _dd
+    unk = archive_dir / "unknown"
+    unk_log = unk / "archive_log.txt"
+    if not unk.is_dir() or not unk_log.exists():
+        return
+    program_name = archive_dir.parent.name
+
+    def _log(m):
+        if log_fn:
+            log_fn(f"[{program_name}] {m}")
+
+    _TS_RE = re.compile(r"\d{8}_\d{6}")
+
+    # timestamp -> version folder (from every vX.Y.Z/archive_log.txt); drop ambiguous ones
+    ts_to_ver: dict[str, Path] = {}
+    ambiguous: set[str] = set()
+    for vdir in archive_dir.iterdir():
+        if not vdir.is_dir() or vdir.name == "unknown":
+            continue
+        vlog = vdir / "archive_log.txt"
+        if not vlog.exists():
+            continue
+        try:
+            for line in vlog.read_text(encoding="utf-8").splitlines():
+                ts = line.split("|", 1)[0].strip()
+                if not _TS_RE.fullmatch(ts):
+                    continue
+                if ts in ts_to_ver and ts_to_ver[ts] != vdir:
+                    ambiguous.add(ts)
+                else:
+                    ts_to_ver[ts] = vdir
+        except Exception:
+            continue
+    if not ts_to_ver:
+        return
+
+    # unknown/archive_log.txt -> per-filename chronological timestamp list
+    per_name_ts: dict[str, list[str]] = _dd(list)
+    try:
+        for line in unk_log.read_text(encoding="utf-8").splitlines():
+            parts = line.split("|", 1)
+            if len(parts) != 2:
+                continue
+            ts, fname = parts[0].strip(), parts[1].strip()
+            if _TS_RE.fullmatch(ts) and fname:
+                per_name_ts[fname].append(ts)
+    except Exception:
+        return
+
+    moved = skipped = 0
+    for fname, ts_list in per_name_ts.items():
+        ts_list = sorted(ts_list)  # chronological == unique_path assignment order
+        stem, suf = Path(fname).stem, Path(fname).suffix
+        phys = [unk / (fname if i == 1 else f"{stem} ({i}){suf}")
+                for i in range(1, len(ts_list) + 1)]
+        existing = [p for p in phys if p.exists()]
+        if len(existing) != len(ts_list):
+            _log(f"unknown: '{fname}' — {len(existing)} file(s) vs {len(ts_list)} log entries, skipping (ambiguous)")
+            skipped += len(existing)
+            continue
+        for src, ts in zip(phys, ts_list):
+            if ts in ambiguous or ts not in ts_to_ver:
+                skipped += 1
+                continue
+            dst_dir = ts_to_ver[ts]
+            dst = dst_dir / fname
+            if dst.exists():
+                _log(f"unknown: {src.name} -> {dst_dir.name}/ SKIP (exists)")
+                skipped += 1
+                continue
+            ok, why = _try_move(src, dst)
+            if ok:
+                moved += 1
+            else:
+                _log(f"unknown: {src.name} -> {dst_dir.name}/ SKIP ({why})")
+                skipped += 1
+
+    if moved:
+        _log(f"unknown: reunited {moved} helper file(s) with their version folders"
+             + (f" ({skipped} skipped)" if skipped else ""))
+
+    # tidy up: if no .py copies remain, drop the (now stale) unknown folder + its log
+    try:
+        if not any(p.suffix.lower() == ".py" for p in unk.iterdir()):
+            unk_log.unlink(missing_ok=True)
+            unk.rmdir()
+            _log("unknown: emptied and removed")
+    except Exception:
+        pass
+
+
+_DUP_SUFFIX_RE = re.compile(r"^(.*?) \((\d+)\)$")
+_TS_SUFFIX_RE  = re.compile(r"^(.*?)__\d{8}_\d{6}$")
+
+
+def _canonical_stem(stem: str) -> str:
+    """Strip a '__YYYYMMDD_HHMMSS' timestamp and/or a ' (N)' dedup suffix off a
+    filename stem, yielding the name the file should live under:
+        'if_t__20260401_134341'      -> 'if_t'
+        'Image Tools v2.5.4 (2)'     -> 'Image Tools v2.5.4'
+        'Image Tools v2.5.4__2026..' -> 'Image Tools v2.5.4'
+    """
+    m = _TS_SUFFIX_RE.match(stem)
+    if m:
+        stem = m.group(1)
+    m = _DUP_SUFFIX_RE.match(stem)
+    if m:
+        stem = m.group(1)
+    return stem
+
+
+def _dup_index(stem: str) -> int:
+    m = _DUP_SUFFIX_RE.match(stem)
+    return int(m.group(2)) if m else 0
+
+
+def _normalize_version_folder_names(archive_dir: Path, log_fn=None):
+    """Make every vX.Y.Z/ folder a clean, runnable snapshot.
+
+    Timestamps are gone by design (Dev Tools no longer keeps them in the archive);
+    the version lives in the filename ('Image Tools v2.5.4.exe') and in the folder
+    name, which is what the Launcher now reads.
+
+    Per version folder, files are grouped by their canonical name (timestamp and
+    ' (N)' dedup suffix stripped). For each group the best copy is kept and renamed
+    to the canonical name; redundant copies ('… (2).exe', stray timestamped twins)
+    are deleted. Helper modules (if_t.py, …) keep their importable names so
+    'import if_t' still resolves inside the folder.
+    """
+    from collections import defaultdict as _dd
+    program_name = archive_dir.parent.name
+    renamed = removed = 0
+
+    for vdir in archive_dir.iterdir():
+        if not vdir.is_dir() or vdir.name == "unknown":
+            continue
+
+        groups: dict[str, list[Path]] = _dd(list)
+        for f in vdir.iterdir():
+            if not f.is_file() or f.suffix.lower() in (".txt", ".log"):
+                continue
+            groups[_canonical_stem(f.stem) + f.suffix].append(f)
+
+        for canon, files in groups.items():
+            canon_path = vdir / canon
+            # Keep the base copy: no ' (N)' suffix first, then the canonical
+            # (non-timestamped) name, then lowest index — deterministic, size-agnostic.
+            keeper = min(files, key=lambda p: (_dup_index(p.stem),
+                                               0 if p.name == canon else 1,
+                                               p.name.lower()))
+            for f in files:
+                if f == keeper:
+                    continue
+                try:
+                    f.unlink()
+                    removed += 1
+                    if log_fn:
+                        log_fn(f"[{program_name}]   {vdir.name}/ removed duplicate: {f.name}")
+                except Exception as e:
+                    if log_fn:
+                        log_fn(f"[{program_name}]   WARN remove {f.name}: {e}")
+
+            if keeper.name != canon and not canon_path.exists():
+                ok, _why = _try_move(keeper, canon_path)
+                if ok:
+                    renamed += 1
+
+    if log_fn and (renamed or removed):
+        log_fn(f"[{program_name}] normalized {renamed} name(s), removed {removed} duplicate(s) in version folders")
+
+
 def move_existing_exes_to_archive(target_dir: Path, keep_name: str, logs: list[str], program_name: str):
     """
     Move ALL *.exe except keep_name into archive/vX.Y.Z/ subfolder.
@@ -540,6 +847,28 @@ def find_readme_or_raise(program_dir: Path, program_name: str) -> Path:
         f"  - README.md / README.txt\n"
         f"In folder:\n{program_dir}"
     )
+
+
+def find_readme_full_or_none(program_dir: Path, program_name: str) -> "Path | None":
+    """The detailed companion document, or None.
+
+    The Launcher shows this one behind its own **Details** button
+    (`l.py::find_readme_full_or_none`), so the deploy has to carry it as well as
+    the short ReadMe. Missing is not an error — a program may have only the short
+    one, and then the Launcher simply shows no Details button.
+    """
+    targets = {
+        _normalize_name(f"{README_PREFIX}{program_name}_Full"),
+        _normalize_name(f"{README_PREFIX}{program_name}_Details"),
+        _normalize_name(f"Manual_{program_name}"),
+    }
+    try:
+        for f in program_dir.iterdir():
+            if f.is_file() and _normalize_name(f.stem) in targets:
+                return f
+    except OSError:
+        return None
+    return None
 
 
 def copy_readme_with_overwrite_notice(src_readme: Path, dst_dir: Path, logs: list[str], program_name: str):
@@ -607,10 +936,22 @@ class DeployGUI(ttk.Frame):
 
         self.program_is_new: dict[Path, bool] = {}
         self.program_latest_version: dict[Path, str] = {}
-        
+
+        # Helper exes (a program's build_config.json -> extra_exes): they have a
+        # dist folder of their own but no source folder, so they are shown
+        # indented under their parent, the same way the builder shows them.
+        self.helper_keys_by_parent: dict[str, list[Path]] = {}
+        self.helper_parent_dir: dict[str, Path] = {}   # helper name -> parent source folder
+        self.helper_rows: dict[str, list[ttk.Frame]] = {}
+        self.expander_buttons: dict[str, ttk.Button] = {}
+        # Folded/unfolded state survives a Refresh — the rows are rebuilt, the
+        # list the user opened should not close under them.
+        self.expanded_programs: set[str] = set()
+
         self.dest_path_labels: list[tuple[ttk.Label, str]] = []
         self._log_autoscroll = True
 
+        self.arrow_col_px = 24
         self.program_col_px = 200
         self.version_col_px = 140
         self.new_col_px = 70
@@ -797,14 +1138,13 @@ class DeployGUI(ttk.Frame):
         self.header = ttk.Frame(left)
         self.header.pack(fill="x", padx=8, pady=(8, 2))
 
-        self.header.grid_columnconfigure(0, minsize=26)
-        self.header.grid_columnconfigure(1, minsize=self.program_col_px)
-        self.header.grid_columnconfigure(2, minsize=self.version_col_px)
-        self.header.grid_columnconfigure(3, minsize=self.new_col_px)
-        self.header.grid_columnconfigure(4, weight=1)
-        ttk.Label(self.header, text="Program").grid(row=0, column=1, sticky="w")
-        ttk.Label(self.header, text="Version").grid(row=0, column=2, sticky="w")
-        ttk.Label(self.header, text="Status").grid(row=0, column=3, sticky="w")
+        # Column 0 is the slot for the fold arrow of a program that carries
+        # helpers, so every tick box stays on the same left edge and a row with
+        # an arrow does not read as indented.
+        self._configure_row_columns(self.header)
+        ttk.Label(self.header, text="Program").grid(row=0, column=2, sticky="w")
+        ttk.Label(self.header, text="Version").grid(row=0, column=3, sticky="w")
+        ttk.Label(self.header, text="Status").grid(row=0, column=4, sticky="w")
 
         self.programs_sf = ScrollableFrame(left)
         self.programs_sf.pack(fill="both", expand=True, padx=8, pady=(2, 8))
@@ -886,7 +1226,8 @@ class DeployGUI(ttk.Frame):
             pass
         self._load_programs()
 
-    def auto_deploy(self, built_projects: list, build_summary: str = None):
+    def auto_deploy(self, built_projects: list, build_summary: str = None,
+                    build_info: dict = None):
         """
         Voláno z BuilderUI po úspěšném buildu (copy_after_build).
         built_projects = [(program_dir: Path, version_name: str), ...]
@@ -915,16 +1256,33 @@ class DeployGUI(ttk.Frame):
 
         selected_roots = self._get_selected_destination_roots()
         if not selected_roots:
-            self._log("[auto_deploy] ERROR: žádná destinace není vybrána.")
+            # No destination = no copy, so the copy report never runs. Print the
+            # build report here, otherwise the whole run ends without any report.
+            if build_summary:
+                self._log(build_summary, force_scroll=True)
+            self._log("[auto_deploy] ERROR: žádná destinace není vybrána — "
+                      "nic se nekopírovalo.", force_scroll=True)
             return
 
         self._log(f"[auto_deploy] Spouštím deploy pro: {[p.name for p, _ in built_projects]}\n")
-        self._on_copy(build_summary=build_summary)
+        self._on_copy(build_summary=build_summary, build_info=build_info)
 
-    def _log(self, text: str):
+    def _log(self, text: str, force_scroll: bool = False):
         target = self._external_log if self._external_log is not None else getattr(self, "log", None)
         if target is None:
             return
+        if force_scroll:
+            # Final reports must always land in view. Nudging the log during a long
+            # build/copy turns autoscroll off and only scrolling back to the very
+            # bottom turns it on again — which is how the end-of-run report ended
+            # up written below the visible area and looked like it was missing.
+            self._log_autoscroll = True
+            builder = getattr(self, "_builder_ref", None)
+            if builder is not None:
+                try:
+                    builder._local_log_autoscroll = True
+                except Exception:
+                    pass
         def _append():
             try:
                 target.configure(state="normal")
@@ -964,6 +1322,16 @@ class DeployGUI(ttk.Frame):
             max_px = max(max_px, f.measure(n))
         return max_px + 40
 
+    def _configure_row_columns(self, frame):
+        """The column layout shared by the header and every row: fold arrow, tick
+        box, program, version, status, last deployed."""
+        frame.grid_columnconfigure(0, minsize=self.arrow_col_px)
+        frame.grid_columnconfigure(1, minsize=26)
+        frame.grid_columnconfigure(2, minsize=self.program_col_px)
+        frame.grid_columnconfigure(3, minsize=self.version_col_px)
+        frame.grid_columnconfigure(4, minsize=self.new_col_px)
+        frame.grid_columnconfigure(5, weight=1)
+
     def _load_programs(self):
         for child in self.programs_sf.inner.winfo_children():
             child.destroy()
@@ -971,6 +1339,10 @@ class DeployGUI(ttk.Frame):
         self.program_version_vars.clear()
         self.program_is_new.clear()
         self.program_latest_version.clear()
+        self.helper_keys_by_parent.clear()
+        self.helper_parent_dir.clear()
+        self.helper_rows.clear()
+        self.expander_buttons.clear()
 
         programs_root = _programs_root()
         dist_root = _dist_root()
@@ -995,67 +1367,152 @@ class DeployGUI(ttk.Frame):
             self._log(f"No program folders found in: {programs_root}")
             return
 
-        self.program_col_px = self._compute_program_col_px([p.name for p in program_dirs])
-        self.header.grid_columnconfigure(1, minsize=self.program_col_px)
+        # A helper whose name is already a program folder is that program — list
+        # it once, as itself.
+        taken = {p.name.lower() for p in program_dirs}
+        helper_names_by_parent = {
+            parent: [n for n in names if n.lower() not in taken]
+            for parent, names in find_helper_programs(program_dirs).items()
+        }
 
+        col_names = [p.name for p in program_dirs]
+        for names in helper_names_by_parent.values():
+            col_names += [f"↳ {n}" for n in names]
+        self.program_col_px = self._compute_program_col_px(col_names)
+        self._configure_row_columns(self.header)
+
+        # Read once for the whole list: Versions.txt lives on the scratch share
+        # and re-reading it per program made opening the list wait on the network
+        # as many times as there are programs.
+        versions_map = read_versions_txt()
+
+        self.programs_sf.inner.grid_columnconfigure(0, weight=1)
+        row_idx = 0
         for p in program_dirs:
-            dist_dir = dist_root / p.name   # may or may not exist yet
-            version_folders = list_versions(dist_dir)
-            version_names = [vf.name for vf in version_folders]
+            helper_names = helper_names_by_parent.get(p.name) or []
+            row = self._build_program_row(p, row_idx, dist_root, versions_map)
+            row_idx += 1
 
-            latest = version_names[0] if version_names else ""
-            self.program_latest_version[p] = latest
+            if helper_names:
+                # Folded by default: most programs have no helpers, and an
+                # always-open tree would push the programs themselves out of the
+                # visible part of the list.
+                open_now = p.name in self.expanded_programs
+                btn = ttk.Button(row, text="▾" if open_now else "▸", width=2,
+                                 command=lambda pn=p.name: self._toggle_expanded(pn))
+                btn.grid(row=0, column=0, sticky="w")
+                self.expander_buttons[p.name] = btn
 
-            # Read deployed version from Versions.txt (primary) or local state (fallback)
-            versions_map = read_versions_txt()
-            last_deployed = versions_map.get(p.name, "") or self.state_deployed.get(p.name.lower(), "")
-            last_deployed = last_deployed.strip()
-            is_new = bool(latest) and is_newer_version(latest, last_deployed)
-            self.program_is_new[p] = is_new
+                keys, rows = [], []
+                for n in helper_names:
+                    # No source folder of its own — the name is what the copy
+                    # keys on (dist/<name>), so a key under the programs root is
+                    # enough to make it look like any other program here.
+                    key = programs_root / n
+                    self.helper_parent_dir[n] = p
+                    keys.append(key)
+                    rows.append(self._build_program_row(key, row_idx, dist_root,
+                                                       versions_map, is_helper=True))
+                    row_idx += 1
+                self.helper_keys_by_parent[p.name] = keys
+                self.helper_rows[p.name] = rows
+                if not open_now:
+                    for hr in rows:
+                        hr.grid_remove()
 
-            var_checked = tk.BooleanVar(value=False)
-            self.program_vars[p] = var_checked
+    def _build_program_row(self, key: Path, row_idx: int, dist_root: Path,
+                           versions_map: dict, is_helper: bool = False) -> ttk.Frame:
+        """One row of the program list — a program folder or, indented, a helper
+        exe built from one. Both are copied the same way, so both get a tick box,
+        a version to pick and a status."""
+        name = key.name
+        version_folders = list_versions(dist_root / name)   # may not exist yet
+        version_names = [vf.name for vf in version_folders]
 
-            var_version = tk.StringVar(value=latest)
-            self.program_version_vars[p] = var_version
+        latest = version_names[0] if version_names else ""
+        self.program_latest_version[key] = latest
 
-            row = ttk.Frame(self.programs_sf.inner)
-            row.pack(fill="x", pady=3)
+        # Deployed version from Versions.txt (primary) or local state (fallback)
+        last_deployed = (versions_map.get(name, "")
+                         or self.state_deployed.get(name.lower(), "")).strip()
+        is_new = bool(latest) and is_newer_version(latest, last_deployed)
+        self.program_is_new[key] = is_new
 
-            row.grid_columnconfigure(0, minsize=26)
-            row.grid_columnconfigure(1, minsize=self.program_col_px)
-            row.grid_columnconfigure(2, minsize=self.version_col_px)
-            row.grid_columnconfigure(3, minsize=self.new_col_px)
-            row.grid_columnconfigure(4, weight=1)
+        var_checked = tk.BooleanVar(value=False)
+        self.program_vars[key] = var_checked
+        var_version = tk.StringVar(value=latest)
+        self.program_version_vars[key] = var_version
 
-            ttk.Checkbutton(row, variable=var_checked).grid(row=0, column=0, sticky="w")
-            ttk.Label(row, text=p.name).grid(row=0, column=1, sticky="w", padx=(6, 8))
+        row = ttk.Frame(self.programs_sf.inner)
+        row.grid(row=row_idx, column=0, sticky="ew", pady=(1 if is_helper else 3))
+        self._configure_row_columns(row)
 
-            cb = ttk.Combobox(
-                row,
-                textvariable=var_version,
-                values=version_names,
-                state="readonly" if version_names else "disabled",
-            )
-            cb.grid(row=0, column=2, sticky="w")
+        tick = ttk.Checkbutton(row, variable=var_checked)
+        if not is_helper:
+            tick.configure(command=lambda kk=key: self._on_program_check_clicked(kk))
+        tick.grid(row=0, column=1, sticky="w")
+        ttk.Label(row, text=f"↳ {name}" if is_helper else name).grid(
+            row=0, column=2, sticky="w", padx=((20 if is_helper else 6), 8))
 
-            if not version_names:
-                ttk.Label(row, text="NEW", foreground="gray").grid(row=0, column=3, sticky="w")
-            elif is_new:
-                ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=3, sticky="w")
-            elif last_deployed:
-                ttk.Label(row, text="UTD", foreground="#cc0000").grid(row=0, column=3, sticky="w")
-            else:
-                ttk.Label(row, text="").grid(row=0, column=3, sticky="w")
+        cb = ttk.Combobox(
+            row,
+            textvariable=var_version,
+            values=version_names,
+            state="readonly" if version_names else "disabled",
+        )
+        cb.grid(row=0, column=3, sticky="w")
 
-            if last_deployed:
-                ttk.Label(row, text=f"last deployed: {last_deployed}", foreground="gray").grid(
-                    row=0, column=4, sticky="w"
-                )
-            else:
-                ttk.Label(row, text="last deployed: (none)", foreground="gray").grid(
-                    row=0, column=4, sticky="w"
-                )
+        if not version_names:
+            ttk.Label(row, text="NEW", foreground="gray").grid(row=0, column=4, sticky="w")
+        elif is_new:
+            ttk.Label(row, text="NEW", foreground="green").grid(row=0, column=4, sticky="w")
+        elif last_deployed:
+            ttk.Label(row, text="UTD", foreground="#cc0000").grid(row=0, column=4, sticky="w")
+        else:
+            ttk.Label(row, text="").grid(row=0, column=4, sticky="w")
+
+        ttk.Label(row, foreground="gray",
+                  text=f"last deployed: {last_deployed}" if last_deployed
+                       else "last deployed: (none)").grid(row=0, column=5, sticky="w")
+        return row
+
+    def _on_program_check_clicked(self, key: Path):
+        """Ticking a program takes its helpers with it — the usual case is a
+        released version where the app and its helper match. It is a one-way
+        push, not a lock: untick a helper afterwards and it stays unticked.
+        Ticking also opens the list, so what went along is not hidden away."""
+        var = self.program_vars.get(key)
+        helper_keys = self.helper_keys_by_parent.get(key.name) or []
+        if var is None or not helper_keys:
+            return
+        for hk in helper_keys:
+            hv = self.program_vars.get(hk)
+            if hv is not None:
+                hv.set(var.get())
+        if var.get():
+            self._toggle_expanded(key.name, open_it=True)
+
+    def _toggle_expanded(self, program_name: str, open_it: bool | None = None):
+        was_open = program_name in self.expanded_programs
+        want_open = (not was_open) if open_it is None else bool(open_it)
+        if want_open == was_open:
+            return
+        if want_open:
+            self.expanded_programs.add(program_name)
+        else:
+            self.expanded_programs.discard(program_name)
+
+        for hr in self.helper_rows.get(program_name, []):
+            try:
+                hr.grid() if want_open else hr.grid_remove()
+            except Exception:
+                pass
+        btn = self.expander_buttons.get(program_name)
+        if btn is not None:
+            try:
+                btn.configure(text="▾" if want_open else "▸")
+            except Exception:
+                pass
 
     def _select_all_programs(self):
         for var in self.program_vars.values():
@@ -1092,69 +1549,81 @@ class DeployGUI(ttk.Frame):
         self._set_busy(True)
 
         def worker():
-            for dst_root in selected_roots:
-                if not dst_root.exists():
-                    self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
-                    continue
-
-                for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
-                    if not program_dir.is_dir():
-                        continue
-                    if program_dir.name.lower() in ("archive", "dist"):
+            try:
+                for dst_root in selected_roots:
+                    if not dst_root.exists():
+                        self.after(0, self._log, f"Skipping (not accessible): {dst_root}")
                         continue
 
-                    program_name = program_dir.name
+                    for program_dir in sorted(dst_root.iterdir(), key=lambda p: p.name.lower()):
+                        if not program_dir.is_dir():
+                            continue
+                        if program_dir.name.lower() in ("archive", "dist"):
+                            continue
 
-                    # ── Archive old exes from main folder — keep only newest ─
-                    _all_exes = sorted(
-                        [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)],
-                        key=_exe_version, reverse=True,
-                    )
-                    if len(_all_exes) > 1:
-                        _keep = _all_exes[0]
-                        _logs: list[str] = []
-                        move_existing_exes_to_archive(program_dir, _keep.name, _logs, program_name)
-                        for _msg in _logs:
-                            self.after(0, self._log, _msg)
+                        program_name = program_dir.name
+                        try:
+                            # ── Archive old exes from main folder — keep only newest ─
+                            _all_exes = sorted(
+                                [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)],
+                                key=_exe_version, reverse=True,
+                            )
+                            if len(_all_exes) > 1:
+                                _keep = _all_exes[0]
+                                _logs: list[str] = []
+                                move_existing_exes_to_archive(program_dir, _keep.name, _logs, program_name)
+                                for _msg in _logs:
+                                    self.after(0, self._log, _msg)
 
-                    # ── Fix archive ──────────────────────────────────────
-                    archive_dir = program_dir / "archive"
-                    if archive_dir.exists():
-                        _fix_archive_dir(archive_dir, lambda msg: self.after(0, self._log, msg))
+                            # ── Fix archive ──────────────────────────────────────
+                            archive_dir = program_dir / "archive"
+                            if archive_dir.exists():
+                                _logfn = lambda msg: self.after(0, self._log, msg)
+                                _fix_archive_dir(archive_dir, _logfn)
+                                # Reunite helper .py files stranded in unknown/ with their
+                                # version folders, then make every snapshot runnable by
+                                # stripping timestamp suffixes off in-folder source names.
+                                _reunite_unknown_helpers(archive_dir, _logfn)
+                                _normalize_version_folder_names(archive_dir, _logfn)
 
-                    # ── Fix icons ────────────────────────────────────────
-                    dist_prog_dir = _dist_root() / program_name
-                    src_ico = None
-                    for vf in list_versions(dist_prog_dir)[:1]:
-                        cand = vf / "icon.ico"
-                        if cand.exists():
-                            src_ico = cand
-                            break
-                    if src_ico is None:
-                        cand = dist_prog_dir / "icon.ico"
-                        if cand.exists():
-                            src_ico = cand
+                            # ── Fix icons ────────────────────────────────────────
+                            dist_prog_dir = _dist_root() / program_name
+                            src_ico = None
+                            for vf in list_versions(dist_prog_dir)[:1]:
+                                cand = vf / "icon.ico"
+                                if cand.exists():
+                                    src_ico = cand
+                                    break
+                            if src_ico is None:
+                                cand = dist_prog_dir / "icon.ico"
+                                if cand.exists():
+                                    src_ico = cand
 
-                    for png_name in ("icon.png", "Icon.png", "ICON.png"):
-                        png = program_dir / png_name
-                        if png.exists():
-                            try:
-                                png.unlink()
-                                self.after(0, self._log, f"[{program_name}] Removed: {png_name}")
-                            except Exception as e:
-                                self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
+                            for png_name in ("icon.png", "Icon.png", "ICON.png"):
+                                png = program_dir / png_name
+                                if png.exists():
+                                    try:
+                                        png.unlink()
+                                        self.after(0, self._log, f"[{program_name}] Removed: {png_name}")
+                                    except Exception as e:
+                                        self.after(0, self._log, f"[{program_name}] Could not remove {png_name}: {e}")
 
-                    if src_ico is not None and src_ico.exists():
-                        dst_ico = program_dir / "icon.ico"
-                        if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
-                            try:
-                                shutil.copy2(src_ico, dst_ico)
-                                self.after(0, self._log, f"[{program_name}] icon.ico updated")
-                            except Exception as e:
-                                self.after(0, self._log, f"[{program_name}] FAILED icon.ico: {e}")
+                            if src_ico is not None and src_ico.exists():
+                                dst_ico = program_dir / "icon.ico"
+                                if not dst_ico.exists() or dst_ico.stat().st_size != src_ico.stat().st_size:
+                                    try:
+                                        shutil.copy2(src_ico, dst_ico)
+                                        self.after(0, self._log, f"[{program_name}] icon.ico updated")
+                                    except Exception as e:
+                                        self.after(0, self._log, f"[{program_name}] FAILED icon.ico: {e}")
+                        except Exception as e:
+                            self.after(0, self._log, f"[{program_name}] ERROR (skipped): {e}")
 
-            self.after(0, self._log, "\nDone.")
-            self.after(0, self._set_busy, False)
+                self.after(0, lambda: self._log("\nDone.", force_scroll=True))
+            except Exception as e:
+                self.after(0, lambda m=str(e): self._log(f"\nFix aborted: {m}", force_scroll=True))
+            finally:
+                self.after(0, self._set_busy, False)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1269,12 +1738,21 @@ class DeployGUI(ttk.Frame):
             else:
                 file_log.append(f"  [{action:8}]  {src}")
 
+        # One counter per kind of file, so the end report can name what it counted.
+        # Extras (icons, images/, sounds/) used to be added to exe_copied, which made
+        # the report claim more exe files than there were programs.
         stats = {
             "exe_copied": 0, "exe_failed": 0,
             "py_copied": 0, "py_failed": 0,
             "readme_copied": 0, "readme_failed": 0,
-            "archived": 0, "archive_skipped": 0,
+            "extra_copied": 0, "extra_failed": 0,
+            "icon_copied": 0, "icon_failed": 0, "icon_skipped": 0,
+            "archived_exe": 0, "archived_py": 0, "archive_skipped": 0,
+            "dest_ok": 0, "dest_failed": 0, "dest_unreachable": 0,
         }
+        # Failure counters watched to decide whether a single destination came out
+        # clean — the report says "copied to 2/2 destinations", not just a file count.
+        _FAIL_KEYS = ("exe_failed", "py_failed", "readme_failed", "extra_failed", "icon_failed")
         program_name = program_dir.name
 
         if not version_name:
@@ -1289,11 +1767,22 @@ class DeployGUI(ttk.Frame):
 
         # ReadMe lookup order:
         # 1. version_folder  (builder copies it there for primary dev)
-        # 2. program_dir     (dist/program_name — may have it from previous deploy)
-        # 3. scratch/program_name  (already deployed there by a previous version)
-        # 4. None — skip with warning
+        # 2. source folder   (the project folder in the repo — the live ReadMe.
+        #    Builds made before the builder started copying the ReadMe have none
+        #    in version_folder, and without this step the deploy silently shipped
+        #    no ReadMe at all, so the Launcher showed no ReadMe button.)
+        # 3. program_dir     (dist/program_name — may have it from previous deploy)
+        # 4. scratch/program_name  (already deployed there by a previous version)
+        # 5. None — skip with warning
         src_readme = None
-        _readme_search_dirs = [version_folder, program_dir]
+        _readme_search_dirs = [version_folder, _programs_root() / program_name, program_dir]
+        # A helper exe has no source folder of its own: its documentation lives in
+        # the folder of the program it is built from, named after the helper
+        # (ReadMe_<helper name>.txt). Without this step a helper built before the
+        # builder started copying its ReadMe along would ship none at all.
+        _helper_parent = self.helper_parent_dir.get(program_name)
+        if _helper_parent is not None:
+            _readme_search_dirs.append(_helper_parent)
         for dst_root in destination_roots:
             _readme_search_dirs.append(dst_root / program_name)
         for _d in _readme_search_dirs:
@@ -1304,6 +1793,14 @@ class DeployGUI(ttk.Frame):
                 pass
         if src_readme is None:
             log(f"[{program_name}] WARNING: ReadMe not found — skipping ReadMe copy")
+
+        # The detailed companion doc, searched in the same places and in the same
+        # order. Absent is fine; the Launcher then shows no Details button.
+        src_readme_full = None
+        for _d in _readme_search_dirs:
+            src_readme_full = find_readme_full_or_none(_d, program_name)
+            if src_readme_full is not None:
+                break
 
         # Najdi všechny .py soubory ve version_folder
         src_py_files = list(version_folder.glob("*.py"))
@@ -1322,22 +1819,48 @@ class DeployGUI(ttk.Frame):
                     icon_src = cand
                     break
 
-        # Najdi všechny složky a ostatní soubory ve version_folder (kromě _internal)
+        # Najdi všechny složky a ostatní soubory ve version_folder (kromě _internal).
+        # Folders count: an app's runtime assets live in folders next to the exe
+        # (Announcer/images, Announcer/sounds) and are useless if only the exe is
+        # deployed.
         src_extras = []
         for item in version_folder.iterdir():
             if item.name == "_internal":
                 continue
-            if item == src_exe:
+            if item in (src_exe, src_readme, src_readme_full):
                 continue
-            if item.suffix.lower() in (".py", ".exe"):
-                continue
-            if item.is_dir():
+            if item.is_file() and item.suffix.lower() in (".py", ".exe"):
                 continue
             src_extras.append(item)
+
+        # Runtime assets, second source. Builds made before the builder started
+        # bundling asset folders ship an EMPTY images/ and sounds/, and deploying
+        # such a version used to leave the destination empty too. So whenever the
+        # version folder has nothing to offer for an asset folder, take it from the
+        # source tree (L3-QoL-JanJan/<program>/images) — that is where the files
+        # the program actually uses live.
+        # _programs_root(), not _src_root(): it is the one that resolves the
+        # configured Root folder when running as the built exe.
+        src_prog_dir = _programs_root() / program_name
+        for _asset in ASSET_DIR_NAMES:
+            if _dir_has_files(version_folder / _asset):
+                continue  # the build carries it — already in src_extras
+            _repo_asset = src_prog_dir / _asset
+            if not _dir_has_files(_repo_asset):
+                continue
+            src_extras = [i for i in src_extras if i.name.lower() != _asset]
+            src_extras.append(_repo_asset)
+            log(f"[{program_name}] {_asset}/ not in the build — taken from {_repo_asset}")
+
+        # Folder names the new version brings along — they must survive the
+        # stale-folder cleanup below, which would otherwise delete them and (since
+        # nothing re-created them) leave the deployed app without its assets.
+        incoming_dirs = {i.name for i in src_extras if i.is_dir()}
 
         log(f"[{program_name}] Version: {version_name}")
         log(f"[{program_name}] EXE: {src_exe.name}")
         log(f"[{program_name}] ReadMe: {src_readme.name if src_readme else '(none — skipped)'}")
+        log(f"[{program_name}] Details: {src_readme_full.name if src_readme_full else '(none)'}")
         log(f"[{program_name}] Extra files: {[x.name for x in src_extras]}")
         log(f"[{program_name}] PY files: {[x.name for x in src_py_files]}")
 
@@ -1357,7 +1880,8 @@ class DeployGUI(ttk.Frame):
             except OSError as e:
                 log(f"[{program_name}] SKIP — destination not accessible: {dst_root} ({e})")
                 flog("skipped", str(dst_root), "not accessible")
-                stats["exe_failed"] += 1
+                stats["dest_failed"] += 1
+                stats["dest_unreachable"] += 1
                 continue
             _fix_archive_dir(archive_dir, log)
 
@@ -1365,16 +1889,35 @@ class DeployGUI(ttk.Frame):
 
             dest_label = dst_root.name
             flog("dest", f"→ {target_dir}")
+            _fails_before = sum(stats[k] for k in _FAIL_KEYS)
 
             # ── Smaž zbytkové složky z předchozích chybných deployů ─
+            # Asset folders are never deleted here, not even when neither the build
+            # nor the source tree has them: the deployed app needs them, and a
+            # deletion is the one thing nothing later puts back.
             for item in target_dir.iterdir():
-                if item.is_dir() and item.name not in ("_internal", "archive"):
+                if (item.is_dir()
+                        and item.name not in ("_internal", "archive")
+                        and item.name.lower() not in ASSET_DIR_NAMES
+                        and item.name not in incoming_dirs):
                     try:
                         shutil.rmtree(item)
                         log(f"[{program_name}] Removed stale folder: {item.name}")
                         flog("removed", item.name, str(target_dir))
                     except Exception as e:
                         log(f"[{program_name}] Could not remove folder {item.name}: {e}")
+
+            # Version currently deployed (being replaced) — used to group unversioned
+            # helper .py files (if_t.py, …) into the SAME archive/vX.Y.Z/ folder as the
+            # main script, instead of dumping them into archive/unknown/. Computed before
+            # the .exe is archived away, so the old .exe can serve as a fallback source.
+            _live_ver = None
+            for _cand in list(target_dir.glob(f"{program_name}*.py")) + \
+                         list(target_dir.glob(f"{program_name}*.exe")):
+                _vm = VERSION_RE.search(_cand.stem)
+                if _vm:
+                    _live_ver = _vm.group(0)
+                    break
 
             # ── Archivuj staré .exe ──────────────────────────────────
             for exe in target_dir.glob(f"{program_name}*.exe"):
@@ -1394,7 +1937,7 @@ class DeployGUI(ttk.Frame):
                         pass
                     log(f"[{program_name}] Archived EXE: {exe.name} -> archive/{old_ver_label}/")
                     flog("archived", exe.name, str(dst_arch.relative_to(dst_root)))
-                    stats["archived"] += 1
+                    stats["archived_exe"] += 1
                 else:
                     log(f"[{program_name}] SKIP archive (locked): {exe.name}")
                     flog("skipped", exe.name, "locked")
@@ -1403,7 +1946,9 @@ class DeployGUI(ttk.Frame):
             # ── Archivuj staré .py ───────────────────────────────────
             for pyf in target_dir.glob("*.py"):
                 _vm = VERSION_RE.search(pyf.stem)
-                old_ver_label = _vm.group(0) if _vm else "unknown"
+                # Versioned main .py -> its own version; unversioned helpers -> the
+                # live version's folder (keeps the snapshot together and runnable).
+                old_ver_label = _vm.group(0) if _vm else (_live_ver or "unknown")
                 ver_archive_dir = archive_dir / old_ver_label
                 ver_archive_dir.mkdir(parents=True, exist_ok=True)
                 dst_arch = unique_path(ver_archive_dir / pyf.name)
@@ -1417,7 +1962,7 @@ class DeployGUI(ttk.Frame):
                         pass
                     log(f"[{program_name}] Archived PY: {pyf.name} -> archive/{old_ver_label}/")
                     flog("archived", pyf.name, str(dst_arch.relative_to(dst_root)))
-                    stats["archived"] += 1
+                    stats["archived_py"] += 1
                 else:
                     log(f"[{program_name}] SKIP archive PY (locked): {pyf.name}")
                     flog("skipped", pyf.name, "locked")
@@ -1456,32 +2001,42 @@ class DeployGUI(ttk.Frame):
                 dst_item = target_dir / item.name
                 try:
                     if item.is_dir():
-                        if dst_item.exists():
-                            shutil.rmtree(dst_item)
-                        shutil.copytree(item, dst_item)
+                        copied, failed_n, errs = _merge_dir(item, dst_item)
+                        log(f"[{program_name}] Copied extra: {item.name}/ "
+                            f"({copied} files{f', {failed_n} FAILED' if failed_n else ''})")
+                        for _e in errs[:5]:
+                            log(f"[{program_name}]   FAILED in {item.name}/: {_e}")
+                        if failed_n:
+                            flog("failed", f"{item.name}/", f"{failed_n} of {copied + failed_n} files")
+                            stats["extra_failed"] += 1
+                            continue
                     else:
                         shutil.copy2(item, dst_item)
-                    log(f"[{program_name}] Copied extra: {item.name}")
+                        log(f"[{program_name}] Copied extra: {item.name}")
                     flog("copied", item.name, str(dst_item.relative_to(dst_root)))
-                    stats["exe_copied"] += 1
+                    stats["extra_copied"] += 1
                 except Exception as e:
                     log(f"[{program_name}] FAILED extra {item.name}: {e}")
                     flog("failed", item.name, str(e))
-                    stats["exe_failed"] += 1
+                    stats["extra_failed"] += 1
 
-            # ── ReadMe ───────────────────────────────────────────────
-            if src_readme is not None:
+            # ── ReadMe + the detailed companion ──────────────────────
+            # Both, because the Launcher has a button for each. Publishing only
+            # the short one leaves Details with nothing to open.
+            for _doc, _label in ((src_readme, "ReadMe"), (src_readme_full, "Details")):
+                if _doc is None:
+                    continue
                 try:
-                    dst_readme = target_dir / src_readme.name
+                    dst_readme = target_dir / _doc.name
                     if dst_readme.exists():
-                        log(f"[{program_name}] WARNING: {src_readme.name} exists, overwriting")
-                    shutil.copy2(src_readme, dst_readme)
-                    log(f"[{program_name}] ReadMe copied -> {dst_readme.name}")
-                    flog("copied", src_readme.name, str(dst_readme.relative_to(dst_root)))
+                        log(f"[{program_name}] WARNING: {_doc.name} exists, overwriting")
+                    shutil.copy2(_doc, dst_readme)
+                    log(f"[{program_name}] {_label} copied -> {dst_readme.name}")
+                    flog("copied", _doc.name, str(dst_readme.relative_to(dst_root)))
                     stats["readme_copied"] += 1
                 except Exception as e:
-                    log(f"[{program_name}] FAILED ReadMe: {e}")
-                    flog("failed", src_readme.name, str(e))
+                    log(f"[{program_name}] FAILED {_label}: {e}")
+                    flog("failed", _doc.name, str(e))
                     stats["readme_failed"] += 1
 
             # ── Kopíruj ikonu ────────────────────────────────────────
@@ -1507,12 +2062,20 @@ class DeployGUI(ttk.Frame):
                         shutil.copy2(icon_src, dst_icon)
                         log(f"[{program_name}] Icon copied -> {dst_icon.name}")
                         flog("copied", icon_src.name, str(dst_icon.relative_to(dst_root)))
+                        stats["icon_copied"] += 1
                     except Exception as e:
                         log(f"[{program_name}] FAILED icon: {e}")
                         flog("failed", icon_src.name, str(e))
+                        stats["icon_failed"] += 1
                 else:
                     log(f"[{program_name}] Icon skipped (kept existing) -> {dst_root}")
                     flog("skipped", icon_src.name, f"kept existing in {dest_label}")
+                    stats["icon_skipped"] += 1
+
+            if sum(stats[k] for k in _FAIL_KEYS) > _fails_before:
+                stats["dest_failed"] += 1
+            else:
+                stats["dest_ok"] += 1
 
         log(f"[{program_name}] DONE\n")
         return logs, stats, file_log
@@ -1538,10 +2101,15 @@ class DeployGUI(ttk.Frame):
                 for src_dir in selected_programs:
                     program_dir = dist_root / src_dir.name
                     try:
-                        # Search: version_folder → program_dir → scratch/program_name
+                        # Search: version_folder → source folder → program_dir → scratch/program_name
                         src_readme = None
                         version_folders = list_versions(program_dir)
-                        search_dirs = (version_folders[:1] if version_folders else []) + [program_dir]
+                        search_dirs = (version_folders[:1] if version_folders else []) + [src_dir, program_dir]
+                        # A helper exe keeps its ReadMe in the folder of the
+                        # program it is built from — it has none of its own.
+                        _hp = self.helper_parent_dir.get(src_dir.name)
+                        if _hp is not None:
+                            search_dirs.append(_hp)
                         for dst_root in selected_roots:
                             search_dirs.append(dst_root / program_dir.name)
                         for _d in search_dirs:
@@ -1550,9 +2118,19 @@ class DeployGUI(ttk.Frame):
                                 break
                             except FileNotFoundError:
                                 pass
-                        if src_readme is None:
-                            self.after(0, self._log, f"[{program_dir.name}] WARNING: ReadMe not found — skipped")
+                        # The detailed companion, same places, same order.
+                        src_readme_full = None
+                        for _d in search_dirs:
+                            src_readme_full = find_readme_full_or_none(_d, program_dir.name)
+                            if src_readme_full is not None:
+                                break
+                        if src_readme is None and src_readme_full is None:
+                            self.after(0, self._log, f"[{program_dir.name}] WARNING: no ReadMe found — skipped")
                             continue
+                        if src_readme is None:
+                            self.after(0, self._log, f"[{program_dir.name}] WARNING: short ReadMe not found")
+                        if src_readme_full is None:
+                            self.after(0, self._log, f"[{program_dir.name}] note: no Details doc")
                         for dst_root in selected_roots:
                             try:
                                 if not dst_root.exists():
@@ -1563,12 +2141,17 @@ class DeployGUI(ttk.Frame):
                                 continue
                             target_dir = dst_root / program_dir.name
                             target_dir.mkdir(parents=True, exist_ok=True)
-                            dst_readme = target_dir / src_readme.name
-                            shutil.copy2(src_readme, dst_readme)
-                            self.after(0, self._log, f"[{program_dir.name}] ReadMe copied -> {dst_readme}")
+                            for _doc, _label in ((src_readme, "ReadMe"),
+                                                 (src_readme_full, "Details")):
+                                if _doc is None:
+                                    continue
+                                dst_readme = target_dir / _doc.name
+                                shutil.copy2(_doc, dst_readme)
+                                self.after(0, self._log,
+                                           f"[{program_dir.name}] {_label} copied -> {dst_readme}")
                     except Exception as e:
                         self.after(0, self._log, f"[{program_dir.name}] ERROR: {e}")
-                self.after(0, self._log, "\nDone.")
+                self.after(0, lambda: self._log("\nDone.", force_scroll=True))
             finally:
                 # Always re-enable the buttons, even if a copy hung-then-failed.
                 self.after(0, self._set_busy, False)
@@ -1614,11 +2197,12 @@ class DeployGUI(ttk.Frame):
                         self.after(0, self._log, line)
                 proc.wait()
                 if proc.returncode == 0:
-                    self.after(0, self._log, "\n✓ Build DONE.")
+                    self.after(0, lambda: self._log("\n✓ Build DONE.", force_scroll=True))
                 else:
-                    self.after(0, self._log, f"\n✗ Build FAILED (returncode={proc.returncode})")
+                    self.after(0, lambda rc=proc.returncode: self._log(
+                        f"\n✗ Build FAILED (returncode={rc})", force_scroll=True))
             except Exception as e:
-                self.after(0, self._log, f"ERROR: {e}")
+                self.after(0, lambda m=str(e): self._log(f"ERROR: {m}", force_scroll=True))
             finally:
                 self.after(0, self._set_busy, False)
 
@@ -1795,26 +2379,120 @@ class DeployGUI(ttk.Frame):
 
             summary = f"\n{'='*40}\nDeploy libraries DONE  ✓ {ok} OK  |  ✗ {fail} failed\n{'='*40}"
             self.after(0, self._progress_hide)
-            self.after(0, self._log, summary)
+            self.after(0, lambda: self._log(summary, force_scroll=True))
             self.after(0, self._set_busy, False)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_copy(self, build_summary: str = None):
+    def _copy_summary(self, total_stats, per_program: list, n_jobs: int, roots: list,
+                      elapsed: float, n_errors: int, detail_lines: list) -> str:
+        """The end-of-copy report: what went where, counted per kind of file.
+        Counts are totals over ALL destinations — the old report divided by the
+        number of destinations and labelled the result "per dest", which came out
+        wrong whenever one destination failed."""
+        n_dest = len(roots)
+        dest_list = "\n".join(f"    {r}" for r in roots)
+        unreachable = total_stats["dest_unreachable"]
+        unreachable_note = (f"    Destinations unreachable: {unreachable}"
+                            f"  (drive not mounted / network down)\n" if unreachable else "")
+        return (
+            f"\n{'='*40}\n"
+            f"COPY DONE  {'⚠ ' + str(n_errors) + ' error(s) — see log above' if n_errors else '✓ No errors'}\n"
+            f"  Time elapsed:      {_fmt_elapsed(elapsed)}\n"
+            f"  Programs copied:   {sum(1 for p in per_program if p['error'] is None)} of {n_jobs}\n"
+            f"  Destinations:      {n_dest}\n{dest_list}\n"
+            f"\n  Totals across all destinations:\n"
+            f"    EXE copied:        {total_stats['exe_copied']}  |  failed: {total_stats['exe_failed']}\n"
+            f"    PY copied:         {total_stats['py_copied']}  |  failed: {total_stats['py_failed']}\n"
+            f"    ReadMe copied:     {total_stats['readme_copied']}  |  failed: {total_stats['readme_failed']}\n"
+            f"    Extras copied:     {total_stats['extra_copied']}  |  failed: {total_stats['extra_failed']}\n"
+            f"       (icon.ico, images/, sounds/ and anything else next to the exe)\n"
+            f"    Shared icon:       {total_stats['icon_copied']} copied  |  "
+            f"{total_stats['icon_skipped']} kept existing  |  failed: {total_stats['icon_failed']}\n"
+            f"    Old files archived:  {total_stats['archived_exe']} exe + {total_stats['archived_py']} py"
+            f"  |  skipped (locked): {total_stats['archive_skipped']}\n"
+            + unreachable_note +
+            f"\nDetail:\n" + "\n".join(detail_lines) + f"\n{'='*40}"
+        )
+
+    def _overall_summary(self, per_program: list, roots: list, copy_elapsed: float,
+                         n_errors: int, build_info: dict = None) -> str:
+        """The wrap-up for the whole job the user started — build and copy together.
+        The copy report alone never said what was built, and the build report alone
+        never said where it ended up, so neither answered "what did I just do?"."""
+        b_items = {i["name"].lower(): i for i in (build_info or {}).get("items", [])}
+        b_failed = (build_info or {}).get("failed", [])
+        b_elapsed = (build_info or {}).get("elapsed", 0.0) or 0.0
+        did_build = build_info is not None
+
+        total_errors = n_errors + len(b_failed)
+        n_dest = len(roots)
+
+        lines = ["", "=" * 40]
+        lines.append(f"ALL DONE  {'⚠ ' + str(total_errors) + ' error(s)' if total_errors else '✓ Everything went through'}")
+        lines.append(f"  Task:            {'build + copy' if did_build else 'copy only'}")
+        if did_build:
+            lines.append(f"  Total time:      {_fmt_elapsed(b_elapsed + copy_elapsed)}"
+                         f"   (build {_fmt_elapsed(b_elapsed)}  +  copy {_fmt_elapsed(copy_elapsed)})")
+        else:
+            lines.append(f"  Total time:      {_fmt_elapsed(copy_elapsed)}")
+
+        lines.append("")
+        lines.append("  Programs:")
+        for p in per_program:
+            mark = "✗" if p["error"] else ("✓" if p["dest_ok"] == n_dest else "⚠")
+            lines.append(f"    {mark}  {p['name']}  {p['version']}")
+            b = b_items.get(p["name"].lower())
+            if b:
+                where = f"  →  {b['out_dir']}" if b.get("out_dir") else ""
+                lines.append(f"         built in {b['seconds']:.1f}s{where}")
+            if p["error"]:
+                lines.append(f"         NOT copied: {p['error']}")
+            else:
+                lines.append(f"         copied to {p['dest_ok']} of {n_dest} destinations")
+
+        # Built but not copied — a program can drop out of the copy (not on the
+        # Copy manager list), and then only this report would notice.
+        copied_names = {p["name"].lower() for p in per_program}
+        for key, b in b_items.items():
+            if key not in copied_names:
+                lines.append(f"    ⚠  {b['name']}  {b['version']}")
+                lines.append(f"         built in {b['seconds']:.1f}s"
+                             f"{'  →  ' + b['out_dir'] if b.get('out_dir') else ''}")
+                lines.append("         NOT copied — not selected in Copy Manager")
+
+        for f in b_failed[:10]:
+            lines.append(f"    ✗  build failed: {f}")
+
+        lines.append("")
+        lines.append("  Destinations:")
+        for r in roots:
+            lines.append(f"    {r}")
+        lines.append("=" * 40)
+        return "\n".join(lines)
+
+    def _on_copy(self, build_summary: str = None, build_info: dict = None):
         selected_programs = self._get_selected_programs()
         selected_roots = self._get_selected_destination_roots()
 
-        if not selected_programs:
-            messagebox.showwarning("Nothing selected", "Select at least one program.")
-            return
-        if not selected_roots:
-            messagebox.showwarning("No destination", "Select at least one destination root.")
+        if not selected_programs or not selected_roots:
+            # Bailing out must not swallow the build report handed to us.
+            if build_summary:
+                self._log(build_summary, force_scroll=True)
+            if not selected_programs:
+                messagebox.showwarning("Nothing selected", "Select at least one program.")
+            else:
+                messagebox.showwarning("No destination", "Select at least one destination root.")
             return
 
         dist_root = _dist_root()
         jobs = [(dist_root / p.name, self.program_version_vars[p].get().strip()) for p in selected_programs]
 
-        self._clear_log()
+        # Keep the log when the copy is the second half of a build+copy run — wiping
+        # it would throw away the build output the user just watched, and the run is
+        # one single job as far as they are concerned.
+        if build_summary is None and build_info is None:
+            self._clear_log()
         self._log("Checking icon conflicts...\n")
 
         icon_decisions = self._collect_icon_conflicts(jobs, selected_roots)
@@ -1829,6 +2507,7 @@ class DeployGUI(ttk.Frame):
             from collections import defaultdict
             total_stats = defaultdict(int)
             all_file_logs: list[tuple[str, str, list[str]]] = []  # (program, version, file_log)
+            per_program: list[dict] = []                          # for the overall report
             try:
                 for program_dir, version_name in jobs:
                     try:
@@ -1840,6 +2519,11 @@ class DeployGUI(ttk.Frame):
                         for k, v in prog_stats.items():
                             total_stats[k] += v
                         all_file_logs.append((program_dir.name, version_name, file_log))
+                        per_program.append({
+                            "name": program_dir.name, "version": version_name,
+                            "dest_ok": prog_stats.get("dest_ok", 0),
+                            "error": None,
+                        })
 
                         self.state_deployed[program_dir.name.lower()] = version_name
                         write_version_to_txt(program_dir.name, version_name)
@@ -1848,19 +2532,24 @@ class DeployGUI(ttk.Frame):
                     except Exception as e:
                         err_msg = str(e)
                         self.after(0, self._log, f"[{program_dir.name}] ERROR: {err_msg}\n")
-                        total_stats["exe_failed"] += 1
+                        total_stats["program_failed"] += 1
                         all_file_logs.append((program_dir.name, version_name, [f"  [failed  ]  {err_msg}"]))
+                        per_program.append({
+                            "name": program_dir.name, "version": version_name,
+                            "dest_ok": 0, "error": err_msg,
+                        })
 
                 if changed:
                     save_state(self.state_deployed)
 
-                n_errors = total_stats['exe_failed']
+                # Every kind of failure counts, not just the exe one — an unreachable
+                # destination or a failed ReadMe used to be reported as "No errors".
+                # dest_failed is deliberately left out: it only marks WHICH destination
+                # a file failure happened in and would count the same failure twice.
+                n_errors = sum(total_stats[k] for k in (
+                    "exe_failed", "py_failed", "readme_failed", "extra_failed",
+                    "icon_failed", "dest_unreachable", "program_failed"))
                 elapsed = time.perf_counter() - start_time
-                elapsed_str = f"{elapsed:.1f}s"
-                if elapsed > 60:
-                    minutes = int(elapsed // 60)
-                    seconds = int(elapsed % 60)
-                    elapsed_str = f"{minutes}m {seconds}s"
                 n_dest = len(selected_roots)
 
                 detail_lines = []
@@ -1868,20 +2557,19 @@ class DeployGUI(ttk.Frame):
                     detail_lines.append(f"\n  {prog_name}  {ver_name}")
                     detail_lines.extend(flog)
 
-                summary = (
-                    f"\n{'='*40}\n"
-                    f"ALL DONE  {'⚠ ' + str(n_errors) + ' error(s) — see log above' if n_errors else '✓ No errors'}\n"
-                    f"  Time elapsed:     {elapsed_str}\n"
-                    f"  Destinations:      {n_dest}\n"
-                    f"  EXE copied:        {total_stats['exe_copied'] // max(n_dest,1)} per dest  |  failed: {total_stats['exe_failed']}\n"
-                    f"  PY copied:         {total_stats['py_copied'] // max(n_dest,1)} per dest  |  failed: {total_stats['py_failed']}\n"
-                    f"  ReadMe copied:     {total_stats['readme_copied'] // max(n_dest,1)} per dest  |  failed: {total_stats['readme_failed']}\n"
-                    f"  Old EXE archived:  {total_stats['archived']}  |  skipped (locked): {total_stats['archive_skipped']}\n"
-                    f"\nDetail:\n" + "\n".join(detail_lines) + f"\n{'='*40}"
-                )
+                # ── Report 1: what the copy did ─────────────────────────────
+                copy_summary = self._copy_summary(
+                    total_stats, per_program, len(jobs), selected_roots,
+                    elapsed, n_errors, detail_lines)
+
                 if build_summary:
                     self.after(0, self._log, build_summary)
-                self.after(0, self._log, summary)
+                self.after(0, lambda: self._log(copy_summary, force_scroll=True))
+
+                # ── Report 2: the whole task, build and copy together ───────
+                overall = self._overall_summary(
+                    per_program, selected_roots, elapsed, n_errors, build_info)
+                self.after(0, lambda: self._log(overall, force_scroll=True))
             finally:
                 self.after(0, self._set_busy, False)
                 self.after(0, self._refresh)

@@ -1,0 +1,8 @@
+{
+  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe (folders included, recursively). images/ and sounds/ MUST ship with every build: the alarm image is read from images/ next to the exe at runtime, so a build without it can only flash a plain colour, and sounds/ holds the selectable WAV alerts. Dev Tools/cm_t.py then deploys those folders to the share.",
+  "extra_files": [
+    "images",
+    "sounds"
+  ],
+  "hidden_imports": []
+}

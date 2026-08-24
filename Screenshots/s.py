@@ -532,6 +532,31 @@ IDENTIFY_MS = 2000
 MODE_TOKENS = {"NF", "FF", "DF"}
 TS_IN_NAME_RE = re.compile(r"_(\d{12,})\.(png|jpg|jpeg|tif|tiff|bmp)$", re.IGNORECASE)
 
+# Matches the "YYYY-MM-DD__HH-MM-SS" timestamp produced by TS_FMT / RUN_FOLDER_FMT,
+# wherever it lands in a saved filename (prefix, middle, or suffix).
+_TIMESTAMP_IN_FILENAME_RE = re.compile(r"\d{4}-\d{2}-\d{2}__\d{2}-\d{2}-\d{2}")
+
+
+def display_timestamp_only(name: str) -> str:
+    """Reduce a filename to just its timestamp for UI display only — the camera
+    name is already obvious from the tab/selection, so the preview grid caption
+    shows the time and nothing else. The saved file keeps its full name.
+    Falls back to the plain filename when there is no timestamp to show."""
+    m = _TIMESTAMP_IN_FILENAME_RE.search(name)
+    if m:
+        date, _, clock = m.group(0).partition("__")
+        return f"{date} {clock.replace('-', ':')}"
+    m = TS_IN_NAME_RE.search(name)
+    if m:  # raw CPVA name: epoch nanoseconds, same reading as the copy step
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.fromtimestamp(int(m.group(1)) / 1_000_000_000,
+                                          tz=ZoneInfo("Europe/Prague")
+                                          ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return m.group(1)
+    return Path(name).stem
+
 
 @contextmanager
 def timed(log, label: str):
@@ -731,6 +756,10 @@ user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
 user32.GetClientRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
 user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
@@ -793,27 +822,72 @@ def _get_window_text(hwnd: int) -> str:
 def _norm_win_title(s: str) -> str:
     return _NORM_ALNUM_RE.sub("", (s or "").lower())
 
-def find_window_by_title_substring(substr: str) -> int | None:
+def _get_window_class(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value or ""
+
+# Window classes that belong to everyday desktop apps, never to the CSS camera
+# viewer — a title match against one of these is almost always a false positive
+# (e.g. a browser tab or Explorer window whose title happens to mention a
+# camera name because a previously saved screenshot file was opened/browsed).
+_EXCLUDED_WINDOW_CLASSES = {
+    "chrome_widgetwin_1",       # Edge / Chrome / most Electron apps
+    "cabinetwclass",            # File Explorer
+    "notepad",
+    "applicationframewindow",   # UWP apps (Settings, Photos, ...)
+    "windows.ui.core.corewindow",
+    "framework::cframe",        # Office (Word/Excel/OneNote)
+    "rctrl_renwnd32",           # Outlook
+    "tktoplevel",               # our own tkinter tools
+    "tk",
+}
+
+def find_window_by_title_substring(substr: str, log=None) -> int | None:
     if not substr:
         return None
     needle = _norm_win_title(substr)
     if not needle:
         return None
-    found: list[int] = []
+
+    exact_matches: list[tuple[int, str]] = []
+    loose_matches: list[tuple[int, str]] = []
 
     def _cb(hwnd, lparam):
         if not user32.IsWindowVisible(hwnd):
             return 1
+        if user32.IsIconic(hwnd):
+            return 1  # minimized — not usable as a capture target, and often a stale leftover
         title = _get_window_text(hwnd)
         if not title:
             return 1
-        if needle in _norm_win_title(title):
-            found.append(int(hwnd) & 0xFFFFFFFFFFFFFFFF)
-            return 0  # stop enum
+        norm_title = _norm_win_title(title)
+        if norm_title == needle:
+            exact_matches.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title))
+            return 1  # keep scanning in case of duplicates; exact match always wins anyway
+        if needle in norm_title:
+            cls = _get_window_class(hwnd).lower()
+            if cls in _EXCLUDED_WINDOW_CLASSES:
+                if log:
+                    log(f"[WIN] ignored '{title}' (class={cls}) — not a camera window")
+                return 1
+            loose_matches.append((int(hwnd) & 0xFFFFFFFFFFFFFFFF, title))
         return 1
 
     user32.EnumWindows(EnumWindowsProc(_cb), 0)
-    return found[0] if found else None
+
+    if exact_matches:
+        return exact_matches[0][0]
+    if loose_matches:
+        # A real CSS window's title is (almost) exactly the needle. A title that
+        # merely *contains* the needle (e.g. a saved screenshot filename opened in
+        # another app) is longer — so the shortest candidate is the safest bet.
+        loose_matches.sort(key=lambda hw: len(hw[1]))
+        if log and len(loose_matches) > 1:
+            log(f"[WIN] multiple candidates for '{substr}': "
+                f"{[t for _, t in loose_matches]} -> picked '{loose_matches[0][1]}'")
+        return loose_matches[0][0]
+    return None
 
 def _get_window_bounds(hwnd: int) -> tuple[int, int, int, int]:
     h = ctypes.c_void_p(int(hwnd) & 0xFFFFFFFFFFFFFFFF)
@@ -968,7 +1042,7 @@ def find_camera_folders_bulk(day_root: Path, cams: list[str], log) -> dict[str, 
     log(f"[CPVA] hour_dir = {hour_dir}")
 
     if not hour_dir.exists():
-        log("[CPVA] hour_dir DOES NOT EXIST — hledám předchozí hodinu...")
+        log("[CPVA] hour_dir DOES NOT EXIST - searching previous hour...")
         hour_dir = _find_latest_existing_hour_dir(log)
         if hour_dir is None:
             log("[CPVA] No available hour found.")
@@ -991,7 +1065,7 @@ def find_camera_folders_bulk(day_root: Path, cams: list[str], log) -> dict[str, 
                 if folder_label == want_label[cam]:
                     found[cam] = p
                     needs.remove(cam)
-                    log(f"  ✔ {cam} -> {p.name}")
+                    log(f"  [OK] {cam} -> {p.name}")
                     if not needs:
                         log(f"[CPVA] bulk scan checked={checked}, found={len(found)} (EARLY STOP)")
                         return found
@@ -1186,8 +1260,10 @@ class ToolTip:
 class PreviewWindow(tk.Toplevel):
     """Popup okno s gridem zkopírovaných obrázků."""
 
-    _COLS = 4
-    _THUMB = 180  # px thumbnail
+    _THUMB = 180        # px thumbnail at zoom = 1.0
+    _MIN_THUMB = 60     # never render a thumbnail smaller than this
+    _CELL_PAD = 24      # px consumed per cell by padding + border
+    _FILL_SLACK = 1.3   # how far a thumbnail may grow past the slider size to fill a row
 
     _PALETTES = ["Grayscale", "Gradient", "Hot", "Viridis", "Plasma", "Inferno", "Jet", "Turbo"]
 
@@ -1225,11 +1301,10 @@ class PreviewWindow(tk.Toplevel):
                         arr8 = np.zeros(arr_raw.shape, dtype=np.uint8)
                 else:
                     arr8 = arr_raw
-                if state.get("auto", False):
-                    arr8 = self._autostretch(arr8)
-                offset = state.get("brightness", 0)
-                if offset != 0:
-                    arr8 = np.clip(arr8.astype(np.int16) + offset, 0, 255).astype(np.uint8)
+                arr8, _ = self._apply_bc(arr8, state.get("auto", False),
+                                         state.get("contrast", 0),
+                                         state.get("auto_bright", False),
+                                         state.get("brightness", 0))
                 pal = state.get("palette", "Grayscale")
                 if pal != "Grayscale":
                     if pal not in self._LUTS:
@@ -1344,12 +1419,20 @@ class PreviewWindow(tk.Toplevel):
         self._thumbs: list[ImageTk.PhotoImage] = []
         self._brightness = tk.IntVar(value=0)
         self._auto = tk.BooleanVar(value=False)
+        self._contrast = tk.IntVar(value=0)
+        self._auto_bright = tk.BooleanVar(value=False)
         self._zoom = tk.DoubleVar(value=1.0)
+        # Slider-equivalent values the auto modes computed for the last thumbnail
+        # drawn with the global toolbar settings; _sync_auto_sliders parks the
+        # sliders there. _syncing_sliders blocks the redraw those writes trigger.
+        self._last_auto_applied: dict | None = None
+        self._syncing_sliders = False
         self._popup: tk.Toplevel | None = None
         self._on_keep = on_keep
         self._on_delete = on_delete
         self._on_try_again = on_try_again
-        # per-image persistent state: path -> {"overlay": PIL RGBA Image | None, "palette": str, "brightness": int, "auto": bool}
+        # per-image persistent state: path -> {"overlay": PIL RGBA Image | None, "palette": str,
+        #   "brightness": int, "auto": bool, "contrast": int, "auto_bright": bool}
         self._img_states: dict[Path, dict] = {}
 
         # ── action toolbar (Keep / Delete / Try Again) ────────────
@@ -1368,21 +1451,30 @@ class PreviewWindow(tk.Toplevel):
         bar = ttk.Frame(self, padding=(6, 4))
         bar.pack(fill="x")
 
-        ttk.Label(bar, text="Auto brightness").pack(side="left")
-        ttk.Checkbutton(bar, variable=self._auto,
-                        command=self._redraw).pack(side="left", padx=(2, 12))
+        ttk.Label(bar, text="Contrast:").pack(side="left")
+        self._contrast_scale = ttk.Scale(bar, from_=-127, to=127, orient="horizontal",
+                  variable=self._contrast, length=140,
+                  command=lambda _: self._redraw())
+        self._contrast_scale.pack(side="left", padx=(4, 2))
+        ttk.Button(bar, text="↺", width=3,
+                   command=lambda: (self._contrast.set(0), self._redraw())).pack(side="left", padx=(0, 2))
+        ttk.Checkbutton(bar, text="Auto", variable=self._auto,
+                        command=self._on_auto_contrast_toggle).pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Brightness:").pack(side="left")
-        ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
-                  variable=self._brightness, length=180,
-                  command=lambda _: self._redraw()).pack(side="left", padx=(4, 12))
+        self._bright_scale = ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
+                  variable=self._brightness, length=140,
+                  command=lambda _: self._redraw())
+        self._bright_scale.pack(side="left", padx=(4, 2))
         ttk.Button(bar, text="↺", width=3,
-                   command=lambda: (self._brightness.set(0), self._redraw())).pack(side="left", padx=(0, 12))
+                   command=lambda: (self._brightness.set(0), self._redraw())).pack(side="left", padx=(0, 2))
+        ttk.Checkbutton(bar, text="Auto", variable=self._auto_bright,
+                        command=self._on_auto_bright_toggle).pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Zoom:").pack(side="left")
         ttk.Scale(bar, from_=0.3, to=3.0, orient="horizontal",
                   variable=self._zoom, length=120,
-                  command=lambda _: self._redraw()).pack(side="left", padx=(4, 12))
+                  command=lambda _: self._relayout_if_needed()).pack(side="left", padx=(4, 12))
 
         ttk.Label(bar, text="Palette:").pack(side="left")
         self._palette = tk.StringVar(value="Grayscale")
@@ -1421,32 +1513,146 @@ class PreviewWindow(tk.Toplevel):
         self.bind_all("<MouseWheel>", _on_mousewheel)
 
         self._resize_after_id = None
+        self._thumb_size = self._THUMB
+        self._grid_layout: tuple[int, int] | None = None
+        self._configured_cols = 0
         self.bind("<Configure>", self._on_resize)
         self._redraw()
 
     # ── image processing ──────────────────────────────────────────
+    # Terminology used consistently everywhere below — never mix these two up:
+    #   CONTRAST   = multiplicative gain (spreads values apart / squeezes them
+    #                together). "Auto" = percentile auto-levels stretch.
+    #   BRIGHTNESS = additive offset (shifts every value up or down, gain
+    #                untouched). "Auto" = shift so the top percentile hits 255.
     @staticmethod
-    def _autostretch(arr):
+    def _contrast_from_gain(gain: float) -> int:
+        """Inverse of the _manual_contrast gain curve: gain → slider value in
+        [-127, 127]. Used to park the Contrast slider where auto contrast landed."""
+        if gain <= 0:
+            return 0
+        c = 32893.0 * (gain - 1.0) / (259.0 + 127.0 * gain)
+        return int(round(max(-127.0, min(127.0, c))))
+
+    @classmethod
+    def _autostretch(cls, arr):
+        """Percentile-based contrast stretch (auto-levels) — a gain, not a shift.
+        Returns (arr, equivalent_contrast_slider_value)."""
         import numpy as np
         lo, hi = np.percentile(arr, [0.1, 99.9])
         if hi <= lo + 2:
+            return arr, 0
+        stretched = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255,
+                            0, 255).astype("uint8")
+        return stretched, cls._contrast_from_gain(255.0 / float(hi - lo))
+
+    @staticmethod
+    def _manual_contrast(arr, contrast: int):
+        """Manual linear contrast around mid-gray. `contrast` in [-127, 127];
+        0 = unchanged. Same gain curve as the Image Tools Contrast slider."""
+        import numpy as np
+        if contrast == 0:
             return arr
-        return np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255).astype("uint8")
+        c = float(contrast)
+        factor = (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+        return np.clip(factor * (arr.astype(np.float32) - 128.0) + 128.0, 0, 255).astype("uint8")
+
+    @staticmethod
+    def _auto_brightness(arr, target: int = 255, p_high: float = 99.5):
+        """Auto-level brightness: shift so the p_high percentile reaches `target`.
+        Pure additive offset — preserves contrast. Matches Image Tools 'Auto brightness'.
+        Returns (arr, offset) so the Brightness slider can show the applied shift."""
+        import numpy as np
+        hi = float(np.percentile(arr, p_high))
+        offset = int(round(target - hi))
+        offset = max(-255, min(255, offset))
+        if offset == 0:
+            return arr, 0
+        return np.clip(arr.astype(np.int16) + offset, 0, 255).astype("uint8"), offset
+
+    @classmethod
+    def _apply_bc(cls, arr, auto_contrast: bool, contrast: int,
+                  auto_bright: bool, brightness: int):
+        """Shared brightness/contrast pipeline for every preview path.
+        Auto contrast overrides the manual Contrast slider; Auto brightness
+        overrides the manual Brightness slider (same rule as Image Tools).
+
+        Returns (arr, applied) where applied = {"contrast": int, "brightness": int}
+        are the slider-equivalent values actually used — for the auto modes these
+        are the auto-computed positions, so the UI sliders can follow them."""
+        import numpy as np
+        applied = {"contrast": int(contrast), "brightness": int(brightness)}
+        if auto_contrast:
+            arr, applied["contrast"] = cls._autostretch(arr)
+        elif contrast:
+            arr = cls._manual_contrast(arr, contrast)
+        if auto_bright:
+            arr, applied["brightness"] = cls._auto_brightness(arr)
+        elif brightness:
+            arr = np.clip(arr.astype(np.int16) + brightness, 0, 255).astype("uint8")
+        return arr, applied
+
+    def _on_auto_contrast_toggle(self):
+        # Auto contrast overrides the manual Contrast slider → grey it out while on,
+        # and let _redraw park it at the auto-computed position.
+        self._contrast_scale.configure(state="disabled" if self._auto.get() else "normal")
+        self._redraw()
+
+    def _on_auto_bright_toggle(self):
+        # Auto brightness overrides the manual Brightness slider → grey it out while on,
+        # and let _redraw park it at the auto-computed position.
+        self._bright_scale.configure(state="disabled" if self._auto_bright.get() else "normal")
+        self._redraw()
+
+    def _sync_auto_sliders(self):
+        """Move the disabled sliders to the position the auto modes computed, so
+        the UI always shows the contrast/brightness actually applied. Guarded
+        against re-entering _redraw (the Scale command fires on var writes)."""
+        applied = getattr(self, "_last_auto_applied", None)
+        if not applied:
+            return
+        self._syncing_sliders = True
+        try:
+            if self._auto.get():
+                self._contrast.set(applied["contrast"])
+            if self._auto_bright.get():
+                self._brightness.set(applied["brightness"])
+        finally:
+            self._syncing_sliders = False
+
+    @staticmethod
+    def _fit_to_box(img, size: int):
+        """Scale the WHOLE frame so its long side is exactly `size` — never a crop,
+        and unlike Image.thumbnail() this also enlarges sources smaller than the
+        box, so the Zoom slider grows every thumbnail by the same factor."""
+        long_side = max(img.width, img.height)
+        if long_side == size or long_side == 0:
+            return img
+        scale = size / long_side
+        box = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        try:
+            return img.resize(box, Image.LANCZOS)
+        except Exception:
+            # 1-bit / palette / I;16 sources reject the reducing filters
+            return img.resize(box, Image.NEAREST)
 
     def _process(self, path: Path, size: int) -> ImageTk.PhotoImage | None:
         try:
             import numpy as np
             state = self._img_states.get(path)
-            img = Image.open(path)
-            img.thumbnail((size, size), Image.LANCZOS)
+            img = self._fit_to_box(Image.open(path), size)
 
             is_rgb_source = img.mode in ("RGB", "RGBA")
             use_auto = state["auto"] if state else self._auto.get()
             use_brightness = state["brightness"] if state else self._brightness.get()
+            use_contrast = state.get("contrast", 0) if state else self._contrast.get()
+            use_auto_bright = state.get("auto_bright", False) if state else self._auto_bright.get()
             use_palette = state["palette"] if state else self._palette.get()
 
             # RGB obrázky bez explicitní palety → zachovej barvy
-            if is_rgb_source and use_palette == "Grayscale" and not use_auto and use_brightness == 0 and not state:
+            if (is_rgb_source and use_palette == "Grayscale" and not use_auto
+                    and use_brightness == 0 and use_contrast == 0 and not use_auto_bright
+                    and not state):
                 base_rgb = img.convert("RGB")
                 if state and state.get("overlay") is not None:
                     from PIL import Image as PILImage
@@ -1467,10 +1673,12 @@ class PreviewWindow(tk.Toplevel):
                     arr = np.zeros(arr_raw.shape, dtype=np.uint8)
             else:
                 arr = arr_raw
-            if use_auto:
-                arr = self._autostretch(arr)
-            if use_brightness != 0:
-                arr = np.clip(arr.astype(np.int16) + use_brightness, 0, 255).astype(np.uint8)
+            arr, applied = self._apply_bc(arr, use_auto, use_contrast,
+                                          use_auto_bright, use_brightness)
+            if not state:
+                # This thumbnail used the global toolbar settings → remember where
+                # the auto modes landed so the sliders can be parked there.
+                self._last_auto_applied = applied
             if use_palette != "Grayscale":
                 if use_palette not in self._LUTS:
                     self._build_lut(use_palette)
@@ -1502,7 +1710,7 @@ class PreviewWindow(tk.Toplevel):
                 self.after_cancel(self._resize_after_id)
             except Exception:
                 pass
-        self._resize_after_id = self.after(220, self._redraw)
+        self._resize_after_id = self.after(220, self._relayout_if_needed)
 
     def _on_hover_enter(self, path: Path):
         self._show_popup(path)
@@ -1536,6 +1744,7 @@ class PreviewWindow(tk.Toplevel):
         _free_points = [[]]
         _crop_rect = [existing_state.get("crop_rect", None)]  # (x1,y1,x2,y2) v img coords nebo None
         _crop_preview_ids = []  # canvas shape IDs pro crop preview
+        _syncing = [False]  # True while _render writes the auto-computed slider positions
 
         # Init overlay from existing state
         if existing_state.get("overlay") is not None:
@@ -1549,18 +1758,31 @@ class PreviewWindow(tk.Toplevel):
         ttk.Scale(bar, from_=0.1, to=5.0, orient="horizontal",
                   variable=_zoom, length=140).pack(side="left", padx=(4, 12))
 
+        ttk.Label(bar, text="Contrast:").pack(side="left")
+        _contrast_zoom = tk.IntVar(value=existing_state.get("contrast", self._contrast.get()))
+        _contrast_scale_z = ttk.Scale(bar, from_=-127, to=127, orient="horizontal",
+                  variable=_contrast_zoom, length=120)
+        _contrast_scale_z.pack(side="left", padx=(4, 2))
+        _auto_zoom = tk.BooleanVar(value=existing_state.get("auto", self._auto.get()))
+        ttk.Checkbutton(bar, text="Auto", variable=_auto_zoom).pack(side="left", padx=(0, 12))
+
         ttk.Label(bar, text="Brightness:").pack(side="left")
         _bright_zoom = tk.IntVar(value=existing_state.get("brightness", self._brightness.get()))
-        ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
-                  variable=_bright_zoom, length=140).pack(side="left", padx=(4, 12))
+        _bright_scale_z = ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
+                  variable=_bright_zoom, length=120)
+        _bright_scale_z.pack(side="left", padx=(4, 2))
+        _auto_bright_zoom = tk.BooleanVar(value=existing_state.get("auto_bright", self._auto_bright.get()))
+        ttk.Checkbutton(bar, text="Auto", variable=_auto_bright_zoom).pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Palette:").pack(side="left")
         _pal_zoom = tk.StringVar(value=existing_state.get("palette", self._palette.get()))
         ttk.Combobox(bar, textvariable=_pal_zoom, values=self._PALETTES,
                      state="readonly", width=10).pack(side="left", padx=(4, 12))
 
-        _auto_zoom = tk.BooleanVar(value=existing_state.get("auto", self._auto.get()))
-        ttk.Checkbutton(bar, text="Auto", variable=_auto_zoom).pack(side="left", padx=(4, 0))
+        def _sync_auto_enable(*_):
+            _contrast_scale_z.configure(state="disabled" if _auto_zoom.get() else "normal")
+            _bright_scale_z.configure(state="disabled" if _auto_bright_zoom.get() else "normal")
+        _sync_auto_enable()
 
         # Apply / Revert přímo v toolbaru
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(16, 8))
@@ -1571,6 +1793,8 @@ class PreviewWindow(tk.Toplevel):
                 "palette": _pal_zoom.get(),
                 "brightness": _bright_zoom.get(),
                 "auto": _auto_zoom.get(),
+                "contrast": _contrast_zoom.get(),
+                "auto_bright": _auto_bright_zoom.get(),
             }
             win.destroy()
             self._redraw()
@@ -1590,6 +1814,8 @@ class PreviewWindow(tk.Toplevel):
                 "palette": _pal_zoom.get(),
                 "brightness": _bright_zoom.get(),
                 "auto": _auto_zoom.get(),
+                "contrast": _contrast_zoom.get(),
+                "auto_bright": _auto_bright_zoom.get(),
                 "crop_rect": _crop_rect[0],
                 "zoom": _zoom.get(),
             }
@@ -1681,6 +1907,8 @@ class PreviewWindow(tk.Toplevel):
 
         # ── render ────────────────────────────────────────────────
         def _render(*_):
+            if _syncing[0]:
+                return  # slider write came from the auto-position sync, not the user
             try:
                 import numpy as np
                 from PIL import Image as PILImage
@@ -1694,8 +1922,11 @@ class PreviewWindow(tk.Toplevel):
                 pal = _pal_zoom.get()
                 use_auto = _auto_zoom.get()
                 offset = _bright_zoom.get()
+                contrast = _contrast_zoom.get()
+                use_auto_bright = _auto_bright_zoom.get()
 
-                if is_rgb and pal == "Grayscale" and not use_auto and offset == 0:
+                if (is_rgb and pal == "Grayscale" and not use_auto and offset == 0
+                        and contrast == 0 and not use_auto_bright):
                     base_img = img_r.convert("RGBA")
                 else:
                     img_l = img_r.convert("I") if img_r.mode in ("I", "I;16") else img_r.convert("L")
@@ -1708,10 +1939,18 @@ class PreviewWindow(tk.Toplevel):
                             arr = np.zeros(arr_raw.shape, dtype=np.uint8)
                     else:
                         arr = arr_raw
-                    if use_auto:
-                        arr = self._autostretch(arr)
-                    if offset != 0:
-                        arr = np.clip(arr.astype(np.int16)+offset, 0, 255).astype("uint8")
+                    arr, applied = self._apply_bc(arr, use_auto, contrast,
+                                                  use_auto_bright, offset)
+                    # Park the disabled sliders where the auto modes landed.
+                    if use_auto or use_auto_bright:
+                        _syncing[0] = True
+                        try:
+                            if use_auto:
+                                _contrast_zoom.set(applied["contrast"])
+                            if use_auto_bright:
+                                _bright_zoom.set(applied["brightness"])
+                        finally:
+                            _syncing[0] = False
                     if pal != "Grayscale":
                         if pal not in self._LUTS:
                             self._build_lut(pal)
@@ -1742,6 +1981,10 @@ class PreviewWindow(tk.Toplevel):
         _bright_zoom.trace_add("write", _render)
         _pal_zoom.trace_add("write", _render)
         _auto_zoom.trace_add("write", _render)
+        _contrast_zoom.trace_add("write", _render)
+        _auto_bright_zoom.trace_add("write", _render)
+        _auto_zoom.trace_add("write", _sync_auto_enable)
+        _auto_bright_zoom.trace_add("write", _sync_auto_enable)
 
         # Set window size to fit image after first render
         DEFAULT_WIN_W = 900
@@ -2024,29 +2267,77 @@ class PreviewWindow(tk.Toplevel):
             canvas.yview_scroll(int(-event.delta / 120), "units")
         canvas.bind("<MouseWheel>", _wheel)
 
+    # ── grid layout ───────────────────────────────────────────────
+    def _compute_layout(self) -> tuple[int, int, int]:
+        """Return (thumb_size, columns, columns_that_fit) for the current zoom
+        and window width.
+
+        The Zoom slider asks for a thumbnail size; the grid then takes as many
+        columns of that size as fit the visible width and lets the thumbnails
+        grow up to _FILL_SLACK× so the row fills the window exactly. Both the
+        size and the column count only ever move one way as the slider moves,
+        so zooming stays predictable while the grid reflows itself
+        (4×4 → 3×5+1 → 2×8 → …) to whatever the window can hold.
+        """
+        avail = self._canvas.winfo_width()
+        if avail < 100:  # not mapped yet — fall back to the window width
+            avail = max(200, self.winfo_width() - 40)
+        pad = self._CELL_PAD
+        want = max(self._MIN_THUMB, int(self._THUMB * self._zoom.get()))
+        want = min(want, max(self._MIN_THUMB, avail - pad))  # a single image must still fit
+        cols_fit = max(1, avail // (want + pad))
+        size = max(self._MIN_THUMB,
+                   min(avail // cols_fit - pad, int(want * self._FILL_SLACK)))
+        cols = max(1, min(cols_fit, len(self._paths)))
+        return size, cols, cols_fit
+
+    @staticmethod
+    def _fit_caption(name: str, font, max_px: int) -> str:
+        """Middle-ellipsize `name` until it measures at most `max_px` in `font`."""
+        if font.measure(name) <= max_px:
+            return name
+        keep = len(name)
+        while keep > 4:
+            keep -= 1
+            head = keep // 2
+            candidate = name[:head] + "…" + name[len(name) - (keep - head):]
+            if font.measure(candidate) <= max_px:
+                return candidate
+        return name[:4] + "…"
+
+    def _relayout_if_needed(self):
+        """Redraw only when the zoom/resize actually changes the grid. Dragging
+        the slider inside one step would otherwise re-decode every file per pixel."""
+        if self._syncing_sliders:
+            return
+        size, cols, _fit = self._compute_layout()
+        if (size, cols) != self._grid_layout:
+            self._redraw()
+
     # ── grid draw ─────────────────────────────────────────────────
     def _redraw(self):
+        if self._syncing_sliders:
+            return  # slider write came from the auto-position sync, not the user
         for w in self._inner.winfo_children():
             w.destroy()
         self._thumbs.clear()
 
-        # Dynamická šířka podle šířky okna
-        win_w = self.winfo_width()
-        if win_w < 100:
-            win_w = 900
-        pad = 24  # padding kolem každého obrázku (2x padx=4 + border)
-        min_thumb = 80
-        max_cols = self._COLS  # max 4 sloupce
-        # Zjisti kolik sloupců se vejde při aktuálním zoom
-        zoom_size = max(min_thumb, int(self._THUMB * self._zoom.get()))
-        # Kolik sloupců se vejde do šířky okna
-        cols = min(max_cols, max(1, win_w // (zoom_size + pad)))
-        # Přepočítej velikost thumbnailu aby vyplnil šířku
-        size = max(min_thumb, (win_w - pad * cols - 20) // cols)
+        size, cols, cols_fit = self._compute_layout()
+        self._thumb_size = size
+        self._grid_layout = (size, cols)
 
         placed = 0
-        for col_idx in range(cols):
-            self._inner.columnconfigure(col_idx, weight=1, uniform="col")
+        # Full rows share the leftover pixels evenly; a grid narrower than the
+        # window (fewer images than fit) stays left-packed instead of drifting apart.
+        stretch = cols >= cols_fit
+        for col_idx in range(max(self._configured_cols, cols)):
+            inside = col_idx < cols
+            self._inner.columnconfigure(
+                col_idx,
+                weight=1 if (inside and stretch) else 0,
+                uniform="col" if inside else "")
+        self._configured_cols = cols
+        cap_font = tkfont.Font(font=("Segoe UI", 7))
         for i, path in enumerate(self._paths):
             pm = self._process(path, size)
             if pm is None:
@@ -2065,11 +2356,19 @@ class PreviewWindow(tk.Toplevel):
             lbl.bind("<Leave>", lambda e, p=path: self._on_hover_leave(e))
             lbl.bind("<Button-1>", lambda e, p=path: self._on_click(p))
 
-            name = path.name
-            if len(name) > 22:
-                name = name[:10] + "…" + name[-10:]
-            ttk.Label(cell, text=name, font=("Segoe UI", 7),
-                      foreground="gray").pack()
+            # The caption must never be wider than the thumbnail: a wider cell
+            # would push the grid past the canvas width, and Tk answers that by
+            # squeezing the cells — which clips the image instead of scaling it.
+            caption = display_timestamp_only(path.name)
+            if cap_font.measure(caption) > size and " " in caption:
+                caption = caption.split(" ", 1)[1]  # tiny thumbnails: drop the date, keep the time
+            name = self._fit_caption(caption, cap_font, size)
+            name_lbl = ttk.Label(cell, text=name, font=cap_font,
+                                  foreground="gray", wraplength=size)
+            name_lbl.pack()
+            ToolTip(name_lbl, lambda p=path: p.name)  # full filename incl. timestamp on hover
+
+        self._sync_auto_sliders()
 
     # ── large preview popup ───────────────────────────────────────
     def _show_popup(self, path: Path):
@@ -2078,16 +2377,23 @@ class PreviewWindow(tk.Toplevel):
             import numpy as np
             state = self._img_states.get(path)
             img = Image.open(path)
-            zoom_size = max(80, int(self._THUMB * self._zoom.get()))
-            popup_size = zoom_size * 4
+            # Scale the hover preview off the size actually on screen, not off the
+            # raw slider value, so it stays in step with the grid — and keep it
+            # on screen once the thumbnails themselves are already large.
+            popup_size = min(max(self._MIN_THUMB, self._thumb_size) * 3,
+                             int(self.winfo_screenheight() * 0.8))
             img.thumbnail((popup_size, popup_size), Image.LANCZOS)
 
             is_rgb_source = img.mode in ("RGB", "RGBA")
             use_auto = state["auto"] if state else self._auto.get()
             use_brightness = state["brightness"] if state else self._brightness.get()
+            use_contrast = state.get("contrast", 0) if state else self._contrast.get()
+            use_auto_bright = state.get("auto_bright", False) if state else self._auto_bright.get()
             use_palette = state["palette"] if state else self._palette.get()
 
-            if is_rgb_source and use_palette == "Grayscale" and not use_auto and use_brightness == 0 and not state:
+            if (is_rgb_source and use_palette == "Grayscale" and not use_auto
+                    and use_brightness == 0 and use_contrast == 0 and not use_auto_bright
+                    and not state):
                 pm = ImageTk.PhotoImage(img.convert("RGB"))
             else:
                 img_l = img.convert("I") if img.mode in ("I", "I;16") else img.convert("L")
@@ -2100,10 +2406,8 @@ class PreviewWindow(tk.Toplevel):
                         arr = np.zeros_like(arr_raw, dtype=np.uint8)
                 else:
                     arr = arr_raw
-                if use_auto:
-                    arr = self._autostretch(arr)
-                if use_brightness != 0:
-                    arr = np.clip(arr.astype(np.int16) + use_brightness, 0, 255).astype(np.uint8)
+                arr, _ = self._apply_bc(arr, use_auto, use_contrast,
+                                        use_auto_bright, use_brightness)
                 if use_palette != "Grayscale":
                     if use_palette not in self._LUTS:
                         self._build_lut(use_palette)
@@ -2136,6 +2440,30 @@ class PreviewWindow(tk.Toplevel):
             self._popup = None
 
 # ---------------- App ----------------
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 def set_app_icon(win, ico_path, app_id=None):
     """Apply icon.ico to the title bar AND the Windows taskbar button.
 
@@ -2144,9 +2472,10 @@ def set_app_icon(win, ico_path, app_id=None):
     default feather. We force every slot from icon.ico via Win32.
     """
     import ctypes
-    if app_id:
+    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
+    if _aumid:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
     try:
@@ -2172,9 +2501,14 @@ def set_app_icon(win, ico_path, app_id=None):
 
 class App(tk.Tk):
     def __init__(self):
+        # Before super().__init__(): Windows reads the identity when the first
+        # taskbar button is created. See _icon_app_id() for the content tag.
         try:
             import ctypes as _ct
-            _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ELI.Screenshots")
+            _aumid = _icon_app_id("ELI.Screenshots",
+                                  str(get_app_dir() / "icon.ico"))
+            if _aumid:
+                _ct.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
         super().__init__()
@@ -4163,8 +4497,14 @@ class App(tk.Tk):
                                     else:
                                         _base = f"{_stem}__{_lbl_token}{_ext}"
                                 dst = out_dir / _base
-                                self.log(f"[COPY] {latest} -> {dst.name}")
+                                self.log(f"[COPY] {latest} -> {dst}")
                                 shutil.copy2(str(latest), str(dst))
+                                if not dst.exists():
+                                    problems.append(f"{cam}: copy reported OK but file is missing at {dst}")
+                                    self.log(f"[COPY] WARNING: file not present after copy: {dst}")
+                                    done_steps += 1
+                                    self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
+                                    continue
                                 copied_files.append(dst)
                                 copied += 1
                                 if _lbl_enabled:
@@ -4182,7 +4522,7 @@ class App(tk.Tk):
                             hwnd = None
                             needles = self.build_window_needles(cam)
                             for needle in needles:
-                                hwnd = find_window_by_title_substring(needle)
+                                hwnd = find_window_by_title_substring(needle, log=self.log)
                                 if hwnd:
                                     self.log(f"[WIN] matched by: '{needle}'")
                                     break
@@ -4205,13 +4545,14 @@ class App(tk.Tk):
                         problems.append(f"Unknown source mode: {source_mode}")
 
                 self.log(f"\n=== COPY END | Camera Outputs = {copied} | Problems = {len(problems)} ===")
+                self.log(f"=== OUTPUT FOLDER: {out_dir} ===")
                 self._last_out_dir = out_dir
                 if problems:
                     self.log("=== COPY FINISHED WITH PROBLEMS ===")
                     for p in problems:
-                        self.log(f" ⚠ {p}")
+                        self.log(f" [!] {p}")
                 else:
-                    self.log(f"=== DONE — {out_dir} ===")
+                    self.log(f"=== DONE - {out_dir} ===")
                 # Otevři preview pokud byly zkopírovány soubory
                 if copied > 0:
                     is_auto = _cycle_number is not None

@@ -10,8 +10,8 @@
     "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-07-15 07:52:23",
-  "time_to": "2026-07-15 08:52:23",
+  "time_from": "2026-08-21 14:48:12",
+  "time_to": "2026-08-21 15:48:12",
   "http_timeout": 10.0,
   "conditions": [
     {
@@ -43,5 +43,30 @@
     2560,
     1369
   ],
-  "avg_target_points": 2000
+  "avg_target_points": 2000,
+  "graph_opts": {
+    "font_size": 11,
+    "tick_font_delta": -1,
+    "cursor_font_delta": 0,
+    "axis_gap_px": 6,
+    "label_pad_px": 5,
+    "outer_margin_px": 8,
+    "show_axis_titles": true,
+    "y_ticks_max": 6,
+    "y_minor_ticks": false,
+    "x_ticks_max": 8,
+    "x_tick_seconds": 0,
+    "x_time_format": "auto",
+    "margin_right": 0.015,
+    "margin_top": 0.97,
+    "margin_bottom": 0.12,
+    "band_pad_frac": 0.12,
+    "cursor_value_boxes": true,
+    "cursor_boxes_max": 20,
+    "line_markers": true,
+    "live_poll_ms": 300,
+    "live_graph_min_ms": 300,
+    "live_table_ms": 1500
+  },
+  "style_presets": {}
 }

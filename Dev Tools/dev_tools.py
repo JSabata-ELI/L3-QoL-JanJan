@@ -13,6 +13,30 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _icon_app_id(prefix, ico_path):
+    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so a fixed id that was once seen without an icon keeps drawing the
+    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
+    program, same icon, only the id changed -> old id generic, fresh id
+    correct). Hashing the icon into the id makes every PC derive the same id
+    from the same picture, and retires the old id by itself the day the icon
+    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
+    clearing. Returns None when the icon cannot be read; the caller then sets
+    no id at all rather than burning a content id on a run that has no picture
+    to give it. The same helper sits in every program here.
+    """
+    if not ico_path:
+        return None
+    try:
+        import hashlib
+        with open(ico_path, "rb") as fh:
+            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+    except OSError:
+        return None
+
+
 def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
     """Give the window (title bar) AND the Windows taskbar button our icon.
 
@@ -22,9 +46,10 @@ def set_app_icon(win, ico_path: str, app_id: str | None = None) -> None:
     We force every slot from icon.ico via Win32 before the window is first shown.
     """
     import ctypes
-    if app_id:
+    _aumid = _icon_app_id(app_id, ico_path) if app_id else None
+    if _aumid:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_aumid)
         except Exception:
             pass
     try:
@@ -55,13 +80,12 @@ def main():
     root = tk.Tk()
     root.title("Dev Tools")
     set_app_icon(root, str(_app_dir() / "icon.ico"), "ELI.DevTools")
-    root.geometry("950x780")
-    root.minsize(900, 600)
-
+    root.geometry("1180x820")
+    root.minsize(1060, 620)
     try:
-        ttk.Style(root).configure("Focused.TFrame")
+        root.state("zoomed")          # start maximized
     except Exception:
-        pass
+        root.attributes("-zoomed", True)
 
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, side="top")
@@ -69,9 +93,9 @@ def main():
     # Sdílený log widget — fyzicky žije v CM tabu, Builder do něj píše přes log_widget
     cm_tab = DeployGUI(nb)
 
-    def _on_build_done(built_projects, build_summary=None):
+    def _on_build_done(built_projects, build_summary=None, build_info=None):
         nb.select(cm_tab)
-        cm_tab.auto_deploy(built_projects, build_summary=build_summary)
+        cm_tab.auto_deploy(built_projects, build_summary=build_summary, build_info=build_info)
 
     builder_tab = BuilderUI(nb, on_build_done=_on_build_done, log_widget=cm_tab.log)
     builder_tab._cm_ref = cm_tab

@@ -1,95 +1,98 @@
-﻿Launcher — Information
-Created by Jan Moučka, ELI Laser
+﻿Launcher — Short information
+Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
 -----------------------------------------------------------------
+Detailed version: ReadMe_Launcher_Full.txt  ("Details" button)
+-----------------------------------------------------------------
 
-Central hub for launching all QoL tools. Scans the selected
-software directory, organises programs into categories, shows
-available versions, and launches executables.
+WHAT IT DOES
 
+  One window from which every program in this collection can be
+  started. It looks at a folder full of programs, sorts them into
+  groups, and shows one card per program with its version, its
+  documentation and its older versions.
 
-=================================================================
-SOURCES (radio buttons at the top)
-=================================================================
-
-  - Lab — Scratch:        \\hapls-share.lcs.local\scratch\Software
-  - Office — Scratch:     configurable (see Set Path)
-  - Office — SharePoint:  configurable (see Set Path)
-  - Office — Programs:    OneDrive/ELI Beamlines/Python/programy
-
-  Select a source to scan it. The active source is highlighted.
-
-SET PATH (upper-right button)
-  - Configure your personal Office Scratch and SharePoint paths.
-  - Settings are saved to %APPDATA%\Launcher\config.json and
-    restored on next launch.
+  It also tells you when a program has a newer version than the one
+  you last used.
 
 
-=================================================================
-PROGRAM CARDS
-=================================================================
+HOW IT WORKS
 
-Each program is shown as a card with:
+  Nothing is installed and nothing is registered. The Launcher
+  simply looks at a folder, and whatever it finds there is what it
+  offers. Point it at a different folder and it shows a different
+  set of programs.
 
-  [Program button]  — click to launch the current version.
-                      The button shows an arrow (↑) and turns
-                      orange when a newer version is available
-                      on disk.
-
-  [ReadMe]          — opens the program's readme file (if present).
-
-  [✓]               — acknowledge a new version without launching.
-                      Clears the orange highlight and remembers
-                      the acknowledgement across restarts.
-                      (Only shown when an update is available.)
-
-  [📂]              — opens the program's folder in Explorer.
-
-  [🔽]              — dropdown of archived older versions with
-                      timestamps; click to launch that version.
+  That is why it has several sources to choose from at the top: the
+  same programs exist in more than one place — the copy the lab runs
+  from, the copy on the office share, and the working copy on this
+  computer.
 
 
-=================================================================
-UPDATE INDICATOR
-=================================================================
+THE SOURCE BUTTONS AT THE TOP
 
-  - Every 10 seconds the Launcher checks for newer .exe files.
-  - If a newer version is found, the button turns orange and
-    gains a ↑ arrow.
-  - The highlight persists across restarts until you either:
-      * Launch the program (auto-acknowledges), or
-      * Click the ✓ button on the card.
+  Lab - Scratch          the copy the lab runs from
+  Office - Scratch       your own office copy
+  Office - SharePoint    the copy on SharePoint
+  Office - Programs      the working copy on this computer
 
-
-=================================================================
-CATEGORIES
-=================================================================
-
-  Programs are grouped into collapsible sections:
-  Scripts, Parts, External, In Progress,
-  Not Working Correctly, Personal.
-
-  Click a section header to expand or collapse it.
+  Pick one and it is scanned. The two office paths are yours to set
+  with the gear button; they are remembered. On a lab machine the
+  office sources are switched off.
 
 
-=================================================================
-NOTES
-=================================================================
+A PROGRAM CARD
 
-  The Notes button (lower right) opens the shared notes.txt file
-  from the current Scratch path.
+  Big button    starts the program. It shows the version, and turns
+                orange with an arrow when a newer version is sitting
+                on disk than the one you last used.
+  ReadMe        the short description of the program.
+  Details       the long one, when the program has it.
+  Tick          "I know about the new version" — clears the orange
+                without starting anything.
+  Folder        opens the program's folder.
+  Arrow down    a list of older versions; pick one to run it.
+
+  Right-click a card to move that program into another group. Your
+  choice is remembered.
 
 
-=================================================================
-GENERAL NOTES
-=================================================================
+THE ORANGE HIGHLIGHT
 
-  - Supports two exe layouts:
-      Scratch:   <Program folder>/<Program>.exe
-      Programy:  dist/<Program>/vX.Y.Z/<Program>.exe
-  - Archive versions are read from the archive/ subfolder.
-  - Program icons are loaded from icon.ico in the exe folder.
-  - Config: %APPDATA%\Launcher\config.json
+  Every ten seconds the Launcher looks for newer program files. When
+  it finds one, that card goes orange with an arrow, and it stays
+  orange across restarts until you either start the program or press
+  the tick.
+
+
+RUNNING AN OLD VERSION
+
+  An old program file cannot run on its own — it needs the support
+  folder that sits next to the current one. So the Launcher briefly
+  puts the current files aside, drops the old ones in, runs them,
+  and puts the current ones back when you close the program.
+
+  If a program is killed rather than closed, that swap can be left
+  half done. The Launcher then refuses to start it again and offers
+  to put it right, either at the next scan or straight away with the
+  broom button.
+
+
+THE OTHER BUTTONS
+
+  Notes    the shared notes file on the current share.
+  Gear     set your two office paths.
+  Broom    tidy up: version files left in the wrong folder, and
+           programs stuck in a half-finished swap. Both checks also
+           run by themselves after every scan.
+
+
+ONE RULE FOR DOCUMENTATION
+
+  A program's short description must be named ReadMe_<folder name>,
+  with any extension, and the long one ReadMe_<folder name>_Full.
+  The Launcher builds the name it looks for out of the folder name,
+  so a plain README.txt is invisible and the button opens nothing.
 
 -----------------------------------------------------------------

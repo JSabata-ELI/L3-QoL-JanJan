@@ -2,31 +2,60 @@
   "custom_pvs": [
     {
       "name": "Sum of Green [J]",
-      "expr": "F+H"
+      "expr": "F+H",
+      "bindings": {
+        "F": "L3-PM03-025:Energy",
+        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
+      }
     },
     {
       "name": "Beta/Green [%]",
-      "expr": "A/(F+H)*100"
+      "expr": "A/(F+H)*100",
+      "bindings": {
+        "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
+        "F": "L3-PM03-025:Energy",
+        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
+      }
     },
     {
       "name": "PCC1 Eff [%]",
-      "expr": "(F+H)/B*100"
+      "expr": "(F+H)/B*100",
+      "bindings": {
+        "F": "L3-PM03-025:Energy",
+        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+        "B": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy"
+      }
     },
     {
       "name": "Split Ratio [%]",
-      "expr": "F/(F+H)*100"
+      "expr": "F/(F+H)*100",
+      "bindings": {
+        "F": "L3-PM03-025:Energy",
+        "H": "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
+      }
     },
     {
       "name": "PTM1/PAP1",
-      "expr": "B/D"
+      "expr": "B/D",
+      "bindings": {
+        "B": "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
+        "D": "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy"
+      }
     },
     {
       "name": "Comp. Beta Output [J]",
-      "expr": "A*0.749"
+      "expr": "A*0.749",
+      "bindings": {
+        "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
+      }
     },
     {
       "name": "Back Reflection Ratio [%]",
-      "expr": "E/(0.749*A)*100"
+      "expr": "E/(0.749*A)*100",
+      "bindings": {
+        "E": "L3-PM03-023:Energy",
+        "A": "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
+      }
     }
   ]
 }
