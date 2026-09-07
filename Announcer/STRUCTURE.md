@@ -1,13 +1,16 @@
 # Announcer — STRUCTURE
 
-> Verified against source: 2026-08-24 · `a.py` 2902 L
+> Verified against source: 2026-09-02 · `a.py` 3718 L
 
 Single-file tkinter app. Three jobs in one window:
 
-1. **Conditions** — a saved list of things that must stay true. A `screen`
-   condition compares its own rectangle to its own reference every 500 ms; a `pv`
-   condition compares an archived value to its own limits. The first one to fail
-   raises the alarm and says, in the user's own words, what needs doing.
+1. **Conditions** — a saved list of things that must stay true, shown in a
+   three-page `ttk.Notebook` (Screen areas / Values / Halls) over **one** list.
+   A `screen` condition compares its own rectangle to its own reference every
+   500 ms; a `pv` condition compares an archived value to its own limits and, if
+   an area is attached to it, that picture too; a `hall` condition compares the
+   beam fate and the PSS state to what the operator declared. The first one to
+   fail raises the alarm and says, in the user's own words, what needs doing.
 2. **The ad-hoc region watch** — the original single unnamed rectangle from
    "Set reference", watched alongside the conditions.
 3. **PV alerts** — poll eight fixed machine values every 500 ms and show a
@@ -29,6 +32,34 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `scorpion.png` | Loose copy in the folder root; the app reads `images/` only. |
 | `build_config.json` | Dev Tools build settings. `extra_files` lists `images` and `sounds` as **folders**. |
 | `icon.ico` | Window / taskbar icon, via `set_app_icon`. |
+| `testing/` | Tests and benches, none of which touch the real `presets.json`. |
+
+### `testing/`
+
+| File | What it proves |
+|------|----------------|
+| `test_hall_logic.py` | `_hall_verdict` over every combination, the moving grace either side of its limit, and `_fetch_latest` widening against a stubbed fetch. No window, no network. |
+| `test_conditions_load.py` | The old `screen` / `pv` shapes still load unchanged, the new `gate_*` and `hall` keys load, a corrupt area is dropped without taking its condition with it, and nothing private is written back. |
+| `bench_hall_live.py` | Against the real archiver: a matching PSS state is quiet, the wrong one fires and names both states, and an unreadable beam fate never fires but does say so. |
+| `bench_value_area.py` | A value condition with an area attached: the picture half fires on its own, an unchanged picture does not, and the value half still fires with an area present. |
+| `shot_tabs.py`, `shot_editors.py` | Screenshot the three tabs and the three editors. The only way to see whether a tab label came out legible. |
+
+Three traps the harnesses were written around, worth knowing before writing a
+fourth:
+
+- **Pump with `mainloop()`, not a loop of `update()`.** Results come back from
+  the worker thread through `after()`, and under `update()` those do not
+  arrive — the Halls read-out sits on "reading…" forever and looks like a bug
+  in the program. `shot_tabs.py` and both benches drive themselves from
+  `after()` callbacks inside a real loop.
+- **`ImageGrab` takes absolute screen coordinates and works out the
+  virtual-desktop offset itself.** Do not subtract it by hand: this machine's
+  virtual desktop starts at y = -174 and "correcting" for that moved every shot
+  174 px down. A shot that comes back as a photograph or as solid black is the
+  **lock screen** — a locked session has no window to photograph.
+- The saved `window_geometry` puts the window back where it was last left,
+  which can be a monitor that is currently asleep; a grab of that one is black.
+  Both harnesses force the position with `_apply_geometry` first.
 
 `images/` and `sounds/` must ship with every build: a build without `images/` can
 only flash a plain colour, because the alarm image is read from next to the exe.
@@ -60,6 +91,10 @@ fills the window. `images/viper.png` is that conversion of the delivered artwork
 | `COND_PV_WINDOW_S` | 10 | How far back a `pv` **condition** looks for its worst sample. |
 | `COND_MAX_REF_BYTES` | 1 000 000 | Cap on a stored reference picture — it lives inside `presets.json`. |
 | `COND_DEFAULT_PV` | `L3-PM03-023:Energy` | Pre-filled in a new value condition: the back-reflection energy. |
+| `HALL_POLL_MS` | 2000 | Hall read interval — the two hall values change hours apart. |
+| `HALL_LOOKBACK_S` | 1 h, 1 d, 7 d, 30 d | Widening windows `_fetch_latest` tries in turn. |
+| `HALL_MOVING_GRACE_S` | 60 | Default seconds the switchyard may be on the move. |
+| `HALL_MOVING_VALUE` | 0 | The beam fate that means "on its way", not a destination. |
 | `_RESERVED_PRESET_KEYS` | | Top-level keys in `presets.json` that are **not** presets: `pv_thresholds`, `window_geometry`, `image_geometry`, `flash_mode`, `image_file`, `color_cycle`, `flash_interval`, `conditions`. Anything else at the top level is a preset name. |
 
 ### The monitored values — `_PV_MONITORS`
@@ -92,6 +127,24 @@ deviation.
 Badge colours: purple `#7a1fa0` (absolute breach), red `#cc2200`, orange
 `#cc6600`, no badge when in range.
 
+### Where the beam goes — `HALL_FATE_PV`, `HALL_PSS_PV`
+
+| PV | Values |
+|----|--------|
+| `L3BT-MSS:Beam_fate` | 0 switchyard moving · 1 E2 · 2 E3 · 3 E4 · 4 E5 ELI-LUIS · 5 E5 ELI-MAIA |
+| `L3-PSS:STATE_EXH_EXTERNAL_HIGH_P` | 0 internal only · 1 into the experiment |
+
+Both are `enum` channels the archiver writes **on change only**, hours apart, so
+the 60 s window every other reader uses comes back empty nearly always. That is
+what `_fetch_latest` exists for.
+
+**`L3BT-MSS:Beam_fate` is not archived** (checked 2026-09-01: the whole
+`L3BT-MSS` prefix is absent, and no channel anywhere carries "fate" in its
+name). Live Channel Access is not reachable from these machines either. So the
+beam-fate half reads as unavailable and can never trip; the PSS half works. Do
+not "fix" this in the code — it is a missing channel, not a bug. The operator
+says the value will arrive from a different API.
+
 ---
 
 ## Conditions
@@ -107,7 +160,13 @@ an underscore are runtime-only and are stripped by `_save_conditions`.
 
 {"kind": "pv", "name": "Back reflection", "enabled": true,
  "pv": "L3-PM03-023:Energy", "warn": 1.0, "trip": 2.0, "unit": "mJ",
- "message": "Back reflection energy over the limit"}
+ "message": "Back reflection energy over the limit",
+ "gate_monitor": 1, "gate_region": [x1, y1, x2, y2],
+ "gate_threshold": 2.0, "gate_reference": "<base64 PNG>"}
+
+{"kind": "hall", "name": "Shooting into E4", "enabled": true,
+ "message": "The beam is not going where you set it",
+ "hall": 3, "pss": 1, "moving_grace_s": 60}
 ```
 
 - **`_ref_img`** — the decoded reference, a PIL image, made once by
@@ -132,6 +191,29 @@ an underscore are runtime-only and are stripped by `_save_conditions`.
   "fine" would be the one wrong answer.
 - **Failure is one-shot**, exactly like the ad-hoc region: `_raise_alarm` stops
   watching, so nothing re-alarms every 500 ms.
+- **The `gate_*` keys are optional and mirror a screen condition** on the same
+  dict — `_SCREEN_AREA_KEYS` and `_GATE_AREA_KEYS` name the two sets, which is
+  what lets `_build_area_block` build both editors. A value condition carrying
+  them holds while *(value under trip)* **and** *(picture matches)*; either half
+  failing trips, and the message says which. The two halves are checked on
+  different clocks — the picture in `_poll` on the UI thread every 500 ms, the
+  value in `_poll_pvs` on a worker — and that is deliberate: no synchronisation
+  is needed when each can raise the alarm by itself.
+- **A `gate_region` that will not parse is dropped whole**, picture and all, so
+  the next save does not carry the wreckage forward. The value half survives.
+- **A `hall` condition's `hall` / `pss` are `None` when that half is off.**
+  Zero is a real beam fate (switchyard moving) and a real PSS state (internal
+  only), so "unset" cannot be spelled 0; `_parse_level` gives the same
+  empty-is-not-zero treatment it gives warn/trip, and the dropdowns say
+  `_NO_CHECK` rather than showing a number.
+- **`_hall_verdict` is module level and pure.** It takes the condition and the
+  two readings and returns one of `ok` / `warn` / `unknown` / `trip` with a
+  sentence — no window, no network, so `testing/test_hall_logic.py` can walk
+  every combination.
+- **A hall value that could not be read is `unknown`, never `trip`** — and never
+  silent either: the badge goes orange and names which of the two is missing.
+  Reporting "fine" on the strength of a reading that was never made is the one
+  wrong answer, and today the beam fate is exactly that case.
 
 ---
 
@@ -142,6 +224,9 @@ an underscore are runtime-only and are stripped by `_save_conditions`.
 | `set_app_icon(win, ico_path, app_id)` | Window + taskbar icon. Must be frozen-aware — in a build `__file__` does not point next to the exe. |
 | `_pv_key(channel)` | One dict key for either a plain PV name or a difference pair. |
 | `_parse_level(text)` | A limit box: the number in it, or `None` when empty (level off). |
+| `_hall_name(v)`, `_pss_name(v)` | A beam-fate / PSS number as words; `None` becomes "not readable", an unrecognised number says so rather than passing for a hall. |
+| `_value_for_label(table, label)` | The number behind a dropdown entry, `None` for `_NO_CHECK`. |
+| `_hall_verdict(cond, fate, pss, moving_for_s)` | `(verdict, sentence)` — the whole hall rule, pure and testable. |
 | `_HTTP_MESSAGES`, `_NETWORK_HINTS`, `_readable_pv_error(pv_name, exc)` | Turn an HTTP status or a socket error into a sentence with a hint, for the log. A raw traceback in the log window tells the operator nothing. The PVs are read with plain `urllib` — this file pulls in no `requests`. |
 
 ---
@@ -192,10 +277,11 @@ Both are visible at once while an alarm is up.
 | UI | `_build_ui`, `_toggle_settings_popup`, `_build_settings_popup`, `_on_main_click_close_settings`, `_on_any_click` |
 | Presets | `_load_presets`, `_save_presets_file`, `_preset_names`, `_refresh_preset_combo`, `_save_preset`, `_load_preset`, `_delete_preset`, `_save_pv_thresholds`, `_save_flash_settings` |
 | Conditions — data | `_next_cond_uid`, `_load_conditions`, `_save_conditions`, `_decode_reference`, `_encode_reference`, `_cond_summary`, `_enabled_conditions` |
-| Conditions — panel | `_build_conditions_panel`, `_refresh_cond_tree`, `_selected_condition`, `_on_cond_click`, `_delete_condition`, `_resnap_condition`, `_edit_condition` |
+| Conditions — panel | `_build_conditions_panel`, `_build_cond_page`, `_build_quick_region_row`, `_build_hall_readout`, `_refresh_cond_tree`, `_selected_condition`, `_on_cond_click`, `_delete_condition`, `_resnap_condition`, `_build_area_block`, `_edit_condition` |
 | Conditions — badges | `_rebuild_cond_badges`, `_set_cond_badge`, `_clear_cond_badges` |
+| Halls | `_fetch_latest`, `_read_hall_pvs`, `_hall_readout_text`, `_read_hall_now`, `_check_hall_conditions` |
 | Region | `_open_region_selector`, `_select_region`, `_on_selector_closed`, `_region_selected`, `_save_reference`, `_grab`, `_grab_rect`, `_picture_diff` |
-| Watching | `_toggle_tracking`, `_start_tracking`, `_stop_tracking`, `_poll`, `_on_change_detected`, `_on_condition_failed`, `_raise_alarm`, `_reset`, `_update_circle` |
+| Watching | `_toggle_tracking`, `_start_tracking`, `_stop_tracking`, `_poll`, `_watched_areas`, `_on_change_detected`, `_on_condition_failed`, `_raise_alarm`, `_reset`, `_update_circle` |
 | Alarm | `_ensure_image_win`, `_resolve_image_geometry`, `_set_flash_alpha`, `_hide_image_win`, `_start_flash`, `_do_flash`, `_play_sound` |
 | HUD | `_set_ui_visible`, `_set_transparent` |
 | Geometry recorders | `_open_geometry_recorder`, `_start_control_window_recording`, `_start_image_window_recording`, `_save_geometry` |
@@ -206,6 +292,25 @@ Both are visible at once while an alarm is up.
 | Monitors | `_identify_monitors` (numbered overlay on each screen) |
 | PV alerts | `_cpva_context`, `_fetch_samples`, `_condition_value`, `_poll_pvs`, `_update_pv_display`, `_check_pv_conditions`, `_on_pv_frame_configure`, `_relayout_pv_alerts` |
 | Shutdown | `_on_close` (cancels the PV poll job before destroying the window) |
+
+### The notebook
+
+`_build_conditions_panel` makes one `ttk.Notebook` with a page per entry in
+`_COND_TABS`, and each page gets its own `Treeview` from `_build_cond_page`.
+All three read and write the **same** `self._conditions`; a row's `iid` is its
+index into that list, which is what keeps `_selected_condition`,
+`_on_cond_click`, `_delete_condition` and `_resnap_condition` working whichever
+page the selection is on. `_selected_condition` looks at the open page first, so
+pressing Edit does what the page you are looking at implies.
+
+Two things live on a page rather than in the window: `_build_quick_region_row`
+(the unnamed rectangle and the saved regions, on Screen areas) and
+`_build_hall_readout` (the live line, on Halls). `_set_ui_visible` therefore
+hides the notebook alone, not each of them.
+
+Tab labels are styled explicitly (`Cond.TNotebook.Tab`, dark ink on light).
+This machine runs Windows in dark mode and the ttk default came out grey on
+grey — verify by rendering, `testing/shot_tabs.py`, not by reading the code.
 
 ### Things that are the way they are for a reason
 
@@ -239,6 +344,27 @@ Both are visible at once while an alarm is up.
 - **The condition editor works on a copy** and writes into `self._conditions` only
   on Save; `_check_pv_conditions` drops a result whose condition is no longer in
   the list, because the fetch that produced it started before the edit.
+- **`_fetch_latest` widens its window; `_condition_value` must not be used for
+  an enum.** `_condition_value` returns the *highest* sample, which is the right
+  answer for "did the energy spike" and a meaningless one for a hall number. The
+  hall read wants the newest sample, and has to look back as far as a month to
+  find one.
+- **`_hall_span_hint` remembers the window that worked, per PV, and the search
+  only ever widens from it.** Without the hint a channel that is not archived at
+  all costs four requests on every read, every two seconds — and the beam fate is
+  that channel today. The search never narrows again: a narrower window is a
+  subset of a wider one, so once the hinted window comes back empty there is
+  nothing a smaller one could still hold. Starting wide is never wrong, because
+  the newest sample of a wide window is the same sample.
+- **The hall read rides the PV worker but on its own clock.** `_poll_pvs` checks
+  `self._next_hall_read` and only then calls `_read_hall_pvs`; the result travels
+  back through `_update_pv_display`'s third argument. Two values that change
+  twice a day do not need reading at 2 Hz, and four widening queries each would
+  make the 500 ms loop overlap itself.
+- **"How long has the switchyard been moving" is measured from the archiver's
+  timestamp**, not from `time.time()` minus something local. This PC's clock runs
+  about 25 s ahead of the facility, so a locally-timed grace period would be
+  wrong by half a minute in the wrong direction.
 - **The archiver, not live PVs.** `_fetch_samples` calls the CPVA samples endpoint
   over HTTPS with certificate verification disabled and returns `(time_ns, value)`
   pairs; the badges average the newest `PV_AVG_COUNT` of the last 60 s. A single

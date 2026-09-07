@@ -9,10 +9,10 @@ Detailed version: ReadMe_Diagnostic Webex listener_Full.txt
 
 WHAT IT DOES
 
-  Sits in the Webex chat all day and waits for one command. When it
-  arrives, it starts the Diagnostic program on this PC and switches
-  its monitoring on, then writes back to the chat when the program
-  is really running.
+  Sits in the Webex chat all day and waits for two commands. On /run
+  it starts the Diagnostic program on this PC and switches its
+  monitoring on, then writes back to the chat when the program is
+  really running. On /food it answers with the canteen menu.
 
   It exists because Diagnostic can only answer chat messages while
   it is open. This little program is the part that is always open,
@@ -44,6 +44,29 @@ HOW TO USE IT
   A cold start takes up to a minute, sometimes more. The bot keeps
   answering while it waits, and the "Done" message comes when the
   program is really up — it is not forgotten.
+
+
+THE CANTEEN MENU
+
+      @Diagnostics /food          today
+      @Diagnostics /food week     the whole week
+
+  It reads the menu Diagnostic saved earlier, so the answer arrives
+  with Diagnostic closed — which is the point. It says when the menu
+  was read, and if that was a long time ago it says so instead of
+  passing old food off as today's.
+
+  While Diagnostic itself is open, this program stays quiet about
+  /food and lets Diagnostic answer, so a question never gets two
+  answers.
+
+  While Diagnostic is closed, this program also keeps the OKbase
+  sign-in alive and reads the menu once a day, so the menu stays
+  fresh and the sign-in does not have to be filled in again. That is
+  the main reason to leave this window open.
+
+  Whose menu it is and how it gets saved is set in Diagnostic, in
+  Settings -> Canteen menu.
 
 
 STARTING AND STOPPING IT

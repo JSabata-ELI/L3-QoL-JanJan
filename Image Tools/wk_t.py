@@ -3226,6 +3226,11 @@ def _zoom_slider_to_pct(pos: int) -> float:
     return 2.0 * (_ZOOM_SLIDER_SPAN ** (pos / _ZOOM_SLIDER_STEPS))
 
 
+#  The box every sample in the tool strip is drawn in. One size for all three, so the
+#  row looks like one set of controls rather than three afterthoughts.
+_SAMPLE_BOX = (64, 34)
+
+
 class _StrokePreview(QWidget):
     """The little sample beside the Line and Brush sliders. It draws a stroke in the
     colour and thickness the next drawn item will get, so the weight can be seen
@@ -3246,7 +3251,9 @@ class _StrokePreview(QWidget):
         self._max_width = float(max(2, max_width))
         self._width = 2
         self._color = QColor(255, 0, 0)
-        self.setFixedSize(64, 28)
+        # All three samples in the strip are the same box, so the row reads as one set
+        # of controls; 34 is what the text sample needs to keep 20 pt at true size.
+        self.setFixedSize(64, _SAMPLE_BOX[1])
         self.setToolTip(tip)
         self.setAccessibleName(tip)
 
@@ -3299,6 +3306,22 @@ class _StrokePreview(QWidget):
             p.drawLine(QPointF(x0, cy), QPointF(x1, cy))
 
 
+def _place_popup_above(win: QWidget, anchor: QWidget):
+    """Put `win` above `anchor` — below it when the screen ends there — and keep it
+    inside the screen sideways. Shared by the stroke and the text samples."""
+    top_left = anchor.mapToGlobal(anchor.rect().topLeft())
+    cx = top_left.x() + anchor.width() // 2
+    x = cx - win.width() // 2
+    y = top_left.y() - win.height() - 8
+    scr = QGuiApplication.screenAt(top_left) or QGuiApplication.primaryScreen()
+    if scr is not None:
+        g = scr.availableGeometry()
+        x = max(g.left() + 2, min(x, g.right() - win.width() - 2))
+        if y < g.top() + 2:
+            y = top_left.y() + anchor.height() + 8
+    win.move(x, y)
+
+
 class _StrokeZoomPopup(QWidget):
     """The big sample that pops up while a size slider is being dragged.
 
@@ -3330,17 +3353,7 @@ class _StrokeZoomPopup(QWidget):
         and there is no release to wait for."""
         self._width = max(1, int(width))
         self._color = QColor(color)
-        top_left = anchor.mapToGlobal(anchor.rect().topLeft())
-        cx = top_left.x() + anchor.width() // 2
-        x = cx - self.width() // 2
-        y = top_left.y() - self.height() - 8
-        scr = QGuiApplication.screenAt(top_left) or QGuiApplication.primaryScreen()
-        if scr is not None:
-            g = scr.availableGeometry()
-            x = max(g.left() + 2, min(x, g.right() - self.width() - 2))
-            if y < g.top() + 2:
-                y = top_left.y() + anchor.height() + 8
-        self.move(x, y)
+        _place_popup_above(self, anchor)
         self.show()
         self.raise_()
         self.update()
@@ -3391,6 +3404,169 @@ class _StrokeZoomPopup(QWidget):
             p.drawPath(path)
         else:
             p.drawLine(QPointF(x0, cy), QPointF(x1, cy))
+
+
+#  The text samples. Line and Brush have had a sample beside them from the start and
+#  Text had only a number, which is the one size nobody can picture: 16 and 40 read
+#  the same on a spin box and come out four times apart on the picture. These two draw
+#  the letters in the same font, size and colour the next text item will get.
+_TEXT_SAMPLE = "Aa"
+_TEXT_FONT = "Arial"      # the font paint_annots draws text items with
+
+
+def _text_ink(size: int) -> QRectF:
+    """The rectangle the sample letters really cover at `size`, measured from the
+    baseline. The font's own line height is a third taller than the letters — using it
+    would throw away most of the true-size range of a box only 28 pixels high."""
+    fm = QFontMetrics(QFont(_TEXT_FONT, max(1, int(size))))
+    r = fm.tightBoundingRect(_TEXT_SAMPLE)
+    return QRectF(float(r.x()), float(r.y()),
+                  max(1.0, float(r.width())), max(1.0, float(r.height())))
+
+
+class _TextPreview(QWidget):
+    """The little sample beside the Text size box.
+
+    Up to about 20 the letters are drawn at their real size — that is the range almost
+    every label stays in, and there the sample is exact. Above it the rest of the range
+    is squeezed into the height that is left over: a bigger number always draws bigger
+    letters, but no longer at true size. The frame turns amber and dashed to say so,
+    exactly as the Line and Brush samples do, and the number in the box is the exact
+    one either way.
+
+    The true range stops well short of the box on purpose. Filling the box would leave
+    a pixel or two for everything from 20 to 200, and 20, 28 and 60 all came out the
+    same height — a sample that cannot tell those apart is worse than none."""
+
+    _TRUE_UP_TO = 20.0        # ink height in pixels, not the number in the box
+
+    def __init__(self, tip: str, max_size: int = 200, parent=None):
+        super().__init__(parent)
+        self._size = 16
+        self._color = QColor(255, 0, 0)
+        self._top_ink = _text_ink(max_size).height()
+        self.setFixedSize(*_SAMPLE_BOX)
+        self.setToolTip(tip)
+        self.setAccessibleName(tip)
+
+    def set_text_style(self, size: int, color: QColor):
+        s = max(1, int(size))
+        col = QColor(color)
+        if s == self._size and col == self._color:
+            return
+        self._size = s
+        self._color = col
+        self.update()
+
+    def fit(self) -> "tuple[QRectF, float, bool]":
+        """(ink rectangle, how much it had to shrink, was it shrunk) for the size set
+        now. Kept apart from the painting so it can be checked."""
+        r = _text_ink(self._size)
+        room_w = float(self.width() - 8)
+        room_h = float(self.height() - 6)
+        true_cap = min(room_h, self._TRUE_UP_TO)
+        k = 1.0
+        if r.height() > true_cap:
+            top = max(self._top_ink, true_cap + 1.0)
+            frac = (math.log(min(r.height(), top) / true_cap)
+                    / math.log(top / true_cap))
+            # The squeezed range starts a whole pixel above the true one: starting AT
+            # it made the first size past the cap round to the same height as the cap
+            # itself, so 16 and 20 drew identically.
+            base = min(true_cap + 1.0, room_h)
+            k = (base + max(0.0, room_h - base) * frac) / r.height()
+        k = min(k, room_w / r.width())
+        return r, k, k < 0.99
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        r, k, squeezed = self.fit()
+
+        frame = QPen(QColor("#c98a1e") if squeezed else QColor("#c9ced6"))
+        if squeezed:
+            frame.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(frame)
+        p.setBrush(QBrush(QColor("#ffffff")))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0),
+                          3, 3)
+
+        p.setFont(QFont(_TEXT_FONT, self._size))
+        p.setPen(QPen(self._color))
+        p.translate(self.width() / 2.0, self.height() / 2.0)
+        p.scale(k, k)
+        # tightBoundingRect is measured from the baseline, so the baseline has to be
+        # put back where it belongs to centre the letters themselves.
+        p.drawText(QPointF(-r.x() - r.width() / 2.0, -r.y() - r.height() / 2.0),
+                   _TEXT_SAMPLE)
+
+
+class _TextZoomPopup(QWidget):
+    """The big text sample, shown for a moment whenever the size is changed.
+
+    The little sample runs out of box above about 18, so 40 and 200 end up looking the
+    same there. This window is built tall enough for the biggest size the box allows,
+    so the letters are at their true size over the whole range."""
+
+    _PAD = 20
+
+    def __init__(self, max_size: int, parent=None):
+        super().__init__(parent, Qt.WindowType.ToolTip |
+                         Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._size = 16
+        self._color = QColor(255, 0, 0)
+        top = _text_ink(max(6, int(max_size)))
+        # Built for the biggest size the box allows, so the window never has to shrink
+        # the letters to make them fit. The extra height is the caption strip.
+        self.setFixedSize(max(260, int(top.width()) + 2 * self._PAD),
+                          max(96, int(top.height()) + 2 * self._PAD) + 18)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    def show_for(self, anchor: QWidget, size: int, color: QColor, hold_ms: int = 0):
+        self._size = max(1, int(size))
+        self._color = QColor(color)
+        _place_popup_above(self, anchor)
+        self.show()
+        self.raise_()
+        self.update()
+        if hold_ms > 0:
+            self._hide_timer.start(hold_ms)
+        else:
+            self._hide_timer.stop()
+
+    def hide(self):
+        self._hide_timer.stop()
+        super().hide()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        p.setPen(QPen(QColor("#9aa2ad")))
+        p.setBrush(QBrush(QColor("#ffffff")))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0),
+                          5, 5)
+
+        cap = QFont(); cap.setPointSize(8)
+        p.setFont(cap)
+        p.setPen(QPen(QColor("#666666")))
+        p.drawText(QRectF(6, 3, self.width() - 12, 14),
+                   int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                   f"{self._size} pt — true size at 100 % zoom")
+
+        r = _text_ink(self._size)
+        p.setFont(QFont(_TEXT_FONT, self._size))
+        p.setPen(QPen(self._color))
+        strip = 18.0
+        cx = self.width() / 2.0
+        cy = strip + (self.height() - strip - 4.0) / 2.0
+        p.drawText(QPointF(cx - r.x() - r.width() / 2.0,
+                           cy - r.y() - r.height() / 2.0), _TEXT_SAMPLE)
 
 
 class _StatCell(QLabel):
@@ -4647,6 +4823,45 @@ def _ico_camera(p, c):
     p.drawEllipse(QRectF(6.8, 8.4, 6.4, 6.4))                  # the lens
 
 
+# ── marks laid ON a frame (the Image Finder's comparison wall) ───────────────
+# Deliberately not the plain shapes of the drawing tools above: these buttons do
+# not draw a shape, they put a REFERENCE mark on the frames, and the frame is
+# half of what they mean. So each one is the shape inside a picture frame.
+def _ico_mark_frame(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 1.5, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRect(QRectF(2.2, 3.6, 15.6, 12.8))
+
+
+def _ico_mark_circle(p, c):
+    _ico_mark_frame(p, c)
+    p.setPen(_ipen(c, 2.0))
+    p.drawEllipse(QPointF(10.0, 10.0), 4.4, 4.0)
+
+
+def _ico_mark_square(p, c):
+    _ico_mark_frame(p, c)
+    p.setPen(_ipen(c, 2.0, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRect(QRectF(6.0, 6.2, 8.0, 7.6))
+
+
+def _ico_mark_cross(p, c):
+    _ico_mark_frame(p, c)
+    p.setPen(_ipen(c, 2.0, cap=Qt.PenCapStyle.FlatCap))
+    p.drawLine(QPointF(10.0, 5.4), QPointF(10.0, 14.6))
+    p.drawLine(QPointF(5.0, 10.0), QPointF(15.0, 10.0))
+
+
+def _ico_marks_clear(p, c):
+    """A marked frame with the mark struck out. The stroke runs corner to corner
+    so it stays readable at 20 px, where a small × inside the frame turns to mush."""
+    _ico_mark_frame(p, c)
+    p.setPen(_ipen(c, 1.8))
+    p.drawEllipse(QPointF(10.0, 10.0), 4.0, 3.6)
+    p.setPen(_ipen(c, 2.4, cap=Qt.PenCapStyle.RoundCap))
+    p.drawLine(QPointF(4.2, 15.0), QPointF(15.8, 5.0))
+
+
 # "180°" keeps its plain text: a third circular arrow next to Undo and Original
 # would be one turning arrow too many to tell apart.
 _ICON_RECIPES_ACTION = {
@@ -4658,6 +4873,9 @@ _ICON_RECIPES_ACTION = {
     # icon vocabulary for the whole program.
     "play": _ico_play, "step_prev": _ico_step_prev, "step_next": _ico_step_next,
     "popout": _ico_popout, "calendar": _ico_calendar, "camera": _ico_camera,
+    # ...and by the Image Finder's wall, for the same reason.
+    "mark_circle": _ico_mark_circle, "mark_square": _ico_mark_square,
+    "mark_cross": _ico_mark_cross, "marks_clear": _ico_marks_clear,
 }
 
 
@@ -4955,8 +5173,17 @@ class WorkshopWidget(QWidget):
         self._text_sb.setFixedWidth(52)
         self._text_sb.setToolTip("Size of the text. With a text item selected it "
                                  "changes that item.")
-        self._text_sb.valueChanged.connect(self._on_style_changed)
         row2.addWidget(self._text_sb)
+        self._text_prev = _TextPreview("How big the letters will come out",
+                                       self._text_sb.maximum())
+        row2.addWidget(self._text_prev)
+        # The big true-size sample. There is no drag to follow on a spin box, so it
+        # shows itself for a moment every time the number changes.
+        self._text_zoom = _TextZoomPopup(self._text_sb.maximum(), self)
+        self._text_last = self._text_sb.value()
+        # Connected only once the samples exist, so the first change cannot land in
+        # _on_style_changed before there is anything to draw into.
+        self._text_sb.valueChanged.connect(self._on_style_changed)
 
         self._fill_cb = QCheckBox("Fill")
         self._fill_cb.setStyleSheet(_CHECK_QSS)
@@ -5140,6 +5367,7 @@ class WorkshopWidget(QWidget):
         # A separate window would otherwise stay on screen after the tab is left.
         self._line_zoom.hide()
         self._brush_zoom.hide()
+        self._text_zoom.hide()
 
     def _annotate_shortcut_tooltips(self):
         """Write the key into the tooltip of the button that does the same thing — a
@@ -5302,6 +5530,12 @@ class WorkshopWidget(QWidget):
             slot is not None and bool(slot.annots))
         menu.addSeparator()
         act("Copy the picture", self._copy_clipboard, slot is not None)
+        # The same switch as in the Save section, put where the saving is done: with
+        # that section rolled up there was no sign the choice existed.
+        a_ov = menu.addAction("Save with overlay")
+        a_ov.setCheckable(True)
+        a_ov.setChecked(self._cb_burn.isChecked())
+        a_ov.toggled.connect(self._cb_burn.setChecked)
         act("Save PNG…", lambda: self._save("png"), slot is not None)
         act("Duplicate", self._duplicate_slot, slot is not None)
         menu.addSeparator()
@@ -5750,17 +5984,25 @@ class WorkshopWidget(QWidget):
     def _build_save_section(self):
         sec = self._add_section("save", "Save", True)
         lay = sec.body_layout
-        self._cb_burn = QCheckBox("Include the drawing and measurements")
+        self._cb_burn = QCheckBox("Save with overlay")
         self._cb_burn.setStyleSheet(_CHECK_QSS)
-        self._cb_burn.setChecked(True)
+        self._cb_burn.setChecked(bool(self._ui_state.get("save_overlay", True)))
+        self._cb_burn.setToolTip(
+            "Ticked: everything drawn on the picture goes into the file — text, "
+            "lines, arrows, freehand strokes, regions, the scale bar and the numbers "
+            "the measuring tools wrote by themselves.\n"
+            "Unticked: only the picture is written, with nothing drawn on it.")
+        self._cb_burn.toggled.connect(self._on_burn_toggled)
         lay.addWidget(self._cb_burn)
 
         row = QHBoxLayout()
-        b_png = _btn("Save PNG…", "Write what you see as a PNG file")
+        b_png = _btn("Save PNG…", "Write the picture as a PNG file — with or without "
+                                  "the drawing, as “Save with overlay” says")
         b_png.clicked.connect(lambda: self._save("png"))
-        b_tif = _btn("Save TIFF…", "Write what you see as a TIFF file")
+        b_tif = _btn("Save TIFF…", "Write the picture as a TIFF file — with or without "
+                                   "the drawing, as “Save with overlay” says")
         b_tif.clicked.connect(lambda: self._save("tiff"))
-        b_jpg = _btn("Save JPEG…", "Write what you see as a JPEG file — smaller, but "
+        b_jpg = _btn("Save JPEG…", "Write the picture as a JPEG file — smaller, but "
                                    "it throws detail away; never save data as JPEG")
         b_jpg.clicked.connect(lambda: self._save("jpg"))
         row.addWidget(b_png); row.addWidget(b_tif); row.addWidget(b_jpg)
@@ -5823,6 +6065,19 @@ class WorkshopWidget(QWidget):
         b_sload.clicked.connect(self._load_session)
         srow.addWidget(b_ssave); srow.addWidget(b_sload)
         lay.addLayout(srow)
+
+    def _on_burn_toggled(self, on: bool):
+        """Remember the choice and say out loud what the next save will contain — the
+        switch decides what lands in the file, so it must never be a silent state."""
+        self._ui_state["save_overlay"] = bool(on)
+        self._save_ui_state()
+        self._say("Saving with the drawing and the measured numbers on the picture."
+                  if on else
+                  "Saving the picture only — nothing drawn on it goes into the file.")
+
+    def _overlay_note(self) -> str:
+        return ("with the drawing" if self._cb_burn.isChecked()
+                else "picture only, no drawing")
 
 
     # ─────────────────────────────────────────────── Public API ───
@@ -6091,14 +6346,25 @@ class WorkshopWidget(QWidget):
         c.update()
 
     def _refresh_stroke_samples(self):
-        """Keep the two numbers and the two samples beside the sliders showing what a
-        stroke drawn right now would look like."""
+        """Keep the numbers and the three samples in the strip showing what a stroke or
+        a piece of text drawn right now would look like."""
         line_w = self._line_sl.value()
         brush_w = self._brush_sl.value()
         self._line_val.setText(str(line_w))
         self._brush_val.setText(str(brush_w))
         self._line_prev.set_stroke(line_w, self._draw_color)
         self._brush_prev.set_stroke(brush_w, self._draw_color)
+        text_sz = self._text_sb.value()
+        self._text_prev.set_text_style(text_sz, self._draw_color)
+        # The big text sample belongs to the SIZE box, so a colour change must not pop
+        # it up; only a new number does, and it goes away by itself.
+        if text_sz != self._text_last:
+            self._text_last = text_sz
+            self._text_zoom.show_for(self._text_sb, text_sz, self._draw_color,
+                                     hold_ms=1200)
+        elif self._text_zoom.isVisible():
+            self._text_zoom.show_for(self._text_sb, text_sz, self._draw_color,
+                                     hold_ms=1200)
         # The big sample follows the drag, and for a size set with the arrow keys —
         # where there is no release to hide it — it shows itself for a moment.
         for sl, pop, w in ((self._line_sl, self._line_zoom, line_w),
@@ -7536,7 +7802,7 @@ class WorkshopWidget(QWidget):
             return
         self._last_save_dir = p.parent
         if _write_image(img, p):
-            self._say(f"Saved a copy: {p}")
+            self._say(f"Saved a copy: {p} — {self._overlay_note()}")
         else:
             QMessageBox.warning(self, "Save error", f"Could not write:\n{p}")
 
@@ -7641,6 +7907,7 @@ class WorkshopWidget(QWidget):
             self._say("Nothing to save.")
             return
         quality = 95 if fmt == "JPEG" else None
+        overlay = self._overlay_note()
 
         def work():
             ok_n = fail_n = 0
@@ -7654,7 +7921,7 @@ class WorkshopWidget(QWidget):
                     ok_n += 1
                 except Exception:
                     fail_n += 1
-            msg = f"Saved {ok_n} image(s) as {fmt} into {folder}"
+            msg = f"Saved {ok_n} image(s) as {fmt} into {folder} — {overlay}"
             if fail_n:
                 msg += f", {fail_n} failed"
             if skipped:
@@ -7853,7 +8120,7 @@ class WorkshopWidget(QWidget):
         img = self._render_for_save(slot)
         if img is not None:
             QGuiApplication.clipboard().setImage(img)
-            self._say("Copied to the clipboard.")
+            self._say(f"Copied to the clipboard — {self._overlay_note()}.")
 
     # ──────────────────────────────────────────────────── Info ────
 

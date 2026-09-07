@@ -46,18 +46,35 @@ the Spectra folder.
   Images         the camera image store on the network, opened when
                  you double-click an image path in the table.
   Local data     a folder of ramping records kept next to the
-                 program. The PV Time Plot tab reads that and works
-                 with no network at all.
+                 program, left over from an earlier way of working.
+                 Nothing has been written into it since June 2026 and
+                 no tab reads it any more.
 
-THE ONE-HOUR RULE. The archiver answers reliably for a window of
-about an hour. So every request is split into one-hour pieces, and
-the pieces are fetched many at a time. A week of ten values is
-seventeen hundred requests, and that is why it is done in parallel
-rather than in sequence.
+HOW MUCH IT WILL ANSWER AT ONCE. The archiver refuses a request when
+the answer would be too big, and how much is "too big" depends on the
+signal: a valve position changes a handful of times a day, a shot
+energy many times a second. So the program does not guess a fixed
+size. It asks for a lot, and whatever comes back refused it halves
+and asks again, remembering per signal how much that signal will
+serve. A quiet signal ends up costing one request for a whole month;
+a busy one is cut down to what it can give. The pieces are fetched
+many at a time.
 
-THE NIGHT SHORTCUT. Pieces falling in the small hours are skipped,
-because nothing is recorded then. On a long window that is a third of
-the requests saved for nothing lost.
+Two consequences worth knowing:
+
+  - No period is too long. A year works. It may take a while, the
+    line under the graph counts the requests, and "Stop loading" is
+    there if you change your mind.
+  - Nothing is skipped. Earlier versions asked one hour at a time and
+    threw away every hour between 22:00 and 06:00 on the assumption
+    that nothing is recorded overnight — without saying so, so a
+    period over a night came back with holes in it. That is gone.
+
+WHEN SOMETHING CANNOT BE READ. A signal that could only be read in
+part still shows what there was, and the line under the graph names
+it and says how many hours are missing; the Log lists the exact
+stretches. If nothing at all came back, it says so in those words —
+it never reports an unanswered archive as an empty one.
 
 THE CARRY-FORWARD VALUE. For every value, the last sample BEFORE your
 window is also fetched. Without it, a signal that has not changed for
@@ -80,9 +97,27 @@ what makes a month-long load possible at all.
     an absolute date and time, or a relative quick pick — the last
     hour, the last 24 hours, now.
 
+    THE BLUE LINE AT THE BOTTOM IS THE ANSWER. It spells out the two
+    moments OK will hand back, and it is the one thing worth reading
+    before pressing OK: each end is taken from the tab that is on
+    top, so a date typed on the absolute side while the relative side
+    is showing is not what you get.
+
+    Turning the calendar to another month (◀ ▶, the month name, the
+    year box) takes the chosen day with it — the same day of the
+    month, or the last day of a shorter one. Before, the day stayed
+    behind: February was on screen while the dialog still held today,
+    and with the clock boxes untouched OK handed back the period you
+    started from. A months-long request came back as the last hour.
+
+    The end of the period is also what decides live mode. "Now" on
+    the relative side means "keep up with the clock", and Live stays
+    on. Any fixed end means "show me that stretch of the past", and
+    Live switches off — see 3.5.
+
 3.2 THE VALUE LIST
 
-    "Browse..." opens the channel browser. The full list of archived
+    "Browse" opens the channel browser. The full list of archived
     channels — about ten thousand of them — is downloaded once and
     then filtered as you type, so typing is instant.
 
@@ -92,6 +127,9 @@ what makes a month-long load possible at all.
     also work if you want to be explicit.
 
     "Remove" drops the selected entries, the bin clears the list.
+    Nothing is left selected afterwards: the entry that moves up into
+    the freed place used to come out highlighted, so pressing Remove
+    twice took a value you had not chosen.
 
 3.3 PRESETS
 
@@ -115,6 +153,15 @@ what makes a month-long load possible at all.
     than being dropped. The period starts as the last hour, so there
     is always one set.
 
+    IT DRAWS WHILE IT LOADS. The period is read from the present
+    backwards, and the graph and the table are redrawn every second
+    or so with whatever has arrived. On a long period the picture
+    fills in from the right-hand edge instead of leaving you looking
+    at an empty plot and a progress bar. "Stop loading", beside the
+    bar, keeps everything already drawn and tells you what is
+    missing; it is there because a year is a fair thing to ask for
+    and changing your mind halfway should not cost you the wait.
+
     The reason there is no button: it could only ever do what the
     program already knows it has to do, and a button that must be
     pressed before the screen tells the truth is a button that will
@@ -128,7 +175,18 @@ what makes a month-long load possible at all.
     now" rather than as fixed times. The countdown next to the button
     shows the next poll. Off, the period you chose stands still.
 
-    Four things about live mode are worth knowing, because they are
+    Live mode follows the clock, so it belongs to a period that ends
+    at "now". Choose an end at a fixed moment and it switches itself
+    off: you asked to look at a stretch of the past, and holding Live
+    on would have quietly turned your From and To into a WIDTH — ask
+    for yesterday 08:00 to 12:00 and you would have got the last four
+    hours instead. That is done for the calendar and for a preset
+    that carries its own period. Setting only the START relatively
+    (the 12 h / 1 Day / 3 Days / 7 Days buttons) leaves the end at
+    "now", so those keep Live running. The Live button itself is
+    always the override, in both directions.
+
+    Five things about live mode are worth knowing, because they are
     all deliberate:
 
       - The graph and the table are refreshed on SEPARATE clocks. The
@@ -147,13 +205,12 @@ what makes a month-long load possible at all.
         cost free, so a slow machine backs off by itself instead of
         leaving the window no time to respond.
 
-      - The live window is capped at twelve hours. The program
-        remembers your last window, so a window that had grown to
-        several days would silently become the live window on the
-        next start — and a live window is re-merged, re-filtered and
-        redrawn for the whole session. When the cap shortens your
-        window, the Log says so. With Live off, any period you ask
-        for is still loaded in full.
+      - The live window is NOT capped. It used to be shortened to
+        twelve hours, which meant the graph disagreed with the period
+        it was labelled with. It now uses what you give it; above a
+        day the Log points out that every refresh re-reads and
+        redraws the whole span, so it will feel slower. Nothing is
+        shortened without telling you.
 
       - "Stop live" also cancels the requests already in flight. Just
         stopping the timer would leave a queue of archiver calls
@@ -319,6 +376,24 @@ what makes a month-long load possible at all.
         along the bottom: how many, or a fixed spacing from one
         second to one day, and whether they show seconds. The plot
         margins, as percentages of the picture. The cursor boxes.
+
+        THE TIME STAMPS. Left on "Automatic", they show as much of
+        the clock as the spacing warrants and no more: seconds only
+        while the stamps are seconds apart, the clock alone once they
+        are minutes apart, and the date alone once they are days
+        apart. Over more than one day they come out on two lines,
+        the date above the time, and the date is printed only where
+        the day changes — so a two-day period is labelled by day
+        without repeating the date under every stamp. Over a few
+        months the year joins the date, because a year-long period
+        would otherwise open and close on the same "09-02".
+
+        Both ends of the period are always stamped, and an automatic
+        stamp landing too close to one of them is dropped rather than
+        written over it. The two outer stamps are also pulled inside
+        the plot instead of being centred on its edge. Those two
+        rules are what fixed the stamp on the right being written
+        over its neighbour.
         The live speeds (section 3.5). And a couple of switches that
         trade detail for speed — minor tick marks are off by default
         because with a dozen stacked axes they are the single most
@@ -530,15 +605,78 @@ what makes a month-long load possible at all.
 
 6.2 PV TIME PLOT
 
-    The daily pattern, or the raw trace, of the ramping records kept
-    locally next to the program. It needs no archiver and no network.
-    Conditions can be added per row.
+    THE QUESTION IT ANSWERS is "how did this value behave day by day",
+    over days that need not be next to each other. It reads the
+    archive itself, whole days at a time, and is independent of the
+    period the Graph tab is showing.
+
+    PICK DAYS opens the same calendar the rest of the suite uses: a
+    click takes one day, Ctrl+click adds days one by one, and
+    Ctrl+Shift+click takes a stretch. The tab opens on the last five
+    working days. Weekends are not offered on purpose — nothing is
+    archived there.
+
+    Y VARIABLE is any channel in the PV list on the left, including a
+    computed one. The channels do not have to be loaded in the Graph
+    tab; the list is what the tab reads.
+
+    DAILY DISTRIBUTION draws one shape per day — a violin, at its
+    widest where most of the shots were, with the median marked in
+    red. A day that ran at two different levels shows as two humps,
+    which a daily average and an error bar hide completely. A day with
+    fewer than two shots is left out and said so in the caption.
+
+    RAW SHOTS draws every shot on a real time axis instead. Each day
+    is its own run of points, so no line is dragged across the gap
+    between two days that are not neighbours.
+
+    ONE POINT PER MEASUREMENT of the chosen value, and no more: the
+    conditions are read at those moments, holding their last value.
+    Without that, a slowly-changing channel like the waveplate would
+    add points of its own and the same number would be counted into
+    the distribution several times over.
+
+    CONDITIONS are target ± percent, one row each, and each row can be
+    switched off without losing it. A row starts switched off, because
+    a filter that appears already active would empty the plot for no
+    stated reason. The caption always says which conditions were in
+    force and how many shots of how many survived them.
+
+    WHAT IT COSTS. A day of eight channels is about fifty requests and
+    two or three seconds; a week is read while you watch, a month is
+    worth starting and leaving alone. Every day that has been read
+    stays in memory for as long as the program runs, per channel, so
+    changing the Y value, adding a condition or retyping a target
+    redraws at once. Only a day — or a channel — that has not been
+    read yet is fetched, and pressing Plot again in the middle of a
+    long read keeps everything already fetched.
+
+    A CHANNEL THAT REPORTS RARELY (a waveplate, a valve) can have its
+    last change hours before the day starts. Its value still holds, so
+    the value from before the day is fetched and carried in, instead of
+    leaving the morning's shots blank and having a condition drop them
+    all.
 
 6.3 TABLE
 
     Every merged row. Only the newest few thousand rows are actually
     drawn, to keep the window responsive — the export, the graph and
     the scatter always use all of them.
+
+    The columns are the values that are on the GRAPH. Switch one off
+    in the list under the graph and its column goes too, so the table
+    can never disagree with the picture. A value with nothing in the
+    period at all — no sample and no earlier value to carry in — is
+    left out rather than shown as an empty column. A value that is a
+    word (a beam fate) has no line on the graph but does have a
+    column: a table of shots is where it belongs.
+
+    A value that did not change inside the period is not blank. The
+    last value it had BEFORE the period is carried across it, in every
+    row, the same carry-forward the graph draws. Formulas are computed
+    from those carried values too, so a computed value is no longer
+    empty for a period in which its sources happened to stand still —
+    which is what made every formula look broken on an old period.
 
     Right-click a row to copy it or to open its image. Double-click a
     cell containing an image path to open that frame.
@@ -555,12 +693,79 @@ what makes a month-long load possible at all.
 7. EXPORT
 =================================================================
 
-The export writes EVERY loaded row, not the few thousand the table
-draws. One time column, then one column per value.
+"Export table", under the table, opens one window with two lists and
+three switches.
 
-Semicolon between columns, point as the decimal separator, and the
-separator announced on the first line so Excel opens the file
-directly instead of showing an import wizard.
+7.1 THE TWO LISTS
+
+    Channels to export
+        The COLUMNS of the file. It opens with exactly the values that
+        are on screen — the same rule as the table: what the graph
+        shows, nothing switched off, nothing with an empty column.
+
+    Channels that define a shot
+        The ROWS of the file. This is the question that decides whether
+        the file is a table of shots or a table of "something was
+        written here".
+
+        Only a value that is recorded once per shot can say when a shot
+        happened. The diagnostic energies do that. A shot rate, a
+        timing or state word, a beam fate, a valve or shutter position,
+        the waveplate — these are written at their own pace, whenever
+        the control system feels like it, and letting them mark shots
+        multiplies the file: one measured window of eight minutes held
+        sixteen real shots and two thousand two hundred rate samples.
+
+        They are still exported. Every shot carries the last value each
+        of them had at that moment, exactly like the carry-forward on
+        the graph. They simply do not add rows.
+
+        The program ticks the numeric diagnostics and leaves the rest
+        unticked, going by the name (rate, timing, fate, state, status,
+        mode, enable, open, close, shutter, valve, position, raw
+        position, temperature, pressure, flow, alarm) and always
+        leaving out the master value and the computed ones. It is a
+        starting point, not a verdict — tick and untick freely.
+
+7.2 THE SWITCHES
+
+    Rows
+        "Every shot in the window — reads the archive again" goes back
+        to the archive for the whole period in FULL detail. This is
+        what you want for data: the graph is thinned to a couple of
+        thousand points per signal for drawing, and exporting that
+        would be exporting the picture, not the measurement.
+        "The rows already on screen" writes the merged rows as they
+        are, instantly, with no reading at all.
+
+    Keep only rows that pass the Conditions
+        The same filter as on screen. Available for the re-read; the
+        rows on screen have already been through it.
+
+    Decimal comma
+        Writes 1,5 instead of 1.5, for an Excel set to Czech.
+
+7.3 WHAT IT WRITES, AND HOW LONG IT TAKES
+
+One time column (to the millisecond, Prague time), then one column per
+value, headed with the same name the value wears on the graph. A
+semicolon between the columns and the separator announced on the first
+line, so Excel opens the file directly instead of showing an import
+wizard. A value that is a word — a beam fate — is written as the word,
+quoted if it contains a semicolon itself.
+
+Numbers are written with ten significant digits, so nothing is rounded
+away, and 0.1+0.2 comes out as 0.3 rather than 0.30000000000000004.
+
+A year is a legitimate period. The period is read a couple of hours at
+a time and each piece is appended to the file straight away, so the
+file can be far larger than the computer's memory. The window on top
+says which day it is on and how many shots are written so far, and
+Cancel stops it — everything already written stays, and the Log says
+where it stopped.
+
+While it runs you can keep working. It is reading the archive, though,
+so if Live mode is on the two are competing; the Log says so.
 
 
 =================================================================
@@ -573,8 +778,9 @@ directly instead of showing an import wizard.
   the presets file            named value lists
   the conditions presets      named filter sets
   the computed values file    the formulas and their bindings
-  the ramping folder          local records for the PV Time tab, with
-                              an index file and the named setups
+  the ramping folder          old local records and the named setups.
+                              No tab reads them any more; the PV Time
+                              tab goes to the archive instead
 
 Deleting those resets the program to its defaults. Nothing about a
 particular load is saved.
@@ -594,14 +800,34 @@ particular load is saved.
       rows were dropped and why. That the table is left empty rather
       than unfiltered is deliberate.
 
+      A condition can now also judge a value that has no sample inside
+      the period, because the value carried in from before it is a
+      real value. Before, such a condition was skipped and said so in
+      the Log. So a condition on a value that was last left outside
+      its range — a closed shutter, a laser that was off — empties the
+      table, which is the honest answer.
+
   A computed value's column is empty
       A value the formula needs is not loaded, or the formula has a
       syntax error. Both are in the Log, and the dialog marks the
-      missing value.
+      missing value. It is no longer caused by the sources standing
+      still: the last value from before the period is carried in and
+      the formula is computed from that.
 
-  Live mode shortened my window
-      The twelve-hour cap. Section 3.5. Switch Live off and the longer
-      period is loaded in full.
+  A computed value has no column at all
+      Then it cannot be computed anywhere in this period — one of its
+      values is not in the list and has no earlier value either. The
+      Log names it. A column that would be empty from top to bottom is
+      left out on purpose.
+
+  I asked for a long period and got the last hour
+      Turning the calendar to another month used to leave the chosen
+      DAY where it was, so February looked selected while the dialog
+      still held today — and with the clock boxes untouched that is
+      the period you started from. Fixed: the day follows the month
+      you turn to. Whatever happens, the blue line at the bottom of
+      the dialog spells out the two moments OK will hand back; if it
+      does not say what you meant, OK will not either.
 
   Live mode is falling behind
       Too many values, or too long a window. Under Graph settings →
@@ -627,8 +853,19 @@ particular load is saved.
       the list, or let the thinning do its work.
 
   Nothing loads at all
-      The archiver is not reachable from this computer. The PV Time
-      Plot tab still works — it reads local files.
+      The archiver is not reachable from this computer. Nothing will
+      load, the PV Time Plot tab included — it reads the archive too.
+
+  The PV Time Plot says "add a channel to the PV list first"
+      Its Y drop-down is filled from the PV list on the left. An empty
+      list, or a preset that carries no channels, leaves it with
+      nothing to offer.
+
+  The PV Time Plot came out empty with conditions on
+      The caption says how many shots were read and that none passed.
+      Read the target and the tolerance: they are a percentage of the
+      target, so "70 ± 10 %" means 63 to 77, and a condition left
+      pointing at the wrong channel will drop everything.
 
   The graph is a solid block of ink
       Too many samples for the width. Use "Avg to" to reduce the
@@ -639,6 +876,20 @@ particular load is saved.
       stamps than the drawing library will produce. The program
       doubles the spacing until the count is sane, but if you have
       set something extreme, set it back to automatic.
+
+  The time stamps are written over each other
+      Set the spacing back to "Automatic" and lower "Max time
+      stamps" in Graph settings. On automatic they should never
+      collide, whatever the period — if they do, that is a fault
+      worth reporting.
+
+  A long period seems not to load
+      Watch the line under the graph: it counts the requests and
+      estimates the time left, and the picture fills in from the
+      right as the data arrives. If it ends with a warning that some
+      signals are incomplete, the Log lists the stretches that could
+      not be read. "Nothing could be read" means the archive was not
+      answering.
 
   Scrolling changed a setting
       It should not any more — see section 4.6. If it still does,

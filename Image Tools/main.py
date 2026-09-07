@@ -21,7 +21,7 @@ if getattr(sys, "frozen", False):
         with open(Path(sys.executable).resolve().parent / "debug_pil.txt", "w") as _f:
             _f.write(f"PIL import error: {e}\n")
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton, QLabel
+from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget, QPushButton
 from PySide6.QtCore import Qt, QTimer
 
 # ── version from exe name ─────────────────────────────────────────────────────
@@ -61,27 +61,57 @@ def _icon_file() -> Path | None:
 
 
 def _icon_app_id(prefix, ico_path):
-    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it, so a fixed id that was once seen without an icon keeps drawing the
-    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
-    program, same icon, only the id changed -> old id generic, fresh id
-    correct). Hashing the icon into the id makes every PC derive the same id
-    from the same picture, and retires the old id by itself the day the icon
-    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
-    clearing. Returns None when the icon cannot be read; the caller then sets
-    no id at all rather than burning a content id on a run that has no picture
-    to give it. The same helper sits in every program here.
+    it: an id that was once seen without a usable icon keeps drawing the
+    generic placeholder for good, whatever icon the window later carries, and
+    clearing the shell icon cache would have to be repeated on every PC.
+
+    Hashing the icon's own bytes into the id was the first fix, but a
+    content-only id can be poisoned just as well, and then it never recovers
+    because it only changes when the picture is redrawn. Measured again on
+    2026-09-03: Calibrations, CSS Logger, Git Work and Image Tools all drew
+    the blank window placeholder on the taskbar while their title bars carried
+    the right icon, and Diagnostic -- the only one whose id also carried its
+    file name -- drew its icon. So the running build's own file name, which
+    carries the version, goes into the hash too: every rebuild runs under an
+    id Windows has never seen, so it cannot be serving a stale picture for it,
+    on this PC or any other.
+
+    Returns None when the icon cannot be read; the caller then sets no id at
+    all rather than burning an id on a run that has no picture to give it.
+    The same helper sits in every program here.
     """
+    # A frozen build gets no taskbar identity at all, deliberately.
+    # Windows caches the taskbar picture per AppUserModelID and never re-reads
+    # it, so one bad cache entry breaks that build for good; tagging the id
+    # with the build's file name only postponed it (Diagnostic v1.1.3's id
+    # drew the blank placeholder within a day of the build). Measured
+    # 2026-09-04 with three otherwise identical windows: the app's own id ->
+    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
+    # from the exe's own resource, which the builder always embeds (verified
+    # on a purpose-built PyInstaller exe). With no id Windows keys the button
+    # on the exe itself, so there is no per-id cache left to go stale. An id
+    # is still worth having when running from source, where the process is
+    # python.exe and would otherwise wear the Python icon.
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return None
     if not ico_path:
         return None
+    import hashlib
+    import os
+    import sys
     try:
-        import hashlib
         with open(ico_path, "rb") as fh:
-            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+            data = fh.read()
     except OSError:
         return None
+    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
+                             else (sys.argv[0] or __file__))
+    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
+    return f"{prefix}.{tag.hexdigest()[:12]}"
 
 
 # Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
@@ -201,16 +231,12 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
         _wk = _load_module("workshop", "wk_t.py")
     except Exception as e:
         raise RuntimeError(f"wk_t.py error: {e}") from e
-    # One Moment is loaded last: it borrows the Slider's PV and camera pickers, the
-    # Shot Finder's frame resolver and the Workshop's painted icons, so all three must
-    # already be in sys.modules. It keeps its own try because it is the newest tab and
-    # a failure in it must not take the other four down with it.
-    _om_error = ""
-    try:
-        _om = _load_module("one_moment", "om_t.py")
-    except Exception as e:
-        _om = None
-        _om_error = str(e)
+    # One Moment is GONE, merged into the Image Finder (2026-09-04). Everything it
+    # did lives there now: click the PV graph to pick moments — every click adds one
+    # more, on any marked day — and the wall shows every picked camera at every
+    # picked moment, with the range statistics, the formulas over time, the
+    # prev/next shot arrows and the two Send-to-Slider flavours in the Finder's own
+    # panel. `om_t.py` was deleted; its design spec is folded into if_t.py's header.
     ShotFinderWidget  = _sf.ShotFinderWidget
     ImageFinderWidget = _if.ImageFinderWidget
     Viewer            = _is.Viewer
@@ -244,25 +270,6 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     tabs.addTab(viewer, "Image Slider")
     tabs.addTab(shot_finder, "Shot Finder")
 
-    # One Moment — everything at ONE time, the transpose of the Slider.
-    one_moment = None
-    if _om is not None:
-        try:
-            one_moment = _om.OneMomentWidget()
-            tabs.addTab(one_moment, "One Moment")
-        except Exception as e:
-            one_moment = None
-            _om_error = str(e)
-    if one_moment is None:
-        # Say so on a tab of its own rather than quietly offering four tabs: a missing
-        # tab reads as "this version does not have it" and sends the operator looking
-        # for a newer build that does not exist.
-        _broken = QLabel("One Moment could not be loaded:\n\n" + (_om_error or "?"))
-        _broken.setWordWrap(True)
-        _broken.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _broken.setStyleSheet("color: #b00020; padding: 24px;")
-        tabs.addTab(_broken, "One Moment (unavailable)")
-
     tabs.addTab(workshop, "Workshop")
 
     # Wire up the integration: finder can switch to slider tab and load folder
@@ -281,14 +288,10 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     viewer._workshop_tab_idx  = workshop_idx
     shot_finder._workshop_ref     = workshop
     shot_finder._workshop_tab_idx = workshop_idx
-    if one_moment is not None:
-        one_moment._workshop_ref     = workshop
-        one_moment._workshop_tab_idx = workshop_idx
-        one_moment._tab_widget       = tabs
-        # ...and "Send to Image Slider": One Moment finds the shot, the Slider is
-        # where it gets looked at (viewer.open_moment).
-        one_moment._slider_ref       = viewer
-        one_moment._slider_tab_idx   = tabs.indexOf(viewer)
+    # "Send moment" / "Send + cameras": the Image Finder finds the shot, the Slider
+    # is where it gets slid through (viewer.open_moment). This used to be One
+    # Moment's handoff.
+    finder._slider_tab_idx = tabs.indexOf(viewer)
 
     # ...and the way back: "Show in Image Slider" opens the folder a Workshop frame
     # came from. Only the folder — the Slider browses files on the share, so an edited
@@ -322,9 +325,6 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
             shot_finder._prog.setVisible(False)
             shot_finder._result_lbl.setText("Stopped.")
         except Exception: pass
-        if one_moment is not None:
-            try: one_moment.cancel_scan()
-            except Exception: pass
 
     btn_stop_all.clicked.connect(_stop_all)
 

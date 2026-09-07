@@ -50,6 +50,10 @@ def load_finder():
 CAM = "C03-040-PTM11WNF-_-IMG"
 DAY = date(2026, 8, 10)
 HOUR_UTC = 8                       # the one hour folder that exists
+# The search takes PRAGUE hours now — the tab lost its lab-time mode, so there is
+# no longer a way to ask it to read UTC hours as wall clock. 10.08.2026 is CEST,
+# so the 08 UTC folder is 10:00 Prague.
+HOUR_PRAGUE = 10
 
 
 def hour_start_ns() -> int:
@@ -115,7 +119,7 @@ def main():
         _if._cpva_fetch_samples = lambda ch, s, e, timeout=None: list(tp_samples)
 
     def run():
-        return w._find_image_for_day_cam(DAY, CAM, True, HOUR_UTC, HOUR_UTC)
+        return w._find_image_for_day_cam(DAY, CAM, HOUR_PRAGUE, HOUR_PRAGUE)
 
     def ts_of(path):
         return _if.extract_ns_from_stem(Path(path).stem)

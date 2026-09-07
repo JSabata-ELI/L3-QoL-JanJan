@@ -632,7 +632,7 @@ def _lookup_col_value(per_col: "dict[str, list[dict]]", col_meta: "dict[str, dic
 
     # No sample in window — slow PVs look back for the last known value.
     channel = CPVA_CHANNEL_MAP.get(col, col)
-    if channel in cpva.FORWARD_CHANNELS:
+    if cpva.is_step_channel(channel, int(target_ns), network_ok=allow_network):
         res = cpva.value_at_or_before(channel, int(target_ns),
                                       timeout=CPVA_HTTP_TIMEOUT,
                                       network_ok=allow_network)
@@ -779,6 +779,234 @@ def _resolve_cam_folder(hour_folder: "Path | None", cam: str) -> Path | None:
     return None
 
 
+# ── one listing per folder, shared by every camera and every moment ───────────
+# How long after an hour has ended its folder still counts as "being written to".
+# This PC's clock runs ahead of the facility and the archiver publishes about a
+# second late, so the hour is not declared closed the instant it ends.
+_HOUR_CLOSED_GRACE_MIN = 5
+# What an open folder's listing is worth before it has to be read again.
+_OPEN_FOLDER_TTL_S = 20.0
+
+
+def _hour_is_closed(day: date, hour_utc: int) -> bool:
+    """True when nothing more can ever be written into that hour's folder, so its
+    listing can be remembered for good."""
+    try:
+        end = (datetime(day.year, day.month, day.day, int(hour_utc) % 24,
+                        tzinfo=timezone.utc) + timedelta(hours=1))
+    except Exception:
+        return False
+    now = datetime.now(timezone.utc)
+    # A neighbouring hour is looked for with (hour ± 1) % 24, which at midnight names
+    # an hour of the day before or after. Such a folder is far in the past or the
+    # future; only the recent past decides anything, so anything more than half a day
+    # out is treated as settled.
+    if end - now > timedelta(hours=12):
+        return True
+    return now > end + timedelta(minutes=_HOUR_CLOSED_GRACE_MIN)
+
+
+def _ts_ns_target(ts_dt: "datetime | None", ts_ns_override: "int | None") -> "int | None":
+    """The timestamp a frame is looked for at, in UTC nanoseconds. API rows carry the
+    exact value; a picked moment arrives as a Prague-naive datetime."""
+    if ts_ns_override is not None:
+        return int(ts_ns_override)
+    if ts_dt is None:
+        return None
+    if PRAGUE is not None:
+        return int(ts_dt.replace(tzinfo=PRAGUE).timestamp() * 1_000_000_000)
+    from datetime import timezone as _tz
+    return int(ts_dt.replace(tzinfo=_tz(timedelta(hours=1)))
+               .timestamp() * 1_000_000_000)
+
+
+class DayScanCache:
+    """One reading of a share folder, reused by every camera and every moment.
+
+    Without it, resolving ONE moment for twenty cameras costs hundreds of network
+    round trips: `_resolve_cam_folder` falls back to listing the whole hour folder
+    and asking `is_dir()` about each of its ~90 camera folders SEPARATELY, and it
+    does that per camera and per probed hour; `_find_image_for_ts` then walks the
+    camera folder again for every one of them. Over SMB a folder read is about
+    150 ms, and that is where the minute went.
+
+    Here each folder is read ONCE:
+
+    * an hour folder → a name-to-path map that answers every camera at once, built
+      from the listing's own directory flags (no extra round trip per entry);
+    * a camera folder → its frame timestamps, sorted, so the nearest frame is a
+      binary search rather than another walk.
+
+    A folder that can still be written to (the hour going on right now) is re-read
+    after `_OPEN_FOLDER_TTL_S`; every closed hour is kept until the size cap evicts
+    the least recently used entry. `listings` and `hits` count real folder reads and
+    answers from memory, which is what the status line and the bench report.
+
+    Safe to share between threads: the maps are guarded, and one folder is read by
+    one worker while the others wait for its answer instead of repeating the read.
+    """
+
+    HOUR_MAX = 400
+    CAM_MAX = 1500
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._hours: "dict[str, tuple[float, dict]]" = {}
+        self._cams: "dict[str, tuple[float, tuple]]" = {}
+        self._reading: "dict[str, threading.Lock]" = {}
+        self.listings = 0
+        self.hits = 0
+
+    # ── plumbing ─────────────────────────────────────────────────────────────
+    def _read_lock(self, key: str) -> threading.Lock:
+        """The lock that says "somebody is already reading this folder". Sixteen
+        workers asking for the same hour at once must cost one folder read, not
+        sixteen."""
+        with self._guard:
+            lk = self._reading.get(key)
+            if lk is None:
+                lk = self._reading[key] = threading.Lock()
+            return lk
+
+    def _get(self, store: dict, key: str):
+        with self._guard:
+            got = store.pop(key, None)
+            if got is None:
+                return None
+            expires, value = got
+            if expires and time.time() > expires:
+                self._reading.pop(key, None)
+                return None
+            store[key] = got            # touched → back of the queue
+            self.hits += 1
+            return value
+
+    def _put(self, store: dict, key: str, value, closed: bool, cap: int):
+        with self._guard:
+            store.pop(key, None)
+            store[key] = (0.0 if closed else time.time() + _OPEN_FOLDER_TTL_S, value)
+            while len(store) > cap:
+                gone = next(iter(store))
+                store.pop(gone, None)
+                self._reading.pop(gone, None)
+
+    def stats(self) -> "tuple[int, int]":
+        with self._guard:
+            return self.listings, self.hits
+
+    def forget(self):
+        with self._guard:
+            self._hours.clear()
+            self._cams.clear()
+            self._reading.clear()
+
+    # ── the two folder kinds ─────────────────────────────────────────────────
+    def cam_folder(self, hour_folder: "Path | None", cam: str,
+                   closed: bool) -> "Path | None":
+        """That camera's folder inside the hour folder, from ONE listing of it."""
+        if hour_folder is None or not cam:
+            return None
+        key = "H|" + str(hour_folder).lower()
+        names = self._get(self._hours, key)
+        if names is None:
+            with self._read_lock(key):
+                names = self._get(self._hours, key)     # another worker just did it
+                if names is None:
+                    names = self._list_hour(hour_folder)
+                    self._put(self._hours, key, names, closed, self.HOUR_MAX)
+        return names.get(cam.lower())
+
+    def _list_hour(self, hour_folder: Path) -> dict:
+        out: "dict[str, Path]" = {}
+        try:
+            with os.scandir(hour_folder) as it:
+                for e in it:
+                    try:
+                        if e.is_dir():
+                            out[e.name.lower()] = Path(e.path)
+                    except OSError:
+                        continue
+        except Exception:
+            pass
+        with self._guard:
+            self.listings += 1
+        return out
+
+    def frames(self, cam_folder: "Path | None", closed: bool) -> "tuple[list, list]":
+        """(timestamps, paths) of the camera folder's frames, sorted by timestamp."""
+        if cam_folder is None:
+            return [], []
+        key = "C|" + str(cam_folder).lower()
+        got = self._get(self._cams, key)
+        if got is None:
+            with self._read_lock(key):
+                got = self._get(self._cams, key)
+                if got is None:
+                    got = self._list_frames(cam_folder)
+                    self._put(self._cams, key, got, closed, self.CAM_MAX)
+        return got
+
+    def _list_frames(self, cam_folder: Path) -> "tuple[list, list]":
+        pairs: "list[tuple[int, Path]]" = []
+        try:
+            with os.scandir(cam_folder) as it:
+                for e in it:
+                    if not e.is_file():
+                        continue
+                    ts_ns = _ts_from_stem(Path(e.name))
+                    if ts_ns is not None:
+                        pairs.append((ts_ns, Path(e.path)))
+        except Exception:
+            pass
+        with self._guard:
+            self.listings += 1
+        pairs.sort(key=lambda p: p[0])
+        return [p[0] for p in pairs], [p[1] for p in pairs]
+
+    def nearest_frame(self, cam_folder: "Path | None", ts_ns_target: "int | None",
+                      tol_ns: int, closed: bool) -> "Path | None":
+        """The frame closest to `ts_ns_target`, or None when the nearest one is
+        further away than the tolerance. A binary search over the remembered
+        listing — the same answer `_find_image_for_ts` walks the folder for."""
+        if cam_folder is None or ts_ns_target is None:
+            return None
+        stamps, paths = self.frames(cam_folder, closed)
+        if not stamps:
+            return None
+        i = bisect.bisect_left(stamps, int(ts_ns_target))
+        best, best_diff = None, None
+        # BOTH neighbours of the insertion point: bisect alone names the frame AFTER
+        # the moment, which is the wrong one half the time.
+        for j in (i - 1, i):
+            if 0 <= j < len(stamps):
+                d = abs(stamps[j] - int(ts_ns_target))
+                if best_diff is None or d < best_diff:
+                    best, best_diff = paths[j], d
+        if best is None or best_diff >= tol_ns:
+            return None
+        return best
+
+
+_IMG_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+
+
+def _ts_from_stem(name: Path) -> "int | None":
+    """The unix-nanosecond stamp inside an archive file name, or None when the file
+    is not one of ours. The same 19-digit scan `_find_image_for_ts` does."""
+    if name.suffix.lower() not in _IMG_EXT:
+        return None
+    stem = name.stem
+    for i in range(len(stem) - 18):
+        sub = stem[i:i + 19]
+        if sub.isdigit():
+            ts_ns = int(sub)
+            # A 19-digit run outside the plausible range is not the stamp; keep
+            # looking further along the name, exactly as _find_image_for_ts does.
+            if 946684800_000_000_000 <= ts_ns <= 4102444800_000_000_000:
+                return ts_ns
+    return None
+
+
 def _find_image_for_ts(cam_folder: Path, ts_dt: datetime,
                        ts_ns_override: "int | None" = None) -> Path | None:
     """Najde nejbližší obrázkový soubor k timestampu (max 5s tolerance).
@@ -832,7 +1060,8 @@ def _find_image_for_ts(cam_folder: Path, ts_dt: datetime,
 
 def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None",
                        hour_cache: dict, images_root: "Path | None" = None,
-                       day_dir: "Path | None" = None
+                       day_dir: "Path | None" = None,
+                       scan_cache: "DayScanCache | None" = None
                        ) -> "tuple[Path | None, Path | None]":
     """(matched image, camera folder it was looked for in) for ONE shot.
 
@@ -844,7 +1073,13 @@ def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None
     can only ever contribute a frame from just across the boundary.
 
     hour_cache maps hour → camera folder, so resolving many shots of one day does not
-    re-probe the share. Call from a worker thread: os.scandir over SMB blocks ~150 ms."""
+    re-probe the share. Call from a worker thread: os.scandir over SMB blocks ~150 ms.
+
+    scan_cache is the shared `DayScanCache`. hour_cache spares THIS camera a second
+    probe of an hour it has already seen; the scan cache spares EVERY camera and every
+    later moment the folder read altogether — one listing of an hour folder answers all
+    twenty cameras, and one listing of a camera folder answers every moment inside that
+    hour. Without it, twenty cameras cost hundreds of round trips over the share."""
     if dt_obj is None or not cam:
         return None, None
     hour_utc = _folder_hour_from_prague(dt_obj.hour, day)
@@ -853,11 +1088,16 @@ def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None
         if hf is None:
             return None, None
         day_dir = hf.parent
+    target_ns = _ts_ns_target(dt_obj, ts_ns)
     first_folder = None
     for delta in (0, -1, 1, -2, 2):
         h = (hour_utc + delta) % 24
+        closed = _hour_is_closed(day, h)
         if h in hour_cache:
             cam_folder = hour_cache[h]
+        elif scan_cache is not None:
+            cam_folder = scan_cache.cam_folder(day_dir / str(h), cam, closed)
+            hour_cache[h] = cam_folder
         else:
             cam_folder = _resolve_cam_folder(day_dir / str(h), cam)
             hour_cache[h] = cam_folder
@@ -865,7 +1105,11 @@ def _find_image_in_day(day: date, cam: str, dt_obj: datetime, ts_ns: "int | None
             continue
         if first_folder is None:
             first_folder = cam_folder
-        img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns)
+        if scan_cache is not None:
+            img = scan_cache.nearest_frame(cam_folder, target_ns, IMG_MATCH_TOL_NS,
+                                           closed)
+        else:
+            img = _find_image_for_ts(cam_folder, dt_obj, ts_ns_override=ts_ns)
         if img is not None:
             return img, cam_folder
     return None, first_folder
@@ -943,6 +1187,29 @@ class _ChannelSignals(QObject):
     loaded = Signal(list)  # archiver channel names
 
 class _NoScrollComboBox(QComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class _TrimSpinBox(QDoubleSpinBox):
+    """A number box narrow enough that it must not waste room on trailing zeros.
+
+    The left panel is ~275 px wide, so the target/tolerance boxes are 50-56 px.
+    With three fixed decimals a tolerance of 2000 was PAINTED as "2000." and read
+    like a 2 — and a ±2000 J band matched every shot of every day while the user
+    believed the search was ±2 J. Trailing zeros carry no information, so they are
+    the part that gets dropped; the digits that decide the search are always shown.
+
+    The wheel is ignored for the same reason _NoScrollComboBox exists: a scroll
+    over the panel must never silently retune the search."""
+
+    def textFromValue(self, value):
+        s = super().textFromValue(value)
+        dp = str(self.locale().decimalPoint())
+        if dp and dp in s:
+            s = s.rstrip("0").rstrip(dp)
+        return s or "0"
+
     def wheelEvent(self, event):
         event.ignore()
 
@@ -1437,7 +1704,7 @@ class ShotFinderWidget(QWidget):
 
         # ══════════════════ Group: CAMERAS ══════════════════════════════════
         # The search box + floating suggestion list that used to sit here are what
-        # the Cameras… button now opens; the panel keeps only the picked cameras.
+        # the Cameras button now opens; the panel keeps only the picked cameras.
         ll = s_cam.body_layout
         ll.addWidget(QLabel("Selected cameras:"))
         self._cam_selected = QTableWidget(0, 2)
@@ -3043,11 +3310,16 @@ class ShotFinderWidget(QWidget):
             channel = self._col_channel(col)
             chan_line = (f"\nArchiver channel: {channel}"
                          if channel != full_label else "")
-            chk.setToolTip(
+            row_tip = (
                 f"{full_label}{chan_line}\n"
                 "Ticked: search filters on this PV (target ± tolerance).\n"
                 "Unticked: value is only shown in the results and on the images.\n"
                 "Right-click: rename, copy channel name, remove.")
+            chk.setToolTip(row_tip)
+            # The same tip on the whole row: the name is elided to ~68 px and the
+            # rest of the row is empty stretch, so pointing "at the PV" usually
+            # means pointing next to the tick box, where there was no tip at all.
+            row_w.setToolTip(row_tip)
             # The menu is hooked to the tick box as well as to the row: the box covers
             # most of the row, and a policy set on the parent alone never sees the
             # child's context-menu event.
@@ -3065,7 +3337,7 @@ class ShotFinderWidget(QWidget):
             t_lbl = QLabel("T:")
             t_lbl.setStyleSheet("font-size: 10px;")
             tgt_l.addWidget(t_lbl)
-            t_sb = QDoubleSpinBox()
+            t_sb = _TrimSpinBox()
             t_sb.setRange(-1e9, 1e9)
             t_sb.setDecimals(3)
             t_sb.setValue(cfg.get("target", 10.0))
@@ -3075,14 +3347,30 @@ class ShotFinderWidget(QWidget):
             pm_lbl = QLabel("±")
             pm_lbl.setStyleSheet("font-size: 10px;")
             tgt_l.addWidget(pm_lbl)
-            tol_sb = QDoubleSpinBox()
+            tol_sb = _TrimSpinBox()
             tol_sb.setRange(0.0, 1e9)
             tol_sb.setDecimals(3)
             tol_sb.setValue(cfg.get("tol", 0.0))
-            tol_sb.setFixedWidth(50)
-            tol_sb.setToolTip(
-                f"Tolerance around the target for {full_label}\n{channel}")
+            tol_sb.setFixedWidth(56)
             tgt_l.addWidget(tol_sb)
+            # A tolerance as big as the target lets EVERY value through — that is
+            # never what someone means by "20 ± something", so the box says so
+            # instead of the search quietly returning the whole day.
+            def _mark_tol(*_a, _t=t_sb, _tol=tol_sb, _lbl=full_label, _ch=channel):
+                tip = f"Tolerance around the target for {_lbl}\n{_ch}"
+                if _tol.value() >= abs(_t.value()) and _tol.value() > 0:
+                    _tol.setStyleSheet(
+                        "QDoubleSpinBox { background: #fff3cd; color: #856404;"
+                        " font-weight: 700; }")
+                    _tol.setToolTip(
+                        tip + "\n⚠ This band is wider than the target itself — "
+                              "every archived value matches it.")
+                else:
+                    _tol.setStyleSheet("")
+                    _tol.setToolTip(tip)
+            t_sb.valueChanged.connect(_mark_tol)
+            tol_sb.valueChanged.connect(_mark_tol)
+            _mark_tol()
             unit = self._col_unit(col)
             if unit:
                 u_lbl = QLabel(unit)
@@ -3727,7 +4015,7 @@ class ShotFinderWidget(QWidget):
         return m.group(1) if m else ""
 
     def _open_camera_picker(self):
-        """The Cameras… button — the Image Slider's own picker, over the cameras
+        """The Cameras button — the Image Slider's own picker, over the cameras
         found in the picked time window. Presets are shared with the Slider, so a
         camera set saved in one tab is offered in the other."""
         # A scan may never have run for this range (or have failed): let the dialog
@@ -3743,12 +4031,11 @@ class ShotFinderWidget(QWidget):
             day_obj, 0, 23,
             [n for _num, n in self._selected_cameras],
             parent=self,
-            preloaded_cameras=list(self._all_cameras))
-        # The Slider configures its multi-camera grid from this dialog; the Shot
-        # Finder has no grid, so that button would lead nowhere.
-        btn_layout = getattr(dlg, "_btn_layout", None)
-        if btn_layout is not None:
-            btn_layout.setVisible(False)
+            preloaded_cameras=list(self._all_cameras),
+            # The Slider arranges its multi-camera grid in this dialog; the Shot
+            # Finder has no grid, so the whole Layout section would lead nowhere —
+            # and it must not rewrite the arrangement the Slider remembers either.
+            show_layout=False)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._set_selected_cameras(dlg.selected_camera_names())
@@ -3820,6 +4107,12 @@ class ShotFinderWidget(QWidget):
 
         # The list a search was actually run with is the one worth having back.
         self._save_pv_state()
+        # Kept for the results heading: the band the rows below it were judged
+        # against, so a surprising result can be checked against it on the spot.
+        self._searched_bands = [
+            f"{self._col_short(c['col'])} {c['target']:g} ± {c['tol']:g}"
+            + (f" {self._col_unit(c['col'])}" if self._col_unit(c["col"]) else "")
+            for c in criteria]
 
         search_cols = [c["col"] for c in criteria]
         col = search_cols[0]  # primary column
@@ -4299,7 +4592,11 @@ class ShotFinderWidget(QWidget):
             status_color = QColor("#856404")
             row_bg       = QColor("#fff3cd")
         elif n_tol > 1:
-            status_str   = f"✓ {n_tol} shots in range"
+            # "values", not "shots": this counts the archived samples of the searched
+            # PV that fall inside the band, and the archiver stores more than one
+            # sample per shot. Calling them shots made a day of a wide-open band look
+            # like tens of thousands of shots that never happened.
+            status_str   = f"✓ {n_tol} values in range"
             status_color = QColor("#155724")
             row_bg       = QColor("#d4edda")
         else:
@@ -4318,14 +4615,33 @@ class ShotFinderWidget(QWidget):
             status_str,
             folder_str,
         ]
+        # Which band the row was actually judged against — the panel's boxes may
+        # already have been retyped, and a row that looks wrong is nearly always a
+        # band that was wider than intended.
+        band_tips = []
+        for crit in criteria_csv_res:
+            cc = crit["col"]
+            unit = self._col_unit(cc)
+            t_ui = crit.get("target_ui")
+            if t_ui is None:
+                t_ui = crit.get("target_csv", 0.0)
+            band_tips.append(
+                f"{self._col_short(cc)}: {t_ui:g} ± {crit.get('tol_ui', 0.0):g}"
+                + (f" {unit}" if unit else "")
+                + f"  ({self._col_channel(cc)})")
+        band_tip = "Searched band:\n" + "\n".join(band_tips)
+
         for c, text in enumerate(cells):
             item = QTableWidgetItem(text)
             if row_bg:
                 item.setBackground(row_bg)
-            if c == 2 and pv_tips:
+            # PV / Value / Δ all name the same PVs — every one of them says which
+            # archiver channel it read.
+            if c in (2, 3, 4) and pv_tips:
                 item.setToolTip("\n".join(pv_tips))
             if c == 5:
                 item.setForeground(status_color)
+                item.setToolTip(band_tip)
             if c == 6:
                 if folder_path is not None:
                     item.setData(Qt.ItemDataRole.UserRole, str(folder_path))
@@ -4384,8 +4700,8 @@ class ShotFinderWidget(QWidget):
             QMessageBox.information(self, "Nothing to show", f"{dr.day}: {dr.reason}.")
             return
         if not dr.rows_in_tol:
-            QMessageBox.information(self, "No shots",
-                                    f"No shots within tolerance for {dr.day}.")
+            QMessageBox.information(self, "Nothing in range",
+                                    f"No values within tolerance for {dr.day}.")
             return
         self._show_day_panel(dr)
 
@@ -4401,10 +4717,12 @@ class ShotFinderWidget(QWidget):
         # Reporting the row count alone would call a table full of failures a success.
         n_ok = sum(1 for dr in all_results if dr.status == "ok")
         n_cams = len(self._cam_order)
+        bands = getattr(self, "_searched_bands", [])
         self._result_lbl.setText(
             f"Results: {n_ok} with an image"
             + (f", {n - n_ok} without" if n > n_ok else "")
-            + (f"  ({n_cams} cameras)" if n_cams > 1 else ""))
+            + (f"  ({n_cams} cameras)" if n_cams > 1 else "")
+            + (f"   ·   {' , '.join(bands)}" if bands else ""))
         self._log(f"Search done — {n} row(s), {n_ok} with an image")
         # _set_busy(False) re-enables every control, so the export buttons must be
         # re-evaluated afterwards: they act on the tab in front, not on the whole search.

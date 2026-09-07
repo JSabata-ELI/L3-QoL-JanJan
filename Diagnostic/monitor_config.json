@@ -17,6 +17,7 @@
     "trend_speedup_factor": 2.0,
     "trend_slowdown_factor": 2.0,
     "history_minutes": 720,
+    "refresh_alarm_minutes": 3.5,
     "data_watchdog_enabled": true,
     "data_watchdog_fail_polls": 2,
     "frozen_check_enabled": true,
@@ -34,6 +35,25 @@
     "graph_pv_panel": true,
     "start_monitoring_on_launch": false,
     "alert_plot_hours": 12,
+    "okbase_enabled": true,
+    "okbase_base_url": "",
+    "okbase_username": "",
+    "okbase_password": "",
+    "okbase_session_cookie": "dpapi:AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAjS2YkMhhsUe2DZJz9nfyNQAAAAACAAAAAAAQZgAAAAEAACAAAAA/29RjUS7nHQrv0g7Pb4JgDCT4+57cMM6C8CfK4IsnKgAAAAAOgAAAAAIAACAAAAAauC8LQNhde4449iEbNwi9WgA3sRrM5WHi783+LoX6hQAIAABiwO8mzmoCe//suGs19YJKqUgSz1x6ySvk+NwPpJECWg0HjR1fBaX3ZMuFXWnkSC9cxLsamh4KSYWcIN+vLSlbr16gfbViBa+7Funyz9Q/4Wp2VQRzPdlkbr9MIyz4JPtdpmv0SAXCE35Ca2m3X8/ZpBRWm2Qx/SZIOZxUG7NeldihXZQQISqCjFEPC4WuYzEBu2EqGoak5bDoQXWNrWrhYJGEd3X5yAkewc+OJ2AwJo2ZXArNnFIVhZgYS9xOzwQuNJP5X2ufp3pIoqQh6OEb71gmxYV/25ODRH4WfCxH3jrCCzrenSz66luiJGhfQdDVQnixSOBZZ1BHWXrDI9nHBguKiQtUNGvUSWNQqHJbkRWpxA/m0G1BIAMqLNPEwhbCkCeMWJWeQbkgMvAKnK6lyFEwSEBba0L86hEmv2X0pBS2Os04WmSCeLrFePggBklp1QimOouXH8j58qkRs5XYptgf7Y3cYTR/3aQNwM/6LjW9B/9ydKvsl1bmj4Ib0SThXh3tNZ54/ddLUjiDe2uISe2K5uxzhjuHNQ0cBWxCXS0aTWGuekzTxRjdrJIh7s96WAmZ0OtbmeWb4lEW3WuC8VOJxYKVHOOvfuQ6ag0bofg+7A/1UvuJKkxWtOXSI5eI49ge2S3UVb9tq0bnODfjthJf4dLBK9XCSM2nBhElWQ6OGH3xwc6vl/IlR12yLYH7Jxx4jA3f2c6RFu8Sl9TnfFS3+gM/EC0f1T3DRwXbw2KujwqmypyqamOx8wBk8fw7XSQO0s33j78ud9bXP1bopaUTzhSaGf3R4H5R4v0OKlu0jdH3Dlmlz18UAx4kwVlHsk4fTPvbW/LPbVFON5RJIEmSv/JDZJ4yNOPfu+9/vBow6aGg5L/0hfEo/2bDGMsdp6PzaGUwdyBedd7Y3BDEAM+a5+AXv/OVG8ahcS3hnbMg/QGtg0cEItjGsxfAcmYWQ5KePMqBp6rldSY6vAiOKabPM9owXfmuudCqkyg3XhfASzMnVPIS+uzqUng/PpR3K0KIB+IRygSSnm4kD0g9d77a3AJHyZ0iTuT8r0MncNPjJ3/B9Aqi1mCwyyYMVDRJeUBirZHaOl/FaHHAup7vB6CiE//nkOtyPBS84Oh98pCcbwBns6UfyOwLHVK8eqrphZQFrQPo+39aoup7rTqp5UFrFyPgFh21CgSo+h6bi9DlP3lNZjNATpTDx8m+N8vxo2Dls+3q1vQU5RIIedO7R/9pzbTWj6E0iDwgrDS/W6JXHCLBt23pqXfIbpHIjxo6GjGKVpX0YN6kRmyzkFeveOuQY/PBkLaxt0Rak9kN6IEorGulqo6Bjk/mgy9e4y37PkkCKuJBDc6/TYj6HOuS53H4kEoP87i88LObAbCHEHiBSjFTNA/upX1cjK/pXMtD5ByEsK50yWof2DbTdpguyaEsFgXJUVEw9gKiwcPVHTD4WyEHPAZXw87U/CNriwWNk9e/ZQuUaLhPZWChZH7teDBYCE+ppHFD+DNwJCjbSV542bwxRxXrBz2wXYKUkXxE1zN7oxYNSXOOCLo/+mgfGD3yRiT3IY54DUa0hTOI9KagMnu5+1mNVffTTvxvsDmNuFyD37MkzecPVnHnNQ2B4sY4v3qKi81PDZ2ue1k4nzie2LuJpqPOaWom2khjIIryAGpI8n5SFbJ+d9Tc6M5/Ng7fBenUhvzRD1d0ywudZhw7PG2o930RD8l8UMVdiS1HkZrZEaO2hWro0SpCwi2H33VODWfWFNVwp09T16SPMg9cPDlzm95tig8TXiQfan/+You3WSrZ3KqqcKznOejgr17i2hahSyo+wwuU64yZPVyDqc2PwQF9uFMfdhcCZGbjtJ4K8uvFKThxDdlK0fo1U1OYN5U+hWXKrrcZIbR0PM+vjq72pamd+jYve7/E480+JDZ/w5CZT2p9mmHBMpMMlAbhFI0Q557finvFATgE9u5bgGNzIPDn6fdd54y7HweFbQvA+Wy/pNk5ZugpqZDLiMU0F66eizyzwElX/Apn5wG1BVAp1S2MGSreQ7mBBCq8yGB/xEXk9n8khm+rxe3q5bC2oQLqMlI1nNpT21YhbzvvrWi0iHBgL4QGf4jHyjM5IYRxhJQc9n8lpMZ65ZHCP5ltL7roW/xFPzhAHD1mmdyLm1V7HiA0LpyJ3wrIFHpyEF8/Tl79O/S25eNPbt+RTgUd4H69DvFfi8h9e8iIcPIpbfL+/geiMVDkBhnmtvHPY6xxmQeAqq6DDtNSipj7e42S99uSiCfOT9K7EJvX+ZNI4y+nK8VQVh+kKbJxRxVxP5qeWgxuUq7lsblzNzG2Ufb3Yj3hbyxx6Xo5kkHqn/m54jzy4A6ICEUUMUnTpw6WJu9dNUxmYfDYA4YGBDsraffHTcYXU5P1xOJO3RkMOZg/2n4HUuZ5ZtWOu04Q9m3Y0J1dcwccTpbhg0/6CDGAgtbLaK/ElMtHRQ6NBftEkaRFL11mpwEJFgD9WjmCP73/VqZze3fgbNxlMQP16ovpsWn05Cy44PjLKlNDUcKIXjQH12/KUPQl9l0niX0lJjXiYuqeY/WZsZdTEPyl2UkA/jkezT7+yp5OeN7Kjalvc8bkal4Eu4FlM8dXv4+FNtUiNPcLcH/jXERfymMWZHJCHRwF+f+Fk6eHIDv4w5nz5TcxCvIx7LQaDscNvPsAPVhHnA1PLHvF3sYvM5goDmJ8YDq/k+Zj9ENMymnems04wkAAAAA75y7NbdgxycClfYdAMlyFyDv/5qaLcEl7u1grdpNEZEX48VyxjxYmRPVOEj9m1NsaKwj5uCdMa+coEeGiPm21",
+    "okbase_canteen_id": 1,
+    "okbase_user_id": 6507822,
+    "okbase_filter": {
+      "datumOd": "2026-07-27T00:00:00.000+02:00",
+      "datumDo": "2026-09-06T00:00:00.000+02:00",
+      "weekStart": "2026-08-24T00:00:00.000+02:00",
+      "weekEnd": "2026-08-30T00:00:00.000+02:00",
+      "userId": 6507822,
+      "jidelnaId": 1,
+      "objednavky": {}
+    },
+    "okbase_timeout_s": 20.0,
+    "okbase_refresh_hour": 6,
+    "okbase_keepalive_min": 10,
     "shared_pv_list_enabled": true,
     "shared_pv_list_path": "",
     "shared_pv_list_timeout_s": 3.0,
@@ -54,7 +74,7 @@
       "alarm_low": 7.0,
       "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus",
+        "L3-UTIL-CHL03-001:PumpON",
         "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
@@ -83,8 +103,8 @@
               1.0
             ],
             [
-              2.3,
-              2.3
+              3.0,
+              3.5
             ]
           ],
           "warn_low": 13.8,
@@ -112,7 +132,7 @@
       "alarm_low": 7.0,
       "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus",
+        "L3-UTIL-CHL03-002:PumpON",
         "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
@@ -141,8 +161,8 @@
               1.0
             ],
             [
-              2.0,
-              3.0
+              3.0,
+              3.5
             ]
           ],
           "warn_low": 12.1,
@@ -170,7 +190,7 @@
       "alarm_low": 7.0,
       "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus",
+        "L3-UTIL-CHL03-003:PumpON",
         "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
@@ -199,8 +219,8 @@
               1.0
             ],
             [
-              2.0,
-              3.0
+              3.0,
+              3.5
             ]
           ],
           "warn_low": 8.6,
@@ -228,7 +248,7 @@
       "alarm_low": 7.0,
       "alarm_high": 24.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus",
+        "L3-UTIL-CHL03-004:PumpON",
         "L3-TIMING-TIMING:SysRate"
       ],
       "profiles": [
@@ -257,8 +277,8 @@
               1.0
             ],
             [
-              2.0,
-              3.0
+              3.0,
+              3.5
             ]
           ],
           "warn_low": 8.2,
@@ -275,7 +295,7 @@
     },
     {
       "name": "L3-UTIL-CHL03-005:Temp",
-      "display_name": "He Chiller",
+      "display_name": "Helium Chiller",
       "units": "DegC",
       "group": "Temperatures",
       "subgroup": "Chillers",
@@ -286,12 +306,17 @@
       "alarm_low": 15.0,
       "alarm_high": 25.0,
       "gate_pvs": [
-        "L3-SIS-KEY:HighPowerStatus"
+        "L3-SIS-KEY:HighPowerStatus",
+        "L3-UTIL-CHL03-005:PumpON"
       ],
       "profiles": [
         {
           "label": "Operations",
           "conds": [
+            [
+              1.0,
+              1.0
+            ],
             [
               1.0,
               1.0
@@ -331,12 +356,17 @@
       "alarm_low": 18.0,
       "alarm_high": 22.5,
       "gate_pvs": [
-        "L3-SIS-KEY:LowPowerStatus"
+        "L3-SIS-KEY:LowPowerStatus",
+        "L3-UTIL-CHL03-006:PumpON"
       ],
       "profiles": [
         {
           "label": "Operations",
           "conds": [
+            [
+              1.0,
+              1.0
+            ],
             [
               1.0,
               1.0

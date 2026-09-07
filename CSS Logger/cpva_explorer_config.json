@@ -1,17 +1,11 @@
 {
   "pv_list": [
-    "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy",
-    "HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",
-    "L3-PFWP6-MTR03-1:RawPos",
-    "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
-    "L3-PM03-023:Energy",
-    "L3-PM03-025:Energy",
-    "L3-VCS-LN36:OPEN",
-    "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy"
+    "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
+    "L3-TIMING-TIMING:SysRate"
   ],
   "time_preset": "past_24h",
-  "time_from": "2026-08-21 14:48:12",
-  "time_to": "2026-08-21 15:48:12",
+  "time_from": "2025-09-04 14:50:07",
+  "time_to": "2026-09-04 16:06:29",
   "http_timeout": 10.0,
   "conditions": [
     {
@@ -38,10 +32,10 @@
   "master_pv": "L3-PFWP6-MTR03-1:RawPos",
   "master_multiple": "1000",
   "suite_geometry": [
-    4480,
-    -151,
-    2560,
-    1369
+    4489,
+    -142,
+    2542,
+    1351
   ],
   "avg_target_points": 2000,
   "graph_opts": {

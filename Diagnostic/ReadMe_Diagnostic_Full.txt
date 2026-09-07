@@ -65,8 +65,11 @@ Two consequences worth knowing:
 | `operation_history_logic.py` | Long-term drift per waveplate, behind the History tab (see the note above about its missing input file) |
 | `test_alerting.py` | Offline tests for the alerting layer, including the frozen-value detector (`python test_alerting.py`) |
 | `test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict, its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python test_monitor_frozen.py`) |
+| `test_rule_change_grace.py` | Offline tests for the hold that follows a change of the limits in force: when it opens, what it does to a half-built alert state, what the table and the bot say while it runs, and a regression test reproducing the end-of-shift chiller messages with the hold switched off (`python -m pytest test_rule_change_grace.py`) |
 | `test_bot_commands.py` | Offline tests for the chat command grammar (`python test_bot_commands.py`) |
-| `build_config.json`, `icon.ico` | Build settings for Dev Tools (`extra_files` carries `notify_provision.dat`, `win32crypt` is forced into the bundle) and the app icon |
+| `edge_cdp.py` | The **Sign in with Edge** button: opens a browser window of its own on the canteen page, waits for the sign-in, and reads it out of that window. No extra library — it carries a small websocket client of its own |
+| `test_edge_cdp.py` | Offline tests for that, with no browser and no network (`python -m pytest test_edge_cdp.py`) |
+| `build_config.json`, `icon.ico` | Build settings for Dev Tools (`extra_files` carries `notify_provision.dat`; `win32crypt`, `okbase_menu` and `edge_cdp` are forced into the bundle) and the app icon |
 | `STRUCTURE.md` | Developer map of every module, class and function |
 
 Leftovers from the removed repository pipeline, kept only so old data is not
@@ -90,9 +93,12 @@ monitor_tab._PollWorker          every poll_interval_s, poll_max_workers at a ti
   ▼
 PVRuntime.samples (in memory)  ──►  PVTableModel (table)  ──►  GraphPanel (plot)
   │
+  ├─ _check_limits_change        holds alerting after the rule in force changes
   ├─ alerting.AlertEvaluator     thresholds + debounce/settle + re-notify
   ├─ alerting.detect_frozen      "not updating"  (this PV's reading is dead)
-  ├─ _check_refresh_health       "not refreshed" (this program stopped reading)
+  ├─ _check_refresh_health       "not refreshed" (this program stopped reading;
+  │                              marks the screen and the replies at once, tells
+  │                              the chat only if the stall lasts)
   ▼
 alerting.NotificationHub  ──►  Teams webhook / SMTP email / Webex rooms
                                         ▲
@@ -169,11 +175,17 @@ Live monitoring and alerting — in practice the whole program.
   with the recent trend (`trend_*` keys), recovery notices, and a data watchdog
   that alerts once when *every* PV stops returning data for
   `data_watchdog_fail_polls` polls and once when the flow resumes.
+- **Rule-change grace** — a conditional rule swaps a PV's whole band the instant
+  its dependency PVs move, and the measured value cannot follow that fast, so
+  alerting for that PV is held for `rule_change_grace_minutes` after every such
+  change (`_check_limits_change`, `PVRuntime.grace_until_ns`). See below.
 - **"Not updating" check** — a per-PV freshness check for data that arrives but
   is no longer live (`frozen_*` keys, `alerting.detect_frozen`). See below.
 - **Refresh watchdog** — the program's own pulse: if no pass has landed for
-  several intervals, everything on screen and every chat answer is marked
-  `not refreshed` and the bot announces it unasked. See below.
+  `refresh_alarm_minutes` (Settings, default 3.5 min), everything on screen and
+  every chat answer is marked `not refreshed`; a stall lasting past
+  `refresh_alert_minutes` (default 30 min) is also said in the chat, once, with
+  one more message when reading resumes. See below.
 - **Settings** — everything above, plus the notification channels (or, in a
   provisioned build, a read-only summary of them) and the share location.
   `DEFAULT_SETTINGS` is the single source of truth for keys and defaults;
@@ -340,34 +352,306 @@ Time windows (Europe/Prague, may be given in any option position):
 | `yesterday 7-18` | clock window on that day |
 | `15.8. 7-18`, `15.8.2026 7-18`, `2026-08-15 7-18` | clock window on that date |
 | `2026-08-15`, `15.8.` | that whole day |
+| `1.1. 9:00 - 1.9. 12:00` | a range between two points in time |
+| `1.1. - 1.9.` | the same, whole days — 1 September included |
+| `15.8. 9:00 - 22:00` | a side without a date takes the other side's date |
+| `yesterday 21:00 - now` | `now` is allowed as the right-hand end |
 
 A window running past the current time is cut off at now and the reply says
-`(so far)`. A bare `15.8.` with no year means the most recent 15 August.
+`(so far)`. A bare `15.8.` with no year means the most recent 15 August — except
+at the far end of a range, where it means the day that follows the near end, so
+`1.9. - 5.9.` asked on 2 September is the days coming up, not last year's. A
+range that ends before it starts is refused rather than quietly moved, and so is
+anything longer than three years.
 
 `y 15-35` fixes the Y range of the plot, `y auto` leaves it automatic.
+
+`detail` reads every single reading instead of the fast summary described below.
+Right for a close look at a few hours; slow over months.
 
 The commands themselves:
 
 | Command | What it does |
 |---|---|
 | `/help`, `/?` | this cheat sheet (a bare `help` with no slash works too) |
-| `/status [pv, pv]` | value + state for all PVs, or only the named ones. Always ends with when those values were read; if the program has stopped reading, a warning goes above the list and each line reads `not refreshed` in place of `ok` |
+| `/status [pv, pv]` | value + state for all PVs, or only the named ones. Always ends with when those values were read; if the program has stopped reading, a warning goes above the list and each line reads `not refreshed` in place of `ok`. The whole-list reply also carries the uptime and memory footer, and — only when the canteen sign-in has actually been refused — one quiet line about that |
 | `/alarms` | only PVs currently in warning/alarm. Refuses to answer "all clear" while the values are out of date |
 | `/list` | the configured PVs |
-| `/plot <pv, pv, …>[; window][; y lo-hi]` | **one** graph with a curve per PV. `/plot all` takes every PV. A single PV also gets its warning/alarm lines — an overlay does not, since the lines would belong to no visible curve. Without a window option the **Alert plot window** from Settings is used |
+| `/plot <pv, pv, …>[; window][; y lo-hi][; detail]` | **one** graph with a curve per PV. `/plot all` takes every PV. A single PV also gets its warning/alarm lines — an overlay does not, since the lines would belong to no visible curve. Without a window option the **Alert plot window** from Settings is used. Over a long window see "A plot over weeks or months" below |
+| `/cancel`, `/abort` | take back a plot that is still being fetched. A year-long window is hundreds of requests to the archiver and minutes of waiting; this stops the requests that have not gone out yet and sends nothing, so the right window can be asked for straight away. Requests already in flight still have to come back, so the reply is not instant. "Nothing is running" means there was nothing to take back |
 | `/start` | alerting on (PVs are read and plotted either way) |
-| `/stop [hours]` | alerting off; with hours, auto-resume later |
+| `/stop [hours]` | alerting off; with hours, auto-resume later. This is about **alerting**, not about a running plot — that one is `/cancel`. If a plot is still being fetched, the reply says so and offers `/cancel` |
 | `/enable <pv, pv>` / `/disable <pv, pv>` | alerting per PV |
 | `/datawatchdog on\|off` | the "no data at all" alert; no argument shows the state |
 | `/graph <pv\|all>` | what the app window itself shows (one PV or all) |
 | `/window <minutes>` | time window of that live graph |
 | `/yaxis <lo-hi>`, `/yaxis auto` | Y range of that live graph |
 | `/run` | belongs to the always-on listener, which starts the app when it is closed. The app answers it too, so that when the listener is not running the reply is "Diagnostika uz bezi" and not "unknown command" |
+| `/food [when][; language]` | the canteen menu from OKbase. No argument = today until 14:30 and the next serving day after that (`/food today` overrides it); `week`, `next week`, `tomorrow`, a weekday name (`friday`), or a date (`27.8.`, `2026-08-27`). `; cz` or `; en` picks one language, otherwise both are shown. `/food refresh` reads the portal again on the spot; `/food status` says what is saved, what it is doing and whether the sign-in still works. `/menu` and `/lunch` are the same command |
 
 The rendered plot goes to **every** enabled channel, not only to the chat: Webex
 rooms get the PNG, e-mail gets it as an attachment, Teams gets the text (an
 Incoming Webhook cannot carry an image). If no PV had archived data in the
 window, the message still goes out and says so.
+
+
+A plot over weeks or months
+---------------------------
+
+A chiller writes a reading every second or so, which is about 90 000 readings a
+day. Half a year of two of them is 26 million readings — more than there are dots
+on the picture, and far more than can be fetched one hour at a time. So a long
+window is read and drawn differently.
+
+**What you get.** The line is the *average* of each point on the picture, and
+around it is a shaded band from the *lowest* to the *highest* reading that point
+covers, with a thin line along each edge. That band is the important part: a
+single reading that jumped to 41 °C for two seconds three months ago is one dot
+wide, but it is drawn at full height, so it is still visible. An average alone
+would have hidden it completely. With more than three curves on one picture the
+bands are left out — they would overlap into mud — and the caption says so.
+
+**How long it takes.** The program first measures how densely each PV is written
+and then asks the archiver for as much at a time as it will answer without
+choking. A chiller over 180 days costs 360 requests instead of 4320, and two of
+them come back in about four minutes rather than forty. The reply tells you the
+plan (`600 requests, roughly 4 min`) as soon as it is known, then reports
+progress, and `/cancel` stops it at any time.
+
+**Why it can no longer take the computer down.** On 2.9.2026 a 180-day graph
+filled the entire memory of the laptop — the screen went black and the machine
+had to be switched off by holding the power button. One reading out of the
+archive is not just a number and a time: it carries its status, quality and
+units too, about 1.7 kB of memory each. The program had asked for whole days at
+a time of a channel written many times a second, ten such requests at once, and
+that is tens of gigabytes.
+
+Three things changed. The program now **refuses an answer bigger than 32 MB**
+while it is still arriving and asks for a shorter stretch instead; it **works
+through a long stretch piece by piece** rather than holding all the pieces; and
+it tells apart *"I measured this channel and it is quiet"* from *"I could not
+measure it at all"* — the second one used to be planned as if it were the first,
+which is what asked for those whole days. Reading 180 days now takes about
+270 MB of memory whether the window is a week or half a year.
+
+As a last resort it also watches its own memory while reading. If it ever gets
+tight anyway, it stops, draws what it managed to read and stamps the picture
+`STOPPED EARLY - not enough memory to read it all`, with the reason in the
+reply. A partial graph that says so is always better than a frozen PC.
+
+**When it samples.** If reading every stretch of a very long window would take
+too many requests, the program reads an evenly spread part of it instead — say
+one hour out of every four, across the whole window — and then the picture is
+stamped `SAMPLED - 24 % of the window read` and the message says the same. The
+shape and every peak *inside* a read stretch are real; a spike falling *between*
+two read stretches would not show. Add `; detail` to read all of it however long
+it takes.
+
+**Blank patches mean three different things**, and the reply always says which:
+
+- *the archiver holds no readings there* — it was read, and there was nothing;
+- *it could not be read* — the request failed. The message says
+  "4 % of the window could not be read", and those stretches are blank on the
+  plot, **not** zero;
+- *it was not asked for* — either because the plot is sampled, or because the
+  reading was stopped early to save the computer's memory. Both stamp the
+  picture and say so in the reply.
+
+A PV that cannot be read no longer takes the other curves with it: the ones that
+worked are drawn, and the message names the one that did not.
+
+#### The canteen menu (`/food`)
+
+The meals come from the OKbase portal
+(`elieric.okbase.cz` → Stravování → Objednávka jídel). That is an Angular page
+over a JSON interface, so `okbase_menu.py` is an API client and not a scraper;
+there is no HTML parsing and no extra library in the build.
+
+**Which day a plain `/food` means.** Today, until **14:30**. After that lunch
+has been served and the useful answer is the next day there is something to eat,
+so a bare `/food` moves on by itself. It does not simply add a day: it walks
+forward to the next day the saved menu actually offers meals, so a Friday
+afternoon lands on Monday rather than on an empty Saturday, and a holiday is
+stepped over the same way. Nothing about this is silent — the heading names the
+day it is showing — and any day asked for by name (`/food today`, `/food 27.8.`,
+`/food week`) is left exactly where it was asked for. The cut-off is
+`okbase_menu.LUNCH_OVER_AT`.
+
+**How the answer is laid out.** Meals are grouped by course with a heading each
+(`🥣 Soups`, `🍛 Main courses`, …) and numbered inside the group. The course used
+to be a label at the end of every line, which put the word "soup" exactly where
+the eye looks for the price.
+
+The canteen puts the Czech and the English name into a **single field**,
+separated by a slash — sometimes, in either order, and often with one of them
+missing. `split_languages()` therefore decides which half is which by Czech
+diacritics rather than by position, and leaves the name whole when both halves
+look Czech ("Řízek vepřový/kuřecí" is one dish, not two languages). The Czech
+name is shown with the English one on its own indented line under it; `; cz` and
+`; en` narrow it to one. A meal that only has one language is shown either way —
+a blank line where lunch should be would be worse than the wrong language.
+
+**Setting it up: one button.** For a Microsoft single-sign-on account no program
+can pass the authenticator prompt — that is the whole point of it — so the
+feature borrows a sign-in a person has already completed. Settings → Canteen
+menu has two buttons for that, and neither needs a shell or DevTools.
+
+**Sign in with Edge** opens a browser window of its own on the canteen page and
+does the whole walk itself: it steps past OKbase's own sign-in page (the one with
+the *company account* button) and, when Microsoft asks which account to use, it
+picks the one named in **Work account**. Measured on the office PC: about five
+seconds from the button to a saved sign-in, with nothing to click. Fill the
+**Work account** field in first — with two work accounts on a PC, Microsoft
+always asks, and only one of them is the account the canteen knows. Leave it
+empty and the window simply stops on "Pick an account" and waits.
+
+Anything the portal still asks for — a password, a confirmation in the
+authenticator — is answered in that window, which is brought to the front so it
+cannot hide behind the Settings window. It closes itself the moment it has the
+sign-in. The everyday Edge is never touched, closed or restarted, because this
+uses a profile of its own under `%LOCALAPPDATA%\Diagnostic\edge-profile`, which
+also remembers the account for next time.
+
+While it waits it says where the window currently is, so a page it cannot get
+past by itself is visible instead of looking like a program doing nothing. If it
+does time out, the message names the page the window was left on — that is
+nearly always a prompt nobody answered, not a broken program.
+
+If a sign-in window from an earlier attempt is still open, the new one cannot
+start: Windows gives the address to the window that is already there and nothing
+new appears. That is noticed within about two seconds now, the old window is
+closed and the sign-in starts again on its own — the everyday Edge is still not
+touched, because only this program's own profile is ever closed. The two other
+endings say plainly which they are: **the window was closed before the sign-in
+finished**, or it ran out of time on a named page.
+
+**Paste sign-in from clipboard** is the fallback, for a PC where the first cannot
+be used. In the browser: F12 → Network → open Stravování → Objednávka jídel →
+right-click the `nacti-vse` row → Copy → "Copy as cURL", then press the button. A
+plain `Cookie` line is accepted too, and either flavour of cURL (bash or cmd). A
+copied cURL is worth more than a bare cookie: it also carries `okbase_user_id`,
+which canteen, and the exact request body the portal accepts, all of which are
+saved.
+
+Either button then reads the menu to prove it worked. Cookie **values** are never
+shown — only names and lengths — so a live sign-in cannot end up in a screenshot.
+
+From a shell, when the app will not start (in the `Diagnostic` folder):
+
+| Command | What it does |
+|---|---|
+| `python okbase_capture.py --edge` | the same browser window, without the app |
+| `python okbase_capture.py` | from a copied cURL on the clipboard. `--dry` tests without saving, `--file <path>` reads the command from a file |
+| `python okbase_menu.py --check` | **is the saved sign-in still good?** Says alive / signed out / portal unreachable, and what the saved menu covers |
+
+`--check` exists because the question kept being answered by guessing.
+**Rebuilding Diagnostic does not lose the sign-in** — it is kept for the Windows
+account, not inside the program, so every build reads the same one.
+
+Settings → **Canteen menu (/food)**:
+
+| Field | Meaning |
+|---|---|
+| Read the canteen menu from OKbase | off by default. Off = `/food` only says it has no menu |
+| User name / Password | for the sign-in form on the portal itself. The password is DPAPI-encrypted on **Save**, for this Windows account only. Leave both empty for a Microsoft account — the sign-in below is what works |
+| Browser session | the borrowed sign-in itself. Filled in by the two buttons; it is kept as a field because typing a `Cookie` line in by hand is the one route that always works. All of it, not just `JSESSIONID`: the company sign-on cookie in there is what lets the portal mint a new session on its own, which is the difference between signing in once and signing in daily |
+| Sign in with Edge / Paste sign-in from clipboard | the two routes above |
+| Work account | the work address the canteen portal knows you by, e.g. `name@company.com`. Used only by **Sign in with Edge**, to answer Microsoft's "Pick an account" for you. With two work accounts on one PC that question is always asked and only one answer works, so this is what turns the button into a five-second, no-click sign-in. Empty = the window waits for you to pick |
+| Read after (hour) | the menu is read at most once a day, past this hour |
+| Keep sign-in alive (min) | how often the sign-in is touched so it does not expire from disuse — default 10 min. One tiny request each time. **This is what makes it last:** a web session dies of being unused, so without it the borrowed sign-in would be good for one server-side timeout (often half an hour) and would have to be redone every morning |
+| OKbase address | leave empty for the default |
+| Read the menu now | signs in and reads with the fields as typed, without saving them |
+
+None of these three buttons runs in the window itself — one of them waits on a
+person at a Microsoft prompt and the others on a portal that may be slow, so they
+run beside it and grey themselves out while they work.
+
+These settings never go on the share (`SHARE_LOCAL_ONLY_KEYS`) and are never put
+in the build (`notify_provision`): the sign-in belongs to one person on one
+Windows account. They are not kept next to the program either, but in
+`%APPDATA%\Diagnostic\okbase.json` — the program has several homes (the source
+folder and every version under `C:\Dev\dist`), and a file beside the exe would be
+a *different* file for each, so **every rebuild would arrive with no sign-in**.
+One file, read by every build, by a source run, and by the always-on listener.
+
+What travels to the share is the menu itself, as `menu_cache.json` — written next
+to the shared PV list, and also to `%APPDATA%\Diagnostic\`.
+
+That cache is the whole point. The menu changes at most once a day, so the bot
+does not need a live OKbase session to answer, and the **always-on listener**
+can answer `/food` with the app closed by reading the same file. The listener
+stays quiet while the app is running, so a question never gets two answers.
+
+Every reply says when the menu was read. If the cache is more than about a day
+old, or if it simply does not cover the day asked about, the reply says so —
+it never shows another day's food instead. `/food refresh` reads the portal
+again immediately.
+
+One timer does two jobs, because they have nothing else in common: the **menu**
+is fetched at most once a calendar day, while the **sign-in** is touched on every
+tick (`okbase_keepalive_min`). A session that is used never times out, so the
+paste survives until the portal itself restarts. A rotated session id — and a
+brand new session minted by remember-me — is saved back over the stored one, so
+the next keepalive touches the session that is actually alive.
+
+**A dead session repairs itself.** Measured against the portal: with `JSESSIONID`
+deleted, and again with a dead one, a single GET of
+`/rest/authentication/sso` returns a brand new session — HTTP 200, no redirect to
+Microsoft, no authenticator prompt — on the strength of the `_shibsession_…`
+cookie that came along in the same paste. That cookie is the real company
+sign-on; the session cookie is disposable. So `session_from_cookie` walks
+`REVIVE_PATHS` before it ever reports an expiry, and the new session id is saved
+back over the old one. This is what makes one paste last: it holds until the
+company sign-on itself lapses, not until the next half-hour timeout.
+
+**And even then, nothing is sent to the chat about it.** The lunch menu is a
+convenience; a message saying it is not working is not worth interrupting a room
+that exists for laser alarms. So an expired sign-in is mentioned only where
+somebody has asked for it:
+
+- `/status` (the whole list, not a single PV) ends with one quiet line — "Canteen
+  sign-in expired — /food still shows the menu read earlier";
+- every `/food` reply carries a line saying *why* the menu cannot get any newer;
+- `/food status` reports the whole picture — what is saved, when it was read, what
+  the last contact did, and whether the sign-in itself was refused.
+
+The PV Monitor window's own log still records each change of outcome, and so does
+the console of the always-on listener.
+
+**"Expired" and "could not reach it" are two different things, and they used to
+share a message.** Any failure at all — a 502 from the proxy, a dropped VPN, a
+read that timed out — was reported as an expired sign-in, which sent a person off
+to the browser to replace a sign-in that was working perfectly. Now only an
+actual refusal by the portal (HTTP 401 or 403) counts as expired. Anything else
+says the portal could not be reached, asks nobody to do anything, and does not
+even attempt the repair above — those addresses are on the host that just failed
+to answer, so trying them is three more timeouts for a certain nothing.
+
+Two smaller consequences of the same clean-up: a renewed session is now merged
+over the stored one instead of replacing it, so a portal that deletes a cookie
+can no longer take the company sign-on with it; and the borrowed sign-in is tried
+**before** the user-name-and-password form, which on this site cannot work at all
+and was costing up to 160 seconds of waiting at the front of every attempt.
+
+`/food status` is the "what worked and what did not" answer: how many days are
+saved and how old they are, what the program is doing at that moment, whether the
+last contact with OKbase worked (and the reason if not), **whether the sign-in
+itself is known to work** — a portal that did not answer settles nothing, and
+that line says so — the keepalive rate, and when the next read of the menu is
+due. The log gets the same information — every fetch, but a keepalive **only when
+its outcome changes**, since one every ten minutes would otherwise bury
+everything else.
+
+The always-on listener now notices a sign-in renewed while it is running: it
+re-reads the file once per keepalive and again just before answering a `/food`,
+so it no longer has to be restarted. It also keeps a session it renewed itself,
+which it previously saved to disk and then ignored.
+
+The request the portal wants is not documented, so `okbase_menu.py` tries a
+short list of plausible ones and remembers the one that worked in
+`okbase_filter`. The answer is read the same tolerant way: field names are
+matched loosely, so a vendor upgrade that renames something costs a menu, not
+the bot.
 
 #### Email (SMTP) — Seznam.cz and Outlook.com
 
@@ -498,6 +782,83 @@ reading but is painted dark red and prefixed with `⏸` (e.g. `⏸ ok`), and the
 status bar reads `stopped (reading only)` — the value is true, nobody is watching
 it. A row whose **On** box is unchecked still shows `off` as before.
 
+### Conditional limits, and the grace after they change
+
+A PV may carry several sets of limits, each with a rule naming the dependency PVs
+and the values they must have — `L3-SIS-KEY:HighPowerStatus = 1` and
+`L3-TIMING-TIMING:SysRate = 0.2`, for instance. Every poll re-picks the set in
+force (`_match_profile`): the first rule whose conditions all match, otherwise the
+Global set. The **Depends on** dropdown shows which one won (`Automatic (0,2 Hz)`)
+and can pin one — or Global — unconditionally.
+
+The trap is what happens the instant a rule changes hands. The band is swapped
+immediately; the measured value is still where the previous band left it and needs
+minutes to arrive. A chiller switched on in the morning is the plainest example:
+DA4's water sits at ~20 °C, `PumpON` goes to 1, the band that applies while it
+runs asks for 10.8–12.0, and it takes ten minutes of perfectly correct cooling to
+get there. Without a hold that start-up alarms every single day.
+
+What set this off was the opposite end of the same day — 31.08.2026, and worth
+writing down because the messages looked like the rule switch and were not. The
+archive for DA4: the rate was 0.2 Hz and high power on all afternoon, so the
+tight band was in force and 11.2–11.5 °C sat comfortably inside it. At 19:01:40
+the setpoint was let go (11.4 → 15.0) and at 19:05:08 the chiller was switched
+off (`PumpON` 1 → 0, `ProcessStatus` "Digital StartStop switched. 0(off)"). The
+temperature rose past 12.0 with the running band **still in force**, the settle
+window expired, and an ALARM went out at 19:10:35. Twelve seconds earlier high
+power had gone off, so the rule stopped matching, the Global 7–24 band took over,
+14.1 was fine again and `[OK] Recovered` followed at 19:13:05.
+
+So there were two faults, and they needed two different fixes. Nothing had changed
+hands before that alarm — the grace below cannot help with it. The band has to stop
+applying when the chiller stops running, so on 01.09.2026 every chiller rule gained
+`L3-UTIL-CHL03-00N:PumpON = 1`: on DA1–DA4 in place of the hall state, which the
+shot-rate condition already covers, and on Helium and Utility beside it, since there
+the hall state was the only dependency and dropping it would have let the tight
+running band apply all night whenever the pump happens to run. The same pass gave all
+four DA rules the same shot-rate window, 3.0–3.5 — DA1 asked for exactly 2.3 and
+DA2–DA4 for 2.0–3.0, so at the real 3.3 Hz none of them had ever matched, and every
+chiller quietly ran on the global limits whenever the machine ran fast.
+
+And with `PumpON` in the rule, the band now changes hands twice a day at exactly the
+moments the temperature is furthest from it, which is what the grace is for.
+
+So `_check_limits_change()` runs on every poll, right after the set in force is
+picked and before the evaluator is called:
+
+- the set is reduced to a **key made of the four bounds**, not of the rule's
+  position in the list, so a second rule with the same numbers, or an edit to an
+  unrelated rule, is not a change — while an edit that really moves a bound is;
+- when the key differs from last pass, `grace_until_ns` is set to now +
+  `rule_change_grace_minutes` (Settings → **Hold after a rule change (min)**,
+  default 20, 0 = off) and the change is logged with the time the hold expires;
+- while `rt.in_grace()`, `_on_poll` does not call the evaluator at all for that
+  PV — no debounce, no settle window, no reminders, no recovery;
+- if **nothing had been announced yet** for the current episode
+  (`alert.first_notified_ns == 0`), the alert state is reset to OK as well.
+  Without that, a settle window opened under the old band would resolve against
+  the new one after the hold and produce an "all clear" for an alarm nobody ever
+  saw — the same noise from the other end;
+- an episode that **was** announced is left alone, so its recovery still goes out
+  once the hold expires. Somebody was told; they have to be told it ended.
+- the first poll after launch never opens a hold (there is nothing to have
+  changed from), and a PV with no conditional rules never opens one at all.
+
+What that must not do is hide where the value actually sits. So during the hold
+`PVRuntime.display_level()` reports the **raw severity** rather than the held
+alert state — the State cell paints amber/red exactly as it would otherwise — and
+the **Alarm status** cell reads `new limits → HH:MM` with a tooltip saying which
+set took over and until when nothing will be raised. `/status` and `/alarms` add
+`— limits just changed, held until HH:MM` to the line for the same reason.
+
+It is a delay, not an amnesty: a value still outside the new band when the hold
+expires goes through the ordinary debounce and settle and alerts then — a chiller
+switched on and still at 14.5 °C three quarters of an hour later is not cooling,
+and that is worth a message. `test_rule_change_grace.py` covers all of it,
+including the morning start-up with the hold off (so the reason for the feature
+cannot be quietly removed) and the 31.08. evening, which it asserts still alarms,
+because that one is the missing `PumpON` dependency and not this.
+
 ### "Not updating" — a PV that answers but is not live
 
 The data watchdog only fires when *every* PV goes silent. A single PV can fail in
@@ -570,16 +931,19 @@ worked — and nothing about a screen full of last-known values says they are
 last-known. Asked `/status` from a phone, it would keep replying `ok` for hours.
 The wedge that produced this (an in-flight flag that a lost pass leaves True for
 ever) is self-healed in `_start_poll`, but self-healing silently is not enough:
-if the cure does not take, somebody has to be told.
+while the cure is running, what is on the screen is still out of date and has to
+say so.
 
 `_check_refresh_health()` is that heartbeat. It runs on the poll tick *and* on
 the Webex listener tick — two independent clocks, so whichever is still running
 notices the other being stuck — and compares now against `_last_poll_ok_ns`, set
 only where a pass actually lands (`_on_poll`). The limit (`_refresh_limit_s`) is
-five poll intervals plus a minute, never under three, deliberately longer than
-the wedge watchdog's own write-off at five intervals: a stall that cures itself
-should pass without waking anybody, and only one that survives the cure is worth
-announcing.
+Settings → **Mark as not refreshed after (min)** (`refresh_alarm_minutes`,
+default 3.5 min), so whoever is on call decides how patient the marking is. What
+Settings cannot do is ask for less than the program needs to unstick itself: the
+wedge watchdog writes a lost pass off after five intervals and starts a fresh
+one, so a shorter limit would flag every stall that is already curing itself.
+Anything below five poll intervals plus half a minute is therefore raised to it.
 
 When it trips:
 
@@ -590,16 +954,33 @@ When it trips:
   figure, so it survives every redraw and cannot upset the blitted crosshair);
 - every **State** cell reads `not refreshed`, with a tooltip naming the time the
   values actually come from;
-- one notification goes out, and one more when the readings come back — the same
-  once-per-episode shape as the other data faults, tagged `refresh` so it can
-  never overwrite a PV's Alarm status cell. Alerting being stopped silences the
-  message, never the display.
+- **nothing is sent to the chat yet.** It used to announce the stall the moment
+  it saw it and then its recovery, once each. In practice the wedge watchdog
+  cures the stall seconds later, so the pair arrived together and told nobody
+  anything — the screenshot that ended that version had them one second apart.
+  For a short stall, what the fault is worth is the marking, not the message.
 
-And every reply the bot gives says it, whether or not anyone asked:
+A stall that *lasts*, though, is the opposite case: it is not curing itself, no
+limit is being watched while it runs, and somebody reading a phone has no way to
+know the numbers are frozen. So a second, much longer wait —
+Settings → **Say it in the chat after (min)** (`refresh_alert_minutes`, default
+30 min, 0 = never) — sends exactly one message when it passes, and one more when
+reading resumes (`_send_refresh_alert`, tagged `refresh`, no plot: the picture
+would be exactly as out of date as the numbers, which is the thing being
+reported). The wait is floored at the marking limit, since the chat cannot be
+told about a stall the program does not yet consider one, and like every other
+alert it is only sent while monitoring is armed. `_refresh_alert_sent` keeps it
+to one message however often the check runs — and it is measured from the last
+completed read, not from when the marking went on, so "30 min" means half an
+hour of no data.
 
-- `/status` puts the warning *above* the values (the first line is the one that
-  gets read on a phone) and ends with `Values read at HH:MM:SS (N ago)` — which
-  it now carries even when all is well, so "when was this read" is never a guess;
+And every reply the bot gives carries it:
+
+- `/status` opens with one short line — `⚠ NOT REFRESHED — last read HH:MM:SS,
+  N ago` (`_refresh_note_short()`) — *above* the values, because the first line
+  is the one that gets read on a phone, and ends with `Values read at HH:MM:SS
+  (N ago)`, which it carries even when all is well so "when was this read" is
+  never a guess;
 - each PV line reads `[not refreshed — …]` in place of `[ok]`;
 - `/alarms` will not answer "✅ No PVs currently in warning/alarm" while the
   values are old — that is a claim about the present, and it says instead that it

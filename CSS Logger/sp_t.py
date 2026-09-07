@@ -8,6 +8,8 @@ Archive workflow:
   2. Drag on the search graph to select a time region (= one spectrum); repeat.
   3. Click "Analyze" -> averaged spectra appear in the bottom graph. Colour them by
      selection order or by GDD / TOD on a rainbow scale.
+  4. Display -> Show -> "Every spectrum" switches the averaging off: every single
+     shot measured inside each region is drawn as its own curve.
 
 Live workflow:
   1. Switch to Live -> click "Start Live".
@@ -32,7 +34,7 @@ try:
 except ImportError:
     _PRAGUE = None
 
-from PySide6.QtCore import (Qt, QObject, QTimer, Signal, QDate, QLocale,
+from PySide6.QtCore import (Qt, QObject, QTimer, Signal,
                             QRect, QPoint, QEvent)
 from PySide6.QtGui import (QAction, QColor, QCursor, QIcon, QPalette,
                            QShortcut, QKeySequence, QGuiApplication,
@@ -41,11 +43,11 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QCheckBox, QGroupBox, QScrollArea, QSizePolicy, QButtonGroup,
     QFileDialog, QDialog, QDialogButtonBox, QFrame, QSplitter,
-    QCalendarWidget, QMessageBox, QMainWindow, QTabWidget, QComboBox,
+    QMessageBox, QMainWindow, QTabWidget, QComboBox,
     QProgressBar, QStyledItemDelegate, QAbstractItemView, QInputDialog,
     QToolButton, QMenu, QStyle, QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QListWidget, QListWidgetItem, QRadioButton, QDoubleSpinBox,
-    QGridLayout,
+    QGridLayout, QSlider, QStyleOptionSlider,
 )
 
 import matplotlib
@@ -55,9 +57,44 @@ matplotlib.rcParams['figure.facecolor'] = 'white'
 import matplotlib.cm as _mpl_cm
 import matplotlib.colors as _mpl_colors
 import matplotlib.dates as mdates
+from matplotlib.collections import LineCollection
+from matplotlib.ticker import FixedLocator, FuncFormatter
+from matplotlib.transforms import blended_transform_factory
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
+
+
+def _import_daypicker():
+    """Load the shared day/time picker (sibling daypicker.py): one instance per
+    process, registered before exec.
+
+    daypicker.py owns HOW A DAY AND A TIME WINDOW ARE PICKED for every program in
+    the suite. The master copy lives in Image Tools/; this folder keeps a verbatim
+    copy because the builder only ever bundles .py files from the program's own
+    folder (Dev Tools/b_t.py). testing/test_daypicker_sync.py fails the moment the
+    two copies differ.
+
+    Loaded by path instead of `import daypicker` on purpose: a plain import would
+    make the builder's module-home check see the same module name in two program
+    folders and refuse to build.
+    """
+    import importlib.util as _ilu
+    mod = sys.modules.get("daypicker")
+    if mod is not None:
+        return mod
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daypicker.py")
+    spec = _ilu.spec_from_file_location("daypicker", p)
+    mod = _ilu.module_from_spec(spec)
+    sys.modules["daypicker"] = mod     # register BEFORE exec (re-entrancy safe)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+daypicker = _import_daypicker()
+PickSeg        = daypicker.PickSeg
+seg_bounds_ns  = daypicker.seg_bounds_ns
+DayTimePicker  = daypicker.DayTimePicker
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 PV_ENERGY = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
@@ -135,6 +172,13 @@ DEFAULT_LIVE_N  = 100          # default "average last N" value
 LIVE_HISTORY_S  = 600          # on Start Live, preload this many seconds of recent shots
 MAX_INDIVIDUAL_LINES = 400     # cap when overlaying a region's individual spectra
 
+# "Every spectrum" display: draw each measured shot instead of one averaged curve.
+# A whole day is tens of thousands of shots, so the drawing is capped and evenly
+# decimated - and the legend says how many of how many are actually on screen,
+# because a silently thinned graph reads as "this is all there was".
+SINGLE_METHOD    = "single"     # _METHODS value for "Every spectrum"
+MAX_SINGLE_LINES = 3000         # cap when every spectrum is the display itself
+
 # ── Colour-bar slot on the spectra graph ──────────────────────────────────────
 # The GDD/TOD colour bar lives in ONE permanent axes that is only shown or hidden.
 # It used to be created with fig.colorbar(sm, ax=ax), which takes a slice of the
@@ -185,6 +229,158 @@ QGroupBox {
 }
 QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
 """
+
+# ── The shot bar under the search graph ───────────────────────────────────────
+# "Every spectrum — pick one" is a QSlider and not a QScrollBar: a scroll bar's
+# handle is a block as wide as one page, and this bar has to say WHERE ON THE
+# GRAPH one single shot is — that is a point, so it needs a handle that is a
+# point. (It used to be a horizontal QScrollBar in the side panel.)
+#
+# Every colour is set here. _APP_STYLESHEET styles only the VERTICAL scroll bars,
+# and an unstyled QSlider takes the inherited dark theme and comes out as a grey
+# handle on a grey groove on a grey panel.
+_SLIDER_HANDLE_W = 12          # kept in sync with the handle width below
+
+_TIMEBAR_STYLE = f"""
+QSlider:horizontal {{ height: 20px; }}
+QSlider::groove:horizontal {{
+    background: #e6e6e6; border: 1px solid #b4b4b4; border-radius: 5px;
+    height: 12px; margin: 0;
+}}
+QSlider::handle:horizontal {{
+    background: #5b6b80; border: 1px solid #3f4c5c; border-radius: 3px;
+    width: {_SLIDER_HANDLE_W}px; margin: -4px 0;
+}}
+QSlider::handle:horizontal:hover   {{ background: #1565C0; border-color: #0D47A1; }}
+QSlider::handle:horizontal:pressed {{ background: #0D47A1; border-color: #08306b; }}
+QSlider::groove:horizontal:disabled {{ background: #efefef; border-color: #d0d0d0; }}
+QSlider::handle:horizontal:disabled {{ background: #c4c4c4; border-color: #b0b0b0; }}
+"""
+
+# Finer than any pixel width the bar can have, so rounding in the
+# value <-> pixel conversion never costs a pixel of alignment.
+_SHOT_BAR_MAX = 100_000
+
+
+def _slider_metrics(sl: QSlider) -> "tuple[int, int, int]":
+    """(groove_x, travel, handle_width) for a horizontal slider, from the style.
+
+    These are the three numbers Qt itself uses to place a handle, so asking for
+    them is the only way a value and a pixel can be converted the same way in
+    both directions. `travel` is how far the handle's left edge can move, so the
+    handle's CENTRE only ever covers groove_x + handle_width/2 … + travel.
+
+    That inset is exactly what the bar has to overhang the plot box by on each
+    side for "same X on the graph = same X on the bar" to hold — and it must be
+    measured, never assumed: it changes with the platform style, and a wrong
+    guess drifts the handle a whole handle width across the bar.
+    """
+    w  = max(1, sl.width())
+    hwid = _SLIDER_HANDLE_W
+    gx, gw = 0, w
+    try:
+        opt = QStyleOptionSlider()
+        sl.initStyleOption(opt)
+        st = sl.style()
+        hr = st.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                               QStyle.SubControl.SC_SliderHandle, sl)
+        gr = st.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                               QStyle.SubControl.SC_SliderGroove, sl)
+        if hr.width() > 0:
+            hwid = hr.width()
+        if gr.width() > 0:
+            gx, gw = gr.x(), gr.width()
+    except Exception:
+        pass
+    return gx, max(1, gw - hwid), hwid
+
+
+class _ShotBar(QSlider):
+    """The bar under the search graph. A horizontal slider, driven differently in
+    three ways.
+
+    1. A click anywhere jumps straight to that place. The bar is pinned to the
+       graph's time axis, so a click on it is a click on a moment in time —
+       Qt's default (page towards it) would need a dozen clicks to cross a day.
+    2. The wheel and the arrow keys move ONE MEASURED SHOT, not one slider unit.
+       The value range is far finer than the pixel width, so that the mapping
+       from time to pixels never rounds; that also makes a single unit a no-op,
+       which is why stepping is handed back to the tab.
+    3. Nothing else may be put in its layout row — the row's left and right
+       margins are what pins the bar to the plot box above it.
+    """
+
+    def __init__(self, step_cb, page_cb):
+        super().__init__(Qt.Orientation.Horizontal)
+        self._step_cb = step_cb          # ±1 shot
+        self._page_cb = page_cb          # ±a screenful of shots
+        self._dragging = False
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    # ── absolute positioning ──────────────────────────────────────────────
+    # Both directions go through Qt's own value<->position arithmetic, so the
+    # pixel this bar reports is the pixel Qt actually draws the handle on. Doing
+    # the division by hand instead was off by more than a pixel at some widths.
+    def value_at_pixel(self, x: float) -> int:
+        """The value whose HANDLE CENTRE sits at logical pixel x."""
+        gx, travel, hwid = _slider_metrics(self)
+        return int(QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(),
+            int(round(x - gx - hwid / 2.0)), travel,
+            self.invertedAppearance()))
+
+    def pixel_at_value(self, v: int) -> float:
+        """Where the handle's centre lands for value v, in logical pixels."""
+        gx, travel, hwid = _slider_metrics(self)
+        pos = QStyle.sliderPositionFromValue(
+            self.minimum(), self.maximum(), int(v), travel,
+            self.invertedAppearance())
+        return gx + pos + hwid / 2.0
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton and self.isEnabled():
+            self._dragging = True
+            self.setSliderDown(True)
+            self.setValue(self.value_at_pixel(ev.position().x()))
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging:
+            self.setValue(self.value_at_pixel(ev.position().x()))
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._dragging and ev.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.setSliderDown(False)
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    # ── stepping by shots ─────────────────────────────────────────────────
+    def wheelEvent(self, ev):
+        dy = ev.angleDelta().y()
+        if dy:
+            self._step_cb(1 if dy > 0 else -1)
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+    def keyPressEvent(self, ev):
+        k = ev.key()
+        if k in (Qt.Key.Key_Left, Qt.Key.Key_Down):
+            self._step_cb(-1); ev.accept(); return
+        if k in (Qt.Key.Key_Right, Qt.Key.Key_Up):
+            self._step_cb(+1); ev.accept(); return
+        if k == Qt.Key.Key_PageDown:
+            self._page_cb(-1); ev.accept(); return
+        if k == Qt.Key.Key_PageUp:
+            self._page_cb(+1); ev.accept(); return
+        super().keyPressEvent(ev)
 
 # ── Step cards at the top of the sidebar ──────────────────────────────────────
 # The top of the panel reads downwards as "what am I doing": pick a day, pick the
@@ -327,6 +523,104 @@ def _step_card(number: int, title: str) -> tuple:
     outer.addLayout(body)
     return card, body
 
+# ── The panel's bottom settings block ─────────────────────────────────────────
+# Everything that only changes HOW the result is drawn — the graph options, the
+# comparison curve and the horizontal range — lives in one coloured, foldable
+# group at the very bottom, under the buttons. Same shape as the Image Slider's
+# sections in Image Tools, so the two panels read alike: a solid accent bar with
+# white text over a body washed in a very pale tint of the same accent.
+#
+# Every colour is written here. An unstyled group box inherits the dark theme and
+# comes out grey-on-grey.
+
+def _shade(hex_color: str, factor: float) -> str:
+    """hex_color moved toward black (factor < 1) or toward white (factor > 1)."""
+    h = hex_color.lstrip("#")
+    try:
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return hex_color
+    if factor <= 1.0:
+        r, g, b = (int(c * factor) for c in (r, g, b))
+    else:
+        r, g, b = (int(c + (255 - c) * (factor - 1.0)) for c in (r, g, b))
+    r, g, b = (max(0, min(255, c)) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+# Purple, the same accent the Image Slider gives its "Image / Display" section.
+_SET_ACCENT = "#7a4fc0"
+
+def _sub_label(text: str) -> QLabel:
+    """Small caption for one block inside the settings group."""
+    lbl = QLabel(text.upper())
+    lbl.setStyleSheet(
+        "font-size: 10px; font-weight: 700; letter-spacing: 1px; padding-top: 2px;"
+        f" color: {_shade(_SET_ACCENT, 0.75)}; background: transparent; border: none;")
+    return lbl
+
+class _SettingsGroup(QWidget):
+    """Coloured header + pale body; the header folds the body away."""
+
+    def __init__(self, title: str, accent: str = _SET_ACCENT,
+                 expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._expanded = bool(expanded)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._header = QToolButton()
+        self._header.setCheckable(True)
+        self._header.setChecked(self._expanded)
+        self._header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._header.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                   QSizePolicy.Policy.Fixed)
+        self._header.setStyleSheet(
+            "QToolButton { text-align: left; border: none; padding: 6px 9px;"
+            " margin-top: 6px; font-weight: 700; font-size: 11px;"
+            " letter-spacing: 1px; border-top-left-radius: 4px;"
+            " border-top-right-radius: 4px; color: #ffffff;"
+            f" background: {accent}; }}"
+            f"QToolButton:hover {{ background: {_shade(accent, 0.85)}; }}"
+        )
+        self._header.setToolTip("Click to fold this block away or open it again.")
+        self._header.clicked.connect(self._on_clicked)
+        outer.addWidget(self._header)
+
+        self.body = QWidget()
+        self.body.setObjectName("setBody")
+        # A near-white tint (1.93): anything stronger and the black control text
+        # stops being comfortably legible. Scoped to the object name so the
+        # controls inside keep their own white / transparent backgrounds, and the
+        # label rule fixes the text colour that would otherwise come from the
+        # inherited dark theme.
+        self.body.setStyleSheet(
+            "#setBody { border: 1px solid " + _shade(accent, 1.55) + ";"
+            " border-left: 3px solid " + _shade(accent, 1.35) + ";"
+            " background: " + _shade(accent, 1.93) + ";"
+            " border-bottom-left-radius: 4px; border-bottom-right-radius: 4px; }"
+            "#setBody QLabel { background: transparent; border: none; color: #111; }"
+        )
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(8, 5, 7, 7)
+        self.body_layout.setSpacing(4)
+        outer.addWidget(self.body)
+
+        self.body.setVisible(self._expanded)
+        self._paint_header()
+
+    def _paint_header(self):
+        arrow = "▾" if self._expanded else "▸"
+        # Escape '&' — QToolButton would eat it as a shortcut marker.
+        self._header.setText(f"{arrow}  {self._title.upper().replace('&', '&&')}")
+
+    def _on_clicked(self):
+        self._expanded = self._header.isChecked()
+        self.body.setVisible(self._expanded)
+        self._paint_header()
+
 _BTN_PRIMARY = (
     "QPushButton { background:#1565C0; color:white; font-weight:700; "
     "padding:7px 10px; border-radius:4px; }"
@@ -343,6 +637,16 @@ _BTN_DANGER = (
     "QPushButton { background:#B71C1C; color:white; font-weight:700; "
     "padding:7px 10px; border-radius:4px; }"
     "QPushButton:hover { background:#7F0000; }"
+)
+# Archive / Live: the chosen one is a filled blue button with white text, the
+# other dark ink on light grey. Written out because the app-wide stylesheet
+# repaints every button and the style's own "checked" look never shows through.
+_BTN_MODE = (
+    "QPushButton { background:#f0f0f0; color:#111; font-weight:600; "
+    "padding:6px 10px; border:1px solid #b4b4b4; border-radius:4px; }"
+    "QPushButton:hover:!checked { background:#dde8ff; }"
+    "QPushButton:checked { background:#1565C0; color:#ffffff; font-weight:700; "
+    "border:1px solid #0D47A1; }"
 )
 
 _TB_STYLE = (
@@ -422,6 +726,26 @@ def _cpva_fetch(channel: str, start_ns: int, end_ns: int) -> list:
 _CHUNK_NS      = int(3600 * 1e9)      # one hour
 _CHUNK_MIN_NS  = int(60 * 1e9)        # do not split below one minute
 _FETCH_WORKERS = 8
+# Above this many one-hour requests the load is worth a word of warning first
+# (hours × PVs). A normal day of a dozen PVs is well under it.
+_FETCH_WARN_REQUESTS = 400
+
+# The shortest drag on the search graph that counts as selecting a spectrum
+# rather than a click. The axis is in seconds of archive time.
+_MIN_SPAN_S = 0.25
+
+# Days sit flush against one another on the compressed axis, so a drag meant for
+# one day almost always clips its neighbour by a few pixels — and zoomed out over
+# a fortnight a few pixels are minutes of archive time. Such a clipping used to
+# become its own spectrum, which the operator then had to delete by hand. A piece
+# of a drag now has to earn its place: either it holds a fair share of the drag,
+# or it covers practically the whole of its own day.
+#
+# The share is measured against the LONGEST piece of the drag, never against the
+# drag total: with a total-based rule a deliberate drag over 20 equal days would
+# give every piece 5 % and throw them all away.
+_EDGE_KEEP_FRAC = 0.20   # at least a fifth of the drag's longest day
+_FULL_DAY_FRAC  = 0.90   # ...or practically all of this day's own loaded window
 
 _last_fetch_error: dict = {}          # channel -> message from its last failure
 
@@ -648,6 +972,73 @@ def _trapz(y, x) -> float:
     return float(fn(y, x))
 
 
+# The archiver does not always store the whole X axis. L3-SBDP-SPIDER:
+# TimeDomain_Int_X holds 2048 points while its _Y holds 4096, and every drawing
+# path used to compare the two lengths, find them unequal and quietly count
+# array positions instead — four analysed days came out in "samples", with a
+# 33 fs pulse reported as "FWHM 18.2" and its peak as "2045 nm".
+# A short axis whose step is constant is not a broken axis, it is a truncated
+# one: it can be rebuilt exactly from its own first value and step (the SPIDER
+# axis starts at -3749.087 fs and steps 1.8306 fs, so point 2048 is t = 0 —
+# confirmed against TimeDomain_FL_Y, whose transform-limited pulse peaks there).
+# An axis that is NOT uniform is never extended: extrapolating a grating
+# spectrometer's λ axis would invent numbers.
+_X_UNIFORM_TOL = 1e-3      # spread of the step, relative, still counted as uniform
+
+
+def _fit_x_axis(x, n: int) -> "np.ndarray | None":
+    """The measured X axis to draw n intensity points against, or None if the
+    stored axis cannot honestly cover them (caller then uses sample numbers)."""
+    if x is None or n < 1:
+        return None
+    x = np.asarray(x, dtype=float)
+    if x.size == n:
+        return x
+    if x.size < 2 or not bool(np.all(np.isfinite(x))):
+        return None
+    d = np.diff(x)
+    step = (float(x[-1]) - float(x[0])) / (x.size - 1)
+    if step == 0.0:
+        return None
+    if float(np.max(np.abs(d - step))) > abs(step) * _X_UNIFORM_TOL:
+        return None
+    return float(x[0]) + step * np.arange(n, dtype=float)
+
+
+# Quantity name, axis unit and short symbol that go with a unit string. The panel
+# was written for a grating spectrometer and said "Wavelength [nm]" / "Peak λ"
+# everywhere; the same tab is used on SPIDER TimeDomain_Int, whose axis is
+# femtoseconds, and a femtosecond axis labelled nm is worse than no axis at all.
+_X_UNIT_KINDS = {
+    "nm":  ("Wavelength", "λ"),
+    "µm":  ("Wavelength", "λ"),
+    "um":  ("Wavelength", "λ"),
+    "thz": ("Frequency",  "f"),
+    "fs":  ("Time",       "t"),
+    "ps":  ("Time",       "t"),
+    "ns":  ("Time",       "t"),
+    "rad": ("Phase",      "φ"),
+}
+
+
+def _x_unit_kind(unit: str) -> tuple[str, str]:
+    """(quantity name, symbol) for a unit; a unit we do not know stays generic."""
+    return _X_UNIT_KINDS.get((unit or "").strip().lower(), ("X", "x"))
+
+
+def _guess_x_unit(*pv_names: str) -> str:
+    """Default unit of the X AXIS of a spectrum channel, from its name. Only the
+    SPIDER time domain differs from the nanometres the tab was built for — note
+    this is the axis, so TimeDomain_Phase is also fs (its phase is the Y value)
+    while SpecDomain_Phase is nm. Editable in the panel when a name lies."""
+    blob = " ".join(n or "" for n in pv_names).lower()
+    if "timedomain" in blob or "time_domain" in blob:
+        return "fs"
+    if "thz" in blob:
+        return "THz"
+    return "nm"
+
+
 def _fwhm(x: np.ndarray, y: np.ndarray) -> "float | None":
     """Full width at half maximum (above baseline), with linear edge interpolation."""
     x = np.asarray(x, dtype=float)
@@ -823,6 +1214,7 @@ _METHODS = {
     "Median":             "median",
     "Trimmed mean 10%":   "trimmed",
     "Sigma-clipped mean": "sigma",
+    "Every spectrum":     SINGLE_METHOD,
 }
 
 # Short forms for the legend. Measured on synthetic data, the four methods differ by
@@ -834,6 +1226,7 @@ _METHOD_SHORT = {
     "median":  "Median",
     "trimmed": "Trimmed 10%",
     "sigma":   "Sigma-clip",
+    SINGLE_METHOD: "Every spectrum",
 }
 
 
@@ -857,12 +1250,266 @@ def _fmt_dur(t0_ns: int, t1_ns: int) -> str:
     return f"{secs // 60}m{secs % 60:02d}s"
 
 
-def _day_range_ns(qdate: QDate) -> tuple[int, int]:
-    tz = _PRAGUE or timezone.utc
-    d = date(qdate.year(), qdate.month(), qdate.day())
-    start = datetime(d.year, d.month, d.day,  0,  0,  0, tzinfo=tz)
-    end   = datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=tz)
-    return int(start.timestamp() * 1e9), int(end.timestamp() * 1e9)
+def _fmt_window(w: "tuple[int, int]") -> str:
+    """'2026-08-25 08:00-12:00' — one picked window, for labels and status text."""
+    a, b = _ns_to_dt(w[0]), _ns_to_dt(w[1])
+    return f"{a.strftime('%Y-%m-%d %H:%M')}-{b.strftime('%H:%M')}"
+
+
+# ── _TimeMap ──────────────────────────────────────────────────────────────────
+class _TimeMap:
+    """The compressed time axis of the search graph.
+
+    The picked windows are laid end to end and the time BETWEEN them is removed
+    from the axis, so picking Mon 08-12 and Wed 14-19 gives a graph of two blocks
+    side by side instead of two thin traces with two empty days between them.
+
+    x is plain seconds from the start of the first window - deliberately NOT a
+    matplotlib date number, because half of matplotlib's date machinery would
+    then quietly interpret a compressed x as a real instant. Real dates come back
+    on the tick labels through a FuncFormatter.
+
+    With a single window this is the identity (offset 0), so the one-day graph
+    behaves exactly as it did before: there is no separate code path for it.
+
+    Everything the user sees or clicks on the search graph goes through here:
+    trace data, region shading, the drag that creates a region, the crosshair
+    readout and the axis limits. Regions themselves keep storing absolute ns.
+    """
+
+    def __init__(self, windows: "list[tuple[int, int]]"):
+        # Sorted, positive-length, non-overlapping: overlaps would make from_x
+        # ambiguous. The picker gives one window per day, so a merge is enough.
+        ws: list[list[int]] = []
+        for a, b in sorted((w for w in windows if w[1] > w[0])):
+            if ws and a <= ws[-1][1]:
+                ws[-1][1] = max(ws[-1][1], b)
+            else:
+                ws.append([a, b])
+        self.windows: list[tuple[int, int]] = [(a, b) for a, b in ws]
+        # Cumulative x offset of each window's start, in seconds.
+        self._off: list[float] = []
+        acc = 0.0
+        for a, b in self.windows:
+            self._off.append(acc)
+            acc += (b - a) / 1e9
+        self._total = acc
+
+    def __bool__(self) -> bool:
+        return bool(self.windows)
+
+    def is_identity(self) -> bool:
+        return len(self.windows) <= 1
+
+    # ── time → x ──────────────────────────────────────────────────────────────
+    def to_x(self, t_ns: int) -> "float | None":
+        """Seconds on the compressed axis, or None when t falls in a removed gap.
+
+        The window end is EXCLUSIVE, the same convention the calendar uses
+        (daypicker.seg_bounds_ns): 12:00-13:00 is one hour, and a sample stamped
+        exactly 13:00:00 belongs to the next window, not this one.
+        """
+        for (a, b), off in zip(self.windows, self._off):
+            if a <= t_ns < b:
+                return off + (t_ns - a) / 1e9
+        return None
+
+    def to_x_clamped(self, t_ns: int) -> float:
+        """Like to_x, but a time in a gap is pulled to the nearest window edge.
+
+        Used for region shading: a region selected before the windows changed can
+        start or end in time that is no longer on the axis, and it still has to be
+        drawn somewhere sensible instead of vanishing.
+        """
+        if not self.windows:
+            return 0.0
+        if t_ns <= self.windows[0][0]:
+            return 0.0
+        if t_ns >= self.windows[-1][1]:
+            return self._total
+        for i, ((a, b), off) in enumerate(zip(self.windows, self._off)):
+            if t_ns < a:                       # in the gap before this window
+                return off
+            if t_ns <= b:
+                return off + (t_ns - a) / 1e9
+        return self._total
+
+    def clip(self, t0_ns: int, t1_ns: int) -> "list[tuple[float, float]]":
+        """Split [t0, t1] into one x-range per window it actually overlaps.
+
+        A region dragged across a window boundary must be painted as two blocks,
+        never as one block that also covers the removed time.
+        """
+        out = []
+        for (a, b), off in zip(self.windows, self._off):
+            lo, hi = max(t0_ns, a), min(t1_ns, b)
+            if hi > lo:
+                out.append((off + (lo - a) / 1e9, off + (hi - a) / 1e9))
+        return out
+
+    def split_ns(self, t0_ns: int, t1_ns: int) -> "list[tuple[int, int]]":
+        """The same split, but in absolute ns - one interval per window."""
+        out = []
+        for a, b in self.windows:
+            lo, hi = max(t0_ns, a), min(t1_ns, b)
+            if hi > lo:
+                out.append((lo, hi))
+        return out
+
+    def contains(self, t_ns: int) -> bool:
+        return any(a <= t_ns < b for a, b in self.windows)
+
+    def window_len_ns(self, t_ns: int) -> int:
+        """Length of the loaded window this instant falls in (0 if in removed time).
+
+        Lets a caller ask "how much of that day did I select?" — a day loaded with
+        a 30-minute window is a small slice of a multi-day drag even when it was
+        selected in full.
+        """
+        for a, b in self.windows:
+            if a <= t_ns < b:
+                return b - a
+        return 0
+
+    def window_at_x(self, x: float) -> "tuple[int, int] | None":
+        """The (start, end) of the window under this point on the axis.
+
+        None outside every window — the axis has a hair of padding on both sides
+        (see xlim), so a click there is not on any day. On a join the next window
+        wins, the same convention from_x follows.
+        """
+        if not self.windows or x < 0 or x > self._total:
+            return None
+        last = len(self.windows) - 1
+        for i, ((a, b), off) in enumerate(zip(self.windows, self._off)):
+            if x < off + (b - a) / 1e9 or i == last:
+                return (a, b)
+        return None
+
+    # ── x → time ──────────────────────────────────────────────────────────────
+    def from_x(self, x: float) -> int:
+        """Absolute ns for a point on the compressed axis (clamped to the ends).
+
+        A join is a single point standing for two instants — the end of one
+        window and the start of the next. The next window wins, so a drag that
+        starts on a join belongs to the day the user can see to the right of it,
+        and a drag that ends there stops at the end of the day on the left.
+        """
+        if not self.windows:
+            return 0
+        if x <= 0:
+            return self.windows[0][0]
+        last = len(self.windows) - 1
+        for i, ((a, b), off) in enumerate(zip(self.windows, self._off)):
+            end = off + (b - a) / 1e9
+            if x < end or i == last:
+                return int(a + max(0.0, min(x, end) - off) * 1e9)
+        return self.windows[-1][1]
+
+    # ── axis ──────────────────────────────────────────────────────────────────
+    def xlim(self) -> "tuple[float, float]":
+        # A hair of margin on both sides, so the first and last sample and the
+        # boundary dividers are not drawn on top of the axis spines.
+        pad = max(1.0, self._total * 0.002)
+        return -pad, self._total + pad
+
+    def boundaries(self) -> "list[float]":
+        """x of every join between two windows (nothing for a single window)."""
+        return [off for off in self._off[1:]]
+
+    def window_centres(self) -> "list[tuple[float, tuple[int, int]]]":
+        return [(off + (b - a) / 2e9, (a, b))
+                for (a, b), off in zip(self.windows, self._off)]
+
+    def is_window_start(self, x: float, tol: float = 1.0) -> bool:
+        return any(abs(x - off) <= tol for off in self._off)
+
+    def trace(self, t_ns, vals):
+        """Remap a sorted sample series onto the compressed axis.
+
+        Returns (plot_x, plot_y, cur_x, cur_y).
+
+        plot_* carry a NaN break at every window join, so the steps-post line
+        cannot be drawn straight across removed time — without it Monday evening
+        would appear joined to Wednesday morning by a fake horizontal line. Each
+        window's last value is also held out to the window's own end, which is
+        what an archived value actually does.
+
+        cur_* are the same points without the NaNs, kept strictly ascending
+        because the crosshair searchsorts on them.
+        """
+        px, py, cx, cy = [], [], [], []
+        for (a, b), off in zip(self.windows, self._off):
+            lo = int(np.searchsorted(t_ns, a, side="left"))
+            hi = int(np.searchsorted(t_ns, b, side="left"))   # end is exclusive
+            if hi <= lo:
+                continue
+            xs = off + (t_ns[lo:hi] - a) / 1e9
+            ys = vals[lo:hi]
+            end_x = off + (b - a) / 1e9
+            cx.append(xs); cy.append(ys)
+            if px:
+                px.append(np.array([np.nan])); py.append(np.array([np.nan]))
+            px.append(xs); py.append(ys)
+            # Hold the last value out to the window edge (zero-order hold).
+            if xs[-1] < end_x:
+                px.append(np.array([end_x])); py.append(np.array([ys[-1]]))
+                cx.append(np.array([end_x])); cy.append(np.array([ys[-1]]))
+        if not px:
+            empty = np.array([], dtype=float)
+            return empty, empty, empty, empty
+        return (np.concatenate(px), np.concatenate(py),
+                np.concatenate(cx), np.concatenate(cy))
+
+    def ticks(self, max_ticks: int = 12) -> "tuple[list[float], list[str]]":
+        """Tick positions and labels showing the REAL date and time.
+
+        Every window gets at least its own start tick, so no block is left
+        unlabelled however short it is. Beyond a handful of windows the start
+        ticks alone fill the axis, and inner clock ticks are dropped — with a
+        fortnight picked they printed straight through the dates ("08-2412:00").
+        """
+        if not self.windows:
+            return [], []
+        n = len(self.windows)
+        multi = n > 1
+        if n > max_ticks // 2:
+            # Day starts only, thinned out if even those would not fit.
+            every = max(1, -(-n // max_ticks))
+            pos, lab = [], []
+            for i, ((a, _b), off) in enumerate(zip(self.windows, self._off)):
+                if i % every:
+                    continue
+                pos.append(off)
+                lab.append(_ns_to_dt(a).strftime("%m-%d\n%H:%M"))
+            return pos, lab
+        per = max(1, max_ticks // n)
+        # A round step that keeps roughly `per` ticks inside the longest window.
+        longest = max((b - a) / 1e9 for a, b in self.windows)
+        for step in (300, 600, 900, 1800, 3600, 2 * 3600, 3 * 3600, 6 * 3600,
+                     12 * 3600, 24 * 3600):
+            if longest / step <= per:
+                break
+        pos: list[float] = []
+        lab: list[str] = []
+        for (a, b), off in zip(self.windows, self._off):
+            span = (b - a) / 1e9
+            dt_a = _ns_to_dt(a)
+            # First tick of the window: the window's own start, always labelled
+            # with the date when there is more than one window.
+            pos.append(off)
+            lab.append(dt_a.strftime("%m-%d\n%H:%M") if multi
+                       else dt_a.strftime("%H:%M"))
+            # Then round clock times inside it.
+            first = ((int(dt_a.hour * 3600 + dt_a.minute * 60 + dt_a.second)
+                      // step) + 1) * step
+            sec = first - (dt_a.hour * 3600 + dt_a.minute * 60 + dt_a.second)
+            while sec < span - step * 0.25:
+                if sec > step * 0.25:
+                    pos.append(off + sec)
+                    lab.append(_ns_to_dt(int(a + sec * 1e9)).strftime("%H:%M"))
+                sec += step
+        return pos, lab
 
 
 # ── Cross-thread signal carrier ───────────────────────────────────────────────
@@ -875,385 +1522,6 @@ class _Sig(QObject):
 
 def _bg(fn) -> None:
     threading.Thread(target=fn, daemon=True).start()
-
-
-# ── DatePickerDialog ──────────────────────────────────────────────────────────
-# Calendar styling: gray day-name header, blue navigation bar (matches Image Tools).
-_CAL_STYLE = """
-QCalendarWidget QWidget { background: #ffffff; color: #111; }
-QCalendarWidget QAbstractItemView:enabled {
-    background: #ffffff; color: #111;
-    selection-background-color: #1565C0; selection-color: white;
-}
-QCalendarWidget QWidget#qt_calendar_navigationbar { background: #eeeeee; }
-QCalendarWidget QToolButton {
-    color: #222; background: transparent;
-    font-weight: 700; font-size: 13px;
-    border-radius: 3px; padding: 3px 6px;
-}
-QCalendarWidget QToolButton:hover { background: #d0d0d0; }
-QCalendarWidget QToolButton#qt_calendar_monthbutton {
-    border: 1px solid #aaaaaa; background: #f5f5f5; padding: 2px 8px;
-}
-QCalendarWidget QToolButton#qt_calendar_monthbutton:hover { background: #e0e0e0; }
-QCalendarWidget QSpinBox {
-    color: #222; background: #eeeeee; border: none; font-weight: 700;
-}
-QCalendarWidget QMenu { color: #111; background: #fff; }
-"""
-
-
-class _WeekendDelegate(QStyledItemDelegate):
-    """Paint calendar cells: selected=blue background, Sat/Sun=red text.
-
-    Weekend detection uses the cell's real date, so spillover-month cells are
-    coloured correctly too.
-    initStyleOption strips State_Selected for cells not in _selected_keys so that
-    Qt's own selection highlight (today after Clear, etc.) never bleeds through.
-    """
-    def __init__(self, cal: QCalendarWidget):
-        super().__init__(cal)
-        self._cal = cal
-        self._selected_keys: set = set()   # (year, month, day) tuples
-
-    def _first_cell(self) -> "tuple[int, int]":
-        """Row/column of the first *day* cell. Qt drops the header row when
-        NoHorizontalHeader is set and the week-number column when
-        NoVerticalHeader is set, so the grid does not always start at (1, 1)."""
-        first_row = 1
-        if (self._cal.horizontalHeaderFormat()
-                == QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader):
-            first_row = 0
-        first_col = 1
-        if (self._cal.verticalHeaderFormat()
-                == QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader):
-            first_col = 0
-        return first_row, first_col
-
-    def _date_for_index(self, index) -> "QDate | None":
-        # The model knows the real date for in-month cells — always prefer it.
-        d = index.data(Qt.ItemDataRole.UserRole)
-        if isinstance(d, QDate) and d.isValid():
-            return d
-        first_row, first_col = self._first_cell()
-        if index.row() < first_row or index.column() < first_col:
-            return None                       # header row / week-number column
-        first = QDate(self._cal.yearShown(), self._cal.monthShown(), 1)
-        if not first.isValid():
-            return None
-        # Column offset of the 1st within the first displayed week.
-        offset = (first.dayOfWeek() - self._cal.firstDayOfWeek().value) % 7
-        row = index.row() - first_row
-        # Qt shifts the whole grid one week back when the 1st sits in the very
-        # first column (QCalendarModel::dateForCell, MinimumDayOffset = 1), so
-        # row 0 then shows the PREVIOUS week. Without this the painted days are
-        # a week off (clicking one day highlighted a different one).
-        if offset < 1:
-            row -= 1
-        start = first.addDays(-offset)
-        return start.addDays(row * 7 + (index.column() - first_col))
-
-    def set_selected(self, dates: "list[QDate]"):
-        self._selected_keys = {(d.year(), d.month(), d.day()) for d in dates}
-        view = self._cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-        if view is not None:
-            view.viewport().update()
-
-    def initStyleOption(self, option, index):
-        super().initStyleOption(option, index)
-        d = self._date_for_index(index)
-        if d is not None and (d.year(), d.month(), d.day()) not in self._selected_keys:
-            # Strip Qt's internal selection highlight (e.g. today's cell after Clear).
-            option.state = option.state & ~QStyle.StateFlag.State_Selected
-
-    def paint(self, painter, option, index):
-        d = self._date_for_index(index)
-        if d is None:
-            super().paint(painter, option, index)
-            return
-        is_weekend = d.dayOfWeek() in (6, 7)    # weekend from the date, never the column
-        is_sel = (d.year(), d.month(), d.day()) in self._selected_keys
-        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
-
-        if is_sel:
-            painter.save()
-            painter.fillRect(option.rect, QColor("#1565C0"))
-            painter.setPen(QColor("#ffcccc") if is_weekend else QColor("#ffffff"))
-            painter.setFont(option.font)
-            painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, text)
-            painter.restore()
-        else:
-            super().paint(painter, option, index)
-            if is_weekend:
-                painter.save()
-                painter.setPen(QColor("#cc0000"))
-                painter.setFont(option.font)
-                painter.drawText(option.rect, Qt.AlignmentFlag.AlignCenter, text)
-                painter.restore()
-
-
-def _make_calendar(initial: "QDate | None" = None) -> "tuple[QFrame, QCalendarWidget]":
-    """Return (wrapper_frame, cal).
-
-    The wrapper contains:
-      1. A custom gray QWidget row with day-name QLabels (Mon…Sun) — 100% reliable
-         gray header regardless of PySide6/Fusion stylesheet interactions.
-      2. The QCalendarWidget with the built-in header hidden.
-
-    Weekend cells (Sat/Sun) — including spillover-month cells — are coloured red
-    via _WeekendDelegate, which resolves each cell to its real date.
-    """
-    # ── QCalendarWidget (both built-in headers hidden — we supply our own nav + day row) ──
-    cal = QCalendarWidget()
-    cal.setGridVisible(True)
-    cal.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedKingdom))
-    cal.setFirstDayOfWeek(Qt.DayOfWeek.Monday)
-    cal.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-    cal.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.NoHorizontalHeader)
-    if initial:
-        cal.setSelectedDate(initial)
-    cal.setStyleSheet(_CAL_STYLE)
-
-    # Hide built-in navigation bar — we draw our own below so hdr_row sits directly above the grid.
-    nav_internal = cal.findChild(QWidget, "qt_calendar_navigationbar")
-    if nav_internal:
-        nav_internal.hide()
-
-    # Install weekend+selection delegate on the grid view.
-    view = cal.findChild(QAbstractItemView, "qt_calendar_calendarview")
-    if view is not None:
-        cal._wk_delegate = _WeekendDelegate(cal)
-        view.setItemDelegate(cal._wk_delegate)
-
-    # ── Custom navigation bar (light gray, month as button, year spinbox) ────
-    _MONTHS = ["January", "February", "March", "April", "May", "June",
-               "July", "August", "September", "October", "November", "December"]
-
-    nav_row = QWidget()
-    nav_row.setAutoFillBackground(True)
-    nav_pal = nav_row.palette()
-    nav_pal.setColor(QPalette.ColorRole.Window, QColor("#eeeeee"))
-    nav_row.setPalette(nav_pal)
-    nav_lay = QHBoxLayout(nav_row)
-    nav_lay.setContentsMargins(4, 3, 4, 3)
-    nav_lay.setSpacing(4)
-
-    prev_btn = QToolButton()
-    prev_btn.setText("◀")
-    prev_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 18px; padding: 1px 6px; }"
-                           "QToolButton:hover { background: #d0d0d0; border-radius: 3px; }")
-
-    month_btn = QPushButton()
-    month_btn.setMinimumWidth(100)
-    month_btn.setStyleSheet(
-        "QPushButton { border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;"
-        " font-weight: bold; font-size: 12px; padding: 2px 10px; }"
-        "QPushButton:hover { background: #e0e0e0; }"
-    )
-
-    year_spin = QSpinBox()
-    year_spin.setRange(2000, 2100)
-    year_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-    year_spin.setStyleSheet(
-        "QSpinBox { border: 1px solid #aaa; border-radius: 3px; background: #f5f5f5;"
-        " padding: 1px 4px; font-weight: bold; font-size: 12px; }"
-    )
-    year_spin.setFixedWidth(60)
-
-    next_btn = QToolButton()
-    next_btn.setText("▶")
-    next_btn.setStyleSheet("QToolButton { border: none; font-weight: bold; font-size: 18px; padding: 1px 6px; }"
-                           "QToolButton:hover { background: #d0d0d0; border-radius: 3px; }")
-
-    nav_lay.addWidget(prev_btn)
-    nav_lay.addStretch()
-    nav_lay.addWidget(month_btn)
-    nav_lay.addWidget(year_spin)
-    nav_lay.addStretch()
-    nav_lay.addWidget(next_btn)
-
-    def _update_nav():
-        m, y = cal.monthShown(), cal.yearShown()
-        month_btn.setText(_MONTHS[m - 1])
-        year_spin.blockSignals(True)
-        year_spin.setValue(y)
-        year_spin.blockSignals(False)
-
-    def _on_month_btn():
-        menu = QMenu(month_btn)
-        for i, name in enumerate(_MONTHS, 1):
-            menu.addAction(name).setData(i)
-        chosen = menu.exec(month_btn.mapToGlobal(month_btn.rect().bottomLeft()))
-        if chosen:
-            cal.setCurrentPage(cal.yearShown(), chosen.data())
-
-    prev_btn.clicked.connect(cal.showPreviousMonth)
-    next_btn.clicked.connect(cal.showNextMonth)
-    month_btn.clicked.connect(_on_month_btn)
-    year_spin.valueChanged.connect(lambda y: cal.setCurrentPage(y, cal.monthShown()))
-    cal.currentPageChanged.connect(lambda _y, _m: _update_nav())
-    _update_nav()
-
-    # ── Custom gray day-name header ──────────────────────────────────────────
-    hdr_row = QWidget()
-    hdr_row.setAutoFillBackground(True)
-    hdr_pal = hdr_row.palette()
-    hdr_pal.setColor(QPalette.ColorRole.Window, QColor("#757575"))
-    hdr_row.setPalette(hdr_pal)
-    hdr_lay = QHBoxLayout(hdr_row)
-    hdr_lay.setContentsMargins(0, 0, 0, 0)
-    hdr_lay.setSpacing(0)
-    for name in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"):
-        lbl = QLabel(name)
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet("color: #111111; font-weight: 700; padding: 4px 0;")
-        hdr_lay.addWidget(lbl, stretch=1)
-
-    # ── Wrapper frame: [nav_row] [hdr_row] [cal grid] ───────────────────────
-    wrapper = QFrame()
-    wrapper.setStyleSheet("QFrame { border: 1px solid #b0b0b0; border-radius: 3px; }")
-    w_lay = QVBoxLayout(wrapper)
-    w_lay.setContentsMargins(0, 0, 0, 0)
-    w_lay.setSpacing(0)
-    w_lay.addWidget(nav_row)
-    w_lay.addWidget(hdr_row)
-    w_lay.addWidget(cal)
-
-    return wrapper, cal
-
-
-class DatePickerDialog(QDialog):
-    """Single-calendar date picker.
-
-    Plain click        → select exactly that one day (replaces the selection).
-    Ctrl+click         → toggle that single day in/out of a multi-day selection.
-    Ctrl+Shift+click   → range from the last click to the clicked day, XOR-ed into
-                         the selection (so a repeat over the same range deselects
-                         what it selected — an "anti-selection").
-    Weekends (Sat/Sun) can ONLY be picked by a plain click — Ctrl and Ctrl+Shift
-    skip them.
-
-    Uses QCalendarWidget.clicked(QDate) — reliable across all PySide6 versions.
-    """
-    def __init__(self, parent=None, initial: QDate | None = None):
-        super().__init__(parent)
-        self.setWindowTitle("Select day(s)")
-        self.setWindowIcon(QIcon())
-        self.setModal(True)
-        self.setMinimumWidth(330)
-
-        self._last_click: QDate | None = None
-        self._dates: list[QDate] = []
-
-        lay = QVBoxLayout(self)
-        lay.setSpacing(8)
-
-        self._frame, self._cal = _make_calendar(initial)
-        lay.addWidget(self._frame)
-
-        self._lbl_info = QLabel("")
-        self._lbl_info.setStyleSheet("color: #555; font-size: 11px;")
-        lay.addWidget(self._lbl_info)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Select")
-        clear_btn = btns.addButton("Clear", QDialogButtonBox.ButtonRole.ResetRole)
-        clear_btn.setToolTip("Deselect all days")
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        clear_btn.clicked.connect(lambda: self._apply_selection([]))
-        lay.addWidget(btns)
-
-        self._cal.clicked.connect(self._on_date_clicked)
-
-        if initial and initial.isValid():
-            self._apply_selection([initial])
-            self._last_click = initial
-
-    # ── Click handler ─────────────────────────────────────────────────────────
-    def _on_date_clicked(self, d: QDate):
-        mods  = QApplication.keyboardModifiers()
-        ctrl  = bool(mods & Qt.KeyboardModifier.ControlModifier)
-        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
-        new_dates = self._compute_click(d, ctrl, shift)
-        self._last_click = d
-        if new_dates is None:    # ignored (Ctrl on a weekend)
-            self._lbl_info.setText("Weekends can only be selected by a plain click.")
-            return
-        self._apply_selection(new_dates)
-
-    def _compute_click(self, d: QDate, ctrl: bool, shift: bool) -> "list[QDate] | None":
-        """Pure selection logic. Returns the new selection, or None if the click
-        should be ignored (Ctrl on a weekend)."""
-        cur      = list(self._dates)
-        cur_keys = {self._key(x) for x in cur}
-        if ctrl and shift:
-            # Range [anchor … d], weekdays only, XOR-ed into the current selection.
-            anchor = self._last_click if self._last_click is not None else d
-            rng = [x for x in self._date_range(anchor, d) if not self._is_weekend(x)]
-            rng_keys = {self._key(x) for x in rng}
-            keep = [x for x in cur if self._key(x) not in rng_keys]   # deselect overlap
-            add  = [x for x in rng if self._key(x) not in cur_keys]   # select the rest
-            new_dates = keep + add
-        elif ctrl:
-            # Toggle a single weekday; weekends are plain-click only.
-            if self._is_weekend(d):
-                return None
-            if self._key(d) in cur_keys:
-                new_dates = [x for x in cur if self._key(x) != self._key(d)]
-            else:
-                new_dates = cur + [d]
-        else:
-            # Plain click: exactly one day (weekends allowed).
-            new_dates = [d]
-        return sorted(new_dates, key=lambda x: (x.year(), x.month(), x.day()))
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    @staticmethod
-    def _key(d: QDate) -> tuple:
-        return (d.year(), d.month(), d.day())
-
-    @staticmethod
-    def _is_weekend(d: QDate) -> bool:
-        return d.dayOfWeek() >= 6   # 6=Sat, 7=Sun
-
-    @staticmethod
-    def _date_range(d1: QDate, d2: QDate) -> "list[QDate]":
-        if d2 < d1:
-            d1, d2 = d2, d1
-        days, d = [], d1
-        while d <= d2:
-            days.append(d)
-            d = d.addDays(1)
-        return days
-
-    def _apply_selection(self, dates: "list[QDate]"):
-        self._dates = dates
-        delegate = getattr(self._cal, "_wk_delegate", None)
-        if delegate is not None:
-            delegate.set_selected(dates)
-        if dates:
-            self._cal.setSelectedDate(dates[-1])
-        n = len(dates)
-        if n == 0:
-            self._lbl_info.setText("Click = 1 day · Ctrl+click = multi · Ctrl+Shift+click = range")
-        elif n == 1:
-            self._lbl_info.setText(f"Selected: {dates[0].toString('yyyy-MM-dd')}")
-        else:
-            self._lbl_info.setText(
-                f"Selected: {dates[0].toString('yyyy-MM-dd')} → "
-                f"{dates[-1].toString('yyyy-MM-dd')}  ({n} days)"
-            )
-
-    # ── Public API ────────────────────────────────────────────────────────────
-    def selected_date(self) -> QDate:
-        return self._dates[0] if self._dates else self._cal.selectedDate()
-
-    def selected_dates(self) -> "list[QDate]":
-        """Chronologically sorted list of selected days."""
-        return list(self._dates) if self._dates else [self._cal.selectedDate()]
 
 
 # ── PvSearchDialog ────────────────────────────────────────────────────────────
@@ -1799,7 +2067,8 @@ class PresetEditDialog(QDialog):
 class ExportDialog(QDialog):
     """Pick what to export: one CSV (details + curve data) and/or the graph image."""
 
-    def __init__(self, n_regions: int, n_live: int, method: str, parent=None):
+    def __init__(self, n_regions: int, n_live: int, method: str, parent=None,
+                 single: bool = False, n_shots: int = 0):
         super().__init__(parent)
         self.setWindowTitle("Export results")
         self.setModal(True)
@@ -1810,7 +2079,9 @@ class ExportDialog(QDialog):
 
         parts = []
         if n_regions:
-            parts.append(f"{n_regions} spectra")
+            parts.append(f"{n_regions} spectra"
+                         + (f" = {n_shots} measured shots" if single and n_shots
+                            else ""))
         if n_live:
             parts.append(f"{n_live} live shot(s)")
         hdr = QLabel("Export " + " + ".join(parts) + ":")
@@ -1818,6 +2089,8 @@ class ExportDialog(QDialog):
         lay.addWidget(hdr)
 
         self._chk_data = QCheckBox(
+            "Data table  →  CSV  (details + one column per measured spectrum "
+            "+ live shots)" if single else
             f"Data table  →  CSV  (details + wavelength/{method}/std + live shots)"
         )
         self._chk_graph = QCheckBox("Graph image  →  picture of the spectra plot")
@@ -1833,11 +2106,21 @@ class ExportDialog(QDialog):
         row_fmt.addWidget(self._cmb_fmt, stretch=1)
         lay.addLayout(row_fmt)
 
-        note = QLabel(
+        note_text = (
             "One CSV holds a details block (date, time, energy, dispersion orders) "
             "followed by the curve table. A 'sep=;' line and a decimal point let "
             "Excel open it directly in any locale."
         )
+        if single:
+            note_text += (
+                "  The display is set to Every spectrum, so the curve table holds "
+                "one column per measured shot, named by its time, with the shot's "
+                "own intensity against the wavelength column — every shot, even "
+                "the ones the graph left out when it thinned the picture. "
+                "Thousands of columns make a large file, and Excel stops reading "
+                "at 16 384."
+            )
+        note = QLabel(note_text)
         note.setWordWrap(True)
         note.setStyleSheet(
             "background:#e8f0fe; border:1px solid #90CAF9; border-radius:4px; "
@@ -1927,7 +2210,12 @@ class _AxisLimitsDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(370)
 
-        _date_x = isinstance(ax.xaxis.get_major_formatter(), mdates.DateFormatter)
+        # A time axis: either a real matplotlib date axis (the CSS Logger tab) or
+        # the Spectra search graph's compressed axis, which is tagged because its
+        # formatter is a plain FuncFormatter — typing limits there would mean
+        # typing seconds-along-the-selection.
+        _date_x = (isinstance(ax.xaxis.get_major_formatter(), mdates.DateFormatter)
+                   or bool(getattr(ax, "_sp_time_axis", False)))
 
         lay = QVBoxLayout(self)
         lay.setSpacing(8)
@@ -1942,7 +2230,8 @@ class _AxisLimitsDialog(QDialog):
 
         self._e_xmin = self._e_xmax = None
         if _date_x:
-            note = QLabel("X axis uses datetime — adjust range with zoom/pan tools.")
+            note = QLabel("X axis is time — adjust the range with the zoom/pan "
+                          "tools, or pick a different time window.")
             note.setStyleSheet("color: #666; font-size: 10px;")
             note.setWordWrap(True)
             gl.addWidget(note)
@@ -2155,10 +2444,12 @@ class SpectraWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._selected_day:     QDate | None             = None
-        self._selected_days:    list[QDate]              = []   # multi-day support
-        self._day_start_ns:     int                      = 0
-        self._day_end_ns:       int                      = 0
+        # What the calendar was asked for: one time window per picked day, each
+        # with its own hours. _segments keeps the pick so reopening the calendar
+        # shows it again; _tmap is the compressed axis built from the windows.
+        self._segments:         list                     = []   # daypicker.PickSeg
+        self._windows:          list[tuple[int, int]]    = []   # (start_ns, end_ns)
+        self._tmap:             "_TimeMap"               = _TimeMap([])
         # User-editable list of scalar PVs to plot in the top "search" graph.
         # A PV can stay in the list but be taken off the graph (its tick box) —
         # channels parked that way live in _pv_hidden and are filled by the load.
@@ -2291,18 +2582,22 @@ class SpectraWidget(QWidget):
         self._lbl_status.setStyleSheet("color: #555; font-size: 10px;")
         lay.addWidget(self._lbl_status)
 
-        # ══ Step 1 — the day ═══════════════════════════════════════════
-        card1, b1 = _step_card(1, "DAY")
+        # ══ Step 1 — the day and the time window ═══════════════════════
+        card1, b1 = _step_card(1, "DAY & TIME")
         self._lbl_day = QLabel("No day selected")
         self._lbl_day.setWordWrap(True)
         self._lbl_day.setStyleSheet(
             "font-size: 11px; font-weight: 700; color: #263238; border: none;"
             " background: transparent;")
         b1.addWidget(self._lbl_day)
-        self._btn_pick_day = QPushButton("\U0001F4C5  Load day…")
+        # No "&" in a button label: Qt eats it as the shortcut marker, so
+        # "Load day & time" came out as "Load day  time" with an underlined t.
+        self._btn_pick_day = QPushButton("\U0001F4C5  Load day and time…")
         self._btn_pick_day.setStyleSheet(_BTN_PRIMARY)
         self._btn_pick_day.setToolTip(
-            "Open the calendar and load a day (or a range of days) of data into the search graph."
+            "Open the calendar and load data into the search graph.\n"
+            "Click = one day · Ctrl+click = several days · Ctrl+Shift+click = a run of days.\n"
+            "Each day gets its own From/To time; only the chosen hours are loaded."
         )
         b1.addWidget(self._btn_pick_day)
         lay.addWidget(card1)
@@ -2461,10 +2756,39 @@ class SpectraWidget(QWidget):
         )
         row_sp.addWidget(self._btn_spec, alignment=Qt.AlignmentFlag.AlignBottom)
         b3.addLayout(row_sp)
+
+        # Unit of the X axis. The tab was written for a grating spectrometer and
+        # printed "Wavelength [nm]" / "Peak λ" everywhere, but the same panel is
+        # used on the SPIDER time domain, whose axis is femtoseconds — a pulse
+        # duration announced in nanometres is worse than no axis at all. Guessed
+        # from the channel name and editable, because a name can lie.
+        row_un = QHBoxLayout()
+        row_un.setSpacing(5)
+        lbl_un = QLabel("Unit:")
+        # Own colour, not the host's: the card is pale blue, and a label that
+        # inherits a dark theme's white text disappears into it.
+        lbl_un.setStyleSheet(
+            "font-size: 11px; color: #111; background: transparent; border: none;")
+        row_un.addWidget(lbl_un)
+        self._edit_x_unit = QLineEdit(self._x_unit())
+        self._edit_x_unit.setMaximumWidth(64)
+        self._edit_x_unit.setStyleSheet(
+            "font-size: 11px; color: #111; border: 1px solid #bbb; "
+            "border-radius: 3px; background: #fff; padding: 1px 3px;")
+        self._edit_x_unit.setToolTip(
+            "Unit of the horizontal axis of the spectrum graph — nm for a "
+            "spectrometer, fs for the SPIDER time domain. It sets the axis title, "
+            "the readout, the Peak / FWHM labels and the exported column names.")
+        self._edit_x_unit.editingFinished.connect(self._on_x_unit_edited)
+        row_un.addWidget(self._edit_x_unit)
+        row_un.addStretch(1)
+        b3.addLayout(row_un)
         lay.addWidget(card3)
 
         # ── Mode ───────────────────────────────────────────────────────
-        g_mode = QGroupBox("Mode")
+        # Built here, put on the panel further down: the order on screen is
+        # day → search by → spectrum → selected spectra → mode → analyze.
+        g_mode = self._g_mode = QGroupBox("Mode")
         g_mode.setStyleSheet(_GROUP_STYLE)
         row_m = QHBoxLayout(g_mode)
         self._btn_archive   = QPushButton("Archive")
@@ -2474,13 +2798,18 @@ class SpectraWidget(QWidget):
         self._btn_archive.setCheckable(True)
         self._btn_live_mode.setCheckable(True)
         self._btn_archive.setChecked(True)
+        # The app-wide stylesheet gives every button its own border and background,
+        # which wipes out the style's "pressed in" look — both mode buttons then
+        # looked identical and nothing on the panel said which mode was on. The
+        # chosen one is now a filled blue button with white text.
+        for _b in (self._btn_archive, self._btn_live_mode):
+            _b.setStyleSheet(_BTN_MODE)
         self._mode_grp = QButtonGroup(self)
         self._mode_grp.setExclusive(True)
         self._mode_grp.addButton(self._btn_archive)
         self._mode_grp.addButton(self._btn_live_mode)
         row_m.addWidget(self._btn_archive)
         row_m.addWidget(self._btn_live_mode)
-        lay.addWidget(g_mode)
 
         # ── Live controls ──────────────────────────────────────────────
         self._g_live = QGroupBox("Live")
@@ -2512,17 +2841,24 @@ class SpectraWidget(QWidget):
         live_l.addWidget(self._btn_live_start)
         # (the blinking "live is running" indicator lives in the top status block)
         self._g_live.setVisible(False)
-        lay.addWidget(self._g_live)
 
         # (region selection list lives in the collapsible block, not here)
+
+        # ══ Settings — everything that only changes how it is DRAWN ════
+        # One coloured, foldable group at the bottom of the panel: the graph
+        # options, the comparison curve and the horizontal range. They are not
+        # steps of the workflow, so they are out of the way of the steps.
+        self._g_settings = _SettingsGroup("Display settings")
+        set_l = self._g_settings.body_layout
 
         # ── Display options ────────────────────────────────────────────
         # One grid, not five separate rows: the three labels line up in a column and
         # the section is several rows shorter. As five independent QHBoxLayouts every
         # combo started at a different x and the block wasted vertical space.
-        g_disp = QGroupBox("Display")
-        g_disp.setStyleSheet(_GROUP_STYLE)
+        set_l.addWidget(_sub_label("Graph"))
+        g_disp = QWidget()
         disp_l = QVBoxLayout(g_disp)
+        disp_l.setContentsMargins(0, 0, 0, 0)
         disp_l.setSpacing(4)
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
@@ -2530,18 +2866,23 @@ class SpectraWidget(QWidget):
         grid.setColumnStretch(1, 1)
         disp_l.addLayout(grid)
 
-        grid.addWidget(QLabel("Average"), 0, 0)
+        grid.addWidget(QLabel("Show"), 0, 0)
         self._cmb_method = QComboBox()
         self._cmb_method.addItems(list(_METHODS.keys()))
         self._cmb_method.setToolTip(
-            "How to combine the spectra in each region:\n"
+            "What the bottom graph draws for each selected time region:\n"
             "• Mean — plain average\n"
             "• Median — robust against outlier shots\n"
             "• Trimmed mean 10% — drops the 10% lowest/highest values\n"
-            "• Sigma-clipped mean — drops points beyond 3σ, then averages\n\n"
-            "The active method is named in the graph title and in every legend "
-            "entry — on clean spectra the four differ by a fraction of a percent, "
-            "so the label is the only way to tell them apart."
+            "• Sigma-clipped mean — drops points beyond 3σ, then averages\n"
+            "• Every spectrum — no averaging at all: every single shot measured "
+            "in the region is drawn as its own curve\n\n"
+            "The active setting is named in the graph title and in every legend "
+            "entry — on clean spectra the four averages differ by a fraction of a "
+            "percent, so the label is the only way to tell them apart.\n\n"
+            f"Every spectrum draws at most {MAX_SINGLE_LINES} curves per region; "
+            "above that every n-th shot is drawn and the legend says how many of "
+            "how many you are looking at."
         )
         grid.addWidget(self._cmb_method, 0, 1)
 
@@ -2605,12 +2946,22 @@ class SpectraWidget(QWidget):
         )
         self._chk_show_energy.setStyleSheet(_CHK_STYLE)
         disp_l.addWidget(self._chk_show_energy)
-        lay.addWidget(g_disp)
+        set_l.addWidget(g_disp)
+
+        # "Every spectrum — pick one" used to be a group box here. It now lives
+        # directly under the search graph (_make_shot_bar), because the bar has to
+        # line up with that graph's time axis pixel for pixel — a bar in this
+        # panel could never say WHERE on the graph the picked shot is.
 
         # ── X range ────────────────────────────────────────────────────
-        g_xr = QGroupBox("Spectrum range [nm]")
-        g_xr.setStyleSheet(_GROUP_STYLE)
+        # The caption is not fixed: it says "Wavelength range [nm]" on a
+        # spectrometer and "Time range [fs]" on the SPIDER time domain
+        # (_sync_x_unit_labels writes it from the unit).
+        self._lbl_xrange = _sub_label("Spectrum range")
+        set_l.addWidget(self._lbl_xrange)
+        g_xr = QWidget()
         xr_v = QVBoxLayout(g_xr)
+        xr_v.setContentsMargins(0, 0, 0, 0)
         xr_v.setSpacing(4)
         xr_l = QHBoxLayout()
         xr_l.setSpacing(4)
@@ -2640,12 +2991,14 @@ class SpectraWidget(QWidget):
             "contains signal. Uncheck to keep your manual values."
         )
         xr_v.addWidget(self._chk_autofit)
-        lay.addWidget(g_xr)
+        set_l.addWidget(g_xr)
+        self._sync_x_unit_labels()      # caption carries the unit, not a fixed "nm"
 
         # ── Compare two regions ────────────────────────────────────────
-        g_cmp = QGroupBox("Compare regions")
-        g_cmp.setStyleSheet(_GROUP_STYLE)
+        set_l.addWidget(_sub_label("Compare regions"))
+        g_cmp = QWidget()
         cmp_l = QVBoxLayout(g_cmp)
+        cmp_l.setContentsMargins(0, 0, 0, 0)
         cmp_l.setSpacing(3)
         self._chk_compare = QCheckBox("Show comparison curve")
         self._chk_compare.setStyleSheet(_CHK_STYLE)
@@ -2664,21 +3017,145 @@ class SpectraWidget(QWidget):
         self._cmb_cmp_mode = QComboBox()
         self._cmb_cmp_mode.addItems(["A − B (difference)", "A ÷ B (ratio)"])
         cmp_l.addWidget(self._cmb_cmp_mode)
-        lay.addWidget(g_cmp)
+        set_l.addWidget(g_cmp)
 
-        # ── Selected regions (list + analyze + progress) ───────────────
-        # Lives here, under "Compare regions", to save horizontal space.
+        # ══ The panel, in the order it is used ═════════════════════════
+        # The three numbered steps are already on it. What follows is the list of
+        # what was picked, then how it is read (mode), then Analyze, then the two
+        # buttons that end the job — and the drawing settings last of all.
+
+        # ── Selected spectra (the list itself) ─────────────────────────
         lay.addWidget(self._make_region_panel(), stretch=1)
 
-        # ── Export ─────────────────────────────────────────────────────
+        # ── Mode (+ the live controls that belong to it) ───────────────
+        lay.addWidget(self._g_mode)
+        lay.addWidget(self._g_live)
+
+        # ── Analyze + its progress bar ─────────────────────────────────
+        self._btn_analyze = QPushButton("✓  Analyze")
+        self._btn_analyze.setEnabled(False)
+        self._btn_analyze.setStyleSheet(_BTN_SUCCESS)
+        self._btn_analyze.setToolTip(
+            "Fetch and average the spectra in every not-yet-analyzed selection, then plot them."
+        )
+        lay.addWidget(self._btn_analyze)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._progress.setFormat("Analyzing  %v / %m  (%p%)")
+        self._progress.setTextVisible(True)
+        self._progress.setVisible(False)
+        self._progress.setStyleSheet(
+            "QProgressBar { border: 1px solid #b0b0b0; border-radius: 4px; "
+            "text-align: center; height: 20px; font-size: 11px; font-weight: 700; "
+            "background: #ffffff; color: #111; }"
+            "QProgressBar::chunk { background: #2E7D32; border-radius: 3px; }"
+        )
+        lay.addWidget(self._progress)
+
+        # ── Clear all + Export ─────────────────────────────────────────
+        self._btn_clear_regs = QPushButton("Clear all")
+        self._btn_clear_regs.setToolTip("Remove all selected spectra from the list.")
         self._btn_export = QPushButton("\U0001F4BE  Export results")
         self._btn_export.setEnabled(False)
         self._btn_export.setToolTip(
             "Export the analyzed spectra to a CSV (details + curves) and/or save the plot image."
         )
-        lay.addWidget(self._btn_export)
+        row_end = QHBoxLayout()
+        row_end.setSpacing(6)
+        row_end.addWidget(self._btn_clear_regs)
+        row_end.addWidget(self._btn_export, stretch=1)
+        lay.addLayout(row_end)
+
+        # ── Display settings, last ─────────────────────────────────────
+        lay.addWidget(self._g_settings)
 
         return sb
+
+    # ── The shot bar: "Every spectrum — pick one", under the search graph ─────
+    # A bundle of a thousand faint curves says nothing about WHICH shot is which.
+    # This bar picks one of them and the spectra graph paints it bold.
+    #
+    # Two rules make it what it is:
+    #   1. The bar and the graph share one X. The same place on the graph is the
+    #      same place on the bar — handle centre and data point on the SAME pixel.
+    #      That is why the bar's travel is pinned to the plot box (_pin_shot_bar)
+    #      and not to the canvas or to the widget.
+    #   2. The bar can only stand on a real measurement. Where no shot was taken
+    #      the handle cannot go: it sticks at the last shot before an empty
+    #      stretch and reappears at the first shot after it (_on_shot_bar_moved).
+    #
+    # Only shown while the display is set to Every spectrum — there is nothing to
+    # step through when one averaged curve is on screen.
+
+    def _make_shot_bar(self) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 1, 0, 3)
+        v.setSpacing(1)
+
+        # Row 1 — the bar, alone. Its left/right margins are re-pinned to the
+        # plot box on every draw of the search graph, so anything else in this
+        # row would push the bar's ends off the graph's axis.
+        self._shot_bar_row = QWidget()
+        row = QHBoxLayout(self._shot_bar_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self._sl_shot = _ShotBar(lambda s: self._step_single(s),
+                                 lambda s: self._page_single(s))
+        self._sl_shot.setStyleSheet(_TIMEBAR_STYLE)
+        self._sl_shot.setRange(0, _SHOT_BAR_MAX)
+        self._sl_shot.setEnabled(False)
+        self._sl_shot.setToolTip(
+            "Pick one measured shot out of the bundle. The bar lines up with the "
+            "graph above it, so the handle stands exactly under the shot it is "
+            "on, and it can only stop where a shot was actually taken."
+        )
+        self._sl_shot.valueChanged.connect(self._on_shot_bar_moved)
+        row.addWidget(self._sl_shot, stretch=1)
+        v.addWidget(self._shot_bar_row)
+
+        # Row 2 — the buttons and the caption. Plain widgets, so this row keeps
+        # its own margins and is free to be as wide as the panel.
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(6, 0, 6, 0)
+        row2.setSpacing(6)
+        self._btn_single_prev = QPushButton("◀")
+        self._btn_single_next = QPushButton("▶")
+        for _btn, _step, _tip in ((self._btn_single_prev, -1, "One shot earlier"),
+                                  (self._btn_single_next, +1, "One shot later")):
+            _btn.setFixedWidth(30)
+            _btn.setFixedHeight(20)
+            _btn.setToolTip(_tip)
+            _btn.setEnabled(False)
+            _btn.clicked.connect(lambda _=False, s=_step: self._step_single(s))
+            _btn.setStyleSheet(
+                "QPushButton { color: #111; font-weight: 700; background: #f4f4f4; "
+                "border: 1px solid #b4b4b4; border-radius: 3px; }"
+                "QPushButton:hover { background: #e8f0fe; }"
+                "QPushButton:disabled { color: #aaa; background: #efefef; "
+                "border-color: #d4d4d4; }"
+            )
+        row2.addWidget(self._btn_single_prev)
+        row2.addWidget(self._btn_single_next)
+        self._chk_single_hl = QCheckBox("Highlight")
+        self._chk_single_hl.setChecked(True)
+        self._chk_single_hl.setStyleSheet(_CHK_STYLE)
+        self._chk_single_hl.setToolTip(
+            "Draw the picked shot bold on top of the bundle in the spectra graph, "
+            "and mark it in the search graph. Uncheck to see the bundle on its own."
+        )
+        self._chk_single_hl.toggled.connect(self._on_single_hl_toggled)
+        row2.addWidget(self._chk_single_hl)
+        self._lbl_single = QLabel("Nothing to step through yet — analyze a spectrum.")
+        self._lbl_single.setStyleSheet("font-size: 11px; color: #222;")
+        row2.addWidget(self._lbl_single, stretch=1)
+        v.addLayout(row2)
+
+        box.setVisible(False)
+        self._shot_bar_box = box
+        return box
 
     def _make_canvas_panel(self, suffix: str) -> QWidget:
         w = QWidget()
@@ -2726,6 +3203,18 @@ class SpectraWidget(QWidget):
         setattr(self, f"_ax_{suffix}",     ax)
         setattr(self, f"_canvas_{suffix}", canvas)
         setattr(self, f"_tb_{suffix}",     tb)
+        # The shot bar belongs to the search graph, so it is built INSIDE that
+        # graph's panel: it has to sit right under the plot box with nothing
+        # between them, and it has to follow the panel wherever the panel goes.
+        if suffix == "top":
+            v.addWidget(self._make_shot_bar())
+
+        # Double-click inside a day on the search graph → mark that whole day.
+        # Connected here, once: _install_span runs on every redraw, so hooking it
+        # there would stack a fresh handler each time. Left double-click DOES reach
+        # matplotlib (only right-click does not, see the note below).
+        if suffix == "top":
+            canvas.mpl_connect("button_press_event", self._on_top_dblclick)
 
         # Right-click inside the axis → "Edit axis…" context menu.
         # Uses Qt CustomContextMenu (reliable); mpl button_press_event misses
@@ -2785,6 +3274,9 @@ class SpectraWidget(QWidget):
 
                 if chosen is act_lim:
                     _AxisLimitsDialog(ax, _canvas, _canvas).exec()
+                    # Typed limits are not a pan/zoom gesture, so the tracker
+                    # ignores them — file them here or the next redraw drops them.
+                    self._remember_axis_limits(ax)
                 elif chosen is act_labels:
                     _AxisLabelsDialog(ax, _canvas, _canvas).exec()
                 elif chosen is act_major:
@@ -2813,6 +3305,10 @@ class SpectraWidget(QWidget):
                     except Exception:
                         pass
                 elif chosen is act_reset:
+                    # home() called in code does not fire the toolbar action, so
+                    # the saved zoom has to be dropped here too — otherwise the
+                    # next redraw puts the view straight back.
+                    self._forget_axis_limits(ax)
                     _tb.home()
                 return
 
@@ -2858,6 +3354,13 @@ class SpectraWidget(QWidget):
         )
         self._bot_cursor_artists = {"vline": vline, "hline": hline,
                                     "y_ann": y_ann, "x_ann": x_ann}
+        # The bold "this one" curve is an overlay on the same canvas and dies with
+        # the same ax.clear(), so it is recreated here rather than in a second hook
+        # somebody would forget to call.
+        self._install_single_hl_artists()
+        # clear() also replaced the axes' callback registry — the pan/zoom memory
+        # has to be reconnected to the new one or it is dead after the first redraw.
+        self._track_bot_zoom()
 
     def _install_cursor(self, canvas, fig, ax, x_is_time: bool):
         """Blitted crosshair with Y-axis and X-axis floating annotations inside the graph.
@@ -2878,9 +3381,35 @@ class SpectraWidget(QWidget):
             for a in _artists():
                 a.set_visible(False)
 
+        def _blit():
+            """Restore the captured background and repaint the overlay on top.
+
+            One place, used by the cursor, by the leave handler and by the
+            "Every spectrum" shot bar — each of them used to restore the
+            background and blit on its own, so whichever ran last wiped the
+            other's artists off the graph."""
+            bg = _state["bg"]
+            if bg is None:
+                canvas.draw_idle()
+                return
+            canvas.restore_region(bg)
+            for artist in _artists() + self._single_hl_list():
+                if artist.get_visible() and artist.axes is not None:
+                    artist.axes.draw_artist(artist)
+            canvas.blit(fig.bbox)
+
+        self._bot_blit_fn = _blit
+
         def _on_draw(_evt):
             _hide_all()
             _state["bg"] = canvas.copy_from_bbox(fig.bbox)
+            # The bold "this one" curve is animated, so the full draw that just
+            # finished left it out — put it straight back on the fresh background.
+            try:
+                self._update_single_highlight(blit=False)
+            except Exception:
+                pass
+            _blit()
 
         def _fmt_y(y):
             abs_y = abs(y)
@@ -2896,7 +3425,9 @@ class SpectraWidget(QWidget):
                     return dt.strftime("%H:%M:%S")
                 except Exception:
                     return f"{x:.4g}"
-            return f"{x:.4g} nm"
+            if self._x_is_samples():
+                return f"{x:.4g}"
+            return f"{x:.4g} {self._x_unit()}".strip()
 
         def _process():
             _state["pending"] = False
@@ -2906,8 +3437,8 @@ class SpectraWidget(QWidget):
 
             if evt is None or evt.inaxes is None or not ca:
                 if bg:
-                    canvas.restore_region(bg)
-                    canvas.blit(fig.bbox)
+                    _hide_all()
+                    _blit()
                 return
 
             x, y = evt.xdata, evt.ydata
@@ -2925,14 +3456,7 @@ class SpectraWidget(QWidget):
             ca["x_ann"].set_text(f" {_fmt_x(x)} ")
             ca["x_ann"].set_visible(True)
 
-            if bg:
-                canvas.restore_region(bg)
-                for artist in _artists():
-                    if artist.get_visible() and artist.axes is not None:
-                        artist.axes.draw_artist(artist)
-                canvas.blit(fig.bbox)
-            else:
-                canvas.draw_idle()
+            _blit()
 
         def _on_motion(evt):
             _state["last_event"] = evt
@@ -2942,10 +3466,10 @@ class SpectraWidget(QWidget):
                 QTimer.singleShot(16, _process)
 
         def _on_leave(_evt):
+            # Only the crosshair goes away — the bold curve is not the mouse's.
             _hide_all()
             if _state["bg"]:
-                canvas.restore_region(_state["bg"])
-                canvas.blit(fig.bbox)
+                _blit()
 
         canvas.mpl_connect("draw_event",          _on_draw)
         canvas.mpl_connect("motion_notify_event", _on_motion)
@@ -2985,6 +3509,93 @@ class SpectraWidget(QWidget):
             cs["dot"] = dot
             cs["value_label"] = lbl
         self._top_cursor_artists = {"vline": vline, "x_ann": x_ann}
+        # The shot bar's marker is an overlay on the same axes and dies with the
+        # same ax.clear(), so it is recreated here rather than in a second hook
+        # somebody would forget to call.
+        self._install_top_marker_artists()
+        # clear() also replaced the axes' callback registry: without this the
+        # zoom memory and the shot bar's follow-the-axis wiring are both dead
+        # after the first redraw.
+        self._track_top_zoom()
+
+    def _install_top_marker_artists(self):
+        """(Re)create the "the bar is here" marker on the search graph.
+
+        animated=True keeps both artists out of every full draw, so the blitted
+        background stays clean and _blit_top() is the only thing that paints them
+        — an artist baked into the background would leave a ghost behind at every
+        position the bar passed through."""
+        ax = self._ax_top
+        line = ax.axvline(color="#111111", linewidth=1.6, visible=False,
+                          animated=True, zorder=10)
+        # Inside the plot box, hanging from the top edge — NOT above it: the search
+        # graph carries a title there ("Drag to select time region(s)…") and a tag
+        # sitting on top of it would cover it.
+        tag = ax.text(
+            0.5, 0.995, "", transform=blended_transform_factory(ax.transData,
+                                                                ax.transAxes),
+            ha="center", va="top", fontsize=9, color="#111111", zorder=13,
+            visible=False, animated=True, clip_on=False,
+            bbox=dict(boxstyle="round,pad=0.25", fc="#ffffff", ec="#555555",
+                      alpha=0.95, linewidth=1.6),
+        )
+        self._top_marker = {"line": line, "tag": tag}
+
+    def _top_marker_list(self) -> list:
+        """The marker's artists, or an empty list before the graph exists."""
+        m = getattr(self, "_top_marker", None)
+        return [m["line"], m["tag"]] if m else []
+
+    def _blit_top(self):
+        """Repaint the search graph's overlay only (crosshair + shot marker).
+
+        Falls back to a full draw until the cursor has captured a background."""
+        fn = getattr(self, "_top_blit_fn", None)
+        if fn is not None:
+            try:
+                fn()
+                return
+            except Exception:
+                pass
+        canvas = getattr(self, "_canvas_top", None)
+        if canvas is not None:
+            canvas.draw_idle()
+
+    def _update_top_marker(self, blit: bool = True):
+        """Point the marker at the shot the bar is on, or hide it.
+
+        The line sits at the shot's own place on the compressed time axis, so it
+        is on the same pixel as the bar's handle below it."""
+        arts = self._top_marker_list()
+        if not arts:
+            return
+        line, tag = arts
+        r = it = None
+        chk = getattr(self, "_chk_single_hl", None)
+        if self._is_single() and chk is not None and chk.isChecked():
+            r, _k, it = self._single_current()
+        tmap = self._tmap
+        x = None
+        if r is not None and it is not None and it.get("ts") and tmap:
+            x = tmap.to_x(int(it["ts"]))
+        if x is None:
+            for a in arts:
+                a.set_visible(False)
+        else:
+            line.set_xdata([x, x])
+            line.set_visible(True)
+            # The border carries the spectrum's own colour, so the marker says
+            # which selection the shot came out of. Taken from the region, never
+            # from its place in the list.
+            colors = getattr(self, "_region_colors_cache", None) or {}
+            col = colors.get(r["id"], r.get("color", "#555555"))
+            tag.set_position((x, 0.995))
+            tag.set_text(f" {_fmt_hms(int(it['ts']))} ")
+            tag.get_bbox_patch().set_edgecolor(col)
+            tag.set_visible(True)
+            line.set_color(col)
+        if blit:
+            self._blit_top()
 
     def _install_top_cursor(self, canvas, fig, ax):
         """Blitted crosshair for the energy plot: one vertical line + a time label
@@ -3004,12 +3615,41 @@ class SpectraWidget(QWidget):
             return arts
 
         def _hide_all():
+            # Only the crosshair — the shot marker is not the mouse's.
             for a in _artists():
                 a.set_visible(False)
+
+        def _blit():
+            """Restore the captured background and repaint the overlay on top.
+
+            One place, used by the cursor, by the leave handler and by the shot
+            bar: each of them restoring the background on its own means whichever
+            ran last wipes the other's artists off the graph."""
+            bg = _state["bg"]
+            if bg is None:
+                canvas.draw_idle()
+                return
+            canvas.restore_region(bg)
+            for a in _artists() + self._top_marker_list():
+                if a.get_visible() and a.axes is not None:
+                    a.axes.draw_artist(a)
+            canvas.blit(fig.bbox)
+
+        self._top_blit_fn = _blit
 
         def _on_draw(_evt):
             _hide_all()
             _state["bg"] = canvas.copy_from_bbox(fig.bbox)
+            # The marker is animated, so the full draw that just finished left it
+            # out — put it straight back on the fresh background.
+            try:
+                self._update_top_marker(blit=False)
+            except Exception:
+                pass
+            _blit()
+            # tight_layout has settled, so this is the moment the plot box's
+            # pixels are final and the bar below can be lined up with it.
+            self._schedule_shot_bar_pin()
 
         def _fmt_v(v):
             av = abs(v)
@@ -3018,9 +3658,16 @@ class SpectraWidget(QWidget):
             return f"{v:.4e}"
 
         def _fmt_time(x):
+            # x is a position on the compressed axis, so the real instant has to
+            # come from the map — and it must carry the date, because the cursor
+            # can now be standing on any of several days.
+            tmap = self._tmap
+            if not tmap:
+                return f"{x:.4g}"
             try:
-                from zoneinfo import ZoneInfo
-                return _mdates.num2date(x, tz=ZoneInfo("Europe/Prague")).strftime("%H:%M:%S")
+                dt = _ns_to_dt(tmap.from_x(x))
+                return (dt.strftime("%H:%M:%S") if tmap.is_identity()
+                        else dt.strftime("%d.%m. %H:%M:%S"))
             except Exception:
                 return f"{x:.4g}"
 
@@ -3039,8 +3686,8 @@ class SpectraWidget(QWidget):
             bg  = _state["bg"]
             if evt is None or evt.inaxes is None:
                 if bg:
-                    canvas.restore_region(bg)
-                    canvas.blit(fig.bbox)
+                    _hide_all()
+                    _blit()
                 return
             x = evt.xdata
             ca = getattr(self, "_top_cursor_artists", None)
@@ -3061,14 +3708,7 @@ class SpectraWidget(QWidget):
                 cs["value_label"].set_position((xpos, v))
                 cs["value_label"].set_text(f" {_fmt_v(v)} ")
                 cs["value_label"].set_visible(True)
-            if bg:
-                canvas.restore_region(bg)
-                for a in _artists():
-                    if a.get_visible():
-                        a.axes.draw_artist(a)
-                canvas.blit(fig.bbox)
-            else:
-                canvas.draw_idle()
+            _blit()
 
         def _on_motion(evt):
             _state["last_event"] = evt
@@ -3080,8 +3720,7 @@ class SpectraWidget(QWidget):
         def _on_leave(_evt):
             _hide_all()
             if _state["bg"]:
-                canvas.restore_region(_state["bg"])
-                canvas.blit(fig.bbox)
+                _blit()
 
         canvas.mpl_connect("draw_event",          _on_draw)
         canvas.mpl_connect("motion_notify_event", _on_motion)
@@ -3126,33 +3765,9 @@ class SpectraWidget(QWidget):
         self._regions_lay.setSpacing(0)
         self._regions_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
         v.addWidget(self._regions_w)
-
-        row_btns = QHBoxLayout()
-        self._btn_clear_regs = QPushButton("Clear all")
-        self._btn_clear_regs.setToolTip("Remove all selected spectra from the list.")
-        self._btn_analyze    = QPushButton("✓  Analyze")
-        self._btn_analyze.setEnabled(False)
-        self._btn_analyze.setStyleSheet(_BTN_SUCCESS)
-        self._btn_analyze.setToolTip(
-            "Fetch and average the spectra in every not-yet-analyzed selection, then plot them."
-        )
-        row_btns.addWidget(self._btn_clear_regs)
-        row_btns.addWidget(self._btn_analyze)
-        v.addLayout(row_btns)
-
-        # analysis progress bar (hidden until analysis runs)
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 1)
-        self._progress.setValue(0)
-        self._progress.setFormat("Analyzing  %v / %m  (%p%)")
-        self._progress.setTextVisible(True)
-        self._progress.setVisible(False)
-        self._progress.setStyleSheet(
-            "QProgressBar { border: 1px solid #b0b0b0; border-radius: 4px; "
-            "text-align: center; height: 20px; font-size: 11px; font-weight: 700; }"
-            "QProgressBar::chunk { background: #2E7D32; border-radius: 3px; }"
-        )
-        v.addWidget(self._progress)
+        # Analyze, the progress bar, Clear all and Export are NOT part of this
+        # panel any more — they are built by _make_sidebar and sit below Mode, so
+        # the panel reads list → mode → analyze → finish.
         return col
 
     def _make_graphs(self) -> QWidget:
@@ -3348,7 +3963,7 @@ class SpectraWidget(QWidget):
         self._cmb_cmp_b.currentIndexChanged.connect(self._redraw_spectra)
         self._cmb_cmp_mode.currentIndexChanged.connect(self._redraw_spectra)
         self._chk_show_energy.toggled.connect(self._update_top_visibility)
-        self._cmb_method.currentIndexChanged.connect(self._redraw_spectra)
+        self._cmb_method.currentIndexChanged.connect(self._on_method_changed)
         self._sb_x_min.valueChanged.connect(self._on_x_range_edited)
         self._sb_x_max.valueChanged.connect(self._on_x_range_edited)
         self._sb_live_n.valueChanged.connect(self._redraw_spectra)
@@ -3368,19 +3983,181 @@ class SpectraWidget(QWidget):
         self._tb_top.subplot_params_changed.connect(self._save_layout)
         self._tb_bot.subplot_params_changed.connect(self._save_layout)
 
+    @staticmethod
+    def _measured_y_range(ax):
+        """Lowest and highest value actually drawn on ax, or None.
+
+        Matplotlib's own scaling is not trustworthy on this graph. It keeps a
+        running box of "where the data is" and skips any artist it cannot place
+        (here: thousands of spectra handed over as one bundle). When that skip
+        happens the only thing left in the box is the crosshair's horizontal line
+        at zero, so the graph is scaled to the empty-graph ±0.05 and every
+        spectrum is cut off just above the baseline — the reported bug: real peaks
+        at 1.0, the axis stopping at 0.05.
+
+        So the range is measured here from the curves themselves. Only artists
+        drawn in real data coordinates count: the crosshair lines and the value
+        tags are pinned to the frame, not to the data, and must not be measured.
+        """
+        lo, hi = np.inf, -np.inf
+
+        def _grow(vals):
+            nonlocal lo, hi
+            v = np.asarray(vals, dtype=float).ravel()
+            v = v[np.isfinite(v)]
+            if v.size:
+                lo = min(lo, float(v.min()))
+                hi = max(hi, float(v.max()))
+
+        def _in_data_coords(artist):
+            try:
+                return artist.get_transform() == ax.transData
+            except Exception:
+                return False
+
+        for coll in list(ax.collections):
+            if not _in_data_coords(coll):
+                continue
+            for p in coll.get_paths():
+                if p.vertices.size:
+                    _grow(p.vertices[:, 1])
+        for ln in list(ax.lines):
+            if _in_data_coords(ln):
+                _grow(ln.get_ydata())
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            return None
+        return lo, hi
+
+    def _drawn_x_span(self):
+        """Lowest and highest X the curves on the graph could cover, or None.
+
+        The whole axis of every visible spectrum, BEFORE the From/To range cuts
+        it down — that is what the range has to be compared against."""
+        lo, hi = np.inf, -np.inf
+        for r in self._regions:
+            if not r.get("analyzed") or not r.get("visible", True):
+                continue
+            y = r.get(self._curve_method())
+            if y is None:
+                continue
+            x = self._curve_x(r, len(np.asarray(y)))
+            if x.size:
+                lo, hi = min(lo, float(x.min())), max(hi, float(x.max()))
+        if self._live and self._live_buf:
+            x = self._axis_for(self._x_data, len(list(self._live_buf)[-1][1]))
+            if x.size:
+                lo, hi = min(lo, float(x.min())), max(hi, float(x.max()))
+        return None if not np.isfinite(lo) else (lo, hi)
+
+    def _range_misses_data_msg(self) -> str:
+        """What to put on the graph when From/To keeps no data at all.
+
+        An empty white graph with a ±0.05 axis reads as "the archive has nothing",
+        which is the wrong thing to conclude — and it is exactly what the panel
+        showed while the range and the curves were on two different axes."""
+        quantity, unit, _ = self._x_names()
+        span = self._drawn_x_span()
+        head = (f"Nothing inside {quantity} range "
+                f"{self._sb_x_min.value()} … {self._sb_x_max.value()}"
+                + (f" {unit}" if unit else ""))
+        if span is None:
+            return head
+        return (f"{head}\nThe spectra cover {span[0]:.0f} … {span[1]:.0f}"
+                + (f" {unit}" if unit else "")
+                + " — widen From/To, or tick Auto-fit and analyze again.")
+
+    def _fit_bot_ylim(self, ax):
+        """Scale the spectra graph to the curves that are on it, plus 5 % air."""
+        rng = self._measured_y_range(ax)
+        if rng is None:
+            return
+        lo, hi = rng
+        pad = (hi - lo) * 0.05 or (abs(hi) * 0.05 or 0.05)
+        ax.set_ylim(lo - pad, hi + pad)
+
+    def _track_zoom_on(self, ax, xlim_attr, ylim_attr, redrawing_attr, tb_attr):
+        """(Re)connect the pan/zoom memory of one graph.
+
+        Two things this has to get right, and both were wrong:
+
+        * **Re-wire after every ax.clear().** clear() throws the axes' whole
+          callback registry away and puts an empty one in its place, so wiring
+          this once in __init__ left the memory dead from the first redraw on:
+          a zoom was forgotten as soon as anything was redrawn.
+        * **Only a real gesture counts.** Matplotlib autoscales an axes while it
+          is being DRAWN, i.e. after the redraw flag has been dropped, so the
+          empty placeholder graph's own ±0.05 fired ylim_changed and was filed
+          away as "the user's zoom". Every later redraw then re-applied it, and
+          the intensity axis stopped at 0.05 with spectra peaking at 1.0 — the
+          reported bug, and the reason a new X range dragged Y to a range the
+          user had never asked for. So a change is only remembered while Pan or
+          Zoom is actually the active tool; typed limits and Reset view record
+          and forget themselves (_remember/_forget_axis_limits)."""
+        def _gesture() -> bool:
+            if getattr(self, redrawing_attr, False):
+                return False
+            return bool(getattr(getattr(self, tb_attr, None), "mode", ""))
+
+        def _on_xlim(a):
+            if _gesture():
+                setattr(self, xlim_attr, a.get_xlim())
+
+        def _on_ylim(a):
+            if _gesture():
+                setattr(self, ylim_attr, a.get_ylim())
+
+        ax.callbacks.connect('xlim_changed', _on_xlim)
+        ax.callbacks.connect('ylim_changed', _on_ylim)
+
+    def _axis_limit_attrs(self, ax):
+        """The saved-zoom field names of this axes, or None (e.g. a twin axes)."""
+        if ax is getattr(self, "_ax_top", None):
+            return "_top_user_xlim", "_top_user_ylim"
+        if ax is getattr(self, "_ax_bot", None):
+            return "_bot_user_xlim", "_bot_user_ylim"
+        return None
+
+    def _remember_axis_limits(self, ax):
+        """Keep the limits this axes has now across the next redraws.
+
+        For limits the user TYPED (the Axis limits… dialog): those come from no
+        gesture at all, so the tracker above deliberately ignores them and they
+        would be gone with the next redraw."""
+        attrs = self._axis_limit_attrs(ax)
+        if attrs:
+            setattr(self, attrs[0], ax.get_xlim())
+            setattr(self, attrs[1], ax.get_ylim())
+
+    def _forget_axis_limits(self, ax):
+        """Drop the saved zoom, so the graph fits itself to the data again."""
+        attrs = self._axis_limit_attrs(ax)
+        if attrs:
+            setattr(self, attrs[0], None)
+            setattr(self, attrs[1], None)
+
+    def _track_top_zoom(self):
+        """Pan/zoom memory of the search graph, plus the shot bar that rides on it."""
+        self._track_zoom_on(self._ax_top, '_top_user_xlim', '_top_user_ylim',
+                            '_top_redrawing', '_tb_top')
+        # The shot bar covers whatever stretch of the axis the graph is showing,
+        # so a zoom or a pan has to move the handle to keep it under its shot.
+        # This runs on programmatic limit changes too, which is what it is for:
+        # _draw_energy re-applies the saved zoom and the handle must follow.
+        self._ax_top.callbacks.connect('xlim_changed',
+                                       lambda _a: self._sync_shot_bar())
+
+    def _track_bot_zoom(self):
+        """Pan/zoom memory of the spectra graph."""
+        self._track_zoom_on(self._ax_bot, '_bot_user_xlim', '_bot_user_ylim',
+                            '_bot_redrawing', '_tb_bot')
+
     def _connect_zoom_tracking(self):
         """Save user's pan/zoom state so redraws don't reset it."""
-        def _mk_handler(ax, xlim_attr, ylim_attr, redrawing_attr):
-            def _on_xlim(a):
-                if not getattr(self, redrawing_attr, False):
-                    setattr(self, xlim_attr, a.get_xlim())
-            def _on_ylim(a):
-                if not getattr(self, redrawing_attr, False):
-                    setattr(self, ylim_attr, a.get_ylim())
-            ax.callbacks.connect('xlim_changed', _on_xlim)
-            ax.callbacks.connect('ylim_changed', _on_ylim)
-        _mk_handler(self._ax_top, '_top_user_xlim', '_top_user_ylim', '_top_redrawing')
-        _mk_handler(self._ax_bot, '_bot_user_xlim', '_bot_user_ylim', '_bot_redrawing')
+        # Only the search graph is wired here: its artists are created by the
+        # first _draw_energy, so nothing has wired it yet. The spectra graph was
+        # wired while its canvas was built (_install_bot_cursor_artists), and both
+        # are re-wired after every clear() from those same installers.
+        self._track_top_zoom()
         # Clear saved zoom when user presses Home (resets to full data view)
         for action in self._tb_top.actions():
             if action.text() == "Home":
@@ -3562,6 +4339,84 @@ class SpectraWidget(QWidget):
             return f"{cfg.get('scale', 1.0)}·({src}) + {cfg.get('offset', 0.0)}"
         return src
 
+    # ── Unit of the X axis ────────────────────────────────────────────────────
+    def _x_unit(self) -> str:
+        """Unit of the spectrum graph's horizontal axis: what the user typed, or
+        a guess from the channel name."""
+        cfg = self._x_axis_cfg or {"mode": "native"}
+        u = cfg.get("unit")
+        if isinstance(u, str) and u.strip():
+            return u.strip()
+        if cfg.get("mode") == "index":
+            return ""
+        src = (cfg.get("source_pv") if cfg.get("mode") in ("pv", "linear")
+               else self._spec_x_pv)
+        return _guess_x_unit(src, self._spec_base_pv)
+
+    def _x_names(self) -> tuple:
+        """(quantity, unit, symbol) behind every axis label the panel prints —
+        ("Wavelength", "nm", "λ") for a spectrometer, ("Time", "fs", "t") for
+        the SPIDER time domain."""
+        unit = self._x_unit()
+        quantity, symbol = _x_unit_kind(unit)
+        return quantity, unit, symbol
+
+    def _x_title(self) -> str:
+        """Axis title of the spectrum graph, sample numbers included."""
+        if self._x_is_samples():
+            return "Sample number (no measured axis resolved)"
+        quantity, unit, _ = self._x_names()
+        return f"{quantity} [{unit}]" if unit else quantity
+
+    def _fmt_x_value(self, v, decimals: int = 2) -> str:
+        """One X value with its unit, for the readouts and the details box."""
+        if v is None:
+            return "n/a"
+        unit = "" if self._x_is_samples() else self._x_unit()
+        return f"{v:.{decimals}f} {unit}".strip()
+
+    def _on_x_unit_edited(self):
+        """The unit changes labels only — no data is refetched or recomputed."""
+        new = self._edit_x_unit.text().strip()
+        cfg = dict(self._x_axis_cfg or {"mode": "native"})
+        if new == (cfg.get("unit") or "").strip():
+            return
+        cfg["unit"] = new
+        self._x_axis_cfg = cfg
+        self._save_spec_base()
+        self._edit_x_unit.setText(self._x_unit())
+        self._sync_x_unit_labels()
+        self._rebuild_regions_ui()
+        self._redraw_spectra()
+
+    def _x_fit_note(self) -> str:
+        """A word about an axis the archiver stored only part of, so a rebuilt
+        axis never passes for a fully archived one. '' when nothing was rebuilt."""
+        method = self._curve_method()
+        for r in self._regions:
+            if not r.get("analyzed"):
+                continue
+            y, x = r.get(method), r.get("x")
+            if y is None or x is None:
+                continue
+            n  = len(np.asarray(y))
+            nx = len(np.asarray(x))
+            if nx != n and _fit_x_axis(x, n) is not None:
+                # Say the assumption out loud: the stored part was taken as the
+                # BEGINNING of the axis and continued at the same spacing. (For
+                # SPIDER that is certain — the Fourier-limit trace peaks exactly
+                # on point 2048, so point 2048 is t = 0.)
+                return (f"X axis: the archive stored only {nx} of the {n} axis "
+                        f"points — the rest was continued at the same spacing.")
+        return ""
+
+    def _sync_x_unit_labels(self):
+        """Repaint the labels that carry the unit outside the graph itself."""
+        quantity, unit, _ = self._x_names()
+        if getattr(self, "_lbl_xrange", None) is not None:
+            self._lbl_xrange.setText(
+                (f"{quantity} range [{unit}]" if unit else f"{quantity} range").upper())
+
     def _resolve_x_data(self, start_ns: int, end_ns: int) -> "np.ndarray | None":
         """Fetch / build the wavelength axis according to self._x_axis_cfg.
         Returns None when the axis should fall back to the sample index."""
@@ -3621,6 +4476,10 @@ class SpectraWidget(QWidget):
             f"X axis: {self._x_axis_summary()}\nY axis: {self._spec_y_pv}"
         )
         self._lbl_spec_pair.setText(f"X: {self._x_axis_summary()}   /   Y: {self._spec_y_pv}")
+        # A new channel means a new axis, so the unit is guessed again from its
+        # name — a hand-typed unit belongs to the channel it was typed for.
+        self._edit_x_unit.setText(self._x_unit())
+        self._sync_x_unit_labels()
         self._save_spec_base()
         if self._live:
             self._stop_live()
@@ -3637,7 +4496,8 @@ class SpectraWidget(QWidget):
     # reselecting every span by hand. Now the selections stay and the results are
     # recomputed for them.
     _RESULT_KEYS = ("x", "mean", "median", "trimmed", "sigma", "std", "p10", "p90",
-                    "stack", "orders", "energy_avg", "energy_n", "n", "_metrics")
+                    "stack", "stack_ts", "orders", "energy_avg", "energy_n", "n",
+                    "_metrics")
 
     def _reanalyze_all(self, why: str):
         """Drop stale results but KEEP the selections, then re-run the analysis."""
@@ -3861,10 +4721,10 @@ class SpectraWidget(QWidget):
             self._tbl_pvs.selectRow(row)
         self._tbl_pvs.blockSignals(False)
         self._fit_pv_columns()
-        # The PV *set* changed → reload all search PVs for the loaded day.
+        # The PV *set* changed → reload all search PVs for the loaded windows.
         self._update_active_card()
         self._btn_rem_pv.setEnabled(self._tbl_pvs.currentRow() >= 0)
-        if not self._live and self._selected_days:
+        if not self._live and self._windows:
             self._load_day_energy()
 
     def _update_preset_combo(self):
@@ -4156,33 +5016,84 @@ class SpectraWidget(QWidget):
         self._redraw_spectra()
 
     # ── Day picker ────────────────────────────────────────────────────────────
+    def _day_summary(self) -> str:
+        """The Step-1 label: one window spelled out, several summed up."""
+        w = self._windows
+        if not w:
+            return "No day selected"
+        if len(w) == 1:
+            a, b = _ns_to_dt(w[0][0]), _ns_to_dt(w[0][1])
+            return (f"{a.strftime('%Y-%m-%d')}\n"
+                    f"{a.strftime('%H:%M')} – {b.strftime('%H:%M')}")
+        hours = sum(b - a for a, b in w) / 3.6e12
+        return (f"{len(w)} days\n"
+                f"{_ns_to_dt(w[0][0]).strftime('%Y-%m-%d')} … "
+                f"{_ns_to_dt(w[-1][0]).strftime('%Y-%m-%d')}\n"
+                f"{hours:.1f} h selected")
+
+    def _window_tooltip(self) -> str:
+        if not self._windows:
+            return ""
+        return "Loaded:\n" + "\n".join(_fmt_window(w) for w in self._windows)
+
     def _pick_day(self):
-        dlg = DatePickerDialog(self, initial=self._selected_day or QDate.currentDate())
+        """Open the shared day/time picker (daypicker.py — the same calendar as
+        Image Tools). It returns one time window per picked day, each with its own
+        hours; only those windows are fetched and drawn."""
+        init_date = _ns_to_dt(self._windows[0][0]).date() if self._windows else None
+        dlg = DayTimePicker(parent=self, init_date=init_date,
+                            init_segments=list(self._segments) or None,
+                            allow_live=False,     # Spectra has its own Live button
+                            title="Select day(s) and time window")
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        windows = [w for w in dlg.selected_windows() if w[1] > w[0]]
+        if not windows:
+            return
+        if not self._confirm_request_volume(windows):
             return
         # switch UI back to archive mode
         self._btn_archive.setChecked(True)
         self._set_live_mode(False)
-        dates = dlg.selected_dates()
-        self._selected_days = dates
-        self._selected_day  = dates[0]
-        if len(dates) == 1:
-            self._lbl_day.setText(f"Day: {dates[0].toString('yyyy-MM-dd')}")
-        else:
-            self._lbl_day.setText(
-                f"Days: {dates[0].toString('yyyy-MM-dd')} → "
-                f"{dates[-1].toString('yyyy-MM-dd')}  ({len(dates)} days)")
+        self._segments = list(dlg.all_segments())
+        self._windows  = windows
         # Keep already-selected spectra across day changes — they carry absolute
         # timestamps and stay in the list (delete them via the ✕ in the list).
+        # A zoom remembered in axis coordinates would stand for a different
+        # instant now, but _load_day_energy ends in _draw_energy(), which resets
+        # the view anyway — so there is nothing to clear here.
         self._load_day_energy()
 
+    def _confirm_request_volume(self, windows: "list[tuple[int, int]]") -> bool:
+        """Warn before a load that will take minutes — but never refuse it.
+
+        The archive is read in one-hour pieces, per PV, so the request count is
+        hours × PVs: a fortnight of eleven PVs is well over a thousand. Capping it
+        would turn a slow load into a silently incomplete one, so this only asks.
+        """
+        hours = sum(-(-(b - a) // _CHUNK_NS) for a, b in windows)
+        n_req = int(hours) * max(1, len(self._search_pvs))
+        if n_req <= _FETCH_WARN_REQUESTS:
+            return True
+        ans = QMessageBox.question(
+            self, "This will take a while",
+            f"{len(windows)} day(s) × {len(self._search_pvs)} PV(s) is about "
+            f"{n_req} archive requests.\n\n"
+            f"It will work, but it can take several minutes. Stop cancels it at "
+            f"any point.\n\nLoad it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        return ans == QMessageBox.StandardButton.Yes
+
     def _load_day_energy(self):
-        days = self._selected_days or ([self._selected_day] if self._selected_day else [])
-        if not days:
+        windows = list(self._windows)
+        if not windows:
             return
-        start_ns, _ = _day_range_ns(days[0])
-        _, end_ns   = _day_range_ns(days[-1])
-        self._day_start_ns, self._day_end_ns = start_ns, end_ns
+        # The sidebar label describes what is LOADED, so it is set here rather
+        # than in _pick_day: whatever route got us here, it cannot go stale.
+        self._tmap = _TimeMap(windows)
+        self._lbl_day.setText(self._day_summary())
+        self._lbl_day.setToolTip(self._window_tooltip())
         pvs = list(self._search_pvs)
         if not pvs:
             self._draw_top_empty("Add a search PV to plot")
@@ -4191,9 +5102,12 @@ class SpectraWidget(QWidget):
         self._btn_pick_day.setEnabled(False)
         self._loading = True
         self._refresh_pill()
-        self._progress.setRange(0, len(pvs))
+        # One step per PV *and* window, or the bar would sit at 1/1 through a
+        # ten-day load.
+        steps = len(pvs) * len(windows)
+        self._progress.setRange(0, steps)
         self._progress.setValue(0)
-        self._progress.setFormat("Loading  %v / %m  PV(s)  (%p%)")
+        self._progress.setFormat("Loading  %v / %m  (%p%)")
         self._progress.setVisible(True)
 
         sig = _Sig(self)
@@ -4205,14 +5119,42 @@ class SpectraWidget(QWidget):
         def _work():
             try:
                 series = []
+                step = 0
                 for i, (lbl, ch) in enumerate(pvs):
                     if self._cancel.is_set():
                         break
-                    sig.progress.emit(f"Loading {i+1}/{len(pvs)}: {lbl}…")
-                    data = _fetch_scalars(ch, start_ns, end_ns)
+                    data: list = []
+                    err = None
+                    newest = None
+                    for j, (w_start, w_end) in enumerate(windows):
+                        if self._cancel.is_set():
+                            break
+                        if len(windows) == 1:
+                            sig.progress.emit(f"Loading {i+1}/{len(pvs)}: {lbl}…")
+                        else:
+                            sig.progress.emit(
+                                f"Loading {i+1}/{len(pvs)}: {lbl} — "
+                                f"window {j+1}/{len(windows)} "
+                                f"({_fmt_window((w_start, w_end))})…")
+                        raw = _fetch_scalars(ch, w_start, w_end)
+                        # Each window overwrites _last_fetch_error, so keep the
+                        # first failure instead of only the last window's.
+                        err = err or _last_fetch_error.get(ch)
+                        if raw:
+                            newest = max(newest or 0, max(t for t, _ in raw))
+                        # Every request also returns the last sample from BEFORE
+                        # its own start. On the compressed axis that sample sits in
+                        # removed time, so it is dropped here, in the worker, where
+                        # the window is still in hand: doing it in the slot meant
+                        # scanning every window for every one of half a million
+                        # samples with the whole panel frozen.
+                        data += [(t, v) for (t, v) in raw if w_start <= t < w_end]
+                        step += 1
+                        sig.progress_n.emit(step, steps)
+                    data.sort(key=lambda tv: tv[0])
                     series.append({"label": lbl, "channel": ch, "data": data,
-                                   "error": _last_fetch_error.get(ch)})
-                    sig.progress_n.emit(i + 1, len(pvs))
+                                   "raw_newest": newest,
+                                   "error": err})
                 sig.done.emit(series)
             except Exception as e:
                 sig.error.emit(str(e))
@@ -4229,15 +5171,14 @@ class SpectraWidget(QWidget):
         if self._cancel.is_set():
             self._set_status("Load cancelled.")
             return
-        # Drop the "last value before start" sample EPICS returns, so the axis
-        # is clamped to the selected day instead of stretching to the previous day.
+        # The worker already dropped the "last value before start" sample that
+        # every request returns, so s["data"] holds only time that was asked for.
         out = []
         for s in series:
-            d = [(t, v) for (t, v) in s["data"]
-                 if self._day_start_ns <= t <= self._day_end_ns]
-            # That dropped sample is still worth keeping: for a PV with nothing on
-            # the chosen day it is the only clue to when it last recorded anything.
-            last_before = max((t for t, _ in s["data"]), default=None) if not d else None
+            d = s["data"]
+            # Those dropped samples are still worth keeping: for a PV with nothing
+            # in any window they are the only clue to when it last recorded.
+            last_before = s.get("raw_newest") if not d else None
             out.append({"label": s["label"], "channel": s["channel"],
                         "color": self._trace_colour(s["channel"]), "data": d,
                         "error": s.get("error"), "last_before": last_before})
@@ -4249,14 +5190,14 @@ class SpectraWidget(QWidget):
             if s.get("error"):
                 notes.append(f"{s['label']}: {s['error']}")
             elif s.get("last_before"):
-                notes.append(f"{s['label']}: nothing on this day "
+                notes.append(f"{s['label']}: nothing in the selected time "
                              f"(last archived {_fmt_date(s['last_before'])} "
                              f"{_fmt_hms(s['last_before'])})")
             else:
                 notes.append(f"{s['label']}: nothing archived")
         if total == 0:
-            self._set_status("No data for the selected PV(s) on this day.  "
-                             + "   ".join(notes))
+            self._set_status("No data for the selected PV(s) in the selected "
+                             "time.  " + "   ".join(notes))
             self._draw_top_empty("No data for the selected PV(s)")
             return
         msg = f"Loaded {total} samples across {len(out) - len(empties)} PV(s)."
@@ -4276,7 +5217,7 @@ class SpectraWidget(QWidget):
         self._draw_top_empty("Error loading data")
 
     # ── Energy graph ──────────────────────────────────────────────────────────
-    def _draw_top_empty(self, msg: str = "Select a day first  →  button on the left"):
+    def _draw_top_empty(self, msg: str = "Select a day and time first  →  button on the left"):
         ax = self._ax_top
         ax.clear()
         ax.set_facecolor("white")
@@ -4284,17 +5225,96 @@ class SpectraWidget(QWidget):
                 ha="center", va="center", color="#aaa", fontsize=11)
         ax.set_xticks([])
         ax.set_yticks([])
+        # Still a time axis as far as Axis limits is concerned, even while empty:
+        # its X numbers would be seconds along a selection that does not exist.
+        ax._sp_time_axis = True
+        # clear() detached the shot marker; drawing a detached artist raises
+        # "'NoneType' has no attribute 'dpi'", so put a fresh pair in place.
+        self._install_top_marker_artists()
         self._canvas_top.draw_idle()
 
     def _paint_region_spans(self, ax):
-        # Regions can now span multiple days; spans outside the current day's
-        # x-limits are simply clipped, so painting them all is harmless.
+        # A region is stored in absolute time, so it may cover time that is not on
+        # the axis at all (a different day, or an unselected part of a day). _TimeMap
+        # cuts it into one block per selected window: time nobody asked for is never
+        # shaded, and a region wholly outside the selection simply paints nothing.
         for r in self._regions:
-            ax.axvspan(
-                mdates.date2num(_ns_to_dt(r["t_start"])),
-                mdates.date2num(_ns_to_dt(r["t_end"])),
-                alpha=0.25, color=r["color"], zorder=0,
-            )
+            for x0, x1 in self._tmap.clip(r["t_start"], r["t_end"]):
+                ax.axvspan(x0, x1, alpha=0.25, color=r["color"], zorder=0)
+
+    def _style_time_axis(self, ax):
+        """Put real dates and times back on the compressed x axis.
+
+        The axis is in seconds along the concatenated windows, so matplotlib's
+        date machinery cannot be used: a FixedLocator places the round clock
+        times and a FuncFormatter turns each position back into the real time it
+        stands for. The formatter reads the position, never a tick index, so the
+        labels stay right after a zoom.
+
+        Known trade-off, deliberately kept: the tick positions are fixed, so a
+        deep zoom into one block can leave only one or two ticks on screen. Those
+        labels are still correct, and the crosshair gives the exact instant. Do
+        NOT "fix" it by going back to matplotlib's date locators — they would read
+        this axis as real time and mislabel every tick.
+        """
+        tmap = self._tmap
+        # Read by _AxisLimitsDialog: typing limits into a compressed axis would
+        # mean typing seconds-along-the-selection, which is meaningless.
+        ax._sp_time_axis = True
+        if not tmap:
+            ax.set_xlabel("Time")
+            return
+        multi = len(tmap.windows) > 1
+        ax.set_xlim(*tmap.xlim())
+        pos, _lab = tmap.ticks(12)
+        ax.xaxis.set_major_locator(FixedLocator(pos))
+
+        def _fmt(x, _pos):
+            dt = _ns_to_dt(tmap.from_x(x))
+            # The date only on the first tick of each block — repeating it on
+            # every tick makes the axis a wall of text.
+            if multi and tmap.is_window_start(x, tol=1.0):
+                return dt.strftime("%m-%d\n%H:%M")
+            return dt.strftime("%H:%M")
+
+        ax.xaxis.set_major_formatter(FuncFormatter(_fmt))
+        ax.tick_params(axis="x", labelsize=8, colors="#263238")
+        if multi:
+            hours = sum(b - a for a, b in tmap.windows) / 3.6e12
+            ax.set_xlabel(f"Time   —   {len(tmap.windows)} days, {hours:.1f} h "
+                          f"selected   (unselected time removed)")
+        else:
+            a, b = tmap.windows[0]
+            ax.set_xlabel(f"Time   —   {_ns_to_dt(a).strftime('%Y-%m-%d')}   "
+                          f"{_ns_to_dt(a).strftime('%H:%M')} – "
+                          f"{_ns_to_dt(b).strftime('%H:%M')}")
+
+    def _paint_window_joins(self, ax):
+        """Mark where one picked window ends and the next begins.
+
+        Without this the graph reads as one continuous stretch of time, and a
+        step from one day to the next looks like a real jump in the signal.
+        """
+        tmap = self._tmap
+        if len(tmap.windows) < 2:
+            return
+        for x in tmap.boundaries():
+            ax.axvline(x, color="#37474F", lw=1.4, ls=(0, (4, 3)), zorder=6)
+        tr = blended_transform_factory(ax.transData, ax.transAxes)
+        n = len(tmap.windows)
+        # Inside the axes, not above them: above is where the title is. Every
+        # other label once a fortnight is picked, or they overlap into a smear —
+        # and each one gets a white plate so it stays readable over a trace.
+        every = 1 if n <= 8 else (2 if n <= 16 else 3)
+        fmt = "%a %d.%m." if n <= 8 else "%d.%m."
+        for i, (cx, (a, _b)) in enumerate(tmap.window_centres()):
+            if i % every:
+                continue
+            ax.text(cx, 0.99, _ns_to_dt(a).strftime(fmt), transform=tr,
+                    ha="center", va="top", fontsize=8, color="#263238",
+                    clip_on=False, zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                              ec="#CFD8DC", alpha=0.85))
 
     def _draw_energy(self, reset_view: bool = True):
         ax = self._ax_top
@@ -4358,7 +5378,8 @@ class SpectraWidget(QWidget):
             vals  = np.fromiter((v for _, v in raw), dtype=float, count=len(raw))
             order = np.argsort(t_ns, kind="stable")
             t_ns, vals = t_ns[order], vals[order]
-            times = mdates.date2num(t_ns.astype("datetime64[ns]"))
+            # Onto the compressed axis: one block per picked window, NaN-separated.
+            times, plot_vals, cur_times, cur_vals = self._tmap.trace(t_ns, vals)
             is_active = (s["channel"] == active_ch)
             # Colour is looked up per PV on every draw, so it survives a reload, a
             # day with no data for one PV and any change to the PV list.
@@ -4368,7 +5389,7 @@ class SpectraWidget(QWidget):
             # step-after line reflects the real signal — no false linear ramps.
             # Sample dots help on a sparse trace; on a dense one they merge into a
             # solid band and only make every pan and zoom slower, so drop them.
-            a.plot(times, vals, "-", drawstyle="steps-post",
+            a.plot(times, plot_vals, "-", drawstyle="steps-post",
                    lw=2.0 if is_active else 1.0,
                    color=col, alpha=0.9,
                    marker="." if len(times) <= 20000 else "None", ms=3,
@@ -4379,28 +5400,14 @@ class SpectraWidget(QWidget):
             a.spines[spine].set_color(col)
             self._top_cursor_series.append({
                 "label": s["label"], "color": col, "axis": a,
-                "side": side, "times": times, "vals": vals,
+                "side": side, "times": cur_times, "vals": cur_vals,
             })
 
-        days = self._selected_days or ([self._selected_day] if self._selected_day else [])
-        multi = len(days) > 1
-        # multi-day: show the date in each tick; single day: just the time
-        ax.xaxis.set_major_formatter(
-            mdates.DateFormatter("%m-%d %H:%M" if multi else "%H:%M", tz=_PRAGUE))
-        # clamp the view to the selected day/range (issue: previous day used to show)
-        ax.set_xlim(mdates.date2num(_ns_to_dt(self._day_start_ns)),
-                    mdates.date2num(_ns_to_dt(self._day_end_ns)))
-        self._fig_top.autofmt_xdate(rotation=0, ha="center")
-        # Task 6: always show the selected date on the axis, even for a single day.
-        if days:
-            date_str = (f"{days[0].toString('yyyy-MM-dd')} → {days[-1].toString('yyyy-MM-dd')}"
-                        if multi else days[0].toString("yyyy-MM-dd"))
-            ax.set_xlabel(f"Time   —   {date_str}")
-        else:
-            ax.set_xlabel("Time")
+        self._style_time_axis(ax)
         ax.set_title("Drag to select time region(s), then click Analyze")
         ax.grid(True, alpha=0.25)
         self._paint_region_spans(ax)
+        self._paint_window_joins(ax)
         self._install_top_cursor_artists()
         self._top_redrawing = False
         if self._top_user_xlim is not None:
@@ -4425,31 +5432,146 @@ class SpectraWidget(QWidget):
         if hasattr(self, '_act_select') and not self._act_select.isChecked():
             self._span.set_active(False)
 
-    def _on_span(self, xmin: float, xmax: float):
-        if xmax - xmin < 1e-9:
-            return
-        try:
-            t_start = int(mdates.num2date(xmin).timestamp() * 1e9)
-            t_end   = int(mdates.num2date(xmax).timestamp() * 1e9)
-        except Exception:
-            return
-        rid   = self._region_seq
+    def _add_region(self, t_start: int, t_end: int) -> dict:
+        """Append one region and paint it, without touching the rest of the UI.
+
+        The single place a region is built, so a drag and a double-click cannot
+        drift apart. The caller repaints the canvas and rebuilds the list.
+        """
+        rid = self._region_seq
         self._region_seq += 1
         color = _REGION_COLORS[rid % len(_REGION_COLORS)]
-        self._regions.append({
+        r = {
             "id": rid, "t_start": t_start, "t_end": t_end, "color": color,
             "visible": True, "expanded": False, "show_individual": False,
             "analyzed": False, "n": 0,
-        })
+        }
+        self._regions.append(r)
         # add only the new span (keeps current zoom/pan — nothing else changes)
-        self._ax_top.axvspan(xmin, xmax, alpha=0.25, color=color, zorder=0)
+        for x0, x1 in self._tmap.clip(t_start, t_end):
+            self._ax_top.axvspan(x0, x1, alpha=0.25, color=color, zorder=0)
+        return r
+
+    def _keep_drag_parts(self, parts: "list[tuple[int, int]]"):
+        """Drop the days a drag only clipped. Returns (kept, dropped).
+
+        A piece survives if it holds at least _EDGE_KEEP_FRAC of the drag's
+        longest piece, or covers at least _FULL_DAY_FRAC of its own day's loaded
+        window — the second test is what saves a day loaded with a short window
+        (30 min beside a neighbour's 11 h) from being read as an accidental clip.
+        The longest piece is always kept, so a drag never ends up marking nothing.
+        """
+        if len(parts) < 2:
+            return list(parts), []
+        durs    = [b - a for a, b in parts]
+        biggest = max(durs)
+        floor   = biggest * _EDGE_KEEP_FRAC
+        keep, drop = [], []
+        for (a, b), dur in zip(parts, durs):
+            own = self._tmap.window_len_ns(a)
+            full_day = own > 0 and dur >= own * _FULL_DAY_FRAC
+            if dur >= floor or full_day:
+                keep.append((a, b))
+            else:
+                drop.append((a, b))
+        if not keep:                       # cannot happen with the rule above, but
+            i = durs.index(biggest)        # never leave the operator with nothing
+            keep = [parts[i]]
+            drop = [p for j, p in enumerate(parts) if j != i]
+        return keep, drop
+
+    def _on_span(self, xmin: float, xmax: float):
+        # The axis is in seconds now, not matplotlib date numbers, so the old
+        # 1e-9 guard was one nanosecond wide and let every click through as a
+        # region.
+        if xmax - xmin < _MIN_SPAN_S:
+            return
+        tmap = self._tmap
+        if not tmap:
+            return
+        t_start = tmap.from_x(xmin)
+        t_end   = tmap.from_x(xmax)
+        # A drag that crosses a join covers time that is not on the axis. One
+        # region spanning it would silently average two different days together,
+        # so it becomes one spectrum per window instead.
+        parts = tmap.split_ns(t_start, t_end) or [(t_start, t_end)]
+        # ...but a day the drag merely clipped by a few pixels is not a spectrum
+        # the operator asked for.
+        parts, dropped = self._keep_drag_parts(parts)
+        parts = [(a, b) for a, b in parts if (b - a) / 1e9 >= _MIN_SPAN_S] or parts
+        added = []
+        for p_start, p_end in parts:
+            self._add_region(p_start, p_end)
+            added.append((p_start, p_end))
+        self._canvas_top.draw_idle()
+        self._rebuild_regions_ui()
+        self._update_action_buttons()
+        if dropped:
+            days = ", ".join(sorted({_fmt_date(a) for a, _ in dropped}))
+            trimmed = f"  The overhang into {days} was ignored."
+        else:
+            trimmed = ""
+        if len(added) == 1:
+            a, b = added[0]
+            self._set_status(
+                f"Spectrum {len(self._regions)} added: "
+                f"{_fmt_date(a)} {_fmt_hms(a)} – {_fmt_hms(b)}.{trimmed}  "
+                f"Add more or click Analyze."
+            )
+        else:
+            self._set_status(
+                f"The selection crossed {len(added)} days, so {len(added)} "
+                f"spectra were added: "
+                + ",  ".join(f"{_fmt_date(a)} {_fmt_hms(a)}–{_fmt_hms(b)}"
+                             for a, b in added)
+                + f".{trimmed}  Add more or click Analyze."
+            )
+
+    def _on_top_dblclick(self, event):
+        """Double-click inside a day → mark that whole day, edge to edge.
+
+        Aiming a drag at one block is what produced the unwanted slivers in the
+        first place; this needs no aiming. Same gate as the SpanSelector, so it is
+        inert while Pan/Zoom has the mouse.
+        """
+        if not getattr(event, "dblclick", False) or event.button != 1:
+            return
+        # A second PV puts twinx axes on top of _ax_top, so inaxes is usually one
+        # of THOSE, not _ax_top itself — an identity test here would kill the
+        # feature as soon as a second search PV is ticked. They share the x axis,
+        # so read x back through _ax_top's own transform instead.
+        if event.inaxes is None or event.x is None:
+            return
+        if event.inaxes is not self._ax_top \
+                and event.inaxes not in getattr(self, "_top_extra_axes", []):
+            return
+        act = getattr(self, "_act_select", None)
+        if act is not None and not act.isChecked():
+            return
+        tmap = self._tmap
+        if not tmap:
+            return
+        x_axis, _y = self._ax_top.transData.inverted().transform(
+            (event.x, event.y))
+        win = tmap.window_at_x(float(x_axis))
+        if win is None:
+            return
+        a, b = win
+        same = next((i for i, r in enumerate(self._regions)
+                     if r["t_start"] == a and r["t_end"] == b), None)
+        if same is not None:
+            self._set_status(
+                f"All of {_fmt_date(a)} is already marked as "
+                f"{self._region_label(same)}."
+            )
+            return
+        self._add_region(a, b)
         self._canvas_top.draw_idle()
         self._rebuild_regions_ui()
         self._update_action_buttons()
         self._set_status(
-            f"Spectrum {len(self._regions)} added: "
-            f"{_fmt_hms(t_start)} – {_fmt_hms(t_end)}.  "
-            f"Add more or click Analyze."
+            f"Spectrum {len(self._regions)} added: all of {_fmt_date(a)} "
+            f"({_fmt_hms(a)} – {_fmt_hms(b)}).  Add more or click Analyze."
         )
 
     # ── Regions UI ────────────────────────────────────────────────────────────
@@ -4775,9 +5897,16 @@ class SpectraWidget(QWidget):
                 }
                 if st is None:
                     res.update({"mean": None, "median": None, "trimmed": None,
-                                "sigma": None, "std": None, "stack": None, "n": 0})
+                                "sigma": None, "std": None, "stack": None,
+                                "stack_ts": [], "n": 0})
                 else:
                     res.update(st)
+                    # _compute_stats keeps only the most common waveform length —
+                    # repeat that filter on the timestamps so row i of the stack
+                    # and stack_ts[i] are the same shot ("Every spectrum" names
+                    # each curve by its time in the CSV).
+                    common = st["stack"].shape[1]
+                    res["stack_ts"] = [t for t, a in wfs if len(a) == common]
                 results.append(res)
                 sig.progress_n.emit(i + 1, len(snap))
 
@@ -4823,6 +5952,14 @@ class SpectraWidget(QWidget):
             errs = {res["fetch_error"] for res in results if res.get("fetch_error")}
             if errs:
                 msg += "  " + "   ".join(sorted(errs))
+        note = self._x_fit_note()
+        if note:
+            msg += "  " + note
+        # Also in the channel's own tooltip: the status line is overwritten by the
+        # next thing that happens, and this is a permanent property of the archive.
+        self._lbl_spec_base.setToolTip(
+            f"X axis: {self._x_axis_summary()}\nY axis: {self._spec_y_pv}"
+            + (f"\n{note}" if note else ""))
         self._set_status(msg)
         if self._chk_autofit.isChecked():
             self._auto_fit_range()      # snap range to the data span (signals blocked)
@@ -4845,6 +5982,7 @@ class SpectraWidget(QWidget):
     # ── Spectra graph ─────────────────────────────────────────────────────────
     def _draw_bot_empty(self, msg: str = "Analyze a spectrum in the search graph"):
         ax = self._ax_bot
+        self._bot_redrawing = True
         ax.clear()
         # An empty graph never carries a colour bar — hide the slot and hand the
         # width back, so the placeholder text is centred in the whole figure.
@@ -4858,7 +5996,15 @@ class SpectraWidget(QWidget):
                 ha="center", va="center", color="#aaa", fontsize=11)
         ax.set_xticks([])
         ax.set_yticks([])
+        # Pin the empty view instead of leaving matplotlib to invent one. An
+        # unscaled axes autoscales itself to ±0.05 while it is being DRAWN, long
+        # after this method returned, and that stray limit change used to be
+        # filed away as the user's own zoom — which is what capped the intensity
+        # axis at 0.05 once real spectra arrived.
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
         self._install_bot_cursor_artists()
+        self._bot_redrawing = False
         self._canvas_bot.draw_idle()
 
     # ── Display-option helpers ─────────────────────────────────────────────
@@ -4882,13 +6028,66 @@ class SpectraWidget(QWidget):
             return a if a > 0 else 1.0
         return 1.0
 
+    @staticmethod
+    def _axis_for(x, n: int):
+        """The X axis n intensity points are ACTUALLY drawn against.
+
+        `x` when it fits the waveform, otherwise the plain sample number.
+
+        THE one place that decides it. Every curve on the spectra graph — the
+        averaged one, the faint individuals, every spectrum of the bundle, the
+        bold picked one, the A/B comparison, the live traces — plus the metrics,
+        the auto-fitted From/To range and the CSV export must agree, and they
+        drifted apart twice already because the fallback was written out by hand
+        in each of them.
+
+        "Fits" is _fit_x_axis, NOT a bare length test: an axis the archiver
+        truncated (SPIDER stores 2048 of its 4096 time points) is rebuilt from
+        its own constant step instead of being thrown away. A bare length test
+        was exactly the bug behind the bundle being drawn against sample numbers
+        while everything else was on femtoseconds — the picked spectrum landed at
+        0 fs next to a bundle piled up around "2000", and the fitted range then
+        masked that bundle down to a slice of its own baseline, which is why the
+        intensity axis stopped at 0.05 with peaks at 1.0."""
+        xf = _fit_x_axis(x, n)
+        return xf if xf is not None else np.arange(n, dtype=float)
+
+    @staticmethod
+    def _curve_x(r, n: int):
+        """_axis_for for a region: the axis that region's curves are drawn on."""
+        return SpectraWidget._axis_for(r.get("x") if r is not None else None, n)
+
+    def _x_is_samples(self, r=None) -> bool:
+        """True while the plot's X axis is sample numbers, not a measured axis.
+
+        The axis title and the CSV's first column both have to own up to it —
+        a graph labelled "Wavelength [nm]" that is really counting array
+        positions is the kind of thing nobody notices for months."""
+        regs = ([r] if r is not None else
+                [q for q in self._regions
+                 if q.get("analyzed") and q.get("visible", True)])
+        seen = False
+        for q in regs:
+            y = q.get(self._curve_method()) if q else None
+            if y is None:
+                continue
+            seen = True
+            if _fit_x_axis(q.get("x"), len(np.asarray(y))) is not None:
+                return False       # at least one real axis — never cry samples
+        if seen:
+            return True
+        # No analysed spectra: live mode is the only thing on the graph, and
+        # _plot_live_spectra has the same fallback on a mismatched _x_data.
+        if self._live and self._live_buf:
+            n = len(list(self._live_buf)[-1][1])
+            return _fit_x_axis(self._x_data, n) is None
+        return False
+
     def _prep_curve(self, x, y, smooth_win: int = 0):
         """Mask a curve to the current range, optionally smoothing it.
         Returns (xp, yp, mask)."""
         y = np.asarray(y, dtype=float)
-        if x is None or len(x) != len(y):
-            x = np.arange(len(y))
-        x = np.asarray(x, dtype=float)
+        x = self._axis_for(x, len(y))
         mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
         xp, yp = x[mask], y[mask]
         if smooth_win and xp.size:
@@ -4917,9 +6116,7 @@ class SpectraWidget(QWidget):
         """Overlay the individual spectra of a region as faint thin lines."""
         if stack is None or len(stack) == 0:
             return
-        if x is None or len(x) != stack.shape[1]:
-            x = np.arange(stack.shape[1])
-        x = np.asarray(x, dtype=float)
+        x = self._axis_for(x, stack.shape[1])
         mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
         xp = x[mask]
         scale = ref_scale if (ref_scale and ref_scale > 0) else 1.0
@@ -4933,6 +6130,576 @@ class SpectraWidget(QWidget):
 
     def _method(self) -> str:
         return _METHODS.get(self._cmb_method.currentText(), "mean")
+
+    def _is_single(self) -> bool:
+        """True while the graph shows every measured spectrum instead of an average."""
+        return self._method() == SINGLE_METHOD
+
+    def _curve_method(self) -> str:
+        """The stat key that stands in for one representative curve.
+
+        "Every spectrum" is a way of drawing, not a way of combining: the metric
+        block, the A/B comparison, the auto-fit and the CSV details still need a
+        single curve per region, and that curve is the plain mean."""
+        m = self._method()
+        return "mean" if m == SINGLE_METHOD else m
+
+    def _method_label(self) -> str:
+        """The name shown for the current setting (metrics say where they come from)."""
+        return "Mean" if self._is_single() else self._cmb_method.currentText()
+
+    def _on_method_changed(self):
+        """The variation band describes an average — with every spectrum on screen
+        there is nothing for it to describe, so it is greyed out instead of being
+        silently ignored."""
+        single = self._is_single()
+        self._chk_std.setEnabled(not single)
+        self._cmb_band.setEnabled(not single)
+        self._redraw_spectra()
+
+    @staticmethod
+    def _single_rows(stack):
+        """Which rows of a region's stack are actually drawn/exported.
+
+        Returns (row_indices, total). Above MAX_SINGLE_LINES the spectra are
+        evenly thinned — every caller reports both numbers, never just the drawn
+        one."""
+        total = 0 if stack is None else len(stack)
+        if total == 0:
+            return np.empty(0, dtype=int), 0
+        if total <= MAX_SINGLE_LINES:
+            return np.arange(total), total
+        # Spread the cap over the whole region instead of stepping by ceil(): with
+        # 9007 shots a step of 4 threw away a quarter of the allowance and drew
+        # only 2252 of the 3000 that were allowed.
+        idx = np.unique(np.linspace(0, total - 1, MAX_SINGLE_LINES).round().astype(int))
+        return idx, total
+
+    def _plot_all_spectra(self, ax, x, stack, color, norm, smooth_win, label):
+        """Draw every spectrum of a region as its own curve.
+
+        One LineCollection, not thousands of ax.plot() calls — with a day's worth
+        of shots the per-line version takes minutes and then redraws just as slowly
+        on every zoom. The legend gets one proxy line per region."""
+        idx, total = self._single_rows(stack)
+        if total == 0:
+            return 0, 0
+        # The same axis as every other curve (_axis_for). This used to be a bare
+        # "len(x) != stack width -> sample numbers" test, and it is what put the
+        # whole bundle on array positions while the averaged curve, the bold
+        # picked spectrum, the metrics and the auto-fitted range were all on the
+        # real axis.
+        x = self._axis_for(x, stack.shape[1])
+        mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
+        xp = x[mask]
+        if xp.size == 0:
+            return 0, total
+
+        segs = []
+        for i in idx:
+            yp = np.asarray(stack[i], dtype=float)[mask]
+            if smooth_win:
+                yp = _smooth(yp, smooth_win)
+            scale = self._norm_scale(xp, yp, norm)
+            if scale and scale != 1.0:
+                yp = yp / scale
+            segs.append(np.column_stack((xp, yp)))
+
+        n_drawn = len(segs)
+        # Thin, faint lines when there are many; a handful of shots stay solid.
+        alpha = float(np.clip(40.0 / max(1, n_drawn), 0.06, 0.9))
+        lw    = 1.2 if n_drawn <= 20 else 0.5
+        lc = LineCollection(segs, colors=[color], linewidths=lw, alpha=alpha, zorder=1)
+        ax.add_collection(lc)
+        # add_collection does not grow the data limits on its own
+        ax.autoscale_view()
+        # legend proxy — a LineCollection with an alpha this low is invisible there
+        ax.plot([], [], color=color, lw=2.0, label=label)
+        return n_drawn, total
+
+    # ── "Every spectrum": pick one shot out of the bundle ──────────────────────
+    # The bar under the search graph (_make_shot_bar) walks every drawn spectrum
+    # and paints the one it is on over the bundle: its spectrum's colour at full
+    # strength, on a white halo, plus a tag naming the time inside the graph (so
+    # it still works in focus mode, where everything but this graph is hidden).
+    #
+    # The bold curve is painted ONLY by a blit, never by a full draw
+    # (set_animated(True)). Three thousand curves take seconds to lay out, so a
+    # redraw per step of the bar would be unusable — and an artist baked into the
+    # blit background would leave a ghost behind every time the bar moved.
+
+    def _single_items(self) -> list:
+        """Every individual spectrum the graph is drawing, oldest first.
+
+        One flat list across all visible analyzed spectra, sorted by the time the
+        shot was measured — the same order as the search graph the regions were
+        picked from, and it runs across day boundaries when several days are
+        loaded. Each entry is {rid, k, ts, label}, where `k` is the row of that
+        region's stack. The list is rebuilt after every draw, so hiding a region
+        or re-analyzing can never leave a stale row number behind."""
+        items: list = []
+        if not self._is_single():
+            return items
+        for i, r in enumerate(self._regions):
+            if not r.get("analyzed") or not r.get("visible", True):
+                continue
+            idx, _total = self._single_rows(r.get("stack"))
+            ts = r.get("stack_ts") or []
+            label = self._region_label(i)
+            for k in idx:
+                k = int(k)
+                items.append({"rid": r["id"], "k": k, "label": label,
+                              "ts": int(ts[k]) if k < len(ts) else 0})
+        items.sort(key=lambda it: (it["ts"], it["rid"], it["k"]))
+        return items
+
+    def _rebuild_single_browser(self):
+        """Refresh the bar, keeping the user on the same shot.
+
+        Called at the end of every bottom-graph redraw. The position is matched
+        back by (region, stack row) and NOT by its number: hiding a region or
+        changing the display renumbers the list, and a plain clamp would quietly
+        move the user onto a different spectrum."""
+        old = getattr(self, "_single_items_cache", [])
+        pos_old = getattr(self, "_single_pos", 0)
+        prev = ((old[pos_old]["rid"], old[pos_old]["k"])
+                if 0 <= pos_old < len(old) else None)
+
+        items = self._single_items()
+        self._single_items_cache = items
+        n = len(items)
+        pos = 0
+        if prev is not None and n:
+            for j, it in enumerate(items):
+                if (it["rid"], it["k"]) == prev:
+                    pos = j
+                    break
+            else:
+                pos = min(pos_old, n - 1)
+        self._single_pos = pos
+
+        # The times of every shot, for the bar's snap. Shots with no timestamp
+        # cannot be placed on a time axis at all, so they are left out of the
+        # lookup instead of piling up at position zero.
+        ts_all = np.array([int(it.get("ts") or 0) for it in items], dtype=np.int64)
+        keep = np.flatnonzero(ts_all > 0)
+        self._single_ts_pos = keep
+        self._single_ts_arr = ts_all[keep]
+
+        self._update_shot_bar_visibility()
+        # Without a loaded time axis there is nothing to pin the bar to, so it
+        # cannot say where anything is: it is switched off rather than left
+        # looking live and doing nothing. The ◀ ▶ buttons still work — they walk
+        # the list itself and need no axis.
+        self._sl_shot.setEnabled(n > 1 and bool(self._tmap))
+        self._btn_single_prev.setEnabled(n > 1)
+        self._btn_single_next.setEnabled(n > 1)
+        self._sync_shot_bar()
+        self._update_single_label()
+        self._update_top_marker()
+
+    def _update_shot_bar_visibility(self):
+        """The bar is only there when it has something to do — one averaged curve
+        on screen has nothing to step through.
+
+        It does not have to check whether the search graph is shown: the bar lives
+        inside that graph's panel, so minimising the graph takes the bar with it.
+        That is deliberate — a bar whose whole job is to point at a place on that
+        graph is meaningless without it."""
+        box = getattr(self, "_shot_bar_box", None)
+        if box is not None:
+            box.setVisible(self._is_single())
+
+    def _update_single_label(self):
+        """The caption beside the bar: which shot, when, from where."""
+        items = getattr(self, "_single_items_cache", [])
+        if not items:
+            self._lbl_single.setText("Nothing to step through yet — analyze a spectrum.")
+            return
+        pos = min(getattr(self, "_single_pos", 0), len(items) - 1)
+        it = items[pos]
+        self._lbl_single.setText(
+            f"{pos + 1} of {len(items)}   ·   {self._single_when(it)}"
+            f"   ·   {it['label']}"
+        )
+
+    @staticmethod
+    def _single_when(it) -> str:
+        """The shot's own date + time. Never day-scoped: with several days loaded,
+        two neighbouring positions can sit on different dates."""
+        ts = it.get("ts") or 0
+        return f"{_fmt_date(ts)} {_fmt_hms(ts)}" if ts else "time unknown"
+
+    def _single_current(self):
+        """(region, stack row, entry) for the spectrum the bar is on."""
+        items = getattr(self, "_single_items_cache", [])
+        pos = getattr(self, "_single_pos", 0)
+        if not items or not (0 <= pos < len(items)):
+            return None, None, None
+        it = items[pos]
+        r = self._find_region(it["rid"])
+        stack = r.get("stack") if r else None
+        if stack is None or it["k"] >= len(stack):
+            return None, None, None
+        return r, it["k"], it
+
+    def _single_curve(self, r, k):
+        """One shot of a region, prepared exactly as the bundle behind it.
+
+        Same X axis, same mask, same smoothing, same normalization as
+        _plot_all_spectra — otherwise the bold curve would sit at a different
+        place than the shot it is supposed to be naming."""
+        stack = r["stack"]
+        x = self._curve_x(r, stack.shape[1])
+        mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
+        xp = x[mask]
+        yp = np.asarray(stack[k], dtype=float)[mask]
+        win = self._smooth_win()
+        if win and xp.size:
+            yp = _smooth(yp, win)
+        scale = self._norm_scale(xp, yp, self._norm_mode())
+        if scale and scale != 1.0:
+            yp = yp / scale
+        return xp, yp
+
+    def _install_single_hl_artists(self):
+        """(Re)create the bold "this one" curve on the spectra plot.
+
+        Called from _install_bot_cursor_artists, i.e. after every ax.clear(), for
+        the same reason the crosshair is: clear() detaches the artists, and drawing
+        a detached one raises 'NoneType has no attribute dpi'.
+
+        animated=True keeps all three out of every full draw, so the blitted
+        background stays clean and _blit_bot() is the only thing that paints them.
+        That is also why _savefig_bot switches animation off around savefig — a
+        normal draw skips animated artists, and the picture would lose the curve."""
+        # BLACK on a thin white outline, not the spectrum's own colour. Measured by
+        # rendering: 3000 curves of one colour make a solid blue band, and a bold
+        # line of that same blue inside a white halo reads as a white gap with a
+        # faint core — the halo wins. Black is a colour the bundle never has, so
+        # the curve is unmistakable whatever the colouring mode does; which
+        # spectrum it came from is on the tag, not in the ink.
+        ax = self._ax_bot
+        halo, = ax.plot([], [], color="#ffffff", lw=4.4, solid_capstyle="round",
+                        zorder=8, visible=False, animated=True)
+        line, = ax.plot([], [], color="#000000", lw=2.4, solid_capstyle="round",
+                        zorder=9, visible=False, animated=True)
+        tag = ax.text(
+            0.015, 0.985, "", transform=ax.transAxes, ha="left", va="top",
+            fontsize=9, color="#111111", zorder=12, visible=False, animated=True,
+            bbox=dict(boxstyle="round,pad=0.3", fc="#ffffff", ec="#555555",
+                      alpha=0.92, linewidth=0.8),
+        )
+        self._single_hl = {"halo": halo, "line": line, "tag": tag}
+
+    def _single_hl_list(self) -> list:
+        """The three highlight artists, or an empty list before the graph exists."""
+        a = getattr(self, "_single_hl", None)
+        return [a["halo"], a["line"], a["tag"]] if a else []
+
+    def _blit_bot(self):
+        """Repaint the spectra plot's overlay only (crosshair + bold curve).
+
+        Falls back to a full draw until the cursor has captured a background."""
+        fn = getattr(self, "_bot_blit_fn", None)
+        if fn is not None:
+            try:
+                fn()
+                return
+            except Exception:
+                pass
+        canvas = getattr(self, "_canvas_bot", None)
+        if canvas is not None:
+            canvas.draw_idle()
+
+    def _update_single_highlight(self, blit: bool = True):
+        """Point the bold curve at the bar's spectrum, or hide it."""
+        arts = self._single_hl_list()
+        if not arts:
+            return
+        halo, line, tag = arts
+        r = k = it = None
+        chk = getattr(self, "_chk_single_hl", None)
+        if self._is_single() and chk is not None and chk.isChecked():
+            r, k, it = self._single_current()
+        if r is None:
+            for a in arts:
+                a.set_visible(False)
+        else:
+            xp, yp = self._single_curve(r, k)
+            on = bool(xp.size)
+            halo.set_data(xp, yp)
+            halo.set_visible(on)
+            line.set_data(xp, yp)
+            line.set_visible(on)
+            n = len(getattr(self, "_single_items_cache", []))
+            pos = getattr(self, "_single_pos", 0)
+            tag.set_text(f" {it['label']}  ·  {self._single_when(it)}  ·  "
+                         f"{pos + 1} of {n} ")
+            # The tag's border carries the spectrum's colour, so the bold black
+            # curve still says which bundle it came out of.
+            colors = getattr(self, "_region_colors_cache", None) or {}
+            tag.get_bbox_patch().set_edgecolor(
+                colors.get(r["id"], r.get("color", "#555555")))
+            tag.get_bbox_patch().set_linewidth(2.0)
+            tag.set_color("#111111")
+            tag.set_visible(on)
+        if blit:
+            self._blit_bot()
+
+    def _on_single_hl_toggled(self, _on: bool):
+        self._update_single_highlight()
+        self._update_top_marker()
+
+    # ── The shot bar: time <-> bar, and the snap onto real measurements ────────
+
+    def _shot_bar_x_span(self):
+        """The stretch of the search graph's axis the bar covers: exactly what the
+        graph is showing. Zoom the graph and the bar follows, so "same X on the
+        graph = same X on the bar" holds at every zoom."""
+        ax = getattr(self, "_ax_top", None)
+        if ax is None:
+            return None
+        try:
+            x0, x1 = (float(v) for v in ax.get_xlim())
+        except Exception:
+            return None
+        if not (np.isfinite(x0) and np.isfinite(x1)) or x1 <= x0:
+            return None
+        return x0, x1
+
+    def _shot_bar_geom(self):
+        """(bar, x of the canvas's left edge in the bar's own pixels, dpi ratio).
+
+        None while the widgets have no geometry yet — during construction, and
+        whenever the panel is hidden."""
+        sl     = getattr(self, "_sl_shot", None)
+        canvas = getattr(self, "_canvas_top", None)
+        if sl is None or canvas is None or sl.width() <= 1 or canvas.width() <= 1:
+            return None
+        ratio = getattr(canvas, "device_pixel_ratio", 1) or 1
+        off = sl.mapFromGlobal(canvas.mapToGlobal(QPoint(0, 0))).x()
+        return sl, off, ratio
+
+    # Time and bar position are converted THROUGH THE PIXEL the graph draws that
+    # instant on (ax.transData), not through a proportion of the axis. That is
+    # rule 1 said in code, and it also absorbs the last of the rounding: the bar's
+    # margins have to be whole pixels, so its travel can never be an exact match
+    # for the plot box, and a proportional mapping inherited that error and grew
+    # it towards the ends of the bar. Going through the pixel leaves only Qt's own
+    # half-pixel. The proportional form is kept as the fallback for when there is
+    # no geometry to measure yet.
+
+    def _shot_bar_value_from_ts(self, ts) -> "int | None":
+        """Bar value whose handle lands on this instant. None if it cannot be
+        placed (no time on the shot, or no axis yet)."""
+        span = self._shot_bar_x_span()
+        tmap = self._tmap
+        if span is None or not tmap or not ts:
+            return None
+        x0, x1 = span
+        x = tmap.to_x_clamped(int(ts))
+        g = self._shot_bar_geom()
+        if g is not None:
+            sl, off, ratio = g
+            try:
+                px = float(self._ax_top.transData.transform((x, 0.0))[0]) / ratio + off
+                return int(np.clip(sl.value_at_pixel(px), 0, _SHOT_BAR_MAX))
+            except Exception:
+                pass
+        return int(round(float(np.clip((x - x0) / (x1 - x0), 0.0, 1.0)) * _SHOT_BAR_MAX))
+
+    def _shot_bar_ts_from_value(self, value: int) -> "int | None":
+        """The instant a bar value points at, on the compressed time axis."""
+        span = self._shot_bar_x_span()
+        tmap = self._tmap
+        if span is None or not tmap:
+            return None
+        x0, x1 = span
+        g = self._shot_bar_geom()
+        if g is not None:
+            sl, off, ratio = g
+            try:
+                px = (sl.pixel_at_value(int(value)) - off) * ratio
+                x = float(self._ax_top.transData.inverted().transform((px, 0.0))[0])
+                return int(tmap.from_x(float(np.clip(x, x0, x1))))
+            except Exception:
+                pass
+        return int(tmap.from_x(x0 + (x1 - x0) * (int(value) / _SHOT_BAR_MAX)))
+
+    def _nearest_shot_pos(self, ts: int) -> "int | None":
+        """The shot closest in time to this instant.
+
+        NEAREST, never "the newest at or before". Turning a time into a bar value
+        and back truncates, so an at-or-before lookup lands on the shot BEFORE the
+        one the handle was put on — every time, in the same direction. On a fast
+        run that is a visible jump backwards on every single move."""
+        arr = getattr(self, "_single_ts_arr", None)
+        idx = getattr(self, "_single_ts_pos", None)
+        if arr is None or idx is None or arr.size == 0:
+            return None
+        j = int(np.searchsorted(arr, int(ts), side="left"))
+        if j <= 0:
+            j = 0
+        elif j >= arr.size:
+            j = arr.size - 1
+        elif abs(int(arr[j - 1]) - int(ts)) <= abs(int(arr[j]) - int(ts)):
+            j -= 1
+        return int(idx[j])
+
+    def _sync_shot_bar(self):
+        """Put the handle on the shot that is picked, without re-triggering the snap."""
+        sl = getattr(self, "_sl_shot", None)
+        if sl is None:
+            return
+        _r, _k, it = self._single_current()
+        v = self._shot_bar_value_from_ts(it.get("ts") if it else None)
+        if v is None:
+            return
+        sl.blockSignals(True)
+        sl.setValue(v)
+        sl.blockSignals(False)
+
+    def _go_to_shot(self, pos: int):
+        """Show shot number `pos`: one blit per graph, no re-layout of anything."""
+        n = len(getattr(self, "_single_items_cache", []))
+        if not n:
+            return
+        self._single_pos = int(np.clip(pos, 0, n - 1))
+        self._sync_shot_bar()
+        self._update_single_label()
+        self._update_single_highlight()
+        self._update_top_marker()
+
+    def _on_shot_bar_moved(self, value: int):
+        """The bar was dragged, clicked or stepped.
+
+        The raw position is never kept: it is resolved to the nearest measured
+        shot and the handle is written back onto that shot's own place. So the
+        handle can never rest between two measurements, and a stretch of the axis
+        where nothing was measured is simply unreachable — the handle sticks at
+        the last shot before it and reappears at the first shot after it."""
+        ts = self._shot_bar_ts_from_value(value)
+        if ts is None:
+            return
+        pos = self._nearest_shot_pos(ts)
+        if pos is None:
+            return
+        self._go_to_shot(pos)
+
+    def _step_single(self, step: int):
+        """◀ / ▶ / wheel / arrow keys — exactly one shot, clamped to the ends."""
+        n = len(getattr(self, "_single_items_cache", []))
+        if not n:
+            return
+        pos = int(np.clip(getattr(self, "_single_pos", 0) + step, 0, n - 1))
+        self._go_to_shot(pos)
+        self._keep_shot_in_view()
+
+    def _page_single(self, direction: int):
+        """PageUp / PageDown — a twentieth of the list at a time."""
+        n = len(getattr(self, "_single_items_cache", []))
+        if n:
+            self._step_single(int(direction) * max(1, n // 20))
+
+    def _keep_shot_in_view(self):
+        """Bring the picked shot back onto the graph if stepping walked off it.
+
+        Only ever needed when the user has zoomed in: the handle must stay under
+        its shot, so if the shot leaves the visible stretch the graph slides over
+        instead (same width, the shot in the middle)."""
+        tmap = self._tmap
+        ax = getattr(self, "_ax_top", None)
+        span = self._shot_bar_x_span()
+        if ax is None or span is None or not tmap:
+            return
+        _r, _k, it = self._single_current()
+        if not it or not it.get("ts"):
+            return
+        x = tmap.to_x_clamped(int(it["ts"]))
+        x0, x1 = span
+        if x0 <= x <= x1:
+            return
+        w = x1 - x0
+        lo, hi = tmap.xlim()
+        new_x0 = float(np.clip(x - w / 2.0, lo, max(lo, hi - w)))
+        ax.set_xlim(new_x0, new_x0 + w)
+        self._canvas_top.draw_idle()
+
+    # ── Rule 1: the bar's travel is pinned to the plot box ────────────────────
+
+    def _schedule_shot_bar_pin(self):
+        """Re-pin once Qt has finished its own layout.
+
+        Deferred, and only one deferral in flight: the pin is driven from the
+        canvas's draw_event, which fires several times in a row while a window is
+        being dragged."""
+        if getattr(self, "_shot_bar_pin_pending", False):
+            return
+        self._shot_bar_pin_pending = True
+        QTimer.singleShot(0, self._pin_shot_bar)
+
+    def _pin_shot_bar(self):
+        """Line the bar's travel up with the plot box, to the pixel.
+
+        The bar's row is given left and right margins that put value 0 on the
+        plot box's left edge and the top value on its right edge. Both are pulled
+        in by the handle's own inset, because value 0 puts the handle's CENTRE
+        half a handle in from the groove's end — without that the whole travel is
+        short by one handle width and the alignment drifts across the bar.
+
+        Re-run from the canvas's draw_event, which is the one hook that covers
+        every way the plot box can move: a resize, a splitter drag, a redraw, and
+        a per-PV Y axis appearing on the right or longer tick labels on the left.
+        """
+        self._shot_bar_pin_pending = False
+        sl     = getattr(self, "_sl_shot", None)
+        row    = getattr(self, "_shot_bar_row", None)
+        ax     = getattr(self, "_ax_top", None)
+        canvas = getattr(self, "_canvas_top", None)
+        if sl is None or row is None or ax is None or canvas is None:
+            return
+        lay = row.layout()
+        if lay is None or row.width() <= 0:
+            return
+        try:
+            bb = ax.get_window_extent()
+        except Exception:
+            return
+        # get_window_extent is in physical pixels; Qt margins are logical ones.
+        # Without the ratio the bar is off by a quarter of the width at 125 %.
+        ratio = getattr(canvas, "device_pixel_ratio", 1) or 1
+        # The canvas and the bar are separate widgets, so the plot box's x has to
+        # be carried into the bar row's own coordinates.
+        x_off = row.mapFromGlobal(canvas.mapToGlobal(QPoint(0, 0))).x()
+        gx, _travel, hwid = _slider_metrics(sl)
+        # The handle's centre never reaches the groove's own ends: it stops half a
+        # handle short at each, and the groove itself may be inset by gx.
+        inset = gx + int(round(hwid / 2.0))
+        left  = int(round(x_off + bb.x0 / ratio)) - inset
+        right = row.width() - int(round(x_off + bb.x1 / ratio)) - inset
+        left, right = max(0, left), max(0, right)
+        if (left, right) == getattr(self, "_shot_bar_margins", None):
+            return                      # nothing moved — do not restart the layout
+        self._shot_bar_margins = (left, right)
+        lay.setContentsMargins(left, 0, right, 0)
+        # The travel just changed, so the handle's pixel has to be recomputed too.
+        self._sync_shot_bar()
+
+    def _savefig_bot(self, path: str):
+        """Save the spectra plot, bold curve included.
+
+        The highlight artists are animated so the shot bar can blit them, and a
+        normal draw skips animated artists — so they are switched back on for the
+        length of the save."""
+        arts = [a for a in self._single_hl_list() if a.get_visible()]
+        for a in arts:
+            a.set_animated(False)
+        try:
+            self._fig_bot.savefig(path, dpi=150, bbox_inches="tight")
+        finally:
+            for a in arts:
+                a.set_animated(True)
 
     def _color_order_label(self) -> "str | None":
         """The dispersion-order key the current colour mode maps onto, or None for
@@ -4978,15 +6745,21 @@ class SpectraWidget(QWidget):
         whichever average is selected in Display."""
         if not m:
             return ""
-        def nm(v):  return f"{v:.2f} nm" if v is not None else "n/a"
+        def val(v): return self._fmt_x_value(v)
         def sci(v): return f"{v:.3g}"    if v is not None else "n/a"
+        # "Peak λ" is a wavelength name. On a time axis the same number is a
+        # position in the pulse and the RMS width is a duration, not a bandwidth.
+        _, _, sym = self._x_names()
+        samples = self._x_is_samples()
+        peak_lbl = "Peak sample" if samples else f"Peak {sym}"
+        wide_lbl = "RMS width" if (samples or sym != "λ") else "RMS bw"
         return (
-            f"<span style='color:#888'>from {self._cmb_method.currentText()}</span><br>"
-            f"<b>Peak λ:</b> {nm(m.get('peak_wl'))} "
+            f"<span style='color:#888'>from {self._method_label()}</span><br>"
+            f"<b>{peak_lbl}:</b> {val(m.get('peak_wl'))} "
             f"<span style='color:#888'>@ {sci(m.get('peak_int'))}</span><br>"
-            f"<b>Centroid:</b> {nm(m.get('centroid'))}<br>"
-            f"<b>FWHM:</b> {nm(m.get('fwhm'))} &nbsp; "
-            f"<b>RMS bw:</b> {nm(m.get('rms_bw'))}<br>"
+            f"<b>Centroid:</b> {val(m.get('centroid'))}<br>"
+            f"<b>FWHM:</b> {val(m.get('fwhm'))} &nbsp; "
+            f"<b>{wide_lbl}:</b> {val(m.get('rms_bw'))}<br>"
             f"<b>Area:</b> {sci(m.get('area'))}"
         )
 
@@ -5032,9 +6805,7 @@ class SpectraWidget(QWidget):
         """Return the (lo, hi) wavelength span of (x, y) that actually contains
         signal (1% of peak above the baseline), or None when there is no signal."""
         y = np.asarray(y, dtype=float)
-        if x is None or len(x) != len(y):
-            x = np.arange(len(y))
-        x = np.asarray(x, dtype=float)
+        x = self._axis_for(x, len(y))
         if y.size == 0:
             return None
         base = float(np.median(np.sort(y)[:max(1, len(y) // 5)]))
@@ -5062,7 +6833,7 @@ class SpectraWidget(QWidget):
     def _auto_fit_range(self):
         """Set From/To to the wavelength span that actually contains signal,
         across all analyzed regions (selected averaging method)."""
-        method = self._method()
+        method = self._curve_method()
         lo_c, hi_c = [], []
         for r in self._regions:
             if not r.get("analyzed"):
@@ -5088,21 +6859,52 @@ class SpectraWidget(QWidget):
         st = _compute_stats(arrs)
         if st is None:
             return
-        span = self._signal_span(self._x_data, st[self._method()])
-        if span is None and self._x_data is not None and len(self._x_data):
-            # no clear signal: fall back to the full X-axis span so it is at least visible
-            span = (float(np.min(self._x_data)), float(np.max(self._x_data)))
+        curve = st[self._curve_method()]
+        span = self._signal_span(self._x_data, curve)
+        if span is None:
+            # No clear signal: fall back to the full X-axis span so it is at least
+            # visible. The FITTED axis, not the stored one — a truncated axis's own
+            # min/max cover half the shot and would mask the other half away.
+            xf = _fit_x_axis(self._x_data, len(np.asarray(curve)))
+            if xf is not None and xf.size:
+                span = (float(np.min(xf)), float(np.max(xf)))
         if span:
             self._apply_fit_span(*span)
 
+    def _single_draw_estimate(self) -> int:
+        """How many individual curves the next draw would put on the graph."""
+        return sum(len(self._single_rows(r.get("stack"))[0])
+                   for r in self._regions
+                   if r.get("analyzed") and r.get("visible", True))
+
     def _redraw_spectra(self):
+        """Wait cursor around a heavy draw.
+
+        Thousands of curves take a couple of seconds to lay out and paint, and
+        every Normalize / Smooth / range click comes back through here — without
+        the cursor the window just looks stuck."""
+        heavy = self._is_single() and self._single_draw_estimate() > 500
+        if heavy:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._redraw_spectra_now()
+        finally:
+            if heavy:
+                QApplication.restoreOverrideCursor()
+
+    def _redraw_spectra_now(self):
         norm       = self._norm_mode()
-        band_on    = self._chk_std.isChecked()
+        single     = self._is_single()
+        band_on    = self._chk_std.isChecked() and not single
         band_kind  = self._band_kind()
         smooth_win = self._smooth_win()
         method     = self._method()
+        curve_m    = self._curve_method()
         x_min, x_max = self._sb_x_min.value(), self._sb_x_max.value()
         color_for   = self._compute_region_colors()  # also sets self._colorbar_info
+        # Kept for the bold "this one" curve, which is painted by a blit long after
+        # this method has returned and must use the very same colours.
+        self._region_colors_cache = color_for
         order_label = self._color_order_label()
         ax = self._ax_bot
         self._bot_redrawing = True
@@ -5116,12 +6918,14 @@ class SpectraWidget(QWidget):
             self._twin_bot = None
         ax.clear()
         any_drawn = False
+        single_shown = 0     # spectra actually drawn / available, "Every spectrum" only
+        single_total = 0
 
         # analyzed regions (skip hidden ones — visibility "eye" toggle)
         for i, r in enumerate(self._regions):
             if not r.get("analyzed") or not r.get("visible", True):
                 continue
-            center = r.get(method)
+            center = r.get(curve_m)
             if center is None:
                 continue
             # metrics computed on the masked, smoothed (un-normalized) curve
@@ -5135,6 +6939,26 @@ class SpectraWidget(QWidget):
                 if v is not None:
                     label = (f"{self._region_label(i)}  {order_label}="
                              f"{round(float(v))} · {m_short}")
+            if single:
+                # every shot in the region, no averaged curve at all
+                stack = r.get("stack")
+                idx, total = self._single_rows(stack)
+                n_drawn = len(idx)
+                count = (f"{total} spectra" if n_drawn >= total
+                         else f"{n_drawn} of {total} spectra drawn")
+                head = self._region_label(i)
+                if order_label is not None:
+                    v = (r.get("orders") or {}).get(order_label)
+                    if v is not None:
+                        head = f"{head}  {order_label}={round(float(v))}"
+                drawn, tot = self._plot_all_spectra(
+                    ax, r.get("x"), stack, col, norm, smooth_win,
+                    f"{head} · {count}")
+                single_shown += drawn
+                single_total += tot
+                if drawn:
+                    any_drawn = True
+                continue
             band_lo = band_hi = std_arg = None
             if band_on and band_kind == "pct":
                 band_lo, band_hi = r.get("p10"), r.get("p90")
@@ -5158,26 +6982,39 @@ class SpectraWidget(QWidget):
             # Record both counts and let the status line own up to the difference.
             self._live_slice_n = len(buf)
             self._live_used_n  = st["n"] if st is not None else 0
-            if st is not None:
+            # "Every spectrum" means exactly that — no averaged curve on top.
+            if st is not None and not single:
                 band_lo = band_hi = std_arg = None
                 if band_on and band_kind == "pct":
                     band_lo, band_hi = st.get("p10"), st.get("p90")
                 elif band_on:
                     std_arg = st["std"]
-                self._plot_spectrum(ax, self._x_data, st[method], std_arg,
-                                    "#000000", f"Live {method} (n={st['n']})",
+                self._plot_spectrum(ax, self._x_data, st[curve_m], std_arg,
+                                    "#000000", f"Live {curve_m} (n={st['n']})",
                                     norm, band_lo, band_hi, lw=2.4, smooth_win=smooth_win)
             any_drawn = True
 
         # comparison curve (difference / ratio of two analyzed regions)
         if self._chk_compare.isChecked():
-            any_drawn = self._plot_comparison(ax, method, smooth_win) or any_drawn
+            any_drawn = self._plot_comparison(ax, curve_m, smooth_win) or any_drawn
 
         if any_drawn:
-            ax.set_xlabel("Wavelength [nm]")
+            # Say what the axis really is. With no resolved axis the curves are
+            # drawn against the sample number, and calling that "Wavelength [nm]"
+            # turns sample 2045 into "Peak λ 2045 nm" — a number that looks
+            # measured and is not. The unit comes from the channel, so the SPIDER
+            # time domain is labelled "Time [fs]" and not nanometres either.
+            ax.set_xlabel(self._x_title())
             ax.set_ylabel(self._intensity_label(norm))
-            ax.set_title(("Live spectra — " if self._live else "Averaged spectra — ")
-                         + self._cmb_method.currentText())
+            if single:
+                head = "Live spectra — every shot" if self._live else "Every spectrum"
+                if single_total:
+                    head += (f" ({single_total} measured)" if single_shown >= single_total
+                             else f" ({single_shown} of {single_total} drawn)")
+                ax.set_title(head)
+            else:
+                ax.set_title(("Live spectra — " if self._live else "Averaged spectra — ")
+                             + self._cmb_method.currentText())
             ax.set_xlim(x_min, x_max)
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=9)
@@ -5200,8 +7037,21 @@ class SpectraWidget(QWidget):
             # ax.clear() above detached the crosshair artists — recreate them so a
             # queued cursor redraw doesn't draw an orphaned Text (NoneType .dpi crash).
             self._install_bot_cursor_artists()
+            # Y range last: it is measured from the finished graph, and the
+            # crosshair's line at zero must already be there to be skipped.
+            self._fit_bot_ylim(ax)
+            # _measured_y_range came back empty = the curves exist but the From/To
+            # range kept none of their points. Say so instead of showing a blank
+            # graph with an invented ±0.05 axis.
+            if self._measured_y_range(ax) is None:
+                self._draw_bot_empty(self._range_misses_data_msg())
         else:
-            self._draw_bot_empty()
+            # Nothing was drawn. With spectra in hand that means the same thing:
+            # the range does not cover them (a bundle drops out here, one point
+            # earlier than an averaged curve does).
+            self._draw_bot_empty(self._range_misses_data_msg()
+                                 if self._drawn_x_span() is not None else
+                                 "Analyze a spectrum in the search graph")
 
         self._bot_redrawing = False
         if self._bot_user_xlim is not None:
@@ -5209,6 +7059,10 @@ class SpectraWidget(QWidget):
         if self._bot_user_ylim is not None:
             ax.set_ylim(self._bot_user_ylim)
         self._canvas_bot.draw_idle()
+        # The shot bar's list is rebuilt here, not when the display box changes:
+        # hiding a spectrum, re-analyzing and switching the method all change what
+        # is on the graph, and all of them come through this one method.
+        self._rebuild_single_browser()
         self._update_metric_labels()
 
     def _plot_comparison(self, ax, method: str, smooth_win: int) -> bool:
@@ -5225,8 +7079,7 @@ class SpectraWidget(QWidget):
         # interpolate B onto A's masked wavelength grid
         xb_full = ra.get("x") if (rb.get("x") is None) else rb.get("x")
         yb = np.asarray(yb, dtype=float)
-        xb = np.asarray(xb_full, dtype=float) if (
-            xb_full is not None and len(xb_full) == len(yb)) else np.arange(len(yb))
+        xb = self._axis_for(xb_full, len(yb))
         if smooth_win and yb.size:
             yb = _smooth(yb, smooth_win)
         cb = np.interp(xa, xb, yb)
@@ -5249,10 +7102,7 @@ class SpectraWidget(QWidget):
         arrs = [a for _, a in buf]
         if not arrs:
             return
-        x = self._x_data
-        if x is None or len(x) != len(arrs[-1]):
-            x = np.arange(len(arrs[-1]))
-        x = np.asarray(x, dtype=float)
+        x = self._axis_for(self._x_data, len(arrs[-1]))
         mask = (x >= self._sb_x_min.value()) & (x <= self._sb_x_max.value())
         xp = x[mask]
 
@@ -5460,7 +7310,11 @@ class SpectraWidget(QWidget):
             )
             return
 
-        dlg = ExportDialog(len(analyzed), len(live), self._method(), self)
+        single = self._is_single()
+        n_shots = (sum(self._export_rows(r.get("stack"))[1] for _, r in analyzed)
+                   if single else 0)
+        dlg = ExportDialog(len(analyzed), len(live), self._curve_method(), self,
+                           single=single, n_shots=n_shots)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         opts = dlg.options()
@@ -5483,7 +7337,7 @@ class SpectraWidget(QWidget):
                 written.append(p)
             if opts["graph"]:
                 p = f"{base}_graph.{opts['graph_fmt']}"
-                self._fig_bot.savefig(p, dpi=150, bbox_inches="tight")
+                self._savefig_bot(p)
                 written.append(p)
         except Exception as ex:
             QMessageBox.critical(self, "Export error", str(ex))
@@ -5492,37 +7346,110 @@ class SpectraWidget(QWidget):
         self._set_status("Exported: " + ", ".join(os.path.basename(p) for p in written))
         QMessageBox.information(self, "Export done", "Saved:\n" + "\n".join(written))
 
+    @staticmethod
+    def _export_rows(stack):
+        """Which rows of a stack the CSV writes: all of them.
+
+        Deliberately NOT _single_rows(). The graph thins above MAX_SINGLE_LINES
+        because thousands of curves take seconds to lay out and repaint, but a
+        column in a text file costs nothing — so "every spectrum" in the file
+        means every spectrum, even when the picture on screen is a thinned
+        sample of it. The details block says which of the two you are holding."""
+        total = 0 if stack is None else len(stack)
+        return np.arange(total), total
+
     def _export_csv(self, path: str, analyzed: list[tuple[int, dict]], live: list):
         """One CSV: a details block, a blank line, then the curve table.
 
         Columns: each analyzed region's averaged curve, plus every live shot
-        (so 7 regions + 100 live shots export as 107 curves).
+        (so 7 regions + 100 live shots export as 107 curves). With the display set
+        to "Every spectrum" the region columns are the individual shots instead —
+        one column per shot, headed by the time it was measured, and ALL of them:
+        the graph's 3000-curve drawing cap does not apply to the file.
+
+        The X column is the axis the graph is really drawn against (_curve_x), not
+        self._x_data. Those two used to be able to disagree: a region with no
+        resolved wavelength axis is plotted against the sample number, while
+        _x_data still held a real axis from an earlier resolve — so the same peak
+        sat at 2045 on screen and at -5.5 in the file.
         """
-        method = self._method()
+        method = self._curve_method()
+        single = self._is_single()
         regs = [(i, r) for i, r in analyzed if r.get(method) is not None]
 
-        x = self._x_data
-        if x is None and regs:
-            x = regs[0][1].get("x")
-        if x is None and regs:
-            x = np.arange(len(regs[0][1][method]))
-        if x is None and live:
-            x = np.arange(len(live[-1][1]))
+        # The export grid: a region's own axis, exactly as it is drawn. The first
+        # region that HAS a real axis wins — with a mixed set, taking region 1's
+        # sample numbers would have meant interpolating everyone else's
+        # nanometres onto array positions.
+        x = None
+        if regs:
+            pick = next((q for _, q in regs
+                         if _fit_x_axis(q.get("x"),
+                                        len(np.asarray(q[method]))) is not None),
+                        regs[0][1])
+            x = self._curve_x(pick, len(np.asarray(pick[method])))
+        elif live:
+            x = self._axis_for(self._x_data, len(live[-1][1]))
         if x is None or (not regs and not live):
             raise ValueError("No curve data to export.")
         x = np.asarray(x, dtype=float)
         nx = len(x)
+        samples = self._x_is_samples()
+        x_quantity, x_unit, x_sym = self._x_names()
+        x_name = ("sample_number" if samples else
+                  f"{x_quantity.lower()}_{x_unit}" if x_unit else x_quantity.lower())
         order_labels = [lbl for lbl, _ in ORDER_PVS]
-        # live shots whose length matches the wavelength axis
+        # live shots whose length matches the export axis
         live_ok = [(t, np.asarray(a, dtype=float)) for t, a in live if len(a) == nx]
+        live_skipped = len(live) - len(live_ok)
+
+        # "Every spectrum": one column per shot instead of the average + std pair.
+        single_cols: dict = {}
+        drawn_cap: dict = {}
+        if single:
+            for i, r in regs:
+                stack = r.get("stack")
+                idx, total = self._export_rows(stack)
+                drawn_cap[i] = len(self._single_rows(stack)[0])
+                ts = r.get("stack_ts") or []
+                # A region whose waveform length differs from the export grid is
+                # resampled onto it instead of being cut off at nx — that silently
+                # blanked the tail of every such column.
+                xr = self._curve_x(r, stack.shape[1]) if total else None
+                regrid = xr if (total and stack.shape[1] != nx) else None
+                cols = []
+                for k in idx:
+                    y = np.asarray(stack[k], dtype=float)
+                    if regrid is not None:
+                        y = np.interp(x, regrid, y)
+                    cols.append((
+                        (f"{self._region_label(i)} {_fmt_hms(ts[k])}"
+                         if k < len(ts) else f"{self._region_label(i)} #{k + 1}"),
+                        y,
+                    ))
+                single_cols[i] = (cols, total)
 
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             f.write("sep=;\r\n")          # tell Excel the delimiter (locale-proof)
             w = csv.writer(f, delimiter=";")
 
             # ── details block ───────────────────────────────────────────
-            metric_cols = ["Peak λ [nm]", "Peak intensity", "Centroid [nm]",
-                           "FWHM [nm]", "RMS bandwidth [nm]", "Area"]
+            if samples:
+                # Never let a sample number leave the program dressed as a unit.
+                w.writerow(["# NOTE: no measured axis was resolved for these "
+                            "spectra — the first column and every position / width "
+                            "below are SAMPLE NUMBERS, not physical units."])
+            else:
+                fit_note = self._x_fit_note()
+                if fit_note:
+                    w.writerow([f"# NOTE: {fit_note}"])
+            wide_lbl = "RMS width" if x_sym != "λ" else "RMS bandwidth"
+            metric_cols = (["Peak sample", "Peak intensity", "Centroid [sample]",
+                            "FWHM [samples]", "RMS width [samples]", "Area"]
+                           if samples else
+                           [f"Peak {x_sym} [{x_unit}]", "Peak intensity",
+                            f"Centroid [{x_unit}]", f"FWHM [{x_unit}]",
+                            f"{wide_lbl} [{x_unit}]", "Area"])
             metric_keys = ["peak_wl", "peak_int", "centroid", "fwhm", "rms_bw", "area"]
             w.writerow(["# Spectrum details"])
             w.writerow(["Spectrum", "Date", "Start", "End", "# of spectra",
@@ -5533,10 +7460,19 @@ class SpectraWidget(QWidget):
                 ea = r.get("energy_avg")
                 orders = r.get("orders") or {}
                 m = r.get("_metrics") or {}
+                meth_txt = method
+                if single:
+                    cols, total = single_cols.get(i, ([], 0))
+                    meth_txt = f"every spectrum ({len(cols)})"
+                    drawn = drawn_cap.get(i, len(cols))
+                    if drawn < len(cols):
+                        # The file is fuller than the picture; say so, or the two
+                        # look like they disagree.
+                        meth_txt += f", graph drew {drawn}"
                 w.writerow([
                     self._region_label(i), date_str,
                     _fmt_hms(r["t_start"]), _fmt_hms(r["t_end"]),
-                    r.get("n", 0), method,
+                    r.get("n", 0), meth_txt,
                     self._fmt_full(ea) if ea is not None else "",
                 ] + [self._fmt_full(orders.get(lbl)) if orders.get(lbl) is not None
                      else "" for lbl in order_labels]
@@ -5546,9 +7482,12 @@ class SpectraWidget(QWidget):
                 t0, t1 = live_ok[0][0], live_ok[-1][0]
                 d0, d1 = _fmt_date(t0), _fmt_date(t1)
                 date_str = d0 if d0 == d1 else f"{d0}…{d1}"
+                live_txt = "individual"
+                if live_skipped:
+                    live_txt += f", {live_skipped} skipped (different length)"
                 w.writerow([f"Live shots (last {len(live_ok)})", date_str,
                             _fmt_hms(t0), _fmt_hms(t1),
-                            len(live_ok), "individual", "",
+                            len(live_ok), live_txt, "",
                             *[""] * len(order_labels), *[""] * len(metric_cols)])
 
             w.writerow([])   # blank separator line
@@ -5557,8 +7496,11 @@ class SpectraWidget(QWidget):
             cmp_name, cmp_vals = self._export_comparison_curve(x, method)
 
             w.writerow(["# Curve data"])
-            header = ["wavelength_nm"]
+            header = [x_name]
             for i, _ in regs:
+                if single:
+                    header.extend(name for name, _ in single_cols.get(i, ([], 0))[0])
+                    continue
                 header.append(f"{self._region_label(i)} ({method})")
                 header.append(f"{self._region_label(i)} std")
             for t, _ in live_ok:
@@ -5569,7 +7511,11 @@ class SpectraWidget(QWidget):
 
             for j in range(nx):
                 row = [self._fmt_full(x[j])]
-                for _, r in regs:
+                for i, r in regs:
+                    if single:
+                        for _, a in single_cols.get(i, ([], 0))[0]:
+                            row.append(self._fmt_full(a[j]) if j < len(a) else "")
+                        continue
                     y, s = r.get(method), r.get("std")
                     row.append(self._fmt_full(y[j]) if y is not None and j < len(y) else "")
                     row.append(self._fmt_full(s[j]) if s is not None and j < len(s) else "")
@@ -5595,9 +7541,8 @@ class SpectraWidget(QWidget):
             return None, None
         ya = np.asarray(ya, dtype=float)
         yb = np.asarray(yb, dtype=float)
-        xa = ra.get("x"); xb = rb.get("x")
-        xa = np.asarray(xa, float) if (xa is not None and len(xa) == len(ya)) else np.arange(len(ya))
-        xb = np.asarray(xb, float) if (xb is not None and len(xb) == len(yb)) else np.arange(len(yb))
+        xa = self._curve_x(ra, len(ya))
+        xb = self._curve_x(rb, len(yb))
         xg = np.asarray(x, dtype=float)
         ca = np.interp(xg, xa, ya)
         cb = np.interp(xg, xb, yb)

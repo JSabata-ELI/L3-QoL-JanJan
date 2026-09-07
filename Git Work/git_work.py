@@ -21,7 +21,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QRunnable, QThreadPool, QObject, Signal
+from PySide6.QtCore import QRunnable, QThreadPool, QObject, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
@@ -54,27 +54,57 @@ ICON = _icon_file()
 
 
 def _icon_app_id(prefix, ico_path):
-    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it, so a fixed id that was once seen without an icon keeps drawing the
-    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
-    program, same icon, only the id changed -> old id generic, fresh id
-    correct). Hashing the icon into the id makes every PC derive the same id
-    from the same picture, and retires the old id by itself the day the icon
-    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
-    clearing. Returns None when the icon cannot be read; the caller then sets
-    no id at all rather than burning a content id on a run that has no picture
-    to give it. The same helper sits in every program here.
+    it: an id that was once seen without a usable icon keeps drawing the
+    generic placeholder for good, whatever icon the window later carries, and
+    clearing the shell icon cache would have to be repeated on every PC.
+
+    Hashing the icon's own bytes into the id was the first fix, but a
+    content-only id can be poisoned just as well, and then it never recovers
+    because it only changes when the picture is redrawn. Measured again on
+    2026-09-03: Calibrations, CSS Logger, Git Work and Image Tools all drew
+    the blank window placeholder on the taskbar while their title bars carried
+    the right icon, and Diagnostic -- the only one whose id also carried its
+    file name -- drew its icon. So the running build's own file name, which
+    carries the version, goes into the hash too: every rebuild runs under an
+    id Windows has never seen, so it cannot be serving a stale picture for it,
+    on this PC or any other.
+
+    Returns None when the icon cannot be read; the caller then sets no id at
+    all rather than burning an id on a run that has no picture to give it.
+    The same helper sits in every program here.
     """
+    # A frozen build gets no taskbar identity at all, deliberately.
+    # Windows caches the taskbar picture per AppUserModelID and never re-reads
+    # it, so one bad cache entry breaks that build for good; tagging the id
+    # with the build's file name only postponed it (Diagnostic v1.1.3's id
+    # drew the blank placeholder within a day of the build). Measured
+    # 2026-09-04 with three otherwise identical windows: the app's own id ->
+    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
+    # from the exe's own resource, which the builder always embeds (verified
+    # on a purpose-built PyInstaller exe). With no id Windows keys the button
+    # on the exe itself, so there is no per-id cache left to go stale. An id
+    # is still worth having when running from source, where the process is
+    # python.exe and would otherwise wear the Python icon.
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return None
     if not ico_path:
         return None
+    import hashlib
+    import os
+    import sys
     try:
-        import hashlib
         with open(ico_path, "rb") as fh:
-            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+            data = fh.read()
     except OSError:
         return None
+    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
+                             else (sys.argv[0] or __file__))
+    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
+    return f"{prefix}.{tag.hexdigest()[:12]}"
 
 # Colours (readable on the light #f0f0f0 / white surfaces).
 C_TEXT = "#111111"
@@ -268,9 +298,17 @@ def has_stash(repo) -> bool:
 
 def _push_hint(err: str) -> str:
     low = (err or "").lower()
+    # Order matters: a protected branch is also reported as "rejected", and
+    # telling somebody to Pull first would send them round in circles.
+    if any(s in low for s in ("protected branch", "pre-receive hook declined",
+                              "refusing to allow", "not permitted")):
+        return ("The server does not allow saving straight into this branch. "
+                "Work on your own line and let the person who looks after the "
+                "project publish it, or ask for permission.")
     if any(s in low for s in ("non-fast-forward", "rejected", "fetch first", "stale info")):
-        return ("Someone pushed to this branch before you. Click Pull first, "
-                "then Push again. (Never force-push a shared branch.)")
+        return ("Somebody pushed to this branch before you. Click Pull first, "
+                "then Push again - that keeps both sides. (Never force-push a "
+                "branch somebody else uses.)")
     if any(s in low for s in ("authentication", "could not read", "denied",
                               "terminal prompt", "403", "401")):
         return ("Sign-in failed. VS Code should prompt you to sign in to GitHub, "
@@ -287,6 +325,182 @@ def _conflict_hint() -> str:
             "Come back and press Refresh.")
 
 
+# --------------------------------------------------- merge conflict facts ----
+
+# What git's two-letter code for a stopped file means, in plain words, and what
+# has to happen to it to keep one side or the other:
+#   (description, what to do to keep THEIRS, what to do to keep OURS)
+# "ours" is the branch you are standing on, "theirs" is the one being merged in.
+#   pick   - ask git for that side's version of the file, then keep it
+#   add    - keep the file that is in the folder right now
+#   remove - the file goes away
+# Deletion is the half that is easy to get backwards: on "UD" it is THEIRS that
+# deleted the file, so keeping theirs means the file goes.
+_UNMERGED = {
+    "UU": ("changed on both sides", "pick", "pick"),
+    "AA": ("added on both sides, differently", "pick", "pick"),
+    "UD": ("changed on '{ours}', deleted on '{theirs}'", "remove", "add"),
+    "DU": ("deleted on '{ours}', changed on '{theirs}'", "add", "remove"),
+    "AU": ("added on '{ours}' only", "remove", "add"),
+    "UA": ("added on '{theirs}' only", "add", "remove"),
+    "DD": ("deleted on both sides", "remove", "remove"),
+}
+
+
+def unmerged_text(code, ours, theirs) -> str:
+    """The two-letter code in plain words, with the branch names filled in."""
+    label = _UNMERGED.get(code, (code,))[0]
+    return label.format(ours=ours, theirs=theirs)
+
+
+def unmerged_paths(repo) -> list:
+    """[(path, code)] for every file git refused to merge on its own."""
+    rc, out, _ = git_capture(repo, "status", "--porcelain=v2")
+    if rc != 0:
+        return []
+    files = []
+    for line in out.splitlines():
+        if not line.startswith("u "):
+            continue
+        # u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+        parts = line.split(" ", 10)
+        if len(parts) == 11:
+            files.append((parts[10], parts[1]))
+    return files
+
+
+def commits_since(repo, base, tip, limit=12) -> list:
+    """What was done on `tip` after it parted ways with `base`.
+
+    The author is part of the line on purpose: the one thing you must know
+    before dropping a side is whether it is your own old work or somebody
+    else's afternoon.
+    """
+    if not base:
+        return []
+    rc, out, _ = git_capture(
+        repo, "log", "--no-merges", f"--max-count={limit}", "--date=short",
+        "--format=%ad  %an:  %s", f"{base}..{tip}")
+    return out.splitlines() if rc == 0 else []
+
+
+def ref_exists(repo, ref) -> bool:
+    return git_capture(repo, "rev-parse", "--verify", "--quiet", ref)[0] == 0
+
+
+def counts(repo, base, tip):
+    """(commits only on tip, commits only on base), or None if it can't be told."""
+    rc, out, _ = git_capture(repo, "rev-list", "--left-right", "--count",
+                             f"{base}...{tip}")
+    if rc != 0 or not out:
+        return None
+    try:
+        base_only, tip_only = (int(x) for x in out.split())
+        return tip_only, base_only
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------- what to do next ----
+
+# One step at a time. Each answer is (what to do in plain words, the button
+# that does it, the action name, colour). The order below is the priority: the
+# first thing that applies is the thing to do now.
+def next_step(repo, info, has_identity, has_message, target=TARGET) -> dict:
+    def step(text, button="", action="", tone=C_TEXT):
+        return {"text": text, "button": button, "action": action, "tone": tone}
+
+    if not repo:
+        return step("Pick the folder with your project - the 'Change...' button "
+                    "in the Repository box above.", "", "", C_WARN)
+    if not has_identity:
+        return step("Tell git who you are before your first save - 'Change...' "
+                    "in the Identity box.", "Set my name and email", "identity",
+                    C_WARN)
+    if info["detached"]:
+        return step("You are not on any line of work, so nothing can be saved. "
+                    "Pick your branch in the box below and switch to it.",
+                    "Switch to the branch in the box", "switch", C_ERR)
+
+    cur = info["branch"]
+    changes = info["changes"]
+
+    if cur in PROTECTED:
+        if changes:
+            return step(
+                f"You are standing on the shared '{cur}' and have {changes} "
+                "changed file(s). Personal work belongs on your own line - make "
+                "one now and your changes come with you.",
+                "Make my own line of work...", "new", C_ERR)
+        if info["upstream"] and info["behind"]:
+            return step(f"'{cur}' is {info['behind']} commit(s) behind the "
+                        "server. Get them first.", "Get the newer version",
+                        "pull", C_WARN)
+        # A newcomer stands here with nothing but 'main'. Two dead ends to
+        # avoid: telling them to switch to the branch they are already on, and
+        # calling somebody else's line on the server "yours".
+        mine = [b for b in list_branches(repo) if b not in PROTECTED]
+        if mine:
+            return step(
+                f"You are standing on the shared '{cur}'. Pick your own line of "
+                "work from the list and switch to it before you change "
+                "anything.", "Show me my lines of work", "pick", C_WARN)
+        extra = (" (If you already have one on the server, it is in the box "
+                 "below, under the separator.)"
+                 if list_remote_only_branches(repo) else "")
+        return step(
+            f"You are standing on the shared '{cur}' and have no line of your "
+            f"own on this PC. Make one - that is where your work belongs.{extra}",
+            "Make my own line of work...", "new", C_WARN)
+
+    # On a personal line of work.
+    if info["upstream"] and info["behind"]:
+        if changes or info["ahead"]:
+            return step(
+                f"The server has {info['behind']} newer commit(s) on '{cur}'. "
+                "Get them first, then send yours - in that order.",
+                "Get the newer version", "pull", C_ERR)
+        return step(f"The server has {info['behind']} newer commit(s) on "
+                    f"'{cur}'. Get them.", "Get the newer version", "pull",
+                    C_WARN)
+    if changes and not has_message:
+        return step(
+            f"{changes} file(s) changed and not saved yet. Write in one line "
+            "what you changed (box below), then save and send it up.",
+            "Save my work and send it up", "commit_push", C_WARN)
+    if changes:
+        return step(f"{changes} changed file(s) ready to be saved. This saves "
+                    "them and sends them to the server in one go.",
+                    "Save my work and send it up", "commit_push", C_WARN)
+    if info["upstream"] is None:
+        return step(f"'{cur}' exists only on this PC. Send it to the server so "
+                    "it is backed up.", "Send it to the server", "commit_push",
+                    C_WARN)
+    if info["ahead"]:
+        return step(f"{info['ahead']} saved commit(s) are still only on this PC.",
+                    "Send them to the server", "commit_push", C_WARN)
+
+    shared = f"origin/{target}"
+    if ref_exists(repo, shared):
+        c = counts(repo, shared, cur)
+        if c:
+            mine, theirs = c
+            if theirs:
+                return step(
+                    f"The shared '{target}' has moved on by {theirs} commit(s) "
+                    "that your line does not have. Bring them into your line "
+                    "first - doing it now avoids a pile of clashes later.",
+                    f"Bring '{target}' into '{cur}'", "get_shared", C_WARN)
+            if mine:
+                return step(
+                    f"Your work is saved, backed up, and {mine} commit(s) ahead "
+                    f"of the shared '{target}'. When it is ready for everybody, "
+                    "publish it.", f"Publish my work into '{target}'", "merge",
+                    C_OK)
+    return step("Everything is saved, backed up and shared. Nothing to do.",
+                "", "", C_OK)
+
+
 # ------------------------------------------------------------- git jobs -----
 
 class GitJobs:
@@ -300,6 +514,9 @@ class GitJobs:
         # whether to re-prefill the message box: refilling it after a run that
         # committed nothing makes the box look used when it never was.
         self.committed = False
+        # Filled in when a merge stops on a clash, so the window can say what
+        # happened on each branch and offer to take one side.
+        self.conflict = None
 
     # -- low level ---------------------------------------------------------
 
@@ -314,6 +531,16 @@ class GitJobs:
             self._log(out, "out")
         if err:
             self._log(err, "out")
+        # Two Git Works, or Git Work and VS Code, reaching for the same project
+        # at the same moment. Nothing will work until the other one lets go, so
+        # say that instead of "command failed".
+        low = (err or "").lower()
+        if "index.lock" in low or "another git process" in low:
+            raise GitError(
+                "Another program is working with this project right now.",
+                "Wait a moment and try again - it is usually VS Code or a "
+                "second Git Work window finishing something. If nothing is "
+                "running, delete the file .git\\index.lock in the project.")
         if check and rc != 0:
             raise GitError(f"Command failed: {' '.join(cmd)}")
         return rc, out, err
@@ -331,6 +558,86 @@ class GitJobs:
                 "You are not on a branch (detached HEAD).",
                 "Pick a branch in the Branch box and click Switch, then retry.")
         return b
+
+    # -- a stopped merge ---------------------------------------------------
+
+    def _record_conflict(self, ours, theirs, finish=None):
+        """Collect the facts about a merge that stopped, for the question the
+        window then asks. Nothing here changes any file."""
+        base = git_capture(self.repo, "merge-base", ours, theirs)[1]
+        self.conflict = {
+            "ours": ours,
+            "theirs": theirs,
+            "files": unmerged_paths(self.repo),
+            "ours_commits": commits_since(self.repo, base, ours),
+            "theirs_commits": commits_since(self.repo, base, theirs),
+            "finish": finish or "",     # "merge_to_main" or ""
+        }
+        for path, code in self.conflict["files"]:
+            self._log(f"    {path} - {unmerged_text(code, ours, theirs)}", "out")
+
+    def take_side(self, report, side):
+        """Finish a stopped merge by keeping one side of every clashing file.
+
+        Only the files git could not merge are touched; everything it merged on
+        its own stays merged. The version that is dropped is not lost - it stays
+        in the history of the branch it came from.
+        """
+        ours, theirs = report["ours"], report["theirs"]
+        keep = theirs if side == "theirs" else ours
+        files = report["files"] or unmerged_paths(self.repo)
+        if not files:
+            raise GitError(
+                "There is nothing left to resolve.",
+                "The merge was already finished or undone somewhere else. "
+                "Press Refresh.")
+        self._log(f"Keeping the '{keep}' version of {len(files)} clashing "
+                  f"file(s).", "info")
+        for path, code in files:
+            _, for_theirs, for_ours = _UNMERGED.get(
+                code, ("changed on both sides", "pick", "pick"))
+            what = for_theirs if side == "theirs" else for_ours
+            if what == "pick":
+                self._run("checkout", f"--{side}", "--", path)
+                self._run("add", "--", path)
+            elif what == "add":
+                self._run("add", "--", path)
+            else:
+                self._run("rm", "-q", "--", path)
+        left = unmerged_paths(self.repo)
+        if left:
+            raise GitError(
+                f"{len(left)} file(s) are still not resolved.",
+                "Open VS Code > Source Control and finish them by hand, then "
+                "Stage all and Commit.")
+        body = "\n".join(f"  {p}" for p, _ in files[:20])
+        self._run("commit", "-m",
+                  f"Merge '{theirs}' into '{ours}' - kept the '{keep}' version "
+                  f"of {len(files)} clashing file(s)\n\n{body}")
+        self.committed = True
+        self._log(f"Merge finished with the '{keep}' version of those files. "
+                  f"The other version is still in the history of its branch.",
+                  "ok")
+        if report.get("finish") == "merge_to_main":
+            self._finish_to_main(theirs)
+        else:
+            self._report_state(ours)
+
+    def _finish_to_main(self, source):
+        """The tail of a Merge into main that had to stop on a clash."""
+        rc, _, err = self._run("push", "origin", self.target, check=False)
+        if rc != 0:
+            raise GitError(
+                f"'{self.target}' was merged here but the server refused it.",
+                _push_hint(err) + f" Your own '{source}' is untouched.")
+        self._log(f"Pushed '{self.target}'.", "ok")
+        self._run("checkout", source)
+        self._run("merge", self.target, "--no-edit")
+        self._log(f"'{source}' is now level with '{self.target}'.", "ok")
+        rc, _, err = self._run("push", "origin", source, check=False)
+        if rc != 0:
+            self._log(f"'{source}' was not pushed: {err}", "hint")
+        self._report_state(source)
 
     def _commit_if_needed(self, msg):
         """Commit everything if a message was given.
@@ -407,6 +714,12 @@ class GitJobs:
                     "Your uncommitted changes would collide with incoming ones.",
                     "Commit your work first (type a message and Commit + Push), "
                     "then Pull.")
+            if unmerged_paths(self.repo):
+                self._record_conflict(cur, f"origin/{cur}")
+                raise GitError(
+                    f"You and the server both changed the same lines of '{cur}'.",
+                    "Answer the question in the next window - it can finish the "
+                    "pull for you by keeping one side.")
             raise GitError(f"Pull of '{cur}' failed.", _conflict_hint())
         n = ab[1] if ab else "the new"
         self._log(f"Pulled {n} commit(s) from the server - '{cur}' is now current.",
@@ -449,6 +762,13 @@ class GitJobs:
             self._log(f"Server has {ab[1]} new commit(s) - pulling first...", "info")
             rc, _, _ = self._run("pull", "--no-edit", "origin", cur, check=False)
             if rc != 0:
+                if unmerged_paths(self.repo):
+                    self._record_conflict(cur, f"origin/{cur}")
+                    raise GitError(
+                        f"You and the server both changed the same lines of "
+                        f"'{cur}'.",
+                        "Answer the question in the next window - it can finish "
+                        "the pull for you by keeping one side.")
                 raise GitError(f"Pull during Sync failed for '{cur}'.", _conflict_hint())
         rc, _, err = self._run("push", "-u", "origin", cur, check=False)
         if rc != 0:
@@ -459,6 +779,46 @@ class GitJobs:
                       f"message and run Sync again.", "hint")
             return
         self._log(f"Sync done - '{cur}' matches the server.", "ok")
+
+    def get_shared(self):
+        """Bring the shared line into the one you are standing on.
+
+        The step nobody remembers to do, and the reason a Merge into main can
+        stop on dozens of clashes weeks later: the two lines drift apart until
+        they both rewrote the same files.
+        """
+        cur = self._current()
+        if cur == self.target:
+            raise GitError(
+                f"You are already on '{self.target}'.",
+                "This step brings the shared line into your own one. Switch to "
+                "your line first.")
+        self._run("fetch", "origin", self.target, check=False)
+        shared = f"origin/{self.target}"
+        c = counts(self.repo, shared, cur)
+        if c and c[1] == 0:
+            self._log(f"'{cur}' already contains everything from "
+                      f"'{self.target}'. Nothing to bring over.", "ok")
+            return
+        rc, _, _ = self._run("merge", shared, "--no-edit", check=False)
+        if rc != 0:
+            if unmerged_paths(self.repo):
+                self._record_conflict(cur, shared)
+                raise GitError(
+                    f"'{cur}' and the shared '{self.target}' both changed the "
+                    "same lines.",
+                    "Answer the question in the next window - it can finish it "
+                    "for you by keeping one side.")
+            raise GitError(
+                f"Bringing '{self.target}' into '{cur}' failed.",
+                "Resolve it in VS Code > Source Control, then Stage all and "
+                "Commit.")
+        self.committed = True
+        self._log(f"'{cur}' now contains everything from '{self.target}'.", "ok")
+        rc, _, err = self._run("push", "origin", cur, check=False)
+        if rc != 0:
+            self._log(f"Not pushed yet: {err}", "hint")
+        self._report_state(cur)
 
     def merge_to_main(self, msg):
         cur = self._current()
@@ -492,21 +852,30 @@ class GitJobs:
         self._run("checkout", self.target)
         rc, _, _ = self._run("pull", "--no-edit", "origin", self.target, check=False)
         if rc != 0:
+            if unmerged_paths(self.repo):
+                self._record_conflict(self.target, f"origin/{self.target}")
+                raise GitError(
+                    f"'{self.target}' and the server copy of it changed the "
+                    "same lines.",
+                    "Answer the question in the next window, or resolve it in "
+                    f"VS Code. You are now on '{self.target}'.")
             raise GitError(
                 f"Pull of '{self.target}' failed.",
                 f"Resolve it in VS Code, then retry. You are now on '{self.target}'.")
         rc, _, _ = self._run("merge", source, "--no-edit", check=False)
         if rc != 0:
+            if unmerged_paths(self.repo):
+                self._record_conflict(self.target, source, finish="merge_to_main")
+                raise GitError(
+                    f"'{source}' and '{self.target}' both changed the same lines.",
+                    "Answer the question in the next window - it can finish the "
+                    "merge for you by keeping one side.")
             raise GitError(
-                f"Merge conflict merging '{source}' into '{self.target}'.",
-                "You are now on 'main'. Resolve conflicts in VS Code > Source "
-                f"Control, Stage all, Commit, then run 'git push origin "
-                f"{self.target}', and finally switch back to '{source}'.")
-        self._run("push", "origin", self.target)
-        self._log(f"Pushed '{self.target}'.", "ok")
-        self._run("checkout", source)
-        self._run("merge", self.target, "--no-edit")
-        self._log(f"'{source}' is now level with '{self.target}'.", "ok")
+                f"Merge of '{source}' into '{self.target}' failed.",
+                "You are now on 'main'. Resolve it in VS Code > Source Control, "
+                f"Stage all, Commit, then run 'git push origin {self.target}', "
+                f"and finally switch back to '{source}'.")
+        self._finish_to_main(source)
 
     def checkout(self, name, stash, from_remote=False):
         if stash:
@@ -654,6 +1023,93 @@ class IdentityDialog(QDialog):
         self.accept()
 
 
+class ConflictDialog(QDialog):
+    """Says what happened on each branch and offers to keep one side.
+
+    Git stops when both branches changed the same lines; it will not guess.
+    This turns that dead end into one question, with the facts needed to
+    answer it: which files, what happened to each, and what was committed on
+    each side since the two parted ways.
+    """
+
+    def __init__(self, parent, report):
+        super().__init__(parent)
+        self.setWindowTitle("Two different versions - which one wins?")
+        self.setStyleSheet(APP_QSS)
+        self.setMinimumWidth(720)
+        self.choice = None
+        ours, theirs = report["ours"], report["theirs"]
+        files = report["files"]
+
+        lay = QVBoxLayout(self)
+        head = QLabel(f"'{theirs}' and '{ours}' changed the same lines, so the "
+                      f"merge stopped.")
+        head.setWordWrap(True)
+        head.setStyleSheet(f"color: {C_ERR}; font-weight: 700; font-size: 13px;")
+        lay.addWidget(head)
+
+        intro = QLabel(
+            f"Everything else was merged automatically. These {len(files)} "
+            f"file(s) need a decision:")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        flist = QTextEdit()
+        flist.setReadOnly(True)
+        flist.setMaximumHeight(120)
+        flist.setPlainText("\n".join(
+            f"{path}   -   {unmerged_text(code, ours, theirs)}"
+            for path, code in files) or "(none)")
+        lay.addWidget(flist)
+
+        lay.addWidget(QLabel("What was done on each side since they parted ways:"))
+        cols = QHBoxLayout()
+        for title, commits in (
+                (f"'{ours}'  (where you are standing now)", report["ours_commits"]),
+                (f"'{theirs}'  (the one being merged in)", report["theirs_commits"])):
+            box = QGroupBox(title)
+            bl = QVBoxLayout(box)
+            view = QTextEdit()
+            view.setReadOnly(True)
+            view.setMinimumHeight(130)
+            view.setPlainText("\n".join(commits) or "(nothing)")
+            bl.addWidget(view)
+            cols.addWidget(box)
+        lay.addLayout(cols)
+
+        note = QLabel(
+            "Keeping one side applies only to the files listed above. The "
+            "version you drop is not lost - it stays in the history of its own "
+            "branch, so it can be fetched back later.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {C_INFO};")
+        lay.addWidget(note)
+
+        row = QHBoxLayout()
+        b_theirs = QPushButton(f"Keep the '{theirs}' version")
+        b_theirs.setObjectName("primary")
+        b_theirs.setToolTip(f"Overwrite those files with the version from "
+                            f"'{theirs}', finish the merge and carry on.")
+        b_theirs.clicked.connect(lambda: self._pick("theirs"))
+        row.addWidget(b_theirs)
+        b_ours = QPushButton(f"Keep the '{ours}' version")
+        b_ours.setToolTip(f"Leave those files as they are on '{ours}' and finish "
+                          f"the merge, ignoring what '{theirs}' did to them.")
+        b_ours.clicked.connect(lambda: self._pick("ours"))
+        row.addWidget(b_ours)
+        row.addStretch()
+        b_no = QPushButton("Leave it - I'll do it in VS Code")
+        b_no.setToolTip("Change nothing. The stopped merge stays as it is so you "
+                        "can go through the files by hand.")
+        b_no.clicked.connect(self.reject)
+        row.addWidget(b_no)
+        lay.addLayout(row)
+
+    def _pick(self, side):
+        self.choice = side
+        self.accept()
+
+
 class App(QWidget):
     def __init__(self):
         super().__init__()
@@ -670,6 +1126,8 @@ class App(QWidget):
         self._worker = None
         self._action_buttons = []
         self._pending_pick = ""   # branch the user picked but has not switched to
+        self._step = {}           # what "What to do now" is currently offering
+        self._info = {}           # last state read, so typing can re-word the step
 
         self._build_ui()
         self._init_repo()
@@ -679,6 +1137,22 @@ class App(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setSpacing(8)
+
+        # What to do now - one sentence and the single button that does it, so
+        # the window can be used without knowing any git vocabulary. Everything
+        # below it stays available for doing things by hand.
+        sg = QGroupBox("What to do now")
+        sl = QHBoxLayout(sg)
+        self.step_lbl = QLabel("")
+        self.step_lbl.setWordWrap(True)
+        self.step_lbl.setStyleSheet(f"color: {C_TEXT}; font-weight: 600;")
+        sl.addWidget(self.step_lbl, 1)
+        self.step_btn = QPushButton("")
+        self.step_btn.setObjectName("primary")
+        self.step_btn.setMinimumWidth(210)
+        self.step_btn.clicked.connect(self._on_step)
+        sl.addWidget(self.step_btn)
+        root.addWidget(sg)
 
         # Repository
         rg = QGroupBox("Repository")
@@ -778,6 +1252,13 @@ class App(QWidget):
         # (e.g. "15072026 konec dne"). The date on its own is a valid
         # message - only an empty box means "just push".
         self.msg_edit.setText(self._today_prefix() + " ")
+        # Re-word the step once typing settles: the panel nags for a message
+        # only while there isn't one.
+        self._step_timer = QTimer(self)
+        self._step_timer.setSingleShot(True)
+        self._step_timer.setInterval(500)
+        self._step_timer.timeout.connect(lambda: self._update_step(self._info))
+        self.msg_edit.textChanged.connect(self._step_timer.start)
         mrow.addWidget(self.msg_edit, 1)
         self.msg_expand_btn = QPushButton("▼ More")
         self.msg_expand_btn.setFixedWidth(70)
@@ -886,6 +1367,7 @@ class App(QWidget):
         else:
             self._append("No git repository selected yet. Click 'Change...' to "
                          "pick your project folder.", "hint")
+            self._update_step({})
             self._set_ui_enabled(False)
 
     def _choose_repo(self):
@@ -912,6 +1394,7 @@ class App(QWidget):
         self._set_ui_enabled(True)
         self._append(f"Repository: {self.repo}", "info")
         self._refresh_identity()
+        self._check_remote()
         self._check_autocrlf()
         self._refresh()
 
@@ -927,6 +1410,7 @@ class App(QWidget):
         for b in self._action_buttons:
             b.setEnabled(on)
         self.branch_cb.setEnabled(on)
+        self.step_btn.setEnabled(on and bool(self._step.get("button")))
 
     # -- identity ----------------------------------------------------------
 
@@ -962,6 +1446,24 @@ class App(QWidget):
         self._edit_identity()
         name, email = get_identity(self.repo)
         return bool(name and email)
+
+    def _check_remote(self):
+        """Every action here talks to a server called 'origin'. Somebody who
+        cloned by hand may not have one, and would otherwise only find out from
+        a failed push."""
+        rc, out, _ = git_capture(self.repo, "remote")
+        names = out.split() if rc == 0 else []
+        if "origin" in names:
+            return
+        if names:
+            self._append(
+                f"This project's server is called '{names[0]}', not 'origin'. "
+                "Every button here uses 'origin', so they will fail. Ask "
+                "whoever set the project up, or re-clone it normally.", "err")
+        else:
+            self._append(
+                "This project has no server attached, so nothing can be sent "
+                "up or taken down - only local saves will work.", "err")
 
     def _check_autocrlf(self):
         rc, out, _ = git_capture(self.repo, "config", "core.autocrlf")
@@ -999,12 +1501,56 @@ class App(QWidget):
             self.branch_cb.setCurrentText(want)
         self.branch_cb.blockSignals(False)
         self._pending_pick = keep
+        self._info = info
         self._update_here(info, cur)
         self._update_status_badge(info)
+        self._update_step(info)
         try:
             self.stash_btn.setEnabled(not self.busy and has_stash(self.repo))
         except Exception:
             pass
+
+    def _update_step(self, info):
+        """Fill the 'What to do now' panel from the real state."""
+        name, email = get_identity(self.repo) if self.repo else ("", "")
+        self._step = next_step(self.repo, info or {"detached": False, "branch": "",
+                                                   "changes": 0, "upstream": None,
+                                                   "ahead": 0, "behind": 0},
+                               bool(name and email),
+                               bool(self._commit_message()), TARGET)
+        self.step_lbl.setText(self._step["text"])
+        self.step_lbl.setStyleSheet(f"color: {self._step['tone']}; font-weight: 600;")
+        label = self._step["button"]
+        self.step_btn.setText(label)
+        self.step_btn.setVisible(bool(label))
+        self.step_btn.setEnabled(bool(label) and not self.busy)
+
+    def _on_step(self):
+        """Do the one thing the panel is offering."""
+        action = self._step.get("action")
+        if action == "identity":
+            self._edit_identity()
+        elif action == "pick":
+            # Open the list for them instead of asking them to find it.
+            self.branch_cb.setFocus()
+            self.branch_cb.showPopup()
+        elif action == "switch":
+            self._on_switch()
+        elif action == "new":
+            self._on_new()
+        elif action == "pull":
+            self._on_pull()
+        elif action == "commit_push":
+            if self._info.get("changes") and not self._commit_message():
+                self._append("Write in one line what you changed, then click the "
+                             "button again.", "hint")
+                self.msg_edit.setFocus()
+                return
+            self._on_commit_push()
+        elif action == "get_shared":
+            self._start_job(lambda j: j.get_shared())
+        elif action == "merge":
+            self._on_merge()
 
     def _on_branch_picked(self, _index):
         self._pending_pick = self.branch_cb.currentText().strip()
@@ -1388,8 +1934,9 @@ class App(QWidget):
             self.msg_edit.setText(today + " ")
 
     def _on_job_done(self, ok):
-        # Read the flag before the worker reference is dropped below.
+        # Read the flags before the worker reference is dropped below.
         committed = bool(self._worker and self._worker.jobs.committed)
+        conflict = self._worker.jobs.conflict if self._worker else None
         self._append("--- done ---" if ok else "--- stopped ---", "ok" if ok else "err")
         # Only a run that really committed gets a fresh message. Otherwise the
         # box keeps exactly what it had, so an empty box stays visibly empty
@@ -1402,6 +1949,29 @@ class App(QWidget):
         self._set_ui_enabled(True)
         self._worker = None
         self._refresh()
+        if conflict:
+            self._ask_about_conflict(conflict)
+
+    def _ask_about_conflict(self, report):
+        """A stopped merge is a question, not a dead end: show what each side
+        did and let the user say which version wins."""
+        dlg = ConflictDialog(self, report)
+        if not dlg.exec() or not dlg.choice:
+            self._append(
+                "Left as it is. The stopped merge is still open - resolve the "
+                "files in VS Code > Source Control, Stage all and Commit, then "
+                "press Refresh.", "hint")
+            return
+        side = dlg.choice
+        keep = report["theirs"] if side == "theirs" else report["ours"]
+        if QMessageBox.question(
+                self, "Keep one version",
+                f"Finish the merge with the '{keep}' version of those "
+                f"{len(report['files'])} file(s)?\n\nThe other version stays in "
+                f"the history of its branch.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+        self._start_job(lambda j: j.take_side(report, side))
 
     # -- log ---------------------------------------------------------------
 

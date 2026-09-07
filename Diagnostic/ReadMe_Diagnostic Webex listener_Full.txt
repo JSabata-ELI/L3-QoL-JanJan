@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-20  (remote_launcher.py, 491 lines)
+Verified against source: 2026-08-26  (remote_launcher.py, 533 lines)
 -----------------------------------------------------------------
 Short version: ReadMe_Diagnostic Webex listener.txt ("ReadMe" button)
 Code map:      STRUCTURE.md  (in the Diagnostic folder)
@@ -53,9 +53,10 @@ Diagnostic is not.
   be: there is no channel to complain on.
 
 
-3. THE COMMAND
+3. THE COMMANDS
 
   /run                (also accepted: /rundiagnostic — the old name)
+  /food [when]        (also accepted: /menu, /lunch)
 
   Only the first word has to be the command, so "/run please" or
   "/run." still work.
@@ -99,7 +100,53 @@ Diagnostic is not.
      the bot keeps answering while a cold start takes its minute.
 
 
-5. THE ANSWERS AND WHAT THEY MEAN
+5. WHAT /food DOES
+
+  It reads the menu Diagnostic saved earlier and writes it into the
+  chat. No sign-in to OKbase happens here, which is why the answer
+  arrives with Diagnostic closed — that is the whole point of the
+  saved copy.
+
+      /food                today
+      /food week           this week; also "next week"
+      /food tomorrow       also "yesterday", or a weekday: /food friday
+      /food 27.8.          a date; also 2026-08-27
+      /food refresh        read OKbase again now (see below)
+      /food status         how many days are saved and how old they are.
+                           Answered honestly: this program cannot see
+                           whether the sign-in still works, so it says
+                           to ask again with Diagnostic open.
+
+  WHILE DIAGNOSTIC IS OPEN THIS PROGRAM SAYS NOTHING ABOUT /food and
+  lets Diagnostic answer. Both replying would double every menu.
+
+  The saved copy is looked for in the shared folder next to the shared
+  PV list, and in %APPDATA%\Diagnostic. The newer of the two wins.
+
+  Every answer says when the menu was read. A copy older than about a
+  day, or one that does not cover the day asked about, says so in the
+  answer — it never shows another day's food instead.
+
+  /food refresh does try OKbase directly, and works only where the
+  saved sign-in decrypts, which means the same Windows account that
+  typed it into Diagnostic's Settings. Where it does not, the answer
+  is the saved menu plus the reason the fresh read failed.
+
+  THIS PROGRAM ALSO KEEPS THE SIGN-IN ALIVE. While Diagnostic is
+  closed, it says hello to OKbase every ten minutes and reads the
+  menu once a day. That is what stops the borrowed browser sign-in
+  from expiring overnight - a web sign-in dies of not being used,
+  and this is the process that is always up. It stands down whenever
+  Diagnostic is open, so the two never do it at the same time or
+  both write to the settings file. A renewed session is saved back
+  automatically.
+
+  Its console says what happened: every menu read, and the sign-in
+  only when its state CHANGES ("stopped working" / "works again") -
+  a line every ten minutes would bury everything else.
+
+
+6. THE ANSWERS AND WHAT THEY MEAN
 
   ▶️ Starting Diagnostic — <what>     the launch was accepted; <what>
                                      names the version, or "source"
@@ -128,7 +175,7 @@ Diagnostic is not.
   crash that never happened.
 
 
-6. RUNNING IT
+7. RUNNING IT
 
   It is a console program. The window is the only sign that it is
   alive, and closing the window is how you stop it — that is why it is
@@ -165,7 +212,7 @@ Diagnostic is not.
   them into its Log tab every half hour.
 
 
-7. WHERE IT LOOKS FOR ITS FILES
+8. WHERE IT LOOKS FOR ITS FILES
 
   Next to the .exe — not in the temporary folder Windows unpacks a
   single-file build into. That distinction matters: monitor_config.json
@@ -182,7 +229,7 @@ Diagnostic is not.
   difference, whichever way the application was started.
 
 
-8. WHEN SOMETHING IS WRONG
+9. WHEN SOMETHING IS WRONG
 
   Nothing happens on a command
     The bot was probably not tagged. In a group space write
@@ -206,7 +253,7 @@ Diagnostic is not.
     Diagnostic to C:\Dev\dist\Diagnostic.
 
 
-9. BUILDING AND DEPLOYING IT
+10. BUILDING AND DEPLOYING IT
 
   Dev Tools -> Builder: the Diagnostic row has an arrow in front of it;
   click the program and this listener appears underneath with its own

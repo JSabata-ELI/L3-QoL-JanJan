@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-24  (a.py, 2902 lines)
+Verified against source: 2026-09-02  (a.py, 3718 lines)
 -----------------------------------------------------------------
 Short version: ReadMe Announcer.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -20,15 +20,22 @@ Code map:      STRUCTURE.md
     twice a second, and the first one that stops being true raises
     the alarm and says what needs doing.
 
-    Two kinds:
+    Three kinds, one per tab:
 
-      Screen area   a rectangle of a screen still looks the way it
+      Screen areas  a rectangle of a screen still looks the way it
                     did when its reference picture was taken
-      Value         a machine value stays under its limit
+      Values        a machine value stays under its limit, and — if
+                    you attach one — a screen area still matches its
+                    picture as well
+      Halls         the beam is going where you said it is going
 
     Each one has a name and a sentence of your own — that sentence is
     what appears when it fires, so it can say "check the L3BT
     alignment in HP" rather than "change detected".
+
+    The tabs only sort the list. Everything in it is watched at once,
+    whichever tab happens to be open, and the first thing to go wrong
+    raises the alarm.
 
     The screen check does not understand what it is looking at, and
     that is the whole point: it works on a camera window, a
@@ -37,11 +44,11 @@ Code map:      STRUCTURE.md
 
 1.2 THE QUICK RECTANGLE
 
-    "Set reference" at the top draws one rectangle without giving it
-    a name, exactly as the program has always worked. It is watched
-    alongside the conditions and it is not remembered as a condition.
-    Use it for a one-off, and a condition for anything you want to
-    keep.
+    "Set reference" on the Screen areas tab draws one rectangle
+    without giving it a name, exactly as the program has always
+    worked. It is watched alongside the conditions and it is not
+    remembered as a condition. Use it for a one-off, and a condition
+    for anything you want to keep.
 
 1.3 THE MACHINE VALUE BADGES
 
@@ -95,19 +102,69 @@ Code map:      STRUCTURE.md
      a limit of zero on an energy would fire the moment the laser
      runs.
   4. UNIT is only used in the text of the badge.
+  5. ALSO REQUIRE A SCREEN AREA — see 2.3.
 
   A value condition needs no rectangle: with only value conditions in
   the list, Start works and nothing has to be drawn.
 
-2.3 THE LIST ITSELF
+2.3 A VALUE WITH A SCREEN AREA ATTACHED
+
+  Tick "Also require a screen area" at the bottom of a value
+  condition and the same Draw area / Take reference controls appear
+  as on a screen condition, with their own monitor and their own
+  sensitivity.
+
+  From then on the condition has two halves and BOTH have to hold:
+
+    the value stays under its trip limit, AND
+    the picture still matches its reference
+
+  Either half going wrong raises the alarm, and the message says
+  which of the two it was. The picture is compared twice a second on
+  this computer; the value comes from the archiver a second or two
+  later. So they are checked on their own clocks, not together, which
+  is why the alarm names the half that failed.
+
+  Untick the box and the area is thrown away, picture and all.
+
+  The arrow button under the list re-takes the picture of whichever
+  area the selected condition owns — its own if it is a screen
+  condition, the attached one if it is a value.
+
+2.4 A HALL CHECK
+
+  You say where you are shooting; the program tells you the moment
+  the machine disagrees. Section 9 has the detail.
+
+  1. "Add hall check" on the Halls tab.
+  2. SHOOTING INTO — E2, E3, E4, E5 ELI-LUIS or E5 ELI-MAIA, or
+     "don't check".
+  3. PSS STATE — "internal only" or "into the experiment", or
+     "don't check".
+  4. SWITCHYARD MAY MOVE FOR — how many seconds the switchyard is
+     allowed to be on its way before that counts as wrong. 60 by
+     default.
+  5. "Read now", at the top of the tab, says what the machine is
+     doing this minute. Set the condition against that, not against
+     what you assume.
+
+  Leaving both dropdowns on "don't check" means the condition can
+  never fire, and it says so when you press Start.
+
+2.5 THE LIST ITSELF
 
   On            click the box to switch a condition on or off; it is
                 saved at once
   Add / Edit    Edit, or a double-click, opens the same dialog again
   Delete        removes it, after asking
-  arrow (↺)     re-takes the reference picture of the selected screen
+  arrow (↺)     re-takes the reference picture of the selected
                 condition — for when what you watch has changed for a
-                good reason and the new state should count as normal
+                good reason and the new state should count as normal.
+                On the Halls tab there is no arrow: there is no
+                picture to take.
+
+  Each tab shows only its own kind, but they are one list underneath.
+  Everything ticked is watched, whichever tab is open.
 
   The list, the reference pictures and the limits all live in the
   settings file next to the program, so they come back next time.
@@ -380,7 +437,75 @@ settings.
 
 
 =================================================================
-9. THE OVERLAY MODE
+9. WHERE THE BEAM GOES
+=================================================================
+
+9.1 THE TWO VALUES
+
+    Beam fate      L3BT-MSS:Beam_fate
+
+                     0   switchyard moving
+                     1   E2
+                     2   E3
+                     3   E4
+                     4   E5 ELI-LUIS
+                     5   E5 ELI-MAIA
+
+    PSS state      L3-PSS:STATE_EXH_EXTERNAL_HIGH_P
+
+                     0   shooting fully internally
+                     1   shooting into the experiment
+
+    The line at the top of the Halls tab shows both of them by name,
+    each with the time it last changed, and it keeps itself up to
+    date while watching runs.
+
+9.2 HOW THEY ARE READ
+
+    From the archiver, like everything else the program reads — but
+    with one difference that matters. These two are written only when
+    they change, and they change hours apart, so asking for the last
+    minute would come back empty nearly always. The program therefore
+    asks for the last hour, then the last day, then the last week,
+    then the last month, and takes the newest sample it finds.
+
+    They are also read far less often than everything else — once
+    every two seconds — because reading a value that changes twice a
+    day five hundred times a minute buys nothing.
+
+9.3 WHAT COUNTS AS WRONG
+
+    Whichever of the two halves you set has to match. A half left on
+    "don't check" is not judged at all.
+
+    The switchyard on its way (beam fate 0) is not treated as a
+    destination. While it is moving the badge is orange and nothing
+    else happens — it only becomes an alarm once it has been moving
+    for longer than the number of seconds set in the condition.
+
+    The clock used for that is the archiver's own timestamp of the
+    sample, not this computer's clock, which runs ahead of the
+    facility's.
+
+9.4 WHAT IS NOT READABLE YET
+
+    THE BEAM FATE IS NOT BEING ARCHIVED. There is no L3BT-MSS channel
+    in the archiver at all, and reading the control system directly
+    is not possible from these computers. So today a hall check set on
+    the beam fate can never fire.
+
+    It does not go quiet about it: the read-out says "cannot be read",
+    the condition's badge turns orange and says which value is
+    missing, and nothing is ever reported as fine on the strength of
+    a reading that was never made. The PSS half works now and can be
+    used on its own.
+
+    When the beam fate does become readable, nothing in the program
+    has to change.
+
+
+=================================================================
+10. THE OVERLAY MODE
 =================================================================
 
 While watching, the control panel becomes a small borderless
@@ -394,7 +519,7 @@ and without being in the way of the mouse.
 
 
 =================================================================
-10. WHEN SOMETHING GOES WRONG
+11. WHEN SOMETHING GOES WRONG
 =================================================================
 
   It alarms constantly
@@ -450,6 +575,25 @@ and without being in the way of the mouse.
       watching is not running — the values are only read while it
       is. If the message log fills with read failures instead, the
       archiver is not reachable from this computer.
+
+  A hall check is ticked but nothing ever happens
+      Either both dropdowns are on "don't check" — the log says so
+      when you press Start — or it is set on the beam fate, which is
+      not archived yet (section 9.4). The read-out at the top of the
+      tab tells you which.
+
+  A hall check fires the moment I start
+      That is the point: the machine is not where you said it was.
+      Press "Read now" to see what it actually says and set the
+      condition against that.
+
+  A hall check keeps going orange while the beam is being switched
+      The switchyard is on the move. Raise "Switchyard may move for"
+      until it covers how long the move really takes.
+
+  A value condition with an area fires and I do not know which half
+      The message says it: "screen area changed" for the picture,
+      "... is over ..." for the value.
 
   A badge is purple but the deviation is tiny
       That is exactly the case purple is for: the chiller is holding

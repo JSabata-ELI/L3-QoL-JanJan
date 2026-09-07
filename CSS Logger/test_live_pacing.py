@@ -128,14 +128,17 @@ class _Recorder:
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-def test_wide_window_is_clamped_for_live():
-    """A multi-day saved window must not become the live rolling window."""
+def test_live_uses_the_window_it_is_given():
+    """Live must show the period on screen, however wide, and never a shortened
+    one. It used to clamp anything over 12 h, so the graph quietly disagreed
+    with the From/To it was captioned with."""
     _Recorder().install()
     w = _new_widget()
     now = datetime.now()
     w._dt_from, w._dt_to = now - timedelta(hours=49), now
-    span = w._live_span_from_window()
-    assert span.total_seconds() == app_main._LIVE_MAX_INIT_SPAN_S, span
+    assert w._live_span_from_window() == timedelta(hours=49)
+    w._dt_from, w._dt_to = now - timedelta(days=200), now
+    assert w._live_span_from_window() == timedelta(days=200)
     # A sane window is used as-is, a nonsensical one falls back to an hour.
     w._dt_from, w._dt_to = now - timedelta(hours=2), now
     assert w._live_span_from_window() == timedelta(hours=2)

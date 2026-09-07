@@ -389,6 +389,21 @@ def _icon_app_id(prefix: str, ico_path) -> str | None:
     all rather than burning an id on a run that has no picture to give it.
     The same helper sits in every program here.
     """
+    # A frozen build gets no taskbar identity at all, deliberately.
+    # Windows caches the taskbar picture per AppUserModelID and never re-reads
+    # it, so one bad cache entry breaks that build for good; tagging the id
+    # with the build's file name only postponed it (Diagnostic v1.1.3's id
+    # drew the blank placeholder within a day of the build). Measured
+    # 2026-09-04 with three otherwise identical windows: the app's own id ->
+    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
+    # from the exe's own resource, which the builder always embeds (verified
+    # on a purpose-built PyInstaller exe). With no id Windows keys the button
+    # on the exe itself, so there is no per-id cache left to go stale. An id
+    # is still worth having when running from source, where the process is
+    # python.exe and would otherwise wear the Python icon.
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return None
     if not ico_path:
         return None
     try:

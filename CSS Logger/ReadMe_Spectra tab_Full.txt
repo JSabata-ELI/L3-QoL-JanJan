@@ -2,7 +2,7 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-08-21  (sp_t.py)
+Verified against source: 2026-08-31  (sp_t.py, daypicker.py)
 -----------------------------------------------------------------
 Short version: ReadMe_Spectra.txt  ("ReadMe" button)
 Code map:      STRUCTURE.md
@@ -74,24 +74,96 @@ comparison — is a way of looking at those averages.
     nothing to stop. Whatever had already been fetched is kept; only
     the work still outstanding is dropped.
 
-3.2 LOADING A DAY
+3.2 LOADING A DAY AND A TIME WINDOW
 
-    "Load day..." opens a calendar. A plain click picks or unpicks a
-    single day. Ctrl+click adds the whole range from your previous
-    click, so a week is two clicks. Several days at once are
-    allowed, and they are treated as one continuous stretch of time.
+    "Load day and time..." opens the calendar. It is the same calendar
+    the Image Tools programs use — one widget, one set of rules, so it
+    behaves exactly as it does in the Image Slider or Image Finder.
 
-    Loading fetches the currently active search signal for those days
-    and draws it in the top graph. That happens in the background;
-    the window stays usable and the status line says what is
-    happening.
+      plain click        pick one day, dropping everything else
+      Ctrl+click         add or remove a single day
+      Ctrl+Shift+click   take the run of days from your last click;
+                         doing it again over the same run takes them
+                         back off
+      Mon..Sun boxes     which weekdays a Ctrl+Shift run may include
+                         (weekends off by default). A plain click or a
+                         Ctrl+click ignores these — a weekend can
+                         always be picked by hand.
+
+    Under the calendar, From and To set which hours of the day are
+    loaded: 08:00 to 19:00 by default, or 08:00 to the next full hour
+    when the day is today. Only those hours are read from the archive,
+    so a day is no longer 24 hours of fetching.
+
+    As soon as a second day is picked, a table appears below with one
+    row per day, each with its own From and To. Changing the big
+    From/To at the top moves every day that you have not typed into by
+    hand; a row you did edit keeps what you gave it. So "Monday
+    morning and Wednesday afternoon" is one selection, not two loads.
+    Nothing takes effect until OK.
+
+    The stretches you picked are called windows in the rest of this
+    document: one window per day.
+
+    Loading fetches the currently active search signal inside each
+    window and draws it in the top graph. That happens in the
+    background; the window stays usable and the status line says which
+    PV and which window it is on.
+
+    A word on size: the archive is read in one-hour pieces, per signal,
+    so the number of requests is hours x signals. A fortnight of a
+    dozen signals is well over a thousand of them, and Spectra asks
+    before starting a load that big. It never refuses one — a cut-short
+    load that looked complete would be worse than a slow one.
+
+3.2.1 HOW SEVERAL DAYS ARE DRAWN
+
+    The picked windows are placed side by side on the top graph and
+    the time between them is left out of the axis altogether. Picking
+    Monday 08:00-12:00 and Wednesday 14:00-19:00 gives nine hours of
+    graph, not three days of which most is empty.
+
+    This is a deliberate change: the tab used to take the first and the
+    last day you clicked and load everything in between, so clicking
+    Monday and Friday quietly loaded five days.
+
+    What tells you where you are:
+
+      - a dashed line at every join between two windows;
+      - the date printed above each block;
+      - the date on the first tick of each block, and plain clock
+        times inside it;
+      - the crosshair readout, which names the day as well as the time
+        as soon as more than one day is loaded.
+
+    Nothing is ever drawn across a join, so a step at the dashed line
+    is a change of day and never a jump in the signal. A drag that
+    crosses a join is split there into one region per day: two
+    different days are never averaged into one spectrum by accident,
+    and the status line says so when it happens. A day the drag only
+    clipped by a few pixels is dropped rather than marked — see 3.5.
+
+    The horizontal axis is therefore not real elapsed time, and typing
+    numbers into it would be meaningless — "Axis limits" leaves X
+    alone and says so. Zoom, pan and the crosshair all work normally.
+
+    A region you selected earlier keeps its real date and time. If you
+    then load days that do not contain it, it simply stops being drawn;
+    it stays in the list and in the export, with its own dates.
 
 3.3 THE THREE NUMBERED CARDS
+
+    The whole left panel is arranged in the order you use it: three
+    numbered cards, then the list of what you have marked, then the
+    mode, then Analyze, then Clear all and Export — and the drawing
+    settings gathered in one foldable purple block at the bottom
+    (section 6).
 
     The top of the left panel is three numbered cards, read downwards
     in the order you actually work:
 
-      1  DAY          which day (or days) is loaded.
+      1  DAY & TIME   which day (or days) is loaded, and for how many
+                      hours. Hover it to see every window spelled out.
       2  SEARCH BY    the signal the search is running on, named in
                       full with its channel underneath, and right
                       below it the whole PV list it is chosen from,
@@ -164,9 +236,34 @@ comparison — is a way of looking at those averages.
     horizontally across the graph. The dragged stretch becomes a
     region, drawn as a shaded band, and appears in the region list.
 
+    A WHOLE DAY: double-click anywhere inside it. The entire loaded
+    day is marked, from its first minute to its last, with no aiming.
+    Double-clicking a day that is already marked that way changes
+    nothing and says so.
+
+    OVERSHOOTING INTO THE NEXT DAY. The days lie flush against one
+    another, separated only by the dashed line, so a drag meant for
+    one day usually crosses it by a few pixels — and zoomed out over
+    a fortnight a few pixels are minutes of archive time. Those
+    minutes of the neighbouring day used to become a region of their
+    own, which then had to be deleted by hand. Now a day has to earn
+    its place in a drag: it is kept if it holds at least a fifth of
+    the drag's longest day, or if the drag covers practically the
+    whole of that day's own loaded hours. Everything else is an
+    overshoot and is left out, and the status line names the day it
+    ignored.
+
+    So a rough drag over one block gives one region, while a drag
+    made deliberately across three blocks still gives three. The
+    second rule is what protects a day loaded with a short window:
+    half an hour of Monday next to eleven hours of Wednesday is a
+    tiny share of the drag, but selecting all of it is clearly not an
+    accident.
+
     "Select" and the pan/zoom tools are mutually exclusive: turning
     on Pan or Zoom switches Select off, because otherwise a drag
-    means two things at once.
+    means two things at once. The double-click follows the same rule,
+    so it does nothing while Pan or Zoom has the mouse.
 
 3.6 ANALYZING
 
@@ -217,13 +314,138 @@ comparison — is a way of looking at those averages.
     is named in the graph title, in every legend entry, and above each
     region's numbers.
 
+3.8 EVERY SPECTRUM — NO AVERAGING AT ALL
+
+    The last entry in the "Show" box is "Every spectrum". It is not a
+    fifth way of averaging: it switches the averaging off. Each shot
+    measured inside a region is drawn as its own curve, in that
+    region's colour, so a region holding four hundred shots puts four
+    hundred curves on the graph. Mark a whole day and select all of
+    it, and you are looking at every spectrum that day produced.
+
+    Nothing extra is fetched for this. "Analyze" already brings back
+    every individual spectrum — it is the same data the averages are
+    computed from — so switching between an average and every
+    spectrum is instant either way.
+
+    WHAT CHANGES WHILE IT IS ON.
+
+      - The variation band is greyed out. It describes the spread
+        around an average, and there is no average on screen to
+        describe.
+      - Normalisation applies to each spectrum separately, so
+        "Peak" stacks every shot at 1 and shows you the shape
+        differences alone.
+      - The numbers under each region — peak, centre, width, area —
+        still come from the plain mean, and say so, because a single
+        number cannot describe several thousand curves.
+      - The comparison curve and the auto-fit of the wavelength
+        range also fall back to the plain mean.
+      - The CSV export changes: one column per measured shot, each
+        named by the time it was taken, holding that shot's own
+        intensity against the wavelength column, instead of the
+        average and its standard deviation.
+      - A bar appears under the search graph: "Every spectrum —
+        pick one" (see 3.9).
+
+    THE LIMIT. At most three thousand curves are drawn per region.
+    Above that, every n-th spectrum is taken, spread evenly over the
+    whole region, and both numbers are put in the graph title and in
+    the legend — "3000 of 9007 drawn" — because a quietly thinned
+    graph reads as if that was all there was. Three thousand curves
+    take a couple of seconds to draw, and the mouse pointer shows the
+    wait while it happens.
+
+    The limit is about drawing only. The exported file always holds
+    every shot, thinned graph or not — see section 11.
+
+3.9 PICKING ONE SHOT OUT OF THE BUNDLE
+
+    A thousand faint curves tell you how much the machine wandered,
+    but not which shot is which. A bar appears DIRECTLY UNDER THE
+    SEARCH GRAPH — not in the panel on the left — while this display
+    is on, and answers that:
+
+      the bar                        drag it, or click anywhere on it,
+                                     to move through the shots.
+      ◀  ▶                           step exactly one shot. So does
+                                     the mouse wheel, and the arrow
+                                     keys, once you have clicked the
+                                     bar.
+      Highlight                      draw the picked shot bold on top
+                                     of the bundle, and mark it in the
+                                     search graph. On by default;
+                                     uncheck it to see the bundle
+                                     alone.
+      the line beside them           "431 of 892 · 2026-02-25
+                                     07:49:10 · Spectrum 2" — which
+                                     shot, when it was measured, and
+                                     which selected spectrum it came
+                                     out of.
+
+    IT IS LINED UP WITH THE GRAPH ABOVE IT. The bar covers exactly
+    the same stretch of time as the graph, edge for edge: the same
+    place on the graph is the same place on the bar. The handle stands
+    under the shot it is on, and a line with the time on it marks the
+    same place in the graph itself. Zoom the graph in and the bar
+    follows, so it still lines up.
+
+    IT CAN ONLY STAND ON A SHOT THAT EXISTS. There is nothing to look
+    at in the time between your selections, so the handle does not go
+    there: dragging into an empty stretch stops on the last shot
+    before it, and coming from the other side stops on the first shot
+    after it. Which means the shaded selections in the graph above are
+    also the map of where the bar can go.
+
+    If you have zoomed the graph in and step past its edge with ◀ ▶,
+    the graph slides over — same zoom, the shot in the middle — rather
+    than leaving the handle stuck against the end.
+
+    THE ORDER IS TIME, not the order you selected things in. The bar
+    runs through every drawn shot of every visible spectrum, earliest
+    on the left, latest on the right — so it is the same order as the
+    search graph you dragged over, and with several days loaded it
+    runs straight through them, dates and all.
+
+    IT GOES AWAY WITH THE SEARCH GRAPH. Untick "Show search graph",
+    or switch to Live, and the bar goes too — it lives inside that
+    graph's panel. That is on purpose: a bar whose whole job is to
+    point at a place on that graph has nothing to say without it.
+
+    THE BOLD CURVE IS BLACK, on a thin white outline. Not the
+    spectrum's own colour: three thousand curves of one colour make a
+    solid band, and a bold line of that same colour inside it reads as
+    a white gap. Black is a colour the bundle never has. Which
+    spectrum the shot came from is on the coloured border of the tag
+    in the top-left corner of the graph — that tag is also why this
+    still tells you what you are looking at in full-screen mode
+    (F11), where only the spectra graph is on screen.
+
+    THE SAME TREATMENT AS THE BUNDLE. The bold curve is masked to the
+    wavelength range, smoothed and normalised exactly like the curves
+    behind it, so it sits on the shot it is naming and not next to it.
+
+    IT DOES NOT REDRAW EITHER GRAPH. Moving the bar repaints the one
+    curve, and the one marker, on top of a stored picture of the rest
+    — measured at about 20 ms a move with three thousand curves of
+    2048 points behind it, where redrawing the whole graph takes over
+    four seconds. So the bar can be dragged.
+
+    WHAT KEEPS YOUR PLACE. Hiding a spectrum with its eye, changing
+    Normalize, re-analyzing — all of them renumber the list. You are
+    kept on the shot you were on, not on the number it used to have.
+    If that shot is gone, the bar falls back to the nearest position.
+
 
 =================================================================
 4. LIVE MODE
 =================================================================
 
 Switch to "Live" in the Mode box, set "Average last N", and press
-"Start Live".
+"Start Live". The mode you are in is the button filled in blue; the
+other one is grey. (It used to be neither: the program's own button
+styling overrode the "pressed in" look, so both buttons looked exactly
+the same and nothing said which mode was on.)
 
   - The last ten minutes are loaded first, so you are not looking at
     an empty graph while it fills.
@@ -233,6 +455,8 @@ Switch to "Live" in the Mode box, set "Average last N", and press
     stutter for no reason. The status line still updates every time.
   - Up to two thousand spectra are kept in memory, oldest discarded.
   - "Stop Live" freezes the display; what is on screen stays there.
+  - With "Show" set to "Every spectrum" the black average curve is
+    left off: the newest shot and the buffered ones are all there is.
 
 HOW MANY ARE REALLY AVERAGED. "Average last N" is a ceiling, not a
 promise. The average uses the newest N shots in the buffer, or all of
@@ -281,6 +505,24 @@ A partly broken wavelength channel — one with gaps or nonsense in it
 — is repaired by fitting the good part and extending it, rather than
 being rejected outright.
 
+WHEN THE ARCHIVE KEPT ONLY PART OF THE AXIS. Some axis channels are
+stored shorter than the spectra they belong to. The SPIDER time axis
+is the case that matters: the archive keeps 2048 points of it while
+each measured trace has 4096. If the stored part rises in even steps,
+the rest is continued at the same spacing, so the whole trace gets a
+real axis; the status line, the tooltip on the channel box and the
+exported file all say that this happened. If the stored part is not
+evenly spaced — a real spectrometer's wavelength axis is not — nothing
+is invented and the graph falls back to sample numbers.
+
+THE UNIT OF THE AXIS. The box marked "Unit" under the channel says
+what the horizontal axis is measured in. It is filled in from the
+channel name — femtoseconds for the SPIDER time domain, nanometres
+for a spectrometer — and you can type over it. It sets the axis
+title, the value under the mouse, the Peak and FWHM lines in the
+region details and the column names in the exported file, so a pulse
+length is never reported in nanometres.
+
 CHANGING IT RE-RUNS WHAT YOU HAD. A region's averaged curves belong to
 one channel and one wavelength axis. Change either, and the numbers
 you are looking at are about the old channel. So changing the spectrum
@@ -300,7 +542,24 @@ on top of the new ones.
 6. THE DISPLAY OPTIONS
 =================================================================
 
-  Average             the four methods from section 3.5.
+WHERE THEY ARE. All of them live in one purple block called "Display
+settings" at the very bottom of the left panel, under the buttons —
+the graph options, the horizontal window and the comparison curve
+together. That is deliberate: none of them fetches anything or changes
+what was measured, they only change how it is drawn, so they are kept
+out of the way of the steps that do. Clicking the purple title folds
+the whole block away; clicking it again brings it back. The colouring
+is the same idea as the coloured sections in the Image Slider, so the
+two panels read alike.
+
+The panel above it runs in the order you use it: the three numbered
+cards, then "Selected spectra" with everything you have marked, then
+Archive / Live, then "Analyze" with its progress bar, and finally
+"Clear all" and "Export results" side by side.
+
+  Show                the four averaging methods from section 3.7,
+                      or "Every spectrum" — no averaging, every
+                      measured shot drawn on its own (section 3.8).
 
   Colour by           Selection order    a fixed palette, in the
                                          order you marked the
@@ -337,9 +596,43 @@ on top of the new ones.
   Show search graph   hides the top graph to give the spectra the
                       whole window.
 
-  Spectrum range      the wavelength window, From and To, plus
-                      "Auto-fit range to data on Analyze" which sets
-                      it from what was actually measured.
+  From / To           the horizontal window, plus "Auto-fit range to
+                      data on Analyze" which sets it from what was
+                      actually measured. Set a window the spectra do
+                      not reach and the graph says so — it names the
+                      range you asked for and the range the spectra
+                      cover — instead of going blank.
+
+                      Its heading follows the unit of the axis you are
+                      looking at, taken from the "Unit" box in card 3:
+                      "Wavelength range [nm]" on a spectrometer,
+                      "Time range [fs]" on the SPIDER time domain. A
+                      pulse duration labelled in nanometres would be
+                      worse than no label at all.
+
+  Compare regions     picks two analysed regions and draws their
+                      difference or their ratio as an extra curve
+                      (section 9).
+
+ONE AXIS FOR EVERYTHING ON THE GRAPH. Every curve, the metrics, the
+auto-fitted From/To and the exported file are drawn against the same
+axis: the measured one when it fits the waveform (rebuilt from its own
+spacing when the archiver stored only part of it, as on SPIDER), the
+plain sample number when it does not. This was not always true. With
+"Show" set to "Every spectrum" the bundle of individual spectra used a
+simpler rule of its own and fell back to sample numbers while
+everything else was on femtoseconds: the bundle piled up around
+"2000" (its own array position), the picked spectrum was drawn at
+0 fs where it really belongs, and the auto-fitted range, being in
+femtoseconds too, then cut the bundle down to a slice of its own
+baseline — which is why the intensity axis could stop at 0.05 while
+the spectra peaked at 1.0.
+
+WHAT MOVES THE INTENSITY AXIS. By itself the graph fits it to the
+curves it is showing, so a new From/To window rescales it. Zoom or pan
+it by hand (or type limits in the right-click menu) and that is kept
+through every later redraw — until Home or "Reset view" hands the
+graph back to the data.
 
 THE GRAPH KEEPS ITS SIZE. None of the choices above changes how big
 the graph is. That used to be untrue and it was the single worst thing
@@ -411,8 +704,10 @@ One row per region. Each row has:
                   describing a tight family of curves or hiding two
                   different populations.
 
-"Expand all" opens every region at once. There are buttons to clear
-all regions and to analyze.
+"Expand all" opens every region at once. "Analyze" sits below the
+list, under Archive / Live, with its progress bar; "Clear all", which
+empties the list, is on the last row of the panel next to "Export
+results".
 
 
 =================================================================
@@ -467,6 +762,31 @@ One data file holds everything, in two blocks:
       the comparison curve if it is switched on. Seven regions and a
       hundred live shots is a hundred and seven curves in one file.
 
+      With "Show" set to "Every spectrum" the region part changes to
+      one column per measured shot, each headed by the time it was
+      taken, holding that shot's own intensity point by point against
+      the wavelength column. That is the raw data of every spectrum
+      you were looking at, not a summary of it.
+
+      EVERY shot, including the ones the graph left out. The
+      three-thousand-curve drawing limit is there because curves take
+      time to paint; a column in a text file does not. When the two
+      differ, the details block says so — "every spectrum (9007),
+      graph drew 3000". Thousands of columns make a large file, and
+      Excel stops reading at 16 384.
+
+      THE FIRST COLUMN IS THE AXIS THE GRAPH IS DRAWN AGAINST. Its
+      heading carries the unit — "wavelength_nm" for a spectrometer,
+      "time_fs" for the SPIDER time domain — and so do the peak and
+      width columns. If no axis could be resolved for the spectra, the
+      graph plots them against the sample number, the column is headed
+      "sample_number", the width columns turn into sample columns, and
+      a note at the top of the file spells it out. It used to be
+      possible for the graph to show sample numbers while the file
+      showed a real axis, which put the same peak in two different
+      places. If the axis had to be continued past the part the
+      archive stored, a note at the top says that too.
+
 The file uses a semicolon between columns and a point as the decimal
 separator, and it announces the separator on its first line so Excel
 opens it directly instead of showing an import wizard.
@@ -480,7 +800,8 @@ Per user, in your own application data:
 
   the search-signal list
   the named presets
-  the spectrum channel and how its wavelength axis is built
+  the spectrum channel, how its horizontal axis is built, and the
+    unit that axis is shown in
   the window layout — the divider position between the two graphs,
     and the graph margins if you ever set them by hand
   where you left the focus-mode window
@@ -511,6 +832,16 @@ window is open.
       Check the X and Y pair shown under the card. If the axis was
       built from the sample number, there is no wavelength
       information in it at all.
+
+  The axis says "Sample number" although an _X channel exists
+      The archive holds an axis that does not match the spectra and
+      does not rise in even steps, so it cannot be stretched to fit
+      them without making the numbers up. Hover the channel box: it
+      says how many axis points the archive actually has.
+
+  The axis is in the wrong unit
+      Type the right one into the "Unit" box under the channel. The
+      guess comes from the channel name, and a name can lie.
 
   Live mode shows nothing
       No new shots are arriving. The status line updates every three

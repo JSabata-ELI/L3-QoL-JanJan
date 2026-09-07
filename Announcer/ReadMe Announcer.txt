@@ -14,15 +14,19 @@ WHAT IT WATCHES
   image or colour, a sound, and the sentence you wrote for that
   condition.
 
-  A condition is one of two things:
+  There are three kinds, one per tab:
 
-    Screen area   a rectangle of a screen still looks the way it did
+    Screen areas  a rectangle of a screen still looks the way it did
                   when you took its reference picture. Good for a
                   status box, a warning lamp, a number, a camera
                   window — anything drawn on a screen.
-    Value         a machine value stays under its limit. Two limits:
+    Values        a machine value stays under its limit. Two limits:
                   the first only shows a warning badge, the second
-                  raises the alarm.
+                  raises the alarm. A screen area can be attached to
+                  a value, and then both have to hold: the value
+                  under its limit AND the picture still matching.
+    Halls         you say where you are shooting, and the program
+                  tells you the moment the machine disagrees.
 
   It also shows badges for eight machine values that are out of
   range — the helium pressure, the Alpha voltage, and how far each of
@@ -59,22 +63,35 @@ SETTING UP A CONDITION
      instead of guessing.
   3. Fill in "Warn over" and "Trip over" and save. Leave a box empty
      to switch that level off.
+  4. Optional: tick "Also require a screen area" and draw one. The
+     condition then needs both halves — the value under its limit and
+     the picture still matching. Either one going wrong fires the
+     alarm, and the message says which of the two it was.
+
+  Hall:
+  1. Press "Add hall check" on the Halls tab.
+  2. "Shooting into" is where the beam is supposed to go, and "PSS
+     state" is whether the shot is meant to stay inside or go into the
+     experiment. Leave either one on "don't check".
+  3. "Switchyard may move for" is how long the switchyard is allowed
+     to be on its way before that counts as wrong.
+  4. "Read now", at the top of the tab, says what the machine is doing
+     this minute, so you can see what you are setting against.
 
   The arrow button under the list re-takes the reference picture of
-  the selected screen condition — use it when what you are watching
-  has changed for a good reason and the new state should count as
-  normal.
+  the selected condition — use it when what you are watching has
+  changed for a good reason and the new state should count as normal.
 
-  A value condition needs no rectangle at all: with only value
-  conditions in the list, Start still works.
+  A value or hall condition needs no rectangle at all: with only those
+  in the list, Start still works.
 
 
 THE OLD SINGLE-RECTANGLE WATCH
 
-  "Set reference" at the top still draws one quick rectangle without
-  giving it a name, and "Preview region" shows what is inside it. It
-  is watched alongside the conditions. Use it for a one-off; use a
-  condition for anything you want to keep.
+  "Set reference" on the Screen areas tab still draws one quick
+  rectangle without giving it a name, and "Preview region" shows what
+  is inside it. It is watched alongside the conditions. Use it for a
+  one-off; use a condition for anything you want to keep.
 
 
 THE CIRCLE IS THE WHOLE STATE
@@ -100,8 +117,30 @@ WHEN THE ALARM GOES OFF
 
   A value that cannot be read never fires the alarm — the reason goes
   into the message log instead. A condition that cannot fire at all
-  (a screen area with no reference, a value with no trip limit) says
-  so in the log when you press Start.
+  (a screen area with no reference, a value with no trip limit, a hall
+  check with nothing chosen) says so in the log when you press Start.
+
+
+WHERE THE BEAM GOES
+
+  Two machine values say it:
+
+    Beam fate    switchyard moving, E2, E3, E4, E5 ELI-LUIS or
+                 E5 ELI-MAIA
+    PSS state    shooting fully internally, or into the experiment
+
+  The line at the top of the Halls tab shows both, with the time they
+  last changed. A hall check compares them against what you set, and
+  fires the moment they differ.
+
+  While the switchyard is on its way, the badge is orange, not an
+  alarm — that is a passing state. It only becomes an alarm if the
+  switchyard is still moving after the number of seconds you set.
+
+  IMPORTANT: the beam fate is not being archived yet, so today it
+  reads "cannot be read" and a hall check set on it can never fire.
+  It says so out loud rather than quietly reporting that everything is
+  fine. The PSS state half works now.
 
 
 THE MACHINE VALUE BADGES

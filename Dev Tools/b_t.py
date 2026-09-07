@@ -135,6 +135,32 @@ def bump_patch(ver: str) -> str:
     return f"{t[0]}.{t[1]}.{t[2] + 1}"
 
 
+def exe_icon_count(exe: Path) -> int:
+    """How many icon groups the built .exe carries in itself.
+
+    This is what the Windows taskbar draws: a frozen build sets no
+    AppUserModelID (see _icon_app_id() in every program), so Windows keys the
+    taskbar button on the exe file and paints it from the exe's own icon
+    resource. A build that came out without one shows the blank window
+    placeholder instead, and nothing the running program does can fix it -
+    which is exactly the bug that kept coming back. So every build checks it
+    and says so in the log. Returns 0 when the file has no icon, and -1 when
+    the count could not be taken at all.
+    """
+    try:
+        import ctypes
+        import ctypes.wintypes as _wt
+        _ex = ctypes.windll.shell32.ExtractIconExW
+        _ex.argtypes = [_wt.LPCWSTR, ctypes.c_int,
+                        ctypes.POINTER(_wt.HICON), ctypes.POINTER(_wt.HICON),
+                        ctypes.c_uint]
+        _ex.restype = ctypes.c_uint
+        # index -1 only counts the icon groups, it loads nothing
+        return int(_ex(str(exe), -1, None, None, 0))
+    except Exception:
+        return -1
+
+
 def run(cmd, cwd: Path):
     return subprocess.call(cmd, cwd=str(cwd), shell=True)
 
@@ -1460,6 +1486,20 @@ class BuilderUI(ttk.Frame):
             except Exception:
                 pass
 
+        # The taskbar picture comes from the exe itself - see exe_icon_count().
+        if exe_dst.exists():
+            _n = exe_icon_count(exe_dst)
+            if _n > 0:
+                print(f"Icon: the exe carries its own icon ({_n} group(s)) — "
+                      f"its taskbar button will show it")
+            elif _n == 0:
+                print("Warning: the built exe carries NO icon of its own, so "
+                      "its taskbar button will be a blank window. Check that "
+                      "icon.ico sits in the program's folder and that "
+                      "PyInstaller got --icon.")
+            else:
+                print("Warning: could not check whether the exe carries an icon")
+
         # Kopíruj main .py a ostatní zdrojáky
         try:
             py_dst = verdir / f"{name} v{ver}.py"
@@ -1679,6 +1719,17 @@ class BuilderUI(ttk.Frame):
                 shutil.copy2(str(icon_path), str(verdir / "icon.ico"))
             except OSError:
                 pass
+
+        # The taskbar picture comes from the exe itself - see exe_icon_count().
+        if exe_dst.exists():
+            _n = exe_icon_count(exe_dst)
+            if _n > 0:
+                _log(f"  icon: the exe carries its own ({_n} group(s))")
+            elif _n == 0:
+                _log("Warning: the built exe carries NO icon of its own, so "
+                     "its taskbar button will be a blank window")
+            else:
+                _log("Warning: could not check whether the exe carries an icon")
 
         # The helper's OWN documentation, named after the helper and living in
         # the parent's source folder. It is deployed as a program of its own, so

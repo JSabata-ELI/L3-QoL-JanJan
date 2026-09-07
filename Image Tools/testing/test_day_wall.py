@@ -150,11 +150,32 @@ def main():
     wall.set_display("Grayscale", False, None, 0, 0)
     wall._relayout()
     rects = wall._rects
-    area = sum(r.width() * r.height() for r in rects)
-    canvas = wall.width() * wall.height()
     check("one tile per day", len(rects) == len(cells), f"{len(rects)}")
-    check("tiles are a seamless partition of the canvas", area > 0.97 * canvas,
-          f"{100.0 * area / canvas:.1f}% covered")
+
+    # The wall is an equal-size grid, at most four across: every tile the same size,
+    # as large as the pane allows. Slack therefore appears as UNFILLED SLOTS (three
+    # days go in a two-by-two and the fourth slot stays empty), which is the price
+    # of comparing frames at one magnification. What must never appear is slack
+    # BETWEEN tiles — a wall of frames has to read as a wall. So the test is that
+    # the tiles cover exactly the slots they occupy, edge to edge.
+    cols = sum(1 for r in rects if r.y() == rects[0].y())
+    rows = (len(rects) + cols - 1) // cols
+    slots = cols * rows
+    area = sum(r.width() * r.height() for r in rects)
+    grid_area = wall.width() * wall.height() * (len(rects) / slots)
+    check("every tile is the same size",
+          len({(r.width(), r.height()) for r in rects}) <= 2,
+          str(sorted({(r.width(), r.height()) for r in rects})))
+    check("no more than four across", cols <= wall._MAX_COLS, f"{cols} columns")
+    check("the tiles fill their slots edge to edge", area > 0.97 * grid_area,
+          f"{100.0 * area / grid_area:.1f}% of {len(rects)}/{slots} slots")
+    top = sorted((r for r in rects if r.y() == rects[0].y()), key=lambda r: r.x())
+    check("and neighbours share a pixel, with no gap",
+          top[0].x() == 0
+          and top[-1].x() + top[-1].width() == wall.width()
+          and all(top[i].x() + top[i].width() == top[i + 1].x()
+                  for i in range(len(top) - 1)),
+          str([(r.x(), r.width()) for r in top]))
 
     def tile_peak_of(wl, i):
         """Brightest pixel a given wall actually PAINTS for tile i."""
@@ -233,7 +254,7 @@ def main():
             same = False
     check("handed-over frames render on the wall's scale", same)
 
-    print("\ntabs: One frame, one per camera, then day by day")
+    print("\ntabs: one per camera, then day by day (the close-up is a window now)")
     results = {
         "C03-040-PTM11WNF-_-IMG": [(c["day"], 8, c["path"],
                                     {"sbw4": 1.0, "source": "sbw4"}, "found")
@@ -244,7 +265,8 @@ def main():
         app.processEvents()
         time.sleep(0.01)
     titles = [w._view_tabs.tabText(i) for i in range(w._view_tabs.count())]
-    check("the close-up is the first tab", titles[:1] == ["One frame"], str(titles))
+    check("every tab is a wall — no One frame tab", "One frame" not in titles, str(titles))
+    check("the first tab is a camera", titles[:1] == ["C03-040-PTM11WNF"], str(titles))
     check("there is a tab for the camera", "C03-040-PTM11WNF" in titles, str(titles))
     check("day by day is last", titles[-1] == "Day by day", str(titles))
     check("no pop-up window class survives",
@@ -313,9 +335,21 @@ def main():
           f"{pm.width()}x{pm.height()} from {w0}x{h0}")
     w._reset_wall_edits()
 
-    print("\nthe caption says which reading picked the frame")
-    check("SBW4 is named", "[SBW4]" in cam_wall._caption(cam_wall.cells()[0]),
-          cam_wall._caption(cam_wall.cells()[0]))
+    print("\nthe caption warns, and only warns")
+    # Naming the channel the frame was picked by ("[SBW4]") on every tile repeated
+    # back the choice the operator had just made, and it is the same for the whole
+    # wall — so it was dropped. What a caption MUST still carry is the warning: a
+    # frame nobody vouched for has to say so, or a black tile reads as a broken
+    # camera instead of "we just took whatever was in the folder".
+    cell = dict(cam_wall.cells()[0])
+    check("a frame a shot picked carries no tag",
+          "[" not in cam_wall._caption(cell), cam_wall._caption(cell))
+    cell["meta"] = {"source": "blind"}
+    check("a frame nobody vouched for says so",
+          "[no shot data]" in cam_wall._caption(cell), cam_wall._caption(cell))
+    cell["meta"] = {"source": "sbw4", "blank": True}
+    check("an empty frame is called empty, not missing",
+          "(nothing on it)" in cam_wall._caption(cell), cam_wall._caption(cell))
 
     print("\nStop All")
     w.cancel_scan()

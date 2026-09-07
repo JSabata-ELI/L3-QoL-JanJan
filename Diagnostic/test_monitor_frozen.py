@@ -11,6 +11,10 @@ Covers the part that lives in monitor_tab.py:
   announces, and how /status, /alarms, the State column and a plotted chart say
   so instead of reporting "ok".
 
+One more /status detail rides along here because this is where the reply is
+rendered offline: the canteen sign-in line, which is now the ONLY place the app
+mentions an expired OKbase session — nothing is posted to the chat about it.
+
 Qt is imported but no window is shown (offscreen platform), and nothing here
 touches the archiver, the network share or a notification channel: the widget
 methods under test are called on a stand-in object carrying just the settings
@@ -261,6 +265,7 @@ def _refresh_win(pvs=(), runtime=None, last_ok_ns=NOW, **overrides):
     win._last_poll_ok_ns = last_ok_ns
     win._refresh_bad = False
     win._refresh_bad_since_ns = 0
+    win._refresh_alert_sent = False
     win._poll_inflight = False
     win._poll_started_ns = 0
     win._mem_start_ns = NOW - 3600 * SEC
@@ -271,13 +276,16 @@ def _refresh_win(pvs=(), runtime=None, last_ok_ns=NOW, **overrides):
     win.graph = types.SimpleNamespace(
         set_stale_note=lambda text: win.marked.append(text))
     for name in ("_refresh_limit_s", "_refresh_age_s", "_refresh_fault",
+                 "_refresh_alert_limit_s",
                  "_check_refresh_health", "_mark_stale_ui", "_pv_stale_note",
                  "_status_line", "_cmd_status", "_cmd_alarms",
-                 "_freshness_header", "_freshness_footer",
-                 "_resolve_pvs", "_find_pv"):
+                 "_refresh_note_short", "_freshness_header",
+                 "_freshness_footer", "_resolve_pvs", "_find_pv",
+                 "_menu_signin_note"):
         setattr(win, name, types.MethodType(getattr(mt.MonitorWidget, name), win))
     win._log = types.MethodType(lambda self, m: self.logged.append(m), win)
     win._update_status = types.MethodType(lambda self: None, win)
+    # Record the chat message instead of rendering and posting it.
     win._send_refresh_alert = types.MethodType(
         lambda self, level, reason: self.sent.append((level, reason)), win)
     return win
@@ -323,6 +331,28 @@ def test_a_stall_shorter_than_the_self_healing_wait_is_left_alone():
         assert win._refresh_fault() != ""
 
 
+def test_settings_can_make_the_announcement_more_patient():
+    """Settings owns the limit, so a 5 min setting must stay quiet at 4 min."""
+    pv, rt = _ok_pv()
+    win = _refresh_win([pv], {pv.name: rt}, poll_interval_s=30,
+                       refresh_alarm_minutes=5.0)
+    with _clock(NOW + 4 * MIN):
+        assert win._refresh_fault() == ""
+    with _clock(NOW + 6 * MIN):
+        assert win._refresh_fault() != ""
+
+
+def test_a_limit_the_poll_rhythm_could_not_meet_is_raised():
+    """1 min with a 30 s poll would announce every stall the wedge watchdog is
+    already curing, so the floor (five intervals) wins instead."""
+    pv, rt = _ok_pv()
+    win = _refresh_win([pv], {pv.name: rt}, poll_interval_s=30,
+                       refresh_alarm_minutes=1.0)
+    assert win._refresh_limit_s() >= 5 * 30
+    with _clock(NOW + 2 * MIN):
+        assert win._refresh_fault() == ""
+
+
 def test_never_having_read_anything_counts_from_launch():
     pv, rt = _ok_pv()
     win = _refresh_win([pv], {pv.name: rt}, last_ok_ns=0)
@@ -331,27 +361,93 @@ def test_never_having_read_anything_counts_from_launch():
     assert "no reading has completed since this program started" in fault
 
 
-def test_alert_fires_once_then_once_more_on_recovery():
+def test_a_short_stall_is_marked_but_not_said_in_the_chat():
+    """The stall shows up on screen and in every reply straight away, and
+    nothing is sent to the chat — neither when it starts nor when it ends. Most
+    stalls are cured by the wedge watchdog seconds later, so the pair of
+    messages only ever woke somebody up for nothing."""
     pv, rt = _ok_pv()
     win = _refresh_win([pv], {pv.name: rt})
     with _clock(NOW + 20 * MIN):
         win._check_refresh_health()
-        win._check_refresh_health()      # still stalled -> no repeat
-    assert len(win.sent) == 1
-    assert win.sent[0][0] == AlertLevel.ALARM
-    assert mt.NOT_REFRESHED_LABEL.upper() in win.sent[0][1]
+        win._check_refresh_health()
+    assert win.sent == []
     assert win.model.stale and win.marked[-1] != ""
+    assert any(mt.NOT_REFRESHED_LABEL.upper() in m for m in win.logged)
 
     win._last_poll_ok_ns = NOW + 21 * MIN
     with _clock(NOW + 21 * MIN):
         win._check_refresh_health()
-    assert len(win.sent) == 2 and win.sent[1][0] == AlertLevel.OK
+    assert win.sent == []
     assert not win.model.stale and win.marked[-1] == ""
 
 
+def test_a_long_stall_is_said_in_the_chat_once_and_then_cleared():
+    """Half an hour is not a stall curing itself, so the chat is told — once,
+    however many times the check runs — and told again when reading resumes."""
+    pv, rt = _ok_pv()
+    win = _refresh_win([pv], {pv.name: rt})
+    with _clock(NOW + 20 * MIN):
+        win._check_refresh_health()
+    assert win.sent == []                     # marked, not announced yet
+    with _clock(NOW + 31 * MIN):
+        win._check_refresh_health()
+        win._check_refresh_health()
+    assert len(win.sent) == 1
+    level, reason = win.sent[0]
+    assert level == AlertLevel.ALARM
+    assert "STOPPED READING" in reason and "31 min" in reason
+
+    win._last_poll_ok_ns = NOW + 40 * MIN
+    with _clock(NOW + 40 * MIN):
+        win._check_refresh_health()
+    assert len(win.sent) == 2
+    level, reason = win.sent[1]
+    assert level == AlertLevel.OK and "resumed" in reason
+
+
+def test_the_chat_message_can_be_turned_off_and_retimed():
+    pv, rt = _ok_pv()
+    off = _refresh_win([pv], {pv.name: rt}, refresh_alert_minutes=0)
+    with _clock(NOW + 5 * 60 * MIN):
+        off._check_refresh_health()
+    assert off.sent == []
+
+    soon = _refresh_win([pv], {pv.name: rt}, refresh_alert_minutes=10)
+    with _clock(NOW + 8 * MIN):
+        soon._check_refresh_health()
+    assert soon.sent == []
+    with _clock(NOW + 11 * MIN):
+        soon._check_refresh_health()
+    assert len(soon.sent) == 1
+
+
+def test_the_chat_message_never_beats_the_marking():
+    """A chat wait shorter than the marking wait would ask for a message about
+    a stall the program does not even consider one yet."""
+    pv, rt = _ok_pv()
+    win = _refresh_win([pv], {pv.name: rt}, refresh_alarm_minutes=10.0,
+                       refresh_alert_minutes=1.0)
+    assert win._refresh_alert_limit_s() >= win._refresh_limit_s()
+    with _clock(NOW + 5 * MIN):
+        win._check_refresh_health()
+    assert win.sent == [] and not win.model.stale
+
+
+def test_no_chat_message_while_alerting_is_stopped():
+    """Monitoring off means no messages at all — the marking still shows."""
+    pv, rt = _ok_pv()
+    win = _refresh_win([pv], {pv.name: rt})
+    win._monitoring = False
+    with _clock(NOW + 60 * MIN):
+        win._check_refresh_health()
+    assert win.sent == []
+    assert win.model.stale
+
+
 def test_stall_is_shown_even_when_alerting_is_stopped():
-    """Alerting off silences the message, never the display — the operator
-    still has to be able to see that the numbers are old."""
+    """Alerting off must never silence the display — the operator still has to
+    be able to see that the numbers are old."""
     pv, rt = _ok_pv()
     win = _refresh_win([pv], {pv.name: rt})
     win._monitoring = False
@@ -375,6 +471,8 @@ def test_status_line_says_not_refreshed_instead_of_ok():
 
 
 def test_status_reply_warns_above_the_values_and_dates_them():
+    """One short line, above the values — read on a phone, a longer warning
+    pushes the numbers themselves off the screen."""
     pv, rt = _ok_pv()
     win = _refresh_win([pv], {pv.name: rt})
     with _clock(NOW + 20 * MIN):
@@ -382,7 +480,8 @@ def test_status_reply_warns_above_the_values_and_dates_them():
         reply = win._cmd_status()
     head, _, rest = reply.partition("\n")
     assert mt.NOT_REFRESHED_LABEL.upper() in head       # warning comes first
-    assert "**Status" in rest
+    assert "20 min ago" in head                         # and how old they are
+    assert rest.lstrip("\n").startswith("**Status")     # nothing else above
     assert "Values read at" in reply                    # and when they were read
 
 
@@ -394,6 +493,33 @@ def test_a_healthy_status_reply_still_dates_the_values():
     assert reply.startswith("**Status")
     assert "Values read at" in reply
     assert mt.NOT_REFRESHED_LABEL not in reply
+
+
+def test_status_carries_the_canteen_line_only_when_the_signin_was_refused():
+    """Nothing announces an expired canteen sign-in any more, so /status is
+    where it has to show up — and only for a real refusal, never for a portal
+    that merely did not answer, and never on a single-PV reply."""
+    import okbase_menu as om
+    pv, rt = _ok_pv()
+    win = _refresh_win([pv], {pv.name: rt})
+    win.settings["okbase_enabled"] = True
+
+    win._menu_error = ""
+    with _clock(NOW):
+        assert "Canteen sign-in" not in win._cmd_status()
+
+    win._menu_error = om.PORTAL_UNREACHABLE + " (HTTP 502)"
+    with _clock(NOW):
+        assert "Canteen sign-in" not in win._cmd_status()
+
+    win._menu_error = om.SESSION_EXPIRED
+    with _clock(NOW):
+        assert "Canteen sign-in expired" in win._cmd_status()
+        assert "Canteen sign-in" not in win._cmd_status([pv.name])
+
+    win.settings["okbase_enabled"] = False
+    with _clock(NOW):
+        assert "Canteen sign-in" not in win._cmd_status()
 
 
 def test_alarms_will_not_claim_all_clear_while_the_values_are_old():
@@ -449,18 +575,22 @@ def test_state_cell_says_not_refreshed():
 @contextlib.contextmanager
 def _canned_series(newest_ns, n=20, step_ns=MIN):
     """Serve a fixed run of samples instead of asking the archiver."""
-    real = mt._fetch_series
+    real = mt._fetch_chart_data
 
-    def fake(series, start_ns, end_ns, timeout):
-        xs = [mt.api.ns_to_prague(newest_ns - i * step_ns)
-              for i in range(n - 1, -1, -1)]
-        return xs, [16.0 + 0.1 * i for i in range(n)], "°C"
+    def fake(series, start_ns, end_ns, timeout, **kw):
+        t_ns = [newest_ns - i * step_ns for i in range(n - 1, -1, -1)]
+        datas = [mt.chart_history.make_raw_series(
+            s.pv_name, s.display_name, t_ns,
+            [16.0 + 0.1 * i for i in range(n)], start_ns, end_ns, "°C")
+            for s in series]
+        return datas, mt.chart_history.FetchReport(n_requests=1, n_done=1,
+                                                   n_pvs=len(series))
 
-    mt._fetch_series = fake
+    mt._fetch_chart_data = fake
     try:
         yield
     finally:
-        mt._fetch_series = real
+        mt._fetch_chart_data = real
 
 
 def _chart_info(newest_ns, end_ns, stale_after_s):

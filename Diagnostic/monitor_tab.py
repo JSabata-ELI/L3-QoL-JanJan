@@ -23,11 +23,12 @@ import os
 import re
 import socket
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Optional
 
@@ -40,7 +41,8 @@ from PySide6.QtGui import (
     QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
     QMessageBox, QPlainTextEdit, QProgressBar, QProgressDialog, QPushButton,
@@ -48,6 +50,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+import chart_history
 import cpva_api as api
 import shared_pvs
 from alerting import (
@@ -58,6 +61,7 @@ from alerting import (
 import bot_commands
 import memstats
 import notify_provision
+import okbase_menu
 from secrets_util import encrypt_secret
 
 # ---------------------------------------------------------------------------
@@ -201,6 +205,16 @@ _BTN_SUCCESS = (
     "QPushButton:hover { background:#1B5E20; }"
     "QPushButton:disabled { background:#bbb; color:#888; }"
 )
+# The quieter button, for the second-choice action beside a primary one. Painted
+# rather than left to the theme: this PC runs Windows in dark mode, so an
+# unstyled button comes out dark grey text on a dark grey ground.
+_BTN_PLAIN = (
+    "QPushButton { background:#f2f2f2; color:#111; font-weight:600; "
+    "padding:7px 10px; border:1px solid #9a9a9a; border-radius:4px; }"
+    "QPushButton:hover { background:#e2e8f0; border-color:#1565C0; }"
+    "QPushButton:disabled { background:#e0e0e0; color:#8a8a8a; "
+    "border-color:#c0c0c0; }"
+)
 _CHK_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; }
 QCheckBox::indicator {
@@ -246,6 +260,14 @@ DEFAULT_SETTINGS = {
     "debounce_count": 2,
     "settle_minutes": 7.0,
     "stable_seconds": 120,
+    # Grace after the limits in force change. A PV with conditional rules gets
+    # a different band the moment its dependency PVs move (shot rate down, high
+    # power off, chillers being switched off at the end of the day), and the
+    # measured value needs time to reach the new band. Alerting for that PV is
+    # held for this long after every such change, so the switch itself never
+    # raises an alarm — only a value that still misses the new band once the
+    # wait is over does. 0 = no grace (alert straight away on the new limits).
+    "rule_change_grace_minutes": 20.0,
     # Trend-adaptive reminders: for an already-alarming PV, speed up / slow down
     # the re-notify reminders based on its recent value trend (worsening ->
     # faster, self-correcting -> slower). Only touches the reminder rhythm, not
@@ -256,6 +278,18 @@ DEFAULT_SETTINGS = {
     "trend_speedup_factor": 2.0,    # worsening: reminder cooldown / this
     "trend_slowdown_factor": 2.0,   # improving: reminder cooldown * this
     "history_minutes": 720,
+    # Refresh watchdog: how long the program may go without completing a read
+    # before everything it shows counts as out of date (status bar, State
+    # column, chat replies). Raised automatically when the poll rhythm alone
+    # could not meet it — see _refresh_limit_s.
+    "refresh_alarm_minutes": 3.5,
+    # …and how long a stall has to last before it is also said in the chat.
+    # Short stalls are cured by the wedge watchdog in _start_poll seconds
+    # later, so announcing those woke people for nothing; a stall this long is
+    # not curing itself and nobody would otherwise know the values are frozen.
+    # One message when it passes this, one more when reading resumes. 0 = never
+    # say it in the chat (marking on screen only).
+    "refresh_alert_minutes": 30.0,
     # Data watchdog: alerts once when every monitored PV fails to fetch data
     # for this many consecutive polls (a network/archiver outage, not a
     # single PV's own no-data), and once more when data flow resumes.
@@ -297,6 +331,14 @@ DEFAULT_SETTINGS = {
     "start_monitoring_on_launch": False,
     # alert graph
     "alert_plot_hours": 12,
+    # /plot over a long window. plot_max_workers is deliberately well below
+    # poll_max_workers: a plot can now run for a minute or more, and it shares
+    # both the archiver and the 64-connection pool with the live poll. Let it
+    # take too many and a poll pass overruns its interval, which posts a
+    # "not refreshed" alert to everyone — an alarm caused by drawing a graph.
+    "plot_max_workers": 10,
+    "plot_request_budget": 600,     # requests before it samples instead
+    "plot_bins": 900,               # points across the picture
     # channels
     "teams_enabled": True,
     "email_enabled": False,
@@ -320,6 +362,28 @@ DEFAULT_SETTINGS = {
     "webex_commands_enabled": True,
     "webex_command_poll_s": 5,   # <5 s tends to trip Webex HTTP 429 rate limits
     "webex_command_allowlist": [],   # sender emails allowed; empty = anyone in room
+    # canteen menu (/food) — read from the OKbase portal, see okbase_menu.py.
+    # LOCAL-ONLY, every one of them: the credentials are this Windows account's
+    # DPAPI blobs, and the rest only makes sense next to them.
+    "okbase_enabled": False,
+    "okbase_base_url": "",          # blank = okbase_menu.BASE_DEFAULT
+    "okbase_username": "",
+    "okbase_password": "",
+    # Which work account to pick in the sign-in window. Two work accounts on one
+    # PC is the normal case here, Microsoft always asks which, and only one of
+    # them is the one the portal knows — so without this the automatic sign-in
+    # stops on a question nobody is watching for.
+    "okbase_account": "",
+    "okbase_session_cookie": "",    # browser JSESSIONID, for Microsoft sign-in
+    "okbase_canteen_id": "",        # blank = 1, the canteen this site uses
+    "okbase_user_id": "",           # the portal wants it in the query; from a capture
+    "okbase_filter": {},            # request body that worked; blank = try them all
+    "okbase_timeout_s": 20.0,
+    "okbase_refresh_hour": 6,       # local hour of the once-a-day refresh
+    # How often the borrowed browser session is touched so it does not idle out.
+    # A web session dies of being UNUSED, so this is what turns a paste good for
+    # one timeout into one good until the portal restarts.
+    "okbase_keepalive_min": 10,
     # shared PV list: the list itself, and the shared part of these settings,
     # live on the scratch share (see shared_pvs.py) so every copy of the app
     # monitors the same PVs with the same limits and pacing. These four keys are
@@ -338,6 +402,14 @@ SHARE_LOCAL_ONLY_KEYS = (
     "shared_pv_list_enabled", "shared_pv_list_path", "shared_pv_list_timeout_s",
     "_shared_pv_root_cache",
     "graph_legend_loc", "graph_legend_anchor", "graph_pv_panel",
+    # The canteen sign-in is one person's, on one PC: the password is a DPAPI
+    # blob that decrypts for this Windows account only, and a session cookie is
+    # a live login. Neither has any business on an open scratch share — the
+    # menu itself travels instead, in menu_cache.json.
+    "okbase_enabled", "okbase_base_url", "okbase_username", "okbase_password",
+    "okbase_session_cookie", "okbase_canteen_id", "okbase_user_id",
+    "okbase_filter", "okbase_timeout_s", "okbase_refresh_hour",
+    "okbase_keepalive_min", "okbase_account",
 )
 
 
@@ -376,6 +448,18 @@ SHARED_WRITE_DEBOUNCE_MS = 2000
 # shown in the status line and written to the log at intervals — the log line
 # is what turns "it feels slower today" into a number that either climbs or
 # does not. It doubles as an "I am still alive" heartbeat in the log.
+# --- canteen menu (/food) ---------------------------------------------------
+# One clock, two jobs (see _menu_tick): the menu itself is fetched at most once
+# a calendar day, while the borrowed OKbase sign-in is touched every tick so it
+# does not expire from disuse. The tick therefore runs at the keepalive rate
+# (`okbase_keepalive_min`), not at the menu's.
+MENU_FIRST_LOOK_MS = 30 * 1000            # after the launch has settled
+# Only one menu job runs at a time. The thread cannot be cancelled, so if one
+# never answers the flag alone would switch the whole feature off for the rest
+# of the run — /food would keep repeating the last verdict for ever. After this
+# long the missing job is written off and a new one is allowed to start.
+MENU_JOB_WEDGE_S = 180.0
+
 MEM_LOG_INTERVAL_MS = 30 * 60 * 1000     # every half hour
 MEM_WARN_PCT = 90.0                       # PC commit this full -> warn in the log
 MEM_WARN_REPEAT_NS = int(3600e9)          # …and at most once an hour
@@ -400,6 +484,20 @@ def load_config() -> dict:
     # every copy alerts through the same accounts with no per-PC setup (and the
     # local file never has to carry the credentials). See notify_provision.
     settings.update(notify_provision.load())
+    # The canteen sign-in belongs to the Windows account, not to this copy of
+    # the program — see okbase_menu.OKBASE_KEYS. Overlaid the same way the
+    # provisioned channels are, so a rebuild inherits it instead of losing it.
+    user_food = okbase_menu.load_user_settings()
+    if not user_food:
+        # One-time move: it used to be written into this file, beside the
+        # program. save_config() no longer keeps it here, so without this the
+        # first save after upgrading would throw the sign-in away.
+        stale = {k: v for k, v in (data.get("settings") or {}).items()
+                 if k in okbase_menu.OKBASE_KEYS}
+        if stale:
+            okbase_menu.save_user_settings(stale)
+            user_food = okbase_menu.load_user_settings()
+    settings.update(user_food)
     data["settings"] = settings
     data.setdefault("pvs", [])
     return data
@@ -427,10 +525,10 @@ def save_config(data: dict) -> None:
     # build and would otherwise be sitting in a plain JSON next to the exe (and
     # would shadow a later rebuild's values).
     prov = notify_provision.load()
-    if prov:
-        settings = {k: v for k, v in (data.get("settings") or {}).items()
-                    if k not in prov}
-        data = {**data, "settings": settings}
+    skip = set(prov) | set(okbase_menu.OKBASE_KEYS)
+    settings = {k: v for k, v in (data.get("settings") or {}).items()
+                if k not in skip}
+    data = {**data, "settings": settings}
     try:
         # Atomic: this file is the offline fallback whose PV list can seed the
         # share, and load_config() degrades a truncated file to an empty list.
@@ -695,6 +793,13 @@ class PVRuntime:
     raw_value: Optional[float] = None
     # Conditional profile in force at the last poll (None = default thresholds).
     active_profile: Optional[dict] = None
+    # Which threshold set that was, as a comparable key ("" before the first
+    # poll), and until when alerting is held because it changed. A value cannot
+    # jump to a new band the instant the rule does — see
+    # rule_change_grace_minutes.
+    limits_key: str = ""
+    grace_until_ns: int = 0
+    grace_reason: str = ""       # "0,2 Hz → Global", for the table and the log
     # Which threshold set the user pinned in the 'Depends on' dropdown:
     # None = Automatic (follow the first matching rule), -1 = Global forced,
     # i >= 0 = pin profiles[i] (its limits apply unconditionally).
@@ -724,13 +829,21 @@ class PVRuntime:
     # One notification per freeze episode (and one when it clears).
     frozen_notified: bool = False
 
+    def in_grace(self, now_ns: int = 0) -> bool:
+        """True while alerting is held because the limits in force just
+        changed."""
+        if not self.grace_until_ns:
+            return False
+        return (now_ns or api.now_ns()) < self.grace_until_ns
+
     def display_level(self, monitoring: bool = True):
         """AlertLevel for colouring, or None for NODATA."""
         if self.current_value is None:
             return None
-        if not monitoring:
-            # Evaluator idle: `alert` is frozen at whatever it was when
-            # monitoring stopped, so report the raw severity instead.
+        if not monitoring or self.in_grace():
+            # Evaluator idle (or held after a rule change): `alert` is frozen at
+            # whatever it was, so report the raw severity instead — the cell has
+            # to show where the value really sits against the limits now.
             return self.live_level if self.live_level is not None \
                 else self.alert.level
         return self.alert.level
@@ -875,9 +988,18 @@ class _BackfillWorker(QRunnable):
 
         def fetch_one(name):
             try:
-                return name, api.cpva_fetch_samples_chunked(
+                # errors={} so one unreadable hour costs that hour, not the
+                # whole PV's history: what came back is still worth drawing.
+                bad = {}
+                out = api.cpva_fetch_samples_chunked(
                     name, self._start, self._end, self._timeout,
-                    max_workers=chunk_workers)
+                    max_workers=chunk_workers, errors=bad)
+                if bad:
+                    _safe_emit(self._sig.log.emit,
+                               f"History backfill: part of "
+                               f"{api.shorten_pv_name(name)} could not be "
+                               f"read ({bad[name]}); using the rest.")
+                return name, out
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
                 _safe_emit(self._sig.log.emit,
                            f"History backfill failed for "
@@ -965,11 +1087,20 @@ class _LearnWorker(QRunnable):
             start = end - int(self._days * 86400 * 1e9)
             _safe_emit(self._sig.log.emit,
                        f"Fetching {self._days} d of history for {self._name}…")
+            # errors={}: a week of history is 168 requests, and losing all of
+            # them to one refused hour after minutes of waiting is the worst
+            # possible answer. Learn from what came back and say what did not.
+            bad = {}
             samples = api.cpva_fetch_samples_chunked(
                 self._name, start, end, self._timeout,
                 log_fn=lambda m: _safe_emit(self._sig.log.emit, m),
                 progress_fn=lambda d, t: _safe_emit(
-                    self._sig.progress.emit, (d, t)))
+                    self._sig.progress.emit, (d, t)),
+                errors=bad)
+            if bad:
+                _safe_emit(self._sig.log.emit,
+                           f"  part of the history could not be read "
+                           f"({bad[self._name]}); learning from the rest.")
             vals = []
             units = ""
             rejected = 0
@@ -1160,6 +1291,12 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     committed alert has nothing to send yet ("pending")."""
     if rt is None or not pv.enabled:
         return ""
+    # Held because the limits themselves just changed. Shown even while the
+    # state is still OK: the value may already be outside the new band, and
+    # this is the only cell that says why nothing is being raised about it.
+    if rt.in_grace():
+        return "new limits → " + api.ns_to_prague(
+            rt.grace_until_ns).strftime("%H:%M")
     if rt.alert.level == AlertLevel.OK:
         return ""
     if rt.alert.settle_until_ns:
@@ -1177,9 +1314,21 @@ def _alarm_status_text(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     return "pending"
 
 
+def _grace_tooltip(rt: "PVRuntime") -> str:
+    """Why this PV is not raising anything right after its limits changed."""
+    until = api.ns_to_prague(rt.grace_until_ns).strftime("%H:%M:%S")
+    what = f" ({rt.grace_reason})" if rt.grace_reason else ""
+    return (f"The limits in force for this PV changed{what}, so alerting is "
+            f"held until {until}. The value needs time to reach the new band, "
+            f"and the change alone must not raise an alarm. If it is still "
+            f"outside the new limits when the wait is over, it alerts then.")
+
+
 def _alarm_status_tooltip(pv: "PVConfig", rt: Optional["PVRuntime"]) -> str:
     if rt is None or not pv.enabled:
         return "Alerting off for this PV."
+    if rt.in_grace():
+        return _grace_tooltip(rt)
     if rt.alert.level == AlertLevel.OK:
         return "No active alert."
     lines = [f"State: {rt.alert.level.label}"]
@@ -1417,6 +1566,8 @@ class PVTableModel(QAbstractTableModel):
                         "what the PV is doing now.")
                 if rt is not None and rt.frozen:
                     parts.append(_frozen_tooltip(rt))
+                if rt is not None and pv.enabled and rt.in_grace():
+                    parts.append(_grace_tooltip(rt))
                 if pv.enabled and not self.monitoring:
                     parts.append("Monitoring is stopped — values are still "
                                  "read and shown, but nothing is evaluated "
@@ -2920,6 +3071,45 @@ class WebexRoomsWidget(QWidget):
         return next((r["room_id"] for r in self.rows() if r["listen"]), "")
 
 
+class _OkbaseSignInSignals(QObject):
+    """Off-thread canteen work, reported back to the Settings dialog.
+
+    Both jobs it carries wait on something outside this program — a person at a
+    Microsoft prompt, or a portal that may be slow — so neither may run on the UI
+    thread. The dialog is modal, and a modal window that stops repainting is what
+    Windows draws as "Not Responding".
+    """
+    progress = Signal(str)                  # one sentence, while it works
+    signed_in = Signal(object)              # (cookie_line, error)
+    verified = Signal(object)               # (cache, error)
+
+
+def _okbase_signin_job(sig: _OkbaseSignInSignals, page: str, account: str = ""):
+    """Open a browser window and wait for the sign-in. Never raises."""
+    try:
+        import edge_cdp
+        line, err = edge_cdp.renew(
+            page=page, account=account,
+            progress=lambda text: _safe_emit(sig.progress.emit, text))
+    except Exception as exc:  # noqa: BLE001 - must never reach the UI thread
+        line, err = "", f"the browser sign-in could not run ({exc})"
+    _safe_emit(sig.signed_in.emit, (line, err))
+
+
+def _okbase_verify_job(sig: _OkbaseSignInSignals, settings: dict):
+    """Read the menu with the details typed in. Writes NOTHING.
+
+    write=False on purpose: this runs on details the operator may still cancel,
+    so it must not overwrite the saved menu, the saved sign-in or the remembered
+    request template.
+    """
+    try:
+        cache, err = okbase_menu.refresh(settings, write=False)
+    except Exception as exc:  # noqa: BLE001
+        cache, err = {}, str(exc)
+    _safe_emit(sig.verified.emit, (cache, err))
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: "MonitorWidget"):
         super().__init__(parent)
@@ -3135,6 +3325,136 @@ class SettingsDialog(QDialog):
                 grp.setVisible(False)
             lay.insertWidget(1, self._build_provisioned_box())
 
+        # --- Canteen menu (/food) ------------------------------------------
+        # Never provisioned into the build, unlike the channels above: the
+        # sign-in belongs to one person on one PC (see SHARE_LOCAL_ONLY_KEYS).
+        food = QGroupBox("Canteen menu (/food)")
+        food.setStyleSheet(_GROUP_STYLE)
+        ff = QFormLayout(food)
+        self.okbase_en = QCheckBox("Read the canteen menu from OKbase")
+        self.okbase_en.setStyleSheet(_CHK_STYLE)
+        self.okbase_en.setToolTip(
+            "When on, the menu is read from the OKbase portal once a day and "
+            "saved, so the bot can answer /food — also from the always-on "
+            "listener, with this program closed. When off, /food only says it "
+            "has no menu.")
+        self.okbase_en.setChecked(bool(s.get("okbase_enabled", False)))
+        ff.addRow("", self.okbase_en)
+        self.okbase_user = QLineEdit(s.get("okbase_username", ""))
+        self.okbase_user.setPlaceholderText("OKbase user name")
+        self.okbase_user.setToolTip(
+            "Your OKbase user name, for the sign-in form on the portal itself. "
+            "Leave both this and the password empty if you sign in through "
+            "Microsoft — use the session below instead.")
+        ff.addRow("User name", self.okbase_user)
+        self.okbase_pass = QLineEdit(s.get("okbase_password", ""))
+        self.okbase_pass.setEchoMode(QLineEdit.Password)
+        self.okbase_pass.setToolTip(
+            "Encrypted at rest (Windows DPAPI) for your Windows account only — "
+            "the saved value is unreadable to others / on other PCs, and it "
+            "never travels to the shared folder. "
+            "Tip: use ${ENV:NAME} to read from an env var instead.")
+        ff.addRow("Password", self.okbase_pass)
+        self.okbase_cookie = QLineEdit(s.get("okbase_session_cookie", ""))
+        self.okbase_cookie.setEchoMode(QLineEdit.Password)
+        self.okbase_cookie.setPlaceholderText("whole Cookie line from the browser")
+        self.okbase_cookie.setToolTip(
+            "For accounts that sign in through Microsoft with a confirmation in "
+            "the authenticator. No program can pass that prompt, so instead it "
+            "borrows the sign-in you have already done in the browser.\n\n"
+            "Sign in to OKbase, press F12, open Network, click any request to "
+            "okbase, and under Request headers copy the WHOLE 'Cookie' line in "
+            "here. Copy all of it, not just JSESSIONID: if a 'remember me' "
+            "cookie is in there, the portal hands out a new session by itself "
+            "and this lasts far longer.\n\n"
+            "Stored the same encrypted way as the password. When it does expire "
+            "nothing is announced in the chat — /status ends with one line about "
+            "it and every /food answer says so; the saved menu keeps answering "
+            "meanwhile.\n\n"
+            "You should not have to fill this in by hand — use the two buttons "
+            "below. It is kept because it is the one route that works no matter "
+            "what.")
+        ff.addRow("Browser session", self.okbase_cookie)
+
+        # Two ways to fill the field above without a DevTools expedition. The
+        # field stays, because a route that always works is worth keeping — but
+        # nobody should have to use it.
+        signin_row = QWidget()
+        signin_row.setAttribute(Qt.WA_StyledBackground, True)
+        signin_lay = QHBoxLayout(signin_row)
+        signin_lay.setContentsMargins(0, 0, 0, 0)
+        signin_lay.setSpacing(6)
+        self.btn_okbase_edge = QPushButton("Sign in with Edge")
+        self.btn_okbase_edge.setStyleSheet(_BTN_PRIMARY)
+        self.btn_okbase_edge.setToolTip(
+            "Opens a browser window on the OKbase page. Sign in there as you "
+            "normally would — on a work PC that is often just picking your "
+            "account — and the sign-in is taken from that window automatically. "
+            "No F12, nothing to copy.\n\n"
+            "The window is a separate one of its own, so your everyday Edge is "
+            "not touched, and it closes itself the moment the sign-in appears.")
+        self.btn_okbase_edge.clicked.connect(self._okbase_edge_signin)
+        signin_lay.addWidget(self.btn_okbase_edge)
+        self.btn_okbase_paste = QPushButton("Paste sign-in from clipboard")
+        self.btn_okbase_paste.setStyleSheet(_BTN_PLAIN)
+        self.btn_okbase_paste.setToolTip(
+            "For when the button beside this one cannot be used. In the browser, "
+            "signed in to OKbase: F12 → Network → open Stravování → Objednávka "
+            "jídel → right-click the 'nacti-vse' row → Copy → Copy as cURL. Then "
+            "press this.\n\n"
+            "A plain 'Cookie' line works too. Nothing that could give your "
+            "sign-in away is ever shown — only the cookie names and how long "
+            "they are.")
+        self.btn_okbase_paste.clicked.connect(self._okbase_paste_signin)
+        signin_lay.addWidget(self.btn_okbase_paste)
+        signin_lay.addStretch(1)
+        ff.addRow("", signin_row)
+        self.okbase_account = QLineEdit(s.get("okbase_account", ""))
+        self.okbase_account.setPlaceholderText("name@company.com")
+        self.okbase_account.setToolTip(
+            "The work address the canteen portal knows you by. With two work "
+            "accounts on one PC, Microsoft always asks which one to use — and "
+            "only one of them works here — so the button fills that in for you "
+            "and the sign-in finishes without a single click.\n\n"
+            "Leave it empty and the window stops on 'Pick an account' and waits "
+            "for you.")
+        ff.addRow("Work account", self.okbase_account)
+        self.okbase_signin_note = QLabel("")
+        self.okbase_signin_note.setWordWrap(True)
+        self.okbase_signin_note.setStyleSheet("color:#555;")
+        self.okbase_signin_note.setVisible(False)
+        ff.addRow("", self.okbase_signin_note)
+        self.okbase_hour = _NoWheelSpinBox()
+        self.okbase_hour.setRange(0, 23)
+        self.okbase_hour.setToolTip(
+            "The hour of the day after which the menu is read. It is read at "
+            "most once a day; /food refresh reads it again at any time.")
+        self.okbase_hour.setValue(int(s.get("okbase_refresh_hour", 6)))
+        ff.addRow("Read after (hour)", self.okbase_hour)
+        self.okbase_keep = _NoWheelSpinBox()
+        self.okbase_keep.setRange(1, 120)
+        self.okbase_keep.setToolTip(
+            "How often the OKbase sign-in is touched so it stays alive. A web "
+            "sign-in expires from not being used, so without this the borrowed "
+            "browser session would only last until the portal's own timeout "
+            "(often half an hour) and would have to be pasted in again every "
+            "day. One tiny request each time. Range 1-120 min.")
+        self.okbase_keep.setValue(int(s.get("okbase_keepalive_min", 10)))
+        ff.addRow("Keep sign-in alive (min)", self.okbase_keep)
+        self.okbase_url = QLineEdit(s.get("okbase_base_url", ""))
+        self.okbase_url.setPlaceholderText(okbase_menu.BASE_DEFAULT)
+        self.okbase_url.setToolTip(
+            "Address of the OKbase interface. Leave empty to use "
+            f"{okbase_menu.BASE_DEFAULT}.")
+        ff.addRow("OKbase address", self.okbase_url)
+        bfood = self.btn_okbase_test = QPushButton("Read the menu now")
+        bfood.setStyleSheet(_BTN_PLAIN)
+        bfood.setToolTip("Sign in with the details above and read the menu now, "
+                         "to confirm they work. Does not save the settings.")
+        bfood.clicked.connect(self._test_okbase)
+        ff.addRow("", bfood)
+        lay.addWidget(food)
+
         # --- Monitoring ----------------------------------------------------
         form_grp = QGroupBox("Monitoring")
         form_grp.setStyleSheet(_GROUP_STYLE)
@@ -3155,6 +3475,36 @@ class SettingsDialog(QDialog):
             "when monitoring many PVs. Range 1-64.")
         self.poll_workers.setValue(int(s.get("poll_max_workers", 24)))
         form.addRow("Concurrent fetches", self.poll_workers)
+        self.refresh_alarm = _NoWheelDoubleSpinBox()
+        self.refresh_alarm.setRange(1.0, 120.0)
+        self.refresh_alarm.setDecimals(1)
+        self.refresh_alarm.setSingleStep(0.5)
+        self.refresh_alarm.setToolTip(
+            "How long the program may go without finishing a reading before "
+            "everything on screen and every bot reply is marked 'not "
+            "refreshed'. This only marks it; the message to the chat has its "
+            "own, much longer wait below. A stalled reading is dropped and "
+            "retried on its own after five poll intervals, so anything shorter "
+            "than that would mark stalls that are already curing themselves — "
+            "such a value is raised automatically. Range 1–120 min.")
+        self.refresh_alarm.setValue(
+            float(s.get("refresh_alarm_minutes", 3.5)))
+        form.addRow("Mark as not refreshed after (min)", self.refresh_alarm)
+        self.refresh_alert = _NoWheelDoubleSpinBox()
+        self.refresh_alert.setRange(0.0, 1440.0)
+        self.refresh_alert.setDecimals(0)
+        self.refresh_alert.setSingleStep(5.0)
+        self.refresh_alert.setToolTip(
+            "How long the reading has to have been stopped before it is also "
+            "said in the chat. Short stalls cure themselves within a few poll "
+            "intervals, and a pair of messages about those woke people for "
+            "nothing — but a stall this long is not curing itself, and nobody "
+            "would otherwise know the values are frozen. One message when it "
+            "passes this, one more when reading resumes. 0 = never say it in "
+            "the chat, keep the marking on screen only. Range 0–1440 min.")
+        self.refresh_alert.setValue(
+            float(s.get("refresh_alert_minutes", 30.0)))
+        form.addRow("Say it in the chat after (min, 0=off)", self.refresh_alert)
         self.avg_n = _NoWheelSpinBox(); self.avg_n.setRange(1, 500)
         self.avg_n.setToolTip(
             "Each poll averages up to this many recent samples before comparing "
@@ -3195,6 +3545,22 @@ class SettingsDialog(QDialog):
             "where it started. 0 = announce immediately. Range 0–3600 s.")
         self.stable.setValue(int(s.get("stable_seconds", 120)))
         form.addRow("Stability hold (s, 0=off)", self.stable)
+        self.rule_grace = _NoWheelDoubleSpinBox()
+        self.rule_grace.setRange(0, 240)
+        self.rule_grace.setDecimals(0); self.rule_grace.setSingleStep(5.0)
+        self.rule_grace.setToolTip(
+            "When a PV's limits change because its dependency PVs moved — the "
+            "shot rate drops, high power goes off, the chillers are switched "
+            "off at the end of the day while the hall keeps running — the "
+            "measured value is still where the old limits left it. Alerting "
+            "for that PV is held this long after every such change, so the "
+            "switch itself never raises an alarm; a value still outside the "
+            "new limits when the wait is over alerts then, as usual. The "
+            "'Alarm status' cell shows 'new limits → HH:MM' meanwhile. "
+            "0 = alert straight away on the new limits. Range 0–240 min.")
+        self.rule_grace.setValue(
+            float(s.get("rule_change_grace_minutes", 20.0)))
+        form.addRow("Hold after a rule change (min, 0=off)", self.rule_grace)
         self.cooldown = _NoWheelSpinBox(); self.cooldown.setRange(0, 1440)
         self.cooldown.setToolTip(
             "Minimum minutes between repeat notifications for a PV that stays in "
@@ -3474,6 +3840,140 @@ class SettingsDialog(QDialog):
             timeout=float(self._win.settings["http_timeout_s"]))
         self._show_test(c.send_test(), "Webex", c.last_error)
 
+    # --- canteen sign-in ----------------------------------------------
+    def _okbase_trial(self) -> dict:
+        """The canteen settings as they stand in the dialog right now.
+
+        Whatever has just been typed or pasted, not what is saved — the whole
+        point of the two buttons is to find out whether it works BEFORE saving.
+        """
+        return {
+            "okbase_base_url": self.okbase_url.text().strip(),
+            "okbase_username": self.okbase_user.text().strip(),
+            "okbase_password": self.okbase_pass.text(),
+            "okbase_session_cookie": self.okbase_cookie.text().strip(),
+            "okbase_user_id": getattr(self, "_pasted_user_id", "")
+            or self._win.settings.get("okbase_user_id", ""),
+            "okbase_canteen_id": getattr(self, "_pasted_canteen_id", "")
+            or self._win.settings.get("okbase_canteen_id", ""),
+            "okbase_filter": getattr(self, "_pasted_filter", None)
+            or self._win.settings.get("okbase_filter", {}),
+            "okbase_timeout_s": self._win.settings.get("okbase_timeout_s", 20.0),
+        }
+
+    def _okbase_busy(self, busy: bool, note: str = "") -> None:
+        """Grey the three canteen buttons while one of them is working."""
+        for button in (self.btn_okbase_edge, self.btn_okbase_paste,
+                       self.btn_okbase_test):
+            button.setEnabled(not busy)
+        self._okbase_note(note)
+
+    def _okbase_note(self, text: str) -> None:
+        self.okbase_signin_note.setText(text)
+        self.okbase_signin_note.setVisible(bool(text))
+
+    def _okbase_edge_signin(self):
+        """Borrow the sign-in from a browser window, instead of by hand."""
+        page = okbase_menu.MENU_PAGE_DEFAULT
+        base = self.okbase_url.text().strip()
+        if base:
+            # A different instance: land on its own page, not the default one.
+            page = base.split("/okbase/", 1)[0] + "/okbase/web-client/web/objednavky-jidel"
+        self._okbase_busy(True, "Opening a browser window…")
+        sig = _OkbaseSignInSignals(self)
+        sig.progress.connect(self._okbase_note)
+        sig.signed_in.connect(self._on_okbase_signed_in)
+        # A plain daemon thread, not QThreadPool: this one waits minutes on a
+        # person, and QThreadPool waits for its runnables when it is destroyed —
+        # which would move that wait to closing the program.
+        threading.Thread(target=_okbase_signin_job,
+                         args=(sig, page, self.okbase_account.text().strip()),
+                         daemon=True, name="okbase-signin").start()
+
+    def _on_okbase_signed_in(self, result):
+        line, err = result
+        if not line:
+            self._okbase_busy(False, "")
+            QMessageBox.warning(
+                self, "Canteen sign-in",
+                f"The sign-in did not come through:\n{err}\n\n"
+                f"You can still use 'Paste sign-in from clipboard'.")
+            return
+        self.okbase_cookie.setText(line)
+        lines = okbase_menu.describe_cookies(okbase_menu.parse_cookies(line))
+        self._okbase_busy(False, "Sign-in taken from the browser. Checking it…")
+        if err:
+            # Got something, but not the part that makes it last.
+            QMessageBox.warning(self, "Canteen sign-in",
+                                f"{err}.\n\n" + "\n".join(lines))
+        self._verify_okbase("Sign-in taken from the browser. Checking it…")
+
+    def _okbase_paste_signin(self):
+        """Read a sign-in off the clipboard — a Cookie line or a copied cURL."""
+        text = QApplication.clipboard().text()
+        got = okbase_menu.read_paste(text)
+        if got.problem:
+            self._okbase_note("")
+            QMessageBox.warning(self, "Canteen sign-in", got.problem)
+            return
+        self.okbase_cookie.setText(got.cookies)
+        # Kept for _save: a copied cURL also carries who the person is, which
+        # canteen, and the one request body the portal accepts. Losing those
+        # would make this button a downgrade from okbase_capture.py.
+        self._pasted_user_id = got.user_id
+        self._pasted_canteen_id = got.canteen_id
+        self._pasted_filter = got.filter_body
+        found = [f"Read {got.source}."]
+        if got.user_id:
+            found.append(f"It also carries your OKbase id ({got.user_id}).")
+        found.extend(okbase_menu.describe_cookies(got.jar))
+        QMessageBox.information(self, "Canteen sign-in", "\n".join(found))
+        self._verify_okbase("Sign-in pasted. Checking it…")
+
+    def _test_okbase(self):
+        self._verify_okbase("Reading the menu from OKbase…")
+
+    def _verify_okbase(self, note: str):
+        """Read the menu with the details typed in, without saving anything.
+
+        On a worker thread. It used to run here on the UI thread, where a portal
+        that had gone quiet could hold the whole window for minutes — on the one
+        button a person presses while they are already fighting the sign-in.
+        """
+        self._okbase_busy(True, note)
+        sig = _OkbaseSignInSignals(self)
+        sig.verified.connect(self._on_okbase_verified)
+        threading.Thread(target=_okbase_verify_job,
+                         args=(sig, self._okbase_trial()),
+                         daemon=True, name="okbase-verify").start()
+
+    def _on_okbase_verified(self, result):
+        cache, err = result
+        self._okbase_busy(False, "")
+        if cache:
+            got = okbase_menu.cache_days(cache)
+            day = okbase_menu.next_food_day(cache)
+            meals = got.get(day.isoformat()) or []
+            preview = "\n".join(f"  {m.name} — {m.price}" if m.price
+                                else f"  {m.name}" for m in meals)
+            self._okbase_note("The sign-in works.")
+            QMessageBox.information(
+                self, "Canteen menu",
+                f"Read {len(got)} day(s) from OKbase.\n\n"
+                + (f"{day:%A %d.%m.}:\n{preview}" if preview
+                   else "Nothing on the menu for that day."))
+        elif okbase_menu.is_unreachable(err):
+            # Not a verdict on what was just typed in — say so, or the operator
+            # goes back to the browser for nothing.
+            self._okbase_note("The portal did not answer.")
+            QMessageBox.warning(
+                self, "Canteen menu",
+                f"The OKbase portal did not answer, so this says nothing about "
+                f"the sign-in:\n{err}\n\nTry again in a minute.")
+        else:
+            QMessageBox.warning(self, "Canteen menu",
+                                f"Could not read the menu:\n{err}")
+
     def _save(self):
         s = self._win.settings
         s["alert_plot_hours"] = self.plot_hours.value()
@@ -3503,14 +4003,48 @@ class SettingsDialog(QDialog):
             s["webex_commands_enabled"] = self.webex_cmds.isChecked()
             s["webex_command_poll_s"] = self.webex_cmd_poll.value()
             s["webex_command_allowlist"] = _parse_recipients(self.webex_allow.text())
+        # Canteen menu — these go to the Windows account's own file, not into
+        # monitor_config.json, so every build and the listener share one
+        # sign-in (see okbase_menu.OKBASE_KEYS). Kept in `s` as well, so the
+        # running app uses them at once.
+        food = {
+            "okbase_enabled": self.okbase_en.isChecked(),
+            "okbase_base_url": self.okbase_url.text().strip(),
+            "okbase_username": self.okbase_user.text().strip(),
+            "okbase_password": encrypt_secret(self.okbase_pass.text()),
+            "okbase_account": self.okbase_account.text().strip(),
+            "okbase_session_cookie": encrypt_secret(
+                self.okbase_cookie.text().strip()),
+            "okbase_refresh_hour": self.okbase_hour.value(),
+            "okbase_keepalive_min": self.okbase_keep.value(),
+        }
+        # What a pasted cURL brought with it: who the person is, which canteen,
+        # and the one request body the portal accepts. Only written when a paste
+        # actually found them, so re-saving the dialog can never wipe a template
+        # a successful fetch had learned (see _on_menu_done).
+        if getattr(self, "_pasted_user_id", ""):
+            food["okbase_user_id"] = self._pasted_user_id
+        if getattr(self, "_pasted_canteen_id", ""):
+            food["okbase_canteen_id"] = self._pasted_canteen_id
+        if getattr(self, "_pasted_filter", None):
+            food["okbase_filter"] = self._pasted_filter
+        s.update(food)
+        problem = okbase_menu.save_user_settings(food)
+        if problem:
+            QMessageBox.warning(self, "Canteen menu",
+                                f"The canteen settings could not be saved:\n"
+                                f"{problem}")
         # monitoring
         s["poll_interval_s"] = self.poll.value()
         s["poll_max_workers"] = self.poll_workers.value()
+        s["refresh_alarm_minutes"] = float(self.refresh_alarm.value())
+        s["refresh_alert_minutes"] = float(self.refresh_alert.value())
         s["avg_last_n"] = self.avg_n.value()
         s["sample_window_s"] = self.window_s.value()
         s["debounce_count"] = self.debounce.value()
         s["settle_minutes"] = self.settle.value()
         s["stable_seconds"] = self.stable.value()
+        s["rule_change_grace_minutes"] = float(self.rule_grace.value())
         s["renotify_cooldown_minutes"] = self.cooldown.value()
         s["recovery_notify"] = self.recovery.isChecked()
         s["trend_adaptive_enabled"] = self.trend_adaptive.isChecked()
@@ -3617,40 +4151,71 @@ class ChartSeries:
     vmax: Optional[float] = None
 
 
-def _fetch_series(series: ChartSeries, start_ns: int, end_ns: int,
-                  timeout: float):
-    """Fetch one PV's numeric samples for the window. Returns (xs, ys, units)."""
-    samples = api.cpva_fetch_samples_chunked(series.pv_name, start_ns, end_ns,
-                                             timeout)
-    xs, ys, units = [], [], ""
-    for s in samples:
-        v = api.cpva_decode_value(s)
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            continue
-        fv = float(v)
-        if _out_of_range(fv, series.vmin, series.vmax):
-            continue
-        t = s.get("time")
-        if isinstance(t, (int, float)):
-            xs.append(api.ns_to_prague(int(t)))
-            ys.append(fv)
-            u = api.cpva_decode_units(s)
-            if u:
-                units = u
-    return xs, ys, units
+# Matplotlib counts days since year 1, the archiver counts nanoseconds since
+# 1970. Converting between the two numbers directly saves building a datetime
+# object per reading, which over a long window is most of the work.
+_MPL_EPOCH = mdates.date2num(datetime(1970, 1, 1, tzinfo=timezone.utc))
+
+
+def _ns_to_num(t_ns):
+    return _MPL_EPOCH + np.asarray(t_ns, dtype=np.float64) / 86_400e9
+
+
+def _fetch_chart_data(series: list[ChartSeries], start_ns: int, end_ns: int,
+                      timeout: float, **kw):
+    """Read every PV of the chart. Returns (list of SeriesData, FetchReport).
+
+    All the archiver work lives in chart_history: measuring how densely each
+    channel is written so the requests can be sized to match, condensing every
+    answer as it arrives instead of piling up millions of readings, and keeping
+    one unreadable stretch from costing the whole picture.
+    """
+    reqs = [chart_history.SeriesRequest(s.pv_name, s.display_name,
+                                        s.vmin, s.vmax) for s in series]
+    return chart_history.fetch_series_reduced(reqs, start_ns, end_ns,
+                                              timeout=timeout, **kw)
+
+
+# The picture is drawn on a white sheet whatever the desktop theme is. Windows
+# here runs in dark mode, so anything left to matplotlib's own defaults risks
+# coming out light-on-light in the chat.
+CHART_PAPER = "#ffffff"
+CHART_INK   = "#111111"
+CHART_TICK  = "#222222"
+CHART_EDGE  = "#666666"
+CHART_GRID  = "#cccccc"
+
+# Above this many curves the min-max bands overlap into mud, so only the
+# average lines are drawn. /plot all is a documented command.
+CHART_MAX_BANDS = 3
 
 
 def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
                      timeout: float, window_label: str = "",
                      yaxis: Optional[tuple] = None,
                      stale_after_s: float = 0.0,
-                     out_info: Optional[dict] = None) -> bytes | None:
+                     out_info: Optional[dict] = None,
+                     cancel_fn=None, *,
+                     max_workers: int = 10,
+                     n_bins: int = chart_history.DEFAULT_BINS,
+                     budget: int = chart_history.DEFAULT_BUDGET,
+                     detail: bool = False,
+                     progress_fn=None,
+                     plan_fn=None,
+                     log_fn=None) -> bytes | None:
     """Render one PNG with a curve per PV over [start_ns, end_ns].
 
     Worker-thread safe: builds its own Figure and uses the non-Qt Agg canvas,
     rendering to in-memory PNG bytes (no temp file, no shared matplotlib state).
     Threshold lines are drawn only for a single-PV chart — on an overlay they
     would belong to no visible curve. Returns None when no PV had any data.
+
+    A window short enough to hold every reading is drawn exactly as it always
+    was: one step curve through the readings themselves. A longer one is drawn
+    condensed — a line through each point's average with a shaded band from its
+    lowest to its highest reading — because a six-month window holds more
+    readings than there are pixels, and the band is what keeps a two-second
+    excursion visible instead of averaged away.
 
     `stale_after_s` > 0 asks the picture to say whether it is current: if the
     newest point plotted falls short of the end of the window by more than that
@@ -3659,56 +4224,111 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
     edge is simply what was asked for. `out_info`, if given, is filled with the
     same finding (`stale_s`, `newest_ns`, `note`) so the covering message can
     repeat it in words.
+
+    `cancel_fn` is asked, before and between PVs and inside every chunked
+    fetch, whether the picture is still wanted. Once it says no, the work stops
+    and None comes back with `out_info["cancelled"]` set, so the caller knows
+    the difference between "nothing was archived" and "you took it back".
     """
-    fetched = []
-    for s in series:
-        xs, ys, units = _fetch_series(s, start_ns, end_ns, timeout)
-        if xs:
-            fetched.append((s, xs, ys, units))
+    def _stopped() -> bool:
+        return cancel_fn is not None and cancel_fn()
+
+    datas, report = _fetch_chart_data(
+        series, start_ns, end_ns, timeout, max_workers=max_workers,
+        n_bins=n_bins, budget=budget, detail=detail,
+        progress_fn=progress_fn, plan_fn=plan_fn, cancel_fn=cancel_fn,
+        log_fn=log_fn)
+    if _stopped():
+        if out_info is not None:
+            out_info["cancelled"] = True
+        return None
+
+    by_name = {s.pv_name: s for s in series}
+    fetched = [d for d in datas if d.has_data]
+    if out_info is not None:
+        out_info["report"] = report
+        out_info["datas"] = datas
+        body, banner = chart_history.describe_fetch(datas, report, window_label)
+        out_info["findings"] = body
+        out_info["banner"] = banner
     if not fetched:
         return None
 
     fig = Figure(figsize=(8, 4), dpi=110)
+    fig.patch.set_facecolor(CHART_PAPER)
     ax = fig.add_subplot(111)
+    ax.set_facecolor(CHART_PAPER)
     cmap = matplotlib.colormaps.get_cmap("tab10")
-    all_units = {u for _, _, _, u in fetched if u}
+    all_units = {d.units for d in fetched if d.units}
     single = len(fetched) == 1
-    for i, (s, xs, ys, units) in enumerate(fetched):
-        label = s.display_name
+    bands = len(fetched) <= CHART_MAX_BANDS
+    condensed = False
+    for i, d in enumerate(fetched):
+        units = d.units
+        label = d.request.display_name
         if units and len(all_units) > 1:
             label += f" [{units}]"    # mixed units: say which curve is which
-        # Same unit-family styling as the live graph: temperature solid,
-        # pressure dashed.
-        ax.plot(xs, ys, drawstyle="steps-post", linewidth=1.5,
-                linestyle=GraphPanel._unit_linestyle(units),
-                color=PRIMARY if single else cmap(i % 10), label=label)
-    if single and fetched[0][0].thresholds is not None:
-        thr = fetched[0][0].thresholds
+        color = PRIMARY if single else cmap(i % 10)
+        if d.is_reduced:
+            condensed = True
+            seen = np.isfinite(d.bin_mean)
+            x = _ns_to_num(d.bin_t_ns)
+            if bands:
+                ax.fill_between(x, d.bin_min, d.bin_max, where=seen,
+                                interpolate=False, color=color, alpha=0.20,
+                                linewidth=0, zorder=1)
+                # The edges as well as the shading. A one-off excursion lands
+                # in a single point, and a single point of pale fill is one
+                # invisible pixel — which is exactly the reading somebody is
+                # looking for in a six-month plot.
+                for edge in (d.bin_min, d.bin_max):
+                    ax.plot(np.where(seen, x, np.nan), edge, linewidth=0.8,
+                            color=color, alpha=0.75, zorder=1)
+            # `where` breaks the band, NaN breaks the line — an unread stretch
+            # has to be a hole in both, not a straight line drawn across it.
+            ax.plot(np.where(seen, x, np.nan), d.bin_mean, linewidth=1.4,
+                    color=color, label=label, zorder=2)
+        else:
+            # Same unit-family styling as the live graph: temperature solid,
+            # pressure dashed.
+            ax.plot(_ns_to_num(d.raw_t_ns), d.raw_v, drawstyle="steps-post",
+                    linewidth=1.5, linestyle=GraphPanel._unit_linestyle(units),
+                    color=color, label=label,
+                    # One or two readings draw no visible line at all.
+                    marker="." if d.n_samples < 3 else None)
+    if single and by_name[fetched[0].request.pv_name].thresholds is not None:
+        thr = by_name[fetched[0].request.pv_name].thresholds
         for val, ls, lw in ((thr.warn_low, "--", 1.0), (thr.warn_high, "--", 1.0),
                             (thr.alarm_low, "-.", 1.5), (thr.alarm_high, "-.", 1.5)):
             if val is not None:
                 ax.axhline(val, linestyle=ls, linewidth=lw, alpha=0.7,
                            color=ALARM_COLOR if ls == "-." else WARN_COLOR)
 
-    names = ", ".join(s.display_name for s, _, _, _ in fetched)
+    names = ", ".join(d.request.display_name for d in fetched)
     if len(names) > 70:
         names = f"{len(fetched)} PVs"
-    ax.set_title(f"{names}  ({window_label})" if window_label else names)
-    ax.set_ylabel(next(iter(all_units)) if len(all_units) == 1 else "")
+    title = f"{names}  ({window_label})" if window_label else names
+    if condensed:
+        title += ("\nline = average, band = lowest…highest" if bands
+                  else f"\nline = average (band left out: {len(fetched)} curves)")
+    ax.set_title(title, color=CHART_INK, fontsize=10)
+    ax.set_ylabel(next(iter(all_units)) if len(all_units) == 1 else "",
+                  color=CHART_INK)
+    ax.tick_params(colors=CHART_TICK, labelcolor=CHART_TICK)
+    for spine in ax.spines.values():
+        spine.set_color(CHART_EDGE)
     if not single:
-        ax.legend(loc="best", fontsize=8)
+        leg = ax.legend(loc="best", fontsize=8, facecolor=CHART_PAPER,
+                        edgecolor=CHART_EDGE)
+        for t in leg.get_texts():
+            t.set_color(CHART_INK)
     if yaxis:
         ax.set_ylim(yaxis[0], yaxis[1])
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.6, color=CHART_GRID)
     # How current is this picture? The curve simply stopping is otherwise
     # indistinguishable from a flat reading, and on a phone-sized image nobody
     # reads the x axis to find out.
-    newest_ns = 0
-    for _s, xs, _ys, _u in fetched:
-        try:
-            newest_ns = max(newest_ns, int(max(xs).timestamp() * 1e9))
-        except (ValueError, OverflowError, OSError):
-            pass
+    newest_ns = max((d.newest_ns for d in fetched), default=0)
     lag_s = (end_ns - newest_ns) / 1e9 if newest_ns else 0.0
     if stale_after_s > 0 and newest_ns and lag_s > stale_after_s:
         note = (f"NOT CURRENT - newest data "
@@ -3718,13 +4338,20 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
         # as an empty box.
         ax.text(0.99, 0.02, note, transform=ax.transAxes, ha="right",
                 va="bottom", fontsize=8, color=ALARM_COLOR,
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=CHART_PAPER,
                           edgecolor=ALARM_COLOR, alpha=0.85))
         if out_info is not None:
             out_info["note"] = note
+    banner = (out_info or {}).get("banner", "")
+    if banner:
+        ax.text(0.01, 0.98, banner, transform=ax.transAxes, ha="left",
+                va="top", fontsize=8, color=ALARM_COLOR,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=CHART_PAPER,
+                          edgecolor=ALARM_COLOR, alpha=0.85))
     if out_info is not None:
         out_info["newest_ns"] = newest_ns
         out_info["stale_s"] = lag_s
+    ax.xaxis_date(api.TZ_PRAGUE)
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=api.TZ_PRAGUE))
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -4882,8 +5509,29 @@ class _AlertWorker(QRunnable):
         _safe_emit(self._sig.done.emit, (self._tag, errors, png is not None))
 
 
+class _CancelToken:
+    """A "never mind" switch shared between the chat and a running job.
+
+    A year-long /plot is hundreds of archiver requests and minutes of waiting;
+    without this, a window typed by mistake had to be sat out before the right
+    one could be asked for. Set from the UI thread, read from the worker — a
+    plain bool assignment, which is atomic, so no lock is needed.
+    """
+
+    def __init__(self, label: str = ""):
+        self.label = label          # what to call the job in the chat
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def __call__(self) -> bool:     # usable directly as a cancel_fn
+        return self.cancelled
+
+
 class _ChartSignals(QObject):
-    done = Signal(object)   # ({channel: error}, had_png)
+    done = Signal(object)   # (token, {channel: error}, had_png, cancelled)
+    progress = Signal(str)  # a line for the asking room while a long read runs
 
 
 class _ChartWorker(QRunnable):
@@ -4894,9 +5542,13 @@ class _ChartWorker(QRunnable):
     def __init__(self, sig: _ChartSignals, hub: NotificationHub,
                  series: list[ChartSeries], start_ns: int, end_ns: int,
                  timeout: float, title: str, window_label: str,
-                 body_md: str, yaxis=None, stale_after_s: float = 0.0):
+                 body_md: str, yaxis=None, stale_after_s: float = 0.0,
+                 token: "_CancelToken" = None, detail: bool = False,
+                 max_workers: int = 10, budget: int = 600, n_bins: int = 900,
+                 log_fn=None):
         super().__init__()
         self._sig = sig
+        self._token = token
         self._hub = hub
         self._series = series
         self._start_ns = start_ns
@@ -4907,30 +5559,102 @@ class _ChartWorker(QRunnable):
         self._body_md = body_md
         self._yaxis = yaxis
         self._stale_after_s = stale_after_s
+        self._detail = detail
+        self._max_workers = max_workers
+        self._budget = budget
+        self._n_bins = n_bins
+        self._log_fn = log_fn
+        self._last_progress = 0.0
+        self._progress_sent = 0
+
+    def _plan(self, mode: str, n_requests: int, est_s: float,
+              coverage: float) -> None:
+        """Say what the read is going to cost, once it is known.
+
+        A long plot used to be a silent wait of unknown length, which is what
+        makes people ask for it twice.
+        """
+        if n_requests < 60 and est_s < 20:
+            return
+        how = f"{n_requests} requests"
+        if est_s >= 20:
+            how += f", roughly {fmt_duration(est_s)}"
+        if mode == "sampled":
+            how += (f" — reading {coverage * 100:.0f} % of the window; "
+                    f"add `; detail` to read all of it")
+        _safe_emit(self._sig.progress.emit, f"_{how}._")
+        self._last_progress = time.monotonic()
+
+    def _progress(self, done: int, total: int) -> None:
+        """Say how far along a long read is — sparingly.
+
+        Only into the room the command came from, never through the alert hub:
+        that one also writes to Teams and e-mail, and nobody wants five progress
+        e-mails. Webex answers 429 to a chatty bot, hence the throttle.
+        """
+        if total < 60 or self._progress_sent >= 4:
+            return
+        now = time.monotonic()
+        if done < total and now - self._last_progress < 30.0:
+            return
+        if done >= total:
+            return
+        self._last_progress = now
+        self._progress_sent += 1
+        _safe_emit(self._sig.progress.emit,
+                   f"_Reading… {done * 100 // total} % ({done}/{total} "
+                   f"requests)._")
 
     def run(self):
         png = None
         info: dict = {}
+        crash = ""
         try:
             png = render_chart_png(self._series, self._start_ns, self._end_ns,
                                    self._timeout, self._window_label,
-                                   self._yaxis, self._stale_after_s, info)
-        except Exception:  # noqa: BLE001 - the reply must go out text-only
-            png = None
+                                   self._yaxis, self._stale_after_s, info,
+                                   self._token, detail=self._detail,
+                                   max_workers=self._max_workers,
+                                   budget=self._budget, n_bins=self._n_bins,
+                                   progress_fn=self._progress,
+                                   plan_fn=self._plan,
+                                   log_fn=self._log_fn)
+        except chart_history.PlotTooBig as e:
+            crash = f"⚠ {e}"
+        except Exception as e:  # noqa: BLE001 - the reply must still go out
+            # Per-request and per-PV failures are handled inside chart_history,
+            # so anything landing here is a fault in this program, not in the
+            # archive. Saying "no archived data" would send the operator hunting
+            # for a problem that is not theirs.
+            crash = (f"⚠ I hit an internal error while drawing this "
+                     f"({e.__class__.__name__}: {e}).")
+            if self._log_fn:
+                self._log_fn(f"  chart render failed: {e!r}")
+        if self._token is not None and self._token.cancelled:
+            # Taken back while it was running: send nothing at all. A picture
+            # arriving after "cancelled" would be worse than the wait.
+            _safe_emit(self._sig.done.emit, (self._token, {}, False, True))
+            return
         body = self._body_md
-        if png is None:
+        findings = info.get("findings", "")
+        if crash:
+            body += f"\n\n**{crash}**"
+        elif findings:
+            body += f"\n\n{findings}"
+        elif png is None:
             body += "\n\n_No archived data in that window — text only._"
-        elif info.get("note"):
+        if png is not None and info.get("note"):
             # Said in the message as well as on the picture: a chat client may
             # show the text before the image has loaded, and the warning is the
             # part that must not be missed.
             body += f"\n\n**⚠ {info['note']}**"
-        elif info.get("newest_ns"):
+        elif png is not None and info.get("newest_ns"):
             body += (f"\n\n_Newest data point: "
                      f"{api.ns_to_prague(info['newest_ns']).strftime('%d.%m. %H:%M:%S')}._")
         text = re.sub(r"[*`_]", "", body)
         errors = self._hub.dispatch_chart(self._title, text, body, png)
-        _safe_emit(self._sig.done.emit, (errors, png is not None))
+        _safe_emit(self._sig.done.emit,
+                   (self._token, errors, png is not None, False))
 
 
 # ---------------------------------------------------------------------------
@@ -4989,6 +5713,41 @@ class _TextReplyWorker(QRunnable):
 
     def run(self):
         self._webex.post_text(self._markdown)
+
+
+# ---------------------------------------------------------------------------
+# Canteen menu (/food)
+# ---------------------------------------------------------------------------
+
+class _MenuSignals(QObject):
+    done = Signal(object)   # (mode, cache_or_empty_dict, cookies, error_text)
+
+
+def _menu_job(sig: _MenuSignals, settings: dict, mode: str):
+    """The canteen menu off the UI thread. `mode` is one of:
+
+        "load"   read the saved copy from disk (no portal, no credentials)
+        "fetch"  sign in and read the portal, then write the copy
+        "ping"   touch the portal so a borrowed session does not idle out
+
+    A plain daemon thread rather than the thread pool, on purpose: this both
+    talks to the portal and writes the scratch share, and QThreadPool waits for
+    its runnables in its destructor — a job stuck on a dead share host would
+    move the 48 s stall to app SHUTDOWN (see the shared_pvs module docstring).
+    """
+    cache, cookies, err = {}, "", ""
+    try:
+        if mode == "fetch":
+            out: dict = {}
+            cache, err = okbase_menu.refresh(settings, session_out=out)
+            cookies = out.get("cookies", "")
+        elif mode == "ping":
+            cookies, err = okbase_menu.keepalive(settings)
+        else:
+            cache = okbase_menu.load_cache(settings)
+    except Exception as e:  # noqa: BLE001 - must never reach the UI thread
+        err = str(e)
+    _safe_emit(sig.done.emit, (mode, cache, cookies, err))
 
 
 # ---------------------------------------------------------------------------
@@ -5075,6 +5834,8 @@ class MonitorWidget(QWidget):
         self._cmd_bot_id_inflight = False
         self._cmd_gen = 0
         self._cmd_backoff_until_ns = 0   # honour Webex 429 Retry-After
+        # Plots still being fetched, newest last — what /cancel takes back.
+        self._chart_jobs: list[_CancelToken] = []
         self._watchdog_fail_streak = 0   # consecutive fully-failed polls
         self._watchdog_bad = False       # True once the "no data" alert fired
         # Refresh watchdog — the program's own heartbeat, as opposed to the
@@ -5084,8 +5845,9 @@ class MonitorWidget(QWidget):
         # These three fields are what turns that into something the operator
         # and the bot can both see.
         self._last_poll_ok_ns = 0        # when a pass last landed
-        self._refresh_bad = False        # True once the "not refreshed" alert fired
+        self._refresh_bad = False        # True once the marking went on
         self._refresh_bad_since_ns = 0   # when it was first noticed
+        self._refresh_alert_sent = False  # …and once the chat was told as well
         # Memory watch (see MEM_LOG_INTERVAL_MS). The launch reading is the
         # baseline every later one is compared against, so growth over days is
         # a number and not an impression.
@@ -5093,6 +5855,25 @@ class MonitorWidget(QWidget):
         self._mem_start = memstats.read()
         self._mem_start_ns = api.now_ns()
         self._mem_warned_ns = 0
+        # Canteen menu (/food). Kept in memory so answering costs nothing on the
+        # UI thread — the file on the share exists for the standalone listener,
+        # which is what answers while this app is closed.
+        self._menu_cache: dict = {}
+        self._menu_busy = False
+        self._menu_started: Optional[datetime] = None   # when the running job began
+        self._menu_refreshed_day = ""    # ISO date of the last successful fetch
+        self._menu_error = ""            # why the last attempt failed, for the chat
+        self._menu_reply_pending = False  # a /food refresh is waiting to answer
+        self._menu_reply_args = ""
+        self._menu_doing = ""            # "fetch" / "ping" / "load" while running
+        self._menu_last_check: Optional[datetime] = None
+        self._menu_last_ok = False       # did the last contact with OKbase work
+        # The last contact that actually SETTLED the question. None = never yet.
+        # An unreachable portal leaves this alone: it is the difference between
+        # "your sign-in is dead" and "I could not tell", and conflating them is
+        # what sent a person off to re-paste a sign-in that was working.
+        self._menu_last_decisive: Optional[bool] = None
+        self._menu_timer: Optional[QTimer] = None
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -5101,6 +5882,7 @@ class MonitorWidget(QWidget):
         self._build_ui()
         self._prefetch_channels()
         self._start_cmd_listener()
+        self._start_menu_watch()
         # Publish only a genuine seed (first run against a share with no list
         # yet). Republishing an unchanged list on every launch would bump the
         # mtime for everyone and trip a phantom conflict warning elsewhere.
@@ -5599,6 +6381,77 @@ class MonitorWidget(QWidget):
         prof = self._match_profile(pv)
         return pv.profile_thresholds(prof) if prof is not None else pv.thresholds()
 
+    @staticmethod
+    def _limits_label(pv: PVConfig, prof: Optional[dict]) -> str:
+        """Human name of a threshold set, for the log and the table."""
+        if prof is None:
+            return "Global"
+        return ((prof.get("label") or "").strip()
+                or _profile_rule_text(pv, prof) or "rule")
+
+    @staticmethod
+    def _limits_key(pv: PVConfig, prof: Optional[dict]) -> str:
+        """Comparable identity of the threshold set in force, so a change
+        between two polls can be spotted. Keyed on the numbers, not on the
+        rule's position in the list: editing an unrelated rule then must not
+        read as a switch, while an edit that really moves a limit does."""
+        thr = pv.profile_thresholds(prof) if prof is not None else pv.thresholds()
+        return "|".join("" if b is None else f"{b:g}" for b in
+                        (thr.alarm_low, thr.warn_low, thr.warn_high,
+                         thr.alarm_high))
+
+    def _check_limits_change(self, pv: PVConfig, rt: PVRuntime,
+                             now: int) -> None:
+        """Open the alerting grace when a PV's limits in force have changed.
+
+        A conditional rule swaps the whole band the instant its dependency PVs
+        move — the shot rate drops, high power goes off, the chillers are being
+        switched off at the end of the day while the hall keeps running. The
+        measured value is still where the old band left it, so without this the
+        switch itself raises an alarm (and a recovery a few minutes later, when
+        the next dependency change hands out yet another band). Neither message
+        says anything about the machine.
+
+        So: no alerting for `rule_change_grace_minutes` after every change, and
+        if nothing had been announced yet the alert state starts clean, so the
+        wait cannot be followed by an 'all clear' for an alarm nobody ever saw.
+        A value that still misses the new band when the wait is over alerts
+        then, in the ordinary way.
+        """
+        key = self._limits_key(pv, rt.active_profile)
+        if rt.grace_until_ns and not rt.in_grace(now):
+            rt.grace_until_ns = 0           # the wait is over — arm again
+            rt.grace_reason = ""
+        if not rt.limits_key:
+            rt.limits_key = key             # first pass: nothing to compare to
+            return
+        if key == rt.limits_key:
+            return
+        was = rt.limits_key
+        rt.limits_key = key
+        try:
+            grace_s = float(self.settings.get(
+                "rule_change_grace_minutes", 20.0)) * 60.0
+        except (TypeError, ValueError):
+            grace_s = 1200.0
+        label = self._limits_label(pv, rt.active_profile)
+        if grace_s <= 0:
+            self._log(f"{pv.display_name}: limits changed to {label} "
+                      f"({was} → {key}).")
+            return
+        rt.grace_until_ns = now + int(grace_s * 1e9)
+        rt.grace_reason = f"now {label}"
+        if rt.alert.first_notified_ns == 0:
+            # Nothing was ever sent about the old limits, so there is no
+            # episode to keep open — and no recovery owed for it either.
+            rt.alert = AlertState()
+            rt.notify_status = ""
+            rt.notify_error = ""
+        self._log(f"{pv.display_name}: limits changed to {label} — alerting "
+                  f"held until "
+                  f"{api.ns_to_prague(rt.grace_until_ns).strftime('%H:%M:%S')} "
+                  f"while the value follows.")
+
     def learn_selected(self):
         pvs = self._selected_pvs()
         if not pvs:
@@ -5935,8 +6788,17 @@ class MonitorWidget(QWidget):
                  "webex_commands_enabled", "webex_command_poll_s",
                  "webex_command_allowlist")
 
+    _MENU_KEYS = ("okbase_enabled", "okbase_base_url", "okbase_username",
+                  "okbase_password", "okbase_session_cookie",
+                  "okbase_canteen_id", "okbase_refresh_hour",
+                  "okbase_keepalive_min")
+
     def _cmd_settings_snapshot(self) -> str:
         return json.dumps({k: self.settings.get(k) for k in self._CMD_KEYS},
+                          sort_keys=True, default=str)
+
+    def _menu_settings_snapshot(self) -> str:
+        return json.dumps({k: self.settings.get(k) for k in self._MENU_KEYS},
                           sort_keys=True, default=str)
 
     def _share_settings_snapshot(self) -> tuple:
@@ -5945,6 +6807,7 @@ class MonitorWidget(QWidget):
 
     def open_settings(self):
         before = self._cmd_settings_snapshot()
+        menu_before = self._menu_settings_snapshot()
         share_before = self._share_settings_snapshot()
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.Accepted:
@@ -5963,6 +6826,21 @@ class MonitorWidget(QWidget):
             # briefly drops commands for no reason.
             if self._cmd_settings_snapshot() != before or self._cmd_timer is None:
                 self._start_cmd_listener()
+            # New canteen credentials are worth trying at once: the operator has
+            # just typed them in and wants to know whether they work.
+            if self._menu_settings_snapshot() != menu_before:
+                self._menu_refreshed_day = ""
+                # The old verdict was about the old sign-in. Leaving it standing
+                # is what made a freshly pasted session look dead: /food kept
+                # printing "the sign-in has expired" under a menu that could by
+                # then be read perfectly well.
+                self._menu_error = ""
+                # Arm the clock, then fetch NOW. Not _start_menu_watch(): that
+                # takes the single job slot with a "load" and the fetch — the
+                # whole point of having just typed the credentials in — would be
+                # dropped, leaving the operator to wait 30 s to learn nothing.
+                self._arm_menu_timer()
+                self._menu_tick()
             self.persist()
             if self._share_settings_snapshot() != share_before:
                 # Re-pointing must not publish this copy's in-memory list into a
@@ -6313,6 +7191,9 @@ class MonitorWidget(QWidget):
             rt.active_profile = self._match_profile(pv)
             thr = (pv.profile_thresholds(rt.active_profile)
                    if rt.active_profile is not None else pv.thresholds())
+            # A different threshold set than last pass? Hold alerting for a
+            # while — the value cannot be in the new band yet.
+            self._check_limits_change(pv, rt, now)
             # Plain severity of this reading, kept up to date even while
             # monitoring is off so the State column stays truthful.
             rt.live_level = (_raw_severity(val, thr)
@@ -6320,7 +7201,7 @@ class MonitorWidget(QWidget):
                              AlertLevel.OK if val is not None else None)
             if not self._monitoring:
                 continue
-            if pv.enabled and thr.is_active():
+            if pv.enabled and thr.is_active() and not rt.in_grace(now):
                 scale, worsening = self._trend_cooldown_scale(rt, thr, now)
                 note = self.evaluator.evaluate(rt.alert, val, thr, now,
                                                cooldown_scale=scale)
@@ -6460,15 +7341,23 @@ class MonitorWidget(QWidget):
         """How long the program may go without completing a read before what it
         shows counts as out of date.
 
-        Deliberately longer than the wedge watchdog in _start_poll, which writes
-        a lost pass off after five intervals and immediately starts a fresh one:
-        a stall that cures itself that way should pass without anyone being
-        woken, and only a stall that survives the cure is worth announcing.
-        Never under three minutes.
+        Settings owns the figure ("Mark as not refreshed after (min)"), so
+        whoever is on call can decide how patient the marking is. What Settings
+        cannot do is ask for a limit the polling rhythm itself could never meet:
+        the wedge watchdog in _start_poll writes a lost pass off after five
+        intervals and immediately starts a fresh one, so a limit shorter than
+        that would flag every stall that is already curing itself. Hence the
+        floor below — the chosen value is used whenever it is the longer of the
+        two, and quietly raised when it is not.
         """
         poll_s = max(1, int(self.settings.get("poll_interval_s", 30)))
         timeout = float(self.settings.get("http_timeout_s", 10.0))
-        return max(5.0 * poll_s + 60.0, 3.0 * timeout + 60.0, 180.0)
+        floor = max(5.0 * poll_s + 30.0, 3.0 * timeout + 30.0, 90.0)
+        try:
+            chosen = float(self.settings.get("refresh_alarm_minutes", 3.5)) * 60.0
+        except (TypeError, ValueError):
+            chosen = 210.0
+        return max(chosen, floor)
 
     def _refresh_age_s(self) -> float:
         """Seconds since the last completed read of every PV. Before the first
@@ -6502,14 +7391,35 @@ class MonitorWidget(QWidget):
                      f"not come back")
         return what
 
+    def _refresh_alert_limit_s(self) -> float:
+        """How long nothing may be read before the chat is told, not just the
+        screen. 0 = never tell the chat. Always at least the marking limit —
+        the chat cannot hear about a stall the program does not consider one."""
+        try:
+            mins = float(self.settings.get("refresh_alert_minutes", 30.0))
+        except (TypeError, ValueError):
+            mins = 30.0
+        if mins <= 0:
+            return 0.0
+        return max(mins * 60.0, self._refresh_limit_s())
+
     def _check_refresh_health(self):
-        """Announce it — once — when the program stops refreshing, and once
-        more when it starts again.
+        """Mark it — on screen and in every chat reply — while the program is
+        not refreshing, take the marking off when it starts again, and tell the
+        chat about a stall that lasts.
+
+        The marking goes on early (`refresh_alarm_minutes`) because its whole
+        job is to stop an out-of-date value being reported as `ok`. The message
+        waits far longer (`refresh_alert_minutes`): most stalls are cured by the
+        wedge watchdog seconds later, and a pair of chat messages about those
+        told nobody anything. One that has lasted half an hour is not curing
+        itself, and then nobody would otherwise know the numbers are frozen —
+        so one message goes out, and one more when reading resumes.
 
         Called from the poll tick and from the Webex listener tick, so whichever
         clock is still running catches the other one being stuck. Deliberately
         separate from the data watchdog: that one fires when the archiver stops
-        answering, this one fires when this program stops asking.
+        answering, this one notices when this program stops asking.
         """
         if not hasattr(self, "graph"):
             return   # called before the window is built (nothing to show on yet)
@@ -6518,23 +7428,46 @@ class MonitorWidget(QWidget):
             self._refresh_bad = True
             self._refresh_bad_since_ns = api.now_ns()
             self._log(f"⚠ {NOT_REFRESHED_LABEL.upper()} — {fault}")
-            if self._monitoring:
-                self._send_refresh_alert(
-                    AlertLevel.ALARM,
-                    f"VALUES ARE {NOT_REFRESHED_LABEL.upper()} — {fault}. "
-                    f"Anything I report until this clears is out of date.")
             self._mark_stale_ui(fault)
         elif not fault and self._refresh_bad:
-            gap = fmt_duration(
-                (api.now_ns() - self._refresh_bad_since_ns) / 1e9)
+            age_s = (api.now_ns() - self._refresh_bad_since_ns) / 1e9
+            gap = fmt_duration(age_s)
             self._refresh_bad = False
             self._refresh_bad_since_ns = 0
             self._log(f"Values are refreshing again (stopped for {gap}).")
-            if self._monitoring:
+            self._mark_stale_ui("")
+            if self._refresh_alert_sent:
+                self._refresh_alert_sent = False
                 self._send_refresh_alert(
                     AlertLevel.OK,
-                    f"Values are refreshing again after {gap}.")
-            self._mark_stale_ui("")
+                    f"Reading resumed — the values on screen and in every "
+                    f"reply are live again. Nothing was read for {gap}.")
+        # A stall that is not curing itself: say it in the chat, once.
+        if self._refresh_bad and not self._refresh_alert_sent \
+                and self._monitoring:
+            limit = self._refresh_alert_limit_s()
+            if limit > 0 and self._refresh_age_s() >= limit:
+                self._refresh_alert_sent = True
+                self._send_refresh_alert(
+                    AlertLevel.ALARM,
+                    f"THIS PROGRAM HAS STOPPED READING — {fault}. Every value "
+                    f"on screen and in every reply is a leftover from that "
+                    f"time, so no limit is being watched. Restart the "
+                    f"Diagnostic app.")
+
+    def _send_refresh_alert(self, level: AlertLevel, reason: str):
+        """One message about the program's own reading having stopped (or come
+        back). No plot: the picture would be exactly as out of date as the
+        numbers are, which is the thing being reported."""
+        prev = AlertLevel.ALARM if level == AlertLevel.OK else AlertLevel.OK
+        self._log(f"REFRESH: {reason}")
+        payload = AlertPayload(
+            level=level, prev_level=prev,
+            pv_name="System", display_name="Values not refreshing",
+            value=0.0, units="", reason=reason,
+            timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="transition")
+        self._launch_alert_worker(payload, Thresholds(), tag="refresh",
+                                  render_plot=False)
 
     def _mark_stale_ui(self, fault: str):
         """Put the 'not refreshed' marking on (or take it off) the status line,
@@ -6546,18 +7479,6 @@ class MonitorWidget(QWidget):
         self.model.refresh_all()
         self.graph.set_stale_note(fault)
         self._update_status()
-
-    def _send_refresh_alert(self, level: AlertLevel, reason: str):
-        prev = AlertLevel.ALARM if level == AlertLevel.OK else AlertLevel.OK
-        payload = AlertPayload(
-            level=level, prev_level=prev,
-            pv_name="System", display_name="Value refresh",
-            value=0.0, units="", reason=reason,
-            timestamp_str=api.ns_to_prague_str(api.now_ns()), kind="transition")
-        # Its own tag, so it can never overwrite a PV's "Alarm status" cell nor
-        # the data watchdog's.
-        self._launch_alert_worker(payload, Thresholds(), tag="refresh",
-                                  render_plot=False)
 
     def _pv_stale_note(self, pv: PVConfig, rt: Optional[PVRuntime]) -> str:
         """Empty when this PV's reading is as fresh as it should be, otherwise
@@ -6771,6 +7692,306 @@ class MonitorWidget(QWidget):
         # first). The button re-enables when the first worker reports back.
         for pv in pvs:
             self._send_plot_for(pv, tag="manual")
+
+    # --- canteen menu (/food) -----------------------------------------
+    def _start_menu_watch(self):
+        """Load the saved menu, then keep both it and the sign-in alive.
+
+        Two jobs on one clock, because they have nothing else in common:
+
+        * the menu itself is fetched at most **once a calendar day**, past the
+          configured hour — it does not change more often than that;
+        * the borrowed browser session is touched **every tick**, because a web
+          session dies of being unused. Without that the pasted sign-in would
+          only be good until the next server-side timeout, and the operator
+          would be refilling it every morning.
+
+        Answering /food never waits for any of this: the reply is rendered from
+        whatever is already in memory.
+        """
+        self._arm_menu_timer()
+        self._start_menu_job("load")     # show the saved menu right away
+
+    def _arm_menu_timer(self, first_ms: int = MENU_FIRST_LOOK_MS):
+        """(Re)start the one clock both menu jobs hang off.
+
+        Split out of _start_menu_watch so that saving new credentials can
+        re-arm the clock WITHOUT also queueing a "load" — a load would take the
+        single job slot and the fetch that is the whole point of saving would be
+        dropped (see _start_menu_job).
+        """
+        if self._menu_timer is not None:
+            self._menu_timer.stop()
+            self._menu_timer = None
+        if not self.settings.get("okbase_enabled"):
+            return
+        self._menu_timer = QTimer(self)
+        self._menu_timer.timeout.connect(self._menu_tick)
+        # First look shortly after launch, then settle into the keepalive rhythm
+        # in _menu_tick. One parented timer rather than a bare singleShot: an
+        # unparented 30 s singleShot outlives the widget and would fire into a
+        # deleted object if the tab is closed in the meantime.
+        self._menu_timer.setInterval(first_ms)
+        self._menu_timer.start()
+
+    def _menu_keepalive_ms(self) -> int:
+        mins = float(self.settings.get("okbase_keepalive_min")
+                     or okbase_menu.KEEPALIVE_MINUTES_DEFAULT)
+        return int(max(1.0, mins) * 60_000)
+
+    def _reload_okbase_sign_in(self):
+        """Pick up a sign-in re-pasted from outside, without a restart.
+
+        The session cookie lives in the Windows account's own file, and
+        okbase_capture.py (or a second copy of the program) can write a fresh
+        one there while this app is running. This app kept its own copy in
+        memory from launch, so a new paste used to be invisible until the app
+        was closed and opened again. Re-reading the file before each keepalive
+        closes that gap: a fresh paste heals the running app on the next tick.
+        """
+        disk = okbase_menu.load_user_settings()
+        if not disk:
+            return
+        new_cookie = disk.get("okbase_session_cookie") or ""
+        old_cookie = self.settings.get("okbase_session_cookie") or ""
+        changed = new_cookie and new_cookie != old_cookie
+        # Adopt every canteen field from disk — the file is the source of truth
+        # for these — but only announce and re-arm when the sign-in itself moved.
+        for key in okbase_menu.OKBASE_KEYS:
+            if key in disk:
+                self.settings[key] = disk[key]
+        if changed:
+            self._menu_error = ""      # the old verdict is not the new sign-in's
+            self._log("Canteen menu: picked up a renewed OKbase sign-in.")
+
+    def _menu_tick(self):
+        """Fetch today's menu if it is due, otherwise just keep the sign-in warm."""
+        self._reload_okbase_sign_in()
+        target = self._menu_keepalive_ms()
+        if self._menu_timer is not None and self._menu_timer.interval() != target:
+            self._menu_timer.setInterval(target)
+        if not self.settings.get("okbase_enabled"):
+            return
+        now = datetime.now()
+        due = (now.date().isoformat() != self._menu_refreshed_day
+               and now.hour >= int(self.settings.get("okbase_refresh_hour", 6) or 0))
+        # A fetch is a keepalive too — it is a request on the same session — so
+        # the two never both run on one tick.
+        self._start_menu_job("fetch" if due else "ping")
+
+    def _start_menu_job(self, mode: str):
+        """Run one menu job on a daemon thread. Returns False if one is running."""
+        if self._menu_busy:
+            # …unless the one "running" has stopped answering. The thread cannot
+            # be cancelled, but after MENU_JOB_WEDGE_S it is dead to us, and the
+            # flag would otherwise silence the menu for the rest of the run: a
+            # re-pasted sign-in would never be tried and /food would keep saying
+            # the old sign-in had expired.
+            started = self._menu_started
+            waited = (datetime.now() - started).total_seconds() if started else 0.0
+            if started is None or waited < MENU_JOB_WEDGE_S:
+                return False
+            self._log(f"Canteen menu: the previous job has not answered in "
+                      f"{waited / 60:.0f} min — starting a new one.")
+        self._menu_busy = True
+        self._menu_started = datetime.now()
+        self._menu_doing = mode
+        # Only a fetch is worth announcing every time. A keepalive runs every
+        # few minutes, so saying so each time would bury the log — it reports
+        # only when its outcome CHANGES (see _on_menu_done).
+        if mode == "fetch":
+            self._log("Canteen menu: reading it from OKbase…")
+        sig = _MenuSignals(self)
+        # deleteLater FIRST — see _start_poll: a queued delete still lets the
+        # handler below receive its payload, and without it every job leaks its
+        # signals object for the lifetime of the tab.
+        sig.done.connect(sig.deleteLater)
+        sig.done.connect(self._on_menu_done)
+        threading.Thread(target=_menu_job, args=(sig, dict(self.settings), mode),
+                         daemon=True, name="okbase-menu").start()
+        return True
+
+    def _remember_session(self, cookies: str):
+        """Save a rotated session back, so the next keepalive touches the live one.
+
+        The portal hands out a new session id when it rotates one, and a
+        remember-me renewal creates a brand new session altogether. Keeping the
+        first paste for ever would mean pinging a session that no longer exists.
+
+        What arrives here has already been through okbase_menu.merged_cookie_header,
+        so it can never be SHORTER than what is stored. That matters: a jar that
+        had lost `_shibsession_` used to be written straight over the stored line
+        and took the single sign-on with it.
+        """
+        if not cookies:
+            return
+        stored = self.settings.get("okbase_session_cookie") or ""
+        try:
+            from secrets_util import resolve_secret
+            if resolve_secret(stored) == cookies:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        encrypted = encrypt_secret(cookies)
+        self.settings["okbase_session_cookie"] = encrypted
+        okbase_menu.save_user_settings({"okbase_session_cookie": encrypted})
+
+    def _on_menu_done(self, result):
+        self._menu_busy = False
+        self._menu_started = None
+        self._menu_doing = ""
+        mode, cache, cookies, err = result
+        was_refresh = mode == "fetch"
+        self._remember_session(cookies)
+        if cache:
+            self._menu_cache = cache
+            if was_refresh:
+                self._menu_refreshed_day = datetime.now().date().isoformat()
+                days = len(cache.get("days") or {})
+                self._log(f"Canteen menu: read {days} day(s) from OKbase.")
+                # The portal's filter is not documented; once a body has worked,
+                # remember it so later refreshes ask the right question first.
+                used = cache.get("filter_used")
+                if isinstance(used, dict) and used != self.settings.get("okbase_filter"):
+                    self.settings["okbase_filter"] = used
+                    okbase_menu.save_user_settings({"okbase_filter": used})
+        elif mode == "load":
+            self._log("Canteen menu: nothing saved yet.")
+
+        if mode in ("fetch", "ping"):
+            # What the last contact with the portal did, so /food status and the
+            # Settings dialog can both say it rather than guessing.
+            self._menu_error = err
+            self._menu_last_check = datetime.now()
+            # "Could not reach the portal" is not a verdict on the sign-in, so it
+            # must not become one. The last DECISIVE answer is what /food and the
+            # status line quote; an unreachable tick only records that it could
+            # not tell. Without this, one hiccup made the app announce a dead
+            # sign-in and a person went and pasted a live one back in.
+            unreachable = okbase_menu.is_unreachable(err)
+            was_ok = self._menu_last_decisive
+            if not unreachable:
+                self._menu_last_ok = not err
+                self._menu_last_decisive = not err
+            if unreachable:
+                if was_ok is not False:
+                    self._log(f"Canteen menu: could not reach OKbase — {err}. "
+                              f"The sign-in itself is probably fine.")
+            elif err and was_refresh:
+                self._log(f"Canteen menu: reading it failed — {err}")
+            elif mode == "ping" and self._menu_last_decisive != was_ok:
+                # A keepalive runs every few minutes; only a CHANGE is news.
+                self._log("Canteen menu: the OKbase sign-in works again."
+                          if self._menu_last_decisive
+                          else f"Canteen menu: the OKbase sign-in stopped "
+                               f"working — {err}")
+
+        # An expired browser session is NOT announced in the chat. The canteen
+        # menu is a convenience, and an unprompted "the sign-in has expired" is
+        # noise about something nobody is waiting for. It is recorded here, and
+        # said only when somebody asks: /status carries one line, /food says it
+        # under the menu, /food status explains it in full.
+        if self._menu_reply_pending:
+            self._menu_reply_pending = False
+            self._reply(self._food_reply(self._menu_reply_args))
+
+    def _food_status(self) -> str:
+        """What the canteen menu is doing, what worked and what did not."""
+        lines = ["**🍽 Canteen menu — what I know**"]
+        if not self.settings.get("okbase_enabled"):
+            lines.append("- **Switched off** in Settings → Canteen menu.")
+        days = okbase_menu.cache_days(self._menu_cache)
+        if days:
+            keys = sorted(days)
+            meals = sum(len(v) for v in days.values())
+            lines.append(f"- **Saved menu:** {len(days)} day(s), {meals} meal(s), "
+                         f"{keys[0]} to {keys[-1]}")
+            age = okbase_menu.cache_age_hours(self._menu_cache)
+            if age is not None:
+                stamp = str(self._menu_cache.get("fetched", ""))[:16].replace("T", " ")
+                lines.append(f"- **Read from OKbase:** {stamp} "
+                             f"({age:.0f} h ago)")
+        else:
+            lines.append("- **Saved menu:** none yet")
+        if self._menu_doing:
+            doing = {"fetch": "reading the menu from OKbase",
+                     "ping": "checking the OKbase sign-in",
+                     "load": "reading the saved menu"}.get(self._menu_doing, self._menu_doing)
+            lines.append(f"- **Doing right now:** {doing}")
+        if self._menu_last_check is not None:
+            if okbase_menu.is_unreachable(self._menu_error):
+                outcome = f"the portal did not answer — {self._menu_error}"
+            elif self._menu_error:
+                outcome = f"failed — {self._menu_error}"
+            else:
+                outcome = "worked"
+            lines.append(f"- **Last contact with OKbase:** "
+                         f"{self._menu_last_check:%Y-%m-%d %H:%M} — {outcome}")
+        else:
+            lines.append("- **Last contact with OKbase:** not tried yet "
+                         "in this run")
+        # The verdict on the SIGN-IN, which is a different question from the
+        # last contact: a portal that did not answer settles nothing, and this
+        # line is what stops a person pasting on the strength of a hiccup.
+        if self._menu_last_decisive is None:
+            lines.append("- **The sign-in itself:** not yet established in this "
+                         "run")
+        elif self._menu_last_decisive:
+            lines.append("- **The sign-in itself:** works — nothing to paste")
+        else:
+            lines.append("- **The sign-in itself:** refused by the portal — this "
+                         "one does need renewing in Settings → Canteen menu")
+        mins = float(self.settings.get("okbase_keepalive_min")
+                     or okbase_menu.KEEPALIVE_MINUTES_DEFAULT)
+        lines.append(f"- **Sign-in kept warm:** every {mins:g} min, so the "
+                     f"borrowed browser session does not time out")
+        nxt = ("already read today" if self._menu_refreshed_day
+               == datetime.now().date().isoformat()
+               else f"due after "
+                    f"{int(self.settings.get('okbase_refresh_hour', 6) or 0):02d}:00")
+        lines.append(f"- **Next read of the menu:** {nxt}")
+        return "\n".join(lines)
+
+    def _food_reply(self, args: str) -> str:
+        """The /food answer for `args`, from the menu already in memory."""
+        text = okbase_menu.answer_food(args, self._menu_cache)
+        err = getattr(self, "_menu_error", "")
+        if okbase_menu.is_expired(err):
+            # Says WHY the menu is old, next to the menu itself — a plain "read
+            # 3 days ago" leaves the reader guessing whether it is broken.
+            text += ("\n\n_The OKbase sign-in has expired, so this cannot get "
+                     "any newer until it is renewed in Settings._")
+        elif okbase_menu.is_unreachable(err):
+            # Deliberately a different sentence: this one asks nobody to do
+            # anything. Printing the expiry line here is what had a live sign-in
+            # pasted in again and again.
+            text += ("\n\n_The OKbase portal did not answer just now, so this "
+                     "may not be the newest. The sign-in itself looks fine._")
+        elif err and not self._menu_cache:
+            text += f"\n\n_Last attempt: {err}_"
+        return text
+
+    def _cmd_food(self, pc: "bot_commands.ParsedCommand"):
+        req = okbase_menu.parse_food_args(pc.args)
+        if req.mode == "status":
+            # The app knows more than the saved file does — what it is doing
+            # right now, and whether the sign-in still works.
+            self._reply(self._food_status())
+            return
+        if req.mode != "refresh":
+            self._reply(self._food_reply(pc.args))
+            return
+        if not self.settings.get("okbase_enabled"):
+            self._reply("⚠ The canteen menu is switched off in Settings, so I "
+                        "cannot read it from OKbase.")
+            return
+        self._reload_okbase_sign_in()    # a paste done just now, no restart
+        if not self._start_menu_job("fetch"):
+            self._reply("⏳ Already reading the menu from OKbase — one moment.")
+            return
+        self._menu_reply_pending = True
+        self._menu_reply_args = ""       # answer with today's menu when it lands
+        self._reply("⏳ Reading the menu from OKbase…")
 
     # --- Webex two-way command listener -------------------------------
     def _start_cmd_listener(self):
@@ -7001,10 +8222,18 @@ class MonitorWidget(QWidget):
                 self._reply(self._cmd_status(pc.items))
             elif cmd == "/alarms":
                 self._reply(self._cmd_alarms())
+            elif cmd in ("/cancel", "/abort", "/nevermind"):
+                self._cmd_cancel()
             elif cmd == "/start":
                 self.toggle_monitoring(True)
                 self._reply("▶ Monitoring started.")
             elif cmd == "/stop":
+                # /stop has always meant "stop alerting", so it keeps that
+                # meaning — but a plot left running is exactly what somebody
+                # typing /stop may have meant, so say how to drop it.
+                busy = [t.label for t in self._chart_jobs if not t.cancelled]
+                tail = (f" A plot is still being fetched ({'; '.join(busy)}) — "
+                        f"send `/cancel` to drop it.") if busy else ""
                 if args:
                     hours = float(args[0])
                     if hours <= 0:
@@ -7013,10 +8242,11 @@ class MonitorWidget(QWidget):
                     until = api.ns_to_prague(self._resume_at_ns).strftime(
                         "%Y-%m-%d %H:%M")
                     self._reply(f"⏸ Monitoring paused for {hours:g} h — "
-                                f"auto-resume at {until}. Send /start to resume now.")
+                                f"auto-resume at {until}. Send /start to "
+                                f"resume now.{tail}")
                 else:
                     self.toggle_monitoring(False)
-                    self._reply("⏹ Monitoring stopped (no auto-resume).")
+                    self._reply(f"⏹ Monitoring stopped (no auto-resume).{tail}")
             elif cmd == "/window":
                 mins = int(float(args[0]))
                 self.settings["graph_window_minutes"] = mins
@@ -7050,6 +8280,8 @@ class MonitorWidget(QWidget):
                         self._reply(f"Graph: {pv.display_name}.")
             elif cmd == "/plot":
                 self._cmd_plot(pc)
+            elif cmd in ("/food", "/menu", "/lunch"):
+                self._cmd_food(pc)
             elif cmd == "/datawatchdog":
                 if args and args[0].lower() in ("on", "off"):
                     enabled = args[0].lower() == "on"
@@ -7137,6 +8369,10 @@ class MonitorWidget(QWidget):
                 f"- **Window:** {label} (Europe/Prague)\n")
         if opts.yaxis:
             body += f"- **Y range:** {opts.yaxis[0]:g} … {opts.yaxis[1]:g}\n"
+        if opts.detail:
+            body += "- **Detail:** every single reading\n"
+        for w in opts.warnings:
+            body += f"- ⚠ {w}\n"
         body += "\n".join(self._status_line(pv) for pv in pvs)
         body = self._freshness_header() + body
         # Only judge the picture's freshness when the window was asked to run up
@@ -7144,19 +8380,56 @@ class MonitorWidget(QWidget):
         # stops, and calling that "not current" would be nonsense.
         live_window = (api.now_ns() - end_ns) < int(120 * 1e9)
         stale_after_s = self._sample_age_limit_s() if live_window else 0.0
+        token = _CancelToken(f"{short} — {label}")
+        self._chart_jobs.append(token)
         sig = _ChartSignals(self)
         sig.done.connect(sig.deleteLater)   # see _start_poll
         sig.done.connect(self._on_chart_result)
+        sig.progress.connect(self._reply)
         self._chart_sig = sig      # handle to the latest; the worker owns it
         QThreadPool.globalInstance().start(_ChartWorker(
             sig, self.hub, series, start_ns, end_ns,
             float(self.settings["http_timeout_s"]),
             f"Plot — {short} ({label})", label, body, opts.yaxis,
-            stale_after_s))
-        self._reply(f"📈 Rendering {short} — {label}…")
+            stale_after_s, token, detail=opts.detail,
+            max_workers=int(self.settings.get("plot_max_workers", 10)),
+            budget=int(self.settings.get("plot_request_budget", 600)),
+            n_bins=int(self.settings.get("plot_bins", 900)),
+            log_fn=self._log))
+        hint = "" if opts.time is None or opts.time.hours <= 24 else \
+            " Send `/cancel` if you asked for the wrong window."
+        if opts.detail and opts.time is not None and opts.time.hours > 48:
+            hint += (" `detail` means every reading, so this one may take a "
+                     "long while.")
+        self._reply(f"📈 Rendering {short} — {label}…{hint}")
+
+    def _cancel_jobs(self) -> list[str]:
+        """Take back every plot still being fetched. Returns what was stopped."""
+        stopped = []
+        for token in self._chart_jobs:
+            if not token.cancelled:
+                token.cancel()
+                stopped.append(token.label)
+        return stopped
+
+    def _cmd_cancel(self):
+        stopped = self._cancel_jobs()
+        if not stopped:
+            self._reply("Nothing is running — there is nothing to cancel.")
+            return
+        names = "; ".join(stopped)
+        self._log(f"Webex: plot cancelled ({names}).")
+        self._reply(f"🛑 Cancelled: {names}. "
+                    f"Requests already sent still have to come back, so it can "
+                    f"take a few seconds — but nothing will be sent.")
 
     def _on_chart_result(self, result):
-        errors, had_png = result
+        token, errors, had_png, cancelled = result
+        if token in self._chart_jobs:
+            self._chart_jobs.remove(token)
+        if cancelled:
+            self._log(f"Chart dropped (cancelled): {token.label}.")
+            return
         for ch, err in errors.items():
             self._log(f"  {ch} send failed: {err}")
         if not errors:
@@ -7180,23 +8453,34 @@ class MonitorWidget(QWidget):
             "- `/alarms` — only PVs currently in warning/alarm, plus any that "
             "stopped updating\n"
             "- `/list` — the configured PVs\n"
-            "- `/plot <pv, pv, …>[; window][; y lo-hi]` — send one graph with a "
-            "curve per PV, e.g. `/plot Chiller 1, Chiller 2; yesterday 7-18`. "
-            "`/plot all` takes every PV; a single PV also gets its limit lines.\n"
+            "- `/plot <pv, pv, …>[; window][; y lo-hi][; detail]` — send one "
+            "graph with a curve per PV, e.g. "
+            "`/plot Chiller 1, Chiller 2; yesterday 7-18` or "
+            "`/plot Chiller 1; 1.1. 9:00 - 1.9. 12:00`. "
+            "`/plot all` takes every PV; a single PV also gets its limit "
+            "lines. Over a long window the curve is the average of each point "
+            "with a shaded band from its lowest to its highest reading, so a "
+            "short peak still shows; `; detail` reads every single reading "
+            "instead, which is slow over months.\n"
+            "- `/cancel` — drop a plot that is still being fetched, so a long "
+            "window asked for by mistake does not have to be waited out "
+            "(`/abort` does the same)\n"
             "- `/start` — alerting on (PVs are read and plotted either way)\n"
             "- `/stop [hours]` — alerting off; with hours, auto-resume later "
-            "(e.g. `/stop 10`)\n"
+            "(e.g. `/stop 10`). This is about alerting, not about a running "
+            "plot — that one is `/cancel`.\n"
             "- `/enable <pv, pv>` `/disable <pv, pv>` — alerting per PV\n"
             "- `/datawatchdog on|off` — the 'no data at all' alert "
             "(no argument: show current state)\n"
-            "- I also announce it by myself, without being asked, if I stop "
-            "refreshing the values at all, and again when I start again. That "
-            "one cannot be switched off.\n"
             "- `/graph <pv|all>` — what the app window itself shows\n"
             "- `/window <minutes>` — time window of that live graph\n"
             "- `/yaxis <lo-hi>|auto` — Y range of that live graph\n"
             "- `/run` — start the app when it is closed (answered by the "
-            "always-on listener; if the app is already open it says so)")
+            "always-on listener; if the app is already open it says so)\n"
+            "- `/food` — the canteen menu: today until 14:30, the next serving "
+            "day after that; `/food today`, `/food week`, `/food tomorrow`, "
+            "`/food friday`, `/food 27.8.`, `/food refresh`. Read from OKbase "
+            "once a day, and answered even when the app is closed.")
 
     def _status_line(self, p: PVConfig) -> str:
         rt = self.runtime.get(p.name)
@@ -7224,6 +8508,12 @@ class MonitorWidget(QWidget):
             state = rt.display_level(self._monitoring).label.lower()
             if not self._monitoring:
                 state += ", not monitored"
+            elif rt.in_grace():
+                # The limits under it changed a moment ago, so this reading is
+                # judged against a band the value cannot have reached yet.
+                state += (", limits just changed — held until "
+                          + api.ns_to_prague(rt.grace_until_ns)
+                          .strftime("%H:%M"))
         else:
             state = "no data"
         return f"- **{p.display_name}**: {val} {units} [{state}]"
@@ -7252,17 +8542,51 @@ class MonitorWidget(QWidget):
             if snap is not None:
                 up = fmt_duration((api.now_ns() - self._mem_start_ns) / 1e9)
                 out += (f"\n_Up {up} · {memstats.short_line(snap)}_")
+            note = self._menu_signin_note()
+            if note:
+                out += f"\n_{note}_"
         return out
+
+    def _menu_signin_note(self) -> str:
+        """One quiet line for /status when the canteen sign-in needs renewing.
+
+        The only place the app brings the canteen up by itself. Nothing is
+        posted when it breaks: /food is a convenience, and an unasked-for
+        warning about it is noise. Here it rides along with a status somebody
+        asked for, and only when the portal actually REFUSED the sign-in — a
+        portal that merely did not answer says nothing.
+        """
+        if not self.settings.get("okbase_enabled"):
+            return ""
+        if not okbase_menu.is_expired(getattr(self, "_menu_error", "")):
+            return ""
+        return ("🍽 Canteen sign-in expired — `/food` still shows the menu read "
+                "earlier; renew it in Settings → Canteen menu")
+
+    def _refresh_note_short(self) -> str:
+        """One short line saying the values are out of date, or '' when they are
+        current.
+
+        The window says the same thing at length; a chat reply is read on a
+        phone, where the long version pushes the values themselves off the
+        screen. So this is the whole warning: the label, when the last reading
+        was taken, and how long ago that is.
+        """
+        if not self._refresh_fault():
+            return ""
+        if not self._last_poll_ok_ns:
+            return (f"**⚠ {NOT_REFRESHED_LABEL.upper()} — no reading has "
+                    f"completed yet.**")
+        when = api.ns_to_prague(self._last_poll_ok_ns).strftime("%H:%M:%S")
+        age = fmt_duration(self._refresh_age_s())
+        return (f"**⚠ {NOT_REFRESHED_LABEL.upper()} — last read {when}, "
+                f"{age} ago.**")
 
     def _freshness_header(self) -> str:
         """The banner that goes above any list of values, or '' when they are
         current."""
-        fault = self._refresh_fault()
-        if not fault:
-            return ""
-        return (f"**⚠ {NOT_REFRESHED_LABEL.upper()} — {fault}.**\n"
-                f"_Everything below is the last reading I managed to take, not "
-                f"the present state._\n\n")
+        note = self._refresh_note_short()
+        return f"{note}\n\n" if note else ""
 
     def _freshness_footer(self) -> str:
         """One line saying when the values below were actually read."""
@@ -7300,18 +8624,22 @@ class MonitorWidget(QWidget):
             level = rt.display_level(self._monitoring) if rt else None
             if level not in (AlertLevel.WARNING, AlertLevel.ALARM):
                 continue
-            lines.append(f"- **{p.display_name}**: {val} {units} [{level.label.lower()}]")
+            held = (" — limits just changed, held until "
+                    + api.ns_to_prague(rt.grace_until_ns).strftime("%H:%M")
+                    if self._monitoring and rt.in_grace() else "")
+            lines.append(f"- **{p.display_name}**: {val} {units} "
+                         f"[{level.label.lower()}{held}]")
         out = []
         if lines:
             out.append("**Current alarms:**\n" + "\n".join(lines))
         if frozen:
             out.append(f"**⚠ Reading is not live:**\n" + "\n".join(frozen))
-        fault = self._refresh_fault()
+        note = self._refresh_note_short()
         if not out:
             # "No alarms" is a claim about the present. While the values are
             # out of date it is not one this program is entitled to make.
-            if fault:
-                return (f"**⚠ {NOT_REFRESHED_LABEL.upper()} — {fault}.**\n"
+            if note:
+                return (f"{note}\n"
                         f"_I cannot tell whether anything is in alarm right "
                         f"now; nothing was in alarm at the last reading._")
             return f"✅ No PVs currently in warning/alarm.\n\n_{self._freshness_footer()}_"

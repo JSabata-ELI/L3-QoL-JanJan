@@ -7,15 +7,20 @@ PySide6 app (main.py) and from headless tests.
 
 Extracted from the former tkinter `cssl.py` (now removed).
 """
+import itertools
 import json
+import math
 import os
 import re
 import ssl
 import subprocess
 import sys
+import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -53,9 +58,22 @@ CPVA_BASE_URL          = "https://10.78.0.57:8443/api/1.0/cpva"
 CPVA_SAMPLES_ENDPOINT  = "/samples"
 CPVA_CHANNELS_ENDPOINT = "/channels"
 CPVA_HTTP_TIMEOUT      = 10.0
+# A single big request needs far longer than a one-hour one. The per-request
+# timeout is derived from its span (see _timeout_for_span), between these two.
+CPVA_HTTP_TIMEOUT_LONG = 120.0
 
-# The archiver only returns reliable data when the query window <= 1 h.
+# One hour: the span the archiver serves for any channel, however fast it is.
+# It is no longer the fixed request size — cpva_fetch_many_adaptive asks for as
+# much as the server will actually give and halves only what it refuses — but it
+# stays the reference unit for timeouts, request estimates and the live tick.
 CHUNK_SIZE_NS = int(3600 * 1e9)   # 1 hour in nanoseconds
+
+# Adaptive fetch bounds.
+MIN_CHUNK_NS       = int(60 * 1e9)          # never split below one minute
+MAX_CHUNK_NS       = int(30 * 86400 * 1e9)  # largest span ever tried in one request
+RAW_START_CHUNK_NS = 4 * CHUNK_SIZE_NS      # raw mode's optimistic first try
+MIN_CHUNK_COUNT    = 16                     # smallest useful decimation target
+FETCH_MAX_REQUESTS = 20_000                 # hard budget for one fetch call
 
 # Rows within this many milliseconds of each other are merged into one.
 SAMPLE_HOLD_MIN_GAP_MS = 137
@@ -263,63 +281,138 @@ def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
     return data
 
 
-def _chunk_is_night(chunk_start_ns: int, chunk_end_ns: int) -> bool:
-    """Return True if the entire chunk is within 22:00-06:00 Prague time (no data expected)."""
-    TZ = ZoneInfo("Europe/Prague")
-    now_ns_val = int(datetime.now(timezone.utc).timestamp() * 1e9)
-    # Never skip chunks that extend to current time or future
-    if chunk_end_ns >= now_ns_val - 60 * 1_000_000_000:  # within 1 min of now
+def _timeout_for_span(span_ns: int, base: float = CPVA_HTTP_TIMEOUT,
+                      cap: float = CPVA_HTTP_TIMEOUT_LONG) -> float:
+    """Seconds to allow one request covering `span_ns`.
+
+    An hour is answered well inside the 10 s default; a month can take a
+    minute. Scaling with the span stops a small request from waiting two
+    minutes on a sick archiver while still letting a big one finish.
+    """
+    if span_ns <= CHUNK_SIZE_NS:
+        return base
+    return min(cap, max(base, base * span_ns / CHUNK_SIZE_NS))
+
+
+# Statuses the archiver uses when one response would be too large or too slow.
+_SPLIT_STATUS = (413, 414, 500, 502, 503, 504)
+
+
+def _is_splittable_error(exc) -> bool:
+    """True only for failures a SMALLER time window could plausibly fix.
+
+    The archiver answers HTTP 500 when a single response would carry too many
+    samples, and a huge response can simply run out of time; halving the window
+    cures both. A refused connection or a bad host is not cured by halving —
+    fanning those out would turn one unreachable archiver into tens of
+    thousands of pointless requests.
+    """
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    if code in _SPLIT_STATUS:
+        return True
+    if "Timeout" in type(exc).__name__:        # requests / urllib3 read timeout
+        return True
+    return isinstance(exc, ValueError)         # truncated / unexpected shape
+
+
+def _looks_decimated(samples: list, requested: int):
+    """Did the server honour `count=`?  True / False / None when unclear."""
+    if not requested or not samples:
+        return None
+    if any(s.get("quality") == "Interpolated" for s in samples[:20]):
+        return True
+    if len(samples) > 5 * requested:
         return False
-    dt_start = datetime.fromtimestamp(chunk_start_ns / 1e9, tz=TZ)
-    dt_end   = datetime.fromtimestamp(chunk_end_ns   / 1e9, tz=TZ)
-    def is_night(h): return h >= 22 or h < 6
-    return is_night(dt_start.hour) and is_night(dt_end.hour)
+    return None
+
+
+def _coalesce_ranges(ranges: list) -> list:
+    """Sort and merge touching/overlapping (start, end) pairs."""
+    out = []
+    for a, b in sorted(ranges):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+class _SpanOracle:
+    """How much time one channel's archiver will serve in a single request.
+
+    `good` is the widest span known to have worked, `bad` the narrowest known
+    to have failed. There is one oracle PER CHANNEL on purpose: how many
+    samples an hour holds is a property of the signal, so a single shared
+    oracle would drag a slowly-changing signal (a valve state, an hourly
+    setpoint) down to the chunk size of the fastest one — turning a dozen
+    requests into thousands.
+    """
+
+    __slots__ = ("good", "bad", "_lock")
+
+    def __init__(self):
+        self.good = 0
+        self.bad  = 0                 # 0 = nothing has failed yet
+        self._lock = threading.Lock()
+
+    def ok(self, span_ns: int) -> None:
+        with self._lock:
+            self.good = max(self.good, int(span_ns))
+
+    def failed(self, span_ns: int) -> None:
+        with self._lock:
+            self.bad = int(span_ns) if not self.bad else min(self.bad, int(span_ns))
+
+    def plan_span(self, span_ns: int, hint: "_SpanOracle" = None) -> int:
+        """Span to try for a range of `span_ns` that has just been refused.
+
+        Always at most half of what failed, so a split always makes progress.
+        `hint` is the shared cross-channel oracle: until this channel has had a
+        success of its own, the widest span ALREADY known to work for some
+        other signal is a far better guess than blind halving.
+        """
+        with self._lock:
+            good, bad = self.good, self.bad
+        if not good and hint is not None:
+            good = hint.good
+        target = good or (bad // 2 if bad else span_ns // 2)
+        half = max(MIN_CHUNK_NS, span_ns // 2)
+        return max(MIN_CHUNK_NS, min(int(target) or MIN_CHUNK_NS, half))
+
+
+class FetchReport(NamedTuple):
+    """What one adaptive fetch actually managed to do.
+
+    `gaps` is the honest part: every time range that could not be read, per
+    channel. A short sample list plus an empty `gaps` means the archive really
+    holds nothing there; a short list with gaps means we failed to read it.
+    """
+    gaps:        dict          # channel -> [(start_ns, end_ns), ...]
+    boundaries:  dict          # channel -> [start_ns of each request served]
+    requests:    int
+    splits:      int
+    cancelled:   bool
+    over_budget: bool
+    decimated:   object        # True / False / None (unknown)
+    span_ns:     int
+    elapsed_s:   float
 
 
 def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
                                timeout: float = CPVA_HTTP_TIMEOUT,
                                log_fn=None,
                                max_workers: int = 12) -> list[dict]:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """One channel over [start_ns, end_ns), as much of it as can be read.
 
-    chunks = []
-    cs = start_ns
-    i = 0
-
-    while cs < end_ns:
-        ce = min(cs + CHUNK_SIZE_NS, end_ns)
-        if not _chunk_is_night(cs, ce):
-            chunks.append((i, cs, ce))
-        i += 1
-        cs = ce
-
-    if not chunks:
-        return []
-
-    if len(chunks) == 1:
-        return cpva_fetch_samples(channel, chunks[0][1], chunks[0][2], timeout)
-
-    if log_fn:
-        log_fn(f"      {channel}: {len(chunks)} chunks")
-
-    workers = min(max_workers, len(chunks))
-    results_map = {}
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(cpva_fetch_samples, channel, cs, ce, timeout): idx
-            for idx, cs, ce in chunks
-        }
-
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            results_map[idx] = fut.result()
-
-    results = []
-    for idx in sorted(results_map):
-        results.extend(results_map[idx])
-
-    return results
+    NOTE: this no longer raises when part of the range cannot be read. It used
+    to re-raise the first failing hour, which threw away the whole channel over
+    a single refused request; now an unreadable range is simply absent from the
+    result (see :func:`cpva_fetch_many_adaptive` if you need to know which).
+    """
+    res, _errors, _report = cpva_fetch_many_adaptive(
+        [channel], start_ns, end_ns, count=None, timeout=timeout,
+        max_workers=max_workers, log_fn=log_fn)
+    return res.get(channel, [])
 
 
 def _is_cancelled(cancel_fn) -> bool:
@@ -339,79 +432,384 @@ def _is_cancelled(cancel_fn) -> bool:
         return False
 
 
+def _empty_report(gaps, boundaries, span_ns) -> FetchReport:
+    return FetchReport(gaps, boundaries, 0, 0, False, False, None, span_ns, 0.0)
+
+
+def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
+                             count: int | None = None,
+                             timeout: float | None = None,
+                             max_workers: int = 16,
+                             progress_fn=None,
+                             cancel_fn=None,
+                             log_fn=None,
+                             chunk_fn=None,
+                             start_chunk_ns: int | None = None,
+                             min_chunk_ns: int = MIN_CHUNK_NS,
+                             max_requests: int = FETCH_MAX_REQUESTS,
+                             preflight: bool = True):
+    """Read several channels over [start_ns, end_ns), whatever its length.
+
+    Asks for as much time per request as the archiver will actually serve, and
+    halves only what it refuses. The archiver answers HTTP 500 when a single
+    response would carry too many samples, so the old fixed shapes both failed:
+    one request over the whole window lost the entire channel on the first 500,
+    and a rigid one-hour grid needed 70 000 requests for a year.
+
+    ``count`` > 0 asks for server-side decimation and is shared out across the
+    requests in proportion to their span, so the total returned stays near the
+    target instead of being multiplied by the number of requests.
+
+    Work is queued NEWEST FIRST, so a long load fills the graph in from the
+    right-hand (present) edge while it runs.
+
+    Returns ``(results, errors, report)``:
+      * ``results``  channel -> time-ordered, de-duplicated sample list
+      * ``errors``   channel -> one human sentence (same shape as before)
+      * ``report``   :class:`FetchReport`, including the ranges NOT read
+
+    ``progress_fn(done, total)`` is called from worker threads. ``total`` is a
+    live estimate that only ever GROWS: it starts at the number of planned
+    requests, and each time one splits into *k* pieces the parent counts as
+    done and ``total`` grows by *k*. ``done`` never falls, ``total`` never falls,
+    ``done <= total`` always, and the last call has ``done == total``.
+
+    ``chunk_fn(channel, samples)`` is called as each request lands, for callers
+    that want to paint partial results. ``log_fn(text)`` gets one-line notes.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    start_ns, end_ns = int(start_ns), int(end_ns)
+    span_total = max(0, end_ns - start_ns)
+    base_timeout = CPVA_HTTP_TIMEOUT if timeout is None else float(timeout)
+
+    gaps: dict[str, list] = {ch: [] for ch in channels}
+    boundaries: dict[str, list] = {ch: [] for ch in channels}
+    errors: dict[str, str] = {}
+    parts: dict[str, list] = {ch: [] for ch in channels}
+    first_exc: dict[str, str] = {}
+
+    if not channels or span_total <= 0:
+        if progress_fn:
+            progress_fn(0, 0)
+        return ({ch: [] for ch in channels}, errors,
+                _empty_report(gaps, boundaries, span_total))
+
+    oracles = {ch: _SpanOracle() for ch in channels}
+    hint = _SpanOracle()          # shared, consulted only for a FIRST attempt
+    t0 = time.monotonic()
+    lock = threading.Lock()
+    finished = threading.Event()
+    state = {"pending": 1, "done": 0, "total": 0, "requests": 0, "splits": 0,
+             "cancelled": False, "over_budget": False, "decimated": None,
+             "noted_span": {}}
+    ex: object = None
+    emit_lock = threading.Lock()
+    emitted = [0, 0]
+
+    def _note(text: str) -> None:
+        if log_fn:
+            try:
+                log_fn(text)
+            except Exception:
+                pass
+
+    def _share(cnt, piece_ns, whole_ns):
+        if not cnt:
+            return None
+        if whole_ns <= 0:
+            return int(cnt)
+        return max(MIN_CHUNK_COUNT, int(round(cnt * piece_ns / whole_ns)))
+
+    def _emit_progress():
+        """Report progress, in order, from whichever worker thread got here.
+
+        The snapshot is taken INSIDE emit_lock: taking it outside let two
+        threads deliver their counts in the wrong order, so a caller watching a
+        progress bar saw it jump backwards.
+        """
+        if progress_fn is None:
+            return
+        with emit_lock:
+            with lock:
+                d, t = state["done"], state["total"]
+            if d < emitted[0] or t < emitted[1]:
+                return                    # a fresher snapshot already went out
+            emitted[0], emitted[1] = d, t
+            try:
+                progress_fn(d, t)
+            except Exception:
+                pass
+
+    def _submit(ch, a, b, cnt, planned: bool = False, probe: bool = False) -> bool:
+        """Queue one request. False (and a recorded gap) when the budget is spent.
+
+        A `planned` request is already counted in "total" (the whole plan is
+        counted up front, so the progress total never has to shrink); a split
+        child is new work and grows the total.
+        """
+        with lock:
+            if state["requests"] >= max_requests:
+                state["over_budget"] = True
+                gaps[ch].append((a, b))
+                if planned:
+                    state["done"] += 1
+                return False
+            state["requests"] += 1
+            state["pending"] += 1
+            if not planned:
+                state["total"] += 1
+        try:
+            ex.submit(_task, ch, a, b, cnt, probe)
+        except RuntimeError:
+            # The pool was shut down under us (a cancel while a split was being
+            # queued). Retire the slot as done — never shrink "total", callers
+            # are promised it only grows — and record the range as unread.
+            with lock:
+                state["pending"] -= 1
+                state["done"]    += 1
+                state["cancelled"] = True
+                gaps[ch].append((a, b))
+                pend = state["pending"]
+            if pend == 0:
+                finished.set()
+            return False
+        return True
+
+    def _split(ch, a, b, cnt, span):
+        oracles[ch].failed(span)
+        hint.failed(span)
+        piece = oracles[ch].plan_span(span, hint)
+        k = max(2, int(math.ceil(span / piece)))
+        with lock:
+            state["splits"] += 1
+            told = state["noted_span"].get(ch)
+            if told != piece:
+                state["noted_span"][ch] = piece
+        if told != piece:
+            _note(f"{shorten_pv_name(ch)}: {span/3.6e12:.1f} h per request refused, "
+                  f"trying {piece/3.6e12:.2f} h ({k} pieces)")
+        # Newest piece first, for the same reason the whole plan is newest first.
+        for i in range(k - 1, -1, -1):
+            ca = a + (span * i) // k
+            cb = b if i == k - 1 else a + (span * (i + 1)) // k
+            if cb > ca:
+                _submit(ch, ca, cb, _share(cnt, cb - ca, span))
+
+    def _task(ch, a, b, cnt, probe: bool = False):
+        try:
+            if _is_cancelled(cancel_fn):
+                with lock:
+                    state["cancelled"] = True
+                    gaps[ch].append((a, b))
+                return
+            span = b - a
+            tmo = _timeout_for_span(span, base_timeout)
+            samples, exc = None, None
+            try:
+                samples = cpva_fetch_samples(ch, a, b, tmo, cnt)
+            except Exception as e:
+                exc = e
+            if exc is not None and not _is_splittable_error(exc):
+                # A dropped keep-alive is routine on a long load and the adapter
+                # retries nothing of its own. Try once more, but never fan out.
+                try:
+                    samples, exc = cpva_fetch_samples(ch, a, b, tmo, cnt), None
+                except Exception as e:
+                    exc = e
+            if exc is not None:
+                with lock:
+                    first_exc.setdefault(ch, f"{type(exc).__name__}: {exc}")
+                if _is_splittable_error(exc) and span > min_chunk_ns:
+                    _split(ch, a, b, cnt, span)
+                else:
+                    with lock:
+                        gaps[ch].append((a, b))
+                return
+            if not probe:
+                # A probe is deliberately tiny, so letting it set "the widest
+                # span known to work" would make every later split fall back to
+                # one hour and cost thousands of requests over a long period.
+                oracles[ch].ok(span)
+                hint.ok(span)
+            raw_warn = False
+            with lock:
+                boundaries[ch].append(a)
+                parts[ch].append(samples)
+                if state["decimated"] is None and cnt:
+                    state["decimated"] = _looks_decimated(samples, cnt)
+                    raw_warn = state["decimated"] is False
+            if raw_warn:
+                _note(f"the archiver returned {len(samples)} raw samples for "
+                      f"count={cnt} — it does not decimate, so a long period "
+                      f"will be slow and heavy")
+            if chunk_fn:
+                try:
+                    chunk_fn(ch, samples)
+                except Exception:
+                    pass
+        finally:
+            with lock:
+                state["pending"] -= 1
+                state["done"]   += 1
+                pend = state["pending"]
+            _emit_progress()
+            if pend == 0:
+                finished.set()
+
+    # ── the plan: newest first, channels interleaved ───────────────────────
+    if start_chunk_ns is None:
+        want = min(span_total, MAX_CHUNK_NS if count else RAW_START_CHUNK_NS)
+    else:
+        want = int(start_chunk_ns)
+    want = max(min_chunk_ns, int(want))
+
+    # Each channel opens with ONE small request at the newest end. It is what
+    # puts something on screen straight away: the first big request over a long
+    # period is often refused, and the caller would otherwise watch an empty
+    # graph through the whole search for a span the archiver will serve.
+    probe_span = min(span_total, max(min_chunk_ns, CHUNK_SIZE_NS))
+    use_probe = span_total > 2 * probe_span
+
+    per_ch = {}
+    for ch in channels:
+        lst, b = [], end_ns
+        if use_probe:
+            a = b - probe_span
+            lst.append((ch, a, b, True))
+            b = a
+        while b > start_ns:
+            a = max(start_ns, b - want)
+            lst.append((ch, a, b, False))
+            b = a
+        per_ch[ch] = lst
+    plan = [t for grp in itertools.zip_longest(*per_ch.values())
+            for t in grp if t is not None]
+
+    # Count the whole plan up front, so the reported total only ever grows when
+    # a request genuinely splits into more work.
+    with lock:
+        state["total"] = len(plan)
+    if progress_fn:
+        emitted[1] = len(plan)
+        progress_fn(0, len(plan))
+
+    # ── pre-flight: is the archiver there at all? ──────────────────────────
+    # A big first request is allowed up to 120 s, so without this a dead
+    # archiver would look like a two-minute hang. One minute of the newest end
+    # at the short timeout answers that in 10 s. Skipped for short windows,
+    # which are cheap enough to fail on their own.
+    if preflight and span_total > 4 * CHUNK_SIZE_NS:
+        probe_a = max(start_ns, end_ns - MIN_CHUNK_NS)
+        dead = None
+        for _attempt in (1, 2):
+            try:
+                cpva_fetch_samples(channels[0], probe_a, end_ns, base_timeout, None)
+                dead = None
+                break
+            except Exception as e:
+                # Any HTTP reply at all — even a refusal or a 404 for one bad
+                # channel name — means the archiver is alive; only a failure
+                # that never got a reply counts as unreachable.
+                if getattr(e, "response", None) is not None:
+                    dead = None
+                    break
+                dead = e
+        if dead is not None:
+            msg = f"{type(dead).__name__}: {dead}"
+            _note(f"the archiver did not answer ({msg}) — nothing was read")
+            for ch in channels:
+                gaps[ch] = [(start_ns, end_ns)]
+                errors[ch] = msg
+            if progress_fn:
+                progress_fn(1, 1)
+            return ({ch: [] for ch in channels}, errors,
+                    FetchReport(gaps, boundaries, 1, 0, False, False, None,
+                                span_total, time.monotonic() - t0))
+
+    workers = max(1, min(max_workers, len(plan)))
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
+        for ch, a, b, is_probe in plan:
+            if _is_cancelled(cancel_fn):
+                # Do not even queue the rest: the caller has moved on.
+                with lock:
+                    state["cancelled"] = True
+                    state["done"] += 1
+                    gaps[ch].append((a, b))
+                continue
+            _submit(ch, a, b, _share(count, b - a, span_total),
+                    planned=True, probe=is_probe)
+        # Retire the planner only after everything is queued: without this seed
+        # the first task can finish before the second is submitted, "pending"
+        # touches zero and the fetch returns with one request's worth of data.
+        with lock:
+            state["pending"] -= 1
+            pend = state["pending"]
+        if pend == 0:
+            finished.set()
+        while not finished.wait(0.25):
+            if _is_cancelled(cancel_fn):
+                with lock:
+                    state["cancelled"] = True
+                break
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    # ── merge: by sample time, not by request order ────────────────────────
+    # Every request also returns the sample just before its own start, so
+    # neighbours overlap. With adaptive splitting a child's anchor can predate
+    # its parent's start, so request order is not time order — and
+    # cpva_fetch_last_before relies on the last element being the newest.
+    out: dict[str, list] = {}
+    for ch in channels:
+        merged = sorted(itertools.chain.from_iterable(parts[ch]),
+                        key=lambda s: (s.get("time") or 0))
+        seen, clean = set(), []
+        for s in merged:
+            t = s.get("time")
+            if t in seen:
+                continue
+            seen.add(t)
+            clean.append(s)
+        out[ch] = clean
+
+    for ch in channels:
+        g = _coalesce_ranges(gaps[ch])
+        gaps[ch] = g
+        boundaries[ch].sort()
+        if g:
+            unread = sum(b - a for a, b in g)
+            errors[ch] = (
+                f"{len(g)} range(s) unread ({unread/3.6e12:.2f} h of "
+                f"{span_total/3.6e12:.2f} h) — first "
+                f"{ns_to_local_str(g[0][0])[:16]} → {ns_to_local_str(g[0][1])[:16]}"
+                + (f": {first_exc[ch]}" if ch in first_exc else ""))
+        elif ch in first_exc and not out[ch]:
+            errors[ch] = first_exc[ch]
+
+    report = FetchReport(gaps, boundaries, state["requests"], state["splits"],
+                         state["cancelled"], state["over_budget"],
+                         state["decimated"], span_total, time.monotonic() - t0)
+    if state["over_budget"]:
+        _note(f"stopped after {max_requests} requests — the period is too long "
+              f"to read in full at this level of detail")
+    return out, errors, report
+
+
 def cpva_fetch_many_chunked(channels: list[str], start_ns: int, end_ns: int,
                             timeout: float = CPVA_HTTP_TIMEOUT,
                             max_workers: int = 16,
                             progress_fn=None,
                             cancel_fn=None):
-    """Fetch several channels over [start_ns, end_ns) using ONE shared thread pool.
+    """Raw (undecimated) read of several channels — see cpva_fetch_many_adaptive.
 
-    All (channel, 1-hour-chunk) requests compete for the same pool, so the load
-    is limited by a single ``max_workers`` cap instead of running channels
-    sequentially. Returns ``(results, errors)`` where ``results`` maps each
-    channel to its time-ordered sample list and ``errors`` maps a channel to the
-    first error string encountered (that channel's data may be partial/empty).
-
-    ``progress_fn(done, total)`` is called from worker threads as chunks finish.
-    ``cancel_fn()`` is polled between chunks — see :func:`_is_cancelled`.
+    Kept as the two-value form for callers that do not need the report.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    tasks = []                       # (channel, chunk_idx, cs, ce)
-    for ch in channels:
-        cs = start_ns
-        i = 0
-        while cs < end_ns:
-            ce = min(cs + CHUNK_SIZE_NS, end_ns)
-            if not _chunk_is_night(cs, ce):
-                tasks.append((ch, i, cs, ce))
-            i += 1
-            cs = ce
-
-    results_map = {ch: {} for ch in channels}
-    errors: dict[str, str] = {}
-    total = len(tasks)
-    if progress_fn:
-        progress_fn(0, total)
-    if total == 0:
-        return {ch: [] for ch in channels}, errors
-
-    done = 0
-    workers = min(max_workers, total)
-
-    def _run(ch, cs, ce):
-        if _is_cancelled(cancel_fn):
-            return None                         # queued but no longer wanted
-        return cpva_fetch_samples(ch, cs, ce, timeout)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {
-            ex.submit(_run, ch, cs, ce): (ch, idx)
-            for ch, idx, cs, ce in tasks
-        }
-        for fut in as_completed(futures):
-            ch, idx = futures[fut]
-            try:
-                res = fut.result()
-            except Exception as exc:            # keep other channels/chunks alive
-                errors.setdefault(ch, str(exc))
-            else:
-                if res is not None:
-                    results_map[ch][idx] = res
-            done += 1
-            if progress_fn:
-                progress_fn(done, total)
-            if _is_cancelled(cancel_fn):
-                ex.shutdown(wait=False, cancel_futures=True)
-                break
-
-    out = {}
-    for ch in channels:
-        merged = []
-        for idx in sorted(results_map[ch]):
-            merged.extend(results_map[ch][idx])
-        out[ch] = merged
-    return out, errors
+    res, errors, _report = cpva_fetch_many_adaptive(
+        channels, start_ns, end_ns, count=None, timeout=timeout,
+        max_workers=max_workers, progress_fn=progress_fn, cancel_fn=cancel_fn)
+    return res, errors
 
 
 def cpva_fetch_many_optimized(channels: list[str], start_ns: int, end_ns: int,
@@ -420,61 +818,53 @@ def cpva_fetch_many_optimized(channels: list[str], start_ns: int, end_ns: int,
                               max_workers: int = 16,
                               progress_fn=None,
                               cancel_fn=None):
-    """Fetch several channels using server-side decimation (one request each).
+    """Decimated read of several channels — see cpva_fetch_many_adaptive.
 
-    Each channel is fetched with a single request over the whole window, passing
-    ``count`` so the archiver returns decimated samples instead of every raw
-    sample (see cpva_fetch_samples). This needs no 1-hour chunking — the archiver
-    serves the full range at once from a decimation level. Returns
-    ``(results, errors)`` like cpva_fetch_many_chunked. ``progress_fn(done,
-    total)`` is called as channels finish (total = number of channels).
+    Kept as the two-value form for callers that do not need the report.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    results = {ch: [] for ch in channels}
-    errors: dict[str, str] = {}
-    total = len(channels)
-    if progress_fn:
-        progress_fn(0, total)
-    if total == 0:
-        return results, errors
-
-    done = 0
-    workers = min(max_workers, total)
-
-    def _run(ch):
-        if _is_cancelled(cancel_fn):
-            return None                         # queued but no longer wanted
-        return cpva_fetch_samples(ch, start_ns, end_ns, timeout, count)
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_run, ch): ch for ch in channels}
-        for fut in as_completed(futures):
-            ch = futures[fut]
-            try:
-                res = fut.result()
-            except Exception as exc:
-                errors.setdefault(ch, str(exc))
-            else:
-                if res is not None:
-                    results[ch] = res
-            done += 1
-            if progress_fn:
-                progress_fn(done, total)
-            if _is_cancelled(cancel_fn):
-                ex.shutdown(wait=False, cancel_futures=True)
-                break
-    return results, errors
+    res, errors, _report = cpva_fetch_many_adaptive(
+        channels, start_ns, end_ns, count=count, timeout=timeout,
+        max_workers=max_workers, progress_fn=progress_fn, cancel_fn=cancel_fn)
+    return res, errors
 
 
 # Cumulative look-back horizons (seconds) for hunting the most recent sample
 # before a time. We scan the NEW slice at each step (near → far) and stop at the
-# first hit, so PVs with recent data cost one chunk and only truly-stale PVs pay
-# for the deeper scan. The archiver is unreliable for windows > 1 h, so every
-# slice is fetched via cpva_fetch_samples_chunked (1-hour chunks) — a single
-# multi-hour request would silently return nothing.
+# first hit, so PVs with recent data cost one request and only truly-stale PVs
+# pay for the deeper scan.
 _LAST_BEFORE_STEPS_S = (3600, 6 * 3600, 24 * 3600,
                         3 * 24 * 3600, 7 * 24 * 3600, 30 * 24 * 3600)
+
+# Enough points to be sure the newest one in the range is among them, few
+# enough that the archiver will serve a wide range in one go.
+_LAST_BEFORE_COUNT = 100
+
+
+def _last_before_in_range(channel: str, lo: int, hi: int,
+                          timeout: float = CPVA_HTTP_TIMEOUT,
+                          cancel_fn=None):
+    """Newest sample in [lo, hi), hunted NEWEST HALF FIRST, or None.
+
+    One request when the archiver will serve the whole range, and O(log) when
+    it will not — instead of one request per hour. That matters because this
+    runs for every signal whose data starts after the window: at a fixed hour
+    grid the deepest 30-day ring alone was ~720 requests per signal.
+    """
+    if hi <= lo or _is_cancelled(cancel_fn):
+        return None
+    try:
+        raw = cpva_fetch_samples(channel, lo, hi,
+                                 _timeout_for_span(hi - lo, timeout),
+                                 _LAST_BEFORE_COUNT)
+    except Exception as exc:
+        if not (_is_splittable_error(exc) and (hi - lo) > MIN_CHUNK_NS):
+            return None
+        mid = lo + (hi - lo) // 2
+        return (_last_before_in_range(channel, mid, hi, timeout, cancel_fn)
+                or _last_before_in_range(channel, lo, mid, timeout, cancel_fn))
+    if not raw:
+        return None
+    return max(raw, key=lambda s: (s.get("time") or 0))
 
 
 def cpva_fetch_last_before(channel: str, before_ns: int,
@@ -482,9 +872,9 @@ def cpva_fetch_last_before(channel: str, before_ns: int,
                            cancel_fn=None):
     """Return the most recent sample dict strictly before `before_ns`, or None.
 
-    Scans expanding 1-hour-chunked rings back to ~30 days and stops at the first
-    ring that holds data, so a PV whose last update predates the requested
-    window can still be carried forward instead of leaving a gap in the plot.
+    Scans expanding rings back to ~30 days and stops at the first ring that
+    holds data, so a PV whose last update predates the requested window can
+    still be carried forward instead of leaving a gap in the plot.
     ``cancel_fn`` is polled before every ring, since the deepest scan is the
     single longest thing the initial load does.
     """
@@ -495,13 +885,9 @@ def cpva_fetch_last_before(channel: str, before_ns: int,
         lo = max(0, before_ns - int(step_s * 1e9))
         if lo >= hi:
             break
-        try:
-            raw = cpva_fetch_samples_chunked(channel, lo, hi, timeout)
-        except Exception:
-            raw = None
-        if raw:
-            # Chunked results are time-ordered ascending → last is nearest `hi`.
-            return raw[-1]
+        found = _last_before_in_range(channel, lo, hi, timeout, cancel_fn)
+        if found:
+            return found
         hi = lo
         if lo == 0:
             break
@@ -641,12 +1027,12 @@ def parse_user_datetime(s: str) -> datetime | None:
 # ---------------------------------------------------------------------------
 
 # Segments stripped from PV names for display (case-insensitive).
+# Each name is only dropped when it is a WHOLE dash/underscore segment. Without
+# the boundary guards the "IN" alternative also matched inside a word, so
+# L3-TIMING-TIMING:SysRate was labelled "L3-TIM_G-TIM_G - SysRate" — on the
+# graph, in the table header and in the exported file.
 _STRIP_PATTERNS = re.compile(
-    r"HAPLS[-_]?|"
-    r"ENER[-_]?|"
-    r"[-_]?IN[-_]?|"
-    r"[-_]?LT\d[-_]?|"
-    r"[-_]?DIAG\d?[-_]?|"
+    r"(?<![A-Za-z0-9])(?:HAPLS|ENER|IN|LT\d+|DIAG\d*)(?![A-Za-z0-9])[-_]?|"
     r"[-_]{2,}",
     re.IGNORECASE,
 )
@@ -665,7 +1051,10 @@ def shorten_pv_name(full_name: str) -> str:
 
     # Strip noise from device part
     device = _STRIP_PATTERNS.sub("_", device_part)
-    device = re.sub(r"_+", "_", device).strip("_")
+    # Collapse any run of separators, not just underscores: a dropped segment
+    # leaves its own "_" next to the dash that separated it, and "PFM8-_" would
+    # otherwise come out as "PFM8-".
+    device = re.sub(r"[-_]{2,}", "_", device).strip("-_")
 
     # From the field, take only up to the first dot segment (drop .RBV, .value, etc.)
     field = field_part.split(".")[0] if field_part else ""

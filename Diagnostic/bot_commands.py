@@ -20,7 +20,7 @@ spaces; only ``,`` and ``;`` are structural.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -64,6 +64,12 @@ def parse_command(text: str) -> ParsedCommand:
     parts = re.split(r"\s+", text, maxsplit=1)
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
+    # An option written straight onto the command — "/food; cz" or "/food;cz" —
+    # is the natural way to type it, and it used to make the command itself
+    # "/food;", which matched nothing and answered "unknown command".
+    if OPT_SEP in cmd:
+        cmd, _, glued = cmd.partition(OPT_SEP)
+        args = f"{OPT_SEP}{glued} {args}".strip()
     segments = [s.strip() for s in args.split(OPT_SEP)]
     items = [i.strip() for i in segments[0].split(ITEM_SEP) if i.strip()]
     options = [s for s in segments[1:] if s]
@@ -118,12 +124,130 @@ def _parse_date(token: str, now: datetime):
     return None
 
 
-def _fmt_range(start: datetime, end: datetime, truncated: bool) -> str:
+def _fmt_range(start: datetime, end: datetime, truncated: bool,
+               day_end: bool = False) -> str:
+    if day_end:
+        # The end was typed as a bare date, so say that date rather than the
+        # midnight that follows it — nobody types "1.9." and expects to read
+        # "2. 9. 00:00" back.
+        last = end - timedelta(seconds=1)
+        return (f"{start:%Y-%m-%d %H:%M}–{last:%Y-%m-%d} "
+                f"(to the end of the day)")
     if start.date() == end.date():
         label = f"{start:%Y-%m-%d %H:%M}–{end:%H:%M}"
     else:
         label = f"{start:%Y-%m-%d %H:%M}–{end:%Y-%m-%d %H:%M}"
     return label + (" (so far)" if truncated else "")
+
+
+# --- a range between two points in time ------------------------------------
+#
+# "1.1. 9:00 - 1.9. 12:00". Tried only after the single-window parser below has
+# refused the text, so none of the older forms can be captured by accident.
+
+_TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?$")
+_DASHES = ("-", "–", "—")     # hyphen, en dash, em dash
+MAX_RANGE_DAYS = 3 * 366
+
+
+class _Endpoint:
+    """One side of a range: a day, a time of day, either, or the word 'now'."""
+
+    def __init__(self, day=None, tm=None, is_now=False, year_guessed=False):
+        self.day = day
+        self.tm = tm
+        self.is_now = is_now
+        # True when the user wrote "5.9." and the year was filled in for them.
+        self.year_guessed = year_guessed
+
+    @property
+    def has_date(self) -> bool:
+        return self.day is not None
+
+    @property
+    def whole_day(self) -> bool:
+        return self.day is not None and self.tm is None
+
+
+def _parse_endpoint(text: str, now: datetime):
+    """'1.1. 9:00' | '2026-01-01' | '9:00' | 'today 7' | 'now' -> _Endpoint."""
+    tokens = text.split()
+    if not tokens:
+        return None
+    if tokens == ["now"]:
+        return _Endpoint(is_now=True)
+
+    day = None
+    year_guessed = False
+    if tokens[0] == "today":
+        day, tokens = now.date(), tokens[1:]
+    elif tokens[0] == "yesterday":
+        day, tokens = (now - timedelta(days=1)).date(), tokens[1:]
+    else:
+        parsed = _parse_date(tokens[0], now)
+        if parsed is not None:
+            m = _CZ_DATE_RE.match(tokens[0])
+            year_guessed = bool(m and not m.group(3))
+            day, tokens = parsed, tokens[1:]
+    if tokens and tokens[0] in ("time", "t", "from", "at"):
+        tokens = tokens[1:]
+
+    tm = None
+    if tokens:
+        if len(tokens) > 1:
+            return None
+        m = _TIME_RE.match(tokens[0])
+        if m is None:
+            return None
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if h > 24 or mi > 59 or (h == 24 and mi):
+            return None
+        tm = dtime(0, 0) if h == 24 else dtime(h, mi)
+        if h == 24:
+            # "1.9. 24:00" means the end of that day.
+            day = day + timedelta(days=1) if day is not None else None
+    if day is None and tm is None:
+        return None
+    return _Endpoint(day, tm, year_guessed=year_guessed)
+
+
+def _parse_range(spec: str, now: datetime, tz):
+    """Return (start, end, day_end) for a two-point range, else None."""
+    for i, ch in enumerate(spec):
+        if ch not in _DASHES:
+            continue
+        left, right = spec[:i].strip(), spec[i + 1:].strip()
+        if not left or not right:
+            continue
+        a = _parse_endpoint(left, now)
+        b = _parse_endpoint(right, now)
+        if a is None or b is None:
+            continue
+        # Without a date on at least one side this is an ordinary clock window
+        # ("7-18"), which the parser above already understands.
+        if not (a.has_date or b.has_date):
+            continue
+
+        start_day = a.day or b.day
+        start = datetime.combine(start_day, a.tm or dtime(0, 0), tzinfo=tz)
+        if b.is_now:
+            return start, now, False
+        end_day = b.day or a.day
+        if b.year_guessed and end_day < start_day:
+            # "1.9. - 5.9." typed on 2 September. A lone date means the most
+            # recent one, which for the far end of a range would land a year
+            # before the near end. The user plainly meant the days that follow.
+            try:
+                end_day = end_day.replace(year=end_day.year + 1)
+            except ValueError:                    # 29 February
+                end_day = end_day.replace(year=end_day.year + 1, day=28)
+        if b.whole_day:
+            # A bare date on the right means the whole of that day.
+            end = datetime.combine(end_day + timedelta(days=1), dtime(0, 0),
+                                   tzinfo=tz)
+            return start, end, True
+        return start, datetime.combine(end_day, b.tm, tzinfo=tz), False
+    return None
 
 
 def parse_time_spec(spec: str, now_ns: int, tz=TZ_DEFAULT) -> TimeRange:
@@ -137,7 +261,40 @@ def parse_time_spec(spec: str, now_ns: int, tz=TZ_DEFAULT) -> TimeRange:
         today 7-18 | yesterday 7-18  clock window on that day
         2026-08-15 | 15.8. | 15.8.2026        that whole day
         2026-08-15 7-18 | 15.8. 7-18          clock window on that date
+        1.1. 9:00 - 1.9. 12:00       a range between two points in time
+        1.1. - 1.9.                  ... whole days when a side has no time
+        yesterday 21:00 - now        ... 'now' is allowed on the right
     """
+    try:
+        return _parse_single_window(spec, now_ns, tz)
+    except CommandError as first:
+        # Only text the older forms cannot explain is offered to the range
+        # parser, and when that fails too the first message is the better one.
+        s = " ".join((spec or "").split()).lower()
+        now = datetime.fromtimestamp(now_ns / NS, tz=tz)
+        got = _parse_range(s, now, tz) if s else None
+        if got is None:
+            raise first
+        start, end, day_end = got
+        if end <= start:
+            raise CommandError(
+                f"The range '{spec}' ends before it starts.") from None
+        if (end - start).days > MAX_RANGE_DAYS:
+            raise CommandError(
+                f"'{spec}' is longer than three years — that is more than the "
+                f"archive can be asked for in one go.") from None
+        truncated = False
+        if end > now:
+            end, truncated, day_end = now, True, False
+        if end <= start:
+            raise CommandError(
+                f"The range '{spec}' is entirely in the future.") from None
+        return TimeRange(int(start.timestamp() * NS), int(end.timestamp() * NS),
+                         _fmt_range(start, end, truncated, day_end))
+
+
+def _parse_single_window(spec: str, now_ns: int, tz=TZ_DEFAULT) -> TimeRange:
+    """The one-window forms: a relative span, a clock window, a whole day."""
     s = " ".join((spec or "").split()).lower()
     if not s:
         raise CommandError("Empty time window.")
@@ -150,6 +307,10 @@ def parse_time_spec(spec: str, now_ns: int, tz=TZ_DEFAULT) -> TimeRange:
             raise CommandError("The time window must be longer than zero.")
         unit = (m.group(2) or "h")[0]
         seconds = n * {"h": 3600.0, "m": 60.0, "d": 86400.0}[unit]
+        if seconds > MAX_RANGE_DAYS * 86400.0:
+            raise CommandError(
+                f"'{spec}' is longer than three years — that is more than the "
+                f"archive can be asked for in one go.")
         return TimeRange(now_ns - int(seconds * NS), now_ns,
                          f"last {_fmt_num(n)} {unit}")
 
@@ -237,6 +398,12 @@ def parse_yaxis_spec(spec: str):
 class PlotOptions:
     time: Optional[TimeRange] = None
     yaxis: Optional[tuple] = None     # (lo, hi); None = autoscale
+    detail: bool = False              # read every reading, however long it takes
+    warnings: list = field(default_factory=list)
+
+
+# Words that ask for the complete reading instead of a fast summary.
+_DETAIL_WORDS = ("detail", "details", "full", "everything", "all data", "raw")
 
 
 def parse_plot_options(options: list[str], now_ns: int,
@@ -245,9 +412,20 @@ def parse_plot_options(options: list[str], now_ns: int,
     a chat-ready message on anything it cannot place."""
     out = PlotOptions()
     for opt in options:
+        low = " ".join(opt.split()).lower()
+        if low in _DETAIL_WORDS:
+            out.detail = True
+            continue
         if _Y_RE.match(opt):
             out.yaxis = parse_yaxis_spec(opt)
             continue
+        if out.time is not None:
+            # Two time windows in one command used to let the last one win in
+            # silence. With ranges in the language that is easy to do by
+            # accident, so say which one is being used.
+            out.warnings.append(
+                f"Two time windows were given; I am using the last one, "
+                f"'{opt.strip()}'.")
         out.time = parse_time_spec(opt, now_ns, tz)
     return out
 
@@ -293,5 +471,11 @@ SYNTAX_HELP = (
     "`2d`, `7-18`, `7:30-18:00`, `today`, `yesterday`, `yesterday 7-18`, "
     "`15.8. 7-18`, `2026-08-15`. A bare `7-18` means today if it has already "
     "started, otherwise yesterday.\n"
-    "**Y range:** `y 15-35` or `y auto`."
+    "**A range between two points in time:** `1.1. 9:00 - 1.9. 12:00`, "
+    "`1.1. - 1.9.`, `yesterday 21:00 - now`. A side with no date takes the "
+    "other side's date; a side with a date but no time means the whole of that "
+    "day.\n"
+    "**Y range:** `y 15-35` or `y auto`.\n"
+    "**`; detail`** reads every single reading instead of a fast summary — "
+    "right for a close look, slow over months."
 )

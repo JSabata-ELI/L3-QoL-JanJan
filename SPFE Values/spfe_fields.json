@@ -1,0 +1,123 @@
+{
+  "_comment": [
+    "The quantities recorded every morning and every evening, in the order they",
+    "appear in the table. Editing this file is how a quantity is added, renamed or",
+    "given its PV -- no code change is needed.",
+    "",
+    "A row is:",
+    "  key      unique, never changes; it is the column name in spfe_log.csv",
+    "  label    what stands in the second column of the table",
+    "  pvs      one PV name per number in the cell. Empty string = not filled in yet;",
+    "           the cell then shows a dash. A row with no pvs at all is manual.",
+    "  join     what separates the numbers of a multi-PV row (default ';')",
+    "  unit     shown in the Quantity column, in brackets, after the label. It is",
+    "           never typed into a value cell -- only the number is typed.",
+    "  decimals how many decimal places",
+    "  round    the step each number is shown to: 10 = to the nearest ten, 100 = to",
+    "           the nearest hundred, 1 = whole numbers. One entry per PV, or a single",
+    "           number for the whole row. Only the SCREEN and the workbook are",
+    "           rounded -- spfe_log.csv keeps the measured value, so the",
+    "           out-of-range statistics still see the real spread.",
+    "  manual   'text' or 'number' -- typed by the operator instead of read from a PV",
+    "  default  what a manual row shows until somebody types over it. Written into",
+    "           the record when a moment is recorded, so the file says what the",
+    "           screen says. Typing over it changes that one day only.",
+    "  default_from  the first day the default counts. Days before it show an empty",
+    "           cell that can still be typed into, and nothing is written into the",
+    "           files -- a setting cannot be claimed for a day that predates it.",
+    "  url      makes the label a link; clicking it opens the address in a browser",
+    "  check    false switches the out-of-range statistics off for this row",
+    "",
+    "STILL TO BE FILLED IN: Pumplaser DAC, Humidity, Oscillator Power, Oscillator",
+    "Bandwidth and DAZZ2 have no PV -- the archiver has no channel with pump, dac,",
+    "humid, osc or dazz in its name. L3-SPFE-AOD03-002 is the only dazzler the",
+    "archiver knows; DAZZ1 reads its Power_RB.",
+    "",
+    "A dazzler has ONE percentage, not two. The second number the table used to",
+    "show (Amplitude_RB, labelled 'intensity') was a guess and is gone."
+  ],
+
+  "groups": [
+    {
+      "label": "SPFE",
+      "rows": [
+        {"key": "pumplaser_dac", "label": "Pumplaser DAC", "pvs": [""], "decimals": 0}
+      ]
+    },
+    {
+      "label": "Humidity",
+      "rows": [
+        {"key": "humidity", "label": "", "pvs": [""], "unit": "%", "decimals": 1}
+      ]
+    },
+    {
+      "label": "Oscillator",
+      "rows": [
+        {"key": "osc_power",     "label": "Power",     "pvs": [""], "unit": "mW", "decimals": 0},
+        {"key": "osc_bandwidth", "label": "Bandwidth", "pvs": [""], "unit": "nm", "decimals": 0}
+      ]
+    },
+    {
+      "label": "1st amplifier",
+      "rows": [
+        {"key": "ba1loop4", "label": "BA1Loop4 (X,Y)",
+         "pvs": ["L3-SPFE-BA1:X_QD4", "L3-SPFE-BA1:Y_QD4"], "join": ";",
+         "decimals": 0, "round": [10, 10]}
+      ]
+    },
+    {
+      "label": "Dazzlers",
+      "rows": [
+        {"key": "dazz1", "label": "DAZZ1",
+         "pvs": ["L3-SPFE-AOD03-002:Power_RB"],
+         "unit": "%", "decimals": 0, "round": 1},
+        {"key": "dazz2", "label": "DAZZ2", "pvs": [""],
+         "unit": "%", "decimals": 0, "round": 1}
+      ]
+    },
+    {
+      "label": "XPW",
+      "rows": [
+        {"key": "ba2loop2", "label": "Input - BA2Loop2 (X,Y,SUM)",
+         "pvs": ["L3-SPFE-BA2:X_QD2", "L3-SPFE-BA2:Y_QD2", "L3-SPFE-BA2:Sum_QD2"],
+         "join": ";", "decimals": 0, "round": [10, 10, 100]},
+        {"key": "ba2loop4", "label": "Output - BA2Loop4 (X,Y,SUM)",
+         "pvs": ["L3-SPFE-BA2:X_QD4", "L3-SPFE-BA2:Y_QD4", "L3-SPFE-BA2:Sum_QD4"],
+         "join": ";", "decimals": 0, "round": [10, 10, 100]}
+      ]
+    },
+    {
+      "label": "Spider settings",
+      "rows": [
+        {"key": "spider_e5",   "label": "for E5",   "manual": "number", "unit": "fs2",
+         "decimals": 0, "default": "-917", "default_from": "2026-09-01"},
+        {"key": "spider_orig", "label": "Original", "manual": "number", "unit": "fs2",
+         "decimals": 0, "default": "333", "default_from": "2026-09-01"}
+      ]
+    },
+    {
+      "label": "The best GDD",
+      "rows": [
+        {"key": "gdd_baseline",  "label": "L3 baseline",       "manual": "number",
+         "unit": "fs2", "decimals": 0, "default": "22710", "default_from": "2026-09-01"},
+        {"key": "gdd_electrons", "label": "E5: for electrons", "manual": "number",
+         "unit": "fs2", "decimals": 0, "default": "24300", "default_from": "2026-09-01"},
+        {"key": "gdd_plasma",    "label": "E5: for plasma",    "manual": "number",
+         "unit": "fs2", "decimals": 0, "default": "23700", "default_from": "2026-09-01"}
+      ]
+    },
+    {
+      "label": "Energy",
+      "rows": [
+        {"key": "energy", "label": "Energy", "manual": "number", "unit": "", "decimals": 2,
+         "url": "https://elibeamlines.sharepoint.com/:x:/r/sites/L3-HAPLS/_layouts/15/Doc.aspx?sourcedoc=%7B2CCB4AA1-2B11-4ED3-AD1D-4EAE7E851921%7D&file=SPFE_Energy%20comparison.xlsx&action=default&mobileredirect=true&DefaultItemOpen=1"}
+      ]
+    },
+    {
+      "label": "Notes",
+      "rows": [
+        {"key": "notes", "label": "Notes", "manual": "text"}
+      ]
+    }
+  ]
+}

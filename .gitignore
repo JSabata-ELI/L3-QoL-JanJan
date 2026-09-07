@@ -21,6 +21,8 @@ Diagnostic/notify_provision.dat
 # --- Runtime logs and generated output ---
 *.log
 Pulser Monitor/gui_out/
+CSS Logger/testing/_out/
+SPFE Values/testing/_*.png
 
 # --- Lokální stav Dev Tools (každý má svůj) ---
 Dev Tools/build_usage.json

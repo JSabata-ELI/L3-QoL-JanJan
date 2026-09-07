@@ -17,22 +17,26 @@ WHAT IT IS
       Image Slider   play a sequence like a film, one camera or
                      several side by side, recorded or live
       Shot Finder    find the shots where a value was what you want
-      One Moment     pick a moment in the graph and see every
-                     camera at that moment
       Workshop       look at one image properly: measure it, mark
                      it, export it
 
   The tabs hand images to each other. Anything you find in the first
-  four can be sent to Workshop with one button.
+  three can be sent to Workshop with one button.
+
+  "One Moment" is gone: it is part of the Image Finder now. Picking a
+  moment out of a graph and seeing every camera at that moment is
+  done there, under "PV Search" — and you can pick as many moments as
+  you like, on as many days as you like, in one go.
 
 
-THE FIVE TABS
+THE FOUR TABS
 
   COMPARE DAYS
     Click "Time window" to pick the days in the calendar and
-    "Cameras..." to choose the cameras — the two buttons sit side by
+    "Cameras" to choose the cameras — the two buttons sit side by
     side, as in the Image Slider — and the days come up next to each
-    other, so a change shows itself. The camera picker keeps presets,
+    other, so a change shows itself. Press OK in the calendar when
+    you have finished picking; that is what sends it off to look. The camera picker keeps presets,
     the same ones the Image Slider offers. Every day is drawn on the SAME scale, and one set
     of brightness and contrast controls applies to all of them —
     otherwise the comparison would lie.
@@ -45,19 +49,48 @@ THE FIVE TABS
     drifted. Right-click a day to make it the reference, or drop it
     again.
 
-    "Save comparison" writes the whole wall as ONE picture with the
-    days labelled, ready to put in a report. Click a day to look at
-    that one frame closely, and "One frame" / "Days side by side"
-    switches between the two.
+    "Save view" writes the whole view into ONE file with the days
+    labelled, ready to put in a report — every row, including the ones
+    you would have to scroll to. It asks PNG or PDF, and this tab or
+    every tab. Click a day to open that frame in a close-up window,
+    much bigger than the picture itself; the arrows under it step
+    through the rest of the wall.
 
     You can also pick a day and an hour and see what was recorded,
     with the shot energy and any machine values you asked for, and
     send anything on to Workshop or the Image Slider.
 
+    "PV Search" is the other way in, and it is where One Moment went.
+    Mark as many days as you like in its calendar and plot a machine
+    value over them — one day at a time, or all the marked days next
+    to each other. Then either:
+
+      CLICK the graph. That moment is picked, and every further click
+      picks ANOTHER one, on this day or on any other marked day, so
+      you build the set up as you go. Ctrl+Z (or the Undo button)
+      takes the last one back. You get every picked camera at every
+      picked moment.
+
+      DRAG over a stretch. Every stretch gets its own picture from
+      every camera, taken from the peak of the value inside it, and
+      the table under the graph gives the numbers for it.
+
+    Or say it as a number: "the first moment SBW4 was above 13 J"
+    gives you that one moment on all the cameras at once, and it
+    checks the cameras were actually recording something before it
+    answers.
+
+    The cameras do not have to be picked first — press Search and it
+    asks for them, then goes.
+
   IMAGE SLIDER
     The one used most. Choose a period and one or more cameras, and
     then scrub through the frames with the slider or play them back.
-    In live mode it follows the archive as new shots arrive.
+    In live mode it follows the archive as new shots arrive, and a
+    new picture appears as soon as the file is finished being
+    written rather than about a second later. Every camera in the
+    grid does, including the ones whose file happens to land while
+    the selected camera's own picture is still being read.
 
     Every setting — brightness, contrast, palette, zoom — applies to
     the cameras that were SELECTED WHEN YOU MOVED THE CONTROL, or to
@@ -67,7 +100,9 @@ THE FIVE TABS
     A panel of machine values sits beside the picture and always
     shows the values belonging to the frame you are looking at,
     waiting for the archive if it has to rather than showing the
-    previous shot's numbers.
+    previous shot's numbers. While it is waiting it keeps asking at
+    a steady pace instead of backing off, so the numbers land with
+    the picture rather than a beat after it.
 
     LIMITS AND TRIPS — LIVE MODE ONLY
     Any of those values can be given a limit. Open "Select PV
@@ -118,15 +153,40 @@ THE FIVE TABS
     picks the one showing the most picture altogether. Any room left
     over is an even grey margin around the picture.
 
-    To arrange them yourself, drag a camera by its name bar to move it
-    and by its border to resize it, while the pictures keep playing.
-    Right-click the name bar and choose "Auto-arrange cameras" to hand
-    the arrangement back to the program.
+    Press "Camera" and you see that arrangement straight away, under
+    the list of picked cameras, in a Layout picture that is a true
+    scale model of the camera area: each window and each picture has
+    the proportions it will really have, name bar included. Each
+    camera's name is written across its own picture, always at a size
+    you can read.
 
-    Your arrangement can be saved: open "Cameras...", type a name and
+    You can also say how important each camera is. Click a camera in
+    the Layout picture and five buttons come alive above it —
+    Smallest, Small, Medium, Large, Largest. A Largest camera is asked
+    for sixteen times the picture area of a Smallest one, and the
+    program then arranges them that way while still filling the whole
+    area. The choice is written under the camera's name so you can read
+    it without clicking, and it is remembered for that camera from then
+    on, in every set you open it in. New cameras start at Medium.
+
+    Wide differences cost empty space: a small camera gets a small
+    window and its picture cannot fill a window of another shape, so
+    grey room is left around it. Out of all the arrangements that come
+    out at the sizes you asked for, the program picks the one showing
+    the most picture.
+    With more than twelve cameras open the sizes are ignored
+    altogether and every camera is treated the same.
+
+    To arrange them yourself, drag a camera by its name bar to move it
+    and by its border to resize it — in the Layout picture, or on the
+    live pictures while they keep playing. Right-click a name bar and
+    choose "Auto-arrange cameras", or press "Auto-arrange" in the
+    Layout picture, to hand the arrangement back to the program.
+
+    Your arrangement can be saved: open "Camera", type a name and
     press Save next to the list of saved sets. The preset then holds
-    the cameras AND where each one sits, so it comes back exactly as
-    you left it.
+    the cameras, where each one sits AND how big each one is set to
+    be, so it comes back exactly as you left it.
 
   SHOT FINDER
     Give a value and a tolerance — an energy, a waveplate angle —
@@ -146,92 +206,6 @@ THE FIVE TABS
     over the whole day and where in it the shot you are looking at
     sits. Switching to another camera's tab keeps that place.
 
-  ONE MOMENT
-    The other way round from every other tab. They show one thing
-    over time; this one shows everything at one time.
-
-    All the settings are in the panel down the left, as in the Image
-    Slider. The first button opens the calendar and picks the day and
-    the From/To times — the same calendar as in the Image Slider —
-    and afterwards it says on itself what you picked, for example
-    "24.08.  07:00-19:00". The button beside it picks the cameras and
-    says how many. "Search / select PVs..." picks the machine values
-    — the same search and the same list as everywhere else in the
-    program. "Load" then draws them, ALL IN ONE GRAPH:
-    values in the same unit share a scale, values in different units
-    each get a scale of their own, and nothing is stretched to fit
-    anything else.
-
-    On the graph, the LEFT button reads it and the RIGHT button looks
-    closer at it:
-      - LEFT CLICK a moment. The frame from every camera you picked
-        comes up on the right, and the left panel says what each
-        value was at that moment. "prev" / "next" step from shot to
-        shot.
-      - LEFT DRAG across a stretch. "Range statistics" then gives the
-        average, the spread and the count for each value; hover a row
-        for the smallest, the largest and the peak-to-peak.
-      - RIGHT DRAG across a stretch to zoom the time axis into it;
-        RIGHT CLICK to step back out again. The marked stretch and
-        the picked moment are not touched by zooming.
-
-    A moment you CLICK in the graph is kept, listed under "The
-    moment" with the newest at the top. Click a row to go back to
-    that moment instead of hunting for it again; "Forget" drops one
-    row and "Clear" empties the list. The list survives a restart.
-
-    "prev" and "next" save nothing — stepping through a stretch of
-    the day would otherwise bury the list under moments you were only
-    walking past. When you get to one worth keeping, press "Save".
-    It greys out once that moment is already on the list.
-
-    Going back to a moment you have already looked at is instant: the
-    frames are kept in memory, so nothing is read from the share a
-    second time.
-
-    "Send to Image Slider" opens the moment in the Image Slider with
-    the cameras you picked here — full size, with everything that tab
-    can do. It gets the quarter of an hour on either side of the
-    moment, so you can slide through the shots around it, and it
-    opens on the one you sent.
-
-    If a value has no reading inside the marked stretch — a waveplate
-    or a motor is only written down when it MOVES — the last reading
-    from before the stretch is carried forward instead. Those rows
-    are amber and say "held" where the spread would be, with the
-    count at 0, so they cannot be mistaken for a real average.
-
-    A click lands on the nearest real reading of the first value
-    drawn, because a moment between two readings has no shot behind
-    it. Each frame is captioned with the camera and its own time;
-    hover it for how far it is from the moment you asked for — a
-    frame is stored only about every 35 seconds, so a few seconds'
-    difference is normal.
-
-    "Image / Display" changes how the frames look: contrast,
-    brightness, gamma, palette and size, with the same meanings as in
-    the Image Slider. Changing them redraws the frames without
-    reading them from the share again, and going back to a setting you
-    already had is instant too. Holding Ctrl and rolling the
-    mouse wheel over the frames makes them bigger or smaller in
-    place — the window and the graph do not move.
-
-    The eye next to a value takes it off the graph without unpicking
-    it. Click a frame to send it to Workshop. The grey bar between
-    the graph and the frames can be dragged to give either of them
-    more room.
-
-    A value you built from a FORMULA is drawn like any other one. The
-    values it is built from are read even if you did not tick them,
-    and the line breaks wherever one of them has nothing to give,
-    rather than being drawn straight across the gap. A formula with
-    no unit gets a scale of its own, so a ratio around 1.5 is not
-    flattened against a motor position of 20000.
-
-    The tab remembers what you left it on: the window, the cameras,
-    the values, the saved moments, the sliders and which panels were
-    open. Nothing is read from the archive until you press "Load".
-
   WORKSHOP
     One image at a time, properly. Zoom and pan, non-destructive
     brightness / contrast / gamma / palette, a histogram, drawing
@@ -247,6 +221,12 @@ THE FIVE TABS
     the Filters and Edit sections and the Crop tool change it, and
     every one of those can be undone. Saving always writes a NEW
     file — the file the image came from is never overwritten.
+
+    "Save with overlay" in the Save section, and in the right-click
+    menu on the picture, decides whether everything you drew goes
+    into the file with it — text, lines, strokes, regions, the scale
+    bar and the numbers the measuring tools wrote themselves. Untick
+    it and only the picture is written.
 
 
 ABOUT BRIGHTNESS — THE ONE THING WORTH READING

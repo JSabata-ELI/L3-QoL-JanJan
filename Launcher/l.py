@@ -349,7 +349,7 @@ def find_readme_full_or_none(program_dir: Path, program_name: str) -> Path | Non
 # Everything else (not listed) becomes "External".
 
 SCRIPTS = {
-    # folder names of programs that should be in "Scripts"
+    # folder names of programs that should be in "Main scripts"
     "Image Tools",
     "Screenshots",
     "Time Converter",
@@ -393,8 +393,8 @@ PERSONAL = {
 }
 
 GROUP_ORDER = [
-    ("Scripts", "scripts"),
-    ("Parts", "parts"),
+    ("Main scripts", "scripts"),
+    ("Side scripts", "parts"),
     ("External", "external"),
     ("In progress", "in_progress"),
     ("Not working correctly", "not_working_correctly"),
@@ -779,27 +779,57 @@ def prompt_restore_swap_state(parent: tk.Tk, stuck: list[tuple[str, Path, Path]]
 
 # ---------------- APP ----------------
 def _icon_app_id(prefix, ico_path):
-    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it, so a fixed id that was once seen without an icon keeps drawing the
-    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
-    program, same icon, only the id changed -> old id generic, fresh id
-    correct). Hashing the icon into the id makes every PC derive the same id
-    from the same picture, and retires the old id by itself the day the icon
-    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
-    clearing. Returns None when the icon cannot be read; the caller then sets
-    no id at all rather than burning a content id on a run that has no picture
-    to give it. The same helper sits in every program here.
+    it: an id that was once seen without a usable icon keeps drawing the
+    generic placeholder for good, whatever icon the window later carries, and
+    clearing the shell icon cache would have to be repeated on every PC.
+
+    Hashing the icon's own bytes into the id was the first fix, but a
+    content-only id can be poisoned just as well, and then it never recovers
+    because it only changes when the picture is redrawn. Measured again on
+    2026-09-03: Calibrations, CSS Logger, Git Work and Image Tools all drew
+    the blank window placeholder on the taskbar while their title bars carried
+    the right icon, and Diagnostic -- the only one whose id also carried its
+    file name -- drew its icon. So the running build's own file name, which
+    carries the version, goes into the hash too: every rebuild runs under an
+    id Windows has never seen, so it cannot be serving a stale picture for it,
+    on this PC or any other.
+
+    Returns None when the icon cannot be read; the caller then sets no id at
+    all rather than burning an id on a run that has no picture to give it.
+    The same helper sits in every program here.
     """
+    # A frozen build gets no taskbar identity at all, deliberately.
+    # Windows caches the taskbar picture per AppUserModelID and never re-reads
+    # it, so one bad cache entry breaks that build for good; tagging the id
+    # with the build's file name only postponed it (Diagnostic v1.1.3's id
+    # drew the blank placeholder within a day of the build). Measured
+    # 2026-09-04 with three otherwise identical windows: the app's own id ->
+    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
+    # from the exe's own resource, which the builder always embeds (verified
+    # on a purpose-built PyInstaller exe). With no id Windows keys the button
+    # on the exe itself, so there is no per-id cache left to go stale. An id
+    # is still worth having when running from source, where the process is
+    # python.exe and would otherwise wear the Python icon.
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return None
     if not ico_path:
         return None
+    import hashlib
+    import os
+    import sys
     try:
-        import hashlib
         with open(ico_path, "rb") as fh:
-            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+            data = fh.read()
     except OSError:
         return None
+    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
+                             else (sys.argv[0] or __file__))
+    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
+    return f"{prefix}.{tag.hexdigest()[:12]}"
 
 
 def set_app_icon(win, ico_path, app_id=None):

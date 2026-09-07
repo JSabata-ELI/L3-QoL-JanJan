@@ -16,8 +16,15 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `main.py` | The application — PySide6 "CPVA Suite" (CSS Logger + Spectra in one window). Run with `python main.py`. |
 | `cpva_core.py` | Non-UI helpers: config/preset I/O, CPVA archiver HTTP, time / PV-name / image helpers. No GUI toolkit — shared by `main.py` and the tests. |
 | `sp_t.py` | The Spectra widget, embedded as the second tab of the suite. This folder is its only home — see the warning at the top of `main.py`. Its own docs: `STRUCTURE_Spectra_tab.md`, `ReadMe_Spectra tab.txt`, `ReadMe_Spectra tab_Full.txt`. |
+| `daypicker.py` | The shared day/time picker — **a verbatim copy; the master is `Image Tools/daypicker.py`**. It is here because the builder only bundles `.py` files from the program's own folder, and it is loaded by path (`_import_daypicker` in `sp_t.py`) rather than by `import daypicker`, which the builder's module-home check would refuse. Change the master, then re-copy; `testing/test_daypicker_sync.py` fails while the two differ. |
 | `test_smoke.py` | Offline smoke test — headless (`QT_QPA_PLATFORM=offscreen`), network + dialogs mocked, clicks through every button/dialog; also covers custom-PV bindings (incl. the dialog's bindings table) and the Conditions filter. |
-| `test_live_pacing.py` | Offline test of live-mode pacing: window clamping, bounded tick look-back, cursor advance on an empty tick, Stop-Live cancellation, table item reuse. |
+| `test_live_pacing.py` | Offline test of live-mode pacing: the period is used as given (no clamp), bounded tick look-back, cursor advance on an empty tick, Stop-Live cancellation, table item reuse. |
+| `testing/test_long_window_fetch.py` | Offline test of loading a long period: full coverage of 12 h / 48 h / a year against an archiver that refuses anything wider than six hours, night hours read, no signal dragged down by another, unique ascending samples, unread ranges reported, cancellation, monotone progress, newest-first order, and the widget-level three-day load. |
+| `testing/probe_x_axis_long.py` | Renders the time axis for six periods (1 h … 1 year) with the real Windows backend, measures the pixel gap between stamps, and saves a PNG of each into `testing/_out/`. |
+| `testing/test_export_table.py` | Offline test of the table export and the carry-forward: the shot grid ignores the channels written at their own pace, a held value crosses a slice, a word value survives into the file, the table's columns follow the graph, and a whole day exports without a duplicate row at a slice seam. |
+| `testing/test_time_window_dialog.py` | Offline test of the Start/End picker: paging the calendar moves the selected day (a months-long period must not come back as the last hour), the status line follows, a short month clamps, and the multi-day picker keeps its own list. |
+| `testing/probe_export_dialog.py` | Renders the Export table dialog with the real Windows backend into `testing/_out/export_dialog.png` and measures it for pale text, empty labels and clipped names. |
+| `testing/probe_export_live.py` | End-to-end against the REAL archiver: loads a short window, prints how many rows each channel actually has a value in (so a held-only channel is visible as such), exports, and reads the file back. |
 | `test_count_param.py` | Focused test of the archiver `count` parameter handling (hits the real archiver). |
 | `cpva_explorer_config.json` | Saved settings (time range, shown channels, conditions, master PV, `graph_opts`, …). |
 | `cpva_presets.json` | Named PV-list presets. |
@@ -26,7 +33,7 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `derived_pvs.json` | A second store of derived-PV definitions. |
 | `ramping_setups.json` | Named ramping setups. |
 | `ramping_archive.json` | Index of the parquet files in `RampingRepository/`. |
-| `RampingRepository/` | Local parquet data (ramping events) — works offline. |
+| `RampingRepository/` | Local parquet data (ramping events). Historical: nothing has been written since 2026-06-19 and no tab reads it — the PV Time Plot now reads the archiver. `RAMPING_PV_MAP` in `cpva_core.py` is the short-name → PV table those files were built from, i.e. which archiver channel each old column came from. |
 | `build_config.json`, `icon.ico` | Build settings for Dev Tools, and the app icon. |
 | `importtime.txt` | Captured `python -X importtime` output from a startup-cost measurement. Not read by the app. |
 
@@ -39,8 +46,8 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 
 ### Purpose
 Explorer and logger for CPVA (Control System Studio) archive data. Shows PV
-values over time, walks the archive, exports CSV, draws graphs (Graph / XY /
-PV Time) and opens the camera images belonging to a row.
+values over time, walks the archive, exports a shot table to CSV, draws graphs
+(Graph / XY / PV Time) and opens the camera images belonging to a row.
 
 `CPVASuiteWindow(QMainWindow)` hosts two tabs — **CSS Logger**
 (`CSSLoggerWidget`) and **Spectra** (`sp_t.SpectraWidget`) — restores its
@@ -52,21 +59,118 @@ geometry and asks both children to stop their background work on close.
   with per-PV value boxes, span statistics, rubber-band zoom with history,
   reference lines, conditions, custom PVs, and the axis settings panel.
 - **XY Plot** — scatter of one loaded PV against another, rectangle zoom + history.
-- **PV Time Plot** — daily distribution / raw trace from the RampingRepository.
+- **PV Time Plot** — per-day violin (or every shot on a time axis) of one channel
+  over days picked on the calendar, read from the archiver by the tab itself and
+  cached per (day, PV) for the session. Independent of the Graph tab's window.
 - **Table** — `QTableWidget` of the merged rows, context menu (Copy row / Open
-  image), CSV export.
+  image), **Export table** (see below). Its columns are `_table_pvs()`, not
+  `_pv_order`: the channels that are on the graph (`show` ticked) and have
+  something in the window (a sample, or a held value from before it). A word
+  channel keeps its column — it has no line but belongs in a table of shots.
 - **Log** — run log.
 
 ### Sidebar
 Time window dialog, presets (load/save/save-as/delete), PV list
 (Browse/Remove/Clear), **LOAD DATA**, **Live** toggle with countdown, Master PV /
-master-multiple filter, PV count, progress bar.
+master-multiple filter, PV count, progress bar, **Stop loading** (shown only
+while a fetch runs).
+
+### Loading a long period
+A period is read newest first and **drawn as it arrives**: `_LoadSig.partial`
+carries a snapshot every ~1.5 s into `_on_load_partial`, which repaints the
+graph and the table without ending the load (it must never touch
+`_load_in_flight`, the progress bar or the summary). `_LoadSig.note` puts the
+fetch's own notes into the Log while it runs. There is no "this will be big,
+are you sure?" dialog — a year is a legitimate request, and the answer to "this
+is taking too long" is **Stop loading**, which bumps `_load_epoch` (the
+worker's `cancel_fn` watches it), keeps everything already painted and reports
+the rest as unread. `_set_load_pct` holds the bar's high-water mark, because the
+request total grows whenever the archiver refuses a range.
+
+`_load_truth_suffix` is what stops the status line lying: `⚠ N signals
+incomplete (X h unread)`, `stopped`, `raw data — the archiver does not thin it
+out`, and the table/graph truncation. When nothing at all was read it says
+**"Nothing could be read — see the Log tab"**, never "Loaded 0 pts" — that one
+line is how a period over half a day used to present itself.
+
+### PV Time Plot — its own fetch, cached per (day, PV)
+This tab does **not** use the main load. It has its own worker
+(`_pv_time_fetch`, own `_LoadSig`, own `_pv_time_epoch` cancel token) and reads
+whole local days, `dt_to_ns(day) … dt_to_ns(day+1)`, of only the channels it
+needs: the Y channel, every condition channel (switched on or not, so ticking a
+box never triggers a fetch), and the sources of any derived channel among them.
+
+`_pv_time_cache[(date, pv)] = {"ts", "val", "seed"}` — plain arrays, keyed **per
+channel**, not per set of channels. Keying it per set was the first attempt and
+it re-read every day the moment a condition named a ninth channel. `seed` is the
+carry-forward value from before the day, fetched with
+`cpva_fetch_last_before_many` only for channels whose first sample of the day is
+missing or late; without it a slow channel (waveplate, valve) is blank all
+morning and a condition on it drops the morning's shots.
+
+`_pv_time_day_columns` turns the cached arrays into shots: the grid is the
+**basis** channels' own timestamps (`req["basis"]`, the real PVs behind Y),
+merged with the `SAMPLE_HOLD_MIN_GAP_MS` rule via
+`np.diff(all_ts) > gap`; every other channel is read at each shot's last sample
+with `searchsorted(..., "right") - 1`, falling back to `seed`. The grid must
+come from Y alone: taking the union of every channel in play made a held-forward
+value count as another shot, so the same number entered the distribution
+repeatedly and the shot count changed with the condition list. Derived channels
+are `eval`'d over whole columns with `abs/min/max/round` bound to their **numpy**
+versions (`np.minimum`, `np.round`, …) — the builtins fail on an array.
+
+Each finished day is handed over by `sig.partial` as it completes, so pressing
+Plot mid-read keeps every day already fetched and only asks for the rest.
+
+### `_make_calendar(initial, follow_page=)` — the day must follow the month
+Paging the calendar (◀ ▶ / the month menu / the year box) does **not** move
+Qt's selected date. In a picker whose value *is* the one selected day that is a
+silent wrong answer: the user turns to February, presses OK, and gets the day
+the dialog opened on — with the untouched clock boxes that is exactly the
+window it was opened with, which is how "February → now" came back as **the
+last hour**. `follow_page=True` moves the selection onto the month on screen
+(same day of the month, clamped to its length) and repaints the delegate;
+`TimeWindowDialog` uses it and also connects `cal.selectionChanged` to
+`_refresh_status`, so the blue status line never disagrees with the highlight.
+`DatePickerDialog` must NOT use it — its value is an explicit list of days.
+
+### Table export — `_ExportTableDialog` + `_export_from_archive`
+Two lists, because they answer two different questions: **columns** (default
+`_table_pvs()`) and **rows**. Only channels written once per shot can give the
+table its moments; `_export_shot_channels()` picks the numeric channels that are
+not the master, not custom and not named like a housekeeping channel
+(`_NON_SHOT_PV_HINTS`). A rate/timing/fate/state channel writes at its own pace,
+so letting it mark shots turns a shot table into "something was archived here" —
+measured on a real 8-minute window: 16 shots vs 2 221 rate samples. Those
+channels are still exported, held at their last value.
+
+The re-read (`source: "archive"`) is the point of the feature: the graph is
+decimated to `avg_target_points`, so exporting what is loaded exports the
+picture. It fetches raw (`count=None`) and streams:
+
+| Piece | Role |
+|-------|------|
+| `_EXPORT_SLICE_NS` = 2 h | the window is read one slice at a time and appended, so a year never has to fit in RAM. Raw samples arrive as a dict *per sample* (with its own `metaData` dict), so a day of a dozen 3 Hz channels is most of a gigabyte. Small costs nothing: the request count is set by the span the archiver serves, not by the slice, and a dozen channels already fill the fetch pool. Keep it ≤ 4 h — above that `cpva_fetch_many_adaptive` adds a reachability probe per slice |
+| `_export_slices` | contiguous `[lo, hi)` slices; the last one is `+1 ns` so a sample exactly on the window end is not dropped |
+| `_export_slice_rows` | the shot grid = the basis channels' own timestamps merged by `np.diff > SAMPLE_HOLD_MIN_GAP_MS` (the same rule as `_build_table_rows`), then every channel read at `searchsorted(..., "right") - 1`, falling back to the value it is holding. Shots outside `[lo, hi)` are dropped — every request also returns the sample before its own start, so they belong to the neighbouring slice |
+| `held` | carried across slices (seeded by `cpva_fetch_last_before_many` at the window start), which is what pairs a slow channel onto a shot |
+| `last_ts` | a shot within one gap of the previous written row is skipped: the seam guard, because each slice groups its own samples independently |
+| `_export_eval` / `_export_row_ok` / `_export_fmt` | custom PVs per row (from `_cpv_plan()`, with the sources of an exported formula added to the fetch even when they are not columns), the Conditions filter, and one cell — `%.10g` for a float (never `str(0.1+0.2)`), a word value as it is, quoted by `csv.writer` |
+| `_export_epoch` | the cancel token. Bumped by the progress dialog's Cancel and by `CPVASuiteWindow.closeEvent`; a cancelled export keeps the file written so far |
+
+The progress dialog is **non-modal** — an export can run for an hour and the
+rest of the program must stay usable. Only one runs at a time.
 
 ### Dialogs
-`TimeWindowDialog` (absolute + relative quick picks per side),
+`TimeWindowDialog` (absolute + relative quick picks per side; `ends_at_now()`
+tells the caller whether the period follows the clock — the End side on its
+Relative tab with every box at zero. Without it, OK handed back two frozen
+timestamps and "end = now, keep up" was indistinguishable from "end = now, stand
+still", so picking yesterday 08:00-12:00 while Live was on showed the last four
+hours instead. Same idea as `daypicker.DayTimePicker.is_online_mode()`),
 `DatePickerDialog` + `_make_calendar` + `_WeekendDelegate` (house calendar style,
 Monday-first, red weekends), `PVBrowserDialog` (loads the channel list once, then
-filters locally), `_ConditionsDialog` (min/max per PV; custom channels are
+filters locally), `_ExportTableDialog` (see **Table export**), `_ConditionsDialog` (min/max per PV; custom channels are
 offered too), `_RefLinesDialog` (per line: name, which signal it belongs to, Y,
 colour, style, width, reorder, delete, and a button that hands control back to
 the two-click placement in the graph — signalled by `pick_request`, which makes
@@ -147,10 +251,13 @@ defaults or whatever was in effect when it opened.
 | Name | Why it exists |
 |------|---------------|
 | `_LIVE_MAX_SPAN_S` = 366 d | a window outside 60 s … this falls back to 1 h |
-| `_LIVE_MAX_INIT_SPAN_S` = 12 h | the *live* ceiling. The config remembers the last From/To, so a window that grew to days silently became the live window on the next start — and a live window is re-merged, re-filtered and re-drawn for the whole session. `_live_span_from_window()` clamps it and logs the clamp; LOAD DATA still loads any span |
+| `_LIVE_SLOW_SPAN_S` = 24 h | **not** a ceiling. There used to be a 12 h clamp (`_LIVE_MAX_INIT_SPAN_S`), which meant the graph quietly disagreed with the From/To it was captioned with. Live now uses the period as asked; above this span `_live_span_from_window()` says in the Log that every refresh re-reads and redraws the whole of it. What made the clamp unnecessary: Live only ever *starts* for a period that ends at "now" (see `TimeWindowDialog.ends_at_now()`) |
 | `_LIVE_TICK_LOOKBACK_NS` = 2 min | the hard bound on one tick's query range. `_live_last_ts` only advances when samples arrive, so on a quiet archiver `[last sample → now]` grew without limit and each 300 ms tick fanned out into (hours × PVs) 1-hour chunk requests. Kept ≤ `CHUNK_SIZE_NS`, so a tick is exactly one request per PV |
 | `_LIVE_TICK_OVERLAP_NS` = 30 s | an empty tick still moves `_live_last_ts` to `now −` this, so the next query stays small while the overlap covers archiver ingestion lag |
 | `_MAX_TABLE_ROWS` = 5000 | only the newest rows are rendered; export/graph/XY always use the full `_table_rows` |
+| `_NON_SHOT_PV_HINTS` | name fragments of channels that are written at their own pace and must not mark shots in the export (`_export_shot_channels`) |
+| `_EXPORT_SLICE_NS` = 2 h | see **Table export** |
+| `_CPV_SAFE_ENV` | the only names a custom-PV formula can reach (`abs/min/max/round/math`, no builtins). Was a local in `_compute_custom_pvs_in_rows` until the pre-window seed and the export needed the same environment |
 | `_TABLE_SEVERITY_FG` | severity → colour **string**. A `QColor` in a module global is destroyed after the `QApplication` and takes the interpreter down with it (0xC0000005 on exit) |
 | `graph_opts["live_poll_ms"]` = 300 | how often the archive is asked. Was a literal duplicated in `_schedule_live_tick` **and** `_live_countdown_tick`, where the countdown label would silently disagree if only one were edited |
 | `graph_opts["live_graph_min_ms"]` = 300 / `["live_table_ms"]` = 1500 | **two separate refresh clocks.** The graph fast path is cheap, the table rebuild re-merges the whole accumulated history (~1 s with a dozen PVs). They shared one throttle of `max(1 s, 3 × measured cost)`, so one slow table rebuild set the pace for both and the window looked ~5 s behind — the reported "refresh rate is 5 s". Each now keeps `max(floor, 2 × its own measured cost)`; costs are measured separately into `_live_graph_cost_ns` / `_live_table_cost_ns` |
@@ -179,6 +286,26 @@ has been clicked into; otherwise the scroll is passed to the panel underneath).
 Data: `_samples_by_pv`, `_table_rows` (+ `_table_rows_unfiltered`), `_pv_order` /
 `_base_pv_order`, `_col_full_names`, `_numeric_pvs`, `_pre_window_vals`
 (carry-forward value before the window start), `_pairs_cache`.
+
+`_pre_window_vals` is not the graph's alone — it seeds `_build_table_rows`, so a
+channel that did not change inside the window carries its old value in **every
+row** instead of leaving an empty column, and the customs computed from those
+rows stop being blank for a quiet archived window. Two rules go with that:
+* the seed accepts **any** value, not only a number. It used to reuse an
+  already-fetched pre-window sample only `if isinstance(v, (int, float))`, which
+  silently dropped a word channel (a beam fate, a state) — invisible on the
+  graph, an empty first stretch in the table.
+* `_seed_custom_pv_pre_window()` (from `_rebuild_custom_pvs`, before the row
+  compute) evaluates each formula on its sources' pre-window values and stores
+  the result under the custom channel's own name, so a derived trace is held
+  across the window's left edge like a real one. It runs in definition order, so
+  a formula reading another custom picks up the value seeded just above it.
+
+One knock-on effect, and it is the right one: `_apply_conditions_to_rows` takes
+its `available` set from a row, so a condition on a channel with no sample in
+the window is now **applied** to the held value instead of being skipped. A
+channel last left outside its range (closed shutter, laser off) therefore
+empties the table — `_log_conditions_diag` already says so out loud.
 Graph: `_mpl_figure` / `_mpl_canvas`, `_graph_axes`, `_graph_lines`, `_graph_pvs`,
 `_graph_raw` / `_graph_raw_np`, `_graph_spine_xpos`, `_span_selector`,
 `_zoom_selector`, `_graph_toolbar`, `_user_zoomed`, `_reticking`, crosshair
@@ -198,10 +325,12 @@ only records "the user is looking somewhere of their own choosing", which stops
 the live window scrolling the view out from under them.
 XY: `_xy_figure`, `_xy_rows`, `_xy_scatter`, `_xy_rect_selector`, `_xy_toolbar`,
 `_xy_choice_map`.
+PV Time: `_pv_time_canvas` / `_pv_time_figure` / `_pv_time_toolbar`,
+`_pv_time_days` (picked dates), `_pv_time_cache` (see above),
+`_pv_time_choice_map`, `_pv_time_condition_rows`, `_pv_time_sig`,
+`_pv_time_epoch`, `_pv_time_busy`.
 Automatic loading: `_load_in_flight`, `_reload_pending`,
 `_pending_reload_reason`, `_autoload_timer` (400 ms debounce).
-PV Time: `_pv_time_figure`, `_pv_time_df`, `_pv_time_columns`,
-`_pv_time_condition_rows`.
 Live: `_live_mode`, `_live_last_ts`, `_live_window_span`, `_live_last_rebuild_ns`
 (table) + `_live_last_graph_ns` (graph), `_live_table_cost_ns` +
 `_live_graph_cost_ns`, `_live_autoscroll`, `_live_timer` + `_countdown_timer`,
@@ -219,7 +348,7 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | Group | Methods |
 |-------|---------|
 | build | `_build_ui`, `_build_sidebar`, `_build_graph_tab`, `_build_axis_settings_panel`, `_build_xy_tab`, `_build_pv_time_tab`, `_build_table_tab`, `_build_log_tab`, `_populate_ui` |
-| load | `_on_load_clicked(silent=)`, `_on_load_error`, `_on_load_finished` / `__on_load_finished_inner`, `_build_table_rows` |
+| load | `_on_load_clicked(silent=)`, `_on_load_error`, `_on_load_finished` / `__on_load_finished_inner`, `_build_table_rows(samples, order, pre_vals=)` |
 | automatic loading | `_request_reload(delay_ms, reason)`, `_do_auto_reload`, `_finish_load`. **There is no LOAD DATA button.** Everything that changes what should be on screen calls `_request_reload`: PV added / removed / cleared / renamed, a new time window, a new preset. A burst collapses into one fetch via `_autoload_timer`; a request made while `_load_in_flight` sets `_reload_pending` and runs from `_finish_load`. Every load end path **must** call `_finish_load()` — including the "live was switched off meanwhile" early returns in `_on_live_init_error` / `_after_live_initial_load`, or the lock stays held and no automatic reload can ever start again |
 | graph | `_plot_graph` (+ `_schedule_replot`), `_plot_graph_impl`, `_update_graph_data`, `_band_ylim`, `_apply_x_ticks`, `_retick_from_current_xlim`, `_compute_x_ticks`, `_bottom_margin_floor`, `_keep_x_label_visible`, `_grid_style_for` / `_grid_style_name` / `_grid_style_index`, `_apply_font_size`, `_clear_graph`, `_clean_graph`, `_save_graph`, `_graph_popout` / `_restore_graph_from_popup`, `_install_graph_shortcuts` |
 | graph toolbar | `_install_graph_toolbar`, `_install_xy_toolbar`, `_sync_graph_interaction_mode`, `_adopt_toolbar_margins`, `_on_graph_view_home`, `_push_graph_view`, `_on_xy_rect_zoom_push`, `_open_graph_view_menu` |
@@ -228,15 +357,16 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | graph options | `_open_graph_settings_dialog`, `_apply_graph_opts`, `_avg_target_points`, `_on_avg_target_changed` |
 | live | `_toggle_live_mode`, `_live_span_from_window`, `_live_initial_load`, `_on_live_init_error`, `_after_live_initial_load`, `_live_tick`, `_on_incremental_finished`, `_schedule_live_tick`, `_live_countdown_tick`, `_live_poll_ms`, `_scroll_live_time_axis`, `_stop_live`, `_maybe_autostart_live` |
 | filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows` |
-| custom PVs | `_col_letter`, `_channel_letters`, `_cpv_dialog_channels`, `_migrate_custom_pv_bindings`, `_compute_custom_pvs_in_rows`, `_emit_custom_pv_diag`, `_rebuild_custom_pvs`, `_custom_pv_tooltip`, `_open_custom_pv_dialog` |
+| custom PVs | `_col_letter`, `_channel_letters`, `_cpv_dialog_channels`, `_migrate_custom_pv_bindings`, `_cpv_plan`, `_compute_custom_pvs_in_rows`, `_seed_custom_pv_pre_window`, `_emit_custom_pv_diag`, `_rebuild_custom_pvs`, `_custom_pv_tooltip`, `_open_custom_pv_dialog` |
 | table | `_populate_table`, `_set_table_cell`, `_format_value`, `_on_table_scroll`, `_on_table_context_menu`, `_on_table_double_click`, `_try_open_image_at_row` |
 | axis settings | `_refresh_axis_settings_tv`, `_autosize_axis_pane` (the PV list is exactly as tall as the PVs it holds, capped so the graph keeps `_AXIS_PANE_MIN_GRAPH` px and the buttons stay on screen), `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_pv_style_kwargs`, `_pv_stats`, `_flush_axis_measured`, `_resync_pv_colors`, `_safe_float` |
 | columns / looks | `_apply_default_axis_columns`, `_reset_axis_columns`, `_open_axis_column_menu`, `_build_styles_menu`, `_fill_styles_menu`, `_current_style_payload`, `_apply_style_payload`, `_save_style_preset`, `_load_style_preset`, `_delete_style_preset`, `_export_style_preset`, `_import_style_preset` |
 | reference lines | `_open_ref_lines_dialog`, `_graph_ref_pv_choices`, `_ref_axis_for`, `_draw_ref_lines`, `_run_ref_pick`, `_set_ref_pick_step`, `_clear_ref_pick_dim`, `_end_ref_pick`, `_cancel_ref_pick`, `_on_ref_pick_click`, `_on_ref_pick_key`, `_pv_at_click` |
 | XY | `_refresh_xy_choices`, `_on_xy_axis_changed`, `_plot_xy(_impl)`, `_xy_pairs`, `_on_xy_rect_select`, `_clean_xy`, `_clear_xy_plot` |
-| PV Time | `_plot_pv_time(_impl)`, `_draw_daily_distribution`, `_pv_time_add_condition_row`, `_pv_time_add_features`, `_clear_pv_time_plot`, `_load_data_repository` |
+| PV Time | `_plot_pv_time(_impl)`, `_recent_workdays`, `_pick_pv_time_days`, `_refresh_pv_time_days_label`, `_refresh_pv_time_choices`, `_pv_time_add_condition_row`, `_pv_time_remove_condition_row`, `_pv_time_conditions`, `_pv_time_resolve`, `_pv_time_fetch`, `_pv_time_pv_arrays`, `_pv_time_trim_cache`, `_pv_time_finish`, `_on_pv_time_error`, `_pv_time_day_columns`, `_pv_time_day_values`, `_pv_time_draw`, `_draw_daily_distribution`, `_draw_pv_time_raw`, `_install_pv_time_toolbar`, `_clear_pv_time_plot` |
 | PV list / presets | `_open_pv_browser`, `_remove_selected_pvs`, `_clear_pv_list`, `_on_pv_double_click`, `_real_pv_names`, `_sync_pv_list_customs`, `_update_pv_count`, `_refresh_preset_combo`, `_load_preset`, `_save_preset`, `_save_preset_as`, `_delete_preset` |
-| misc | `_open_time_window_dialog`, `_refresh_time_labels`, `_open_conditions_dialog`, `_open_ref_lines_dialog`, `_export_csv`, `_save_runtime_state`, `_log`, `_clear_log`, `_update_status` |
+| export | `_open_export_dialog`, `_export_shot_channels`, `_export_rows_on_screen`, `_export_from_archive` (+ the module helpers `_export_slices`, `_export_slice_rows`, `_export_eval`, `_export_row_ok`, `_export_fmt`) |
+| misc | `_open_time_window_dialog`, `_refresh_time_labels`, `_open_conditions_dialog`, `_open_ref_lines_dialog`, `_col_label`, `_table_pvs`, `_save_runtime_state`, `_log`, `_clear_log`, `_update_status` |
 
 The axis table columns are `_axis_tv_cols` = show · pv · display_name · color ·
 cursor_val · ymin · ymax · auto_scale · width · style · marker · marker_size ·
@@ -283,6 +413,33 @@ called from the full replot, `_update_graph_data`, `_on_zoom_select` and the
 toolbar's Home / Back / Forward. Miss one and the axis keeps the *old* window's
 positions: a narrow zoom then shows **zero** timestamps (measured — that was the
 bug). The live path already had its own copy of this fix; the zoom path did not.
+
+**Both window edges are always stamped, so an interior stamp too close to one
+is the same instant written twice.** `_compute_x_ticks` demanded only a quarter
+of a step of clearance (`_CLEAR`, now **0.6**). At a six-hour step over two days
+a quarter step is 3 % of the width, so the pair at the right-hand edge always
+collided — that was the "the stamp on the right is written over the last value"
+report. Two more parts of the same fix:
+- the outer two labels are pinned inside the plot (`set_horizontalalignment`
+  "left" / "right"); a stamp centred on the right spine hung half of itself off
+  the figure, and `margin_right` is only 1.5 %;
+- `_STEPS` runs out to a year. It used to stop at two days, so a week asked for
+  ~85 stamps and a year for ~180, all on top of each other.
+
+**The stamps are two lines, date above time, and the labels are computed once.**
+`_apply_x_ticks` builds a `{tick position: text}` map in tick order and the
+formatter only looks it up — matplotlib calls the formatter repeatedly and not
+necessarily left to right, so deciding "is this a new day?" inside it made the
+dates come and go between redraws. The date is printed on the first stamp of
+each day; above 120 days it carries the year (a year-long period otherwise opens
+and closes on the same "09-02"); when the step is a whole day or more the stamps
+are dates and only the two window edges also say the time, or an edge and the
+midnight beside it read as one stamp twice. `x_time_format = "auto"` is now
+genuinely automatic — it drops the seconds at whole-minute steps and the clock
+at whole-day steps. It used to be a synonym for `hms`, which is why a two-day
+view printed eight-glyph `06:00:00` stamps. `hms` / `hm` still override it.
+Verify by **rendering**: `testing/probe_x_axis_long.py` measures the gap between
+stamps in pixels for six periods and saves a PNG of each.
 
 **Grids are per PV, one per ticked channel.** Each ticked PV draws
 `ax.yaxis.grid(...)` on **its own** twinx axis with its own colour and its own
@@ -358,21 +515,60 @@ menu** — it would swallow the drag. Those entries live on the "View ▾" butto
 | `load_ramping_repository()` | reads `RampingRepository/index.json` (offline) |
 | `_http_get_json(url, timeout)` | shared GET → JSON |
 | `cpva_fetch_samples(channel, start_ns, end_ns)` | one HTTP GET → list of dicts |
-| `cpva_fetch_samples_chunked(...)` | splits the range into hourly chunks, skips night hours (`_chunk_is_night`) |
-| `cpva_fetch_many_chunked(channels, …)` / `cpva_fetch_many_optimized(...)` | pooled multi-channel fetch. Both take `cancel_fn` — stopping a QTimer cannot stop a running pool, so "Stop Live" used to leave the whole queue hammering the archiver and holding the GIL; a cancelled pool drops everything it has not started (`_is_cancelled`) |
-| `cpva_fetch_last_before(channel, before_ns)` | carry-forward value before the window; scans expanding rings (`_LAST_BEFORE_STEPS_S`, up to ~30 days) |
+| `cpva_fetch_many_adaptive(channels, start_ns, end_ns, count=…)` | **the one fetch.** Asks for as much time per request as the archiver will actually serve and halves only what it refuses, so any period loads — an hour, a year, a night. Returns `(results, errors, FetchReport)`. See "Adaptive fetch" below |
+| `cpva_fetch_samples_chunked(...)` | one channel through the adaptive fetch. No longer raises on a partial failure: it used to re-raise the first failing hour and throw the whole channel away |
+| `cpva_fetch_many_chunked(channels, …)` / `cpva_fetch_many_optimized(...)` | two-value shims over `cpva_fetch_many_adaptive` (raw / decimated), for callers that do not need the report. Both take `cancel_fn` — stopping a QTimer cannot stop a running pool, so "Stop Live" used to leave the whole queue hammering the archiver and holding the GIL; a cancelled pool drops everything it has not started (`_is_cancelled`) |
+| `cpva_fetch_last_before(channel, before_ns)` | carry-forward value before the window; scans expanding rings (`_LAST_BEFORE_STEPS_S`, up to ~30 days), each ring hunted newest-half-first by `_last_before_in_range` — one request when the ring is servable instead of one per hour (~1 100 requests per stale signal at the old fixed grid) |
 | `cpva_fetch_last_before_many(channels, before_ns, …)` | the same for many channels in one shared pool — a few stale PVs used to dominate the whole initial load; returns only channels that had a prior sample. Also `cancel_fn`-aware (the deepest ring scan is the longest single thing a load does) |
 | `cpva_decode_value(sample)` | decodes a sample value (numeric / string / enum) |
 | `cpva_fetch_channels()` | full list of archiver channels |
 | `now_ns()` / `dt_to_ns()` / `ns_to_local_str()` / `_fmt_cursor_value()` | time + value formatting |
 | `parse_user_datetime(s)` | user date/time input (ISO + European format) |
-| `shorten_pv_name(full_name)` | shortens a PV name for the UI (`_STRIP_PATTERNS`) |
+| `shorten_pv_name(full_name)` | shortens a PV name for the UI (`_STRIP_PATTERNS`). A noise segment is only dropped when it is a WHOLE dash/underscore segment: without the boundary guards the `IN` alternative also matched inside a word, so `L3-TIMING-TIMING:SysRate` was labelled `L3-TIM_G-TIM_G - SysRate` — on the graph, in the table header and in the exported file. Any run of separators is then collapsed, not only underscores, or a dropped segment leaves its own `_` beside the dash that separated it (`PFM8-`) |
 | `make_pv_query_matcher(q)` | compiles a query into a predicate: whitespace tokens must appear **in order** (`023 l3` == `*023*l3*`), explicit `*` / `?` still work. Compiled once per query, then run over ~10 000 channels per keystroke |
 | `_matches_wildcard()` | thin wrapper over `make_pv_query_matcher()` (backwards compatibility) |
 | `_open_path()` / `_looks_like_image_path()` / `_image_file_size()` / `_resolve_image_path()` | image helpers |
 | `safe_divide(a, b)` | element-wise division with NaN for a zero/infinite denominator |
 
+### Adaptive fetch (`cpva_fetch_many_adaptive`)
+
+The archiver answers **HTTP 500** when one response would carry too many
+samples. Two shapes were wrong before:
+
+* one request per signal over the whole period (`avg_target_points > 0`, the
+  default) — a single 500 lost the entire signal, which is why nothing much
+  beyond half a day would load at all, and it looked like an empty archive;
+* a rigid one-hour grid — a year needs ~70 000 requests.
+
+Plus `_chunk_is_night` **silently dropped** every hour lying wholly inside
+22:00-06:00 Prague, so any period over a night came back holed, with no error
+and no log line. It is gone.
+
+| Piece | What it does |
+|-------|--------------|
+| `_SpanOracle` | per channel, the widest span known to work and the narrowest known to fail; `plan_span()` picks the next size. **One oracle per channel**: how many samples an hour holds is a property of the signal, so a shared one would drag a slow signal (a valve state) down to the fastest signal's size and turn a dozen requests into thousands. A shared oracle is also kept, consulted only until a channel has a success of its own |
+| the opening request | each channel starts with one `CHUNK_SIZE_NS` request at the **newest** end. It is what puts something on screen at once, and it deliberately does **not** feed the oracle — a tiny "known good" would make every later split fall back to an hour |
+| split, not recurse | a refused range is re-queued as *k* smaller ranges in the **same** pool. Recursing inside the worker (the `sp_t.py` pattern) would serialise a 30-day → 720-piece split in one thread while fifteen idle |
+| `_is_splittable_error` | only 413/414/5xx, a read timeout or a bad shape justify halving. A refused connection gets one retry and is then recorded — otherwise one unreachable archiver becomes half a million requests |
+| newest first | the plan is built from `end_ns` backwards, channels interleaved, so a long period fills the graph in from the present edge |
+| `count` sharing | the decimation target is split across the requests in proportion to their span (floor `MIN_CHUNK_COUNT`), so the total stays near the target instead of being multiplied by the request count |
+| merge | by sample **`time`**, not request order: an adaptively split child's anchor sample can predate its parent's start, and `cpva_fetch_last_before` needs the last element to be the newest. Duplicates (every request also returns the sample before its own start) are dropped |
+| `FetchReport` | `gaps` (per channel, the ranges that could **not** be read), `boundaries` (the request starts actually used — `_remove_fake_hour_boundary_rows` needs them), `requests`, `splits`, `cancelled`, `over_budget`, `decimated`, `elapsed_s` |
+| `progress_fn(done, total)` | `total` only ever **grows**: it starts at the plan size and grows when a request splits. `done` never falls, `done <= total`, and the last call is level. Emission is serialised (`emit_lock`) — snapshotting outside it let two threads report out of order and the bar jumped backwards |
+| `_timeout_for_span` | 1 h → 10 s, ≥ 12 h → 120 s (`CPVA_HTTP_TIMEOUT` … `CPVA_HTTP_TIMEOUT_LONG`). The `http_timeout` config key finally does something — `CSSLoggerWidget._http_timeout()` reads it as the **base** and the per-request value is derived from the span |
+| pre-flight | for periods over 4 h, one 1-minute request at the base timeout first, so an unreachable archiver is known in 10 s rather than after a 120 s hang. Only a failure that got **no HTTP reply at all** counts as dead — a 500 or a 404 means it is answering |
+| `FETCH_MAX_REQUESTS` | 20 000 per call, the backstop. Reported as `over_budget` |
+
+Constants: `CHUNK_SIZE_NS` (1 h — still the unit for timeouts and the live
+tick), `MIN_CHUNK_NS` (1 min floor), `MAX_CHUNK_NS` (30 d, the widest single
+request), `RAW_START_CHUNK_NS` (4 h, raw mode's first try), `MIN_CHUNK_COUNT`.
+
+Measured against a fake archiver (`testing/test_long_window_fetch.py`): a year
+over 2 signals costs ~250 requests when the archiver refuses anything above 7
+days, and 4 when it serves the lot.
+
 ### Dependencies
 - `requests`, `urllib3`, `orjson`, `ssl` — HTTPS to CPVA (no certificate verification)
 - `numpy` — `safe_divide`
+- `threading`, `itertools`, `math`, `time` — the adaptive fetch
 - no GUI toolkit (safe for headless tests)

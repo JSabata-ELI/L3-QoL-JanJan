@@ -225,8 +225,8 @@ the Launcher was closed is highlighted the next time you open it.
 8. THE GROUPS
 =================================================================
 
-  Scripts                  the everyday tools
-  Parts                    pieces of larger programs
+  Main scripts             the everyday tools
+  Side scripts             pieces of larger programs
   External                 everything not otherwise classified
   In progress              not finished
   Not working correctly    known broken

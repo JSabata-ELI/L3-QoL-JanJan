@@ -13,7 +13,9 @@ Code map:      STRUCTURE.md
 Image Tools is a multi-tab application for browsing, analysing and
 exporting camera images from ELI Laser experiments.
 It consists of five integrated tools accessible via tabs at the top:
-Image Finder, Image Slider, Shot Finder, One Moment and Workshop.
+Image Finder, Image Slider, Shot Finder and Workshop. (One Moment was
+merged into the Image Finder on 04.09.2026 — picking a moment out of a
+graph and seeing every camera at it is done there now, under PV Search.)
 
 
 =================================================================
@@ -89,16 +91,44 @@ REFERENCE DAY
   - Right-click a day to make it the reference, right-click again
     to drop it. The reference day itself stays shown as it is.
 
-SAVING THE COMPARISON
-  - "Save comparison" writes the WHOLE wall as one picture with the
-    days labelled — ready to put in a report. Neither of the other
-    tabs can do this; they save frames one at a time.
+SAVING THE VIEW
+  - "Save view" writes the WHOLE view into one file — every row,
+    including the ones below the fold, with the days labelled and a
+    strip under the picture naming the tab, the cameras, the days,
+    how the frames were picked and the reference day. Neither of the
+    other tabs can do this; they save frames one at a time.
+  - It asks two things first: PNG or PDF, and this tab or every tab.
+    Every tab with PNG writes one file per tab, named after it; PDF
+    puts one tab per page, each page as big as its own picture so
+    nothing is scaled down or cropped. A tab you have never opened
+    exports properly too.
   - The camera, the days, the reference day and the scale used are
-    written into the file, so the picture says where it came from.
+    written into the PNG file itself as well, so the picture says
+    where it came from.
+
+THE DAY-BY-DAY TAB
+  - A row is a DAY, and the next row down is the next day. A column
+    is one camera, in the same place all the way down, sorted by
+    name. When a day carries several picks — four marked regions, or
+    five picked moments — they sit side by side inside that day's own
+    row, each camera owning one column per pick, and the banner says
+    how many. (Before, all four shared one slot and three of them
+    were painted underneath the fourth.)
+  - About three rows fill the pane and then it scrolls, and a plain
+    mouse wheel steps a WHOLE DAY per notch. Ctrl+wheel still zooms.
+  - Several moments picked at once give a tab per camera plus this
+    one, exactly like a day search — the flat grid of every camera
+    against every moment is what the exported file is for.
 
 LOOKING AT ONE DAY CLOSELY
-  - Click a day to open that frame on its own; "One frame" and
-    "Days side by side" switch between the two.
+  - Click a day to open that frame in a close-up WINDOW, sized well
+    above the stored picture, with the arrows under it stepping
+    through the rest of the wall. The wall stays clickable behind it,
+    so the next day can be opened without closing the window first.
+  - This used to be a permanent "One frame" tab beside the walls: a
+    half-size picture nobody switched to. The close-up is now as big
+    as the screen allows, which is what looking at a frame closely
+    was asking for.
   - "Open in Image Slider" hands over the frames that are on the
     wall — the ones actually picked, each with its own day caption.
     (It used to open the first camera's whole folder and ignore the
@@ -106,29 +136,40 @@ LOOKING AT ONE DAY CLOSELY
 
 SEARCH
   - The Source group is laid out the way the Image Slider's Source
-    group is: "Time window" and "Cameras..." side by side,
+    group is: "Time window" and "Cameras" side by side,
     "PV Search..." under them, and "Load data" at the bottom — the
     button that actually goes and reads the frames. Actions (Save
     As..., Folder, Workshop and the list of picked cameras) sits
     directly below Source.
-  - "Time window" opens the calendar in a window of its own, with
-    the hour (Lab time / UTC) and the weekday gate under it. A plain
-    click takes one day. Ctrl+click adds or removes a weekday,
-    Ctrl+Shift+click takes the range back to the last day you
-    clicked — only the weekdays ticked there. The day with the blue
-    outline is the one the hour belongs to.
-  - Every click takes effect straight away, so the window has
-    nothing to confirm: leave it open next to the pictures while you
-    try days, or close it. What is picked is written under the
-    buttons — the day (or how many days), the hour and which clock
-    they are read in — and the dot next to that line turns green
-    when the camera list for those days is ready.
-  - The calendar is the same one the Image Slider and the Shot
-    Finder use: Monday first, weekends in red, the month and the
-    year on the bar above it.
+  - "Time window" opens the calendar — the SAME window the Image
+    Slider and the Shot Finder open. A plain click takes
+    one day. Ctrl+click adds or removes one day, weekends included.
+    Ctrl+Shift+click takes the stretch back to the last day you
+    clicked, and skips Saturdays and Sundays unless you tick them in
+    the Mon-Sun row under the calendar; clicking the same stretch
+    again takes it back out.
+  - Pick a second day and a table appears with a row per day, each
+    with its own From and To. There is nothing to switch on. Go back
+    to one day and the table goes away again.
+  - A day you have just added starts at 08:00-19:00, or 08:00 to the
+    current hour if it is today. The From/To above the table moves
+    every day at once; a row you type in keeps what you typed.
+  - Nothing happens until you press OK. Cancel throws the whole
+    change away and leaves the previous pick as it was.
+  - There is no "Lab time" switch any more: the times are the real
+    (Prague) clock, everywhere. There is no automatic "busiest hour"
+    either — it leaned on a file that stopped being written in May
+    and had been guessing 14:00 ever since, which was often the
+    emptiest hour of the day. Pick the window yourself, and use
+    "PV Search..." to find the moment inside it.
+  - What is picked is written under the buttons — the day (or how
+    many days) and the hours — and the dot next to that line turns
+    green when the camera list for those days is ready.
+  - The calendar is Monday first, weekends in red, with the month
+    and the year on the bar above it.
 
 CAMERAS
-  - "Cameras..." sits next to "Time window" — the day and the
+  - "Cameras" sits next to "Time window" — the day and the
     cameras are the one question of what to look at. The list is
     the cameras actually found in the days you picked; search by
     name or by number, and a click adds or removes one. "Select all"
@@ -180,11 +221,134 @@ PVs
     channel. They are still reachable for older days: type the
     column name into the picker's search box.
 
-FIND BY PV CONDITIONS
-  - "Search by PV" browses the archiver channels, lets you set a
-    condition per PV (min / max), and finds the time regions of
-    the day where all of them hold. Each region gets a colour, and
-    the frame closest to it is picked for every selected camera.
+PV SEARCH
+  - "PV Search..." opens a window with a calendar, a graph and the
+    list of machine values to plot. It starts on the days already
+    picked in the Time window.
+
+  - THE CAMERAS DO NOT HAVE TO BE PICKED FIRST. Which cameras to
+    look at and which moments to look at are two separate halves of
+    one question — the graph does not depend on a camera at all — so
+    either may be set first. Press Search with no camera picked and
+    the camera picker opens; the search then runs by itself. If you
+    close the picker without choosing, the search is kept and starts
+    the moment you do choose.
+
+  - THE DAYS. Mark as many as you like, the same way as in the Time
+    window: a plain click takes one day, Ctrl+click adds or removes
+    one, Ctrl+Shift+click takes the range back to the last day you
+    clicked. Under the calendar every marked day is listed with what
+    is picked on it — moments and regions; click a day to show it.
+    A day that carries something picked is never unmarked, so
+    building the set up day by day cannot lose what came before.
+
+  - PICKING MOMENTS. Click the graph: every click adds one more
+    moment, on this day or on any other marked day, and they are all
+    searched together. Each pick snaps to the nearest real sample of
+    the primary value and carries a number on the graph — the same
+    number the tiles wear. Ctrl+Z, or the "Undo" button beside the
+    moment line, takes the last pick back (a marked region too);
+    "Clear" forgets every moment. The result is one wall of
+    every camera at every picked moment.
+
+  - Moments and marked regions can both be on screen. When a moment
+    is picked, the moments are what gets searched and the moment line
+    says the regions are being ignored; "Clear" brings them back.
+    Neither one deletes the other any more.
+
+  - THE GRAPH, two ways. "One day" shows one marked day at a time —
+    the arrows at the top right step through them and say which one
+    you are on ("Thu 13.08.2026  2 / 3"). "All days" puts every
+    marked day on one axis side by side, with a line and the day's
+    name between them, so two days a week apart sit next to each
+    other with no empty week in between.
+
+  - MARKING A REGION. Drag on the graph. The region belongs to the
+    day it was drawn on and stays there when you step to another
+    day. In "All days" a drag that runs over midnight is split into
+    one region per day rather than being quietly cut short. Each
+    region gets a colour, and each one gets its own frame from every
+    selected camera — three regions on a day give three pictures,
+    not one.
+
+  - BY A NUMBER INSTEAD. Tick "Find the first moment a PV was...",
+    choose the value, the comparison (above / at or above / below /
+    at or below / between) and the number. The search then looks for
+    the FIRST moment the condition held and takes that one moment
+    from every camera, so the pictures really are of the same shot.
+    It only accepts a moment where the cameras were recording
+    something, judged by each camera's own TotalPower; if no moment
+    had all of them live it takes the first where some were, and
+    says so. A frame that turns out to be empty is not passed off as
+    a result — the next matching moment is tried.
+
+  - IT SAYS WHICH WAY IT FAILED. "never happened on the marked days"
+    is not the same answer as "happened, but no camera was recording
+    then", and neither is the same as "the archiver did not answer
+    for 13.08., so it cannot be said" — each is reported as itself.
+
+  - SBW4 HAS TWO NAMES. It was re-archived under a new name on
+    14.08.2026, but which name a given stretch of time was written
+    to depends on the configuration that ran, so the date alone is
+    only a guess. Whenever a day (or a marked region) comes back with
+    nothing under one name, the other name is asked for before it is
+    believed — and the status line under the graph says which value
+    was read that way. A value that answers normally costs no extra
+    request.
+
+  - ADDING AND REMOVING VALUES. "Browse" searches every archiver
+    channel; what is added is ticked, selected and scrolled to, and
+    the status line names it. "Remove" takes the selected rows off
+    and says which. Nothing on that list is silent any more.
+    "Own axis" gives the selected value a scale of its own — two
+    values in the same unit but a thousand times apart share a scale
+    on which neither can be read. "Edit" changes the value's name and
+    unit; it writes them to the shared list, so every tab shows the
+    same name afterwards.
+
+  - THE FORMULAS on the shared value list are drawn too, over the
+    whole day, marked "(formula)". What they are built from is read
+    even if you did not tick it, and the line BREAKS wherever one of
+    those is missing rather than being drawn straight across the gap.
+    A formula that cannot be worked out says why, on its row and on
+    the status line, instead of just not appearing. A formula is not
+    offered as the value to search BY: the peak inside a region and
+    "the first moment X was above Y" are asked of the archiver, and a
+    formula is not in the archive.
+
+  - THE STRIP UNDER THE GRAPH is the graph's settings: Grid, Legend,
+    Log Y, "Y range" (type the two numbers, or leave them empty for
+    automatic), "Time range" (part of one day, as two clock times),
+    "Ticks" (minutes between the time labels), "Whole day" (undo
+    every zoom and hand-set range), "Copy" (the graph to the
+    clipboard) and "Save" (the graph as a PNG).
+
+  - THE MARKED RANGE, IN NUMBERS. Under the graph: how many samples
+    each value has in the marked region, its mean, its spread and the
+    two extremes — with the median, the peak-to-peak, the first and
+    last value and the trend in the row's tooltip. Pick which region
+    with the box above the table; a region just dragged takes the
+    place by itself. A value with NO sample inside the range still
+    gets a row: the value it was already sitting at, in amber, with
+    "0" and the word "held", because a setting that did not move is
+    not a broken sensor. Only when there is nothing before the range
+    either does it read as dashes.
+
+  - WALKING THE DAY, AND KEEPING WHAT YOU FIND. Back in the tab, the
+    two arrows under "PV Search" step to the shot before or after the
+    one on the wall — no need to reopen the graph. Stepping records
+    NOTHING. "Save" puts the moment on the wall onto the list beside
+    them and greys out once it is there; a click on a row goes back
+    to that moment, and it comes back at once because the newest
+    saved moments are looked for quietly in the background. "Forget"
+    takes one off, "Clear" empties it. The list is NOT saved —
+    closing the program empties it.
+
+  - AND OVER TO THE SLIDER. "Send moment" opens the moment on the
+    wall in the Image Slider and KEEPS the cameras picked there;
+    "Send + cameras" carries this tab's cameras over as well. Either
+    way the Slider lands on that moment, so the shots either side can
+    be slid through.
 
 MULTI-DAY SEARCH
   - Pick a date range, the cameras and the hour; the result opens
@@ -273,6 +437,16 @@ LOADING IMAGES
     watcher (plus a 0.5–5 s adaptive poll as a safety net) and the
     view auto-advances to the latest frame. A silently dead watcher
     is detected and recreated.
+  - The watcher reports a file the moment it is CREATED, which on the
+    share is before the picture inside it has finished arriving. The
+    picture is now waited for (up to about a second) instead of being
+    read half-written, failing, and being asked for again a second and
+    a half later by the safety net. That wait is what used to make a
+    new shot appear roughly a second after it was really there — one
+    camera measured 1.5 s before, 0.06 s after.
+  - A file older than two minutes is never waited for: a picture that
+    was truncated in the archive hours ago is not going to finish, and
+    browsing must not stall on it.
   - Refresh (⟳) reloads new frames without resetting position.
   - Live mode (⇢) jumps to the newest frame automatically; green =
     on, red = off. Turns off when you move the slider manually.
@@ -280,7 +454,11 @@ LOADING IMAGES
     is ticked (the main one) sets the moment the grid is showing, and
     the others are put on that same moment. A camera that receives a
     picture a moment later than the main one now shows it straight
-    away instead of waiting for the next shot.
+    away instead of waiting for the next shot. That also covers the
+    camera whose file lands while the main camera's own picture is
+    still being read off the share: it used to be put on the previous
+    moment and then left there for a whole shot, which is why one
+    particular tile always looked slower than its neighbours.
   - A camera that saves pictures far less often than the main one is
     kept at ITS own newest picture rather than being left frozen. Its
     clock is then red, because it is not on the same moment as the
@@ -494,22 +672,79 @@ OVERLAYS
     type share one configuration.
 
 MULTI-CAMERA LAYOUT
-  - Cameras can be arranged automatically, or placed by hand in the
-    layout editor. Auto-arrange searches split layouts (rows, columns
-    and any nesting of the two). It first works out how large the
-    SMALLEST picture can possibly be, so a portrait diode array next
-    to square far-field cameras is never squeezed down to a postage
-    stamp. Among the arrangements that keep the smallest picture
-    within about a twentieth of that, it then takes the one showing
-    the most picture altogether, and prefers the one whose windows
-    come out most alike in size. Insisting on the very largest
+  - The arrangement is made in the "Camera" window, in the Layout
+    picture under the list of picked cameras. It is there the moment
+    the window opens — there is no second button to find and no second
+    window to open.
+  - The Layout picture is a true SCALE MODEL of the camera area, not a
+    sketch: the arrangement in it is worked out for the real area in
+    real pixels and then drawn smaller by one single factor, so every
+    window, every picture and every name bar has the proportion it will
+    really have. Before, the arrangement was worked out on the small
+    board itself while the name bar kept the real area's height in
+    plain pixels — so the name bar came out several times too fat, and
+    the arrangement shown could genuinely differ from the one the
+    cameras ended up in.
+  - The picture is shaped to the camera area exactly, so there are no
+    hatched strips down its sides. Room left over in the window shows
+    as ordinary window background above and below it, which is what it
+    is. The strips were the first attempt and they misread badly: they
+    looked like area the cameras had failed to use.
+  - Because the name bar is drawn at its REAL proportion it is only a
+    few pixels tall, far too thin for a name. So each camera's name is
+    written across its picture instead, with its size underneath. The
+    text shrinks to fit; when the full name will not fit even at the
+    smallest readable size it drops to the short name (PAM10NF rather
+    than C03-039-PAM10NF), and on a picture too small for two lines the
+    name wins and the size is left out. Nothing is ever drawn too small
+    to read.
+  - Cameras can be arranged automatically, or placed by hand. Auto-
+    arrange searches split layouts (rows, columns and any nesting of
+    the two). It first works out how large the SMALLEST picture can
+    possibly be — counted per share of the area that camera asked for
+    — so a portrait diode array next to square far-field cameras is
+    never squeezed down to a postage stamp. Among the arrangements
+    that keep it within tolerance of that, it then takes the one
+    showing the most picture altogether, and prefers the one whose
+    windows come out most alike in size. Insisting on the very largest
     smallest picture was the earlier rule and would rather grow one
     picture a few percent than fill the area: three wide cameras came
     out as a single row along the top with two thirds of the area
     empty, where two columns show twice as much picture for a picture
     barely smaller.
-  - Diode arrays are asked for twice the area of a normal camera,
-    because they are the ones read for per-diode detail.
+
+CAMERA SIZES
+  - Every camera has a size: Smallest, Small, Medium, Large or
+    Largest. Click a camera in the Layout picture and the five buttons
+    above it come alive, showing which one it is on now. The size is
+    also written across the camera, so the whole arrangement can be
+    read without clicking anything — unless every camera has the same
+    size, when the word would say nothing and is left out.
+  - The sizes are shares of PICTURE AREA: 1, 4, 8, 12 and 16. A
+    Largest camera is asked for sixteen times the picture area of a
+    Smallest one, which is four times the width and four times the
+    height, and the program cuts the area up so that it really comes
+    out that way. New cameras start at Medium, and portrait diode
+    arrays at Largest — they are the ones read for per-diode detail.
+    Set a diode array to Medium if you would rather have the room back
+    (see the last point below).
+  - The size belongs to the CAMERA, not to the set: set it once and it
+    holds in every set that camera appears in, and after a restart. It
+    is kept in cam_sizes.json next to the other settings.
+  - Setting a size re-arranges the Layout picture at once — including
+    over an arrangement you had dragged by hand or loaded from a
+    preset. It has to: the picture opens on a remembered hand-made
+    arrangement whenever there is one, so a size press that spared it
+    was a button that did nothing at all.
+  - Asking for very different sizes costs empty space, and that is
+    normal. A small camera gets a small window, and its picture cannot
+    fill a window of any other shape, so there is grey room left
+    around it — that is the price of "make that one big and that one
+    small". The program picks, out of all the arrangements that come
+    out at the sizes you asked for, the one that shows the most
+    picture. Move a camera up a size or two if a shift wants the area
+    filled instead. With more than twelve cameras the program falls
+    back to equal-length rows and the sizes are ignored.
   - The windows always reach every edge instead of sitting as a small
     block in the middle of a large grey rectangle. Whatever room is
     left over goes first to the windows where it actually makes the
@@ -520,27 +755,27 @@ MULTI-CAMERA LAYOUT
     whole leftover height piled up underneath it, which is what made
     the cameras look pushed to the top edge with the bottom stretched
     to the floor.
-  - After OK in the camera selection the cameras come up in exactly
-    the automatic arrangement, unless a layout was placed by hand for
-    that same set of cameras. Only a layout you actually dragged is
-    remembered; leaving the editor on Auto-arrange keeps the
-    arrangement automatic, so it is recomputed for the real camera
-    area instead of being frozen at the editor's proportions.
-  - The editor previews the arrangement on a board shaped like the
-    real camera area, so what it shows is what the cameras do.
-  - The cameras can also be arranged where they are playing, without
-    the editor: drag a camera by its name bar to move it, drag the
+  - After OK the cameras come up in exactly the arrangement the Layout
+    picture showed. Only an arrangement you actually dragged is
+    remembered as fixed; one left automatic stays automatic, so it is
+    recomputed for the real camera area — and follows any size you
+    change later — instead of being frozen as it looked that day.
+  - Clicking a camera in the Layout picture only selects it, for the
+    size buttons. It takes a real drag to hand the arrangement over to
+    you.
+  - The cameras can also be arranged where they are playing: drag a
+    camera by its name bar to move it, drag the
     border or a corner of its window to resize it. Edges stick to the
     neighbouring window and to the middle and sides of the area, so
     windows meet exactly instead of leaving ragged gaps; hold Alt while
     dragging to place an edge freely. A short click on the name bar
     still just selects the camera.
   - Moving or resizing a camera this way switches that set of cameras
-    to a hand-made arrangement and remembers it, exactly as the editor
-    does. Right-click a camera's name bar and choose "Auto-arrange
-    cameras" to throw the hand-made arrangement away — for the open
-    window and for the remembered one — and let the program size the
-    cameras again.
+    to a hand-made arrangement and remembers it, exactly as a drag in
+    the Layout picture does. Right-click a camera's name bar and choose
+    "Auto-arrange cameras" to throw the hand-made arrangement away —
+    for the open window and for the remembered one — and let the
+    program size the cameras again from their sizes.
   - "Reset layout" in the Display group is the gentler way back: it
     puts the cameras where they were when you opened this set — the
     arrangement the preset carries, or the one remembered for these
@@ -561,9 +796,16 @@ SPATIAL CONTRAST
 
 POINTING ANALYSIS
   - Run on the loaded image set. With several cameras on screen it
-    analyses the one camera you have clicked in the layout; with no
-    camera, or more than one, selected Run Analysis says so and does
-    nothing.
+    analyses the cameras you have clicked in the layout, or ALL of
+    them when you have clicked none — one graph per camera, computed
+    one camera after another.
+  - With more than one graph, a strip above the graph carries ◀ ▶
+    arrows, the camera's name and "2 / 4"; the arrows step between the
+    cameras and stop at the first and last one. Each camera keeps its
+    own graph: deleted points, zoom and the Show Path switch are still
+    there when you come back to it.
+  - A camera with no frames inside the Set From / Set To range is
+    skipped and named in the status line under the buttons.
   - Fits a Gaussian to each frame to extract beam centroid (cx, cy)
     and beam waist (w0 x h0).
   - Thr: % of the peak a pixel must reach to count towards the
@@ -589,7 +831,10 @@ POINTING ANALYSIS
     Restore All brings back everything.
   - Save Plot exports the current zoom state to PNG. The day markers
     are part of the figure; the draggable cursor and its time readout
-    are not.
+    are not. With graphs for several cameras it first asks whether to
+    save the one on screen or one file per camera — then each file
+    gets the camera name added to its name, and the camera name is
+    written above the picture.
   - Calibration shapes: circle, square, cross for spatial reference.
 
 SAVING
@@ -722,8 +967,15 @@ PV VALUES
     readable roughly a second later (measured 0.2-2.5 s). So at the
     moment a new frame appears, the values for it do not exist yet.
     The panel now says so ("no data yet") and keeps asking until they
-    land, which normally takes one retry; it gives up after 20 s,
-    when "nothing was archived for this frame" is the true answer.
+    land, which normally takes one or two retries; it gives up after
+    20 s, when "nothing was archived for this frame" is the true
+    answer. While the answer is still expected — the first 2.5 s —
+    it asks again every 0.4 s at a steady pace, and only after that
+    does it start slowing down. It used to double the gap from the
+    first retry, so it stepped straight over the moment the sample
+    became readable and the number appeared about 0.7 s later than it
+    had to, on every single shot. Measured: 0.8 s before, 0.02 s
+    after, for about half an extra request per shot.
     Until then it goes on showing the last number it did read, and
     labels it with how far back that shot was — "12.3 J (-28 s)".
     Before this, that older number was shown with a quiet "(old)"
@@ -755,6 +1007,17 @@ PV VALUES
     than the archiver's published point is answered exactly, so
     scrubbing, browsing the archive and the burn-in of saved images
     still resolve EVERY shot's own energy.
+  - A SETTING is not a measurement. A value that is written only
+    when somebody CHANGES it — a GDD order, a motor position, any
+    setpoint readback — has nothing archived next to a picture,
+    because nothing was written at that moment. Such a PV is shown
+    with the last value written before the picture, however many
+    hours back that is: that is simply what the machine was set to
+    when the shot was taken. The program works out which PVs behave
+    that way from the archive itself, so a newly added setting needs
+    nothing switched on for it. Energy detectors keep the strict rule
+    above — no reading of their own means "n/a", never the number
+    from a neighbouring shot.
   - How to read a value (side panel):
       12.3 J          the shot's own archived value.
       ~12.3 J         approximate. Only the waveplate uses this now:
@@ -891,8 +1154,10 @@ ALARM LIMITS AND TRIPS
       · A read fault counts the frames that would not decode. The
         other four are one event, however long it lasts, so nothing
         counts 600 ms ticks.
-      · A PV the archiver refuses for 15 s is a trip of its own. Not
-        on the first failure — one failed read is ordinary.
+      · A PV the archiver will not answer for is NOT a trip. Only a
+        number that passes Min or Max is. "ERR" says the read
+        failed, not that the beam did anything, and the row and the
+        corner badge already say so.
       · No new retrying was added. The program carries on; the frame
         is read from the share again when you press "See".
   - HOW LOUD, in "Overlay settings":
@@ -918,16 +1183,22 @@ CAMERA PRESETS (multi-cam mode)
   - Save/load named sets of cameras via the Presets panel in the
     camera picker dialog (stored in %APPDATA%\ELI_ImageTools).
   - A preset remembers the ARRANGEMENT as well as the camera list:
-    where each camera sits and how big it is. Arrange the cameras the
-    way you want them — by dragging them where they are playing, or in
-    the layout editor — then open "Cameras...", type a name and press
-    Save. Loading that preset later brings the same cameras back in
-    the same places.
+    where each camera sits, and the size each one is set to. Arrange
+    the cameras the way you want them — by dragging them where they are
+    playing, or in the Layout picture — then open "Camera", type a name
+    and press Save. Loading that preset later brings the same cameras
+    back in the same places, at the same sizes.
+  - The preset's sizes WIN when it is loaded: they are written in as
+    those cameras' sizes, so the Layout picture, the live cameras and
+    the next session all agree. Presets saved before sizes existed
+    carry none and change nothing.
   - If the cameras were left arranged automatically when you pressed
     Save, the preset says "arrange these automatically" instead of
-    freezing the sizes. That is deliberate: frozen sizes belong to the
-    window they were measured in, and the preset will be opened in a
-    window of another shape.
+    freezing the window rectangles. That is deliberate: frozen
+    rectangles belong to the window they were measured in, and the
+    preset will be opened in a window of another shape. The sizes are
+    saved either way — they are what the automatic arrangement is
+    steered by.
   - "Auto-arrange cameras" (right-click a camera's name bar) does not
     touch the preset's copy. It rearranges what is on screen; load the
     preset again to get your arrangement back.
@@ -946,16 +1217,19 @@ WHAT IS SEARCHED
   - "Time window" and "Cameras" sit side by side, the picked days are
     listed under them, and "Load data" is at the bottom of the same
     group — the action next to everything it acts on.
-  - "Time window" opens the Image Slider's own picker: one calendar
-    (Monday first, weekends in red, the month and the year on the bar
-    above the days), the times From and To to the minute, and a
-    "Multiple days" tick. With that ticked, every day you click is
-    added to the list and the From/To window applies to all of them;
-    the gear next to one day in the list gives just that day its own
-    window. So the days need NOT follow one another — Monday and
-    Thursday alone is a perfectly good search. "Now" moves the
-    calendar to today. There is no Live mode here; this tab searches
-    what is already archived.
+  - "Time window" opens the one picker every tab opens: a single
+    calendar (Monday first, weekends in red, the month and the year
+    on the bar above the days) and the times From and To to the
+    minute. Ctrl+click adds a day, Ctrl+Shift+click a whole stretch
+    of them. Pick a second day and a table appears with a row per
+    day, each with its own From and To — there is no tick to find,
+    and no separate window for one day's times. So the days need NOT
+    follow one another: Monday and Thursday alone is a perfectly good
+    search. The From/To above the table moves every day at once; a
+    row you type in keeps what you typed. "Now" moves the calendar to
+    today. Nothing happens until OK; Cancel throws the change away.
+    There is no Live mode here; this tab searches what is already
+    archived.
     What this replaced was a pair of calendars of its own, Start
     point and End point, which could only pick whole hours and only a
     run of days from one date to another.
@@ -981,7 +1255,7 @@ SEARCH CRITERIA
     using them as a search filter.
 
 CAMERA SELECTION
-  - "Cameras..." opens the picker; search by name or number and
+  - "Cameras" opens the picker; search by name or number and
     click to add or remove. Every camera you pick is searched and
     gets its own results tab.
   - "✕ Remove selected camera" takes the highlighted one out of the
@@ -1002,9 +1276,11 @@ TECHNICAL NOTES
     make the waveplate alternate between two unrelated values).
   - A value is shown as the number itself, "n/a" (no sample in
     range) or "ERR" (the fetch failed and can be retried).
-  - Step PVs such as the waveplate are archived only when they
-    change, so they are resolved as "last value at or before this
-    frame", not as the nearest sample.
+  - Step PVs such as the waveplate or a GDD order are archived only
+    when they change, so they are resolved as "last value at or
+    before this frame", not as the nearest sample. Which PVs those
+    are is worked out from the archive itself - nothing has to be
+    listed for a newly added setting.
   - Extra columns are matched within 30 s; the frame itself must sit
     within 30 s of the matched shot.
   - Every PV is reported exactly as the archiver has it. SBW4 used
@@ -1098,9 +1374,10 @@ WHERE THE CONTROLS ARE
     Source            time window, cameras, and Load
     PV channels       the value picker and the list of picked
                       values with their number at the moment
-    The moment        which moment is picked, prev / next, "Send to
-                      Image Slider", and the list of saved moments
-                      with Save / Forget / Clear
+    The moment        which moment is picked, prev / next, the two
+                      ways out to the Image Slider ("Send moment"
+                      and "Send + cameras"), and the list of saved
+                      moments with Save / Forget / Clear
     Range statistics  the numbers for a marked stretch
     Image / Display   how the frames look
 
@@ -1116,20 +1393,18 @@ WHERE THE CONTROLS ARE
 
 HOW IT IS USED
 
-  1. The CALENDAR button (the first one, with the calendar symbol) —
-     the day and the From/To times. This is the Image Slider's own
-     picker, the same calendar, so a window picked there is picked
-     here the same way, multiple days included. Only the readings
-     inside the window are read and drawn. Afterwards the button
-     itself says what is picked, for example "24.08.  07:00-19:00";
-     hover it for the whole sentence, including how long the window
-     is. There is no "Live mode" tick in this picker, because this
-     tab does not follow new images — the Image Slider is the tab
-     that does.
-  2. The CAMERA button beside it — which cameras a moment should
-     show. Again the Slider's own picker, saved camera sets included.
-     It then says how many are picked, and names them on hover.
-  3. "Search / select PVs..." — which machine values to draw. The
+  1. "Time window" — the day and the From/To times. This is the
+     Image Slider's own picker, the same calendar, so a window picked
+     there is picked here the same way, multiple days included. Only
+     the readings inside the window are read and drawn. There is no
+     "Live mode" tick in this picker, because this tab does not
+     follow new images — the Image Slider is the tab that does.
+  2. "Camera" beside it — which cameras a moment should show. Again
+     the Slider's own picker, saved camera sets included. It does not
+     offer the arrangement board the Slider's does: this tab has no
+     grid to arrange, and an arrangement picked here would overwrite
+     the Slider's own.
+  3. "Search / select PVs" — which machine values to draw. The
      Slider's own picker over the same shared list, with the same
      search, so a value added or named here is added or named
      everywhere, and a set picked in the Slider is already picked
@@ -1156,6 +1431,30 @@ ONE GRAPH, NOT ONE PER VALUE
   unpicking it: the value stays read and stays listed with its
   number, it is just not drawn. Nothing is re-read when you switch it
   back on.
+
+A VALUE STAYS PUT UNTIL IT CHANGES
+
+  The archive writes a value down when it MOVES, not on a clock. So
+  the graph draws it as a staircase: a waveplate that went to 15000
+  at nine o'clock is drawn at 15000 all the way to the next time it
+  moved, and then steps to the new number at that instant. It is
+  never drawn as a slope from one to the other — a slope would show
+  you angles the machine never stood at.
+
+  A setting that did not move at all inside your window is still
+  drawn, as a flat line at the value it was already sitting at, and a
+  setting whose last move was days ago is drawn from the left-hand
+  edge of the window to the right-hand edge.
+
+  Values measured every shot are treated differently on purpose: if
+  the shots stop at noon, the line stops at noon. Drawing it flat
+  until the evening would say the laser kept firing. The program
+  works out which kind each value is from the value's own history —
+  there is no list to maintain.
+
+  The little dots on a line mark the times something was really
+  written into the archive. A line with no dots on it has too many
+  samples to mark them.
 
   The time axis is labelled on the clock: every minute, quarter of an
   hour, hour or three hours, whichever fits — never at some round
@@ -1192,14 +1491,18 @@ A VALUE BUILT FROM A FORMULA
 
 WHAT THE TAB REMEMBERS
 
-  The window, the cameras, the picked values and their eye state, the
-  saved moments, all the display sliders and their Auto ticks, the
-  palette, the frame size, and which panels were left open. It comes
-  back the way you left it the next time you start the program.
+  The window, the cameras, the picked values and their eye state, all
+  the display sliders and their Auto ticks, the palette, the frame
+  size, and which panels were left open. It comes back the way you
+  left it the next time you start the program.
 
-  A saved moment survives a restart, and can be clicked with nothing
-  loaded at all — a time needs no graph behind it for the frames to
-  be found.
+  The saved moments are the one thing it does NOT keep. They are
+  yours for as long as the program is open: while it runs, a saved
+  moment can be clicked with nothing loaded at all — a time needs no
+  graph behind it for the frames to be found — but closing the
+  program empties the list. Yesterday's times mean nothing against
+  today's window, and they would only push out the ones you are
+  working on.
 
   Restoring reads NOTHING — not the archive, not the image share. The
   tab comes up set the way you left it and waits for you to press
@@ -1207,8 +1510,8 @@ WHAT THE TAB REMEMBERS
 
 THEN, ON THE GRAPH
 
-  The LEFT button reads the graph, the RIGHT button looks closer at
-  it. They never do the same thing.
+  The LEFT button READS the graph, the RIGHT button ZOOMS it and SETS
+  IT UP. They never do the same thing.
 
   LEFT CLICK a moment
     Every picked camera's frame comes up on the right, and the value
@@ -1218,11 +1521,12 @@ THEN, ON THE GRAPH
     saving anything; "Save" keeps the one you stop on.
 
   LEFT DRAG across a stretch
-    "Range statistics" then lists, for every value, the average, the
-    spread (± std) and how many readings the stretch holds. Hover a
-    row for the smallest, the largest and the peak-to-peak. The
-    marked stretch is shaded on the graph and "Clear the range"
-    removes it. A drag works anywhere on the graph.
+    "Range statistics" then lists, for every value, how many readings
+    the stretch holds, the average, the spread (± std) and the
+    smallest and largest value in it. Hover a row for the middle
+    value, the peak-to-peak, the first and last reading and the trend
+    across the stretch. The marked stretch is shaded on the graph and
+    "Clear the range" removes it. A drag works anywhere on the graph.
 
   RIGHT DRAG across a stretch
     The time axis shows only that stretch. The marked range and the
@@ -1230,13 +1534,43 @@ THEN, ON THE GRAPH
     not choosing.
 
   RIGHT CLICK
-    Back out one zoom step, the way you came in; once there are no
-    steps left, back to the whole window.
+    The settings for whatever you clicked on. Four menus, and which
+    one you get depends on where the mouse was:
+
+      on a CURVE (or on its row in the legend)
+        that value's own menu: hide it on the graph, make clicks snap
+        to it instead of to the topmost curve, give it a scale of its
+        own, open the value picker to rename it or set its unit and
+        limits, take it off the list, or copy its channel name.
+
+      on a SCALE down either side
+        that scale's menu: fit it to the data, fit it to the marked
+        stretch only, set the top and bottom by hand, or draw it
+        logarithmically. A scale set by hand stays set until you
+        choose "Fit to the data" again.
+
+      UNDER the graph, where the times are
+        the time axis: zoom back out one step or show the whole
+        window, type the From/To times, or pick a fixed tick spacing
+        instead of the automatic one.
+
+      anywhere ELSE on the graph
+        the graph itself: zoom back out, clear the marked stretch,
+        switch the grid or the legend off, copy the graph to the
+        clipboard or save it as a picture.
+
+  ZOOMING BACK OUT is a STEP at a time — one right drag back per
+  step — with "Show the whole window" for all of it at once. It used
+  to be a plain right click that jumped straight to the whole loaded
+  window; for a pick spanning many days that meant a whole month in
+  one go, which is not what somebody looking closely at ten minutes
+  wants. The toolbar's back arrow and house button do the same job.
 
   Click and drag are told apart by how far the mouse moved: below
-  about five pixels it is a click, above it a drag. The zoom and pan
-  buttons in the toolbar take priority — while one of them is active,
-  the mouse belongs to the toolbar.
+  about five pixels it is a click, above it a drag — so finishing a
+  right drag never opens a menu. The zoom and pan buttons in the
+  toolbar take priority: while one of them is active, the mouse
+  belongs to the toolbar.
 
 WHY A CLICK SNAPS
 
@@ -1246,6 +1580,12 @@ WHY A CLICK SNAPS
   of the FIRST value drawn, which is the topmost one in the value
   list that is not hidden by its eye. That is also what "prev" and
   "next" step along.
+
+  If you would rather it followed a different value — a per-shot
+  energy while a slow motor position sits at the top of the list, for
+  example — right-click that curve and tick "Clicks snap to this PV".
+  The choice is remembered, and it falls back to the ordinary rule if
+  that value stops being drawn.
 
 THE SAVED MOMENTS
 
@@ -1288,23 +1628,90 @@ GOING BACK IS INSTANT
   a moment that recent the answer can still change, so the share is
   asked again.
 
-SEND TO IMAGE SLIDER
+A SAVED MOMENT KEEPS ITS FRAMES
 
-  The way out of this tab. It opens the Image Slider on the moment
-  that is on screen, with the cameras picked here: full size, with
-  the subtraction, the overlays, the profile tools and everything
-  else that tab can do.
+  Pressing "Save" is a promise to come back, so its frames get more
+  than the ordinary memory:
 
-  The Slider is given the quarter of an hour on either side of the
-  moment as its window — so the shots around the interesting one can
-  be slid through — and it opens ON the moment that was sent, not at
-  the start of that window. Nothing has to be picked there a second
-  time. Whatever the Slider was doing before is put down first: live
-  mode, focus mode and the watcher, which would otherwise drag the
-  view to the newest frame or hide the slider itself.
+  - They are HELD. Nothing you look at afterwards can push them out,
+    however many other moments go through the cache in between, so
+    flipping between two saved moments stays instant all day.
+  - They are FETCHED AHEAD. The moment you press Save, that moment's
+    frames are quietly found and drawn in the background, so the
+    first click on its row already has them. It runs on fewer threads
+    than the wall you are waiting for, so it can never be in the way.
+  - Moving a display slider re-draws them too, in the background, so
+    going back is instant after that as well.
 
-  The button is grey until there is both a moment and at least one
-  camera.
+  Two limits: the newest twelve saved moments are held (not all
+  sixty), and what they hold has a ceiling of its own on top of the
+  ordinary one. Both exist because it is the commit charge that runs
+  out on these PCs, and sixty moments times twenty cameras would not
+  fit in it.
+
+  This is MEMORY only — nothing is copied onto the disk. Closing the
+  program empties the list of moments along with their frames.
+
+  Nothing is fetched while the tab is only restoring itself. The
+  background fetch starts after the first time you ask for frames
+  yourself, so a tab you have pressed nothing in reads no share at
+  all.
+
+WHY THE FRAMES USED TO TAKE A MINUTE
+
+  Finding twenty cameras' frames for one moment could take about a
+  minute, where it used to take seconds. None of that was in drawing
+  the pictures; it was in reading folders on the share, and a folder
+  read over the network takes about 150 ms.
+
+  The old way read the same folders over and over. Each camera looked
+  through the hour folder for ITSELF, and when its own folder was not
+  in that hour — cameras do not all record every hour; one day held
+  92 cameras with only 27 of them in every hour — it asked about
+  every one of the ~90 folders in that hour separately. Then it did
+  the same for the neighbouring hours, and then the next camera
+  started again from scratch. Nothing was kept for the next moment
+  either.
+
+  Now each folder is read ONCE and the answer serves every camera and
+  every moment in that hour. On a test tree of 20 cameras with 70
+  others alongside them, that is 25 folder reads instead of 1816 —
+  under four seconds' worth on the share instead of over four
+  minutes — and a second moment in the same hour reads nothing at
+  all.
+
+  The line under the frames now says how long the search took and how
+  many folders it had to read, and how long the drawing took, so a
+  slow one can be explained rather than guessed at. This tab also has
+  its own worker threads now, so nothing another tab is doing can
+  make the frames wait.
+
+THE TWO WAYS OUT TO THE IMAGE SLIDER
+
+  The way out of this tab: the Image Slider is where a frame gets
+  looked at full size, with the subtraction, the overlays, the
+  profile tools and everything else that tab can do. Two buttons,
+  side by side, differing only in where the CAMERAS come from:
+
+    "Send moment"       opens the Slider on this moment and LEAVES
+                        ITS CAMERAS ALONE. Use it when the Slider is
+                        already set up on the cameras you are working
+                        with and only the time needs to change.
+                        Greyed out while the Slider has never picked
+                        a camera — it would open on nothing, and the
+                        tooltip says so.
+
+    "Send + cameras"    also switches the Slider to the cameras
+                        picked here. Greyed out while nothing is
+                        picked here.
+
+  Either way the Slider is given the quarter of an hour on either
+  side of the moment as its window — so the shots around the
+  interesting one can be slid through — and it opens ON the moment
+  that was sent, not at the start of that window. Whatever the Slider
+  was doing before is put down first: live mode, focus mode and the
+  watcher, which would otherwise drag the view to the newest frame or
+  hide the slider itself.
 
 A STRETCH WITH NO READING IN IT
 
@@ -1314,11 +1721,11 @@ A STRETCH WITH NO READING IN IT
   perfectly well defined the whole time.
 
   So the statistics fall back to the last reading BEFORE the stretch
-  and carry it forward: the average column shows that value, the
-  spread column says "held", the count says 0, and the whole row is
-  amber so it can never be mistaken for an average of readings that
-  are really there. Hover it for where that reading came from and how
-  old it is.
+  and carry it forward: the average, smallest and largest columns all
+  show that value (it never moved, so it is all three), the spread
+  column says "held", the count says 0, and the whole row is amber so
+  it can never be mistaken for an average of readings that are really
+  there. Hover it for where that reading came from and how old it is.
 
   This also covers a value with no readings in the whole window: it
   is still listed, with whatever it was sitting at when the window
@@ -1337,6 +1744,8 @@ THE FRAMES
   Frames are found by exactly the same rule as in the Shot Finder
   (the hour folder the moment falls in plus its neighbours, and a
   30-second window), so a frame found here is the frame found there.
+  What changed is only how OFTEN the share is read for it — see "Why
+  the frames used to take a minute" above.
 
 HOW THE FRAMES LOOK  ("Image / Display")
 
@@ -1460,8 +1869,16 @@ THE TOP ROW OF TOOLS
   slider is being dragged, a large sample pops up above it and shows
   the stroke at its real thickness for the whole range, up to the
   widest brush; it disappears as soon as the slider is let go. Set
-  with the arrow keys instead, it shows itself for a moment. After
-  that come text size and a Fill box.
+  with the arrow keys instead, it shows itself for a moment.
+
+  Then comes the text size, with a sample of its own beside it: the
+  letters "Aa" in the drawing colour, at the size the next piece of
+  text will get. Up to about 20 they are at their real size; above
+  that the box runs out of room, so the frame turns amber and dashed
+  and the sample only shows that bigger is bigger. Every change of
+  the number also pops a large sample up for a moment, and that one
+  is at true size over the whole range, up to 200. Last on the row
+  is the Fill box.
 
   The second row: the magnification as a slider with the percentage
   beside it and ＋ − Fit and 1:1 next to that, then Undo / Redo /
@@ -1480,8 +1897,8 @@ RIGHT CLICK ON THE PICTURE
   A short menu of the things you want most often: undo and redo,
   measure the whole picture, the results table, the beam report, the
   value under the pointer (it can be copied, or turned into a
-  marker), delete the selected item, copy, Save PNG…, duplicate,
-  fit and true size. It stays out of the way under Magnify and while
+  marker), delete the selected item, copy, "Save with overlay",
+  Save PNG…, duplicate, fit and true size. It stays out of the way under Magnify and while
   you are clicking out a polygon or an angle, because there right
   click already means something else.
 
@@ -1659,12 +2076,19 @@ COMPARE
   off — set Compare back to Off first.
 
 SAVE
-  Save PNG…, Save TIFF… or Save JPEG… writes a copy of exactly what
-  you see, including the drawing and the measurements unless you
-  untick the box. (Never keep data as JPEG — it throws detail away.)
-  "Save all…" asks for a format and writes every image in the
-  Workshop into one folder, and "Copy" puts the picture on the
-  clipboard.
+  "Save with overlay" decides what lands in the file. Ticked, and
+  everything drawn on the picture goes in with it: text, lines,
+  arrows, freehand strokes, regions, the scale bar and the numbers
+  the measuring tools wrote by themselves. Unticked, only the
+  picture is written, with nothing drawn on it. The same switch is
+  in the right-click menu on the picture, the bar at the bottom says
+  which way each file was written, and the choice is remembered for
+  next time.
+  Save PNG…, Save TIFF… or Save JPEG… then writes the copy. (Never
+  keep data as JPEG — it throws detail away.) "Save all…" asks for a
+  format and writes every image in the Workshop into one folder, and
+  "Copy" puts the picture on the clipboard. All of them follow the
+  same switch.
   - "Save the values as TIFF…" is the other kind of TIFF and both
     are needed. This one writes what was MEASURED: the camera's own
     pixel intensity as a plain 16-bit file, no palette, no display
@@ -1774,7 +2198,14 @@ FOR WHOEVER WORKS ON THE CODE
 
     python testing/test_day_split.py
 
-    test_one_moment.py       the One Moment tab, end to end
+    test_pv_stats_and_formula.py  the marked range's statistics, the
+                             graph controls and a formula over time
+    test_saved_moments.py    the session-only list of saved moments
+    test_wall_regions.py     one row per day, a column per camera
+    test_wall_export.py      Save view: PNG or PDF, one tab or all
+    test_pv_regions_persist.py  a marked region never disappears
+    test_pv_alias_and_order.py  SBW4 under either name; cameras or
+                             moments picked in either order
     test_day_split.py        the archiver refusing a whole day
     test_pv_resilience.py    the PV panel freezing
     test_scale_invariance.py the brightness scale (needs the lab)

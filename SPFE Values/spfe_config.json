@@ -1,0 +1,18 @@
+{
+  "slot_morning": "09:00",
+  "slot_evening": "18:00",
+  "weekdays_only": true,
+
+  "share_root": "",
+  "share_subdir": "SPFE Values",
+  "share_probe_timeout_s": 3.0,
+
+  "history_days": 20,
+  "min_history": 8,
+  "mad_factor": 5.0,
+  "flat_tolerance_pct": 20.0,
+
+  "http_timeout": 10.0,
+  "catch_up_on_start": true,
+  "catch_up_max_days": 30
+}

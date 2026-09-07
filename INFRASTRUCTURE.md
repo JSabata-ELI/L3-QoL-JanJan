@@ -21,6 +21,7 @@ about what crosses folder boundaries.
 | `Announcer` | Screen-region watch + PV badges | Scripts | tkinter | yes |
 | `CSS Logger` | Archive explorer / logger (**Spectra** is its second tab, `sp_t.py`) | Scripts | PySide6 | yes |
 | `Chiller Log` | Long-term chiller flow/temperature trend | Scripts | tkinter | not yet |
+| `SPFE Values` | The daily morning/evening SPFE table, into a workbook on the share | — ² | PySide6 | not yet, on purpose |
 | `Diagnostic` | Live PV monitoring, alerting, Webex bot | External¹ | PySide6 | yes (+ helper exe) |
 | `Pulser Monitor` | Diode-array pulser analysis from camera frames | External¹ | PySide6 | yes |
 | `Shift planner` | Fill your availability into the shift spreadsheet | External¹ | tkinter | yes |
@@ -41,6 +42,12 @@ Extractor are currently absent, so they show up there. That is a gap in the list
 a statement about the programs — right-clicking a card moves it per user, but the
 permanent fix is to add the folder name to the right set.
 
+² **Deliberately invisible.** `SPFE Values` is not built, so the Launcher — which lists
+a folder only when it holds an exe (`l.py:487`) — never sees it. It does appear in
+Dev Tools ▸ Builder's project list, which takes any folder containing a `.py`
+(`b_t.py:314`); it is simply never built. It is written as one QWidget and is meant to
+become an **SPFE values** tab of CSS Logger rather than ship on its own.
+
 `SCRIPTS` also contains `"Chiller log"`, which normalises to match the real folder, so
 Chiller Log will appear under Scripts as soon as it is built.
 
@@ -51,6 +58,7 @@ Chiller Log will appear under Scripts as soon as it is built.
 | Announcer, CSS Logger, Diagnostic, Image Tools, Internal Builder | yes | yes |
 | Calibrations, Chiller Log, Dev Tools, Git Work, Launcher, Screenshots, Shift planner, Time Converter | yes | no (none needed) |
 | Pulser Monitor | **no** | yes |
+| SPFE Values | **no** | no (not built yet) |
 | Extractor | no | no (not built on its own) |
 
 Pulser Monitor is the one program that would benefit from an icon and does not have
@@ -217,11 +225,12 @@ deployed (a share)                build output (this PC)
 
 ## 4. Where settings live, and why
 
-Three homes, and the choice is never arbitrary.
+Four homes, and the choice is never arbitrary.
 
 | Home | Used for | Programs |
 |------|----------|----------|
-| `%APPDATA%\<Name>\` | per-user preferences and caches; anything that must survive a redeploy | `Launcher`, `DevTools`, `GitWork`, `PulserMonitor` (the hand-tuned ROI boxes!), `ELI_ImageTools`, `ELI_Spectra`, `Diagnostic` (run status) |
+| `%APPDATA%\<Name>\` | per-user preferences and caches; anything that must survive a redeploy | `Launcher`, `DevTools`, `GitWork`, `PulserMonitor` (the hand-tuned ROI boxes!), `ELI_ImageTools`, `ELI_Spectra`, `Diagnostic` (run status, and `okbase.json` — the canteen sign-in, which is why a rebuild inherits it) |
+| `%LOCALAPPDATA%\<Name>\` | the same, but for things too big to roam with the Windows profile | `Diagnostic\edge-profile` — the browser profile behind **Sign in with Edge** (`edge_cdp.py`). A Chromium profile is hundreds of megabytes of cache; it is deliberately NOT in the roaming `%APPDATA%` the rest of that program uses, and nothing in it needs to survive being deleted (it costs one extra sign-in) |
 | Next to the program | per-installation configuration and data | `Screenshots/custom_presets.json`, `Announcer/presets.json`, `CSS Logger/*.json`, `Chiller Log/chiller_archive.csv`, `Diagnostic/monitor_config.json` |
 | The scratch share | configuration that must be the same everywhere | `Diagnostic\monitor_pvs_shared.json` (the PV list, thresholds and monitoring settings) |
 | Inside the build | credentials that cannot be per-PC | `Diagnostic/notify_provision.dat` (Teams / SMTP / Webex) |
@@ -254,6 +263,7 @@ Several programs read the same archive, and the difference is the time scale.
 | What is the value right now, and warn me | **Diagnostic** ▸ PV Monitor |
 | What did these values do over the last hours or days | **CSS Logger** |
 | What is the chiller trend over months and years | **Chiller Log** |
+| What did the SPFE read this morning, and every morning before | **SPFE Values** |
 | Which images exist, and what was the machine doing | **Image Tools** ▸ Image Finder |
 | Play a sequence of frames, recorded or live | **Image Tools** ▸ Image Slider |
 | Find the shots where a value was X | **Image Tools** ▸ Shot Finder |
@@ -268,6 +278,10 @@ Deliberate overlaps, so nobody merges them by mistake:
 
 - **Diagnostic vs CSS Logger vs Chiller Log** are live / short-window / long-term.
   Different sampling, different cost, different questions.
+- **SPFE Values vs CSS Logger.** CSS Logger plots any PV over any window; SPFE Values
+  takes one reading of a fixed list at two fixed times a day and writes it into a
+  shared table people fill in by hand today. Same archiver, different product: a
+  document, not a plot.
 - **Announcer's PV badges vs Diagnostic's alerting.** Announcer's are a convenience
   beside its screen watch and only run while it is watching. Diagnostic is the real
   alerting.
@@ -358,8 +372,10 @@ What is duplicated deliberately:
 |---------|-----------|------|
 | `set_app_icon(win, ico, app_id)` | every tkinter program | tkinter's `iconbitmap` only sets the title bar; the Windows 11 taskbar reads the small-icon slots and the window-class icon. Must be **frozen-aware** — in a build `__file__` does not point next to the exe. |
 | `get_app_dir()` / `_app_dir()` | every program | exe folder when frozen, source folder otherwise. Every path resolves through it. |
-| Hour-chunked archiver fetch | Chiller Log, CSS Logger, Image Tools | the one-hour limit from §2 |
-| The house calendar | CSS Logger (both tabs), Pulser Monitor, Chiller Log, Calibrations | Monday-first, grey header, red weekends, white cells. Weekends must be detected from the cell's **date**, never its column index. Inside Image Tools it is not duplicated at all — every tab opens the Image Slider's `DatePickerDialog`, so a day looks and clicks the same in all five. A caller with no live mode passes `allow_live=False` rather than showing a tick that does nothing. |
+| Hour-chunked archiver fetch | Chiller Log, CSS Logger, Image Tools, SPFE Values | the one-hour limit from §2 |
+| `cpva_core.py`'s fetch layer | CSS Logger (owner), SPFE Values (`spfe_core.py`) | function names kept identical on purpose. SPFE Values is written to become a CSS Logger tab; `spfe_t.py` and `spfe_record.py` import through a `try: from cpva_core … except ImportError: from spfe_core …` adapter, so `spfe_core.py` is simply **not copied** when the widget moves and this row disappears. |
+| Priority-ordered share probe | Diagnostic (`shared_pvs._first_reachable`, the reference), SPFE Values (`spfe_store._first_reachable`) | daemon threads, decide as soon as the highest-priority root answers, never a `ThreadPoolExecutor`. The reasoning is the 48-second stall in §2 — see the three consequences listed there. |
+| The house calendar | CSS Logger (both tabs), Pulser Monitor, Chiller Log, Calibrations | Monday-first, grey header, red weekends, white cells. Weekends must be detected from the cell's **date**, never its column index. Inside Image Tools it is not duplicated at all: **`Image Tools/daypicker.py` is the one owner** — the look, the click rules (plain / Ctrl / Ctrl+Shift), the per-day time table that appears the moment a second day is picked, the 08:00–19:00 default, and OK/Cancel. Every tab opens its `DayTimePicker`, so a day looks and clicks the same in all five; a caller with no live mode passes `allow_live=False` rather than showing a tick that does nothing. The rules are written out in `Image Tools/STRUCTURE.md` § *Picking days and times* and pinned by `testing/test_daypicker.py`. The four programs listed here still carry their own copies **on purpose, for now** — Pulser Monitor even shows two calendars side by side, and CSS Logger's Start/End window is a deliberate CS-Studio clone with relative ("−1 hour", "now") spans that a day-picker cannot express. Bringing them over is a separate job; when it happens, `daypicker.py` is what they should adopt. |
 | A tab's own settings file | Image Tools (one JSON per tab in `%APPDATA%\ELI_ImageTools`) | the shared thing (the PV registry) has ONE file; what a single tab shows has its own. Written on every change, never on close — a tab is not told the program is quitting. Restoring must read no network and no share. |
 | Checkbox styling | the Qt programs | QSS on `::indicator` only — never a border on `QCheckBox {}` |
 | Matplotlib toolbar | Pulser Monitor (`_make_mpl_toolbar`) | build it so the icons are **not** tinted; under the dark palette a tinted toolbar goes invisible |

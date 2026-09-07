@@ -4,7 +4,9 @@
     "notify_provision.dat"
   ],
   "hidden_imports": [
-    "win32crypt"
+    "win32crypt",
+    "okbase_menu",
+    "edge_cdp"
   ],
   "extra_exes": [
     {

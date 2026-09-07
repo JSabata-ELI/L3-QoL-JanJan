@@ -50,6 +50,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import memstats
@@ -79,6 +80,10 @@ VERSION_RE = re.compile(r"^v(\d+)(?:\.(\d+))*$")
 ENTRY_COPY_RE = re.compile(r" v\d+(?:\.\d+)*\.py$", re.IGNORECASE)
 
 COMMANDS = ("/run", "/rundiagnostic")
+# The canteen menu, answered from the saved copy (okbase_menu.py) — no OKbase
+# sign-in happens here. This listener answers it only while the app is CLOSED:
+# the app answers its own /food, and both replying would double every menu.
+FOOD_COMMANDS = ("/food", "/menu", "/lunch")
 POLL_FETCH_COUNT = 20
 
 # How long to wait for a launched app to report that it is tracking. A cold
@@ -95,25 +100,28 @@ READY_POLL_S = 2
 MEM_LOG_INTERVAL_S = 3600.0
 
 
-def _is_command(raw: str | None) -> bool:
-    """True when this message asks for the app to start.
+def _split_command(raw: str | None) -> tuple[str, str]:
+    """(command_word, everything_after_it) with the @mention taken off.
 
-    The mention has to come off first. In a group space Webex only delivers
-    messages that @mention the bot, and it puts that mention INTO the text — the
-    room shows "@Diagnostics /run" and the API hands over "Diagnostics /run".
-    Comparing the whole string to the command therefore never matched in the one
-    kind of room where the tag is compulsory, and the command looked ignored.
-    monitor_tab does the same strip for its own commands; this one had been left
-    behind.
+    The mention strip is the part that matters. In a group space Webex only
+    delivers messages that @mention the bot, and it puts that mention INTO the
+    text — the room shows "@Diagnostics /run" and the API hands over
+    "Diagnostics /run". Comparing the whole string to the command therefore
+    never matched in the one kind of room where the tag is compulsory, and the
+    command looked ignored (fixed 2026-08-19). monitor_tab does the same strip
+    for its own commands.
 
     Only the first word has to be the command, so a trailing "please" or a full
-    stop does not lose it.
+    stop does not lose it — and the rest is handed back, because `/food week`
+    needs its argument.
     """
     text = (raw or "").strip()
     if "/" in text and not text.startswith("/"):
         text = text[text.index("/"):]
     parts = text.split()
-    return bool(parts) and parts[0].lower().rstrip(".,!:;") in COMMANDS
+    if not parts:
+        return "", ""
+    return parts[0].lower().rstrip(".,!:;"), " ".join(parts[1:])
 
 
 def _pid_alive(pid: int) -> bool:
@@ -309,6 +317,175 @@ def _wait_and_report(webex: WebexNotifier, proc: "subprocess.Popen", what: str) 
             f"❌ Diagnostic did not come up within {READY_TIMEOUT_S} s. [{what}]")
 
 
+def _save_okbase_cookies(cookies: str, settings: dict | None = None) -> None:
+    """Store a renewed OKbase session in the Windows account's own file.
+
+    Not in monitor_config.json: that file sits next to the program, and the
+    program has several homes (source, and every version under C:\\Dev\\dist), so
+    a sign-in written there would be invisible to all the others — see
+    okbase_menu.OKBASE_KEYS.
+
+    Only ever called while Diagnostic is closed (see _menu_upkeep): if the app
+    were open it would hold its own copy in memory, so the two must never both
+    write.
+
+    `settings` is the live dict main() holds, and it MUST be given: the file was
+    being updated while the dict was not, so this process renewed a session,
+    saved it, and then went straight back to using the original paste on the next
+    tick. It limped along only because the revive path works, and it died the
+    moment that stopped.
+    """
+    if not cookies:
+        return
+    try:
+        import okbase_menu
+        from secrets_util import encrypt_secret, resolve_secret
+        stored = okbase_menu.load_user_settings().get("okbase_session_cookie", "")
+        if resolve_secret(stored) == cookies:
+            return
+        encrypted = encrypt_secret(cookies)
+        problem = okbase_menu.save_user_settings(
+            {"okbase_session_cookie": encrypted})
+        if settings is not None:
+            settings["okbase_session_cookie"] = encrypted
+        print(f"[remote_launcher] could not save the OKbase session: {problem}"
+              if problem else "[remote_launcher] OKbase session renewed and saved.")
+    except Exception as e:  # noqa: BLE001 - never worth stopping the loop for
+        print(f"[remote_launcher] could not save the OKbase session: {e}")
+
+
+def _reload_okbase_settings(settings: dict) -> bool:
+    """Pick up a sign-in pasted in while this listener is running.
+
+    Updates the dict IN PLACE and never rebinds it: main() holds this exact
+    object and hands it to both _menu_upkeep and _food_answer, so a fresh dict
+    would heal neither. Diagnostic's own _reload_okbase_sign_in does the same job
+    for the app; without this the listener kept using whatever sign-in it read at
+    startup and a re-paste needed the listener restarted to take effect.
+
+    Only okbase.json is re-read, not the whole of load_webex_settings(): the bot
+    token and the room do not change under a running listener, and re-reading
+    monitor_config.json every pass would be disk traffic for nothing.
+
+    Returns True when the sign-in itself moved.
+    """
+    try:
+        import okbase_menu
+        disk = okbase_menu.load_user_settings()
+    except Exception:  # noqa: BLE001 - never worth stopping the loop for
+        return False
+    if not disk:
+        return False
+    before = settings.get("okbase_session_cookie") or ""
+    settings.update(disk)
+    return bool(disk.get("okbase_session_cookie")) and \
+        disk.get("okbase_session_cookie") != before
+
+
+def _menu_upkeep(settings: dict, state: dict) -> None:
+    """Keep the canteen sign-in alive, and read the menu once a day.
+
+    This is why a pasted OKbase session does not have to be refilled by hand:
+    the session dies of being UNUSED, and this process is the one that is always
+    up. Diagnostic does the same job while it is open, so this stands down while
+    the app is running — exactly like /food itself.
+    """
+    if not settings.get("okbase_enabled"):
+        return
+    if is_app_running():
+        return
+    try:
+        import okbase_menu
+    except Exception:  # noqa: BLE001
+        return
+
+    # ONE clock for both jobs. A due-but-failing fetch used to skip this check,
+    # so a dead sign-in was retried on every pass of the poll loop — every 10 s,
+    # not every 10 min — and said so in the console each time.
+    now = time.monotonic()
+    if now < state.get("next_try", 0.0):
+        return
+    every = max(60.0, float(settings.get("okbase_keepalive_min")
+                            or okbase_menu.KEEPALIVE_MINUTES_DEFAULT) * 60.0)
+    state["next_try"] = now + every
+
+    # Behind the interval gate on purpose: once per keepalive, not once per pass
+    # of the 5 s poll loop.
+    if _reload_okbase_settings(settings):
+        print("[remote_launcher] picked up a renewed OKbase sign-in.")
+        state["ok"] = None          # a fresh paste is a fresh chance to report
+
+    today = datetime.now()
+    due_fetch = (state.get("day") != today.date().isoformat()
+                 and today.hour >= int(settings.get("okbase_refresh_hour", 6) or 0))
+
+    if due_fetch:
+        out: dict = {}
+        cache, err = okbase_menu.refresh(settings, session_out=out)
+        if cache:
+            state["day"] = today.date().isoformat()
+            print(f"[remote_launcher] canteen menu: read "
+                  f"{len(cache.get('days') or {})} day(s) from OKbase.")
+        _save_okbase_cookies(out.get("cookies", ""), settings)
+        _report_menu_state(state, not cache, err)
+        return
+
+    cookies, err = okbase_menu.keepalive(settings)
+    _save_okbase_cookies(cookies, settings)
+    _report_menu_state(state, bool(err), err)
+
+
+def _report_menu_state(state: dict, failed: bool, err: str) -> None:
+    """Write to the console only when the outcome CHANGES.
+
+    At one attempt every ten minutes, repeating the same line would bury the
+    console — and the chat is never told at all: the canteen menu is not
+    something anybody waits on, so it answers when asked and stays quiet
+    otherwise.
+    """
+    ok = not failed
+    was = state.get("ok")
+    if ok == was:
+        return
+    state["ok"] = ok
+    if ok:
+        if was is False:      # not on the first success of a fresh start
+            print("[remote_launcher] canteen sign-in works again.")
+        return
+    print(f"[remote_launcher] canteen menu: reading it failed — {err}")
+    # Nothing is posted to the chat about it. The canteen menu is a convenience
+    # nobody is waiting on, so an unprompted "the sign-in has expired" is pure
+    # noise; it belongs in the answer to /status and /food, which is where a
+    # person is actually asking. This console line is the whole record.
+
+
+def _food_answer(args: str, settings: dict) -> str:
+    """The /food reply, from the saved menu.
+
+    Imported here rather than at the top so a problem in the menu reader can
+    never stop this listener doing its main job, which is starting the app.
+    """
+    try:
+        import okbase_menu
+    except Exception as e:  # noqa: BLE001
+        return f"⚠ I cannot read the menu right now ({e})."
+    try:
+        req = okbase_menu.parse_food_args(args)
+        if req.mode == "refresh":
+            # Only works where the saved sign-in decrypts — the credentials are
+            # one Windows account's. When it doesn't, say so and show what is
+            # already saved rather than refusing outright.
+            cache, err = okbase_menu.refresh(settings)
+            if not cache:
+                cache = okbase_menu.load_cache(settings)
+                return (okbase_menu.answer_food("", cache)
+                        + f"\n\n_Could not read OKbase again: {err}_")
+            return okbase_menu.answer_food("", cache)
+        return okbase_menu.answer_food(args, okbase_menu.load_cache(settings))
+    except Exception as e:  # noqa: BLE001 - must keep listening no matter what
+        return f"⚠ I could not put the menu together ({e})."
+
+
 def load_webex_settings() -> dict:
     settings = {}
     if CONFIG_FILE.exists():
@@ -320,6 +497,13 @@ def load_webex_settings() -> dict:
     # Same precedence as the app: channels baked into the build win, so this
     # watcher works on a PC that has never opened Settings.
     settings.update(notify_provision.load())
+    # …and the canteen sign-in comes from the Windows account's own file, so
+    # this exe and every build of the app share one (see okbase_menu).
+    try:
+        import okbase_menu
+        settings.update(okbase_menu.load_user_settings())
+    except Exception:  # noqa: BLE001 - /run must work with or without the menu
+        pass
     return settings
 
 
@@ -351,12 +535,16 @@ def main() -> None:
     last_id = None
     primed = False
     print(f"[remote_launcher] listening in room {webex.listen_room_id} "
-          f"every {poll_s}s — send '{COMMANDS[0]}' to launch Diagnostic.")
+          f"every {poll_s}s — send '{COMMANDS[0]}' to launch Diagnostic, "
+          f"'{FOOD_COMMANDS[0]}' for the canteen menu.")
 
     mem_start = memstats.read()
     started = time.monotonic()
     next_mem = started
     print(f"[remote_launcher] {memstats.long_line(mem_start)}")
+    # Canteen upkeep state: when the menu was last read, when the sign-in is
+    # next due a touch, and whether it worked last time.
+    menu_state: dict = {"day": "", "next_try": 0.0, "ok": None}
 
     while True:
         now = time.monotonic()
@@ -370,6 +558,13 @@ def main() -> None:
                 up = int((now - started) / 3600)
                 print(f"[remote_launcher] {memstats.long_line(snap, since)} "
                       f"Running for {up} h.")
+        try:
+            # Its own try: a portal problem must never stop the listener from
+            # answering /run, which is its real job.
+            _menu_upkeep(settings, menu_state)
+        except Exception as e:  # noqa: BLE001
+            print(f"[remote_launcher] canteen upkeep error: {e}")
+
         try:
             if not bot_id:
                 bot_id = webex.get_me_id()
@@ -407,11 +602,21 @@ def main() -> None:
                     continue
                 if webex.is_own_message(it.get("id")):
                     continue
-                if not _is_command(it.get("text")):
+                word, rest = _split_command(it.get("text"))
+                is_food = word in FOOD_COMMANDS
+                if word not in COMMANDS and not is_food:
                     continue
                 email = (it.get("personEmail") or "").lower()
                 if allow and email not in allow:
                     webex.post_text(f"⛔ Sorry, {email} is not allowed to command me.")
+                    continue
+                if is_food:
+                    if is_app_running():
+                        continue      # the app answers /food itself
+                    # A sign-in pasted in a minute ago must not have to wait for
+                    # the next keepalive before `/food refresh` can use it.
+                    _reload_okbase_settings(settings)
+                    webex.post_text(_food_answer(rest, settings))
                     continue
                 if is_app_running():
                     if is_tracking():

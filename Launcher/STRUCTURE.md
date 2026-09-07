@@ -59,8 +59,10 @@ the wrong version by mistake. The names are matched through `_norm()`, so folder
 spelling and spacing do not matter. Note `PERSONAL` still names Copy Manager and
 Builder: harmless, because the folders never reach the grouping step.
 
-Display order (`GROUP_ORDER`): Scripts → Parts → External → In progress →
-Not working correctly → Personal.
+Display order (`GROUP_ORDER`): Main scripts → Side scripts → External →
+In progress → Not working correctly → Personal. The labels are display text
+only; the keys behind them stay `scripts` and `parts`, which is what the saved
+expanded/collapsed state and `custom_groups` in the config are keyed on.
 
 `group_for_program(name)` resolves a group, but `custom_groups` from the config
 wins — the card context menu (`_show_group_menu` → `_move_to_group`) lets the

@@ -144,6 +144,7 @@ STATS: "dict[str, float]" = {
     "warm_failures": 0,     # per-job failures inside warm_days
     "takeovers": 0,         # abandoned single-flight records (see get_day)
     "range_splits": 0,      # oversize ranges re-fetched in halves (fetch_samples_split)
+    "alias_hits": 0,        # empty days answered by the channel's other name (SBW4)
 }
 _stats_lock = threading.Lock()
 
@@ -361,8 +362,20 @@ def fetch_values_ex(channel: str, start_ns: int, end_ns: int,
     if result or not try_value_suffix or channel.endswith(".value"):
         return result, channel
     alias = channel + ".value"
-    return parse_samples(fetch_samples_split(alias, start_ns, end_ns,
-                                             timeout=timeout)), alias
+    try:
+        return parse_samples(fetch_samples_split(alias, start_ns, end_ns,
+                                                 timeout=timeout)), alias
+    except CpvaError as exc:
+        # The suffix is a GUESS — most channels are not archived under it, and the
+        # archiver answers a name it does not know with HTTP 400. Letting that
+        # bubble up turned "the real name answered, and the day is empty" into "the
+        # archiver did not answer", which is a statement about the machine.
+        # Measured 04.09.2026 on L3-SBW4-PM311:Energy: the bare name returns an
+        # empty day, the .value probe returns 400, and PV Search drew no curve at
+        # all instead of falling back to SBW4's other archived name.
+        if not str(exc).startswith("HTTP 4"):
+            raise                      # 5xx / timeout: a real failure, still raised
+        return result, channel
 
 
 def fetch_values(channel: str, start_ns: int, end_ns: int,
@@ -569,6 +582,47 @@ def today_key() -> str:
     return datetime.now(TZ_PRAGUE).strftime("%Y-%m-%d")
 
 
+# SBW4 was re-archived under a new name on this Prague day. Every sample from
+# before it is still under the old name and under NOTHING else, so a query that
+# spans the rename has to change name half way — otherwise the older days come
+# back empty and read as "the laser never fired", which is not what happened.
+SBW4_RENAME_DATE_KEY = "2026-08-14"
+SBW4_CHANNEL_LEGACY = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
+
+
+def channel_for_day(channel: str, date_key: str) -> str:
+    """The name `channel` was archived under on the given Prague day.
+
+    Only SBW4 has ever moved; every other channel is returned unchanged. Date keys
+    are 'YYYY-MM-DD', so a plain string comparison orders them correctly.
+
+    This is a GUESS, not a fact: the two SBW4 names take turns depending on which
+    laser configuration is running, so the date rule alone reads a day back as
+    empty whenever the other name is the one being written. `channel_aliases`
+    below is what makes that recoverable."""
+    if channel == SBW4_CHANNEL and date_key < SBW4_RENAME_DATE_KEY:
+        return SBW4_CHANNEL_LEGACY
+    return channel
+
+
+# Names that mean the SAME measurement. SBW4 is the only one: the HAPLS-era name
+# and the L3 name are both live, and which one carries a given day depends on the
+# configuration that ran, not on the date. A day that comes back empty under one
+# of them is asked for under the other before it is believed.
+_CHANNEL_ALIASES: "dict[str, tuple[str, ...]]" = {
+    SBW4_CHANNEL:        (SBW4_CHANNEL_LEGACY,),
+    SBW4_CHANNEL_LEGACY: (SBW4_CHANNEL,),
+}
+
+
+def channel_aliases(channel: str) -> "tuple[str, ...]":
+    """The other names this channel has been archived under (may be empty).
+
+    Kept deliberately small: an alias list is a promise that the two names are the
+    same physical measurement, and only SBW4 has ever been renamed."""
+    return _CHANNEL_ALIASES.get(channel, ())
+
+
 # ── shared day cache ──────────────────────────────────────────────────────────
 
 class DayResult(NamedTuple):
@@ -579,6 +633,10 @@ class DayResult(NamedTuple):
     # rebuild this list on EVERY lookup (8 ms per call on a 140k-sample span).
     # Optional/last so older positional constructions keep working.
     ts_list: "list[int]" = ()
+    # The name that actually produced these samples. Differs from the name asked
+    # for only when the channel's other name answered (SBW4), and the caller says
+    # so on screen — a graph drawn from a name nobody asked for has to admit it.
+    src_channel: str = ""
 
 
 class _Entry(NamedTuple):
@@ -633,7 +691,7 @@ _error_until: "dict[tuple[str, str], float]" = {}
 
 
 def _entry_result(ent: "_Entry", status: str, age: float) -> DayResult:
-    return DayResult(ent.samples, status, age, ent.ts_list)
+    return DayResult(ent.samples, status, age, ent.ts_list, ent.src_channel)
 
 
 def _merge_tail(old: "list[tuple[int, float]]", old_ts: "list[int]",
@@ -730,8 +788,45 @@ def get_day(channel: str, date_key: str, *,
                                 day_end, timeout=timeout, try_value_suffix=False)
             samples = _merge_tail(ent.samples, ent.ts_list, tail)
         else:
-            samples, src = fetch_values_ex(channel, day_start, day_end,
-                                           timeout=max(timeout, FULL_DAY_TIMEOUT))
+            first_failure: "CpvaError | None" = None
+            try:
+                samples, src = fetch_values_ex(channel, day_start, day_end,
+                                               timeout=max(timeout, FULL_DAY_TIMEOUT))
+            except CpvaBusyError:
+                raise                  # our own pool — says nothing about the name
+            except CpvaError as exc:
+                # The name asked for FAILED. That is not the end of the story when
+                # the measurement has another archived name: a name the archiver
+                # does not know for this day answers 400, and treating that as an
+                # outage is what made SBW4 report "the archiver did not answer" on
+                # days its other name holds every sample. The failure is KEPT and
+                # re-raised below unless the other name actually delivers — a day
+                # cached as "empty" after a failed query would be a lie.
+                if not channel_aliases(channel):
+                    raise
+                first_failure = exc
+                samples, src = [], channel
+            # Nothing under the name asked for → try the other name the SAME
+            # measurement is archived under (SBW4's HAPLS-era and L3 names take
+            # turns). Only ever a SECOND request, and only on a day that came back
+            # empty, so a channel with data pays nothing for this. The name that
+            # answered is remembered as `src_channel`, so today's incremental tail
+            # keeps asking the name that works.
+            if not samples:
+                for alt in channel_aliases(channel):
+                    try:
+                        alt_s, alt_src = fetch_values_ex(
+                            alt, day_start, day_end,
+                            timeout=max(timeout, FULL_DAY_TIMEOUT))
+                    except CpvaError:
+                        continue
+                    if alt_s:
+                        samples, src = alt_s, alt_src
+                        _stat_bump("alias_hits")
+                        first_failure = None
+                        break
+                if first_failure is not None:
+                    raise first_failure
     except CpvaBusyError:
         # Our own pool was full — nothing was learned about this channel or day, so
         # do NOT arm _error_until. Blacking the key out for ERROR_BACKOFF_S on a
@@ -1009,6 +1104,230 @@ STEP_CHANNELS: frozenset = frozenset({"L3-PFWP6-MTR03-1:RawPos"})
 FORWARD_CHANNELS: frozenset = STEP_CHANNELS
 
 
+# ── the same rule, worked out from the archive instead of from a list ─────────
+# The set above cannot be kept complete by hand: every setpoint readback in the
+# facility behaves the same way, and the one that is missing from it reads "no
+# data yet" for ever. The GDD setting L3-SPFE-AOD03-002:Order2_RB did exactly
+# that (2026-09-01): it had been holding 24300 since 10:35 that morning, wrote
+# 16 samples all day, and no ±0.3 s window around an image ever touched one.
+#
+# So a channel that misses the window is now CLASSIFIED from its own record:
+# collect the samples it wrote at or before the moment asked about — walking back
+# days until there are enough of them — and look at how they are spread.
+#
+# A slow gap alone is not enough to call something a setting, because the laser is
+# not always fast: a run at one shot every 25 s is a real cadence (it is the one the
+# panel's own "trailing by a shot" bug was reported at), and holding a detector's
+# reading forward across it would hand out a neighbouring shot's energy — exactly
+# what the ±window exists to prevent. Nor is counting long gaps enough: a setting
+# nudged twenty times in ten minutes has mostly one-second gaps, and it is still a
+# setting for the rest of the day.
+#
+# What separates them is where the TIME goes. A channel written only on change
+# spends practically all of its time between samples — the samples are the events,
+# the silence is the value standing. A detector spends its time firing: its gaps are
+# its cadence. So the verdict is time-weighted:
+#   * a typical gap (p75) longer than STEP_LONG_GAP_S is slower than any shot cadence
+#     the machine has, and settles it on its own; otherwise
+#   * add up the gaps that are unusually long for THIS channel (at least
+#     STEP_LONG_GAP_RATIO × its median gap, and never less than
+#     STEP_MIN_TYPICAL_GAP_S) and compare with the time the samples cover. At
+#     STEP_HOLD_FRACTION or more, the channel is holding rather than measuring.
+# The relative cut is what keeps a 25 s cadence out of it: every gap is the cadence,
+# so none of them is "unusually long" and the fraction is zero. Measured on this
+# archive: PTM1 energy every 5 s all day → 0, the GDD orders → ~1.
+STEP_MIN_TYPICAL_GAP_S = 20.0
+STEP_LONG_GAP_S = 600.0
+STEP_LONG_GAP_RATIO = 10.0
+STEP_HOLD_FRACTION = 0.9
+STEP_TYPICAL_GAP_Q = 0.75
+# What the verdict has to see before it is taken: this many samples AND this much
+# time covered by them, walking back through at most this many days. The SPAN is
+# what stops a setting somebody is working on right now from reading as a live
+# measurement — ten minutes of nudges look exactly like one if that is all you
+# look at, and the walk back is what puts the quiet hours around them back in view.
+STEP_PROBE_MIN_SAMPLES = 8
+STEP_PROBE_MIN_SPAN_S = 2 * 3600.0
+STEP_PROBE_MAX_DAYS = 8
+# channel → (verdict, when it was reached). A fetch failure produces NO verdict
+# rather than a wrong one.
+_step_verdict: "dict[str, tuple[bool, float]]" = {}
+_step_lock = threading.Lock()
+# Verdicts expire. A channel's nature does not change, but the evidence available
+# for it does — the day it is asked about may have barely started, and a setting is
+# indistinguishable from a measurement for as long as somebody is turning the knob.
+# Re-deciding costs one already-cached day read, and it means any misreading heals
+# itself within minutes instead of lasting the whole session.
+STEP_VERDICT_TTL_S = 600.0
+
+
+def _cached_step_verdict(channel: str) -> "bool | None":
+    with _step_lock:
+        ent = _step_verdict.get(channel)
+        if ent is None:
+            return None
+        verdict, stored = ent
+        if time.monotonic() - stored < STEP_VERDICT_TTL_S:
+            return verdict
+        del _step_verdict[channel]
+        return None
+
+
+def _gap_quantile_s(ts_sorted: "list[int]", q: float) -> "float | None":
+    """The q-quantile of the gaps between consecutive timestamps, in seconds.
+    None when there are not two samples to compare."""
+    if len(ts_sorted) < 2:
+        return None
+    gaps = sorted(b - a for a, b in zip(ts_sorted, ts_sorted[1:]))
+    return gaps[min(len(gaps) - 1, int(round(q * (len(gaps) - 1))))] / 1e9
+
+
+def _typical_gap_s(ts_sorted: "list[int]") -> "float | None":
+    """How long this channel usually goes between samples (p75, see above)."""
+    return _gap_quantile_s(ts_sorted, STEP_TYPICAL_GAP_Q)
+
+
+def hold_fraction(ts_sorted: "list[int]") -> "float | None":
+    """How much of the time these samples cover is spent in a gap that is unusually
+    long for this channel — i.e. holding rather than measuring. None when there are
+    fewer than two samples."""
+    if len(ts_sorted) < 2:
+        return None
+    gaps = [b - a for a, b in zip(ts_sorted, ts_sorted[1:])]
+    span = ts_sorted[-1] - ts_sorted[0]
+    if span <= 0:
+        return None
+    median = sorted(gaps)[len(gaps) // 2]
+    cut = max(median * STEP_LONG_GAP_RATIO, STEP_MIN_TYPICAL_GAP_S * 1e9)
+    return sum(g for g in gaps if g >= cut) / span
+
+
+def _holds_between_samples(ts_sorted: "list[int]") -> "bool | None":
+    """Does this run of samples read as a value written only when it CHANGES?
+
+    None when there is nothing to judge by (fewer than two samples)."""
+    slow = _typical_gap_s(ts_sorted)
+    if slow is None:
+        return None
+    if slow >= STEP_LONG_GAP_S:
+        return True                         # slower than any shot cadence there is
+    held = hold_fraction(ts_sorted)
+    return held is not None and held >= STEP_HOLD_FRACTION
+
+
+def _probe_days(channel: str, upto_ns: int, start_dk: str, *,
+                primary: "list[tuple[int, float]] | None",
+                today_ttl: float, timeout: float, network_ok: bool
+                ) -> "tuple[list[int], bool] | None":
+    """Timestamps of the samples at or before upto_ns, walking back from the Prague
+    day start_dk until enough of them cover enough time (STEP_PROBE_MIN_SAMPLES /
+    STEP_PROBE_MIN_SPAN_S) or the walk runs out of days.
+
+    Returns (sorted timestamps, run_is_representative). None when a day could not be
+    read at all: an unreadable day must produce no verdict rather than a wrong one."""
+    seen: "set[int]" = set()
+    dk = start_dk
+    samples = primary
+    for i in range(STEP_PROBE_MAX_DAYS):
+        if i or samples is None:
+            if not network_ok:
+                res = peek_day(channel, dk)
+                if res is None:
+                    return None             # cache-only and this day is not in it
+            else:
+                res = get_day(channel, dk, today_ttl=today_ttl, timeout=timeout)
+            if res.status == "error":
+                return None
+            samples = res.samples
+        seen.update(t for t, _v in samples if t <= upto_ns)
+        ts_sorted = sorted(seen)
+        if (len(ts_sorted) >= STEP_PROBE_MIN_SAMPLES
+                and ts_sorted[-1] - ts_sorted[0] >= STEP_PROBE_MIN_SPAN_S * 1e9):
+            return ts_sorted, True
+        dk = prev_date_key(dk)
+        samples = None
+    return sorted(seen), False
+
+
+def classify_step_channel(channel: str, ts_ns: int, *,
+                          primary: "list[tuple[int, float]] | None" = None,
+                          today_ttl: float = 3.0,
+                          timeout: float = DEFAULT_TIMEOUT,
+                          network_ok: bool = True) -> bool:
+    """Decide (and remember) whether `channel` holds its value between samples.
+
+    `primary` is the sample list of the day containing ts_ns when the caller has
+    already fetched it — the common case, and it usually settles the question on
+    its own without a single extra request."""
+    if channel in STEP_CHANNELS:
+        return True
+    cached = _cached_step_verdict(channel)
+    if cached is not None:
+        return cached
+    probe = _probe_days(channel, ts_ns, date_key_for_ns(ts_ns), primary=primary,
+                        today_ttl=today_ttl, timeout=timeout, network_ok=network_ok)
+    if probe is None:
+        return False                        # a day could not be read — no verdict
+    ts_sorted, complete = probe
+    if len(ts_sorted) < 2 and network_ok:
+        # Nothing written in the last STEP_PROBE_MAX_DAYS days. That is either a
+        # setting nobody has touched for weeks or a channel that has STOPPED — and
+        # the difference matters: holding a dead energy detector's last reading
+        # forward would present a three-week-old shot as this frame's. So find the
+        # last sample there is, wherever it is, and judge the channel by the company
+        # it kept THEN: a detector's own day is dense, a setting's is not.
+        back = value_at_or_before(channel, ts_ns, today_ttl=today_ttl,
+                                  timeout=timeout)
+        if back.ts_ns is not None:
+            probe = _probe_days(channel, back.ts_ns, date_key_for_ns(back.ts_ns),
+                                primary=None, today_ttl=today_ttl, timeout=timeout,
+                                network_ok=network_ok)
+            if probe is not None:
+                ts_sorted, complete = probe
+    verdict = _holds_between_samples(ts_sorted)
+    if verdict is None:
+        # A single sample in the whole archive, or none at all: nothing to judge by,
+        # and nothing worth remembering either — the next lookup may know better.
+        return False
+    if complete or verdict:
+        # A verdict off a run that is too short to be representative is not worth
+        # keeping unless it is "this holds its value" — which few samples over many
+        # days IS the evidence for. Everything kept expires, see _cached_step_verdict.
+        with _step_lock:
+            _step_verdict[channel] = (verdict, time.monotonic())
+    return verdict
+
+
+def is_step_channel(channel: str, ts_ns: "int | None" = None, *,
+                    today_ttl: float = 3.0,
+                    timeout: float = DEFAULT_TIMEOUT,
+                    network_ok: bool = True) -> bool:
+    """True when `channel` is archived only when it CHANGES, so its value at any
+    moment is the last sample at or before it.
+
+    Without ts_ns this answers from what is already known (the explicit list plus
+    verdicts reached earlier) and never fetches — that is what the display paths
+    want. With ts_ns it classifies the channel if it has to."""
+    if channel in STEP_CHANNELS:
+        return True
+    cached = _cached_step_verdict(channel)
+    if cached is not None:
+        return cached
+    if ts_ns is None:
+        return False
+    return classify_step_channel(channel, int(ts_ns), today_ttl=today_ttl,
+                                 timeout=timeout, network_ok=network_ok)
+
+
+def invalidate_step_verdicts(channel: "str | None" = None) -> None:
+    """Forget the auto-detected step/live verdicts (None = all)."""
+    with _step_lock:
+        if channel is None:
+            _step_verdict.clear()
+        else:
+            _step_verdict.pop(channel, None)
+
+
 # ── value grid (quantized channels) ───────────────────────────────────────────
 # Channels whose real value can only ever be a multiple of a fixed step. The
 # waveplate is commanded in whole 1000-count positions, so ANY other reading is
@@ -1252,10 +1571,14 @@ def lookup_near(channel: str, ts_ns: int, *,
                 timeout: float = DEFAULT_TIMEOUT) -> LookupResult:
     """Sample nearest ts_ns within ±window_ns.
 
-    STEP_CHANNELS bypass the window entirely: their value is only archived on
+    Step channels bypass the window entirely: their value is only archived on
     change, so the correct reading at ts_ns is the last sample at or before it
     (value_at_or_before), and a "nearest within 30 s" match would either miss
-    (long hold between moves) or jump early to the NEXT position.
+    (long hold between moves) or jump early to the NEXT position. Which channels
+    those are is not a fixed list — a channel that misses the window is classified
+    from its own record (see classify_step_channel) and answered by look-back the
+    moment it turns out to be one, so a setting the list never heard of reads its
+    real value instead of "no data yet".
 
     prefer defaults to "nearest" — the sample closest in time to the image. For a
     per-shot detector "before" is WRONG as a tie-break: the archiver writes a
@@ -1284,7 +1607,7 @@ def lookup_near(channel: str, ts_ns: int, *,
     cleanly and simply had nothing in the window is "not_found" ("n/a"), not "error"
     ("ERR"). Collapsing both into one variable is why healthy PVs read ERR.
     """
-    if channel in STEP_CHANNELS:
+    if is_step_channel(channel):
         return value_at_or_before(channel, ts_ns, today_ttl=today_ttl,
                                   timeout=timeout)
     if prefer is None:
@@ -1301,6 +1624,7 @@ def lookup_near(channel: str, ts_ns: int, *,
     hit_status = "ok"
     primary_status = "ok"
     primary_head: "int | None" = None
+    primary_samples: "list[tuple[int, float]] | None" = None
     for dk in date_keys:
         res = get_day(channel, dk, today_ttl=today_ttl, timeout=timeout)
         day_status = "error" if res.status == "error" else (
@@ -1308,6 +1632,7 @@ def lookup_near(channel: str, ts_ns: int, *,
         if dk == date_key:
             primary_status = day_status
             primary_head = res.ts_list[-1] if res.ts_list else None
+            primary_samples = res.samples
         cand = nearest_sample_ex(res.samples, ts_ns, window_ns=window_ns,
                                  prefer=prefer, ts_list=res.ts_list)
         if cand is None:
@@ -1323,6 +1648,18 @@ def lookup_near(channel: str, ts_ns: int, *,
                                   timeout=timeout)
         if back.status == "error" and primary_status == "error":
             return back
+        if back.value is not None:
+            return back._replace(head_ts_ns=primary_head)
+    # Nothing in the window, and the caller did not ask for a look-back. Before
+    # answering "nothing", ask what KIND of channel this is: one that is written
+    # only when it changes has no sample near any frame, and its value at this
+    # moment is simply the last one written (see classify_step_channel). That is
+    # not a stale reading — it is the setting the machine is running with.
+    if primary_status != "error" and classify_step_channel(
+            channel, ts_ns, primary=primary_samples,
+            today_ttl=today_ttl, timeout=timeout):
+        back = value_at_or_before(channel, ts_ns, today_ttl=today_ttl,
+                                  timeout=timeout)
         if back.value is not None:
             return back._replace(head_ts_ns=primary_head)
     if primary_status == "error":

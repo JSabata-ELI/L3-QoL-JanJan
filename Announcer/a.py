@@ -57,6 +57,117 @@ COND_PV_WINDOW_S    = 10
 COND_MAX_REF_BYTES  = 1_000_000   # a reference lives inside presets.json
 COND_DEFAULT_PV     = "L3-PM03-023:Energy"   # back-reflection energy
 
+# --- Where the beam is going ---
+# Two enums that together say where the shot ends up. They are archived ON
+# CHANGE ONLY and change hours apart, so they are read with a widening
+# look-back and on a much slower clock than everything else.
+HALL_FATE_PV = "L3BT-MSS:Beam_fate"
+HALL_PSS_PV  = "L3-PSS:STATE_EXH_EXTERNAL_HIGH_P"
+
+# Beam fate value -> what it means. 0 is the switchyard on its way somewhere,
+# which is a passing state, not a destination.
+_HALLS = [(0, "switchyard moving"), (1, "E2"), (2, "E3"), (3, "E4"),
+          (4, "E5 ELI-LUIS"), (5, "E5 ELI-MAIA")]
+HALL_MOVING_VALUE = 0
+
+_PSS_STATES = [(0, "internal only"), (1, "into the experiment")]
+
+HALL_POLL_MS        = 2000        # they change hours apart; 500 ms buys nothing
+HALL_MOVING_GRACE_S = 60          # how long "switchyard moving" is tolerated
+# Widening look-back windows, in seconds. The first one that returns anything
+# wins — a sparse enum can easily have written nothing for a week.
+HALL_LOOKBACK_S     = (3600, 86400, 7 * 86400, 30 * 86400)
+
+
+# Which draft keys one screen-area editor block works on, so a screen condition
+# and the area attached to a value condition can live in one dict without
+# stepping on each other.
+#   (monitor, region, threshold, reference, decoded image)
+_SCREEN_AREA_KEYS = ("monitor", "region", "threshold", "reference", "_ref_img")
+_GATE_AREA_KEYS   = ("gate_monitor", "gate_region", "gate_threshold",
+                     "gate_reference", "_gate_img")
+
+# What a dropdown says when that half is switched off. Not "0": zero is a real
+# beam fate and a real PSS state.
+_NO_CHECK = "don't check"
+
+
+def _value_for_label(table, label):
+    """The number behind a dropdown entry, or None for "don't check"."""
+    for num, text in table:
+        if text == label:
+            return float(num)
+    return None
+
+
+def _hall_name(value):
+    """The hall a beam-fate number means, or the bare number if it means none."""
+    if value is None:
+        return "not readable"
+    for num, label in _HALLS:
+        if num == value:
+            return label
+    return f"unknown value {value:g}"
+
+
+def _pss_name(value):
+    if value is None:
+        return "not readable"
+    for num, label in _PSS_STATES:
+        if num == value:
+            return label
+    return f"unknown value {value:g}"
+
+
+def _hall_verdict(cond, fate, pss, moving_for_s):
+    """Judge one hall condition. Pure, so it can be tested without a window.
+
+    `fate` / `pss` are the newest archived values, or None when they could not
+    be read at all. `moving_for_s` is how long the beam fate has been sitting on
+    "switchyard moving", in seconds.
+
+    Returns (verdict, sentence) where verdict is one of:
+        "ok"      everything set matches
+        "warn"    the switchyard is on its way, inside its grace period
+        "unknown" something that is checked could not be read — never a trip,
+                  because a missing reading is neither a good nor a bad one
+        "trip"    the machine disagrees with what was set
+    """
+    want_hall = cond.get("hall")
+    want_pss  = cond.get("pss")
+    if want_hall is None and want_pss is None:
+        return "unknown", "nothing to check — no hall and no PSS state set"
+
+    missing = []
+    if want_hall is not None and fate is None:
+        missing.append("beam fate")
+    if want_pss is not None and pss is None:
+        missing.append("PSS state")
+    if missing:
+        return "unknown", f"{' and '.join(missing)} cannot be read"
+
+    if want_pss is not None and pss != want_pss:
+        return "trip", (f"PSS says {_pss_name(pss)}, "
+                        f"but {_pss_name(want_pss)} was set")
+
+    if want_hall is not None and fate != want_hall:
+        if fate == HALL_MOVING_VALUE:
+            grace = cond.get("moving_grace_s", HALL_MOVING_GRACE_S)
+            if moving_for_s is not None and moving_for_s > grace:
+                return "trip", (f"switchyard still moving after "
+                                f"{moving_for_s:.0f} s — {_hall_name(want_hall)} "
+                                f"was set")
+            return "warn", f"switchyard moving — {_hall_name(want_hall)} was set"
+        return "trip", (f"beam goes to {_hall_name(fate)}, "
+                        f"but {_hall_name(want_hall)} was set")
+
+    parts = []
+    if want_hall is not None:
+        parts.append(_hall_name(fate))
+    if want_pss is not None:
+        parts.append(_pss_name(pss))
+    return "ok", " · ".join(parts)
+
 # (channel, label, lo_orange, lo_red, hi_orange, hi_red, unit)
 # `channel` is either a PV name (str) or a (minuend, subtrahend) tuple whose
 # difference (minuend - subtrahend) is monitored.
@@ -85,27 +196,57 @@ for _i, _label in enumerate(_CHILLER_LABELS, start=1):
 
 
 def _icon_app_id(prefix, ico_path):
-    """Taskbar identity for `prefix`, tagged with the icon file's own content.
+    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it, so a fixed id that was once seen without an icon keeps drawing the
-    generic placeholder for good (measured on Diagnostic, 2026-08-24: same
-    program, same icon, only the id changed -> old id generic, fresh id
-    correct). Hashing the icon into the id makes every PC derive the same id
-    from the same picture, and retires the old id by itself the day the icon
-    is redrawn -- no hand-bumped ".2" suffixes, no per-machine icon-cache
-    clearing. Returns None when the icon cannot be read; the caller then sets
-    no id at all rather than burning a content id on a run that has no picture
-    to give it. The same helper sits in every program here.
+    it: an id that was once seen without a usable icon keeps drawing the
+    generic placeholder for good, whatever icon the window later carries, and
+    clearing the shell icon cache would have to be repeated on every PC.
+
+    Hashing the icon's own bytes into the id was the first fix, but a
+    content-only id can be poisoned just as well, and then it never recovers
+    because it only changes when the picture is redrawn. Measured again on
+    2026-09-03: Calibrations, CSS Logger, Git Work and Image Tools all drew
+    the blank window placeholder on the taskbar while their title bars carried
+    the right icon, and Diagnostic -- the only one whose id also carried its
+    file name -- drew its icon. So the running build's own file name, which
+    carries the version, goes into the hash too: every rebuild runs under an
+    id Windows has never seen, so it cannot be serving a stale picture for it,
+    on this PC or any other.
+
+    Returns None when the icon cannot be read; the caller then sets no id at
+    all rather than burning an id on a run that has no picture to give it.
+    The same helper sits in every program here.
     """
+    # A frozen build gets no taskbar identity at all, deliberately.
+    # Windows caches the taskbar picture per AppUserModelID and never re-reads
+    # it, so one bad cache entry breaks that build for good; tagging the id
+    # with the build's file name only postponed it (Diagnostic v1.1.3's id
+    # drew the blank placeholder within a day of the build). Measured
+    # 2026-09-04 with three otherwise identical windows: the app's own id ->
+    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
+    # from the exe's own resource, which the builder always embeds (verified
+    # on a purpose-built PyInstaller exe). With no id Windows keys the button
+    # on the exe itself, so there is no per-id cache left to go stale. An id
+    # is still worth having when running from source, where the process is
+    # python.exe and would otherwise wear the Python icon.
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        return None
     if not ico_path:
         return None
+    import hashlib
+    import os
+    import sys
     try:
-        import hashlib
         with open(ico_path, "rb") as fh:
-            return f"{prefix}.{hashlib.sha1(fh.read()).hexdigest()[:12]}"
+            data = fh.read()
     except OSError:
         return None
+    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
+                             else (sys.argv[0] or __file__))
+    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
+    return f"{prefix}.{tag.hexdigest()[:12]}"
 
 
 def set_app_icon(win, ico_path, app_id=None):
@@ -597,6 +738,9 @@ class ScreenTracker(tk.Tk):
 
         # PV monitoring state
         self._pv_poll_job = None
+        self._next_hall_read = 0.0   # the hall values run on their own clock
+        self._hall_read_once = False  # the Halls tab reads once when first opened
+        self._hall_span_hint = {}     # PV -> the look-back window that worked
         self._pv_alert_rows: list[tk.Frame] = []
         self._pv_alert_labels: list[tk.Label] = []
 
@@ -916,40 +1060,8 @@ class ScreenTracker(tk.Tk):
                                         command=self._toggle_settings_popup)
         self._settings_btn.pack(side="left", padx=(4, 0))
 
-        # Action buttons — placed on the top row, using the space right of Settings
-        self._preview_popup = None
-        self._preview_photo = None
-        self.btn_preview = ttk.Button(self._top_frame, text="Preview region", width=14)
-        self.btn_preview.pack(side="left", padx=(12, 2))
-        self.btn_preview.bind("<Enter>", self._show_preview_popup)
-        self.btn_preview.bind("<Leave>", lambda *_: self.after(100, self._check_hide_preview))
-        self.btn_preview.bind("<Button-1>", self._toggle_preview_popup)
-
-        self.btn_reference = ttk.Button(self._top_frame, text="Set reference",
-                                        command=self._select_region, width=13)
-        self.btn_reference.pack(side="left", padx=2)
-
-        self.btn_resnap = ttk.Button(self._top_frame, text="↺",
-                                     command=self._save_reference,
-                                     state="disabled", width=3)
-        self.btn_resnap.pack(side="left", padx=(2, 0))
-
-        # Region presets — compact inline row (row 1)
-        self._preset_frame = ttk.LabelFrame(self, text="Region presets")
-        self._preset_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 4))
-
-        self._preset_var = tk.StringVar()
-        self._preset_combo = ttk.Combobox(self._preset_frame, textvariable=self._preset_var,
-                                           state="readonly", width=20)
-        self._preset_combo.grid(row=0, column=0, padx=(6, 4), pady=4)
-        self._refresh_preset_combo()
-
-        ttk.Button(self._preset_frame, text="Load",
-                   command=self._load_preset, width=6).grid(row=0, column=1, padx=(0, 4), pady=4)
-        ttk.Button(self._preset_frame, text="Save region",
-                   command=self._save_preset, width=10).grid(row=0, column=2, padx=(0, 4), pady=4)
-        ttk.Button(self._preset_frame, text="Delete",
-                   command=self._delete_preset, width=6).grid(row=0, column=3, padx=(0, 6), pady=4)
+        # The quick rectangle's own buttons and the saved regions now live on the
+        # "Screen areas" tab, next to the thing they belong to.
 
         # PV alert panel (row=3) — individual badges shown only when condition
         # breached, laid out side by side and wrapping to new lines as needed.
@@ -1090,7 +1202,7 @@ class ScreenTracker(tk.Tk):
         """
         out = []
         for raw in self._presets.get("conditions") or []:
-            if not isinstance(raw, dict) or raw.get("kind") not in ("screen", "pv"):
+            if not isinstance(raw, dict) or raw.get("kind") not in ("screen", "pv", "hall"):
                 continue
             cond = dict(raw)
             cond["name"] = str(cond.get("name") or "").strip() or "(unnamed)"
@@ -1108,13 +1220,40 @@ class ScreenTracker(tk.Tk):
                 except (TypeError, ValueError):
                     continue
                 cond["_ref_img"] = self._decode_reference(cond.get("reference"))
-            else:
+            elif cond["kind"] == "pv":
                 cond["pv"] = str(cond.get("pv") or "").strip()
                 if not cond["pv"]:
                     continue
                 cond["warn"] = _parse_level(str(cond.get("warn") if cond.get("warn") is not None else ""))
                 cond["trip"] = _parse_level(str(cond.get("trip") if cond.get("trip") is not None else ""))
                 cond["unit"] = str(cond.get("unit") or "")
+                # Optional second half: a screen area that must keep matching its
+                # own picture. Absent keys = a plain value condition.
+                gate = cond.get("gate_region") or []
+                usable = len(gate) == 4
+                if usable:
+                    try:
+                        cond["gate_region"] = [int(v) for v in gate]
+                        cond["gate_threshold"] = float(cond.get("gate_threshold", CHANGE_THRESHOLD))
+                        cond["gate_monitor"] = int(cond.get("gate_monitor", 0))
+                    except (TypeError, ValueError):
+                        usable = False
+                    else:
+                        cond["_gate_img"] = self._decode_reference(cond.get("gate_reference"))
+                if not usable:
+                    # An unreadable area is dropped whole, picture included, so
+                    # the next save does not carry the wreckage forward. The
+                    # value half of the condition is untouched.
+                    for key in ("gate_region", "gate_reference", "gate_threshold",
+                                "gate_monitor", "_gate_img"):
+                        cond.pop(key, None)
+            else:
+                cond["hall"] = _parse_level(str(cond.get("hall") if cond.get("hall") is not None else ""))
+                cond["pss"] = _parse_level(str(cond.get("pss") if cond.get("pss") is not None else ""))
+                try:
+                    cond["moving_grace_s"] = float(cond.get("moving_grace_s", HALL_MOVING_GRACE_S))
+                except (TypeError, ValueError):
+                    cond["moving_grace_s"] = HALL_MOVING_GRACE_S
             out.append(cond)
         return out
 
@@ -1167,10 +1306,23 @@ class ScreenTracker(tk.Tk):
             ref = "reference taken" if cond.get("_ref_img") is not None else "NO REFERENCE"
             return (f"Monitor {cond.get('monitor', 0) + 1} · {x2 - x1}x{y2 - y1} px · "
                     f"change over {cond['threshold']:.1f} · {ref}")
+        if cond["kind"] == "hall":
+            parts = []
+            if cond.get("hall") is not None:
+                parts.append(f"beam to {_hall_name(cond['hall'])}")
+            if cond.get("pss") is not None:
+                parts.append(f"PSS {_pss_name(cond['pss'])}")
+            return " · ".join(parts) if parts else "nothing set — it cannot fire"
         unit = f" {cond['unit']}" if cond.get("unit") else ""
         warn = "—" if cond.get("warn") is None else f"{cond['warn']:g}{unit}"
         trip = "—" if cond.get("trip") is None else f"{cond['trip']:g}{unit}"
-        return f"{cond['pv']} · warn over {warn} · trip over {trip}"
+        out = f"{cond['pv']} · warn over {warn} · trip over {trip}"
+        if cond.get("gate_region"):
+            gx1, gy1, gx2, gy2 = cond["gate_region"]
+            gate_ref = "reference taken" if cond.get("_gate_img") is not None else "NO REFERENCE"
+            out += (f" · + screen area {gx2 - gx1}x{gy2 - gy1} px on monitor "
+                    f"{cond.get('gate_monitor', 0) + 1} ({gate_ref})")
+        return out
 
     def _enabled_conditions(self, kind=None):
         return [c for c in self._conditions
@@ -1179,75 +1331,176 @@ class ScreenTracker(tk.Tk):
     # ------------------------------------------------------------------
     # Conditions — the panel
     # ------------------------------------------------------------------
-    def _build_conditions_panel(self):
-        self._cond_frame = ttk.LabelFrame(self, text="Conditions")
-        self._cond_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 4))
-        self._cond_frame.columnconfigure(0, weight=1)
+    # One notebook page per kind of condition. All three pages read and write
+    # the SAME self._conditions list; a row's iid is its index in that list, so
+    # everything that works on "the selected condition" keeps working whichever
+    # page the selection happens to be on.
+    _COND_TABS = (("screen", "Screen areas"), ("pv", "Values"), ("hall", "Halls"))
 
-        cols = ("on", "name", "kind", "detail")
-        tv = ttk.Treeview(self._cond_frame, columns=cols, show="headings", height=4)
+    def _build_conditions_panel(self):
+        # Tab labels are painted explicitly: the ttk default on this machine
+        # picks up the Windows dark theme and draws grey-on-grey.
+        style = ttk.Style()
+        style.configure("Cond.TNotebook.Tab", padding=(12, 4),
+                        background="#dcdcdc", foreground="#101010")
+        style.map("Cond.TNotebook.Tab",
+                  background=[("selected", "#f5f5f5"), ("active", "#eaeaea")],
+                  foreground=[("selected", "#101010"), ("active", "#101010")])
+
+        self._cond_frame = ttk.Notebook(self, style="Cond.TNotebook")
+        self._cond_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 4))
+        self.rowconfigure(2, weight=1)
+
+        self._cond_trees = {}
+        for kind, title in self._COND_TABS:
+            page = ttk.Frame(self._cond_frame, padding=(0, 4, 0, 0))
+            self._cond_frame.add(page, text=title)
+            page.columnconfigure(0, weight=1)
+            page.rowconfigure(1, weight=1)
+            self._build_cond_page(page, kind)
+
+        # Opening the Halls tab reads the two values once, so the operator sees
+        # what the machine is doing before setting a condition against it.
+        # Reading is not alerting: it happens whether or not watching is on.
+        self._cond_frame.bind("<<NotebookTabChanged>>", self._on_cond_tab_changed)
+
+        self._refresh_cond_tree()
+
+    def _on_cond_tab_changed(self, _event=None):
+        try:
+            kind = self._COND_TABS[self._cond_frame.index(self._cond_frame.select())][0]
+        except Exception:
+            return
+        if kind == "hall" and not self._hall_read_once:
+            self._hall_read_once = True
+            self._read_hall_now()
+
+    def _build_cond_page(self, page, kind):
+        """The list + buttons of one tab, and the extras that tab owns."""
+        # Row 0: whatever belongs only to this tab.
+        if kind == "screen":
+            self._build_quick_region_row(page)
+        elif kind == "hall":
+            self._build_hall_readout(page)
+
+        cols = ("on", "name", "detail")
+        tv = ttk.Treeview(page, columns=cols, show="headings", height=4)
         tv.heading("on", text="On")
         tv.heading("name", text="Condition")
-        tv.heading("kind", text="Watches")
         tv.heading("detail", text="Settings")
         tv.column("on", width=34, anchor="center", stretch=False)
         tv.column("name", width=150, anchor="w", stretch=False)
-        tv.column("kind", width=60, anchor="w", stretch=False)
-        tv.column("detail", width=260, anchor="w", stretch=True)
-        vsb = ttk.Scrollbar(self._cond_frame, orient="vertical", command=tv.yview)
+        tv.column("detail", width=320, anchor="w", stretch=True)
+        vsb = ttk.Scrollbar(page, orient="vertical", command=tv.yview)
         tv.configure(yscrollcommand=vsb.set)
-        tv.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(2, 4))
-        vsb.grid(row=0, column=1, sticky="ns", pady=(2, 4), padx=(0, 6))
+        tv.grid(row=1, column=0, sticky="nsew", padx=(6, 0), pady=(2, 4))
+        vsb.grid(row=1, column=1, sticky="ns", pady=(2, 4), padx=(0, 6))
         tv.bind("<Button-1>", self._on_cond_click)
         tv.bind("<Double-1>", lambda e: self._edit_condition())
-        self._cond_tree = tv
+        self._cond_trees[kind] = tv
 
-        btns = ttk.Frame(self._cond_frame)
-        btns.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        ttk.Button(btns, text="Add screen area", width=16,
-                   command=lambda: self._edit_condition(new="screen")).pack(side="left")
-        ttk.Button(btns, text="Add value", width=11,
-                   command=lambda: self._edit_condition(new="pv")).pack(side="left", padx=(4, 0))
+        add_label = {"screen": "Add screen area", "pv": "Add value",
+                     "hall": "Add hall check"}[kind]
+        btns = ttk.Frame(page)
+        btns.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        ttk.Button(btns, text=add_label, width=16,
+                   command=lambda k=kind: self._edit_condition(new=k)).pack(side="left")
         ttk.Button(btns, text="Edit", width=6,
                    command=self._edit_condition).pack(side="left", padx=(4, 0))
         ttk.Button(btns, text="Delete", width=7,
                    command=self._delete_condition).pack(side="left", padx=(4, 0))
-        # Same arrow as the main window: re-take the reference picture.
-        ttk.Button(btns, text="↺", width=3,
-                   command=self._resnap_condition).pack(side="left", padx=(4, 0))
+        if kind in ("screen", "pv"):
+            # Same arrow as the main window: re-take the reference picture.
+            ttk.Button(btns, text="↺", width=3,
+                       command=self._resnap_condition).pack(side="left", padx=(4, 0))
 
-        self._refresh_cond_tree()
+    def _build_quick_region_row(self, page):
+        """The unnamed rectangle and its saved positions — they belong to the
+        Screen areas tab, not to the window as a whole."""
+        row = ttk.Frame(page)
+        row.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 2))
+
+        self._preview_popup = None
+        self._preview_photo = None
+        self.btn_preview = ttk.Button(row, text="Preview region", width=14)
+        self.btn_preview.pack(side="left")
+        self.btn_preview.bind("<Enter>", self._show_preview_popup)
+        self.btn_preview.bind("<Leave>", lambda *_: self.after(100, self._check_hide_preview))
+        self.btn_preview.bind("<Button-1>", self._toggle_preview_popup)
+
+        self.btn_reference = ttk.Button(row, text="Set reference",
+                                        command=self._select_region, width=13)
+        self.btn_reference.pack(side="left", padx=2)
+
+        self.btn_resnap = ttk.Button(row, text="↺", command=self._save_reference,
+                                     state="disabled", width=3)
+        self.btn_resnap.pack(side="left", padx=(2, 10))
+
+        ttk.Label(row, text="Saved:").pack(side="left", padx=(0, 4))
+        self._preset_var = tk.StringVar()
+        self._preset_combo = ttk.Combobox(row, textvariable=self._preset_var,
+                                          state="readonly", width=16)
+        self._preset_combo.pack(side="left")
+        self._refresh_preset_combo()
+        ttk.Button(row, text="Load", command=self._load_preset,
+                   width=6).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="Save region", command=self._save_preset,
+                   width=11).pack(side="left", padx=(4, 0))
+        ttk.Button(row, text="Delete", command=self._delete_preset,
+                   width=7).pack(side="left", padx=(4, 0))
+
+    def _build_hall_readout(self, page):
+        """One line saying what the two hall values are doing right now."""
+        row = ttk.Frame(page)
+        row.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 2))
+        self._hall_readout = tk.StringVar(value="not read yet — press Read now")
+        ttk.Label(row, textvariable=self._hall_readout,
+                  wraplength=520, justify="left").pack(side="left")
+        ttk.Button(row, text="Read now", width=10,
+                   command=self._read_hall_now).pack(side="right")
 
     def _refresh_cond_tree(self):
-        tv = self._cond_tree
-        sel = tv.selection()
-        keep = sel[0] if sel else None
-        tv.delete(*tv.get_children())
+        keep = {}
+        for kind, tv in self._cond_trees.items():
+            sel = tv.selection()
+            keep[kind] = sel[0] if sel else None
+            tv.delete(*tv.get_children())
         for i, cond in enumerate(self._conditions):
+            tv = self._cond_trees.get(cond["kind"])
+            if tv is None:
+                continue
             tv.insert("", "end", iid=str(i),
                       values=("☑" if cond["enabled"] else "☐",
                               cond["name"],
-                              "screen" if cond["kind"] == "screen" else "value",
                               self._cond_summary(cond)))
-        if keep is not None and keep in tv.get_children():
-            tv.selection_set(keep)
+        for kind, tv in self._cond_trees.items():
+            if keep[kind] is not None and keep[kind] in tv.get_children():
+                tv.selection_set(keep[kind])
         self._rebuild_cond_badges()
         # An enabled condition is something to watch, so the circle must go
         # orange (ready) even with no ad-hoc region set.
         self._update_circle()
 
     def _selected_condition(self):
-        sel = self._cond_tree.selection()
-        if not sel:
-            return None, None
-        idx = int(sel[0])
-        if 0 <= idx < len(self._conditions):
-            return idx, self._conditions[idx]
+        """The condition selected on the tab that is open, else on any tab."""
+        order = list(self._cond_trees.values())
+        try:
+            current = self._cond_frame.index(self._cond_frame.select())
+            order.insert(0, order.pop(current))
+        except Exception:
+            pass
+        for tv in order:
+            sel = tv.selection()
+            if not sel:
+                continue
+            idx = int(sel[0])
+            if 0 <= idx < len(self._conditions):
+                return idx, self._conditions[idx]
         return None, None
 
     def _on_cond_click(self, event):
         """A click in the "On" column switches that condition on or off."""
-        tv = self._cond_tree
+        tv = event.widget
         if tv.identify_region(event.x, event.y) != "cell" or tv.identify_column(event.x) != "#1":
             return None
         iid = tv.identify_row(event.y)
@@ -1272,22 +1525,126 @@ class ScreenTracker(tk.Tk):
         self._refresh_cond_tree()
 
     def _resnap_condition(self):
-        """Re-take the reference of the selected screen condition."""
+        """Re-take the reference picture of whichever area the selection owns.
+
+        A screen condition has one; a value condition has one only when a screen
+        area was attached to it."""
         idx, cond = self._selected_condition()
-        if cond is None or cond["kind"] != "screen":
-            messagebox.showwarning("No screen condition",
-                                   "Select a screen area condition first.", parent=self)
+        if cond is None:
+            messagebox.showwarning("No condition", "Select a condition first.", parent=self)
             return
-        img = self._grab_rect(cond.get("region"))
+        if cond["kind"] == "screen":
+            region, ref_key, img_key = cond.get("region"), "reference", "_ref_img"
+        elif cond["kind"] == "pv" and cond.get("gate_region"):
+            region, ref_key, img_key = cond["gate_region"], "gate_reference", "_gate_img"
+        else:
+            messagebox.showwarning(
+                "No picture to take",
+                "This condition has no screen area. Pick a screen area "
+                "condition, or a value condition with an area attached.",
+                parent=self)
+            return
+        img = self._grab_rect(region)
         if img is None:
             return
         encoded = self._encode_reference(img)
         if encoded is None:
             return
-        cond["reference"], cond["_ref_img"] = encoded, img
+        cond[ref_key], cond[img_key] = encoded, img
         self._save_conditions()
         self._refresh_cond_tree()
         self.status_var.set(f'Reference taken for "{cond["name"]}".')
+
+    def _build_area_block(self, win, parent, draft, keys, start_row, *, thumb_attr):
+        """Monitor + sensitivity + Draw area + Take reference + a thumbnail.
+
+        Used twice: by a screen condition, for its own area, and by a value
+        condition, for the area attached to it. `keys` says which draft keys it
+        reads and writes, so one dict can hold both without a collision.
+
+        Returns (commit, next_row); `commit` writes the two dropdown values into
+        the draft and is called from Save.
+        """
+        mon_key, region_key, thr_key, ref_key, img_key = keys
+        r = start_row
+
+        ttk.Label(parent, text="Monitor:").grid(row=r, column=0, sticky="w",
+                                                padx=(0, 6), pady=3)
+        mon_combo = ttk.Combobox(parent, values=self._monitor_labels,
+                                 state="readonly", width=12)
+        mon_combo.current(min(max(0, int(draft.get(mon_key) or 0)),
+                              len(self._monitor_labels) - 1))
+        mon_combo.grid(row=r, column=1, sticky="w", pady=3)
+
+        thr_var = tk.DoubleVar(value=draft.get(thr_key) or CHANGE_THRESHOLD)
+        ttk.Label(parent, text="Fires on a change over:").grid(row=r + 1, column=0,
+                                                               sticky="w", padx=(0, 6), pady=3)
+        ttk.Spinbox(parent, from_=0.5, to=50.0, increment=0.5, textvariable=thr_var,
+                    width=6, format="%.1f").grid(row=r + 1, column=1, sticky="w", pady=3)
+
+        ttk.Label(parent, text="Area:").grid(row=r + 2, column=0, sticky="w",
+                                             padx=(0, 6), pady=3)
+        area_lbl = ttk.Label(parent, text="")
+        area_lbl.grid(row=r + 2, column=1, sticky="w", pady=3)
+
+        thumb_lbl = tk.Label(parent, relief="solid", bd=1)
+        thumb_lbl.grid(row=r + 3, column=1, sticky="w", pady=(3, 6))
+
+        def refresh():
+            region = draft.get(region_key)
+            area_lbl.configure(
+                text=(f"{region[2] - region[0]} x {region[3] - region[1]} px "
+                      f"at {region[0]}, {region[1]}" if region else "not drawn yet"))
+            img = draft.get(img_key)
+            if img is None:
+                setattr(win, thumb_attr, None)
+                thumb_lbl.configure(image="", text="no reference taken",
+                                    width=20, height=2)
+            else:
+                thumb = img.copy()
+                thumb.thumbnail((300, 140), resample=0)
+                setattr(win, thumb_attr, ImageTk.PhotoImage(thumb))
+                thumb_lbl.configure(image=getattr(win, thumb_attr), text="",
+                                    width=0, height=0)
+
+        def take_reference():
+            if not draft.get(region_key):
+                messagebox.showwarning("No area", "Draw the area first.", parent=win)
+                return
+            img = self._grab_rect(draft[region_key])
+            if img is None:
+                return
+            encoded = self._encode_reference(img)
+            if encoded is None:
+                return
+            draft[ref_key], draft[img_key] = encoded, img
+            refresh()
+
+        def got_area(bbox):
+            draft[region_key] = [int(v) for v in bbox]
+            # Drawing a new area invalidates the old picture, so take a new one
+            # straight away — that is what the drawing was for.
+            self.after(300, take_reference)
+
+        def draw_area():
+            win.withdraw()
+            self._open_region_selector(mon_combo.current(), got_area)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=r + 4, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Button(btn_row, text="Draw area", width=12, command=draw_area).pack(side="left")
+        ttk.Button(btn_row, text="Take reference", width=15,
+                   command=take_reference).pack(side="left", padx=(6, 0))
+        refresh()
+
+        def commit():
+            draft[mon_key] = mon_combo.current()
+            try:
+                draft[thr_key] = max(0.1, float(thr_var.get()))
+            except Exception:
+                draft[thr_key] = CHANGE_THRESHOLD
+
+        return commit, r + 5
 
     def _edit_condition(self, new=None):
         """Add or change one condition. Nothing is written until Save."""
@@ -1302,6 +1659,8 @@ class ScreenTracker(tk.Tk):
                 draft.update(monitor=self._selected_monitor_idx.get(), region=None,
                              threshold=float(self.change_threshold.get()),
                              reference=None, _ref_img=None)
+            elif new == "hall":
+                draft.update(hall=None, pss=None, moving_grace_s=HALL_MOVING_GRACE_S)
             else:
                 draft.update(pv=COND_DEFAULT_PV, warn=None, trip=None, unit="")
         else:
@@ -1312,7 +1671,9 @@ class ScreenTracker(tk.Tk):
             draft = dict(cond)
 
         win = tk.Toplevel(self)
-        win.title("Screen area condition" if draft["kind"] == "screen" else "Value condition")
+        win.title({"screen": "Screen area condition",
+                   "hall": "Where the beam goes",
+                   "pv": "Value condition"}[draft["kind"]])
         win.transient(self)
         win.resizable(False, False)
         win.protocol("WM_DELETE_WINDOW", win.destroy)
@@ -1330,70 +1691,53 @@ class ScreenTracker(tk.Tk):
         ttk.Entry(frame, textvariable=msg_var, width=38).grid(row=1, column=1, sticky="w", pady=3)
 
         if draft["kind"] == "screen":
-            ttk.Label(frame, text="Monitor:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=3)
-            mon_combo = ttk.Combobox(frame, values=self._monitor_labels,
-                                     state="readonly", width=12)
-            mon_combo.current(min(max(0, draft.get("monitor", 0)), len(self._monitor_labels) - 1))
-            mon_combo.grid(row=2, column=1, sticky="w", pady=3)
+            commit_area, last_row = self._build_area_block(
+                win, frame, draft, _SCREEN_AREA_KEYS, 2, thumb_attr="_thumb")
+        elif draft["kind"] == "hall":
+            hall_var = tk.StringVar(value=_hall_name(draft.get("hall"))
+                                    if draft.get("hall") is not None else _NO_CHECK)
+            pss_var = tk.StringVar(value=_pss_name(draft.get("pss"))
+                                   if draft.get("pss") is not None else _NO_CHECK)
+            grace_var = tk.DoubleVar(value=draft.get("moving_grace_s", HALL_MOVING_GRACE_S))
 
-            thr_var = tk.DoubleVar(value=draft["threshold"])
-            ttk.Label(frame, text="Fires on a change over:").grid(row=3, column=0, sticky="w",
-                                                                  padx=(0, 6), pady=3)
-            ttk.Spinbox(frame, from_=0.5, to=50.0, increment=0.5, textvariable=thr_var,
-                        width=6, format="%.1f").grid(row=3, column=1, sticky="w", pady=3)
+            ttk.Label(frame, text="Shooting into:").grid(row=2, column=0, sticky="w",
+                                                         padx=(0, 6), pady=3)
+            ttk.Combobox(frame, textvariable=hall_var, state="readonly", width=22,
+                         values=[_NO_CHECK] + [label for num, label in _HALLS
+                                               if num != HALL_MOVING_VALUE]
+                         ).grid(row=2, column=1, sticky="w", pady=3)
 
-            ttk.Label(frame, text="Area:").grid(row=4, column=0, sticky="w", padx=(0, 6), pady=3)
-            area_lbl = ttk.Label(frame, text="")
-            area_lbl.grid(row=4, column=1, sticky="w", pady=3)
+            ttk.Label(frame, text="PSS state:").grid(row=3, column=0, sticky="w",
+                                                     padx=(0, 6), pady=3)
+            ttk.Combobox(frame, textvariable=pss_var, state="readonly", width=22,
+                         values=[_NO_CHECK] + [label for _num, label in _PSS_STATES]
+                         ).grid(row=3, column=1, sticky="w", pady=3)
 
-            thumb_lbl = tk.Label(frame, relief="solid", bd=1)
-            thumb_lbl.grid(row=5, column=1, sticky="w", pady=(3, 6))
+            ttk.Label(frame, text="Switchyard may move for (s):").grid(
+                row=4, column=0, sticky="w", padx=(0, 6), pady=3)
+            ttk.Spinbox(frame, from_=0, to=600, increment=10, textvariable=grace_var,
+                        width=6, format="%.0f").grid(row=4, column=1, sticky="w", pady=3)
 
-            def refresh_screen_labels():
-                region = draft.get("region")
-                area_lbl.configure(
-                    text=(f"{region[2] - region[0]} x {region[3] - region[1]} px "
-                          f"at {region[0]}, {region[1]}" if region else "not drawn yet"))
-                img = draft.get("_ref_img")
-                if img is None:
-                    win._thumb = None
-                    thumb_lbl.configure(image="", text="no reference taken",
-                                        width=20, height=2)
-                else:
-                    thumb = img.copy()
-                    thumb.thumbnail((300, 140), resample=0)
-                    win._thumb = ImageTk.PhotoImage(thumb)
-                    thumb_lbl.configure(image=win._thumb, text="", width=0, height=0)
+            hall_lbl = ttk.Label(frame, text="", wraplength=340, justify="left")
+            hall_lbl.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
-            def take_reference():
-                if not draft.get("region"):
-                    messagebox.showwarning("No area", "Draw the area first.", parent=win)
-                    return
-                img = self._grab_rect(draft["region"])
-                if img is None:
-                    return
-                encoded = self._encode_reference(img)
-                if encoded is None:
-                    return
-                draft["reference"], draft["_ref_img"] = encoded, img
-                refresh_screen_labels()
+            def hall_read_now():
+                hall_lbl.configure(text="reading…")
 
-            def got_area(bbox):
-                draft["region"] = [int(v) for v in bbox]
-                # Drawing a new area invalidates the old picture, so take a new
-                # one straight away — that is what the drawing was for.
-                self.after(300, take_reference)
+                def show(fate, pss):
+                    if hall_lbl.winfo_exists():
+                        hall_lbl.configure(text=self._hall_readout_text(fate, pss))
 
-            def draw_area():
-                win.withdraw()
-                self._open_region_selector(mon_combo.current(), got_area)
+                def worker():
+                    fate, pss = self._read_hall_pvs()
+                    self.after(0, show, fate, pss)
+
+                threading.Thread(target=worker, daemon=True).start()
 
             btn_row = ttk.Frame(frame)
-            btn_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
-            ttk.Button(btn_row, text="Draw area", width=12, command=draw_area).pack(side="left")
-            ttk.Button(btn_row, text="Take reference", width=15,
-                       command=take_reference).pack(side="left", padx=(6, 0))
-            refresh_screen_labels()
+            btn_row.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+            ttk.Button(btn_row, text="Read now", width=12,
+                       command=hall_read_now).pack(side="left")
             last_row = 7
         else:
             pv_var = tk.StringVar(value=draft.get("pv", ""))
@@ -1444,7 +1788,31 @@ class ScreenTracker(tk.Tk):
             btn_row = ttk.Frame(frame)
             btn_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
             ttk.Button(btn_row, text="Read now", width=12, command=read_now).pack(side="left")
-            last_row = 8
+
+            # The optional second half: a screen area that must keep matching its
+            # own picture. Both halves have to hold; either one failing trips.
+            gate_on = tk.BooleanVar(value=bool(draft.get("gate_region")))
+            ttk.Separator(frame, orient="horizontal").grid(row=8, column=0, columnspan=2,
+                                                           sticky="ew", pady=(8, 0))
+            gate_box = ttk.Frame(frame, padding=(0, 6, 0, 0))
+            gate_box.grid(row=9, column=0, columnspan=2, sticky="ew")
+            ttk.Checkbutton(gate_box, variable=gate_on,
+                            text="Also require a screen area",
+                            command=lambda: toggle_gate()).grid(row=0, column=0, columnspan=2,
+                                                                sticky="w", pady=(0, 4))
+            gate_inner = ttk.Frame(gate_box)
+            gate_inner.grid(row=1, column=0, columnspan=2, sticky="ew")
+            commit_gate, _ = self._build_area_block(
+                win, gate_inner, draft, _GATE_AREA_KEYS, 0, thumb_attr="_gate_thumb")
+
+            def toggle_gate():
+                if gate_on.get():
+                    gate_inner.grid()
+                else:
+                    gate_inner.grid_remove()
+
+            toggle_gate()
+            last_row = 10
 
         def save():
             name = name_var.get().strip()
@@ -1457,11 +1825,19 @@ class ScreenTracker(tk.Tk):
                 if not draft.get("region"):
                     messagebox.showwarning("No area", "Draw the area first.", parent=win)
                     return
-                draft["monitor"] = mon_combo.current()
+                commit_area()
+            elif draft["kind"] == "hall":
+                draft["hall"] = _value_for_label(_HALLS, hall_var.get())
+                draft["pss"] = _value_for_label(_PSS_STATES, pss_var.get())
                 try:
-                    draft["threshold"] = max(0.1, float(thr_var.get()))
+                    draft["moving_grace_s"] = max(0.0, float(grace_var.get()))
                 except Exception:
-                    draft["threshold"] = CHANGE_THRESHOLD
+                    draft["moving_grace_s"] = HALL_MOVING_GRACE_S
+                if draft["hall"] is None and draft["pss"] is None and not messagebox.askyesno(
+                        "Nothing to check",
+                        "Neither the hall nor the PSS state is set, so this "
+                        "condition can never fire. Save it anyway?", parent=win):
+                    return
             else:
                 pv_name = pv_var.get().strip()
                 if not pv_name:
@@ -1471,10 +1847,21 @@ class ScreenTracker(tk.Tk):
                 draft["unit"] = unit_var.get().strip()
                 draft["warn"] = _parse_level(warn_var.get())
                 draft["trip"] = _parse_level(trip_var.get())
-                if draft["trip"] is None and not messagebox.askyesno(
+                if gate_on.get():
+                    if not draft.get("gate_region"):
+                        messagebox.showwarning("No area", "Draw the screen area first, "
+                                                          "or switch it off.", parent=win)
+                        return
+                    commit_gate()
+                else:
+                    for key in ("gate_region", "gate_reference", "gate_threshold",
+                                "gate_monitor", "_gate_img"):
+                        draft.pop(key, None)
+                if draft["trip"] is None and not draft.get("gate_region") and not messagebox.askyesno(
                         "No trip level",
-                        "Without a trip level this condition can never raise the "
-                        "alarm. Save it anyway?", parent=win):
+                        "Without a trip level and without a screen area this "
+                        "condition can never raise the alarm. Save it anyway?",
+                        parent=win):
                     return
             if "_uid" not in draft:
                 draft["_uid"] = self._next_cond_uid()
@@ -1925,10 +2312,22 @@ class ScreenTracker(tk.Tk):
                     f'{cond["name"]} — no reference taken, it cannot fire',
                     "Select the condition and press the arrow button to take its "
                     "reference picture.")
-            elif cond["kind"] == "pv" and cond.get("trip") is None:
+            elif cond["kind"] == "pv":
+                if cond.get("gate_region") and cond.get("_gate_img") is None:
+                    self._log_message(
+                        f'{cond["name"]} — its screen area has no reference picture',
+                        "Select the condition and press the arrow button to take "
+                        "the picture of the area attached to it.")
+                elif cond.get("trip") is None and not cond.get("gate_region"):
+                    self._log_message(
+                        f'{cond["name"]} — no trip level set, it cannot fire',
+                        "Edit the condition and type the value it must not go over.")
+            elif cond["kind"] == "hall" and cond.get("hall") is None and cond.get("pss") is None:
                 self._log_message(
-                    f'{cond["name"]} — no trip level set, it cannot fire',
-                    "Edit the condition and type the value it must not go over.")
+                    f'{cond["name"]} — neither hall nor PSS state set, it cannot fire',
+                    "Edit the condition and choose where the beam is supposed to "
+                    "go, or which PSS state is expected.")
+        self._next_hall_read = 0.0      # read the hall values on the first poll
         self.tracking = True
         self.changed = False
         self.status_var.set("Tracking active…")
@@ -1970,12 +2369,10 @@ class ScreenTracker(tk.Tk):
                 if diff is not None and diff > self.change_threshold.get():
                     self._on_change_detected(diff)
                     return
-        # The named screen conditions, each against its own reference.
-        for cond in self._enabled_conditions("screen"):
-            reference = cond.get("_ref_img")
-            if reference is None:
-                continue
-            img = self._grab_rect(cond.get("region"))
+        # The named screen conditions, each against its own reference, and the
+        # areas attached to value conditions — the same comparison either way.
+        for cond, region, reference, threshold in self._watched_areas():
+            img = self._grab_rect(region)
             if img is None:
                 continue
             if img.size != reference.size:
@@ -1987,10 +2384,28 @@ class ScreenTracker(tk.Tk):
                           f"reference {reference.size[0]}x{reference.size[1]}")
                 return
             diff = self._picture_diff(img, reference)
-            if diff is not None and diff > cond["threshold"]:
-                self._on_condition_failed(cond, f"changed (diff={diff:.1f})")
+            if diff is not None and diff > threshold:
+                self._on_condition_failed(cond, f"screen area changed (diff={diff:.1f})")
                 return
         self._poll_job = self.after(POLL_INTERVAL_MS, self._poll)
+
+    def _watched_areas(self):
+        """Every (condition, region, reference, threshold) the poll compares.
+
+        A screen condition contributes its own area; a value condition
+        contributes the area attached to it, if it has one. Both must keep
+        matching their picture — a picture that stopped matching is the
+        condition no longer being met, whichever kind it belongs to.
+        """
+        out = []
+        for cond in self._enabled_conditions("screen"):
+            if cond.get("_ref_img") is not None and cond.get("region"):
+                out.append((cond, cond["region"], cond["_ref_img"], cond["threshold"]))
+        for cond in self._enabled_conditions("pv"):
+            if cond.get("_gate_img") is not None and cond.get("gate_region"):
+                out.append((cond, cond["gate_region"], cond["_gate_img"],
+                            cond.get("gate_threshold", CHANGE_THRESHOLD)))
+        return out
 
     def _on_change_detected(self, diff):
         self._raise_alarm(f"CHANGE DETECTED  (diff={diff:.1f})")
@@ -2546,10 +2961,6 @@ class ScreenTracker(tk.Tk):
         if visible:
             self._mon_frame.pack(side="left", before=self._canvas_circle)
             self._settings_btn.pack(side="left", padx=(4, 0))
-            self.btn_preview.pack(side="left", padx=(12, 2))
-            self.btn_reference.pack(side="left", padx=2)
-            self.btn_resnap.pack(side="left", padx=(2, 0))
-            self._preset_frame.grid()
             self._cond_frame.grid()
             self._log_frame.grid()
             self._set_transparent(False)
@@ -2558,10 +2969,6 @@ class ScreenTracker(tk.Tk):
                                       f"+{self.winfo_rootx()}+{self.winfo_rooty()}")
             self._mon_frame.pack_forget()
             self._settings_btn.pack_forget()
-            self.btn_preview.pack_forget()
-            self.btn_reference.pack_forget()
-            self.btn_resnap.pack_forget()
-            self._preset_frame.grid_remove()
             self._cond_frame.grid_remove()
             self._log_frame.grid_remove()
             self._set_transparent(True)
@@ -3020,6 +3427,65 @@ class ScreenTracker(tk.Tk):
         samples.sort(key=lambda s: s[0])
         return samples
 
+    def _fetch_latest(self, pv_name, now_ns, context=None):
+        """The newest archived (value, time_ns) of one PV, or None.
+
+        For a value that is written ON CHANGE ONLY — the beam fate and the PSS
+        state both are — the last minute is empty nearly always, so the window
+        widens until something comes back. Not _condition_value: that returns
+        the HIGHEST sample of the window, which is meaningless for an enum.
+
+        The window that worked last time is tried first, and remembered. Without
+        that, a channel that is not archived at all costs four requests on every
+        single read — and the beam fate is exactly that channel today. Starting
+        wide is never wrong: the newest sample of a wide window is the same
+        sample, and these channels hold a handful of points a month.
+        """
+        # Only ever widen from the hint. A narrower window is a subset of a
+        # wider one, so once the hinted window comes back empty there is
+        # nothing a smaller one could still hold.
+        for i in range(self._hall_span_hint.get(pv_name, 0), len(HALL_LOOKBACK_S)):
+            samples = self._fetch_samples(pv_name,
+                                          now_ns - HALL_LOOKBACK_S[i] * 1_000_000_000,
+                                          now_ns, context)
+            if samples:
+                self._hall_span_hint[pv_name] = i
+                return samples[-1][1], samples[-1][0]
+        # Nothing anywhere: next time, ask the widest window only.
+        self._hall_span_hint[pv_name] = len(HALL_LOOKBACK_S) - 1
+        return None
+
+    def _read_hall_pvs(self, context=None):
+        """(beam fate, PSS state) as (value, time_ns) pairs, either may be None."""
+        now_ns = int(time.time() * 1e9)
+        return (self._fetch_latest(HALL_FATE_PV, now_ns, context),
+                self._fetch_latest(HALL_PSS_PV, now_ns, context))
+
+    @staticmethod
+    def _hall_readout_text(fate, pss):
+        """The one line saying what the two values are doing, in plain words."""
+        def one(label, reading, namer):
+            if reading is None:
+                return f"{label}: cannot be read"
+            value, ts = reading
+            when = time.strftime("%d.%m. %H:%M", time.localtime(ts / 1e9))
+            return f"{label}: {namer(value)} (since {when})"
+        return (one("Beam", fate, _hall_name) + "   ·   "
+                + one("PSS", pss, _pss_name))
+
+    def _read_hall_now(self):
+        """The Read now button on the Halls tab."""
+        self._hall_readout.set("reading…")
+
+        def show(fate, pss):
+            self._hall_readout.set(self._hall_readout_text(fate, pss))
+
+        def worker():
+            fate, pss = self._read_hall_pvs()
+            self.after(0, show, fate, pss)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     @staticmethod
     def _condition_value(samples, since_ns):
         """The one number a value condition is judged on.
@@ -3045,6 +3511,12 @@ class ScreenTracker(tk.Tk):
         # trip over it being edited mid-fetch.
         pv_conds = [c for c in self._enabled_conditions("pv") if c.get("trip") is not None
                     or c.get("warn") is not None]
+        # The two hall values change hours apart and need a wide look-back, so
+        # they ride the same worker but on their own, much slower clock.
+        hall_conds = self._enabled_conditions("hall")
+        read_hall = bool(hall_conds) and time.time() >= self._next_hall_read
+        if read_hall:
+            self._next_hall_read = time.time() + HALL_POLL_MS / 1000.0
 
         def fetch_avg(pv_name):
             samples = self._fetch_samples(pv_name, start_ns, now_ns, _ssl)
@@ -3069,7 +3541,9 @@ class ScreenTracker(tk.Tk):
                     abs_val = avg
                 results.append((avg, abs_val))
             cond_results = [(cond, fetch_condition(cond["pv"])) for cond in pv_conds]
-            self.after(0, lambda r=results, c=cond_results: self._update_pv_display(r, c))
+            hall = self._read_hall_pvs(_ssl) if read_hall else None
+            self.after(0, lambda r=results, c=cond_results, h=hall:
+                       self._update_pv_display(r, c, h))
 
         now_ns   = int(time.time() * 1e9)
         start_ns = now_ns - 60 * 1_000_000_000   # last 60 s
@@ -3100,6 +3574,43 @@ class ScreenTracker(tk.Tk):
                 self._set_cond_badge(
                     cond, "#cc6600",
                     f"⚠  {cond['name']}: {value:g}{unit} ↑ (warn {warn:g})")
+            else:
+                self._set_cond_badge(cond, None)
+        return False
+
+    def _check_hall_conditions(self, hall):
+        """Badge, or alarm, for every hall condition, from one pair of readings.
+
+        `hall` is (fate, pss) as returned by _read_hall_pvs, each either a
+        (value, time_ns) pair or None. A value that could not be read never
+        trips, but it does not go quiet either — the badge says so, because
+        "nothing shown" would read as "everything is fine".
+        """
+        fate_read, pss_read = hall
+        fate = fate_read[0] if fate_read else None
+        pss = pss_read[0] if pss_read else None
+
+        # How long the switchyard has been on the move: the archiver's own
+        # timestamp for the sample, not our clock, which runs ahead of the
+        # facility's.
+        moving_for_s = None
+        if fate_read is not None and fate == HALL_MOVING_VALUE:
+            moving_for_s = max(0.0, (time.time() * 1e9 - fate_read[1]) / 1e9)
+
+        if hasattr(self, "_hall_readout"):
+            self._hall_readout.set(self._hall_readout_text(fate_read, pss_read))
+
+        for cond in self._enabled_conditions("hall"):
+            if cond not in self._conditions:
+                continue                      # edited or deleted while fetching
+            verdict, sentence = _hall_verdict(cond, fate, pss, moving_for_s)
+            if verdict == "trip":
+                self._on_condition_failed(cond, sentence)
+                return True
+            if verdict == "warn":
+                self._set_cond_badge(cond, "#cc6600", f"⚠  {cond['name']}: {sentence}")
+            elif verdict == "unknown":
+                self._set_cond_badge(cond, "#cc6600", f"⚠  {cond['name']}: {sentence}")
             else:
                 self._set_cond_badge(cond, None)
         return False
@@ -3143,7 +3654,7 @@ class ScreenTracker(tk.Tk):
             row._active = False
         self._relayout_pv_alerts()
 
-    def _update_pv_display(self, results: list, cond_results=()):
+    def _update_pv_display(self, results: list, cond_results=(), hall=None):
         for i, ((avg, abs_val), (_, label, _lo_o, _lo_r, _hi_o, _hi_r, unit)) in enumerate(zip(results, _PV_MONITORS)):
             lo_r_var, lo_o_var, hi_o_var, hi_r_var = self._pv_thr_vars[i]
             lo_r = lo_r_var.get()
@@ -3184,7 +3695,10 @@ class ScreenTracker(tk.Tk):
                 row._active = False
 
         self._relayout_pv_alerts()
-        self._check_pv_conditions(cond_results)
+        if self._check_pv_conditions(cond_results):
+            return
+        if hall is not None:
+            self._check_hall_conditions(hall)
 
     def _on_pv_frame_configure(self, event):
         # Re-flow only when the available width actually changes (placing

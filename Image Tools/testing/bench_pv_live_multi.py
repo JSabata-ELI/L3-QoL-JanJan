@@ -209,10 +209,19 @@ def main():
                 time.sleep(0.005)
         burst_s = time.monotonic() - t0
         fetches = v._pv_fetch_gen - gen0
-        # +3 for the leading edge and the wait-retries; the point of the check is the
-        # ORDER of magnitude — paced by the interval (~12 here) rather than one per
+        # TWO paced sources, not one, and the cap has to name both or it is measuring
+        # something the design no longer does:
+        #   * the refresh gate, one fetch per PV_REFRESH_MIN_INTERVAL_S;
+        #   * the wait ladder, one per PV_ARCHIVER_RETRY_MS_MIN while a frame's sample is
+        #     genuinely unpublished (see PV_ARCHIVER_FINE_WAIT_S). It used to double
+        #     straight through the ~1 s publication delay, which is why the numbers
+        #     landed ~730 ms after the archiver had them on every shot
+        #     (testing/bench_pv_latency.py: p50 796 ms → 16 ms at a 2.5 s cadence).
+        # +3 for the leading edge. The point of the check is unchanged and is still the
+        # ORDER of magnitude: paced by fixed intervals (~23 here) rather than one per
         # shot plus retries (~40+), which is what a queue would produce.
-        cap = burst_s / m.PV_REFRESH_MIN_INTERVAL_S + 3
+        cap = (burst_s / m.PV_REFRESH_MIN_INTERVAL_S
+               + burst_s / (m.PV_ARCHIVER_RETRY_MS_MIN / 1000.0) + 3)
         check("fetches are paced by the refresh interval, not by the shot rate",
               fetches <= cap,
               f"{fetches} fetches / {len(burst)} shots in {burst_s:.1f} s "

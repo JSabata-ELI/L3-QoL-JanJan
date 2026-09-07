@@ -224,7 +224,7 @@ def test_every_button_handler():
         ("clear_xy",           w._clear_xy_plot),
         ("pv_time_add_cond",   w._pv_time_add_condition_row),
         ("plot_pv_time",       w._plot_pv_time),       # may warn (no pyarrow) — must not crash
-        ("export_csv",         w._export_csv),
+        ("export_table",       w._open_export_dialog),
         ("open_image_row",     lambda: w._try_open_image_at_row(0)),
         ("clear_log",          w._clear_log),
         ("replot_graph",       w._plot_graph),
@@ -425,11 +425,17 @@ def test_custom_pv_bindings_table():
         return ch
 
     def _dump(dlg):
+        # One formula = one block: the name cell is written once and merged over
+        # the formula's letters (and carries "name\nexpr" when there are
+        # several), so the block name is carried down the rows here.
         t = dlg._bind_tbl
-        out = []
+        out, block = [], ""
         for r in range(t.rowCount()):
+            it_name = t.item(r, 0)
+            if it_name is not None:
+                block = it_name.text().split("\n")[0]
             cb = t.cellWidget(r, 2)
-            out.append((t.item(r, 0).text(), t.item(r, 1).text(),
+            out.append((block, t.item(r, 1).text(),
                         cb.currentText() if isinstance(cb, QComboBox) else None,
                         t.item(r, 3).text()))
         return out
@@ -487,6 +493,30 @@ def test_custom_pv_bindings_table():
         del d
         gc.collect()
         _app.processEvents()
+
+
+def test_remove_pv_leaves_nothing_selected():
+    """Remove must not leave the next channel highlighted.
+
+    Qt keeps the current row where it was, so the channel that moved up into the
+    freed place came out selected and a second Remove would have taken it too."""
+    _install_network_mock()
+    _install_dialog_mocks()
+    w = _new_widget()
+    _set_pvs(w, ["L3-TEST-A:Energy", "L3-TEST-B:Energy", "L3-TEST-C:Energy"])
+    w._pv_list.setCurrentRow(0)
+    w._remove_selected_pvs()
+    _app.processEvents()
+    assert w._real_pv_names() == ["L3-TEST-B:Energy", "L3-TEST-C:Energy"], \
+        w._real_pv_names()
+    assert w._pv_list.selectedItems() == [], \
+        [i.text() for i in w._pv_list.selectedItems()]
+    assert w._pv_list.currentRow() == -1, w._pv_list.currentRow()
+    # A second Remove with nothing selected must take nothing.
+    w._remove_selected_pvs()
+    assert w._real_pv_names() == ["L3-TEST-B:Energy", "L3-TEST-C:Energy"], \
+        w._real_pv_names()
+    w.close()
 
 
 def test_conditions_discard_out_of_range_values():
