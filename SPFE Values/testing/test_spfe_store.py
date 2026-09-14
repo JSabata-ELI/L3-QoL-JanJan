@@ -257,8 +257,14 @@ def test_rounding():
     check("the shipped SUM columns are rounded to hundreds",
           [f.row_by_key("ba2loop2").step_for("ba2loop2_3"),
            f.row_by_key("ba2loop2").step_for("ba2loop2_1")] == [100.0, 10.0])
-    check("and the dazzlers to whole percent",
-          f.row_by_key("dazz1").step_for("dazz1_1") == 1.0)
+    # The dazzler percentage moves in tenths, so rounding it to whole percent
+    # showed 0 for every reading; it is not rounded at all now.
+    dazz = f.row_by_key("dazz2")
+    check("the dazzler percentage is not rounded",
+          dazz.step_for(dazz.columns[0]) == 0.0)
+    check("and the archiver's fraction is scaled to percent",
+          dazz.scale == 100.0
+          and store.format_cell(dazz, {dazz.columns[0]: 33.2}) == "33.2 %")
 
 
 def test_parse_cell():

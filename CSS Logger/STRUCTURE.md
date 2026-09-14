@@ -16,13 +16,15 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `main.py` | The application — PySide6 "CPVA Suite" (CSS Logger + Spectra in one window). Run with `python main.py`. |
 | `cpva_core.py` | Non-UI helpers: config/preset I/O, CPVA archiver HTTP, time / PV-name / image helpers. No GUI toolkit — shared by `main.py` and the tests. |
 | `sp_t.py` | The Spectra widget, embedded as the second tab of the suite. This folder is its only home — see the warning at the top of `main.py`. Its own docs: `STRUCTURE_Spectra_tab.md`, `ReadMe_Spectra tab.txt`, `ReadMe_Spectra tab_Full.txt`. |
-| `daypicker.py` | The shared day/time picker — **a verbatim copy; the master is `Image Tools/daypicker.py`**. It is here because the builder only bundles `.py` files from the program's own folder, and it is loaded by path (`_import_daypicker` in `sp_t.py`) rather than by `import daypicker`, which the builder's module-home check would refuse. Change the master, then re-copy; `testing/test_daypicker_sync.py` fails while the two differ. |
+| `daypicker.py` | The shared day/time picker — **a verbatim copy; the master is `Image Tools/daypicker.py`**. It is here because the builder only bundles `.py` files from the program's own folder, and it is loaded by path (`_import_daypicker` in `sp_t.py`) rather than by `import daypicker`, which the builder's module-home check would refuse. It is also listed in `build_config.json` → `hidden_imports`, which compiles it into the exe without any import statement for that check to trip over — **`_internal` never survives the trip to the share, so the loose copy the builder puts there cannot be relied on** (see below). Change the master, then re-copy; `testing/test_daypicker_sync.py` fails while the two differ. |
 | `test_smoke.py` | Offline smoke test — headless (`QT_QPA_PLATFORM=offscreen`), network + dialogs mocked, clicks through every button/dialog; also covers custom-PV bindings (incl. the dialog's bindings table) and the Conditions filter. |
 | `test_live_pacing.py` | Offline test of live-mode pacing: the period is used as given (no clamp), bounded tick look-back, cursor advance on an empty tick, Stop-Live cancellation, table item reuse. |
 | `testing/test_long_window_fetch.py` | Offline test of loading a long period: full coverage of 12 h / 48 h / a year against an archiver that refuses anything wider than six hours, night hours read, no signal dragged down by another, unique ascending samples, unread ranges reported, cancellation, monotone progress, newest-first order, and the widget-level three-day load. |
 | `testing/probe_x_axis_long.py` | Renders the time axis for six periods (1 h … 1 year) with the real Windows backend, measures the pixel gap between stamps, and saves a PNG of each into `testing/_out/`. |
 | `testing/test_export_table.py` | Offline test of the table export and the carry-forward: the shot grid ignores the channels written at their own pace, a held value crosses a slice, a word value survives into the file, the table's columns follow the graph, and a whole day exports without a duplicate row at a slice seam. |
 | `testing/test_time_window_dialog.py` | Offline test of the Start/End picker: paging the calendar moves the selected day (a months-long period must not come back as the last hour), the status line follows, a short month clamps, and the multi-day picker keeps its own list. |
+| `testing/test_xy_live.py` | Offline test of the XY tab: a live tick grows the cloud without rebuilding the figure, a hidden tab is only marked and caught up on the way in, a condition thins it out (and the Table tab with it), and a right-drag zoom leaves Back and Forward usable. |
+| `testing/probe_graph_layout.py` | Renders the Graph tab with the real Windows backend: the opening graph/PV-list split and how many rows it shows, the Std / P-P percentages, and the cursor value boxes with the mouse at each edge. PNGs into `testing/_out/`. |
 | `testing/probe_export_dialog.py` | Renders the Export table dialog with the real Windows backend into `testing/_out/export_dialog.png` and measures it for pale text, empty labels and clipped names. |
 | `testing/probe_export_live.py` | End-to-end against the REAL archiver: loads a short window, prints how many rows each channel actually has a value in (so a held-only channel is visible as such), exports, and reads the file back. |
 | `test_count_param.py` | Focused test of the archiver `count` parameter handling (hits the real archiver). |
@@ -220,6 +222,18 @@ only boxes that would really overlap are merged into a stack, and the stack is
 spread out around the average height its members asked for. A box therefore moves
 only when it has to, and only as far as it has to.
 
+Horizontally the boxes have to be steered too. They are `clip_on=False`, so
+nothing stops them being drawn past the axes and past the window — with the
+mouse at the far right the numbers were simply off-screen. `_place_cursor_boxes`
+now estimates each box's width (`_cursor_box_width`: text length × font size ×
+dpi, the same cheap arithmetic the height estimate uses — asking matplotlib for a
+real extent would need a renderer on every mouse move) and flips the WHOLE set to
+`ha="right"` when the widest one would cross the right spine, so they stay
+together instead of flipping one at a time. `_edge_align` does the same for the
+time box under the axis (`ha` centred → left/right near an end), and the
+left-hand value box is clamped into the plot rectangle vertically while still
+printing the value under the real mouse position, not the clamped one.
+
 ### Custom-PV expressions — letters are positional, bindings are not
 A custom PV is a Python expression over channel letters (`Sum of Green = F+H`),
 and those letters are just positions in `_pv_order`, so they change whenever the
@@ -306,6 +320,17 @@ its `available` set from a row, so a condition on a channel with no sample in
 the window is now **applied** to the held value instead of being skipped. A
 channel last left outside its range (closed shutter, laser off) therefore
 empties the table — `_log_conditions_diag` already says so out loud.
+
+The Log was for a long time the ONLY place that said it. On screen the table
+read "No rows." and the XY tab read "neither channel has values in this
+window", which is simply false — the channels had thousands of samples, the
+conditions threw the rows away. `_apply_conditions_to_rows` now records
+`_cond_drop_counts = (rows_in, rows_out)`, and `_no_rows_message()` turns that
+into the sentence both places show, in dark ink (`_set_xy_info(warn=True)` and
+the same colour on `_lbl_table_info`) because with an empty grid that line is
+the whole answer. `_xy_empty_message(n_rows)` keeps the old wording for the one
+case it was ever right about: rows on the table, but the two chosen channels
+silent.
 Graph: `_mpl_figure` / `_mpl_canvas`, `_graph_axes`, `_graph_lines`, `_graph_pvs`,
 `_graph_raw` / `_graph_raw_np`, `_graph_spine_xpos`, `_span_selector`,
 `_zoom_selector`, `_graph_toolbar`, `_user_zoomed`, `_reticking`, crosshair
@@ -356,13 +381,13 @@ Config: `_graph_opts`, `_presets`, `_condition_presets`, `_custom_pvs`,
 | stats / selection | `_on_span_select` (stores `_sel_range`, then delegates), `_recompute_stats`, `_restore_selection_band`, `_clear_selection`, `_drop_selection_if_outside`, `_make_stat_card`, `_copy_stats_text`, `_clear_stats`, `_on_zoom_select` |
 | graph options | `_open_graph_settings_dialog`, `_apply_graph_opts`, `_avg_target_points`, `_on_avg_target_changed` |
 | live | `_toggle_live_mode`, `_live_span_from_window`, `_live_initial_load`, `_on_live_init_error`, `_after_live_initial_load`, `_live_tick`, `_on_incremental_finished`, `_schedule_live_tick`, `_live_countdown_tick`, `_live_poll_ms`, `_scroll_live_time_axis`, `_stop_live`, `_maybe_autostart_live` |
-| filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows` |
+| filtering | `_apply_conditions_to_rows`, `_log_conditions_diag`, `_row_matches_conditions`, `_condition_value_ok`, `_get_master_pv`, `_get_master_multiple`, `_remove_master_only_rows`, `_remove_fake_hour_boundary_rows`, `_filter_master_multiple_rows`, `_no_rows_message` |
 | custom PVs | `_col_letter`, `_channel_letters`, `_cpv_dialog_channels`, `_migrate_custom_pv_bindings`, `_cpv_plan`, `_compute_custom_pvs_in_rows`, `_seed_custom_pv_pre_window`, `_emit_custom_pv_diag`, `_rebuild_custom_pvs`, `_custom_pv_tooltip`, `_open_custom_pv_dialog` |
 | table | `_populate_table`, `_set_table_cell`, `_format_value`, `_on_table_scroll`, `_on_table_context_menu`, `_on_table_double_click`, `_try_open_image_at_row` |
 | axis settings | `_refresh_axis_settings_tv`, `_autosize_axis_pane` (the PV list is exactly as tall as the PVs it holds, capped so the graph keeps `_AXIS_PANE_MIN_GRAPH` px and the buttons stay on screen), `_on_axis_tv_double_click`, `_on_axis_tv_clicked`, `_on_axis_color_changed`, `_on_axis_item_changed`, `_apply_axis_settings`, `_get_pv_default_settings`, `_pv_style_kwargs`, `_pv_stats`, `_flush_axis_measured`, `_resync_pv_colors`, `_safe_float` |
 | columns / looks | `_apply_default_axis_columns`, `_reset_axis_columns`, `_open_axis_column_menu`, `_build_styles_menu`, `_fill_styles_menu`, `_current_style_payload`, `_apply_style_payload`, `_save_style_preset`, `_load_style_preset`, `_delete_style_preset`, `_export_style_preset`, `_import_style_preset` |
 | reference lines | `_open_ref_lines_dialog`, `_graph_ref_pv_choices`, `_ref_axis_for`, `_draw_ref_lines`, `_run_ref_pick`, `_set_ref_pick_step`, `_clear_ref_pick_dim`, `_end_ref_pick`, `_cancel_ref_pick`, `_on_ref_pick_click`, `_on_ref_pick_key`, `_pv_at_click` |
-| XY | `_refresh_xy_choices`, `_on_xy_axis_changed`, `_plot_xy(_impl)`, `_xy_pairs`, `_on_xy_rect_select`, `_clean_xy`, `_clear_xy_plot` |
+| XY | `_refresh_xy_choices`, `_on_xy_axis_changed`, `_plot_xy(_impl)`, `_xy_pairs`, `_on_xy_rect_select`, `_clean_xy`, `_clear_xy_plot`, `_set_xy_info`, `_xy_empty_message` |
 | PV Time | `_plot_pv_time(_impl)`, `_recent_workdays`, `_pick_pv_time_days`, `_refresh_pv_time_days_label`, `_refresh_pv_time_choices`, `_pv_time_add_condition_row`, `_pv_time_remove_condition_row`, `_pv_time_conditions`, `_pv_time_resolve`, `_pv_time_fetch`, `_pv_time_pv_arrays`, `_pv_time_trim_cache`, `_pv_time_finish`, `_on_pv_time_error`, `_pv_time_day_columns`, `_pv_time_day_values`, `_pv_time_draw`, `_draw_daily_distribution`, `_draw_pv_time_raw`, `_install_pv_time_toolbar`, `_clear_pv_time_plot` |
 | PV list / presets | `_open_pv_browser`, `_remove_selected_pvs`, `_clear_pv_list`, `_on_pv_double_click`, `_real_pv_names`, `_sync_pv_list_customs`, `_update_pv_count`, `_refresh_preset_combo`, `_load_preset`, `_save_preset`, `_save_preset_as`, `_delete_preset` |
 | export | `_open_export_dialog`, `_export_shot_channels`, `_export_rows_on_screen`, `_export_from_archive` (+ the module helpers `_export_slices`, `_export_slice_rows`, `_export_eval`, `_export_row_ok`, `_export_fmt`) |
@@ -482,6 +507,56 @@ startup.
 **Right-drag on the canvas is the zoom, so the canvas must not get a context
 menu** — it would swallow the drag. Those entries live on the "View ▾" button
 (`_open_graph_view_menu`).
+
+**A hand-made zoom must push BOTH views onto the toolbar's history.** matplotlib
+enables Back and Forward purely from where the toolbar sits in `_nav_stack`
+(`backend_qt.py: set_history_buttons`), and its own `release_zoom` pushes after
+applying the new limits as well as before. `_on_zoom_select` (graph) and
+`_on_xy_rect_select` (XY) used to push only the view being LEFT, so the stack
+held one entry, `_pos == 0`, and both buttons stayed greyed out — reported as
+"the back button does nothing after I zoomed with the magnifier". Both now call
+their push helper (`_push_graph_view` / `_xy_push_view`) on each side of the
+`set_xlim` / `set_ylim`, and `_plot_xy_impl` records the opening view right
+after the first `canvas.draw()` so Home and Back have a destination from the
+very first gesture.
+
+### XY tab — it draws from `_table_rows`, so it has to be told when they change
+The scatter is built once by `_plot_xy_impl`; `_xy_update_points` then refreshes
+that same `PathCollection` in place. Rebuilding the figure per tick would throw
+away the toolbar history and the user's view several times a second.
+
+| Piece | Role |
+|-------|------|
+| `_xy_scatter`, `_xy_plotted` | the collection on screen and the `(x_label, y_label, x_pv, y_pv)` it was drawn from — a live refresh whose combos have moved on falls back to the full `_plot_xy` |
+| `_xy_dirty` | the visible tab is redrawn, a hidden one is only marked; `_on_main_tab_changed` catches it up on the way in |
+| `_xy_user_zoomed` | set by `_on_xy_rect_select` and by the toolbar's Zoom/Pan, cleared by Home. While set, a refresh adds points but leaves the axes alone |
+| `_xy_fit_axes` | **`ax.relim()` is no use here** — it ignores collections, and a scatter is a collection. The limits are taken from the points, with 5 % air |
+| `_xy_dot_size(n)` | the count → dot-area ladder, shared by the first plot and every refresh, so a cloud that grows past a threshold thins out the same way a fresh one would |
+
+Callers that must refresh it, all of them places that rebuild `_table_rows`:
+`_on_incremental_finished` (the live table branch), `_open_conditions_dialog`
+and the custom-PV dialog. The Conditions button is on the Graph, XY and Table
+tabs and is one handler — before, pressing it *from the XY tab* repainted
+everything except the plot being looked at.
+
+### `_internal` never reaches the share, so a `.py` loaded by path is not safe there
+`Dev Tools/b_t.py` ships every sibling `.py` as `--add-data`, which lands in the
+build's own `_internal`. That folder never gets to the share. Two separate steps
+see to it: `Dev Tools/cm_t.py` skips `_internal` entirely when it copies a
+program, and its "Deploy Libraries" button fills the destination's `_internal`
+from ONE shared runtime library built from `Internal Builder`, **deleting every
+file that library does not have** ("Remove files that no longer exist in the new
+_internal"). So neither pressing that button nor not pressing it can put
+`daypicker.py` there. The local build ran; the network copy could not find the
+file. Measured: `dist/CSS Logger/v2.1.8/_internal/daypicker.py` exists,
+`dist/_internal_builder/_internal/daypicker.py` does not.
+Two things fix it and both are needed: `daypicker` in `build_config.json` →
+`hidden_imports` (compiled into the exe, where nothing can replace it), and
+`_import_daypicker` searching the exe's own modules, `__file__`'s folder,
+`sys._MEIPASS` and the folder beside `sys.executable` (the deploy does copy the
+loose `.py` there) before it gives up — and naming every path it tried when it
+does. Same loader, same reason, in `Image Tools/is_t.py`, `Image Tools/if_t.py`
+and `SPFE Values/spfe_t.py`.
 
 ---
 

@@ -53,7 +53,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import shared_pvs
 
@@ -65,6 +65,10 @@ MENU_PAGE_DEFAULT = ("https://elieric.okbase.cz/okbase/web-client/web/"
                      "objednavky-jidel")
 CACHE_FILENAME = "menu_cache.json"
 TIMEOUT_DEFAULT = 20.0
+# The cheapest question that has a different answer signed in and signed out —
+# 401 while signed out. Named because edge_cdp asks it too, from inside the
+# browser window, to tell a live sign-in from a cookie left over from yesterday.
+ALIVE_PATH = "/rest/app-info/serverovy-cas"
 
 # Sent as x-okbase-* headers on every call, exactly as the portal's own front
 # end does. One OKbase server can host several organisations and data sources,
@@ -147,15 +151,32 @@ class Meal:
     name: str
     price: str = ""          # already formatted for display ("95 Kč")
     kind: str = ""           # soup / main course / … as the portal labels it
+    # The two fields ordering needs. `item_id` is `listky[day].polozky[].id` —
+    # the number the portal wants back when this meal is ordered — and `code` is
+    # the raw course code (`POLEVKA`, `HLAVNI_JIDLO`) it is filed under in the
+    # order, which is NOT the same string as the human `kind` above. Kept in the
+    # cache so a `/food order 2` acts on the meal the reply actually printed,
+    # even if the menu were re-published in between; a cache written before this
+    # existed simply has no ids, and ordering then re-reads the day live.
+    item_id: Optional[int] = None
+    code: str = ""
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "price": self.price, "kind": self.kind}
+        out = {"name": self.name, "price": self.price, "kind": self.kind}
+        if self.item_id is not None:
+            out["item_id"] = self.item_id
+        if self.code:
+            out["code"] = self.code
+        return out
 
     @staticmethod
     def from_dict(d: dict) -> "Meal":
+        raw_id = d.get("item_id")
         return Meal(name=str(d.get("name") or ""),
                     price=str(d.get("price") or ""),
-                    kind=str(d.get("kind") or ""))
+                    kind=str(d.get("kind") or ""),
+                    item_id=int(raw_id) if str(raw_id or "").isdigit() else None,
+                    code=str(d.get("code") or ""))
 
     def names(self) -> tuple[str, str]:
         return split_languages(self.name)
@@ -318,10 +339,10 @@ def parse_menu(payload: Any) -> dict[str, list[Meal]]:
     days: dict[str, list[Meal]] = {}
     seen: set[tuple[str, str]] = set()
 
-    def walk(node: Any, day: str) -> None:
+    def walk(node: Any, day: str, item_id: Optional[int]) -> None:
         if isinstance(node, list):
             for item in node:
-                walk(item, day)
+                walk(item, day, item_id)
             return
         if not isinstance(node, dict):
             return
@@ -329,6 +350,15 @@ def parse_menu(payload: Any) -> dict[str, list[Meal]]:
         found = _as_iso_date(_pick(node, _DATE_KEYS))
         if found:
             day = found
+
+        # The id ordering needs sits one level ABOVE the name: a menu row is
+        # ``{id, poradi, jidlo: {nazev, typ, …}}``, so the number belongs to the
+        # row and the name to its `jidlo`. Carry it down into the child rather
+        # than looking for it beside the name, where it is not.
+        if isinstance(node.get("jidlo"), dict):
+            raw = node.get("id")
+            if isinstance(raw, int):
+                item_id = raw
 
         name = _as_text(_pick(node, _NAME_KEYS))
         if name and day:
@@ -339,16 +369,107 @@ def parse_menu(payload: Any) -> dict[str, list[Meal]]:
                     name=name,
                     price=_as_price(_pick(node, _PRICE_KEYS)),
                     kind=_pretty_kind(_pick(node, _KIND_KEYS)),
+                    item_id=item_id,
+                    code=_course_code(node),
                 ))
 
         for key, val in node.items():
             if _norm(key) in _NO_RECURSE:
                 continue
             if isinstance(val, (list, dict)):
-                walk(val, day)
+                walk(val, day, item_id)
 
-    walk(payload, "")
+    walk(payload, "", None)
     return days
+
+
+# The course codes the order request files a meal under. Confirmed live: the
+# order's `polozkyIdMap` is keyed by exactly these, one meal per course.
+COURSE_CODES = ("POLEVKA", "HLAVNI_JIDLO")
+
+
+def _course_code(node: dict) -> str:
+    """The raw course code (`POLEVKA`, `HLAVNI_JIDLO`) of a menu row.
+
+    Deliberately NOT `_pretty_kind`'s output: that is wording for a person, and
+    the order request is matched by the portal on the code. Anything unexpected
+    is kept verbatim rather than dropped, so a course OKbase adds later still
+    orders instead of silently vanishing.
+    """
+    raw = _pick(node, ("typ", "jidlotyp", "typjidla"))
+    if isinstance(raw, dict):
+        raw = _pick(raw, ("kod", "code", "nazev", "name"))
+    text = str(raw or "").strip()
+    return text.upper().replace(" ", "_").replace("-", "_") if text else ""
+
+
+# What `listky[day].stav` means. Only these two have ever been seen, and the
+# distinction is the whole cutoff story: `ZVEREJNENY` is a day still taking
+# orders, `UZAVRENY` one that has closed. The closing time is NOT fixed — it is
+# nominally 10:00 but in practice comes earlier some days — so this state, read
+# at the moment of ordering, is the only thing allowed to decide. Never a clock.
+DAY_OPEN, DAY_CLOSED = "open", "closed"
+_DAY_STATES = {"ZVEREJNENY": DAY_OPEN, "UZAVRENY": DAY_CLOSED}
+
+
+def parse_day_states(payload: Any) -> dict[str, str]:
+    """``{'2026-09-11': 'open'}`` — which days still take orders."""
+    out: dict[str, str] = {}
+    tickets = (payload or {}).get("listky") if isinstance(payload, dict) else None
+    if not isinstance(tickets, dict):
+        return out
+    for day, node in tickets.items():
+        iso = _as_iso_date(day) or _as_iso_date((node or {}).get("datumVydeje"))
+        if not iso or not isinstance(node, dict):
+            continue
+        raw = str(node.get("stav") or "").strip().upper()
+        out[iso] = _DAY_STATES.get(raw, raw.lower() or DAY_CLOSED)
+    return out
+
+
+@dataclass
+class Order:
+    """One day of this person's own order, as the portal reports it."""
+    day: str
+    order_id: Optional[int] = None
+    state: str = ""              # OBJEDNANO / ODEBRANO / NEODEBRANO
+    item_ids: tuple[int, ...] = ()
+    none_ordered: bool = True    # the portal's `zadna`
+
+    @property
+    def ordered(self) -> bool:
+        return bool(self.item_ids) and not self.none_ordered
+
+
+def parse_orders(payload: Any) -> dict[str, Order]:
+    """``{'2026-09-11': Order}`` out of the `objednavky` half of `nacti-vse`.
+
+    The same answer that carries the menu carries the person's own orders, so
+    this costs no extra request. Every `nazev` in this half is null — the items
+    are ids only — which is why the menu half has to supply the names.
+    """
+    out: dict[str, Order] = {}
+    rows = (payload or {}).get("objednavky") if isinstance(payload, dict) else None
+    if not isinstance(rows, dict):
+        return out
+    for day, entries in rows.items():
+        iso = _as_iso_date(day)
+        if not iso:
+            continue
+        if not isinstance(entries, list) or not entries:
+            out[iso] = Order(day=iso)
+            continue
+        node = entries[0] if isinstance(entries[0], dict) else {}
+        ids = tuple(int(p["id"]) for p in (node.get("polozky") or [])
+                    if isinstance(p, dict) and isinstance(p.get("id"), int))
+        out[iso] = Order(
+            day=iso,
+            order_id=(node.get("id") if isinstance(node.get("id"), int) else None),
+            state=str(node.get("stav") or ""),
+            item_ids=ids,
+            none_ordered=bool(node.get("zadna")) or not ids,
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +494,276 @@ OKBASE_KEYS = (
     "okbase_session_cookie", "okbase_canteen_id", "okbase_user_id",
     "okbase_filter", "okbase_timeout_s", "okbase_refresh_hour",
     "okbase_keepalive_min", "okbase_account",
+    # Who is allowed to order lunch through the bot. It belongs with the
+    # sign-in and nowhere else: the sign-in is ONE person's, so an order placed
+    # with it spends that person's money, and a Webex room is a shared place —
+    # everyone in it can type. Empty means nobody, which is the right default
+    # for a build handed to somebody else.
+    "okbase_order_emails",
+    # The unused single-use ordering codes, as one-way hashes (see
+    # new_order_codes). Empty means no order is accepted at all.
+    "okbase_order_codes",
 )
+
+
+# ---------------------------------------------------------------------------
+# The single-use codes an order has to carry
+# ---------------------------------------------------------------------------
+#
+# The problem this solves: a chat message is permanent. A fixed password typed
+# into a room stays readable to everyone who can see that room, for ever, so
+# after its first use it protects nothing. A one-time code does not have that
+# problem — what stays visible has already been spent.
+#
+# Why a hundred made-up words rather than a password or an authenticator app:
+#
+#   * the operator has no way to add entries to the company authenticator, so a
+#     rotating-code app is not available here;
+#   * a real dictionary word would be far too easy to guess. There are only a
+#     few thousand common words, a hundred of them are live at any time, so one
+#     in a few dozen guesses would land. These are built from syllables instead
+#     — roughly a million possibilities — while still reading and typing like a
+#     word, which a string of digits does not;
+#   * they are stored as one-way hashes and NOT as DPAPI blobs. Every other
+#     secret here is DPAPI-encrypted because the program must hand the real
+#     value to somebody else: the portal wants the actual cookie. A code is
+#     different — nothing ever needs it back, only a yes/no on one just typed.
+#     So it is hashed, and the stored file cannot be turned back into the codes
+#     by anything, this program included.
+#
+# A spent code is DELETED from the file rather than marked, so there is nothing
+# to un-mark and no flag to get wrong.
+
+ORDER_CODE_COUNT = 100
+ORDER_CODE_SYLLABLES = 3
+# From here on, every successful order says how many codes are left. Said only
+# when it starts to matter: a count under every reply would be noise, and
+# finding out the list is empty at the moment you want lunch would not.
+CODES_LOW_AT = 10
+# Plain ASCII on purpose: these get typed on a phone keyboard, and a diacritic
+# is both awkward there and one more thing that can arrive differently encoded.
+_CODE_CONSONANTS = "bcdfghjklmnprstvz"
+_CODE_VOWELS = "aeiouy"
+
+_CODE_ROUNDS = 200_000
+_PBKDF2_ROUNDS = 240_000
+
+
+def hash_password(plain: str, rounds: int = _PBKDF2_ROUNDS) -> str:
+    """`pbkdf2$<rounds>$<salt>$<hash>`, or "" for an empty input."""
+    import base64
+    import hashlib
+    import secrets as _secrets
+    plain = plain or ""
+    if not plain:
+        return ""
+    salt = _secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, rounds)
+    return "pbkdf2${}${}${}".format(
+        rounds,
+        base64.b64encode(salt).decode("ascii"),
+        base64.b64encode(digest).decode("ascii"))
+
+
+def normalise_code(text: str) -> str:
+    """A typed code reduced to what is compared: letters only, lower case.
+
+    So that a code read off a phone still works when it arrives with a stray
+    dash, a capital first letter or a trailing full stop.
+    """
+    return "".join(ch for ch in (text or "").lower() if ch.isalpha())
+
+
+def new_order_code() -> str:
+    """One pronounceable made-up word, e.g. "bakoli"."""
+    import secrets as _secrets
+    return "".join(_secrets.choice(_CODE_CONSONANTS) + _secrets.choice(_CODE_VOWELS)
+                   for _ in range(ORDER_CODE_SYLLABLES))
+
+
+# The list is stored as ONE salt plus a fingerprint per code:
+#
+#     {"salt": "<base64>", "rounds": 200000, "hashes": ["<base64>", …]}
+#
+# One salt for the whole list rather than one each, because checking a typed
+# code then costs a single derivation and a set lookup instead of up to a
+# hundred of them — which is the difference between telling somebody their code
+# is wrong at once and going to the portal first to find out. The salt being
+# shared does not weaken this: what it protects against is somebody reading the
+# file, and anyone who can read that file can already decrypt the sign-in
+# sitting next to it and order lunch with no code at all.
+
+
+def _code_digest(code: str, salt: bytes, rounds: int) -> str:
+    import base64
+    import hashlib
+    return base64.b64encode(hashlib.pbkdf2_hmac(
+        "sha256", code.encode("utf-8"), salt, rounds)).decode("ascii")
+
+
+def new_order_codes(count: int = ORDER_CODE_COUNT) -> tuple[list[str], dict]:
+    """(the codes to give the person, the blob to store).
+
+    The plain codes exist only in the caller's hands: they are shown once and
+    never written anywhere by this module.
+    """
+    import base64
+    import secrets as _secrets
+    words: list[str] = []
+    seen: set[str] = set()
+    while len(words) < max(1, count):
+        word = new_order_code()
+        if word not in seen:           # two identical codes would spend as one
+            seen.add(word)
+            words.append(word)
+    salt = _secrets.token_bytes(16)
+    return words, {
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "rounds": _CODE_ROUNDS,
+        "hashes": [_code_digest(w, salt, _CODE_ROUNDS) for w in words],
+    }
+
+
+def _code_blob(settings: dict) -> dict:
+    raw = (settings or {}).get("okbase_order_codes")
+    if not isinstance(raw, dict):
+        return {}
+    hashes = raw.get("hashes")
+    if not isinstance(hashes, list) or not raw.get("salt"):
+        return {}
+    return raw
+
+
+def codes_left(settings: dict) -> int:
+    return len(_code_blob(settings).get("hashes") or [])
+
+
+def _find_code(blob: dict, code: str) -> int:
+    """Where `code` sits in the blob, or -1. One derivation, then a lookup."""
+    import base64
+    typed = normalise_code(code)
+    if not typed or not blob:
+        return -1
+    try:
+        digest = _code_digest(typed, base64.b64decode(blob["salt"]),
+                              int(blob.get("rounds") or _CODE_ROUNDS))
+    except Exception:  # noqa: BLE001 - a damaged blob means "no", not a crash
+        return -1
+    hashes = blob.get("hashes") or []
+    try:
+        return hashes.index(digest)
+    except ValueError:
+        return -1
+
+
+def code_on_list(settings: dict, code: str) -> bool:
+    """Is this code usable? Spends nothing.
+
+    Kept separate from spending so a wrong code can be turned away before the
+    portal is troubled, while a right one is not struck off until the change is
+    actually about to be saved.
+    """
+    blob = _code_blob(settings) or _code_blob(load_user_settings())
+    return _find_code(blob, code) >= 0
+
+
+def spend_order_code(settings: dict, code: str) -> tuple[bool, str]:
+    """Use up one code. Returns (ok, reason). Never raises.
+
+    The list is re-read from disk first and written straight back, so it stays
+    right even when the caller is holding a copy made minutes ago — which the
+    app's worker thread always is. `settings` is updated in place as well, so a
+    caller that goes on using its own dict sees the code gone.
+    """
+    if not normalise_code(code):
+        return False, "no ordering code was given"
+    blob = _code_blob(load_user_settings()) or _code_blob(settings)
+    if not blob:
+        return False, ("there are no ordering codes left — make a new list in "
+                       "Settings → Canteen menu → \"Ordering codes\"")
+    index = _find_code(blob, code)
+    if index < 0:
+        return False, ("that ordering code is not on the list, or has been "
+                       "used already")
+    hashes = list(blob.get("hashes") or [])
+    rest = dict(blob)
+    rest["hashes"] = hashes[:index] + hashes[index + 1:]
+    problem = save_user_settings({"okbase_order_codes": rest})
+    if problem:
+        # Refuse rather than proceed: a code that could not be struck off is a
+        # code that would work a second time.
+        return False, f"the code could not be used up ({problem})"
+    settings["okbase_order_codes"] = rest
+    return True, ""
+
+
+def verify_password(stored: str, plain: str) -> bool:
+    """Does `plain` match the stored hash? Never raises, never logs either side."""
+    import base64
+    import hashlib
+    import hmac
+    stored = str(stored or "")
+    if not stored or not plain:
+        return False
+    try:
+        kind, rounds, salt_b64, want_b64 = stored.split("$", 3)
+        if kind != "pbkdf2":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"),
+                                     base64.b64decode(salt_b64), int(rounds))
+        # Constant-time: a length or byte difference must not be measurable.
+        return hmac.compare_digest(digest, base64.b64decode(want_b64))
+    except Exception:  # noqa: BLE001 - a damaged hash means "no", not a crash
+        return False
+
+
+def may_order(settings: dict, email: str, code: str = "") -> tuple[bool, str]:
+    """May this request place orders? (allowed, reason). Spends nothing.
+
+    **The one-time code is the protection here**, and by default the only one.
+    That is a deliberate choice (the operator's, 2026-09-10): lunch gets
+    ordered from more than one account — a shared `l3hapls_…` mailbox as well
+    as a personal address — and a list of addresses to keep in step with that
+    is a lock that mostly locks its owner out. It costs little: a code is good
+    once, and it only ever appears in the chat inside the very message that
+    spends it, so there is no window in which somebody could read one and use
+    it.
+
+    `okbase_order_emails` is therefore **optional** — a list, if somebody wants
+    ordering pinned to particular senders, and empty (the default) meaning any
+    sender who has a valid code.
+
+    The code is checked here but **not** struck off: that happens at the last
+    moment before the save (`spend_order_code`, through `change_order`'s
+    `authorise` hook), so a day the portal turns out to have closed costs the
+    person nothing.
+
+    Nothing typed is ever repeated in the reason: this string goes to the chat.
+    """
+    allowed = settings.get("okbase_order_emails") or []
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    allowed = [str(a).strip().lower() for a in allowed if str(a).strip()]
+    seen = (email or "").strip().lower()
+    if allowed and seen not in allowed:
+        # Only when a list was actually asked for. The address that arrived is
+        # named, because "you are not allowed" is unhelpable when the truth is
+        # "that is your other address" — and nothing is given away: the
+        # sender's own address is on the message they just posted.
+        return False, (f"ordering is limited to certain senders and "
+                       f"`{seen or 'no address at all'}` is not one of them — "
+                       "Settings → Canteen menu → \"Restrict ordering to\"")
+
+    if not codes_left(settings) and not codes_left(load_user_settings()):
+        return False, ("there are no ordering codes — make a list in Settings "
+                       "→ Canteen menu → \"Ordering codes\" first")
+    if not normalise_code(code):
+        return False, ("that needs a one-time ordering code: add "
+                       "`pin:yourcode` to the command")
+    if not code_on_list(settings, code):
+        return False, ("that ordering code is not on the list, or has been "
+                       "used already")
+    return True, ""
 
 
 def user_settings_path() -> Path:
@@ -478,9 +868,11 @@ def write_cache(cache: dict, paths: list[Path]) -> str:
 
 
 def build_cache(days: dict[str, list[Meal]], now: Optional[datetime] = None,
-                filter_used: Any = None) -> dict:
+                filter_used: Any = None,
+                states: Optional[dict[str, str]] = None,
+                orders: Optional[dict[str, "Order"]] = None) -> dict:
     now = now or datetime.now()
-    return {
+    cache = {
         "version": 1,
         "source": "okbase",
         "fetched": now.isoformat(timespec="seconds"),
@@ -488,6 +880,28 @@ def build_cache(days: dict[str, list[Meal]], now: Optional[datetime] = None,
         "days": {day: [m.as_dict() for m in meals]
                  for day, meals in sorted(days.items())},
     }
+    if states:
+        cache["states"] = {day: states[day] for day in sorted(states)}
+    if orders:
+        # Only the days that actually hold an order, and only the fields the
+        # reply needs. The state word is kept because "ordered" and "already
+        # collected" are different answers to "what do I have on Thursday".
+        cache["orders"] = {
+            day: {"items": list(o.item_ids), "state": o.state}
+            for day, o in sorted(orders.items()) if o.ordered}
+    return cache
+
+
+def cache_states(cache: dict) -> dict[str, str]:
+    raw = (cache or {}).get("states") or {}
+    return {str(k): str(v) for k, v in raw.items()} \
+        if isinstance(raw, dict) else {}
+
+
+def cache_orders(cache: dict) -> dict[str, dict]:
+    raw = (cache or {}).get("orders") or {}
+    return {str(k): v for k, v in raw.items()
+            if isinstance(v, dict)} if isinstance(raw, dict) else {}
 
 
 def cache_days(cache: dict) -> dict[str, list[Meal]]:
@@ -604,7 +1018,7 @@ def session_state(session, base: str = BASE_DEFAULT,
     by the app while this same cookie read the menu without complaint.
     """
     try:
-        r = session.get(f"{base}/rest/app-info/serverovy-cas", timeout=timeout)
+        r = session.get(f"{base}{ALIVE_PATH}", timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         return UNREACHABLE, _short_reason(exc)
     if 200 <= r.status_code < 300:
@@ -1026,13 +1440,16 @@ def filter_candidates(day_from: date, day_to: date, canteen_id: Any = None,
     return bodies
 
 
-def fetch_menu(session, day_from: date, day_to: date, base: str = BASE_DEFAULT,
-               timeout: float = TIMEOUT_DEFAULT, canteen_id: Any = None,
-               known_filter: Any = None, user_id: Any = None,
-               week_of: Optional[date] = None):
-    """Fetch the meal list for a date range.
+def fetch_raw(session, day_from: date, day_to: date, base: str = BASE_DEFAULT,
+              timeout: float = TIMEOUT_DEFAULT, canteen_id: Any = None,
+              known_filter: Any = None, user_id: Any = None,
+              week_of: Optional[date] = None):
+    """The whole `nacti-vse` answer, plus the body that got it.
 
-    Returns (days, filter_used, "") on success, or ({}, None, reason).
+    Returns (payload, body_used, "") or (None, None, reason). Split out of
+    `fetch_menu` because ordering needs three things from the SAME answer — the
+    menu, each day's open/closed state and the person's own orders — and asking
+    three times would be three chances to read a different week.
     """
     url = f"{base}/rest/stravovani/objednavky/nacti-vse"
     bodies = filter_candidates(day_from, day_to, canteen_id, user_id, week_of)
@@ -1047,25 +1464,39 @@ def fetch_menu(session, day_from: date, day_to: date, base: str = BASE_DEFAULT,
         try:
             r = session.post(url, json=body, timeout=timeout)
         except Exception as exc:  # noqa: BLE001
-            return {}, None, str(exc)
+            return None, None, str(exc)
         if not (200 <= r.status_code < 300):
             last = f"HTTP {r.status_code} {(r.text or '')[:120]}".strip()
             if r.status_code in (401, 403):
                 # Not a wrong body — a signed-out session, which refuses all five
                 # of them identically. Trying the rest turns one failure into five
                 # and one wait into five.
-                return {}, None, last
+                return None, None, last
             continue
         try:
             payload = r.json()
         except ValueError:
             last = "the portal did not answer with JSON"
             continue
-        days = parse_menu(payload)
-        if days:
-            return days, body, ""
+        if parse_menu(payload):
+            return payload, body, ""
         last = "the portal answered, but no meals were found in the answer"
-    return {}, None, last
+    return None, None, last
+
+
+def fetch_menu(session, day_from: date, day_to: date, base: str = BASE_DEFAULT,
+               timeout: float = TIMEOUT_DEFAULT, canteen_id: Any = None,
+               known_filter: Any = None, user_id: Any = None,
+               week_of: Optional[date] = None):
+    """Fetch the meal list for a date range.
+
+    Returns (days, filter_used, "") on success, or ({}, None, reason).
+    """
+    payload, body, err = fetch_raw(session, day_from, day_to, base, timeout,
+                                   canteen_id, known_filter, user_id, week_of)
+    if payload is None:
+        return {}, None, err
+    return parse_menu(payload), body, ""
 
 
 def fetch_weeks(session, first_monday: date, weeks: int = FETCH_WEEKS,
@@ -1080,24 +1511,49 @@ def fetch_weeks(session, first_monday: date, weeks: int = FETCH_WEEKS,
     quietly returns the wrong week, which is exactly what happened the first
     time. So each week is asked for on its own.
     """
+    days, _states, _orders, used, err = fetch_weeks_full(
+        session, first_monday, weeks, base, timeout, canteen_id,
+        known_filter, user_id)
+    return days, used, err
+
+
+def fetch_weeks_full(session, first_monday: date, weeks: int = FETCH_WEEKS,
+                     base: str = BASE_DEFAULT, timeout: float = TIMEOUT_DEFAULT,
+                     canteen_id: Any = None, known_filter: Any = None,
+                     user_id: Any = None):
+    """`fetch_weeks`, but also each day's state and this person's own orders.
+
+    Returns (days, states, orders, filter_used, error). All three come out of
+    the same answers, so this costs exactly what fetching the menu alone cost.
+    """
     merged: dict[str, list[Meal]] = {}
+    states: dict[str, str] = {}
+    orders: dict[str, Order] = {}
     used: Any = None
     problems: list[str] = []
     for index in range(max(1, weeks)):
         monday = first_monday + timedelta(weeks=index)
-        days, body, err = fetch_menu(
+        payload, body, err = fetch_raw(
             session, monday - timedelta(days=FETCH_DAYS_BACK),
             monday + timedelta(days=FETCH_DAYS_AHEAD), base, timeout,
             canteen_id, known_filter, user_id, week_of=monday)
-        if days:
-            merged.update(days)
+        if payload is not None:
+            merged.update(parse_menu(payload))
+            states.update(parse_day_states(payload))
+            # The orders half spans the whole wide range, not just the displayed
+            # week, so a later week's answer repeats earlier days. Newer wins:
+            # the requests go oldest first, so a plain update is the right way
+            # round — but never let an empty repeat erase a known order.
+            for day, order in parse_orders(payload).items():
+                if order.ordered or day not in orders:
+                    orders[day] = order
             used = used or body
         elif err:
             problems.append(f"week of {monday.isoformat()}: {err}")
     if not merged:
-        return {}, None, ("; ".join(problems)
-                          or "the portal returned no meals for any week")
-    return merged, used, ""
+        return {}, {}, {}, None, ("; ".join(problems)
+                                  or "the portal returned no meals for any week")
+    return merged, states, orders, used, ""
 
 
 # ---------------------------------------------------------------------------
@@ -1222,7 +1678,7 @@ def refresh(settings: dict, now: Optional[datetime] = None,
         session_out["cookies"] = merged_cookie_header(
             session, secrets_resolved_cookie(settings))
 
-    days, used, err = fetch_weeks(
+    days, states, orders, used, err = fetch_weeks_full(
         session, week_monday(now.date()), FETCH_WEEKS, base, timeout,
         settings.get("okbase_canteen_id") or None,
         settings.get("okbase_filter") or None,
@@ -1230,7 +1686,7 @@ def refresh(settings: dict, now: Optional[datetime] = None,
     if not days:
         return {}, err
 
-    cache = build_cache(days, now, used)
+    cache = build_cache(days, now, used, states, orders)
     if write:
         paths = [local_cache_path()]
         shared = shared_cache_path(
@@ -1243,6 +1699,283 @@ def refresh(settings: dict, now: Optional[datetime] = None,
         if problem:
             return cache, f"menu fetched, but saving it failed: {problem}"
     return cache, ""
+
+
+# ---------------------------------------------------------------------------
+# Ordering — the only part of this module that WRITES to the portal
+# ---------------------------------------------------------------------------
+#
+# The portal has one save endpoint, `objednavky/uloz`, and it does not take "add
+# this meal". It takes the desired state of the WHOLE displayed week, keyed by
+# date, exactly as the page's own checkboxes would leave it (captured live
+# 2026-09-09). Two consequences, both load-bearing:
+#
+#   * the current state has to be read first and sent back with the one change
+#     applied — building a body from the single changed day would cancel every
+#     other day of that week;
+#   * a day is either ``[{"zadna": true}]`` (nothing ordered) or
+#     ``[{"polozkyIdMap": {"POLEVKA": id, "HLAVNI_JIDLO": id}, …}]`` — one meal
+#     per course, addressed by the menu item's id.
+#
+# A day that had no order before also carries ``objednavkaId: 0``; a day that
+# had one carries ``zadna: false`` instead. That is what the page sends, and
+# guessing differently is not worth the risk on a request that rewrites a week.
+
+SAVE_PATH = "/rest/stravovani/objednavky/uloz"
+
+
+def _order_entry(item_ids: tuple[int, ...], codes: dict[int, str],
+                 existed: bool) -> tuple[dict, str]:
+    """One day's entry for the save body. Returns (entry, error)."""
+    if not item_ids:
+        return {"zadna": True}, ""
+    picked: dict[str, int] = {}
+    for item in item_ids:
+        code = codes.get(item, "")
+        if not code:
+            # Never send a body that would silently drop a meal: without its
+            # course code there is no key to file it under, and the portal would
+            # read the day as "that meal is gone".
+            return {}, (f"the portal did not say which course meal {item} "
+                        f"belongs to, so the order was not touched")
+        picked[code] = item
+    # Exactly the two shapes the page sends: an existing order carries
+    # `zadna: false`, a brand-new one `objednavkaId: 0` and no `zadna` at all.
+    entry: dict = {"polozkyIdMap": picked}
+    if existed:
+        entry["zadna"] = False
+    else:
+        entry["objednavkaId"] = 0
+    return entry, ""
+
+
+def desired_week(menu: dict[str, list[Meal]], orders: dict[str, Order],
+                 monday: date) -> tuple[dict[str, list[dict]], str]:
+    """The save body's `objednavky`: this week exactly as it stands now.
+
+    Built from what the portal just said, so sending it back unchanged is a
+    no-op. The caller then overwrites the one day it wants to change.
+    """
+    codes: dict[int, str] = {}
+    for meals in menu.values():
+        for meal in meals:
+            if meal.item_id is not None and meal.code:
+                codes[meal.item_id] = meal.code
+
+    out: dict[str, list[dict]] = {}
+    for index in range(7):
+        day = (monday + timedelta(days=index)).isoformat()
+        if day not in menu:
+            continue            # no menu that day — the page does not send it
+        order = orders.get(day)
+        ids = order.item_ids if (order and order.ordered) else ()
+        entry, err = _order_entry(ids, codes, existed=bool(ids))
+        if err:
+            return {}, err
+        out[day] = [entry]
+    return out, ""
+
+
+def save_orders(session, monday: date, template: Any, desired: dict,
+                base: str = BASE_DEFAULT, timeout: float = TIMEOUT_DEFAULT,
+                canteen_id: Any = None, user_id: Any = None) -> str:
+    """POST the week's desired state. Returns "" or a reason.
+
+    The body is the same one `nacti-vse` accepts, with `objednavky` filled in —
+    that is what the page sends, right down to the wide `datumOd`/`datumDo`.
+    """
+    day_from = monday - timedelta(days=FETCH_DAYS_BACK)
+    day_to = monday + timedelta(days=FETCH_DAYS_AHEAD)
+    if isinstance(template, dict) and template:
+        body = retarget_filter(template, day_from, day_to, monday)
+    else:
+        body = filter_candidates(day_from, day_to, canteen_id, user_id, monday)[0]
+    body = dict(body)
+    body["objednavky"] = desired
+    try:
+        r = session.post(f"{base}{SAVE_PATH}", json=body, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return str(exc)
+    if 200 <= r.status_code < 300:
+        return ""
+    # Quote the portal rather than interpret it: the closing time is not fixed,
+    # so a refusal here is news even when the day looked open a second ago.
+    return f"the portal refused it: HTTP {r.status_code} {(r.text or '')[:200]}".strip()
+
+
+@dataclass
+class OrderOutcome:
+    """What a `/food order` or `/food cancel` actually did."""
+    day: str = ""
+    ordered: tuple[Meal, ...] = ()
+    was: tuple[Meal, ...] = ()
+    error: str = ""
+    # Set when the command asked for exactly what the day already holds.
+    # Nothing was sent and no code was spent; `was` holds what is there. Its
+    # own field rather than an `error`, because nothing went wrong — the caller
+    # answers it with the menu, which is what a person wants next.
+    already: bool = False
+
+
+def _meals_by_id(menu_day: list[Meal]) -> dict[int, Meal]:
+    return {m.item_id: m for m in menu_day if m.item_id is not None}
+
+
+def change_order(settings: dict, day: date,
+                 picks: tuple[tuple[str, int], ...] = (),
+                 clear: bool = False,
+                 session_out: Optional[dict] = None,
+                 authorise=None) -> OrderOutcome:
+    """Order the given meals for `day`, or cancel that day. Never raises.
+
+    Reads the week, applies the one change, saves, then reads it back and
+    reports what the portal ended up holding — because a save that is accepted
+    and a save that took effect are not the same thing on this portal.
+
+    `picks` are (course, number) as the person typed them, and they are resolved
+    against the menu READ HERE, not against the saved copy. The saved copy may
+    be hours old, and the one thing worse than "the menu has changed" is
+    ordering meal 2 of a list nobody is looking at any more.
+
+    A day that is already booked is re-ordered, course by course: the picks are
+    merged onto what is there, so `soup 2` on a day holding soup 1 and main 2
+    leaves the main alone, and `main 0` takes the main off. Asking for exactly
+    what is already booked changes nothing and costs no code.
+
+    `authorise` is called once, with no arguments, at the last possible moment
+    — the day has been read and found open, the body is built, and the save is
+    the next thing to happen — and must return (ok, reason). That is where the
+    one-time code is struck off, and the position is the point: a code must not
+    be spent on a day the portal was never even asked to change.
+    """
+    out = OrderOutcome(day=day.isoformat())
+    session, base, timeout, err = open_session(settings)
+    if session is None:
+        out.error = err
+        return out
+    if session_out is not None:
+        session_out["cookies"] = merged_cookie_header(
+            session, secrets_resolved_cookie(settings))
+
+    monday = week_monday(day)
+    canteen = settings.get("okbase_canteen_id") or None
+    user = settings.get("okbase_user_id") or None
+    template = settings.get("okbase_filter") or None
+
+    payload, body, err = fetch_raw(
+        session, monday - timedelta(days=FETCH_DAYS_BACK),
+        monday + timedelta(days=FETCH_DAYS_AHEAD), base, timeout,
+        canteen, template, user, week_of=monday)
+    if payload is None:
+        out.error = err
+        return out
+
+    menu = parse_menu(payload)
+    states = parse_day_states(payload)
+    orders = parse_orders(payload)
+    iso = day.isoformat()
+
+    if iso not in menu:
+        out.error = f"there is no menu for {iso}"
+        return out
+    state = states.get(iso, "")
+    if state != DAY_OPEN:
+        # The cutoff is nominally 10:00 but comes earlier some days, so this
+        # state — read a moment ago — is the only thing that may decide.
+        out.error = (f"{iso} is already closed for orders"
+                     if state == DAY_CLOSED else
+                     f"{iso} is not open for orders (the portal says '{state}')")
+        return out
+
+    by_id = _meals_by_id(menu[iso])
+    before = orders.get(iso)
+    out.was = tuple(by_id[i] for i in (before.item_ids if before and
+                                       before.ordered else ()) if i in by_id)
+
+    was_ids = tuple(before.item_ids) if before and before.ordered else ()
+
+    item_ids: tuple[int, ...] = ()
+    if not clear:
+        picked, err = resolve_picks(menu[iso], picks)
+        if err:
+            out.error = err
+            return out
+        if not picked:
+            out.error = "no meal was named"
+            return out
+        # Merge onto what is already booked, course by course. A command names
+        # the courses it means and says nothing about the others, so a soup
+        # nobody mentioned stays; `0` is how a course is taken off. Replacing
+        # the whole day instead would drop a meal the person never mentioned.
+        final: dict[str, int] = {}
+        for item in was_ids:
+            meal = by_id.get(item)
+            if meal is None or not meal.code:
+                out.error = ("the portal did not say which course the meal "
+                             f"already booked on {iso} belongs to, so the "
+                             "order was not touched")
+                return out
+            final[meal.code] = item
+        for code, item in picked.items():
+            if item is None:
+                final.pop(code, None)
+            else:
+                final[code] = item
+        item_ids = tuple(final.values())
+        if set(item_ids) == set(was_ids):
+            # Exactly what is already there. Stop before the code is spent and
+            # before anything is sent: the save would be a no-op, and the
+            # person is owed the plain answer rather than a spent code. The
+            # caller answers with the menu.
+            out.already = True
+            out.ordered = out.was
+            return out
+
+    desired, err = desired_week(menu, orders, monday)
+    if err:
+        out.error = err
+        return out
+
+    codes = {m.item_id: m.code for m in menu[iso] if m.item_id is not None}
+    entry, err = _order_entry((), codes, existed=False) if clear else \
+        _order_entry(tuple(item_ids), codes,
+                     existed=bool(before and before.ordered))
+    if err:
+        out.error = err
+        return out
+    desired[iso] = [entry]
+
+    if authorise is not None:
+        ok, why = authorise()
+        if not ok:
+            out.error = why
+            return out
+
+    err = save_orders(session, monday, body, desired, base, timeout,
+                      canteen, user)
+    if err:
+        out.error = err
+        return out
+
+    # Read it back. `uloz` answering 200 is not proof: the portal validates the
+    # whole week, and a day it quietly declines comes back unchanged.
+    payload, _body, err = fetch_raw(
+        session, monday - timedelta(days=FETCH_DAYS_BACK),
+        monday + timedelta(days=FETCH_DAYS_AHEAD), base, timeout,
+        canteen, template, user, week_of=monday)
+    if payload is None:
+        out.error = f"it was saved, but reading it back failed: {err}"
+        return out
+    after = parse_orders(payload).get(iso)
+    now_ids = tuple(after.item_ids) if after and after.ordered else ()
+    by_id = _meals_by_id(parse_menu(payload).get(iso) or [])
+    out.ordered = tuple(by_id[i] for i in now_ids if i in by_id)
+
+    wanted = () if clear else tuple(item_ids)
+    if set(now_ids) != set(wanted):
+        out.error = ("the portal accepted the change but did not keep it — "
+                     f"{iso} now holds {len(now_ids)} meal(s)")
+    return out
 
 
 def load_cache(settings: Optional[dict] = None, use_share: bool = True) -> dict:
@@ -1301,14 +2034,27 @@ def _heading(kind: str) -> str:
                                          else "🍴 Other")
 
 
-def render_meals(meals: list[Meal], lang: str = "both") -> list[str]:
+# What marks a meal this person has ordered, in the menu itself. In front of
+# the name rather than after the price: the number and the mark then sit
+# together at the start of the line, where the eye already is, and a mark at
+# the end of a line that wraps on a phone ends up somewhere in the middle.
+ORDERED_MARK = "✅"
+
+
+def render_meals(meals: list[Meal], lang: str = "both",
+                 ordered: Iterable[int] = ()) -> list[str]:
     """The meals of one day: grouped by course, numbered inside each group.
 
     `lang` is "cs", "en" or "both". In "both" the English name goes on its own
     indented line under the Czech one — side by side they were separated only by
     a slash, which is what made the list unreadable when half the meals have one
     language and half have two.
+
+    `ordered` are the menu item ids this person has ordered that day; those
+    meals get ORDERED_MARK. Matched on the id, never on the name: two days can
+    offer the same dish, and a name is not what the portal ordered.
     """
+    want = {int(i) for i in ordered if isinstance(i, int)}
     groups: dict[str, list[Meal]] = {}
     for meal in meals:
         groups.setdefault(meal.kind, []).append(meal)
@@ -1321,10 +2067,178 @@ def render_meals(meals: list[Meal], lang: str = "both") -> list[str]:
         for number, meal in enumerate(groups[kind], start=1):
             title, second = meal.titles(lang)
             price = f" — {meal.price}" if meal.price else ""
-            lines.append(f"{number}) **{title}**{price}")
+            mark = f"{ORDERED_MARK} " if meal.item_id in want else ""
+            lines.append(f"{number}) {mark}**{title}**{price}")
             if second and second != title:
                 lines.append(f"    _{second}_")
     return lines
+
+
+def ordered_ids(cache: dict, day: date) -> list[int]:
+    """The menu item ids ordered on `day`, out of the saved copy."""
+    raw = (cache_orders(cache).get(day.isoformat()) or {}).get("items") or []
+    return [int(i) for i in raw if isinstance(i, int)]
+
+
+def _order_note(cache: dict, day: date, meals: list[Meal]) -> str:
+    """A line under the day when the marks alone cannot tell the whole story.
+
+    Two cases the marks are silent about, and both would otherwise read as
+    "nothing ordered": a saved copy made before the item ids were kept, and an
+    order for a meal that is not on the menu this copy holds.
+    """
+    want = ordered_ids(cache, day)
+    if not want:
+        return ""
+    known = {m.item_id for m in meals if m.item_id is not None}
+    if want and not known:
+        return (f"_{ORDERED_MARK} You have this day ordered, but this saved "
+                "menu is too old to say which meal — `/food refresh`._")
+    missing = [i for i in want if i not in known]
+    if missing:
+        return (f"_{ORDERED_MARK} {len(missing)} ordered item(s) are not on "
+                "this saved menu._")
+    return ""
+
+
+def _course_name(code: str) -> str:
+    return "soup" if code == "POLEVKA" else _pretty_kind(code)
+
+
+# The number that names no meal. `main 0` is how a course is taken OFF a day
+# without touching the other one, which is the counterpart of the merging in
+# change_order: a command that says nothing about the soup leaves the soup
+# alone, so there has to be a way to SAY "no soup".
+DROP_NUMBER = 0
+
+
+def resolve_picks(meals: list[Meal], picks: tuple[tuple[str, int], ...]):
+    """(course, number) → {course: menu item id or None}. Returns (map, error).
+
+    The numbers are the ones the menu reply printed, so this counts within a
+    course exactly as `render_meals` numbers within a course. `0` is the one
+    number that names nothing: it comes back as ``None``, meaning "this course
+    off".
+    """
+    picked: dict[str, Optional[int]] = {}
+    for code, number in picks:
+        if number == DROP_NUMBER:
+            picked[code] = None
+            continue
+        group = [m for m in meals if m.code == code and m.item_id is not None]
+        if not group:
+            return {}, f"there is no {_course_name(code)} on the menu that day"
+        if not 1 <= number <= len(group):
+            return {}, (f"{_course_name(code)} {number} does not exist — "
+                        f"that day has {len(group)}")
+        picked[code] = int(group[number - 1].item_id)
+    return picked, ""
+
+
+def render_order_lines(meals: tuple[Meal, ...], lang: str = "both") -> list[str]:
+    """One bullet per ordered meal, with its course in front."""
+    lines = []
+    for meal in meals:
+        title, second = meal.titles(lang)
+        price = f" — {meal.price}" if meal.price else ""
+        lines.append(f"- {_heading(meal.kind)}: **{title}**{price}")
+        if second and second != title:
+            lines.append(f"    _{second}_")
+    return lines
+
+
+def render_orders(cache: dict, now: Optional[datetime] = None,
+                  lang: str = "both") -> str:
+    """The `/food orders` reply: what this person has ordered, from the cache.
+
+    Read from the saved copy like every other reading reply, so it answers with
+    the app closed. What it cannot do is prove the copy is current — hence the
+    same staleness note the menu carries.
+    """
+    now = now or datetime.now()
+    orders = cache_orders(cache)
+    days = cache_days(cache)
+    today = now.date()
+
+    lines: list[str] = ["**My lunch orders**"]
+    note = _stale_note(cache, now)
+    if note:
+        lines.append(note)
+    shown = 0
+    for day in sorted(orders):
+        try:
+            when = date.fromisoformat(day)
+        except ValueError:
+            continue
+        if when < today:
+            continue        # yesterday's lunch is not a question anybody asks
+        shown += 1
+        by_id = _meals_by_id(days.get(day) or [])
+        picked = tuple(by_id[i] for i in (orders[day].get("items") or [])
+                       if i in by_id)
+        lines.append("")
+        lines.append(f"**{_day_title(when)}**")
+        if picked:
+            lines.extend(render_order_lines(picked, lang))
+        else:
+            # An order whose meals are not in the saved menu — the menu half of
+            # the cache reaches two weeks, the orders half further back.
+            lines.append(f"- ordered ({len(orders[day].get('items') or [])} "
+                         "item(s)), but that day's menu is not in the saved copy")
+    if not shown:
+        lines.append("")
+        lines.append("Nothing ordered from today on.")
+    lines.append("")
+    lines.append(_footer(cache))
+    return "\n".join(lines)
+
+
+def render_already_ordered(outcome: "OrderOutcome",
+                           lang: str = "both") -> str:
+    """"That is already what you have" — the sentence, without the menu.
+
+    The caller adds the day's menu underneath, because that is what a person
+    wants to see next and only the caller can reach it.
+    """
+    try:
+        day = date.fromisoformat(outcome.day)
+        when, short = _day_title(day), day.strftime("%d.%m.")
+    except ValueError:
+        when, short = outcome.day, outcome.day
+    if not outcome.was:
+        return (f"🍽 **{when}** — nothing is ordered for that day, and the "
+                "command asked for nothing either. Nothing has been changed "
+                "and no code was used.")
+    lines = [f"🍽 **{when}** — that is already what you have ordered:"]
+    lines.extend(render_order_lines(outcome.was, lang))
+    lines.append("")
+    lines.append(f"Nothing has been changed and no code was used. Order a "
+                 f"different number to swap it — `/food order {short} 2 "
+                 f"pin:yourcode` — or `/food cancel {short} pin:yourcode` to "
+                 f"drop the day altogether.")
+    return "\n".join(lines)
+
+
+def render_order_outcome(outcome: "OrderOutcome", cancelled: bool = False,
+                         lang: str = "both") -> str:
+    """What to say after a `/food order` / `/food cancel` actually ran."""
+    try:
+        when = _day_title(date.fromisoformat(outcome.day))
+    except ValueError:
+        when = outcome.day
+    if outcome.already:
+        return render_already_ordered(outcome, lang)
+    if outcome.error:
+        return f"⚠ {when}: {outcome.error}"
+    if cancelled or not outcome.ordered:
+        was = ""
+        if outcome.was:
+            names = ", ".join(m.titles(lang)[0] for m in outcome.was)
+            was = f" (was {names})"
+        return f"🍽 **{when}** — lunch cancelled{was}."
+    lines = [f"🍽 **{when}** — ordered:"]
+    lines.extend(render_order_lines(outcome.ordered, lang))
+    return "\n".join(lines)
 
 
 def _stale_note(cache: dict, now: datetime) -> str:
@@ -1366,7 +2280,11 @@ def render_day(cache: dict, day: date, now: Optional[datetime] = None,
     if meals:
         parts.append(f"**🍽 Menu — {_day_title(day)}**")
         parts.append("")
-        parts.extend(render_meals(meals, lang))
+        parts.extend(render_meals(meals, lang, ordered_ids(cache, day)))
+        note = _order_note(cache, day, meals)
+        if note:
+            parts.append("")
+            parts.append(note)
     elif _covers(days, day):
         parts.append(f"**🍽 {_day_title(day)}** — no meals offered.")
     else:
@@ -1400,7 +2318,10 @@ def render_week(cache: dict, monday: date, now: Optional[datetime] = None,
         shown += 1
         parts.append("")
         parts.append(f"**— {_day_title(day)} —**")
-        parts.extend(render_meals(meals, lang))
+        parts.extend(render_meals(meals, lang, ordered_ids(cache, day)))
+        note = _order_note(cache, day, meals)
+        if note:
+            parts.append(note)
     if not shown:
         parts.append("")
         parts.append(f"I have no menu for that week. {_known_range(days)}")
@@ -1468,7 +2389,63 @@ WEEKDAY_WORDS = {
     "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "wednesday": 2, "wed": 2,
     "thursday": 3, "thu": 3, "friday": 4, "fri": 4, "saturday": 5, "sat": 5,
     "sunday": 6, "sun": 6,
+    # The Czech names too. The replies stay English, but the words TYPED at the
+    # bot are typed by Czech speakers, and the course words ("polévka",
+    # "hlavní") already are Czech — accepting one and not the other is the kind
+    # of half-measure somebody trips over on their first order.
+    "pondeli": 0, "pondělí": 0, "po": 0,
+    "utery": 1, "úterý": 1, "út": 1, "ut": 1,
+    "streda": 2, "středa": 2, "st": 2,
+    "ctvrtek": 3, "čtvrtek": 3, "čt": 3, "ct": 3,
+    "patek": 4, "pátek": 4, "pá": 4, "pa": 4,
+    "sobota": 5, "so": 5, "nedele": 6, "neděle": 6, "ne": 6,
 }
+
+# Ordering, as one block, so `/help` and `/food help` say the same thing. It is
+# the only command in this program that WRITES to somebody's HR portal, and the
+# words got typed wrong twice while they were one bullet among twenty — hence a
+# section of its own, at the very bottom of `/help`.
+ORDER_HELP = (
+    "**🍽 Ordering lunch**\n"
+    "\n"
+    "```\n"
+    "/food order friday 1 pin:bakoli\n"
+    "```\n"
+    "\n"
+    "- **order** (or `objednej`) — may sit anywhere in the line, so "
+    "`/food friday order 1 pin:…` is the same thing\n"
+    "- **the day** — `friday` / `pátek`, `today`, `tomorrow`, or a date "
+    "(`11.9.`)\n"
+    "- **the number** — the one printed under that course in the menu. A "
+    "number on its own means the **main course**\n"
+    "- **`pin:`** — one of your one-time codes. Each works once and is then "
+    "struck off, so the code left behind in this chat is already spent\n"
+    "\n"
+    "The rest of it:\n"
+    "\n"
+    "```\n"
+    "/food order friday soup 2 main 1 pin:severu   a soup as well\n"
+    "/food order friday 3 pin:tumida               swap the main course\n"
+    "/food order friday soup 0 pin:hedaki          the soup off, main kept\n"
+    "/food cancel friday pin:nakepy                the whole day off\n"
+    "/food order friday                            just shows the list\n"
+    "/food orders                                  what I have ordered\n"
+    "```\n"
+    "\n"
+    "A day you have **already booked** is re-ordered, one course at a time: "
+    "`soup 2` on a day holding soup 1 and main 2 leaves the main course "
+    "alone. **`0`** is how a course comes off — `main 0` drops the main and "
+    "keeps the soup. Asking for exactly what is already there changes nothing "
+    "and costs no code. (`change` means the same as `order`.)\n"
+    "\n"
+    "`/food order friday` on its own only prints that day's list with its "
+    "numbers, so it needs no code. Reading the menu never does.\n"
+    "\n"
+    "The codes come from Settings → Canteen menu → Ordering codes, a hundred "
+    "at a time; a day that turns out to be closed costs you none. Every reply "
+    "names the meal the portal ended up holding, not the one I meant to order."
+)
+
 
 FOOD_HELP = (
     "**/food** — the canteen menu, as read from OKbase.\n"
@@ -1479,13 +2456,21 @@ FOOD_HELP = (
     "- `/food week` — this week; `/food next week` — the one after\n"
     "- `/food monday` — that weekday of this week\n"
     "- `/food 27.8.` — that date\n"
-    "- `/food refresh` — read it from OKbase again now\n"
+    "- `/food refresh` — the same read, answered with today\n"
     "- `/food status` — what I have saved, what I am doing, and whether the "
     "OKbase sign-in still works\n"
     "\n"
+    "Every one of these reads OKbase on the spot, so it takes a second or two "
+    "and what you get is what the portal holds right now. If the portal does "
+    "not answer, you get the saved copy instead, with a line saying how old it "
+    "is — never an old menu passed off as today's.\n"
+    "\n"
     "Add `; cz` for the Czech names only, `; en` for the English ones. Without "
     "either you get both, the English one under the Czech. It combines with "
-    "everything else: `/food week; en`, `/food friday; cz`."
+    "everything else: `/food week; en`, `/food friday; cz`.\n"
+    "\n"
+    # Last here as well, for the same reason it is last in /help.
+    + ORDER_HELP
 )
 
 
@@ -1505,19 +2490,66 @@ LUNCH_OVER_AT = dtime(14, 30)
 @dataclass
 class FoodRequest:
     """What `/food …` asked for."""
-    mode: str = "day"                 # day | week | refresh | status | help
+    mode: str = "day"     # day | week | refresh | status | help
+                          # order | cancel | orders
     day: Optional[date] = None
     monday: Optional[date] = None
     lang: str = "both"                # cs | en | both
     error: str = ""
+    # For mode "order": (course code, the number printed in that course's list).
+    # Numbers are per course because that is how the menu reply numbers them —
+    # soups 1, 2 and mains 1, 2, 3 — so a single flat number would name a
+    # different meal than the one the person is looking at.
+    picks: tuple[tuple[str, int], ...] = ()
+    # The one-time code, exactly as typed. Never rendered, never logged.
+    password: str = ""
+    # True for `change` / `instead`. Kept only so the word is recorded: it
+    # gates nothing any more, because a plain `order` on a booked day already
+    # re-orders it (see change_order).
+    replace: bool = False
     # True only for a bare `/food`, where no day was named. That is the one case
     # allowed to move itself on past LUNCH_OVER_AT — see next_food_day.
     default_day: bool = False
 
 
+# How the one-time code is written on the command. A marked word, not a bare
+# one: a code is a made-up word and could read like anything, so it has to be
+# told apart by its label and taken out before any other word is looked at.
+PASSWORD_PREFIXES = ("pin:", "pw:", "pass:", "password:", "heslo:", "kod:",
+                     "kód:", "code:")
+
+
+def _take_password(args: str) -> tuple[str, str]:
+    """(the command without the password word, the password).
+
+    Works on the RAW text: a password is case-sensitive, so this has to happen
+    before the lowercasing the rest of the parser does.
+    """
+    kept, found = [], ""
+    for word in (args or "").split():
+        low = word.lower()
+        hit = next((p for p in PASSWORD_PREFIXES if low.startswith(p)), "")
+        if hit and not found:
+            found = word[len(hit):]
+        else:
+            kept.append(word)
+    return " ".join(kept), found
+
+
 def parse_food_args(args: str, today: Optional[date] = None) -> FoodRequest:
     """Read the words after `/food`. Never raises; unknown words come back as
     an error message written for the chat."""
+    # The password comes out FIRST, off the raw text, and is put back on the
+    # finished request — the parser below lowercases everything, which would
+    # quietly change a password with a capital letter in it.
+    args, password = _take_password(args)
+    req = _parse_food_words(args, today, has_code=bool(password))
+    req.password = password
+    return req
+
+
+def _parse_food_words(args: str, today: Optional[date] = None,
+                      has_code: bool = False) -> FoodRequest:
     today = today or date.today()
     # ';' and ',' are the command language's separators, so they are just
     # spacing here — "/food; cz", "/food week; en" and "/food en" are one thing.
@@ -1544,6 +2576,39 @@ def parse_food_args(args: str, today: Optional[date] = None) -> FoodRequest:
         return FoodRequest("status", lang=lang)
     if words[0] in ("help", "?"):
         return FoodRequest("help", lang=lang)
+    # "order" and "cancel" are looked for ANYWHERE in the line, not only as the
+    # first word. "/food friday cancel" is how a person writes it, and while
+    # only the first word was examined that line quietly printed the menu
+    # instead — the worst possible outcome, because it looks like the command
+    # was understood. Same house rule as everywhere else: two independent
+    # things (which day, and what to do) may be said in either order.
+    if any(w in LIST_WORDS for w in words):
+        return FoodRequest("orders", lang=lang)
+    for index, word in enumerate(words):
+        if word in ORDER_WORDS or word in REPLACE_WORDS:
+            req = _parse_order_words(words[:index] + words[index + 1:],
+                                     today, lang)
+            req.replace = word in REPLACE_WORDS
+            return req
+        if word in CANCEL_WORDS:
+            rest = words[:index] + words[index + 1:]
+            req = _parse_order_words(rest, today, lang)
+            if req.picks:
+                return FoodRequest(
+                    "cancel", lang=lang,
+                    error="cancelling clears the whole day, so `/food cancel` "
+                          "takes a day and not a meal.")
+            return FoodRequest("cancel", day=req.day, lang=lang,
+                               error=req.error, default_day=req.default_day)
+
+    # No verb, but a one-time code AND a meal named. Nobody types a code to
+    # read a menu, so this is an order however it was worded — and reading
+    # "/food friday main 1 pin:…" as "show me Friday" is the failure that looks
+    # like success: the menu comes back and nothing was ordered.
+    if has_code:
+        trial = _parse_order_words(words, today, lang)
+        if trial.picks:
+            return trial
 
     offset_weeks = 0
     if words[0] in ("next", "this", "last", "previous", "prev"):
@@ -1573,6 +2638,104 @@ def parse_food_args(args: str, today: Optional[date] = None) -> FoodRequest:
                        error=f"I don't understand '{words[0]}'.")
 
 
+# What the person is asking for. Both languages, because the words typed at the
+# bot are typed by Czech speakers even though every reply is English.
+LIST_WORDS = ("orders", "ordered", "mine", "objednavky", "objednávky")
+ORDER_WORDS = ("order", "book", "take", "objednat", "objednej", "objednavam",
+               "objednávám", "dej", "chci")
+CANCEL_WORDS = ("cancel", "unbook", "drop", "none", "odhlasit", "odhlásit",
+                "odhlas", "odhlaš", "zrusit", "zrušit", "zrus", "zruš",
+                "nechci")
+# Ordering over the top of an order you already have. These are plain synonyms
+# of ORDER_WORDS — `order` on a booked day re-orders it course by course, so
+# there is nothing left for a separate word to unlock. They stay because they
+# are what people type, and a word the bot does not know is an error message.
+REPLACE_WORDS = ("change", "replace", "instead", "swap", "zmenit", "změnit",
+                 "zmen", "změň", "misto", "místo", "prehodit", "přehodit",
+                 "radeji", "raději")
+
+# Which course a number belongs to. A bare number means the main course: that
+# is what almost every order is, and "/food order friday 1" has to mean
+# something obvious rather than being refused.
+COURSE_WORDS = {
+    "soup": "POLEVKA", "soups": "POLEVKA", "polevka": "POLEVKA",
+    "polévka": "POLEVKA", "polevku": "POLEVKA", "polévku": "POLEVKA",
+    "p": "POLEVKA",
+    "main": "HLAVNI_JIDLO", "mains": "HLAVNI_JIDLO", "meal": "HLAVNI_JIDLO",
+    "hlavni": "HLAVNI_JIDLO", "hlavní": "HLAVNI_JIDLO",
+    "jidlo": "HLAVNI_JIDLO", "jídlo": "HLAVNI_JIDLO", "h": "HLAVNI_JIDLO",
+    "m": "HLAVNI_JIDLO",
+}
+_COURSE_FILLER = ("course", "dish", "chod", "and", "a", "plus", "+", "with")
+DEFAULT_COURSE = "HLAVNI_JIDLO"
+
+
+def _parse_order_words(words: list[str], today: date,
+                       lang: str = "both") -> FoodRequest:
+    """The words after `/food order`: a day, and numbered meals per course.
+
+    The day may sit anywhere in the line, so "friday main 1" and "main 1 friday"
+    are the same order — see the house rule that two independent inputs must be
+    settable in any order.
+    """
+    day: Optional[date] = None
+    offset_weeks = 0
+    course = DEFAULT_COURSE
+    picks: list[tuple[str, int]] = []
+
+    for word in words:
+        if word in _COURSE_FILLER:
+            continue
+        if word in ("next", "this", "last", "previous", "prev"):
+            offset_weeks = {"next": 1, "this": 0, "last": -1,
+                            "previous": -1, "prev": -1}[word]
+            continue
+        if word in COURSE_WORDS:
+            course = COURSE_WORDS[word]
+            continue
+        if word.isdigit():
+            picks.append((course, int(word)))
+            continue
+        # A number written straight onto the course ("main1", "p2").
+        head = word.rstrip("0123456789")
+        if head in COURSE_WORDS and head != word:
+            picks.append((COURSE_WORDS[head], int(word[len(head):])))
+            continue
+
+        if word in ("today", "now"):
+            day = today
+        elif word == "tomorrow":
+            day = today + timedelta(days=1)
+        elif word in WEEKDAY_WORDS:
+            day = (week_monday(today) + timedelta(weeks=offset_weeks)
+                   + timedelta(days=WEEKDAY_WORDS[word]))
+        else:
+            parsed = _parse_day_word(word, today)
+            if parsed is None:
+                return FoodRequest("order", lang=lang,
+                                   error=f"I don't understand '{word}'.")
+            day = parsed
+
+    if not picks:
+        # A day with no meal named. Not an error worth a scolding — the menu for
+        # that day, with its numbers, is the answer to "order what?", so the
+        # caller shows it and says how to pick.
+        return FoodRequest("order", day=day, lang=lang,
+                           default_day=day is None)
+    # One meal per course is all the portal holds, so a repeated course is a
+    # typo worth naming rather than silently keeping the last number.
+    seen: dict[str, int] = {}
+    for code, number in picks:
+        if code in seen and seen[code] != number:
+            return FoodRequest(
+                "order", lang=lang,
+                error=f"two different {'soups' if code == 'POLEVKA' else 'main courses'}"
+                      " were asked for; the canteen holds one of each.")
+        seen[code] = number
+    return FoodRequest("order", day=day, lang=lang, default_day=day is None,
+                       picks=tuple(sorted(seen.items())))
+
+
 def _parse_day_word(word: str, today: date) -> Optional[date]:
     """'27.8.', '27.8.2026' or '2026-08-27'."""
     text = word.strip()
@@ -1593,8 +2756,9 @@ def _parse_day_word(word: str, today: date) -> Optional[date]:
 def answer_food(args: str, cache: dict, now: Optional[datetime] = None) -> str:
     """The whole reply to a `/food …` line, given a cache. Never raises.
 
-    `refresh` is not handled here: only a process holding the credentials can do
-    that, so the caller sees mode == "refresh" and decides.
+    `refresh` is not handled here, and neither are `order` and `cancel`: only a
+    process holding the credentials can do those, so the caller sees the mode
+    and decides. Everything that only READS is answered here, from the cache.
     """
     now = now or datetime.now()
     req = parse_food_args(args, now.date())
@@ -1604,6 +2768,8 @@ def answer_food(args: str, cache: dict, now: Optional[datetime] = None) -> str:
         return FOOD_HELP
     if req.mode == "status":
         return render_status(cache, now)
+    if req.mode == "orders":
+        return render_orders(cache, now, req.lang)
     if req.mode == "week":
         return render_week(cache, req.monday or week_monday(now.date()), now,
                            req.lang)

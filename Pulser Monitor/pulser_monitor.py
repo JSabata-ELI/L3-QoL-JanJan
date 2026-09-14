@@ -598,7 +598,7 @@ STATE_NODATA = -1   # whole frame is dark / no real array data → a gap (trip),
 KIND_DROPOUT = "dropout"   # dark ≤ dropout_frames, came back
 KIND_FAULT   = "fault"     # dark > dropout_frames, array stayed up, came back
 KIND_TRIP    = "trip"      # dark > dropout_frames and the array fell within the look-ahead
-KIND_DEAD    = "dead"      # dark through dead_restarts recoveries or dead_confirm_min minutes
+KIND_DEAD    = "dead"      # failed dead_restarts recoveries, or never lit in the window at all
 
 # How a stretch with no array data is classified. All three used to be one thing ("trip"),
 # which is why a 2 s hiccup in the archive and the end-of-day switch-off both showed up in
@@ -1476,9 +1476,17 @@ def _compute_pulser_stats(name: str, st: list, times: list,
 
     Every dark run is classified into exactly one of four kinds, in this order of priority:
 
-      DEAD     it could not be recovered — it stayed dark through `dead_restarts` array
-               recoveries, or for `dead_confirm_min` minutes of time the array spent running
-               at full power. Either limit is enough.
+      DEAD     the operator's two routes, and only these two:
+                 - it stayed dark through `dead_restarts` array recoveries. Somebody tried
+                   to bring it back and it did not come back.
+                 - it never lit at all — dark from the first frame we were allowed to judge,
+                   and still dark after `dead_confirm_min` minutes of array-up time. The
+                   minutes are only a confirmation that we watched long enough to say so;
+                   they are NOT a second way of dying.
+               A pulser that ran, then went dark and stayed dark while nobody ever restarted
+               the array is a FAULT, however long it lasts. Nothing was demonstrated about
+               it: it was never asked to come back. This is the operator's own definition
+               and the reason the time limit no longer stands on its own.
       TRIP     the array went down within `trip_lookahead_frames` of this pulser going dark.
                This pulser took the array with it.
       DROPOUT  dark for no more than `dropout_frames` frames. A flicker.
@@ -1606,6 +1614,13 @@ def _compute_pulser_stats(name: str, st: list, times: list,
     ep_dark = 0
     ep_nodata = 0
     run_start_before_ep = None   # so a flicker can hand the run back untouched
+    # Has this pulser ever been seen properly lit? "Properly" means the same sustained
+    # stretch a recovery has to produce (> drop_max frames) — one bright frame inside hours
+    # of dark is noise, not evidence that the pulser ran. This is what separates the two
+    # ways of being dead: a pulser dark from the first judged frame NEVER ran that day and
+    # is dead on its own; one that did run has to fail actual recoveries to earn the word.
+    ever_lit = False
+    ep_lit_before = False        # value of `ever_lit` when the open dark run started
 
     def _close_run(end_idx: int) -> None:
         """Record the run ending at `end_idx` as a candidate longest-run."""
@@ -1632,7 +1647,15 @@ def _compute_pulser_stats(name: str, st: list, times: list,
         up_dark = up_cum[min(end_idx, n)] - up_cum[ep_start]
         restarts = rs_cum[min(end_idx, n)] - rs_cum[ep_start]
         fell = any(trp[k] for k in range(ep_start, min(n, ep_start + look + 1)))
-        if up_dark >= dead_ns or restarts >= dead_rs:
+        # Route one: somebody tried to bring it back, several times, and it did not come.
+        if restarts >= dead_rs:
+            return KIND_DEAD, fell, restarts
+        # Route two: it never lit in the first place. `dead_confirm_min` is the proof that
+        # we watched the array run long enough to be sure, not a clock that kills a pulser
+        # which ran this morning — the array being up while nobody restarts it demonstrates
+        # nothing about a pulser, and letting the minutes stand alone reported a harmless
+        # long fault as a death.
+        if not ep_lit_before and up_dark >= dead_ns:
             return KIND_DEAD, fell, restarts
         if ep_dark <= drop_max:
             return KIND_DROPOUT, fell, restarts
@@ -1689,6 +1712,11 @@ def _compute_pulser_stats(name: str, st: list, times: list,
                 if run_start is None:
                     run_start = i
                 continue
+            # Same bar as the sustained return above, for the same reason: this is the
+            # record that the pulser genuinely ran, and a single bright frame must not be
+            # able to write it.
+            if on_run[i] > drop_max:
+                ever_lit = True
             if run_start is None:
                 run_start = i
             if in_ep:
@@ -1706,6 +1734,7 @@ def _compute_pulser_stats(name: str, st: list, times: list,
                 in_ep = True
                 ep_start = i
                 run_start_before_ep = run_start
+                ep_lit_before = ever_lit
                 ep_dark = ep_nodata = 0
             ep_dark += 1
         else:  # STATE_NODATA — no data; counts only if a dark run is already open
@@ -2189,6 +2218,13 @@ def _make_mpl_toolbar(nav_cls, canvas, parent=None):
         "QToolButton { background: transparent; padding: 3px; }"
         "QToolButton:hover { background: #d6d6d6; border-radius: 3px; }"
         "QLabel { color: #202020; }")
+    # THE HOST HAS DONE ITS ONE JOB and must now get out of the way. The caller puts
+    # the TOOLBAR into a layout, which re-parents it away and leaves this widget
+    # behind as a child no layout owns — and such a child sits at (0, 0) of its
+    # parent at its default size. Painted in the window's own ground it is invisible
+    # until something scrolls under it, and it stands still while the panel moves.
+    host.setFixedSize(0, 0)
+    host.hide()
     return toolbar
 
 
@@ -3953,6 +3989,7 @@ class _MapTab(QWidget):
         self._start_ns: "int | None" = None
         self._end_ns: "int | None" = None
         self._annot = None
+        self._hint: "QLabel | None" = None
         self._build_ui()
 
     def _build_ui(self):
@@ -3973,6 +4010,7 @@ class _MapTab(QWidget):
         self._map_canvas = FigureCanvasQTAgg(self._map_fig)
         self._map_ax = self._map_fig.add_subplot(111)
         self._map_canvas.mpl_connect("motion_notify_event", self._on_hover)
+        self._map_canvas.mpl_connect("figure_leave_event", self._hide_hint)
         self._map_canvas.mpl_connect("button_press_event", self._on_click)
         left.addWidget(self._map_canvas, 1)
         metric_row = QHBoxLayout()
@@ -4249,11 +4287,6 @@ class _MapTab(QWidget):
         else:
             cbar = self._map_fig.colorbar(im, ax=self._map_ax, fraction=0.046, pad=0.04)
             cbar.set_label(metric)
-        self._annot = self._map_ax.annotate(
-            "", xy=(0, 0), xytext=(12, 12), textcoords="offset points",
-            bbox=dict(boxstyle="round", fc="#ffffe0", ec="#888", alpha=0.95),
-            fontsize=8, zorder=20)
-        self._annot.set_visible(False)
         self._map_fig.tight_layout()
         self._map_canvas.draw()
 
@@ -4305,19 +4338,58 @@ class _MapTab(QWidget):
                          f"({len(a.warmup_windows)}×)")
         return "\n".join(lines)
 
+    # The hover box used to be drawn inside the map itself, so a cell near the top or the
+    # right edge pushed it outside the picture and it was cut off. It is now a plain label
+    # laid over the whole window, kept inside the window on every side.
+    def _ensure_hint(self) -> QLabel:
+        if self._hint is None or self._hint.parent() is not self.window():
+            self._hint = QLabel(self.window())
+            self._hint.setObjectName("pulserHoverHint")
+            self._hint.setTextFormat(Qt.PlainText)
+            self._hint.setStyleSheet(
+                "QLabel#pulserHoverHint{background:#ffffe0;color:#111111;"
+                "border:1px solid #888888;padding:5px 7px;}")
+            f = self._hint.font()
+            f.setPointSizeF(8.5)
+            self._hint.setFont(f)
+            self._hint.hide()
+        return self._hint
+
+    def _hide_hint(self, *_a):
+        if self._hint is not None:
+            self._hint.hide()
+
     def _on_hover(self, event):
-        if self._annot is None:
-            return
         idx = self._cell_at(event)
         if idx is None:
-            if self._annot.get_visible():
-                self._annot.set_visible(False)
-                self._map_canvas.draw_idle()
+            self._hide_hint()
             return
-        self._annot.xy = (event.xdata, event.ydata)
-        self._annot.set_text(self._tooltip_text(idx))
-        self._annot.set_visible(True)
-        self._map_canvas.draw_idle()
+        self._show_hint_at(self._tooltip_text(idx),
+                           self.window().mapFromGlobal(QCursor.pos()))
+
+    def _show_hint_at(self, text: str, pos: QPoint):
+        hint = self._ensure_hint()
+        hint.setText(text)
+        hint.adjustSize()
+        win = self.window()
+        w, h = hint.width(), hint.height()
+        x = pos.x() + 16
+        y = pos.y() + 16
+        if x + w > win.width() - 4:
+            x = max(4, pos.x() - 16 - w)
+        if y + h > win.height() - 4:
+            y = max(4, pos.y() - 16 - h)
+        hint.move(max(4, x), max(4, y))
+        hint.raise_()
+        hint.show()
+
+    def hideEvent(self, event):
+        self._hide_hint()
+        super().hideEvent(event)
+
+    def leaveEvent(self, event):
+        self._hide_hint()
+        super().leaveEvent(event)
 
     def _on_click(self, event):
         idx = self._cell_at(event)
@@ -5150,7 +5222,8 @@ class _StatsTab(QWidget):
         "dropout — a flicker, no longer than 'Dropout up to' frames (not listed here).\n"
         "fault — dark for longer, the array kept running, and it came back.\n"
         "trip — dark for longer and the array went down right after: this pulser took it.\n"
-        "dead — it could not be recovered (see 'Dead after').",
+        "dead — either it survived 'Dead after (recoveries)' restarts without lighting, or\n"
+        "it never lit at all today (see 'Never lit, dead after').",
         "When the pulser went dark.",
         "How long it stayed dark. For a death that ends the window, up to the last frame.",
         "How many frames of real data showed it dark. Compare with the duration: a big\n"
@@ -5875,8 +5948,9 @@ class PulserMonitorWidget(QWidget):
             "called dead.\n"
             "One failed recovery proves nothing: the operator routinely fires several in a\n"
             "row, so a pulser still dark right after the first one may well light on the\n"
-            "second or third. Whichever of this and 'Dead after' is reached first ends the\n"
-            "argument.\n"
+            "second or third. This is the main way a pulser earns the word 'dead': it ran,\n"
+            "it went out, it was restarted this many times and never came back. The other\n"
+            "way is never having lit at all (see 'Never lit, dead after').\n"
             "Switching the diodes back on after a deliberate stop is not a recovery and is\n"
             "not counted here.\n"
             "\n"
@@ -5895,22 +5969,28 @@ class PulserMonitorWidget(QWidget):
         deadr_row.addStretch(1)
         lv.addLayout(deadr_row)
         _tip_deadm = (
-            "How long a pulser may stay dark — counting only time the array was actually\n"
-            "running at full power — before it is called dead, if it has not already used\n"
-            "up its recoveries.\n"
+            "The SECOND way of being dead: a pulser that never lit at all.\n"
+            "It applies only to a pulser that is dark from the first frame we are allowed\n"
+            "to judge and has never been properly lit since — it did not run today. This\n"
+            "is how long the array must be seen running at full power before that is\n"
+            "called dead rather than 'not seen yet'.\n"
+            "It does NOT apply to a pulser that ran and then went dark. That one is a\n"
+            "fault until somebody restarts the array and it fails to come back (see 'Dead\n"
+            "after (recoveries)') — the array simply being up while nobody tries anything\n"
+            "demonstrates nothing about it, however many hours pass.\n"
             "Measured in MINUTES, not frames, deliberately. Every frame-counted limit\n"
             "changes meaning by 16x between the 5 s archive cadence and the 3.3 Hz stream,\n"
             "and that is exactly how the one-second dimming ramp as the array was switched\n"
             "off for the evening came to be reported as eleven pulsers dying at 17:07.\n"
-            "Time inside an outage or a switch-off does not age a dark run: the array was\n"
-            "not running, so nothing was being demonstrated about the pulser.\n"
+            "Time inside an outage or a switch-off does not count: the array was not\n"
+            "running, so nothing was being demonstrated about the pulser.\n"
             "\n"
             "Accepts 0.5 to 240 minutes, in steps of 5.\n"
-            "Useful range 10-40. Replacing a pulser takes an hour or two, so anything in\n"
-            "that band separates 'cannot be recovered' from 'was swapped out and came\n"
-            "back' cleanly. Default 20.")
+            "Useful range 10-40. Lower and a scan of a short window calls every pulser\n"
+            "that has not lit yet dead; much higher and a pulser that plainly never ran\n"
+            "all morning is still only a fault. Default 20.")
         deadm_row = QHBoxLayout()
-        _lbl_deadm = QLabel("Dead after (min):")
+        _lbl_deadm = QLabel("Never lit, dead after (min):")
         _lbl_deadm.setToolTip(_tip_deadm)
         deadm_row.addWidget(_lbl_deadm)
         self._deadm_sb = QDoubleSpinBox()

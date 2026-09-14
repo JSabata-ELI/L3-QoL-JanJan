@@ -41,8 +41,41 @@ THE FOUR TABS
     of brightness and contrast controls applies to all of them —
     otherwise the comparison would lie.
 
+    CLICKING A PICTURE MARKS IT. Nothing pops up. Once a picture is
+    marked, brightness, contrast, gamma, the colour scheme, turning
+    and the drawn marks all apply to THAT picture only; with nothing
+    marked they apply to everything, which is what keeps the days
+    comparable. EVERY CLICK ADDS: click picture after picture and all
+    of them stay marked, and click a marked one again to let just that
+    one go. SHIFT+CLICK marks a whole CAMERA — every day of it at
+    once — and adds it to what was already marked. A picture on its
+    own settings says so under it, so nobody mistakes it for one of
+    the comparable ones.
+
+    To look at one closely: DOUBLE-CLICK it, or right-click it and
+    choose "View", which opens a window much bigger than the picture
+    itself. There is also a "Detailed view" tab at the end of the row
+    of tabs — it shows the marked pictures one at a time, and the
+    arrows under it (or the left and right arrow keys) step through
+    them. Mark nothing and it steps through the whole wall.
+
+    "Day by day" gives each camera a line of its own: that camera's
+    days side by side, the next camera on the next line. Four days
+    fill the window and the rest is to the right — scroll sideways for
+    them, and down for more cameras. The grey strip over each line
+    names the camera; the day and the time are written under each
+    picture.
+
+    Every click ADDS to what is marked, so you can click picture after
+    picture and all of them stay marked. Click a marked one again to
+    let just that one go. Esc, or right-click and "Unmark every
+    picture", lets everything go.
+
     The cameras you picked are listed under the Workshop button.
-    Click one to look at it, double-click it to take it out again.
+    Click one and all its pictures on the wall get marked — nothing
+    pops up. Click another and it is added; click a marked one again
+    to take it back off. Double-click a camera to take it out of the
+    search.
 
     Pick one day as the reference and the others show how far they
     differ from it. That is the quickest way to see when something
@@ -50,11 +83,10 @@ THE FOUR TABS
     again.
 
     "Save view" writes the whole view into ONE file with the days
-    labelled, ready to put in a report — every row, including the ones
-    you would have to scroll to. It asks PNG or PDF, and this tab or
-    every tab. Click a day to open that frame in a close-up window,
-    much bigger than the picture itself; the arrows under it step
-    through the rest of the wall.
+    labelled, ready to put in a report — every row you would have to
+    scroll down to and every camera off to the right, each picture at
+    its own full resolution, so everything in it can be read. It asks
+    PNG or PDF, and this tab or every tab.
 
     You can also pick a day and an hour and see what was recorded,
     with the shot energy and any machine values you asked for, and
@@ -65,15 +97,34 @@ THE FOUR TABS
     value over them — one day at a time, or all the marked days next
     to each other. Then either:
 
-      CLICK the graph. That moment is picked, and every further click
-      picks ANOTHER one, on this day or on any other marked day, so
-      you build the set up as you go. Ctrl+Z (or the Undo button)
-      takes the last one back. You get every picked camera at every
-      picked moment.
+      CLICK the graph — press and let go without moving. That moment
+      is picked, and every further click picks ANOTHER one, on this
+      day or on any other marked day, so you build the set up as you
+      go. Ctrl+Z takes the last one back. You get every picked camera
+      at every picked moment.
 
-      DRAG over a stretch. Every stretch gets its own picture from
-      every camera, taken from the peak of the value inside it, and
-      the table under the graph gives the numbers for it.
+      DRAG over a stretch. Move the mouse at all while the button is
+      down and you get a stretch of time, however narrow it looks.
+      Every stretch gets its own picture from every camera, taken
+      from the peak of the value inside it.
+
+    You can do BOTH at once and both are searched: four clicks and
+    four drags give you eight pictures from every camera. The button
+    under the day list says how many there are altogether ("Search 8
+    selections"), and on the wall every picture simply wears its own
+    number — the numbering runs through moments and stretches alike,
+    so no two picks ever share a number.
+
+    The table under the graph lists everything you have picked —
+    moments and stretches together, in time order, with their
+    numbers — and, on the same row, what each plotted value did
+    inside a marked stretch: how many samples, the mean, the spread
+    and the two extremes. The ✕ at the end of a row throws that one
+    away; Ctrl+Z brings it back. THE NUMBERS DO NOT MOVE when you
+    delete one: if you had 1 2 3 4 and throw 3 away, what is left is
+    still 1 2 4, so the number you were talking about is still the
+    same picture. Press "Renumber" when you want them counted again
+    from one.
 
     Or say it as a number: "the first moment SBW4 was above 13 J"
     gives you that one moment on all the cameras at once, and it
@@ -91,6 +142,11 @@ THE FOUR TABS
     written rather than about a second later. Every camera in the
     grid does, including the ones whose file happens to land while
     the selected camera's own picture is still being read.
+
+    The ◀ ▶ arrows move one image per click; hold one down and it
+    speeds up to five images a second. With several cameras, the
+    master camera is the one the others follow — move any other
+    camera's slider and it stays on the moment you left it.
 
     Every setting — brightness, contrast, palette, zoom — applies to
     the cameras that were SELECTED WHEN YOU MOVED THE CONTROL, or to
@@ -147,6 +203,13 @@ THE FOUR TABS
     pressed "Clear trips", so nothing can pass unnoticed while you
     are looking away.
 
+    The same window sets how the panel of values over the picture
+    looks: its font, its colours, and how big the panel itself is.
+    "Panel size" is in pixels and reads "auto" at 0, which is the
+    panel exactly as big as its values; type a width or a height and
+    it stays that size whatever the numbers do. All of it is
+    remembered for the next time.
+
     With several cameras open, the program sizes their windows so
     that even the smallest picture comes out as large as the screen
     allows, and then, among the arrangements that are as good as that,
@@ -188,6 +251,14 @@ THE FOUR TABS
     the cameras, where each one sits AND how big each one is set to
     be, so it comes back exactly as you left it.
 
+    PCW3_NF shows the permanent reference square that is set on the
+    camera itself. The camera screen draws it, but it is not part of
+    the stored picture, so the program draws it back on. Right-click
+    the picture to switch it off or to nudge its edges. The diodes
+    have their measuring grid behind the same right click; on every
+    other camera a right click opens nothing, and right-click-drag
+    still zooms everywhere.
+
   SHOT FINDER
     Give a value and a tolerance — an energy, a waveplate angle —
     and it finds every shot in a date range that matches, across
@@ -199,12 +270,30 @@ THE FOUR TABS
     the Image Slider uses — one calendar with the times to the
     minute, and the camera list with its saved sets — so the days
     need not follow one another, and a set of cameras saved in one
-    tab is offered in the other.
+    tab is offered in the other. The times open on 07:00 to 20:00,
+    the shift rather than the whole calendar day.
 
-    Double-click a day in the results and you get every matching shot
-    of that day, with a graph beside it showing the searched value
-    over the whole day and where in it the shot you are looking at
-    sits. Switching to another camera's tab keeps that place.
+    Double-click a day in the results and a window opens with every
+    matching shot of that day, and a graph beside it showing the
+    searched value over the whole day and where in it the shot you
+    are looking at sits. The graph gets the bigger half of the
+    window, and its curve holds each value until the next one
+    arrives, the way CS Studio draws it. The window holds nothing
+    else - the picture stays in the picture area of the main window -
+    and it can be moved aside or made big. Switching to another
+    camera's tab keeps that place.
+
+    The last column of that list is the time the picture itself
+    carries, and it fills in by itself as the window opens. Double-
+    click a row to open the folder with that frame selected.
+
+    While a search runs, the bar under "Load data" says how far it
+    has got and the line under it what is being read right now, so
+    one slow day no longer looks like a program that has stopped.
+    How long is left appears once it has been measured on the days
+    already done, not guessed from the start.
+    Changing the picked days shows the same bar while the cameras of
+    those days are being looked up.
 
   WORKSHOP
     One image at a time, properly. Zoom and pan, non-destructive

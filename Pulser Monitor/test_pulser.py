@@ -291,6 +291,26 @@ def main():
     check("came back afterwards -> replaced", st3.dead_until_ns is not None, True)
     check("replaced pulser still counted dead", st3.status_str, "dead — replaced")
 
+    # ── Test 6b: the two ways of being dead, and the one that is not ──────────
+    # The operator's definition: dead is a pulser that was restarted and did not come back,
+    # or one that never lit at all today. A pulser that ran, went out and then simply sat
+    # there while NOBODY restarted the array is neither — it was never asked to come back,
+    # so nothing about it has been demonstrated. The clock used to kill it anyway, which
+    # turned a long harmless fault into a death and dated it to the wrong minute.
+    _say("\nTest 6b — the clock only kills a pulser that never lit")
+    never = "D2"          # dark from the very first frame
+    p_fast = pm.AnalysisParams(dead_confirm_min=1.0)   # 60 s, so 12 frames is plenty
+    samples = build(rois, ref, [(20, "dark", [never]),
+                                (60, "dark", [never, victim])], rng)
+    an = pm.analyze_camera(rois, samples, p_fast)
+    by = {s.name: s for s in an.stats}
+    check("never lit -> dead", by[never].is_dead, True)
+    check("dead from the first frame", by[never].dead_since_ns, an.times_ns[0])
+    check("ran, then went dark, nobody restarted -> not dead", by[victim].is_dead, False)
+    check("...it is a fault", kinds(by[victim]), ["fault"])
+    check("only the never-lit one is dead",
+          [s.name for s in an.stats if s.is_dead], [never])
+
     # ── Test 7: the 17:07 case — the array going off is not forty deaths ──────
     # The array powers down at the end of the day. During the ramp the weakest pulsers read
     # OFF for about a second, and then the samples stop. The old code called every one of

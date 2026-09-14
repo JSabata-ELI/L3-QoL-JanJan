@@ -81,6 +81,7 @@ from matplotlib.widgets import SpanSelector, RectangleSelector
 # ── Non-UI helpers from cpva_core ──────────────────────────────────────────
 from cpva_core import (
     TZ_PRAGUE, now_ns, dt_to_ns, ns_to_local_str, _fmt_cursor_value,
+    _fmt_percent_of,
     parse_user_datetime, shorten_pv_name, make_pv_query_matcher,
     cpva_fetch_samples, cpva_fetch_samples_chunked, cpva_decode_value,
     cpva_fetch_channels, safe_divide,
@@ -153,6 +154,13 @@ def _make_mpl_toolbar(nav_cls, canvas, parent=None):
         hint = _TB_HINTS.get(act.text())
         if hint:
             act.setToolTip(hint)
+    # THE HOST HAS DONE ITS ONE JOB and must now get out of the way. The caller puts
+    # the TOOLBAR into a layout, which re-parents it away and leaves this widget
+    # behind as a child no layout owns — and such a child sits at (0, 0) of its
+    # parent at its default size. Painted in the window's own ground it is invisible
+    # until something scrolls under it, and it stands still while the panel moves.
+    host.setFixedSize(0, 0)
+    host.hide()
     return toolbar
 
 
@@ -1972,6 +1980,17 @@ class CSSLoggerWidget(QWidget):
     def _on_main_tab_changed(self, idx):
         if self._notebook.widget(idx) is self._tab_pv_time:
             self._refresh_pv_time_choices()
+        elif self._notebook.widget(idx) is self._tab_xy:
+            # Live ticks and condition changes only redraw the XY cloud while it
+            # is the visible tab; a hidden one is marked and caught up here, so
+            # what appears on screen is never yesterday's picture.
+            if getattr(self, "_xy_dirty", False):
+                try:
+                    self._xy_update_points()
+                except Exception:
+                    import traceback
+                    self._log(f"[xy_refresh]\n{traceback.format_exc()}")
+                    self._xy_dirty = False
 
     # ── Sidebar ────────────────────────────────────────────────────────────
 
@@ -2300,7 +2319,12 @@ class CSSLoggerWidget(QWidget):
         # docked right beneath it (no dead gap between graph and table).
         self._graph_v_splitter.setStretchFactor(0, 1)
         self._graph_v_splitter.setStretchFactor(1, 0)
-        self._graph_v_splitter.setSizes([900, 190])
+        # Roughly 3:1 — the graph keeps three quarters, the PV list opens on a few
+        # rows. _autosize_axis_pane refines it once the real height is known.
+        self._graph_v_splitter.setSizes([1000, 330])
+        # A drag of the handle is the user's decision and outranks the autosizer
+        # from then on; without this the next resize or table refresh undid it.
+        self._graph_v_splitter.splitterMoved.connect(self._on_graph_splitter_moved)
 
     # ── Axis settings panel ────────────────────────────────────────────────
 
@@ -3804,7 +3828,13 @@ class CSSLoggerWidget(QWidget):
                 dt_cursor = mdates.num2date(x_f, tz=TZ_PRAGUE)
                 ts_str    = dt_cursor.strftime("%H:%M:%S")
                 self._x_cursor_ann.set_position((x_f, -0.01))
-                self._x_cursor_ann.set_text(ts_str); self._x_cursor_ann.set_visible(True)
+                self._x_cursor_ann.set_text(ts_str)
+                # Centred under the cursor normally, but at either end of the
+                # axis half the time would hang outside the window, so the box
+                # tucks itself in against the edge it is nearest.
+                self._x_cursor_ann.set_ha(
+                    self._edge_align(self._x_cursor_ann, x_f, centred=True))
+                self._x_cursor_ann.set_visible(True)
                 if bg is not None: self._x_cursor_ann.axes.draw_artist(self._x_cursor_ann)
                 self._lbl_graph_info.setText(dt_cursor.strftime("%Y-%m-%d %H:%M:%S"))
             except Exception:
@@ -3814,8 +3844,15 @@ class CSSLoggerWidget(QWidget):
             try:
                 yax   = self._y_cursor_ann_ax
                 y_cur = float(yax.transData.inverted().transform((disp_x, disp_y))[1])
+                # The number is the one under the mouse, but the box itself is
+                # kept inside the plot rectangle — without this it slid out past
+                # the top and bottom spines along with the mouse.
+                _bb   = yax.get_window_extent()
+                _pad  = self._y_cursor_ann.get_fontsize() * self._mpl_figure.dpi / 72.0
+                _dy   = min(max(disp_y, _bb.y0 + _pad), _bb.y1 - _pad)
+                y_box = float(yax.transData.inverted().transform((disp_x, _dy))[1])
                 xf    = self._y_cursor_ann.get_position()[0]
-                self._y_cursor_ann.set_position((xf, y_cur))
+                self._y_cursor_ann.set_position((xf, y_box))
                 self._y_cursor_ann.set_text(f" {_fmt_cursor_value(y_cur)}")
                 self._y_cursor_ann.set_visible(True)
                 if bg is not None: yax.draw_artist(self._y_cursor_ann)
@@ -3873,8 +3910,25 @@ class CSSLoggerWidget(QWidget):
         try:
             _bb  = items[0][0].get_window_extent()
             lo_px, hi_px = float(_bb.y0), float(_bb.y1)
+            x0_px, x1_px = float(_bb.x0), float(_bb.x1)
         except Exception:
-            lo_px = hi_px = None
+            lo_px = hi_px = x0_px = x1_px = None
+
+        # Which side of the cursor line the boxes grow to. They are drawn without
+        # clipping, so at the right-hand edge a box that grows rightwards runs off
+        # the plot and off the window — which is where the numbers used to
+        # disappear. Flip the whole set to the left there, and only there, so the
+        # boxes stay together and stop jumping about.
+        try:
+            x_px = float(items[0][0].transData.transform((x_f, 0.0))[0])
+        except Exception:
+            x_px = None
+        side = "left"
+        if x_px is not None and x1_px is not None:
+            widest = max(self._cursor_box_width(ann) for _a, ann, _y, _h in items)
+            if x_px + widest > x1_px and (x_px - widest) >= x0_px:
+                side = "right"      # ha="right" = the text ends at the cursor
+
         for st in stacks:
             # Keep the stack inside the plot rectangle (unless it is taller).
             if lo_px is not None and (hi_px - lo_px) > st[1]:
@@ -3887,10 +3941,48 @@ class CSSLoggerWidget(QWidget):
                 except Exception:
                     ann.set_visible(False); y += h; continue
                 y += h
+                # The artists live between frames, so the side has to be set every
+                # time, not only when it changes.
+                ann.set_ha(side)
+                ann.set_text((" " if side == "left" else "")
+                             + ann.get_text().strip()
+                             + ("" if side == "left" else " "))
                 ann.set_position((x_f, y_data))
                 ann.set_visible(True)
                 if bg is not None:
                     ax.draw_artist(ann)
+
+    def _edge_align(self, ann, x_f, centred=False):
+        """Which way a cursor box should grow so it stays inside the plot.
+
+        "left" means the text starts at the cursor and runs right; "right" means
+        it ends there and runs left. `centred` boxes stay centred until an edge
+        is close enough to push them off the window.
+        """
+        try:
+            ax = ann.axes
+            bb = ax.get_window_extent()
+            x_px = float(ax.transData.transform((x_f, 0.0))[0])
+        except Exception:
+            return "center" if centred else "left"
+        w = self._cursor_box_width(ann)
+        head = w / 2.0 if centred else w
+        if x_px + head > bb.x1:
+            return "right"
+        if centred and x_px - head < bb.x0:
+            return "left"
+        return "center" if centred else "left"
+
+    def _cursor_box_width(self, ann):
+        """Roughly how wide a cursor value box is, in pixels.
+
+        Measured from the text length and the font size, the same cheap way the
+        box height is estimated above. Asking matplotlib for the real extent
+        would need a renderer on every mouse move, and the estimate only has to
+        be good enough to decide which side of the cursor the box goes on.
+        """
+        fs_px = ann.get_fontsize() * self._mpl_figure.dpi / 72.0
+        return (len(ann.get_text()) + 1) * fs_px * 0.62 + 8.0
 
     def _flush_cursor_table(self):
         """Write the latest cursor values (already cached in _pv_settings by the
@@ -4056,10 +4148,12 @@ class CSSLoggerWidget(QWidget):
             ("N",   stats["n"],   "Number of samples inside the selected region."),
             ("Avg", stats["avg"], "Average (arithmetic mean) of the selected values."),
             ("Std", stats["std"], "Standard deviation — how much the values scatter "
-                                  "around the average (population σ)."),
+                                  "around the average (population σ), as a "
+                                  "percentage of the average."),
             ("Min", stats["min"], "Smallest value in the selection."),
             ("Max", stats["max"], "Largest value in the selection."),
-            ("P-P", stats["ptp"], "Peak-to-peak = Max − Min (total spread of the values)."),
+            ("P-P", stats["ptp"], "Peak-to-peak = Max − Min (total spread of the "
+                                  "values), as a percentage of the average."),
         ]
         for r, (lbl, val, tip) in enumerate(rows):
             k = QLabel(lbl + ":")
@@ -4166,13 +4260,17 @@ class CSSLoggerWidget(QWidget):
             sel = v_arr[mask]
             if sel.size == 0:
                 continue
+            _mean = float(np.mean(sel))
+            _lo, _hi = float(np.min(sel)), float(np.max(sel))
             stats = {
                 "n":   f"{sel.size:,}",
-                "avg": _fmt_cursor_value(float(np.mean(sel))),
-                "std": _fmt_cursor_value(float(np.std(sel))),
-                "min": _fmt_cursor_value(float(np.min(sel))),
-                "max": _fmt_cursor_value(float(np.max(sel))),
-                "ptp": _fmt_cursor_value(float(np.max(sel) - np.min(sel))),
+                "avg": _fmt_cursor_value(_mean),
+                # Scatter and spread are read as "how steady is it", which is a
+                # share of the average, not a count of the channel's own units.
+                "std": _fmt_percent_of(float(np.std(sel)), _mean),
+                "min": _fmt_cursor_value(_lo),
+                "max": _fmt_cursor_value(_hi),
+                "ptp": _fmt_percent_of(_hi - _lo, _mean),
             }
             pv_setting = self._pv_settings.get(pv, {})
             disp_name = pv_setting.get("display_name", shorten_pv_name(pv))
@@ -4204,15 +4302,17 @@ class CSSLoggerWidget(QWidget):
         self._stats_scroll.show()
 
     def _on_zoom_select(self, xmin, xmax):
-        # Right-drag = zoom in time. The view we are leaving is pushed onto the
-        # TOOLBAR's history, so its Back / Home undo a right-drag zoom just like
-        # they undo one made with the Zoom button.
+        # Right-drag = zoom in time. BOTH views go onto the TOOLBAR's history —
+        # the one being left so Back returns to it, the one being entered so
+        # Forward comes back to here — exactly as matplotlib's own Zoom button
+        # does it. Pushing only the first left Forward with nowhere to go.
         if xmax - xmin < 1e-6: return
         if not self._graph_axes: return
         t0 = mdates.num2date(xmin, tz=TZ_PRAGUE)
         t1 = mdates.num2date(xmax, tz=TZ_PRAGUE)
         self._push_graph_view()
         self._graph_axes[0].set_xlim(t0, t1)
+        self._push_graph_view()
         self._user_zoomed = True
         self._retick_from_current_xlim()
         if self._mpl_canvas:
@@ -4411,14 +4511,29 @@ class CSSLoggerWidget(QWidget):
         self._user_zoomed = False
         self._retick_from_current_xlim()
 
-    def _on_xy_rect_zoom_push(self):
-        tb = self._xy_toolbar
+    def _xy_push_view(self):
+        """Put the XY plot's current view on the toolbar's history.
+
+        Back and Forward are enabled purely from where the toolbar sits in that
+        history, so a view that is never pushed is a view they cannot reach.
+        """
+        tb = getattr(self, "_xy_toolbar", None)
         if tb is None:
             return
         try:
             tb.push_current()
         except Exception:
             pass
+
+    def _on_xy_view_home(self):
+        """Home pressed on the XY plot: the view is the program's again, so a
+        Live refresh may resume fitting the axes to the cloud."""
+        self._xy_user_zoomed = False
+
+    def _on_xy_toolbar_mode(self, checked):
+        """Zoom or Pan switched on: whatever happens next is the user's view."""
+        if checked:
+            self._xy_user_zoomed = True
 
     # ── Save / clean graph ──────────────────────────────────────────────────
 
@@ -4530,6 +4645,9 @@ class CSSLoggerWidget(QWidget):
                                  self._graph_tab_label)
         self._notebook.setCurrentWidget(self._tab_graph)
         popup.deleteLater()
+        # The pane was hidden, so whatever the user had dragged is gone with it —
+        # start again from the default split rather than from a stale size.
+        self._axis_pane_user_sized = False
         QTimer.singleShot(0, self._autosize_axis_pane)   # pane was hidden
         self._lbl_status.setText("Graph docked back.")
 
@@ -5721,6 +5839,7 @@ class CSSLoggerWidget(QWidget):
                     self._table_rows = self._apply_conditions_to_rows(rows)
                     self._populate_table()
                     self._flush_axis_measured()   # Last/Min/Max/… keep up with Live
+                    self._xy_refresh_live()       # …and so does the XY cloud
                     self._live_table_cost_ns = int(
                         (time.perf_counter() - _table_t0) * 1e9)
                 total_pts = sum(len(v) for v in self._samples_by_pv.values())
@@ -5868,6 +5987,7 @@ class CSSLoggerWidget(QWidget):
         if rows is None:
             rows = self._table_rows_unfiltered
         if not self._conditions or not rows:
+            self._cond_drop_counts = (len(rows), len(rows))
             return list(rows)
         # Rows are built by sample-hold, so the last one carries every channel
         # that appeared anywhere in the window — the exact set of PVs the
@@ -5881,8 +6001,27 @@ class CSSLoggerWidget(QWidget):
             (ts, row_dict) for ts, row_dict in rows
             if self._row_matches_conditions(row_dict, active)
         ]
+        # Remembered so an empty table and an empty XY plot can say WHY they are
+        # empty instead of leaving the Log tab as the only place that knows.
+        self._cond_drop_counts = (len(rows), len(filtered))
         self._log_conditions_diag(skipped, len(rows), len(filtered))
         return filtered
+
+    def _no_rows_message(self) -> str:
+        """Why there are no rows, named after whatever caused it.
+
+        A bare "No rows." reads as "the archiver had nothing" and sends the user
+        hunting for a network fault, when the usual cause is their own
+        Conditions throwing every row away — which is exactly what happens over
+        an hour when the laser was off.
+        """
+        n_in, n_out = getattr(self, "_cond_drop_counts", (0, 0))
+        if self._conditions and n_in and not n_out:
+            pvs = ", ".join(c.get("pv", "?") for c in self._conditions
+                            if c.get("pv"))
+            return (f"No rows — the Conditions rejected all {n_in:,} of them "
+                    f"({pvs}). Switch the Conditions off to see the data.")
+        return "No rows."
 
     def _log_conditions_diag(self, skipped, n_in, n_out):
         """Report what the conditions did — once per distinct outcome, because
@@ -6362,7 +6501,13 @@ class CSSLoggerWidget(QWidget):
             self._table_widget.setColumnCount(1)
             self._table_widget.setHorizontalHeaderLabels(["Timestamp"])
             self._table_cols_cache = ["Timestamp"]
-            self._lbl_table_info.setText("No rows.")
+            msg = self._no_rows_message()
+            self._lbl_table_info.setText(msg)
+            # With an empty grid this line is the whole answer, so when it has a
+            # reason to give it is written in dark ink rather than the usual grey.
+            self._lbl_table_info.setStyleSheet(
+                "color:#8a3b00; font-weight:600;" if msg != "No rows."
+                else "color:#777;")
             return
 
         pvs = self._table_pvs()
@@ -6388,6 +6533,7 @@ class CSSLoggerWidget(QWidget):
                                      self._format_value(val_raw), severity)
 
         self._table_widget.setUpdatesEnabled(True)
+        self._lbl_table_info.setStyleSheet("color:#777;")   # back from a warning
         if len(shown_rows) < len(self._table_rows):
             self._lbl_table_info.setText(
                 f"Showing last {len(shown_rows)} of {len(self._table_rows)} rows  "
@@ -6545,6 +6691,22 @@ class CSSLoggerWidget(QWidget):
     # Never let the PV list eat the whole tab: the graph keeps at least this
     # much height, so the buttons above it always stay on screen.
     _AXIS_PANE_MIN_GRAPH = 240
+    # How many PV rows the list shows when the tab opens. The graph is the reason
+    # the tab exists, so the list starts at about a quarter of the height (3:1)
+    # and is dragged taller when more rows are wanted.
+    _AXIS_PANE_DEFAULT_ROWS = 5
+    _AXIS_PANE_MIN_ROWS     = 4
+
+    def _on_graph_splitter_moved(self, _pos=0, _index=0):
+        """The user dragged the handle between the graph and the PV list.
+
+        From here on the autosizer only maintains the maximum height; it must not
+        move the handle back, or the drag would be undone by the next window
+        resize or table refresh.
+        """
+        if getattr(self, "_axis_pane_sizing", False):
+            return                           # our own setSizes, not a real drag
+        self._axis_pane_user_sized = True
 
     def _autosize_axis_pane(self):
         """Make the PV list exactly as tall as the rows it holds.
@@ -6591,7 +6753,18 @@ class CSSLoggerWidget(QWidget):
         want  = max(floor, min(need + chrome, max(floor, room)))
 
         pane.setMaximumHeight(want)          # can be dragged smaller, never bigger
-        spl.setSizes([max(1, total - spl.handleWidth() - want), want])
+        if getattr(self, "_axis_pane_user_sized", False):
+            return                           # the handle is the user's now
+
+        # Opening height: a few rows, about a quarter of the pane. A real row
+        # height is used where there is one, so the count is right at any font.
+        row_h = tv.rowHeight(0) if tv.rowCount() else 26
+        hdr   = chrome + tv.horizontalHeader().height() + 2 * tv.frameWidth() + 2
+        start = min(want,
+                    max(hdr + self._AXIS_PANE_MIN_ROWS * row_h,
+                        min(hdr + self._AXIS_PANE_DEFAULT_ROWS * row_h,
+                            int(total * 0.25))))
+        spl.setSizes([max(1, total - spl.handleWidth() - start), start])
 
     def _on_axis_tv_double_click(self, row, col):
         col_name = list(self._axis_tv_cols)[col] if col < len(self._axis_tv_cols) else ""
@@ -6852,6 +7025,22 @@ class CSSLoggerWidget(QWidget):
         if self._table_rows:
             self._plot_xy()
 
+    def _set_xy_info(self, text: str, warn: bool = False):
+        """The line under the XY plot. A "nothing to draw" answer is the only
+        thing on the tab at that moment, so it is written in dark ink instead of
+        the usual grey — otherwise the tab looks like the button did nothing."""
+        self._lbl_xy_info.setText(text)
+        self._lbl_xy_info.setStyleSheet(
+            "color:#8a3b00; font-weight:600;" if warn else "color:#777;")
+
+    def _xy_empty_message(self, n_rows: int) -> str:
+        """Why the cloud has no points. With rows on the table the two chosen
+        channels really are silent; with no rows at all the reason belongs to
+        the table, and it is nearly always the Conditions."""
+        if n_rows:
+            return "No data to plot — neither channel has values in this window."
+        return self._no_rows_message()
+
     def _plot_xy(self):
         try:
             self._plot_xy_impl()
@@ -6862,7 +7051,7 @@ class CSSLoggerWidget(QWidget):
                 self._clear_xy_plot()
             except Exception:
                 pass
-            self._lbl_xy_info.setText("XY plot error — see Log tab.")
+            self._set_xy_info("XY plot error — see Log tab.", warn=True)
 
     def _plot_xy_impl(self):
         x_label = self._xy_x_combo.currentText()
@@ -6870,13 +7059,12 @@ class CSSLoggerWidget(QWidget):
         x_pv    = self._xy_choice_map.get(x_label)
         y_pv    = self._xy_choice_map.get(y_label)
         if not x_pv or not y_pv:
-            self._lbl_xy_info.setText("Select X and Y variables first."); return
+            self._set_xy_info("Select X and Y variables first.", warn=True); return
 
         xs, ys, n_rows = self._xy_pairs(x_pv, y_pv)
 
         if not xs:
-            self._lbl_xy_info.setText(
-                "No data to plot — neither channel has values in this window.")
+            self._set_xy_info(self._xy_empty_message(n_rows), warn=True)
             return
 
         self._clear_xy_plot()
@@ -6891,7 +7079,7 @@ class CSSLoggerWidget(QWidget):
         # and every one keeps a hairline dark edge — overlapping dots stay
         # countable instead of merging into one blob.
         _n = len(xs)
-        _size = 24 if _n < 300 else (12 if _n < 2000 else (6 if _n < 20000 else 3))
+        _size = self._xy_dot_size(_n)
         sc   = ax.scatter(xs, ys, s=_size, alpha=0.85,
                           linewidths=0.3, edgecolors="#00000055",
                           c=range(_n), cmap=_XY_CMAP)
@@ -6906,15 +7094,100 @@ class CSSLoggerWidget(QWidget):
         if layout: layout.addWidget(canvas)
         self._xy_canvas = canvas
         self._xy_figure = fig
+        # What is on screen, so a Live refresh cannot silently swap in a
+        # different pair of channels behind the user's back.
+        self._xy_scatter  = sc
+        self._xy_plotted  = (x_label, y_label, x_pv, y_pv)
+        self._xy_user_zoomed = False
+        self._xy_dirty = False
         self._install_xy_toolbar(canvas)
         canvas.draw()
+        # Record the full view now that it exists, so Home and Back have
+        # somewhere to return to from the very first zoom.
+        self._xy_push_view()
 
         self._xy_rect_selector = RectangleSelector(
             ax, self._on_xy_rect_select, useblit=False, button=3,
             props=dict(alpha=0.2, facecolor="#FF6600"))
 
-        self._lbl_xy_info.setText(
-            f"{_n:,} points plotted (from {n_rows:,} rows).")
+        self._set_xy_info(f"{_n:,} points plotted (from {n_rows:,} rows).")
+
+    @staticmethod
+    def _xy_dot_size(n):
+        """Dot area for a cloud of n points.
+
+        Dense clouds hide their own points, so the dots shrink as the count
+        grows. Shared by the first plot and every live refresh, so a cloud that
+        grows past a threshold while Live is running thins out the same way a
+        freshly plotted one would.
+        """
+        return 24 if n < 300 else (12 if n < 2000 else (6 if n < 20000 else 3))
+
+    @staticmethod
+    def _xy_fit_axes(ax, xs, ys):
+        """Frame the whole cloud with a little air around it."""
+        for setter, vals in ((ax.set_xlim, xs), (ax.set_ylim, ys)):
+            lo, hi = float(min(vals)), float(max(vals))
+            pad = (hi - lo) * 0.05 or (abs(hi) * 0.05 or 1.0)
+            setter(lo - pad, hi + pad)
+
+    def _xy_refresh_live(self):
+        """Keep the XY cloud in step with Live.
+
+        Only the visible tab is redrawn; a hidden one is marked and caught up by
+        _on_main_tab_changed. The figure, canvas, toolbar and colour bar are
+        reused — rebuilding them on every tick would throw away the zoom history
+        and the user's current view a few times a second.
+        """
+        if self._xy_canvas is None or self._xy_scatter is None:
+            return
+        if self._notebook.currentWidget() is not self._tab_xy:
+            self._xy_dirty = True
+            return
+        try:
+            self._xy_update_points()
+        except Exception:
+            import traceback
+            self._log(f"[xy_live]\n{traceback.format_exc()}")
+            self._xy_dirty = False
+
+    def _xy_update_points(self):
+        """Put the current rows into the existing scatter."""
+        plotted = getattr(self, "_xy_plotted", None)
+        if not plotted or self._xy_canvas is None or self._xy_scatter is None:
+            self._xy_dirty = False       # nothing is drawn — nothing to catch up
+            return
+        x_label, y_label, x_pv, y_pv = plotted
+        # The combos may have moved on since; then this is a different plot and
+        # the full path has to run.
+        if (self._xy_x_combo.currentText() != x_label
+                or self._xy_y_combo.currentText() != y_label):
+            self._plot_xy()
+            return
+
+        xs, ys, n_rows = self._xy_pairs(x_pv, y_pv)
+        n  = len(xs)
+        sc = self._xy_scatter
+        ax = self._xy_figure.axes[0]
+        if n == 0:
+            sc.set_offsets(np.empty((0, 2)))
+            self._set_xy_info(self._xy_empty_message(n_rows), warn=True)
+        else:
+            sc.set_offsets(np.column_stack((np.asarray(xs, dtype=float),
+                                            np.asarray(ys, dtype=float))))
+            sc.set_array(np.arange(n))
+            sc.set_clim(0, max(n - 1, 1))
+            sc.set_sizes(np.full(n, self._xy_dot_size(n), dtype=float))
+            self._set_xy_info(f"{n:,} points plotted (from {n_rows:,} rows).")
+            # A zoom is the user's choice of what to look at; only an untouched
+            # view follows the growing cloud. ax.relim() is no use here — it
+            # ignores collections, and a scatter is a collection — so the limits
+            # are taken from the points themselves, with the 5 % air matplotlib
+            # would have left.
+            if not getattr(self, "_xy_user_zoomed", False):
+                self._xy_fit_axes(ax, xs, ys)
+        self._xy_dirty = False
+        self._xy_canvas.draw_idle()
 
     def _xy_pairs(self, x_pv, y_pv):
         """Pair two channels up into (x, y) points.
@@ -6976,16 +7249,32 @@ class CSSLoggerWidget(QWidget):
         lay.addWidget(tb)
         tb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
+        # Same two housekeeping jobs as the main graph's toolbar: drop the
+        # "Customize" dialog, and let the app know when the view stopped being
+        # its own to rescale (see _xy_update_points).
+        for act in list(tb.actions()):
+            if act.text() == "Customize":
+                tb.removeAction(act)
+        for act in tb.actions():
+            if act.text() == "Home":
+                act.triggered.connect(self._on_xy_view_home)
+            elif act.text() in ("Zoom", "Pan"):
+                act.toggled.connect(self._on_xy_toolbar_mode)
+
     def _on_xy_rect_select(self, eclick, erelease):
         if not self._xy_figure or not self._xy_figure.axes: return
         ax = self._xy_figure.axes[0]
         x0, x1 = sorted([eclick.xdata, erelease.xdata])
         y0, y1 = sorted([eclick.ydata, erelease.ydata])
         if x1 - x0 < 1e-12 or y1 - y0 < 1e-12: return
-        # The view being left goes onto the toolbar's history, so its Back and Home
-        # undo a right-drag zoom exactly like one made with the Zoom button.
-        self._on_xy_rect_zoom_push()
+        # BOTH sides of the change go onto the toolbar's history, the way
+        # matplotlib's own Zoom button does it: the view being left so Back can
+        # return to it, and the view being entered so Forward can come back to
+        # here. Pushing only the first left Back and Forward greyed out.
+        self._xy_push_view()
         ax.set_xlim(x0, x1); ax.set_ylim(y0, y1)
+        self._xy_push_view()
+        self._xy_user_zoomed = True
         self._xy_canvas.draw_idle()
 
     def _clean_xy(self):
@@ -7000,7 +7289,7 @@ class CSSLoggerWidget(QWidget):
                     pass
             self._xy_rect_selector = None
             self._xy_canvas.draw_idle()
-            self._lbl_xy_info.setText("XY cleared — points removed.")
+            self._set_xy_info("XY cleared — points removed.")
         else:
             self._clear_xy_plot()
 
@@ -7756,6 +8045,11 @@ class CSSLoggerWidget(QWidget):
             # keep showing the rows the new conditions just discarded.
             if self._samples_by_pv:
                 self._plot_graph()
+            # …and so does the XY cloud. The Conditions button sits on the XY tab
+            # too, and pressing it there used to change everything except the
+            # plot the user was looking at.
+            self._xy_dirty = True
+            self._xy_refresh_live()
 
     # ── Reference lines ──────────────────────────────────────────────────────
 
@@ -8069,6 +8363,8 @@ class CSSLoggerWidget(QWidget):
                 self._refresh_axis_settings_tv()
                 self._populate_table()
                 self._refresh_xy_choices()
+                self._xy_dirty = True
+                self._xy_refresh_live()
 
     # ── Table export ─────────────────────────────────────────────────────────
 

@@ -130,7 +130,7 @@ Judged **only while the array is running at full power**: never during warm-up, 
 | **dropout** | Dark for no more than `Dropout up to` frames, then straight back. A flicker. Counted, never discarded — debouncing is off by default so single-frame flickers survive |
 | **fault** | Dark for longer, **the array kept running**, and it came back. "Not working as it should, but it does come back" |
 | **trip** | Dark for longer and **the array went down within `Trip look-ahead` frames** of it going dark — this pulser took the array with it |
-| **dead** | It could not be recovered: after going dark it failed to light again across `Dead after (recoveries)` array recoveries, or through `Dead after (min)` minutes of time the array spent running. Whichever comes first |
+| **dead** | Two routes, and only these two. Either it went dark and failed to light again across `Dead after (recoveries)` array recoveries — somebody tried to bring it back and it did not come — or it **never lit at all**: dark from the first judged frame and still dark after `Never lit, dead after` minutes of array-up time. A pulser that ran, went dark and then simply stayed dark while nobody ever restarted the array is a **fault**, however long it lasts: it was never asked to come back, so nothing was demonstrated about it |
 
 The line between a fault and a trip is **whether the array fell**, decided by looking forward a bounded number of frames — not by whether an outage happens to overlap the dark run somewhere. That older reading counted a pulser which merely sat dark through someone else's outage as if it had caused one, and reported 47 of them on a day with about eight.
 
@@ -189,8 +189,8 @@ Reference levels are only ever written by **`Capture reference...`**, which asks
 | Dropout up to (frames) | 5 | Dark runs no longer than this are flickers |
 | Trip look-ahead (frames) | 10 | How soon after a pulser goes dark the array must fall for it to be a trip rather than a fault |
 | Trip cause (frames) | 3 | How long a pulser must already be dark, right up to an outage, to be named as its cause — and what separates the array falling over from the array being switched off |
-| Dead after (recoveries) | 3 | Failed recoveries before a dark pulser is called dead |
-| Dead after (min) | 20 | Or minutes of array-up time dark. Whichever comes first. A replacement takes an hour or two, so this band separates "cannot be recovered" from "was swapped out" |
+| Dead after (recoveries) | 3 | Failed recoveries before a dark pulser is called dead. The main route: it ran, it went out, it was restarted this many times and never came back |
+| Never lit, dead after (min) | 20 | The other route, and it applies **only** to a pulser dark from the first judged frame that has never lit since. Minutes of array-up time we must watch before calling that dead rather than "not seen yet". It never applies to a pulser that ran earlier in the window |
 | Outage from (s) | 60 | Below this, no data is a hiccup in the archive rather than the array being down. **The most important setting on the 3.3 Hz stream** |
 | Trigger off up to (s) | 300 | Nothing dark first and back within this: we stopped it ourselves |
 | Diodes off from (min) | 30 | Beyond this, an unexplained or un-cleared stretch is the diodes being left off |

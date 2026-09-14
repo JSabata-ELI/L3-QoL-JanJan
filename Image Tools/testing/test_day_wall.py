@@ -187,6 +187,20 @@ def main():
                    for y in range(0, im.height(), 3)
                    for x in range(0, im.width(), 3))
 
+    def tile_hue_of(wl, i):
+        """Is the tile GREY, or coloured? A palette shows up as red != blue, and
+        nothing else about a tile changes when only its palette does."""
+        pm = wl._tile_pixmap(i, wl._rects[i])
+        if pm is None or pm.isNull():
+            return None
+        im = pm.toImage()
+        spread = 0
+        for y in range(0, im.height(), 3):
+            for x in range(0, im.width(), 3):
+                c = im.pixelColor(x, y)
+                spread = max(spread, abs(c.red() - c.blue()))
+        return spread
+
     def tile_peak(i):
         """Brightest pixel the wall actually PAINTS — measured through the real render
         path rather than a re-implementation of it that could drift."""
@@ -268,7 +282,11 @@ def main():
     check("every tab is a wall — no One frame tab", "One frame" not in titles, str(titles))
     check("the first tab is a camera", titles[:1] == ["C03-040-PTM11WNF"], str(titles))
     check("there is a tab for the camera", "C03-040-PTM11WNF" in titles, str(titles))
-    check("day by day is last", titles[-1] == "Day by day", str(titles))
+    # Day by day is the last WALL; the Detailed view (one frame at a time) sits
+    # after every wall, because it is where you go once the wall has answered.
+    check("day by day is the last wall", titles[-2] == "Day by day", str(titles))
+    check("and the Detailed view is after it",
+          titles[-1].startswith("Detailed view"), str(titles))
     check("no pop-up window class survives",
           not hasattr(_if, "MultiDayPreviewWindow"))
     cam_wall = w._cam_walls["C03-040-PTM11WNF"]
@@ -281,21 +299,30 @@ def main():
     check("the walls share one frame cache",
           cam_wall._raw is w._day_wall._raw is w._wall_shared.raw)
 
-    print("\nday by day: a row per day, tall enough to scroll")
+    print("\nday by day: a row per CAMERA, its days left to right")
     dw = w._day_wall
     dw.resize(900, 500)
     dw._relayout()
-    check("one banner per day", len(dw._row_heads) == len(cells),
+    # One camera over three days: ONE row, three columns. It used to be the
+    # transpose — a row per day — which put every camera of one day on one line.
+    check("one banner per camera", len(dw._row_heads) == 1,
           f"{len(dw._row_heads)}")
-    check("the banner names the day",
-          dw._row_heads[0][1].startswith("Monday") and "10.08.2026" in dw._row_heads[0][1],
+    check("the banner names the camera",
+          dw._row_heads[0][1].startswith("C03-040-PTM11WNF"),
           dw._row_heads[0][1])
+    check("and says how many days its line reaches across",
+          "3 days" in dw._row_heads[0][1], dw._row_heads[0][1])
     check("the wall asks for the height its rows need",
           dw.minimumHeight() >= dw.rows_content_height() > 0,
           f"min {dw.minimumHeight()} vs {dw.rows_content_height()}")
     ys = [dw._rects[i].y() for i in range(len(cells))]
-    check("each day sits below the previous one", ys == sorted(ys) and len(set(ys)) == 3,
-          str(ys))
+    check("the camera's days share one line", len(set(ys)) == 1, str(ys))
+    xs = [dw._rects[i].x() for i in range(len(cells))]
+    check("each day sits beside the previous one",
+          xs == sorted(xs) and len(set(xs)) == 3, str(xs))
+    check("and the tile's own caption names the day, not the camera",
+          dw._caption(dw.cells()[0]).startswith("10.08."),
+          dw._caption(dw.cells()[0]))
 
     print("\npicking one frame and opening it up")
     target = cells[0]["path"]
@@ -325,6 +352,31 @@ def main():
     check("Undo brings the adjustment back",
           w._wall_shared.adj.get(target) is not None)
     w._reset_wall_edits()
+
+    print("\nthe palette follows the marked frame too")
+    # It used to be wall-wide always, on the grounds that one colour must mean one
+    # intensity everywhere. Picking out the one day worth a colour scale is the same
+    # act as opening up its brightness, so it is aimed the same way — and the tile
+    # SAYS it is on its own palette, which is what keeps that honest.
+    grey = [tile_hue_of(cam_wall, i) for i in range(len(cells))]
+    cam_wall.apply_gradient([target], "Jet")
+    tinted = [tile_hue_of(cam_wall, i) for i in range(len(cells))]
+    check("the marked frame took the palette", tinted[0] > (grey[0] or 0) + 20,
+          f"colour spread {grey[0]} -> {tinted[0]}")
+    check("its neighbours kept the shared one", tinted[1:] == grey[1:],
+          f"{grey[1:]} -> {tinted[1:]}")
+    check("and it says so, without claiming to be off the shared brightness",
+          "(own palette)" in cam_wall._caption(cam_wall.cells()[0]),
+          cam_wall._caption(cam_wall.cells()[0]))
+    # A palette of its own must NOT drop the frame back to the raw sliders: the
+    # per-frame render path is only for a frame given its own brightness.
+    adj = cam_wall._shared.adj.get(target) or {}
+    check("a palette alone writes no contrast, brightness or gamma",
+          not any(k in adj for k in ("contrast", "offset", "gamma")), repr(adj))
+    w._reset_wall_edits()
+    check("Reset puts the palette back as well",
+          [tile_hue_of(cam_wall, i) for i in range(len(cells))] == grey,
+          f"{grey} -> {[tile_hue_of(cam_wall, i) for i in range(len(cells))]}")
 
     print("\nturning a frame")
     h0, w0 = wall._raw[target][0].shape[:2]

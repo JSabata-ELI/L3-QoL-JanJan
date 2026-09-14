@@ -431,6 +431,14 @@ Launcher card still opens nothing. Name it after the folder.
       hidden_imports, or the whole package to collect_all, in the
       project's settings file.
 
+  A build ends with "No such file or directory" somewhere in Temp
+      The scratch folder the build was using disappeared while it was
+      still working. Every build now gets its own, named after the
+      program, so two Builder windows can no longer delete each
+      other's; leftovers older than a day are swept on the next
+      build. If it still happens, something outside the Builder is
+      cleaning Temp while a build runs.
+
   A build fails saying it cannot overwrite the version folder
       OneDrive has marked the files read-only. The Builder deletes
       the folder first to avoid exactly this; if it still happens,

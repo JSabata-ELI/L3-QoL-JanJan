@@ -1077,6 +1077,21 @@ def find_camera_folders_bulk(day_root: Path, cams: list[str], log) -> dict[str, 
         log(f"[CPVA] bulk scan ERROR: {e}")
         return found
     
+def fmt_span_ms(ms: float) -> str:
+    """Human readable time span: ms below a second, then s / m s / h m s."""
+    ms = abs(float(ms))
+    if ms < 1000:
+        return f"{ms:.1f}ms"
+    total_s = ms / 1000.0
+    h, rem = divmod(int(total_s), 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{int(total_s * 10) / 10:.1f}s"
+
+
 def find_image_near_click_fast(cam_dir: Path, t_click_ns: int, log=None,
                                 _cache: dict | None = None, _cache_time: dict | None = None,
                                 _cache_ttl: float = 5.0) -> Path | None:
@@ -1128,7 +1143,7 @@ def find_image_near_click_fast(cam_dir: Path, t_click_ns: int, log=None,
 
     dt = time.perf_counter() - t0
     if log:
-        log(f"[FAST] dt={dt:.3f}s delta_ms={abs(best_ts - t_click_ns)/1_000_000:.1f}ms")
+        log(f"[FAST] dt={dt:.3f}s delta={fmt_span_ms(abs(best_ts - t_click_ns)/1_000_000)}")
         log(f"[FAST] best_name={best_name}")
     return cam_dir / best_name
     

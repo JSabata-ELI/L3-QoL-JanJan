@@ -137,44 +137,78 @@ and the build-output folder, so neither is mistaken for a program.
 
 
 =================================================================
-5. THE OLDER-VERSION SWAP
+5. HOW AN OLDER VERSION IS STARTED
 =================================================================
 
 This is the least obvious thing the Launcher does, and worth
 understanding before you use it.
 
-An old starter file cannot simply be run from the archive folder. It
-needs the support folder — the large one with the Python runtime in
-it — and there is only one of those, sitting next to the current
-starter. Copying it per archived version would multiply hundreds of
-megabytes by every version ever kept.
+Each archived starter file is a complete old program: every build
+carries its own code inside that one file — which is why they are
+tens of megabytes each, and a different size per version. What sits
+beside it, the support folder, holds only the Python runtime and the
+shared packages, and those suit every version. So that folder is
+never archived; copying hundreds of megabytes for every version ever
+kept is not an option.
 
-So the Launcher swaps instead:
+An old starter therefore runs the old program correctly — it just
+cannot do it from inside the archive folder, where no support folder
+is to be found.
 
-  1. The current starter (and its source snapshot, if there is one)
-     are MOVED into a temporary folder inside the archive.
-  2. The chosen archived pair is copied into the program folder.
-  3. The old version is started, and the Launcher waits for it to
-     finish.
-  4. When it exits, the current files are moved back — this happens
-     even if the run failed.
+What the Launcher does, in this order:
 
-Two things follow from that:
+  1. If the chosen version already sits in the program folder — the
+     last few builds are usually kept there side by side — it is
+     started where it is. Nothing is moved.
+
+     This is the case that used to fail. The old code moved every
+     starter in the program folder out of the way before the run,
+     including the one it was about to start, and then looked for it
+     where it no longer was.
+
+  2. If the archived version brought its own support folder, or the
+     program is a single-file one that needs none, it is started from
+     the archive folder. Nothing is moved either.
+
+  3. Otherwise the version has to borrow the program folder's support
+     folder, so the folder is swapped for the run:
+
+       a. The current starter and source files are MOVED into a
+          temporary folder inside the archive.
+       b. The archived starter AND its whole source snapshot are
+          copied into the program folder.
+       c. The old version is started, and the Launcher waits for it
+          to finish.
+       d. When it exits, the current files are moved back — this
+          happens even if the run failed.
+
+     The source files go in together with the starter, so the folder
+     never shows an old starter with the newest sources beside it.
+     (Only the main source file used to be copied, which left the
+     folder without its helper files entirely.)
+
+  4. A version that kept only its source files, with no starter, is
+     run with Python. It is staged the same way, because the programs
+     look for their icon, their settings and their picture folders
+     next to their own file.
+
+Two things follow from case 3:
 
   - While an old version is running, the program folder holds the old
-    starter. Anybody else launching that program from the same share
-    at that moment gets the old version. Keep old-version runs short.
+    files. Anybody else launching that program from the same share at
+    that moment gets the old version. Keep old-version runs short.
 
   - If the program is killed rather than closed — the machine is
-    switched off, the process is ended in Task Manager — step 4 never
+    switched off, the process is ended in Task Manager — step d never
     happens and the temporary folder is left behind. The Launcher
     detects that: it refuses to launch that program again, and offers
     to put the current files back. That check runs after every scan,
     and on demand with the broom button.
 
-If the swap cannot be done at all, the Launcher falls back to running
-the source snapshot directly, or to starting the archived file where
-it lies, which may or may not work depending on the program.
+Case 4 needs Python on the computer, and if those sources stop with
+an error the message is shown. Without that they would fail in
+silence: they are started without a console, so nothing would appear
+on screen at all.
 
 
 =================================================================
@@ -191,6 +225,12 @@ archived version exist, and both are accepted:
   archive\<Program> vX.Y.Z__20260101_120000.exe
       The older flat form, with a timestamp in the name. Shown as the
       version followed by the date and time.
+
+A version folder holding only source files is listed too, and is run
+with Python (section 5, case 4).
+
+The folders archive\unknown and archive\_temp_latest are not
+versions and are never listed.
 
 Inside a version folder there is one entry in the list, not one per
 file — a "(2)" duplicate copy is ignored in favour of the canonical
@@ -254,9 +294,16 @@ the list in the source.
 
   Clean (broom)
       Two housekeeping checks, on demand:
-        - version files with a timestamp left sitting in a program
-          folder instead of its archive folder — it offers to move
-          them;
+        - version files that are not where their version lives — it
+          lists each one and offers to tidy them up. Two cases: a
+          starter with a timestamp left sitting in a program folder
+          goes to that program's archive folder; a starter or script
+          lying loose in the archive folder itself, beside the vX.Y.Z
+          folders, goes into its own version folder. If the same file
+          is already filed there, byte for byte, the loose copy is
+          deleted instead. If a file of that name is there but differs
+          in size, both are kept — the newcomer gets a " (2)" suffix,
+          and the plain name still wins in the version list;
         - programs left in a half-finished version swap — it offers
           to restore them.
       Both checks also run by themselves shortly after every scan, so
@@ -324,9 +371,24 @@ Launcher.
       program; you will still see it if you double-click the file in
       Explorer yourself.
 
-  An old version behaves oddly
-      It is running against the current support folder, not the one
-      it was built with. That is the trade-off described in section
-      5. If it will not run at all, the two are too far apart.
+  Picking one of the versions in the program folder did nothing,
+  or said the launch failed
+      That was the old fault, fixed. Those versions are now started
+      where they are.
+
+  Picking an old version says Python is needed
+      That version kept only its source files, and this computer has
+      no Python to run them with. Section 5, case 4.
+
+  An old version stops with an error message
+      Its sources are incomplete — a file it needs was never
+      archived — or they need a package this computer does not have.
+      The message names what was missing.
+
+  An old version still shows the same fault as the newest one
+      Then the fault is not in the program's own code. Settings and
+      shared files are not versioned: what a program keeps in your
+      Windows profile, and what it reads from the share, is the same
+      for every version of it.
 
 -----------------------------------------------------------------

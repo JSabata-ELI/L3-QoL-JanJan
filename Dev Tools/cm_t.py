@@ -1299,7 +1299,17 @@ class DeployGUI(ttk.Frame):
 
     def _log(self, text: str, force_scroll: bool = False):
         target = self._external_log if self._external_log is not None else getattr(self, "log", None)
-        if target is None:
+        # The Builder tab mirrors its own messages into this log, so the two
+        # panes must carry the same text both ways: copy/pack messages are
+        # echoed into the Builder's local log as well, otherwise that pane
+        # stays empty for everything the Copy Manager does on its own.
+        builder_log = None
+        builder = getattr(self, "_builder_ref", None)
+        if builder is not None:
+            builder_log = getattr(builder, "_local_log", None)
+            if builder_log is target:
+                builder_log = None
+        if target is None and builder_log is None:
             return
         if force_scroll:
             # Final reports must always land in view. Nudging the log during a long
@@ -1313,24 +1323,39 @@ class DeployGUI(ttk.Frame):
                     builder._local_log_autoscroll = True
                 except Exception:
                     pass
-        def _append():
+        for w, is_builder in ((target, False), (builder_log, True)):
+            if w is None:
+                continue
+            def _append(w=w, is_builder=is_builder):
+                try:
+                    w.configure(state="normal")
+                    w.insert("end", text + "\n")
+                    if is_builder:
+                        should_scroll = getattr(builder, "_local_log_autoscroll", True)
+                    else:
+                        should_scroll = self._log_autoscroll
+                    if should_scroll:
+                        w.see("end")
+                    w.configure(state="disabled")
+                except Exception:
+                    pass
             try:
-                target.configure(state="normal")
-                target.insert("end", text + "\n")
-                if self._log_autoscroll:
-                    target.see("end")
-                target.configure(state="disabled")
+                w.after(0, _append)
             except Exception:
                 pass
-        try:
-            target.after(0, _append)
-        except Exception:
-            pass
 
     def _clear_log(self):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+        # Both panes show the same text, so Clear empties both.
+        builder = getattr(self, "_builder_ref", None)
+        for w in (self.log, getattr(builder, "_local_log", None)):
+            if w is None:
+                continue
+            try:
+                w.configure(state="normal")
+                w.delete("1.0", "end")
+                w.configure(state="disabled")
+            except Exception:
+                pass
 
     def _on_log_scroll(self, event=None):
         self.after(50, self._check_log_position)

@@ -47,7 +47,7 @@ import it here.
 | plotting | `matplotlib` — the Agg and Qt backends, `Figure`, `GridSpec`, … |
 | imaging | `PIL` / Pillow, including `ImageTk`, `ImageGrab` and the `PIL._imaging` C extension |
 | other | `screeninfo`, `orjson`, `requests`, `dateutil` |
-| optional, in `try/except ImportError` | `xlwt`, `tkcalendar`, `epics`, `win32com.client` + `pythoncom` |
+| optional, in `try/except ImportError` | `xlwt`, `tkcalendar`, `epics`, `win32com.client` + `pythoncom`, `win32crypt` (Diagnostic's DPAPI lock — also in the spec's `hiddenimports`, because the deploy deletes the copy Diagnostic's own build makes) |
 
 The optional ones are wrapped so a machine without them can still produce a bundle
 — just one missing that library.

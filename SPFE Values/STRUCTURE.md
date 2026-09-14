@@ -790,6 +790,15 @@ PV from a row renames its log column (`dazz1_1` → `dazz1`), which nothing in t
 program can guess. It backs up every file it rewrites and is safe to run twice.
 Any future change of that kind needs its own script.
 
+It grew two more steps on 7.9.2026, when the dazzler was found to be **DAZZ2**:
+the 51 recorded values move `dazz1` → `dazz2`, and are multiplied by 100,
+because the channel archives the percentage as a fraction (`0.331` = 33.1 %) and
+the row now carries `"scale": 100`. `scale` is the one field-file setting that
+changes what is WRITTEN rather than only what is shown — applied once, in
+`fetch_moment` — so it splits the log into before and after unless the old
+values are scaled with it. The scaling step leaves anything above 1.5 alone,
+which is what makes a second run harmless.
+
 `test_spfe_store`'s formatting checks build their own `Row` objects instead of
 reading the shipped field file: the rounding steps and the units there are the
 operator's to change, and a test that pins them stops them from being changed.

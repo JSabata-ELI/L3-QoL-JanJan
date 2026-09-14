@@ -81,7 +81,12 @@ THE TABS
                  one's last known value is held until the other
                  reports; a value that has gone stale stops counting.
                  The colour says how far through the period a point
-                 is, running from dark blue to red.
+                 is, running from dark blue to red. In Live mode the
+                 cloud grows on its own, and Conditions thin it out
+                 straight away — the same rows the Table and the Graph
+                 use. Once you have zoomed in, the view stays where
+                 you put it; press the house button to let it follow
+                 the cloud again.
   PV Time Plot   the daily pattern of one value: one shape per day
                  showing how the shots were spread, read straight
                  from the archive for the days you pick.
@@ -94,10 +99,15 @@ IN THE GRAPH
   Move the mouse   a crosshair with the time and the value of every
                    visible signal.
   Drag with the    statistics for that interval: count, average,
-  left button      spread, smallest, largest, peak to peak. The blue
-                   band and its numbers stay put through a redraw, a
-                   reload or a change of settings; "Clear selection"
-                   removes them.
+  left button      spread (Std), smallest, largest, and the distance
+                   from smallest to largest (P-P). The average, the
+                   smallest and the largest are in the signal's own
+                   units; the two that describe the scatter are given
+                   as a percentage of the average, which is how a
+                   shot is judged — 7 % says more than 0.07 does. The
+                   blue band and its numbers stay put through a
+                   redraw, a reload or a change of settings; "Clear
+                   selection" removes them.
   Drag with the    zoom in on that stretch of time.
   right button
   F11              the graph in its own window; Ctrl+F11 fullscreen.
@@ -126,7 +136,13 @@ IN THE GRAPH
                     moved up and down the list or deleted.
   Conditions        keep only the rows where chosen values are inside
                     a range. Everything outside is dropped from the
-                    table, the graph and the export.
+                    table, the graph, the XY plot and the export. The
+                    same button sits on the XY and Table tabs and does
+                    the same thing from all three.
+                    Over an hour when the laser was off, every row can
+                    fail — the table and the XY plot then say so, name
+                    the conditions and count what was thrown away, so
+                    an empty screen is never mistaken for lost data.
   Add custom PV     a new signal computed from the loaded ones with a
                     formula.
   Graph settings    fonts, spacing, time stamps, margins, and a few
@@ -135,6 +151,9 @@ IN THE GRAPH
   Below the graph, one row per signal: show, name, colour, the value
   under the cursor, the vertical range, autoscale, line width, line
   style, point style, point size, transparency, smoothing and grid.
+  It opens on about four rows and the graph keeps the rest of the
+  height; drag the grey bar between them to see more rows, and the
+  program will not move it back.
   Grid can be ticked for as many signals as you like: each one gets
   its own grid, in its own colour and its own kind of line — solid,
   dashed, dotted, dash-dot and so on — so several can be read apart

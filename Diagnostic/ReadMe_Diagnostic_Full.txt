@@ -387,7 +387,11 @@ The commands themselves:
 | `/window <minutes>` | time window of that live graph |
 | `/yaxis <lo-hi>`, `/yaxis auto` | Y range of that live graph |
 | `/run` | belongs to the always-on listener, which starts the app when it is closed. The app answers it too, so that when the listener is not running the reply is "Diagnostika uz bezi" and not "unknown command" |
-| `/food [when][; language]` | the canteen menu from OKbase. No argument = today until 14:30 and the next serving day after that (`/food today` overrides it); `week`, `next week`, `tomorrow`, a weekday name (`friday`), or a date (`27.8.`, `2026-08-27`). `; cz` or `; en` picks one language, otherwise both are shown. `/food refresh` reads the portal again on the spot; `/food status` says what is saved, what it is doing and whether the sign-in still works. `/menu` and `/lunch` are the same command |
+| `/food [when][; language]` | the canteen menu from OKbase. No argument = today until 14:30 and the next serving day after that (`/food today` overrides it); `week`, `next week`, `tomorrow`, a weekday name (`friday`), or a date (`27.8.`, `2026-08-27`). `; cz` or `; en` picks one language, otherwise both are shown. Every one of these reads OKbase on the spot (a second or two) and falls back to the saved copy, saying so, if the portal does not answer. `/food refresh` is the same read answered with today; `/food status` says what is saved, what it is doing and whether the sign-in still works. `/menu` and `/lunch` are the same command |
+| `/food order <day> [soup N] [main N] pin:<code>` | sign up for that day's lunch, spending one of your one-time codes. The numbers are the ones printed under each course in the menu reply; a bare number means the main course, so `/food order friday 1 pin:bakoli` is the usual form. `/food order friday` with no number prints Friday's list instead of ordering anything, and needs no code. Czech day and course words work too, and the label may be written `pin:`, `pw:`, `heslo:`, `kod:` or `code:` |
+| `/food order <day> [soup N] [main N] pin:<code>` on a booked day | re-orders it course by course: what you name is swapped, what you do not name stays. `soup 2` on a day holding soup 1 and main 2 leaves the main alone; `main 0` takes the main off and keeps the soup. Asking for exactly what is already there changes nothing and costs no code. `change`, `instead`, `změnit` and `místo` all mean the same as `order` |
+| `/food cancel <day> pin:<code>` | cancel that day's lunch altogether — the whole day, not one course |
+| `/food orders` | what is ordered, from today on, out of the saved copy |
 
 The rendered plot goes to **every** enabled channel, not only to the chat: Webex
 rooms get the PNG, e-mail gets it as an attachment, Teams gets the text (an
@@ -482,6 +486,17 @@ day it is showing — and any day asked for by name (`/food today`, `/food 27.8.
 to be a label at the end of every line, which put the word "soup" exactly where
 the eye looks for the price.
 
+**What you have ordered is marked** with a ✅ in front of the name, so `/food`
+on its own already answers "and what am I having". In front rather than after
+the price, because the number and the mark then sit together at the start of the
+line where the eye already is — after the price it ends up in the middle of the
+line as soon as a phone wraps it. The mark follows the meal's own number in the
+portal and not its name, so a dish that appears on two days is never marked on
+the wrong one, and a day already collected is marked like any other: it is what
+was ordered. If the saved copy is too old to carry those numbers, or holds an
+order for a meal that is not on it, a line underneath says so — that is never
+allowed to read as "nothing ordered".
+
 The canteen puts the Czech and the English name into a **single field**,
 separated by a slash — sometimes, in either order, and often with one of them
 missing. `split_languages()` therefore decides which half is which by Czech
@@ -490,6 +505,83 @@ look Czech ("Řízek vepřový/kuřecí" is one dish, not two languages). The Cz
 name is shown with the English one on its own indented line under it; `; cz` and
 `; en` narrow it to one. A meal that only has one language is shown either way —
 a blank line where lunch should be would be worse than the wrong language.
+
+**Signing up for lunch, and off it.** `/food order friday 1` signs you up for
+main course 1 of Friday's list, `/food order friday soup 2 main 1` adds a soup,
+and `/food cancel friday` clears that day. The numbers are the ones printed
+under each course, so the sequence is: read the menu, then pick out of it. A
+number on its own means the main course, because that is what nearly every
+order is. `/food order friday` with no number prints Friday's list rather than
+guessing. `/food orders` lists what is ordered from today on.
+
+Three things about it are deliberate, and each of them is the answer to a way
+this could go wrong:
+
+*Ordering needs a one-time code, and by default nothing else.* Settings →
+Canteen menu → **Ordering codes** hands you a hundred; until then no order is
+accepted at all, and reading the menu is unaffected. Which account the order
+arrives from does not matter, so a shared mailbox works as well as a personal
+address — **Restrict ordering to** is there if you do want it tied to
+particular senders, and empty (the default) means anybody with a valid code.
+That is a deliberate trade: a list of addresses to keep in step with the way
+lunch actually gets ordered is a lock that mostly locks its owner out, and it
+buys little, because a code is good once and only ever appears in the chat
+inside the very message that spends it — there is no moment at which a
+bystander could read one and still use it.
+
+*An order already placed is re-ordered course by course, not replaced.* A
+command names the courses it means and says nothing about the others, so
+`soup 2` on a day holding soup 1 and main 2 moves the soup and leaves the main
+where it is. Replacing the whole day instead would drop a meal the person never
+mentioned — which is why `0` exists: `main 0` is how you say "and no main
+course", and `cancel` drops the day altogether.
+
+The one command still turned away is the one that asks for exactly what is
+already there. Nothing is sent, no code is spent, and the reply names what is
+on the day plus that day's menu — because a save would be a no-op and a spent
+code would be a real loss.
+
+*A code plus a meal is an order however it is worded.* `/food friday main 1
+pin:bakoli` — no `order` in it — used to come back as the menu, which looks
+exactly like success and ordered nothing. Nobody types a one-time code to read
+a menu, so a code together with a named meal is now read as an order. A code
+with no meal, or a meal with no code, is still just the menu.
+
+*Why one-time codes and not a password.* A chat keeps every message for ever, so
+a password typed into one stays readable to everybody who can see it — and after
+its first use it protects nothing at all. A one-time code has no such problem:
+each works once, is then struck off the list, and the code left behind in the
+chat is already spent. The words are made up out of syllables (`bakoli`,
+`severu`) rather than taken from a dictionary, because there are only a few
+thousand common words and a hundred of them being live would make guessing far
+too easy; and they still read and type like a word, which a string of digits
+does not.
+
+The list is shown once. Copy it out or save it to a file and keep it where you
+will have it when you want lunch. Only fingerprints are stored, so it can never
+be displayed again and cannot be recovered from the settings file. Making a new
+list replaces the old one; neither that nor losing the list ever touches orders
+already placed.
+
+*A mistake costs no code.* A code is used up only at the moment the portal is
+really being asked to change something — so a day that turns out to be closed, a
+meal number that does not exist, or a day with no menu all cost nothing. From
+ten codes down, every successful order says how many are left.
+
+*Looking is not changing.* `/food order friday` with no meal named prints that
+day's list and asks for nothing — `/food friday` shows the same thing to anybody
+anyway, so putting a password in front of it would be theatre.
+
+*The closing time is never worked out from the clock.* The canteen closes a day
+around 10:00 that morning, but in practice sometimes earlier. So the portal is
+asked whether the day is still open, at the moment of ordering, and a refusal
+from it is passed on in its own words rather than translated into a guess.
+
+*The reply names what the portal ended up holding*, not what was asked for: the
+day is read back after saving. The portal's save takes the whole displayed week
+at once, so this is also how the program proves it did not disturb the other
+days — which is the one mistake here that would cost somebody their lunch, and
+the reason the offline test asserts it on every path.
 
 **Setting it up: one button.** For a Microsoft single-sign-on account no program
 can pass the authenticator prompt — that is the whole point of it — so the
@@ -545,6 +637,17 @@ From a shell, when the app will not start (in the `Diagnostic` folder):
 | `python okbase_menu.py --check` | **is the saved sign-in still good?** Says alive / signed out / portal unreachable, and what the saved menu covers |
 
 `--check` exists because the question kept being answered by guessing.
+**A sign-in that works is kept straight away.** "Read the menu now" tests
+whatever is in the fields, not what is saved — that is the point of it, so a
+sign-in can be checked before being kept. But once the answer comes back
+*"The sign-in works"*, it is written to the settings file there and then, and
+the note beside the button says **"The sign-in works. Saved."** Until 2026-09-10
+it was only in the text box until the whole dialog was confirmed with **Save**,
+and that produced the one fault nobody can work out from the outside: this
+window saying the sign-in works while the bot — and the always-on listener,
+which never sees this window — went on insisting it had expired. Everything else
+in the dialog still waits for Save as before.
+
 **Rebuilding Diagnostic does not lose the sign-in** — it is kept for the Windows
 account, not inside the program, so every build reads the same one.
 
@@ -557,6 +660,8 @@ Settings → **Canteen menu (/food)**:
 | Browser session | the borrowed sign-in itself. Filled in by the two buttons; it is kept as a field because typing a `Cookie` line in by hand is the one route that always works. All of it, not just `JSESSIONID`: the company sign-on cookie in there is what lets the portal mint a new session on its own, which is the difference between signing in once and signing in daily |
 | Sign in with Edge / Paste sign-in from clipboard | the two routes above |
 | Work account | the work address the canteen portal knows you by, e.g. `name@company.com`. Used only by **Sign in with Edge**, to answer Microsoft's "Pick an account" for you. With two work accounts on one PC that question is always asked and only one answer works, so this is what turns the button into a five-second, no-click sign-in. Empty = the window waits for you to pick |
+| Restrict ordering to | **Optional.** Chat addresses allowed to use `/food order` and `/food cancel`; **empty (the default) means anybody with a valid ordering code**, so lunch can be ordered from a shared mailbox as well as from your own. Fill it in — several, comma-separated — only if you want ordering pinned to particular senders. A sender turned away is told which address was seen, so it can be copied in from there |
+| Ordering codes | the button hands you **100 one-time codes**, shown that once only, and says how many are still unused. Every order or cancellation has to carry one, written on the command as `pin:bakoli`; it then stops working. **No codes = no order is accepted at all.** Only fingerprints are stored, so the list can never be shown again or recovered from the file — copy it out or save it to a file and keep it on your phone. A new list replaces the old one, and neither that nor losing the list affects orders already placed |
 | Read after (hour) | the menu is read at most once a day, past this hour |
 | Keep sign-in alive (min) | how often the sign-in is touched so it does not expire from disuse — default 10 min. One tiny request each time. **This is what makes it last:** a web session dies of being unused, so without it the borrowed sign-in would be good for one server-side timeout (often half an hour) and would have to be redone every morning |
 | OKbase address | leave empty for the default |
@@ -577,15 +682,24 @@ One file, read by every build, by a source run, and by the always-on listener.
 What travels to the share is the menu itself, as `menu_cache.json` — written next
 to the shared PV list, and also to `%APPDATA%\Diagnostic\`.
 
-That cache is the whole point. The menu changes at most once a day, so the bot
-does not need a live OKbase session to answer, and the **always-on listener**
-can answer `/food` with the app closed by reading the same file. The listener
-stays quiet while the app is running, so a question never gets two answers.
+**Every reading `/food` asks the portal first** (`_freshen_then_reply` in the
+app, `_fresh_cache` in the listener) and answers from what comes back. It costs
+a second or two, and it is worth it: the menu is still being edited during the
+morning, an order placed on it is resolved against the portal's own numbering,
+and the day can close at no fixed time. If that read fails — portal down,
+sign-in expired, credentials that do not decrypt on this Windows account — the
+saved copy answers instead and **says so**: when it was read, and why it could
+not get newer.
 
-Every reply says when the menu was read. If the cache is more than about a day
+That cache is the other half. The menu is fetched once a calendar day on its
+own and written to disk, so the **always-on listener** can answer `/food` with
+the app closed even when the live read is not possible. The listener stays
+quiet while the app is running, so a question never gets two answers.
+
+Every reply says when the menu was read. If the copy is more than about a day
 old, or if it simply does not cover the day asked about, the reply says so —
-it never shows another day's food instead. `/food refresh` reads the portal
-again immediately.
+it never shows another day's food instead. `/food refresh` is the same live
+read, answered with today.
 
 One timer does two jobs, because they have nothing else in common: the **menu**
 is fetched at most once a calendar day, while the **sign-in** is touched on every

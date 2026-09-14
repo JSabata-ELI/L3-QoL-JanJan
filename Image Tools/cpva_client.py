@@ -899,11 +899,17 @@ _WARM_MAX_WORKERS = max(1, _POOL_SIZE // 2)
 
 
 def warm_days(channels: "Iterable[str]", date_keys: "Iterable[str]",
-              *, today_ttl: float = 3.0, timeout: float = DEFAULT_TIMEOUT) -> None:
+              *, today_ttl: float = 3.0, timeout: float = DEFAULT_TIMEOUT,
+              on_done=None) -> None:
     """Pre-load the day cache for channels × date_keys in parallel (bounded by
     _WARM_MAX_WORKERS). Fetch failures are counted and swallowed — this is
     best-effort warm-up and per-item calls will surface/retry them — but only
-    CpvaError is: a programming error in here must not stay invisible."""
+    CpvaError is: a programming error in here must not stay invisible.
+
+    on_done(channel, date_key, done, total) is called as each channel-day lands, from
+    a worker thread. It is what lets a caller show how far a warm-up of a hundred
+    channel-days has got: without it the whole block is one silent wait, which is how
+    a search of one day came to look like a program that had stopped."""
     jobs = [(ch, dk) for ch in dict.fromkeys(channels) for dk in dict.fromkeys(date_keys)]
     if not jobs:
         return
@@ -914,9 +920,20 @@ def warm_days(channels: "Iterable[str]", date_keys: "Iterable[str]",
         except CpvaError:
             _stat_bump("warm_failures")
 
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(_WARM_MAX_WORKERS, len(jobs))) as ex:
-        list(ex.map(_one, jobs))
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    total = len(jobs)
+    with ThreadPoolExecutor(max_workers=min(_WARM_MAX_WORKERS, total)) as ex:
+        futs = {ex.submit(_one, j): j for j in jobs}
+        done = 0
+        for fut in as_completed(futs):
+            done += 1
+            if on_done is not None:
+                ch, dk = futs[fut]
+                # A reporting mistake must not abort a warm-up that is working.
+                try:
+                    on_done(ch, dk, done, total)
+                except Exception:
+                    pass
 
 
 def peek_day(channel: str, date_key: str) -> "DayResult | None":

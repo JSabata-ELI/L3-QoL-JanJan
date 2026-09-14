@@ -178,6 +178,33 @@ exercise almost everything in the folder between them.
       missing from this file, or the build machine did not have the
       library installed (check the optional four in section 2).
 
+      A library that is PURE PYTHON is not the shared folder's job:
+      it is compiled into each program's own .exe. Only libraries
+      with compiled parts (.pyd / .dll) and their data files live in
+      the shared folder, and only those can go missing this way.
+
+  A deployed program cannot find one of its OWN files
+      Deploy Libraries does not only overwrite the shared folder — it
+      also DELETES everything in the destination that the shared one
+      does not have. So a file a program's own build put into its
+      _internal is gone the moment the button is pressed, and it can
+      never be put back from here, because this folder is shared by
+      every program.
+
+      A program must therefore not read its own .py or data files out
+      of _internal. Compile them into the .exe (build_config.json ->
+      hidden_imports) or read them from beside the .exe, which is
+      where the deploy copies them. This is what happened to the CSS
+      Logger's calendar (daypicker.py) in September 2026.
+
+  A program's own build has a .pyd the shared folder lacks
+      Then Deploy Libraries breaks that program, silently if the
+      import is wrapped in try/except. Add the import to
+      _internal_builder.py AND to the hiddenimports list at the top
+      of _internal_builder.spec (the spec is what Dev Tools actually
+      builds with), then rebuild and redeploy. That was the case with
+      win32crypt, which Diagnostic locks its saved passwords with.
+
   A deployed program fails inside numpy or scipy
       Almost certainly the missing-DLL case from section 3.1. The
       bundle was built from the command line instead of the spec.

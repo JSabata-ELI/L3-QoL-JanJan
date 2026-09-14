@@ -112,7 +112,8 @@ TYPING INTO THE TABLE
   exactly as they were. Emptying a cell clears that number and nothing else.
 
   The numbers are shown rounded, because that is how they are read: X and Y to
-  the nearest ten, SUM to the nearest hundred, the Dazzlers to whole percent.
+  the nearest ten, SUM to the nearest hundred. The dazzler percentage is not
+  rounded - it moves in tenths, and to whole percent every reading came out 0.
   The log file always keeps the exact measured value.
 
   Typing into a column that says nothing was recorded - every column of a day
@@ -133,7 +134,9 @@ Record now
   at any time of day - that is what it is for.
 
 < Previous / Next > / Today
-  Which day the table shows.
+  Which day the table shows. The two step buttons walk over Saturdays and
+  Sundays - nothing is recorded then, so stepping into a weekend only shows an
+  empty table. A weekend is still reachable: pick it in View day.
 
 View day
   A window listing every day that has been recorded, with the table beside it.
@@ -232,21 +235,27 @@ BEFORE IT CAN SHOW EVERYTHING
 -----------------------------
 
 Five quantities still have no PV: Pumplaser DAC, humidity, oscillator power,
-oscillator bandwidth and DAZZ2. The archiver has no channel with pump, dac,
-humid, osc or dazz in its name, so somebody has to point at the right ones.
-Open spfe_fields.json next to the program and put the PV name into the "pvs"
-list of the quantity. Until then those cells show a dash; everything else works.
+oscillator bandwidth and DAZZ1. The archiver has no channel with pump, dac,
+humid or osc in its name, so somebody has to point at the right ones. Open
+spfe_fields.json next to the program and put the PV name into the "pvs" list of
+the quantity. Until then those cells show a dash; everything else works.
 
 Two more things in the same file are worth a look:
-  - DAZZ1 reads L3-SPFE-AOD03-002 Power_RB. That is the only dazzler the
-    archiver knows. A dazzler has one percentage, not two: the second number
+  - DAZZ2 reads L3-SPFE-AOD03-002 Power_RB. That is the only dazzler the
+    archiver knows, and it is DAZZ2 - until 7.9.2026 the program read it into
+    the DAZZ1 row, and the days recorded before then were moved across. The
+    channel archives the percentage as a fraction, 0.33 for 33 %, so the row
+    has "scale": 100. A dazzler has one percentage, not two: the second number
     the table used to show, labelled "intensity", was a guess and is gone.
   - The Energy row has no unit yet. Put it in its "unit" and it appears in the
     Detail column.
 
 Also in that file:
   - "round" is the step each number is shown to - 10, 100, 1. Change it there,
-    not in the program.
+    not in the program. 0 leaves the number alone.
+  - "scale" multiplies what the PV gives, for a channel whose unit is not the
+    unit of the row - the dazzler's 0.33 becomes 33 %. Unlike "round" it does
+    change what goes into the log, and it does not touch days already recorded.
   - "default_from" on the Spider settings and the best GDD is the first day
     those numbers count for. Days before it are left empty, because nobody
     wrote those settings down then; they can still be typed in by hand. Take

@@ -374,6 +374,13 @@ DEFAULT_SETTINGS = {
     # them is the one the portal knows — so without this the automatic sign-in
     # stops on a question nobody is watching for.
     "okbase_account": "",
+    # Webex addresses allowed to ORDER lunch, not just read the menu. Empty
+    # means nobody: the sign-in is one person's, so an order placed with it
+    # spends that person's money, and a Webex room is a shared place.
+    "okbase_order_emails": [],
+    # The unused single-use ordering codes, as one salt plus a fingerprint each
+    # (see okbase_menu.new_order_codes). Empty = no order is accepted.
+    "okbase_order_codes": {},
     "okbase_session_cookie": "",    # browser JSESSIONID, for Microsoft sign-in
     "okbase_canteen_id": "",        # blank = 1, the canteen this site uses
     "okbase_user_id": "",           # the portal wants it in the query; from a capture
@@ -409,7 +416,8 @@ SHARE_LOCAL_ONLY_KEYS = (
     "okbase_enabled", "okbase_base_url", "okbase_username", "okbase_password",
     "okbase_session_cookie", "okbase_canteen_id", "okbase_user_id",
     "okbase_filter", "okbase_timeout_s", "okbase_refresh_hour",
-    "okbase_keepalive_min", "okbase_account",
+    "okbase_keepalive_min", "okbase_account", "okbase_order_emails",
+    "okbase_order_codes",
 )
 
 
@@ -3419,6 +3427,55 @@ class SettingsDialog(QDialog):
             "Leave it empty and the window stops on 'Pick an account' and waits "
             "for you.")
         ff.addRow("Work account", self.okbase_account)
+        self.okbase_order_emails = QLineEdit(", ".join(
+            s.get("okbase_order_emails") or []))
+        self.okbase_order_emails.setPlaceholderText(
+            "empty — anybody with a valid ordering code")
+        self.okbase_order_emails.setToolTip(
+            "Optional. Leave it empty and any sender who writes a valid "
+            "one-time code may order — the code is the protection, and that is "
+            "the point of it: lunch gets ordered from more than one account "
+            "(a shared mailbox as well as your own), and a list of addresses "
+            "to keep in step with that is a lock that mostly locks its owner "
+            "out.\n\n"
+            "It costs little: a code is good once, and it only ever appears in "
+            "the chat inside the very message that spends it, so there is no "
+            "window in which somebody could read one and use it.\n\n"
+            "Fill it in — several addresses, comma-separated — only if you do "
+            "want ordering pinned to particular senders. A sender turned away "
+            "is told which address was seen, so it can be copied in from "
+            "there.")
+        ff.addRow("Restrict ordering to", self.okbase_order_emails)
+        codes_row = QWidget()
+        codes_lay = QHBoxLayout(codes_row)
+        codes_lay.setContentsMargins(0, 0, 0, 0)
+        self.okbase_codes_note = QLabel("")
+        self.okbase_codes_note.setStyleSheet("color:#333;")
+        self._show_codes_left(okbase_menu.codes_left(s))
+        self.btn_okbase_codes = QPushButton("Make a new list of 100 codes")
+        self.btn_okbase_codes.setStyleSheet(_BTN_PLAIN)
+        self.btn_okbase_codes.setToolTip(
+            "Every `/food order` and `/food cancel` has to carry one of these "
+            "codes, written on the command as `pin:yourcode`. Each one works "
+            "once and is then struck off the list, so the code left behind in "
+            "the chat is already spent — which is the point: a chat room keeps "
+            "every message for ever, and a fixed password typed into one "
+            "protects nothing after its first use.\n\n"
+            "Reading the menu never asks for a code.\n\n"
+            "The codes are shown once, here, and only their one-way "
+            "fingerprints are stored — nothing can turn the saved file back "
+            "into them, not even this program. Keep the list where you will "
+            "have it when you want lunch, a note on your phone for instance.\n\n"
+            "Making a new list REPLACES the old one: every code from it stops "
+            "working.")
+        self.btn_okbase_codes.clicked.connect(self._okbase_make_codes)
+        # Button first, then the count. The other way round the label's own
+        # width pushed the button off to the right and the two overlapped —
+        # the count is short and the button is the thing being reached for.
+        codes_lay.addWidget(self.btn_okbase_codes)
+        codes_lay.addWidget(self.okbase_codes_note)
+        codes_lay.addStretch(1)
+        ff.addRow("Ordering codes", codes_row)
         self.okbase_signin_note = QLabel("")
         self.okbase_signin_note.setWordWrap(True)
         self.okbase_signin_note.setStyleSheet("color:#555;")
@@ -3908,6 +3965,92 @@ class SettingsDialog(QDialog):
                                 f"{err}.\n\n" + "\n".join(lines))
         self._verify_okbase("Sign-in taken from the browser. Checking it…")
 
+    def _show_codes_left(self, left: int):
+        # Short on purpose: it sits beside the button, and what "none" means is
+        # in the button's tooltip and in what the bot answers.
+        self.okbase_codes_note.setText(f"{left} unused" if left else "none yet")
+
+    def _okbase_make_codes(self):
+        """Make a fresh list of one-time ordering codes and show it once.
+
+        Saved straight away rather than on OK: the codes cannot be shown a
+        second time, so a person who copied them down and then closed the
+        dialog with Cancel would be holding a list that works — or, worse, a
+        list that does not, with no way to tell which.
+        """
+        left = okbase_menu.codes_left(okbase_menu.load_user_settings())
+        if left and QMessageBox.question(
+                self, "New list of ordering codes",
+                f"There are still {left} unused codes.\n\n"
+                "Making a new list replaces them: every code on the old list "
+                "stops working. Carry on?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        words, blob = okbase_menu.new_order_codes()
+        problem = okbase_menu.save_user_settings({"okbase_order_codes": blob})
+        if problem:
+            QMessageBox.warning(self, "Ordering codes",
+                                f"The new list could not be saved: {problem}")
+            return
+        self._win.settings["okbase_order_codes"] = blob
+        self._show_codes_left(len(words))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ordering codes — shown only once")
+        # Painted, not inherited. This window is the one place where unreadable
+        # text costs real trouble: the codes are shown once and copied down by
+        # hand, and this PC is in Windows dark mode, so anything left to the
+        # theme comes out light-on-light or black-on-black somewhere.
+        dlg.setStyleSheet("QDialog{background:#f3f3f3;} QLabel{color:#111111;}")
+        lay = QVBoxLayout(dlg)
+        head = QLabel(
+            f"{len(words)} codes. Each works once, then it is struck off.\n"
+            "Write one on the command as  pin:bakoli\n\n"
+            "Keep them where you will have them when you want lunch — a note "
+            "on your phone. They cannot be shown again.")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        box = QPlainTextEdit("\n".join(words))
+        box.setReadOnly(True)
+        # Explicit ink on explicit paper: this dialog is a child of the app,
+        # whose stylesheet is light, but a read-only box left to the theme is
+        # where grey-on-grey shows up.
+        box.setStyleSheet("background:#ffffff; color:#111111;"
+                          "font-family:Consolas,monospace; font-size:11pt;")
+        box.setMinimumSize(320, 420)
+        lay.addWidget(box, 1)
+        row = QHBoxLayout()
+        copy = QPushButton("Copy all")
+        copy.setStyleSheet(_BTN_PLAIN)
+        copy.clicked.connect(
+            lambda: QApplication.clipboard().setText("\n".join(words)))
+        row.addWidget(copy)
+        save = QPushButton("Save to a file")
+        save.setStyleSheet(_BTN_PLAIN)
+        save.clicked.connect(lambda: self._save_codes_to_file(words))
+        row.addWidget(save)
+        row.addStretch(1)
+        done = QPushButton("Done")
+        done.setStyleSheet(_BTN_PLAIN)
+        done.clicked.connect(dlg.accept)
+        row.addWidget(done)
+        lay.addLayout(row)
+        dlg.exec()
+
+    def _save_codes_to_file(self, words: list[str]):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save the ordering codes",
+            str(Path.home() / "ordering codes.txt"), "Text (*.txt)")
+        if not path:
+            return
+        try:
+            Path(path).write_text("\n".join(words) + "\n", encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Ordering codes",
+                                f"Could not write that file: {exc}")
+
     def _okbase_paste_signin(self):
         """Read a sign-in off the clipboard — a Cookie line or a copied cURL."""
         text = QApplication.clipboard().text()
@@ -3947,6 +4090,46 @@ class SettingsDialog(QDialog):
                          args=(sig, self._okbase_trial()),
                          daemon=True, name="okbase-verify").start()
 
+    def _keep_working_signin(self) -> bool:
+        """Save the sign-in that has just been PROVED to work. Returns saved?
+
+        Why this exists. The two sign-in buttons only ever filled the text box,
+        and nothing reached the disk until the whole dialog was confirmed with
+        Save. That produced the one state nobody can debug: a sign-in that works
+        sitting in a text box, the expired one still on disk, and the bot — and
+        the always-on listener, which never sees this dialog at all — insisting
+        the sign-in has expired while this window says "The sign-in works."
+
+        Only the sign-in and the three things a paste carries with it are
+        written. Everything else the operator may have typed still waits for
+        Save, which is what `write=False` on the verify job was protecting: a
+        cancelled dialog must not rewrite the settings. A working sign-in is not
+        in that category — it is a fact the program just established, and there
+        is no version of "the operator might not have meant it".
+        """
+        cookie = self.okbase_cookie.text().strip()
+        if not cookie:
+            return False
+        food = {"okbase_session_cookie": encrypt_secret(cookie)}
+        if getattr(self, "_pasted_user_id", ""):
+            food["okbase_user_id"] = self._pasted_user_id
+        if getattr(self, "_pasted_canteen_id", ""):
+            food["okbase_canteen_id"] = self._pasted_canteen_id
+        if getattr(self, "_pasted_filter", None):
+            food["okbase_filter"] = self._pasted_filter
+        problem = okbase_menu.save_user_settings(food)
+        if problem:
+            QMessageBox.warning(
+                self, "Canteen sign-in",
+                f"The sign-in works, but saving it failed:\n{problem}\n\n"
+                "Press Save to keep it.")
+            return False
+        self._win.settings.update(food)
+        # And tell the running app, so the bot stops repeating a verdict that
+        # is no longer true. This is the other half of the same confusion.
+        self._win._menu_signin_recovered()
+        return True
+
     def _on_okbase_verified(self, result):
         cache, err = result
         self._okbase_busy(False, "")
@@ -3956,7 +4139,8 @@ class SettingsDialog(QDialog):
             meals = got.get(day.isoformat()) or []
             preview = "\n".join(f"  {m.name} — {m.price}" if m.price
                                 else f"  {m.name}" for m in meals)
-            self._okbase_note("The sign-in works.")
+            kept = self._keep_working_signin()
+            self._okbase_note("The sign-in works." + (" Saved." if kept else ""))
             QMessageBox.information(
                 self, "Canteen menu",
                 f"Read {len(got)} day(s) from OKbase.\n\n"
@@ -4013,6 +4197,18 @@ class SettingsDialog(QDialog):
             "okbase_username": self.okbase_user.text().strip(),
             "okbase_password": encrypt_secret(self.okbase_pass.text()),
             "okbase_account": self.okbase_account.text().strip(),
+            "okbase_order_emails": [
+                part.strip().lower() for part in
+                self.okbase_order_emails.text().replace(";", ",").split(",")
+                if part.strip()],
+            # The codes are made by their own button, which saves them at once
+            # (they cannot be re-shown, so they must not wait for OK). What is
+            # written here is whatever the file holds NOW — read back rather
+            # than remembered from when the dialog opened, because a code spent
+            # by an order while this window was open has to stay spent.
+            "okbase_order_codes": (
+                okbase_menu.load_user_settings().get("okbase_order_codes")
+                or self._win.settings.get("okbase_order_codes") or {}),
             "okbase_session_cookie": encrypt_secret(
                 self.okbase_cookie.text().strip()),
             "okbase_refresh_hour": self.okbase_hour.value(),
@@ -5750,6 +5946,33 @@ def _menu_job(sig: _MenuSignals, settings: dict, mode: str):
     _safe_emit(sig.done.emit, (mode, cache, cookies, err))
 
 
+class _OrderSignals(QObject):
+    done = Signal(object)   # (outcome, cancelled, lang, cookies)
+
+
+def _order_job(sig: "_OrderSignals", settings: dict, day, picks, clear: bool,
+               lang: str, code: str = ""):
+    """Signing up for lunch, or off it, away from the UI thread.
+
+    Three portal requests back to back (read the week, save it, read it back),
+    so it can take seconds. Same daemon thread as _menu_job and for the same
+    reason: nothing here may be able to stall app shutdown.
+
+    The one-time code is struck off through change_order's `authorise` hook, so
+    it is spent only when the save is actually about to happen — a day the
+    portal turns out to have closed costs no code.
+    """
+    out: dict = {}
+    try:
+        outcome = okbase_menu.change_order(
+            settings, day, picks, clear, session_out=out,
+            authorise=lambda: okbase_menu.spend_order_code(settings, code))
+    except Exception as e:  # noqa: BLE001 - must never reach the UI thread
+        outcome = okbase_menu.OrderOutcome(day=day.isoformat(), error=str(e))
+    _safe_emit(sig.done.emit,
+               (outcome, clear, lang, out.get("cookies", "")))
+
+
 # ---------------------------------------------------------------------------
 # Monitor tab widget
 # ---------------------------------------------------------------------------
@@ -5863,8 +6086,13 @@ class MonitorWidget(QWidget):
         self._menu_started: Optional[datetime] = None   # when the running job began
         self._menu_refreshed_day = ""    # ISO date of the last successful fetch
         self._menu_error = ""            # why the last attempt failed, for the chat
-        self._menu_reply_pending = False  # a /food refresh is waiting to answer
+        self._menu_reply_pending = False  # a /food is waiting for the read
         self._menu_reply_args = ""
+        self._menu_reply_suffix = ""     # e.g. the "pick with…" line under a list
+        # When the running lunch-order job started, 0 = none. A stamp rather
+        # than a busy flag so a job that dies silently cannot refuse every
+        # later order until the app is restarted.
+        self._order_job_ns = 0
         self._menu_doing = ""            # "fetch" / "ping" / "load" while running
         self._menu_last_check: Optional[datetime] = None
         self._menu_last_ok = False       # did the last contact with OKbase work
@@ -7764,6 +7992,25 @@ class MonitorWidget(QWidget):
             self._menu_error = ""      # the old verdict is not the new sign-in's
             self._log("Canteen menu: picked up a renewed OKbase sign-in.")
 
+    def _menu_signin_recovered(self):
+        """A sign-in was just proved to work — forget the "expired" verdict.
+
+        Called by the Settings dialog the moment its own test succeeds, because
+        the operator has then already done the thing the message asked for and
+        must not be told to do it again. Every field that quotes the verdict is
+        cleared together: `_menu_error` is what `/food` appends, and
+        `_menu_last_*` is what `/food status` and the status line read. Leaving
+        any of them behind is what made this look like it had not worked.
+        """
+        self._menu_error = ""
+        self._menu_last_check = datetime.now()
+        self._menu_last_ok = True
+        self._menu_last_decisive = True
+        self._log("Canteen menu: the sign-in works and has been saved.")
+        # Read the week again so the saved menu and the orders in it catch up
+        # with a sign-in that has just come back.
+        self._start_menu_job("fetch")
+
     def _menu_tick(self):
         """Fetch today's menu if it is due, otherwise just keep the sign-in warm."""
         self._reload_okbase_sign_in()
@@ -7893,7 +8140,9 @@ class MonitorWidget(QWidget):
         # under the menu, /food status explains it in full.
         if self._menu_reply_pending:
             self._menu_reply_pending = False
-            self._reply(self._food_reply(self._menu_reply_args))
+            suffix = self._menu_reply_suffix
+            self._menu_reply_suffix = ""
+            self._reply(self._food_reply(self._menu_reply_args) + suffix)
 
     def _food_status(self) -> str:
         """What the canteen menu is doing, what worked and what did not."""
@@ -7971,15 +8220,49 @@ class MonitorWidget(QWidget):
             text += f"\n\n_Last attempt: {err}_"
         return text
 
-    def _cmd_food(self, pc: "bot_commands.ParsedCommand"):
+    def _freshen_then_reply(self, args: str, suffix: str = "") -> bool:
+        """Read the portal, then answer `/food args` from whatever came back.
+
+        True when a read was started and WILL answer; False when it could not
+        be started — switched off, or a job already running — and the caller
+        must answer from the saved copy itself.
+
+        A read that fails needs no branch here: `_on_menu_done` leaves the
+        saved copy in place when nothing came back, so the answer is that copy,
+        carrying its own note about how old it is and why it could not get
+        newer. That is the fallback, and it says so rather than passing an old
+        menu off as today's.
+        """
+        if not self.settings.get("okbase_enabled"):
+            return False
+        self._reload_okbase_sign_in()    # a paste done just now, no restart
+        if not self._start_menu_job("fetch"):
+            # One reader is already waiting; a second would overwrite its
+            # question. The saved copy is a second or two old at worst here.
+            return False
+        self._menu_reply_pending = True
+        self._menu_reply_args = args
+        self._menu_reply_suffix = suffix
+        return True
+
+    def _cmd_food(self, pc: "bot_commands.ParsedCommand", email: str = ""):
         req = okbase_menu.parse_food_args(pc.args)
         if req.mode == "status":
             # The app knows more than the saved file does — what it is doing
             # right now, and whether the sign-in still works.
             self._reply(self._food_status())
             return
+        if req.mode in ("order", "cancel"):
+            self._cmd_food_order(req, email)
+            return
         if req.mode != "refresh":
-            self._reply(self._food_reply(pc.args))
+            # Every reading command asks OKbase first. The menu changes during
+            # the morning and the day closes for orders at no fixed time, so an
+            # answer from a copy made hours ago is the wrong answer — and the
+            # read costs a second or two. If it cannot be done, the saved copy
+            # answers, as it always did.
+            if not self._freshen_then_reply(pc.args):
+                self._reply(self._food_reply(pc.args))
             return
         if not self.settings.get("okbase_enabled"):
             self._reply("⚠ The canteen menu is switched off in Settings, so I "
@@ -7992,6 +8275,102 @@ class MonitorWidget(QWidget):
         self._menu_reply_pending = True
         self._menu_reply_args = ""       # answer with today's menu when it lands
         self._reply("⏳ Reading the menu from OKbase…")
+
+    # --- signing up for lunch, and off it ------------------------------
+    #
+    # The only Webex command that WRITES to somebody's HR portal, so it is the
+    # only one with a sender check. The sign-in is one person's: an order placed
+    # with it is that person's lunch and that person's money, and a Webex room
+    # is a shared place where anybody can type.
+
+    ORDER_JOB_MAX_S = 180        # after this a job is assumed dead, not busy
+
+    def _cmd_food_order(self, req, email: str):
+        if req.error:
+            self._reply(f"⚠ {req.error}")
+            return
+
+        day = req.day
+        if day is None:
+            day = okbase_menu.next_food_day(self._menu_cache)
+        if req.mode == "order" and not req.picks:
+            # A day with no meal named. The menu for that day IS the answer —
+            # and it changes nothing, so it is answered BEFORE the sender and
+            # password checks. Asking for a password to look at a menu that
+            # `/food friday` already shows anybody would be theatre.
+            #
+            # Read live like every other menu reply, and here it matters most:
+            # the number typed back is resolved against the portal's list, so a
+            # list from hours ago would have somebody order by a number that no
+            # longer points at the meal they read.
+            suffix = ("\n\nPick with `/food order "
+                      + day.strftime("%d.%m.") + " 1 pin:yourword` (main "
+                      "course 1), or `… soup 2 main 1 pin:yourword`.")
+            if not self._freshen_then_reply(day.isoformat(), suffix):
+                self._reply(self._food_reply(day.isoformat()) + suffix)
+            return
+
+        allowed, why = okbase_menu.may_order(self.settings, email,
+                                             req.password)
+        if not allowed:
+            self._reply(f"⛔ {why}.")
+            return
+        if not self.settings.get("okbase_enabled"):
+            self._reply("⚠ The canteen menu is switched off in Settings, so I "
+                        "cannot order anything.")
+            return
+
+        # Never a plain boolean: a job that dies without answering would leave
+        # the command refused for ever (see the in-flight flag that wedged the
+        # PV panel). A stamp expires on its own.
+        now_ns = time.monotonic_ns()
+        if now_ns - self._order_job_ns < self.ORDER_JOB_MAX_S * 1_000_000_000:
+            self._reply("⏳ Still working on the last lunch change — one moment.")
+            return
+        self._order_job_ns = now_ns
+
+        self._reload_okbase_sign_in()    # a paste done just now, no restart
+        self._reply("⏳ " + ("Cancelling" if req.mode == "cancel"
+                            else "Ordering") + " lunch…")
+        sig = _OrderSignals(self)
+        # deleteLater first — same reason as _start_menu_job.
+        sig.done.connect(sig.deleteLater)
+        sig.done.connect(self._on_order_done)
+        threading.Thread(
+            target=_order_job,
+            args=(sig, dict(self.settings), day, req.picks,
+                  req.mode == "cancel", req.lang, req.password),
+            daemon=True, name="okbase-order").start()
+
+    def _on_order_done(self, payload):
+        outcome, cancelled, lang, cookies = payload
+        self._order_job_ns = 0
+        if cookies:
+            self._remember_session(cookies)
+        # The worker struck a code off the file; this copy must be told, or the
+        # count in Settings and the "codes left" note would both be stale.
+        self._reload_okbase_sign_in()
+        if outcome.already:
+            # Nothing was changed and no code was spent. What a person wants
+            # next is the list they were choosing from, so it goes underneath.
+            self._reply(okbase_menu.render_already_ordered(outcome, lang)
+                        + "\n\n" + self._food_reply(outcome.day))
+            return
+        reply = okbase_menu.render_order_outcome(outcome, cancelled, lang)
+        if not outcome.error:
+            left = okbase_menu.codes_left(self.settings)
+            if left <= okbase_menu.CODES_LOW_AT:
+                reply += (f"\n\n_{left} ordering code(s) left — make a new "
+                          "list in Settings → Canteen menu._")
+        self._reply(reply)
+        if outcome.error:
+            self._log(f"Canteen order failed: {outcome.error}")
+            return
+        what = "cancelled" if cancelled else "ordered"
+        self._log(f"Canteen: {outcome.day} {what}.")
+        # Read the week again so `/food orders` and the saved copy agree with
+        # what was just done, here and for the always-on listener.
+        self._start_menu_job("fetch")
 
     # --- Webex two-way command listener -------------------------------
     def _start_cmd_listener(self):
@@ -8281,7 +8660,7 @@ class MonitorWidget(QWidget):
             elif cmd == "/plot":
                 self._cmd_plot(pc)
             elif cmd in ("/food", "/menu", "/lunch"):
-                self._cmd_food(pc)
+                self._cmd_food(pc, email)
             elif cmd == "/datawatchdog":
                 if args and args[0].lower() in ("on", "off"):
                     enabled = args[0].lower() == "on"
@@ -8480,7 +8859,14 @@ class MonitorWidget(QWidget):
             "- `/food` — the canteen menu: today until 14:30, the next serving "
             "day after that; `/food today`, `/food week`, `/food tomorrow`, "
             "`/food friday`, `/food 27.8.`, `/food refresh`. Read from OKbase "
-            "once a day, and answered even when the app is closed.")
+            "once a day, and answered even when the app is closed.\n"
+            "\n"
+            # A section of its own, and last, because it is the only thing here
+            # that WRITES to somebody's HR portal — and because the ordering
+            # words got typed wrong twice while they were one bullet among
+            # twenty. Kept in okbase_menu so `/help` and `/food help` cannot
+            # drift apart.
+            + okbase_menu.ORDER_HELP)
 
     def _status_line(self, p: PVConfig) -> str:
         rt = self.runtime.get(p.name)

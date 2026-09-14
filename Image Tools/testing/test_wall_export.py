@@ -38,14 +38,14 @@ def make_frame(path: Path, w=160, h=120):
     img.save(str(path), "PNG")
 
 
-def build_cells(tmp: Path, n_rows: int, cams=("PTM11WNF", "PAM1FF")) -> list:
-    """`n_rows` DAYS × the cameras, each day carrying one marked region.
+def build_cells(tmp: Path, n_days: int, cams=("PTM11WNF", "PAM1FF")) -> list:
+    """`n_days` days × the cameras, each day carrying one marked region.
 
-    Days, not regions: a row on the Day-by-day wall is a day, so several days is
-    what makes a wall taller than its pane."""
+    A ROW ON THE DAY-BY-DAY WALL IS A CAMERA, so it is the number of CAMERAS that
+    makes a wall taller than its pane; the days run across it."""
     from datetime import timedelta
     cells = []
-    for i in range(n_rows):
+    for i in range(n_days):
         day = DAY + timedelta(days=i)
         for cam in cams:
             p = tmp / f"{cam}_{i}.png"
@@ -96,12 +96,13 @@ def main() -> int:
     QApplication.instance() or QApplication(sys.argv)
     tmp = Path(tempfile.mkdtemp(prefix="wall_export_"))
 
-    # A rows wall with four DAYS, in a pane that holds about three.
+    # A rows wall with four CAMERAS — four rows — in a pane that holds about three.
     rows_wall = m._DayWall()
     rows_wall.set_layout_mode("rows")
     rows_wall.resize(900, 300)
     rows_wall.set_canvas(900, 300)
-    rows_wall.set_cells(build_cells(tmp, 4))
+    rows_wall.set_cells(build_cells(
+        tmp, 2, cams=("PTM11WNF", "PAM1FF", "PAM2FF", "PFM13NF")))
     rows_wall._relayout()
     B.wait_for(lambda: bool(rows_wall._raw), timeout_s=10.0)
     rows_wall._relayout()
@@ -137,7 +138,7 @@ def main() -> int:
     print("\n=== the caption strip says what the picture is ===")
     prov = stub._wall_provenance(rows_wall, "Day by day")
     line = stub._provenance_line(prov)
-    for want in ("Day by day", "PTM11WNF", "01.09.2026", "04.09.2026",
+    for want in ("Day by day", "PTM11WNF", "01.09.2026", "02.09.2026",
                  "picked by PV"):
         check(f"the line names {want}", want in line, repr(line))
 

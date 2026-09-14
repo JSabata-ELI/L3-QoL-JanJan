@@ -40,7 +40,7 @@ def ns_at(day, hour: int, minute: int = 0) -> int:
 def add_region(dlg, day, h0, h1):
     dlg._regions.append({"id": dlg._region_seq, "t_start_ns": ns_at(day, h0),
                          "t_end_ns": ns_at(day, h1), "color": "#C62828",
-                         "day": day})
+                         "day": day, "no": dlg._next_pick_no()})
     dlg._region_seq += 1
 
 
@@ -64,7 +64,7 @@ def main() -> int:
     print("=== a plain click on another day keeps what is picked ===")
     for h in (8, 9, 10, 11, 12):
         add_region(dlg, DAY, h, h + 1)
-    dlg._rebuild_regions_ui()
+    dlg._regions_changed()
     dlg._refresh_day_list()
     check("five regions marked", len(dlg._regions) == 5)
 
@@ -82,32 +82,40 @@ def main() -> int:
     print("\n=== picks on a second day ADD to the set ===")
     B.wait_for(lambda: NEXT in dlg._series, timeout_s=10.0)
     add_region(dlg, NEXT, 9, 10)
-    dlg._rebuild_regions_ui()
+    dlg._regions_changed()
     dlg._refresh_day_list()
     cfg = dlg.get_config()
     check("both days are searched", sorted(cfg["days"]) == [DAY, NEXT],
           str(cfg["days"]))
     check("with five regions on the first and one on the second",
           len(cfg["regions"][DAY]) == 5 and len(cfg["regions"][NEXT]) == 1)
+    tops = [dlg._day_list.topLevelItem(i) for i in range(2)]
     check("the day list counts them per day",
-          "5 regions" in dlg._day_list.item(0).text()
-          and "1 region" in dlg._day_list.item(1).text(),
-          repr([dlg._day_list.item(i).text() for i in range(2)]))
-    check("and its tooltip says WHICH",
-          dlg._day_list.item(0).toolTip().count("\n") == 4,
-          repr(dlg._day_list.item(0).toolTip()))
+          "5 regions" in tops[0].text(0) and "1 region" in tops[1].text(0),
+          repr([t.text(0) for t in tops]))
+    check("and the day OPENS on which five",
+          tops[0].childCount() == 5
+          and all(tops[0].child(j).text(0).startswith(f"region {j + 1})")
+                  for j in range(5)),
+          repr([tops[0].child(j).text(0) for j in range(tops[0].childCount())]))
 
     print("\n=== a picked moment deletes no region ===")
     dlg._set_moment_from_x(dlg._ns_to_x(ns_at(NEXT, 9, 30), NEXT))
     check("the moment is picked", len(dlg._moments) == 1, str(dlg._moments))
     check("and every region is still there", len(dlg._regions) == 6,
           f"{len(dlg._regions)}")
-    check("the moment line says the regions are ignored",
-          "ignored" in dlg._lbl_moment.text(), dlg._lbl_moment.text())
-    check("the search runs the moments, not the regions",
-          dlg.get_config().get("moments_ns") == dlg._moments)
-    dlg._clear_moment()
-    check("Clear brings the regions back into the search",
+    check("the table says both are searched, and how many frames that is",
+          "1 moment" in dlg._lbl_picks.text()
+          and "6 regions" in dlg._lbl_picks.text()
+          and "7 frame" in dlg._lbl_picks.text(), dlg._lbl_picks.text())
+    cfg = dlg.get_config()
+    check("the search runs the moments AND the regions",
+          cfg.get("moments_ns") == dlg._moments
+          and sum(len(v) for v in cfg.get("regions").values()) == 6,
+          f"{cfg.get('moments_ns')} / {sum(len(v) for v in cfg.get('regions').values())}")
+    for _t in list(dlg._moments):
+        dlg._delete_moment(_t)
+    check("deleting the moment leaves the regions to be searched",
           dlg.get_config().get("moment_ns") is None
           and len(dlg.get_config()["regions"]) == 2)
 

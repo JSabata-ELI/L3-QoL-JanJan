@@ -252,14 +252,32 @@ what makes a month-long load possible at all.
     boxes only move out of the way when they would genuinely overlap
     each other, and only as far as they have to.
 
+    The boxes stay inside the window. Normally they sit just to the
+    right of the crosshair; near the right-hand edge, where they would
+    run off the plot and off the window, the whole set flips to the
+    left of it instead. They are drawn without clipping — that is what
+    let them wander outside — so the flip is what keeps them readable
+    with the mouse at the far right. The time under the axis and the
+    value box on the left-hand scale tuck themselves in the same way,
+    and the value box no longer slides past the top and bottom of the
+    plot.
+
     The boxes can be switched off, and they switch themselves off
     above about twenty visible curves, where they would be a solid
     wall of numbers.
 
     SELECTION. Drag with the LEFT button to get statistics for that
-    interval: one card per value with the number of samples, the
-    average, the spread, the smallest, the largest and the peak to
-    peak. The numbers can be selected and copied.
+    interval: one card per value with the number of samples (N), the
+    average (Avg), the spread (Std), the smallest (Min), the largest
+    (Max) and the distance between those two (P-P). The numbers can be
+    selected and copied.
+
+    Avg, Min and Max are in the signal's own units. Std and P-P are
+    given as A PERCENTAGE OF THE AVERAGE, to hundredths — that is the
+    form a shot is judged in, and an absolute 0.07 says nothing until
+    you have found the average to divide it by. A selection whose
+    average is zero has no honest percentage, so those two cards show
+    a dash instead of a number that would run away.
 
     The selected region is remembered as a moment in time, not as a
     picture. So it survives a redraw: change the font, edit the
@@ -360,7 +378,10 @@ what makes a month-long load possible at all.
         Two deliberate details:
           - If the whole window fails the conditions, the table stays
             empty rather than quietly showing you unfiltered data.
-            The Log says how many rows were dropped.
+            The line under the table says so in dark ink — it names
+            the conditions and counts the rows they threw away — and
+            the XY tab says the same instead of blaming the two
+            channels you picked. The Log has it too.
           - A condition on a value that has no data at all in this
             window is skipped, and logged. Otherwise one absent
             value would reject every row on its own and look like a
@@ -420,6 +441,19 @@ what makes a month-long load possible at all.
     under the cursor, the vertical minimum and maximum, autoscale,
     the line width, the line style, the point style, the point size,
     the transparency, smoothing and grid.
+
+    HOW MUCH ROOM IT TAKES. The graph is what the tab is for, so the
+    list opens on about four or five rows — roughly a quarter of the
+    height, the graph keeping the other three quarters — and scrolls
+    for the rest. It used to open tall enough for every row it had,
+    which on a dozen signals left the graph a strip.
+
+    Drag the grey bar between them for more rows or fewer, and the
+    program leaves it alone from then on: before, the next window
+    resize or table refresh put its own size straight back and the
+    drag looked like it had not registered. Popping the graph out with
+    F11 and docking it again starts over from the default split,
+    because the list is rebuilt with it.
 
     Line style is solid, dashed, dotted, dash-dot or none. Point style
     is auto, none, or one of ● ○ ▲ ■ ✕ +, with its own size. "Auto" is
@@ -602,6 +636,31 @@ what makes a month-long load possible at all.
     dots also carry a hairline dark edge and shrink as the count
     grows, so a dense cloud can still be read as points rather than
     as one blob.
+
+    IT KEEPS UP BY ITSELF. In live mode the cloud grows with every
+    refresh, and pressing Conditions thins it out at once. It used to
+    do neither: the rows behind it were kept fresh all along, but
+    nothing ever redrew the plot, so the only way to see new points
+    was to switch the whole tab off and on again. Now the same live
+    refresh that fills the table also refreshes the cloud, and the
+    Conditions button does the same job from the XY tab as it does
+    from the Graph tab.
+
+    Only the tab you are looking at is redrawn. A hidden XY tab is
+    marked instead and caught up the moment you switch to it, so a
+    plot nobody is watching costs nothing several times a second, and
+    what you do see is never an old picture.
+
+    ONCE YOU HAVE ZOOMED, the view is yours: a live refresh adds the
+    new points but leaves the axes where you put them. The house
+    button hands the view back and the plot follows the cloud again.
+
+    BACK AND FORWARD work after a rectangle zoom. Both views now go
+    onto the toolbar's history — the one being left, so Back returns
+    to it, and the one being entered, so Forward comes back. Only the
+    first used to be recorded, and since the buttons are switched on
+    purely by where the toolbar sits in that history, both stayed
+    greyed out after the first zoom.
 
 6.2 PV TIME PLOT
 
@@ -796,9 +855,16 @@ particular load is saved.
       (about a month). The Log distinguishes the two.
 
   The table is empty after loading
-      Almost always the Conditions. Read the Log — it says how many
-      rows were dropped and why. That the table is left empty rather
-      than unfiltered is deliberate.
+      Almost always the Conditions, and the line under the table now
+      says so outright: which conditions were in force and how many
+      rows they threw away. The Log has the same. That the table is
+      left empty rather than unfiltered is deliberate.
+
+  The XY plot draws nothing and Plot XY looks dead
+      The cloud is built from the table's rows, so if the Conditions
+      emptied the table there is nothing to draw. The line under the
+      plot says which it is: the conditions, or two channels that
+      really are silent in this window.
 
       A condition can now also judge a value that has no sample inside
       the period, because the value carried in from before it is a

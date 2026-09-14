@@ -64,20 +64,63 @@ def _import_daypicker():
     loaded from here -- a plain `import daypicker` would find whichever copy
     happens to be on the path. Registered in sys.modules BEFORE it is executed,
     so a re-entrant import cannot run the module twice.
+
+    Three locations are searched because a built app has no single answer. Next
+    to this file means _internal, and _internal never survives the trip to the
+    share: copying a program there does not bring its _internal at all, and
+    "Deploy Libraries" (Dev Tools/cm_t.py) fills the destination's one from a
+    single shared runtime library, deleting whatever that library does not have.
+    daypicker.py is not in it and cannot be. The copy compiled into the exe
+    (build_config.json -> hidden_imports) and the loose file the deploy drops
+    beside the exe are the fallbacks.
     """
+    import importlib
     import importlib.util as _ilu
+    import os as _os
     import sys as _sys
     from pathlib import Path as _Path
 
     mod = _sys.modules.get("daypicker")
     if mod is not None:
         return mod
-    p = _Path(__file__).resolve().parent / "daypicker.py"
-    spec = _ilu.spec_from_file_location("daypicker", p)
-    mod = _ilu.module_from_spec(spec)
-    _sys.modules["daypicker"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+
+    if getattr(_sys, "frozen", False):
+        try:
+            return importlib.import_module("daypicker")   # compiled into the exe
+        except ImportError:
+            pass
+
+    tried: list = []
+    for _d in (str(_Path(__file__).resolve().parent),
+               getattr(_sys, "_MEIPASS", ""),
+               _os.path.dirname(_os.path.abspath(_sys.executable))):
+        if not _d:
+            continue
+        p = _os.path.join(_d, "daypicker.py")
+        if p in tried:
+            continue
+        tried.append(p)
+        if not _os.path.isfile(p):
+            continue
+        spec = _ilu.spec_from_file_location("daypicker", p)
+        mod = _ilu.module_from_spec(spec)
+        _sys.modules["daypicker"] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            _sys.modules.pop("daypicker", None)
+            raise
+        return mod
+
+    try:
+        return importlib.import_module("daypicker")
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "daypicker.py was not found. Looked in:\n  " + "\n  ".join(tried)
+        + "\nand in the modules compiled into the program itself. A built copy "
+          "needs 'daypicker' in build_config.json -> hidden_imports."
+    )
 
 
 daypicker = _import_daypicker()
@@ -990,6 +1033,8 @@ class SPFEValuesWidget(QWidget):
         for text, step in (("< Previous", -1), ("Next >", 1)):
             b = QPushButton(text)
             b.setStyleSheet(_BTN)
+            b.setToolTip("Working days only - Saturdays and Sundays are stepped\n"
+                         "over. A weekend is opened from View day.")
             b.clicked.connect(lambda _=False, d=step: self._step_day(d))
             step_row.addWidget(b)
         sec_day.body_layout.addLayout(step_row)
@@ -2172,8 +2217,19 @@ class SPFEValuesWidget(QWidget):
 
     # ── display ──────────────────────────────────────────────────────────
     def _step_day(self, delta: int):
+        """One day back or forward, over the weekend rather than into it.
+
+        Nothing is recorded on a Saturday or a Sunday, so stepping through them
+        is two clicks that show two empty tables. A weekend is still reachable
+        -- View day opens the calendar, and a day picked there is shown whatever
+        its name is -- this is only about the two step buttons.
+        """
         self._commit_open_editor()
-        self._day += timedelta(days=delta)
+        day = self._day + timedelta(days=delta)
+        if self.cfg.get("weekdays_only", True):
+            while day.weekday() >= 5:
+                day += timedelta(days=delta)
+        self._day = day
         self._refresh_today()
 
     def _go_today(self):

@@ -141,9 +141,21 @@ answer.
 Neither of the two interesting decisions can be made when a dark run *starts*:
 whether the array fell is known a few frames later (`trip_lookahead_frames`), and
 whether the pulser is recoverable only after the operator has stopped trying
-(`dead_restarts` / `dead_confirm_min` — several recoveries are routinely fired back
-to back). So `_compute_pulser_stats` looks forward and rewrites `kind` on an event
-that began earlier.
+(`dead_restarts` — several recoveries are routinely fired back to back). So
+`_compute_pulser_stats` looks forward and rewrites `kind` on an event that began
+earlier.
+
+`KIND_DEAD` has exactly two routes, and `dead_confirm_min` is only half of one of
+them. `restarts >= dead_restarts` is the main one: it was restarted and did not come
+back. The other is `not ep_lit_before and up_dark >= dead_confirm_min`, i.e. the
+pulser never lit in this window at all and we have now watched the array run long
+enough to say so — `ever_lit` records a sustained ON stretch (longer than
+`dropout_frames`, the same bar a genuine recovery has to clear), and its value is
+captured into `ep_lit_before` when the dark run opens. The minutes deliberately do
+NOT stand alone: a pulser that ran, went dark and sat there while nobody restarted
+the array is a `KIND_FAULT` for as long as that lasts, because the array merely being
+up demonstrates nothing about a pulser nobody asked to come back. The operator's own
+definition, 2026-09-14; `test_pulser.py` Test 6b pins all three outcomes.
 
 The fault/trip line is **whether the array fell within the look-ahead**, not whether
 an outage overlaps the dark run somewhere. The older reading counted a pulser merely

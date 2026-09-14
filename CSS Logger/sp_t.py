@@ -75,20 +75,63 @@ def _import_daypicker():
     folder (Dev Tools/b_t.py). testing/test_daypicker_sync.py fails the moment the
     two copies differ.
 
-    Loaded by path instead of `import daypicker` on purpose: a plain import would
-    make the builder's module-home check see the same module name in two program
-    folders and refuse to build.
+    Not a plain `import daypicker`: the same module name lives in three program
+    folders and the builder's module-home check would refuse to build. It is
+    listed in build_config.json -> hidden_imports instead, which compiles it into
+    the exe itself with no import statement for the check to trip over.
+
+    Three locations are searched because a built app has no single answer. Next to
+    this file means _internal, and _internal never survives the trip to the share:
+    copying a program there does not bring its _internal at all, and "Deploy
+    Libraries" (Dev Tools/cm_t.py) fills the destination's one from a single
+    shared runtime library, deleting whatever that library does not have.
+    daypicker.py is not in it and cannot be — that is what made the network copy
+    fail. The compiled-in copy and the loose file the deploy drops beside the exe
+    are the fallbacks.
     """
+    import importlib
     import importlib.util as _ilu
     mod = sys.modules.get("daypicker")
     if mod is not None:
         return mod
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daypicker.py")
-    spec = _ilu.spec_from_file_location("daypicker", p)
-    mod = _ilu.module_from_spec(spec)
-    sys.modules["daypicker"] = mod     # register BEFORE exec (re-entrancy safe)
-    spec.loader.exec_module(mod)
-    return mod
+
+    if getattr(sys, "frozen", False):
+        try:
+            return importlib.import_module("daypicker")   # compiled into the exe
+        except ImportError:
+            pass
+
+    tried: list = []
+    for _d in (os.path.dirname(os.path.abspath(__file__)),
+               getattr(sys, "_MEIPASS", ""),
+               os.path.dirname(os.path.abspath(sys.executable))):
+        if not _d:
+            continue
+        p = os.path.join(_d, "daypicker.py")
+        if p in tried:
+            continue
+        tried.append(p)
+        if not os.path.isfile(p):
+            continue
+        spec = _ilu.spec_from_file_location("daypicker", p)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules["daypicker"] = mod     # register BEFORE exec (re-entrancy safe)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("daypicker", None)
+            raise
+        return mod
+
+    try:
+        return importlib.import_module("daypicker")
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "daypicker.py was not found. Looked in:\n  " + "\n  ".join(tried)
+        + "\nand in the modules compiled into the program itself. A built copy "
+          "needs 'daypicker' in build_config.json -> hidden_imports."
+    )
 
 
 daypicker = _import_daypicker()

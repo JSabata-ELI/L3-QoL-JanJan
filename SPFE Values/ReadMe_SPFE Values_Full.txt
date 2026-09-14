@@ -52,9 +52,12 @@ can reach is up to the archiver: a PV that was not being archived yet answers
 with nothing, and the Log window says so.
 
 Weekends are skipped by the catch-up, because the value of "Saturday morning" on
-a machine nobody was running is noise. Setting weekdays_only to false in the
-config brings them back everywhere - and a day picked by hand is always filled
-in, weekend or not, because somebody deliberately clicked on it.
+a machine nobody was running is noise. The two step buttons, < Previous and
+Next >, walk over them for the same reason - a weekend is two clicks and two
+empty tables. Setting weekdays_only to false in the config brings them back
+everywhere, buttons included - and a day picked by hand, in "Pick days" or in
+"View day", is always shown and always filled in, weekend or not, because
+somebody deliberately clicked on it.
 
 The recording times themselves are on screen, in the column headings: "Morning
 (09:00)" and "At the end (18:00)". The value under such a heading is the last
@@ -355,6 +358,15 @@ The DAZZ1 change also moved a column in the log, from dazz1_1 to dazz1. That was
 done by testing/migrate_dazz.py, once, on both copies of spfe_log.csv, with a
 backup of each beside it.
 
+On 7.9.2026 the same script and the same rebuild were run again, for two things
+found together. The dazzler the archiver knows is DAZZ2, not DAZZ1, so the 51
+values recorded so far were moved from the dazz1 column to dazz2. And the
+channel archives the percentage as a fraction - 0.331 for 33.1 % - which the
+table showed as "0" because the row was rounded to whole percent. The row now
+carries "scale": 100 and one decimal, and the script scaled the values already
+in the log by 100 so old and new days are the same quantity. It leaves anything
+above 1.5 alone, which is what makes it safe to run twice.
+
 
 8. THE SHARED FOLDER, AND THE 48-SECOND TRAP
 --------------------------------------------
@@ -462,7 +474,14 @@ dazz1_1 would have been orphaned - the log would still hold it, the table would
 no longer look for it. testing/migrate_dazz.py renamed the column in both copies
 of the log, with a backup of each. Any future change of this kind needs the same
 kind of one-off script; the program cannot guess which old column became which
-new one.
+new one. Moving a PV from one row to another - the dazzler, 7.9.2026 - is the
+same job: the values follow the PV, not the row name.
+
+A row can also carry "scale", multiplied into the value as it is read from the
+archiver, for a channel whose unit is not the unit of the row. It is the one
+setting in that file which changes what is WRITTEN, not only what is shown, so
+changing it splits the log into before and after unless the old values are
+scaled too.
 
 
 11. WHEN SOMETHING IS WRONG
@@ -470,7 +489,7 @@ new one.
 
 Some value cells show a dash
   Those quantities have no PV yet: Pumplaser DAC, humidity, oscillator power,
-  oscillator bandwidth and DAZZ2. See section 10.
+  oscillator bandwidth and DAZZ1. See section 10.
 
 "nothing recorded" and an empty table
   Nothing has been recorded for that day. Press "Fill this day"; for a run of

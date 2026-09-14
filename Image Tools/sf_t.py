@@ -486,7 +486,8 @@ def _ns_to_prague(t_ns: int) -> datetime:
 
 def _load_api_for_day(day: date, cols: "list[str]",
                       log=None,
-                      csv_root: "str | None" = None
+                      csv_root: "str | None" = None,
+                      on_col_done=None
                       ) -> "tuple[list[dict], dict[str, list[dict]], dict[str, dict]]":
     """
     Query the CPVA archiver for all requested PV columns over the full day.
@@ -499,6 +500,9 @@ def _load_api_for_day(day: date, cols: "list[str]",
       - per_col_rows: dict mapping col → sorted list of single-col row dicts
         (used for closest-timestamp extra-column matching)
       - col_meta: col → {"source": "api"|"csv"|"none", "status": "ok"|"stale"|"error"|"empty"}
+
+    on_col_done(done, total) is called as each column lands — the progress bar's only
+    way of moving while a single day is being read.
 
     Each row dict has:
       "_dt" : datetime (Prague-naive)
@@ -556,6 +560,7 @@ def _load_api_for_day(day: date, cols: "list[str]",
 
     with ThreadPoolExecutor(max_workers=max(1, len(cols))) as _aex:
         _col_futs = {_aex.submit(_fetch_one_col, c): c for c in cols}
+        _cols_done = 0
         for _fut in as_completed(_col_futs):
             try:
                 _col, _col_rows, _meta = _fut.result()
@@ -564,6 +569,12 @@ def _load_api_for_day(day: date, cols: "list[str]",
                     per_col[_col] = _col_rows
             except Exception as exc:
                 _log(f"  col fetch ERROR: {type(exc).__name__}: {exc}")
+            _cols_done += 1
+            if on_col_done is not None:
+                try:
+                    on_col_done(_cols_done, len(_col_futs))
+                except Exception:
+                    pass
 
     for c in cols:
         col_meta.setdefault(c, {"source": "none", "status": "error"})
@@ -786,6 +797,18 @@ def _resolve_cam_folder(hour_folder: "Path | None", cam: str) -> Path | None:
 _HOUR_CLOSED_GRACE_MIN = 5
 # What an open folder's listing is worth before it has to be read again.
 _OPEN_FOLDER_TTL_S = 20.0
+
+# ── the background fill of the opened day's Frame time column ─────────────────
+# How many rows one UI update carries, and how long a part-filled batch waits for
+# the rest before it is shown anyway. Both exist so a two-thousand-row day costs ten
+# repaints instead of two thousand, while the operator still sees it filling.
+_DAY_PREFILL_BATCH = 200
+_DAY_PREFILL_FLUSH_MS = 250.0
+# A seatbelt, not a budget: the cost of the fill is the number of HOURS the shots
+# span (one folder reading each), not the number of rows, so there is no reason to
+# stop early. Beyond this many rows the table itself is the slow part, and the rest
+# is left to be filled the old way — when the row is picked.
+_DAY_PREFILL_MAX_ROWS = 20000
 
 
 def _hour_is_closed(day: date, hour_utc: int) -> bool:
@@ -1160,28 +1183,123 @@ def _format_value(col: str, raw: str) -> str:
         return raw or "—"
 
 
+# ── SEARCH PROGRESS ───────────────────────────────────────────────────────────
+
+class _ProgressTracker:
+    """How far a search has got, in fractions of a (day × camera) step.
+
+    A search does two very different things per day: it reads the archiver (one fetch
+    per PV, which is where a slow day is spent), and it looks for a frame per camera.
+    Counting only finished (day, camera) pairs made the common case — one day, one
+    camera — a single step, so the bar stood at 0 for the whole wait and then jumped
+    to full. Here the day's step is split: PV_SHARE of it is the archiver read, the
+    rest is spread over that day's cameras. A finished day still adds up to exactly
+    one camera-step per camera, so the bar can never drift away from the count printed
+    next to it.
+
+    The pre-warm fetches every day's PVs at once, and its callbacks arrive on pool
+    threads — hence the lock and the per-day bookkeeping rather than one counter."""
+
+    PV_SHARE = 0.35
+
+    def __init__(self, days, n_cams: int, emit):
+        self._n_cams = max(1, int(n_cams))
+        self._emit = emit
+        self._lock = threading.Lock()
+        self._pv = {d: 0.0 for d in days}
+        self._cams = {d: 0 for d in days}
+        self._last = -1.0
+
+    # ── what the worker reports ───────────────────────────────────────────
+    def pv_step(self, day, frac: float) -> None:
+        """A slice of one day's archiver read is in (frac of that day's PVs)."""
+        with self._lock:
+            if day in self._pv:
+                self._pv[day] = min(1.0, self._pv[day] + max(0.0, frac))
+        self._publish()
+
+    def pv_done(self, day) -> None:
+        """That day's PV data is read — whatever the warm-up managed beforehand."""
+        with self._lock:
+            if day in self._pv:
+                self._pv[day] = 1.0
+        self._publish()
+
+    def cam_done(self, day, k: int = 1) -> None:
+        with self._lock:
+            if day in self._cams:
+                self._cams[day] = min(self._n_cams, self._cams[day] + k)
+        self._publish()
+
+    def day_done(self, day) -> None:
+        """Nothing more will happen for this day (no data, or the archiver refused)."""
+        with self._lock:
+            if day in self._pv:
+                self._pv[day] = 1.0
+                self._cams[day] = self._n_cams
+        self._publish()
+
+    # ── what the bar is told ──────────────────────────────────────────────
+    def units(self) -> float:
+        with self._lock:
+            return sum(
+                self._pv[d] * self.PV_SHARE * self._n_cams
+                + self._cams[d] * (1.0 - self.PV_SHARE)
+                for d in self._pv)
+
+    def _publish(self) -> None:
+        u = self.units()
+        # Monotone by construction, but a rounding wobble on a shared float must never
+        # send the bar backwards — that reads as work being undone.
+        with self._lock:
+            if u <= self._last:
+                return
+            self._last = u
+        self._emit(u)
+
+
 # ── SIGNALS ───────────────────────────────────────────────────────────────────
 
 class _SearchSignals(QObject):
     result   = Signal(object)
     done     = Signal()
     log_msg  = Signal(str)
-    progress = Signal(int)
+    # Fractions of a (day × camera) step, not whole steps: one day with one camera is
+    # a single step, and a bar that stands at zero for the whole minute it takes reads
+    # as a program that has stopped.
+    progress = Signal(float)
     # What is being read right now — printed on the progress bar, so a long search
     # says where it is instead of showing a bar with no words on it.
     stage    = Signal(str)
+    # Seconds still to go, or -1 when nothing can honestly be said yet. It is the
+    # WORKER that decides, because only the worker knows which half of the job it is
+    # in: the archiver read runs every day at once (fast), the frame lookup then walks
+    # the share day by day (slow). One straight line drawn through both halves is what
+    # used to produce a number nobody could rely on.
+    eta      = Signal(float)
 
 
 class _CamLoadSignals(QObject):
     finished = Signal(list)
     log_msg  = Signal(str)
+    # (hour folders read, hour folders to read) — changing the day walks the share
+    # before anything can be searched, and that wait needs to show too.
+    progress = Signal(int, int)
 
 class _PreviewSignals(QObject):
     show    = Signal(object, str, int)  # (QImage | None, energy_text, gen)
     log_msg = Signal(str)
-    # (row of the shot list, image path or "", why there is none) — the Image column
-    # of the opened day is filled in from worker threads.
+    # (row of the shot list, image path or "", why there is none) — the Frame time
+    # column of the opened day is filled in from worker threads.
     day_img = Signal(int, str, str)
+    # A SLICE of that column, resolved in the background: ([(row, path or "", why)],
+    # generation). One signal per row would be thousands of queued slot calls and
+    # thousands of repaint requests for a single day — every setData fires
+    # dataChanged. A batch of two hundred makes that ten.
+    day_img_batch = Signal(list, int)
+    # (generation, rows resolved, folder readings spent) — the end of a fill: the
+    # title suffix goes away and the log says what it cost.
+    day_fill_done = Signal(int, int, int)
 
 class _ChannelSignals(QObject):
     loaded = Signal(list)  # archiver channel names
@@ -1376,9 +1494,19 @@ class ShotFinderWidget(QWidget):
         self._day_rows: "list[dict]" = []
         self._day_cam: "str | None" = None
         self._day_hour_cache: dict = {}
-        self._day_split_sized = False
-        self._day_img_col = -1          # index of the Image column, -1 = not built
+        self._day_window_placed = False   # sized/centred on its first open only
+        self._day_img_col = -1          # index of the Frame time column, -1 = not built
         self._day_reveal_row = -1       # row whose click is waiting for its path
+        # The background fill of the Frame time column: which run is the live one, and
+        # how many of its rows have landed (both read and written on the main thread).
+        self._day_fill_gen = 0
+        self._day_fill_rows = 0
+        # ONE folder-listing cache for the whole tab, built here and kept across days:
+        # a closed hour never changes, and one reading of an hour folder answers every
+        # camera — which is what makes bringing another camera's tab to the front on
+        # the same day nearly free. Emptied when a new search starts
+        # (_rebuild_result_tabs), which is also where its rows are thrown away.
+        self._scan_cache = DayScanCache()
         self._day_canvas = None         # matplotlib canvas (built on first open)
         self._day_toolbar = None
         self._day_ax = None
@@ -1412,7 +1540,9 @@ class ShotFinderWidget(QWidget):
         self._tw_windows: "list[tuple[int, int]]" = []
         self._tw_segments = None            # so the dialog reopens on the last pick
         self._tw_day = _now.date()
-        self._tw_times = (0, 0, 23, 59)     # h_from, m_from, h_to, m_to
+        # The shift, not the calendar day: nothing is shot at four in the morning, and
+        # a window that starts at 00:00 makes every search read hours that hold nothing.
+        self._tw_times = (7, 0, 20, 0)      # h_from, m_from, h_to, m_to
         self._set_time_window_from_times()
 
         self._temp_dir: str | None = None
@@ -1423,6 +1553,8 @@ class ShotFinderWidget(QWidget):
         self._preview_sig.show.connect(self._on_preview_ready)
         self._preview_sig.log_msg.connect(self._log)
         self._preview_sig.day_img.connect(self._on_day_img_resolved)
+        self._preview_sig.day_img_batch.connect(self._on_day_img_batch)
+        self._preview_sig.day_fill_done.connect(self._on_day_fill_done)
         atexit.register(self._cleanup_temp)
         self._last_save_dir: "Path | None" = None
 
@@ -1632,8 +1764,8 @@ class ShotFinderWidget(QWidget):
         self._btn_search.clicked.connect(self._start_search)
         ll.addWidget(self._btn_search)
 
-        # The bar says what is being read right now, how far along it is and roughly
-        # how much is left — a search over many days and cameras is minutes long.
+        # How far along, and roughly how much is left — a search over many days and
+        # cameras is minutes long.
         self._prog = QProgressBar()
         self._prog.setVisible(False)
         self._prog.setTextVisible(True)
@@ -1645,6 +1777,15 @@ class ShotFinderWidget(QWidget):
             "text-align: center; }"
             "QProgressBar::chunk { background: #9fc4f5; }")
         ll.addWidget(self._prog)
+
+        # WHAT is being read right now, on its own wrapping line: the panel is 275 px
+        # wide and a progress bar cannot wrap its own text, so "reading PV data ·
+        # 2026-09-02 · 2/3 PV(s)" written on the bar came out cut at both ends.
+        self._prog_lbl = QLabel("")
+        self._prog_lbl.setVisible(False)
+        self._prog_lbl.setWordWrap(True)
+        self._prog_lbl.setStyleSheet("font-size: 10px; color: #555;")
+        ll.addWidget(self._prog_lbl)
 
         # ── PV search state ───────────────────────────────────────────────
         # ONE ordered list of picked PVs. Each entry carries its own "filter"
@@ -1970,18 +2111,14 @@ class ShotFinderWidget(QWidget):
         self._results_tabs.setDocumentMode(True)
         self._results_tabs.currentChanged.connect(self._on_result_tab_changed)
 
-        # Day rows on top, the shots of ONE opened day in a shorter table underneath.
-        # Both feed the SAME preview on the right — the opened day used to be a modal
-        # dialog carrying its own second copy of the picture, which covered the results.
-        self._results_split = QSplitter(Qt.Orientation.Vertical)
-        self._results_split.setChildrenCollapsible(False)
-        self._results_split.addWidget(self._results_tabs)
+        # The day rows have the whole area to themselves; the shots of ONE opened day
+        # live in a window of their own (_build_day_window), which can be moved aside,
+        # made big or left open next to the results. The picked shot is still drawn in
+        # the preview on the right — the window carries the list and the day's curve,
+        # nothing else.
+        rl.addWidget(self._results_tabs, 1)
         self._day_panel = self._build_day_panel()
-        self._results_split.addWidget(self._day_panel)
-        self._results_split.setStretchFactor(0, 3)
-        self._results_split.setStretchFactor(1, 2)
-        self._day_panel.setVisible(False)
-        rl.addWidget(self._results_split, 1)
+        self._day_window = self._build_day_window(self._day_panel)
         self._rebuild_result_tabs([None])
 
         root_layout.addWidget(left_scroll)
@@ -2011,34 +2148,23 @@ class ShotFinderWidget(QWidget):
     # send-to-Slider and the shot dialog need no notion of tabs at all — and the row
     # index → result index alignment they rely on stays inside one camera.
 
-    # ── OPENED DAY (shots of one day, under the results table) ────────────────
+    # ── OPENED DAY (shots of one day, in a window of its own) ─────────────────
 
     def _build_day_panel(self) -> QWidget:
-        """The shot list of ONE opened day, shown under the day table.
+        """The shot list of ONE opened day, plus that day's PV curve beside it.
 
-        The picture of the picked shot goes to the preview on the right — the same place
-        a day row uses — so opening a day never hides the results."""
+        It fills a window of its own (_build_day_window). The picture of the picked shot
+        goes to the preview on the right of the main window — the same place a day row
+        uses — so the window carries the list and the curve and nothing else."""
         w = QWidget()
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(3)
 
-        hdr = QHBoxLayout()
-        self._day_panel_lbl = QLabel("")
-        self._day_panel_lbl.setStyleSheet("font-weight: 700; font-size: 12px;")
-        hdr.addWidget(self._day_panel_lbl)
-        hdr.addStretch(1)
-        # No Open/Save buttons here — they exist once, in the panel's Save & Send
-        # group, where the "Act on" selector says whether they mean the day or the
-        # shot picked here.
-        btn_close = QPushButton("✕")
-        btn_close.setToolTip("Close the shot list")
-        btn_close.setFixedWidth(24)
-        btn_close.setStyleSheet("font-size: 11px; padding: 2px 0;")
-        btn_close.clicked.connect(self._hide_day_panel)
-        hdr.addWidget(btn_close)
-        lay.addLayout(hdr)
-
+        # No header line and no ✕ here — the window's own title bar says which day and
+        # camera this is, and closes it. No Open/Save buttons either: they exist once,
+        # in the panel's Save & Send group, where the "Act on" selector says whether
+        # they mean the day or the shot picked here.
         self._day_table = QTableWidget(0, 1)
         self._day_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._day_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -2046,7 +2172,9 @@ class ShotFinderWidget(QWidget):
         self._day_table.setStyleSheet(_TABLE_QSS)
         self._day_table.verticalHeader().setVisible(False)
         self._day_table.selectionModel().selectionChanged.connect(self._show_day_shot)
-        self._day_table.cellClicked.connect(self._on_day_cell_clicked)
+        # A single click only picks the shot (preview + the line on the curve); the
+        # folder is opened by a DOUBLE click, anywhere on the row.
+        self._day_table.doubleClicked.connect(self._on_day_row_double_clicked)
 
         # The shot list is narrow (its columns fit their contents), so the rest of the
         # width goes to the day's PV curve — where in the day this shot sits.
@@ -2062,20 +2190,58 @@ class ShotFinderWidget(QWidget):
         self._day_graph_placeholder.setStyleSheet("color: #777; font-size: 11px;")
         self._day_graph_lay.addWidget(self._day_graph_placeholder)
         self._day_split.addWidget(self._day_graph_host)
-        self._day_split.setStretchFactor(0, 4)
-        self._day_split.setStretchFactor(1, 6)
+        self._day_split.setStretchFactor(0, 2)
+        self._day_split.setStretchFactor(1, 3)
         # Sized for real on the first open (_show_day_panel) — a size hint alone
-        # leaves the table narrower than its own columns and hides the Image cell
+        # leaves the table narrower than its own columns and hides the last cell
         # behind a scrollbar.
         self._day_hsplit_sized = False
         lay.addWidget(self._day_split, 1)
         return w
 
+    def _build_day_window(self, panel: QWidget) -> QDialog:
+        """The window the shot list lives in.
+
+        A window and not a strip under the results: the list of one day is read side by
+        side with the table it came from, and a window can be moved onto the second
+        screen, made big, or left open while another day is picked. It is NOT modal —
+        the results table, the tabs and the preview all stay usable behind it — and
+        closing it only closes the list, never the tab."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Shots of the day")
+        dlg.setWindowFlag(Qt.WindowType.Window, True)
+        dlg.setModal(False)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(panel)
+        # Esc and the title bar's ✕ both end here, so the state behind the list (the
+        # "Act on: selected shot" scope) is dropped with it instead of going stale.
+        dlg.rejected.connect(self._hide_day_panel)
+        dlg.finished.connect(lambda *_a: self._hide_day_panel())
+        self._day_window_placed = False
+        return dlg
+
+    def _day_open(self) -> bool:
+        """Is the shot list on screen? The window's visibility is the only truth —
+        a child of a hidden window is not "hidden" as far as Qt is concerned."""
+        win = getattr(self, "_day_window", None)
+        return bool(win is not None and win.isVisible())
+
     def _hide_day_panel(self, *_a):
         """Close the shot list and forget the day it belonged to."""
-        self._day_panel.setVisible(False)     # before clearing: the clear fires a
-        self._day_table.setRowCount(0)        # selection change that must be ignored
-        self._day_dr = None
+        # FIRST, before the rows go: a background fill still running belongs to the day
+        # being closed, and a batch of its answers must not land in whatever comes next.
+        # Every way out of the list — a new search, another day, another camera's tab,
+        # Esc, the ✕ — comes through here, so this one line covers all of them.
+        self._day_fill_gen += 1
+        self._day_fill_rows = 0
+        win = getattr(self, "_day_window", None)
+        if win is not None and win.isVisible():
+            win.blockSignals(True)            # its own finished() lands back here
+            win.hide()
+            win.blockSignals(False)
+        self._day_table.setRowCount(0)        # fires a selection change that _day_open
+        self._day_dr = None                   # (now false) makes _show_day_shot ignore
         self._day_rows = []
         self._day_cam = None
         self._day_hour_cache = {}
@@ -2089,32 +2255,184 @@ class ShotFinderWidget(QWidget):
         # Camera of the SEARCH, not of the live list — the rows were found with it.
         self._day_cam = dr.cam or self._active_cam
         self._day_hour_cache = {}
-        self._day_panel_lbl.setText(
-            f"{dr.day} — {len(self._day_rows)} shot(s) in range"
-            + (f"   ({self._day_cam})" if self._day_cam else ""))
+        # Before the rows are built, so a batch from the day being replaced cannot be
+        # written into the items that are about to be created.
+        self._day_fill_gen += 1
+        self._day_fill_rows = 0
+        self._set_day_title(dr)
         self._fill_day_table(dr)
         self._draw_day_graph(dr)
-        # After setVisible: the scope selector reads isHidden() to decide whether the
+        # Sized and centred on the main window the first time only; after that the
+        # operator's own move and resize are kept for the session.
+        if not self._day_window_placed:
+            self._place_day_window()
+            self._day_window_placed = True
+        # After show(): the scope selector reads _day_open() to decide whether the
         # "selected shot" scope is reachable at all.
-        self._day_panel.setVisible(True)
+        self._day_window.show()
+        self._day_window.raise_()
         self._sync_scope_selector()
         if not self._restoring_focus:
             self._focus_day = dr.day
             self._focus_panel_open = True
-        # First open gives the day rows the bigger half instead of an even split;
-        # after that the user's own drag of the divider is kept.
-        if not self._day_split_sized:
-            h = max(self._results_split.height(), 240)
-            self._results_split.setSizes([int(h * 0.6), int(h * 0.4)])
-            self._day_split_sized = True
-        # Same rule sideways: the shot list gets a bit over half so its columns fit,
-        # the curve gets the rest. The operator's own drag wins afterwards.
+        # The curve gets the bigger half: the shot list is a few narrow columns of
+        # numbers and a time, while the curve is what the day is read from. The
+        # operator's own drag wins afterwards.
         if not self._day_hsplit_sized:
-            w_px = max(self._day_split.width(), 480)
-            self._day_split.setSizes([int(w_px * 0.55), int(w_px * 0.45)])
+            w_px = max(self._day_split.width(), self._day_window.width() - 12, 480)
+            self._day_split.setSizes([int(w_px * 0.40), int(w_px * 0.60)])
             self._day_hsplit_sized = True
         if self._day_table.rowCount():
             self._day_table.selectRow(0)
+        # Name every shot's frame without waiting to be asked, in the background.
+        # Deferred by one turn of the event loop for two reasons: the window's first
+        # paint is not held up by it, and _restore_focus_to_row (which runs after this
+        # method returns) has by then moved the selection, so the fill starts at the
+        # row the operator is actually looking at.
+        QTimer.singleShot(0, lambda _dr=dr, _g=self._day_fill_gen:
+                          self._start_day_prefill(_dr, _g))
+
+    def _set_day_title(self, dr, filled: int = -1):
+        """The window's title says which day and which camera is being listed — the
+        question "whose shots am I looking at" is answered by the frame itself. While
+        the frames are being named in the background, it also counts them, so a few
+        quiet seconds cannot be mistaken for a program that has stopped."""
+        n = len(self._day_rows)
+        txt = (f"{dr.day} — {n} shot(s) in range"
+               + (f"   ({self._day_cam})" if self._day_cam else ""))
+        if 0 <= filled < n:
+            txt += f"   ·   frames {filled}/{n}"
+        self._day_window.setWindowTitle(txt)
+
+    # ── naming every shot's frame, in the background ──────────────────────────
+    #
+    # The Frame time column used to be empty until a row was clicked, because every
+    # row meant its own reading of a folder on the share (~150 ms): a day with two
+    # thousand shots would have been five minutes of them. Through the tab's shared
+    # DayScanCache the cost is one reading per HOUR the shots span — twenty-odd
+    # readings for a whole day — and every row after the first in its hour is answered
+    # from memory. So the whole column can be filled at once, on one thread, behind a
+    # window that is already usable.
+
+    def _start_day_prefill(self, dr, gen: int):
+        """Resolve the frame of every listed shot and fill the column as they land."""
+        if gen != self._day_fill_gen or self._day_dr is None:
+            return                       # the list was closed inside the same turn
+        rows = list(self._day_rows)      # by value: the worker must not read widget state
+        cam = self._day_cam
+        if not rows or not cam:
+            return
+        if len(rows) > _DAY_PREFILL_MAX_ROWS:
+            self._log(f"{len(rows)} shots — naming the frames of the first "
+                      f"{_DAY_PREFILL_MAX_ROWS}; the rest are named when picked.")
+            rows = rows[:_DAY_PREFILL_MAX_ROWS]
+
+        # Start where the operator is looking and wrap round to the top: coming back to
+        # a camera tab can land the selection near the bottom of a long list, and
+        # filling the top first would fill the part nobody is reading.
+        sel = self._day_table.currentRow()
+        start = sel if 0 <= sel < len(rows) else 0
+        order = list(range(start, len(rows))) + list(range(0, start))
+        # Rows already answered for (the picked shot, a double-click) are skipped.
+        todo = [i for i in order if self._day_cell_known(i) is None]
+        if not todo:
+            return
+
+        # The rows already named count towards the title from the start, so the counter
+        # says how much of the column is filled and not how much this pass has done.
+        self._day_fill_rows = len(rows) - len(todo)
+
+        sig = self._preview_sig
+        # The hour map is shared with the preview thread on purpose, and so is the
+        # folder cache: DayScanCache reads each folder once and makes the loser of a
+        # race wait for that reading instead of repeating it.
+        cache = self._day_hour_cache
+        scan = self._scan_cache
+        miss = f"no frame within {IMG_MATCH_TOL_NS/1e9:.0f}s of this shot"
+        listings0 = scan.stats()[0]
+
+        def _fill():
+            try:
+                _fill_rows()
+            except RuntimeError:
+                # The tab was destroyed while this thread was reading the share (the
+                # program is closing). There is nothing left to fill.
+                pass
+
+        def _fill_rows():
+            batch: "list[tuple[int, str, str]]" = []
+            t_flush = time.monotonic()
+            done = 0
+            for row_idx in todo:
+                if gen != self._day_fill_gen:
+                    return                        # another day, or the list was closed
+                shot = rows[row_idx]
+                dt_obj = shot.get("_dt")
+                if dt_obj is None:
+                    continue
+                try:
+                    img = self._find_image_for_shot(dr, cam, dt_obj, shot.get("_ns"),
+                                                    cache, scan_cache=scan)
+                except Exception:
+                    img = None
+                # NOT _image_problem: that opens and decodes the frame, and doing it
+                # for two thousand shots over the share is minutes and megabytes. A
+                # frame that turns out to be broken is caught when it is previewed.
+                batch.append((row_idx, str(img) if img else "", "" if img else miss))
+                done += 1
+                if (len(batch) >= _DAY_PREFILL_BATCH
+                        or (time.monotonic() - t_flush) * 1000.0 >= _DAY_PREFILL_FLUSH_MS):
+                    if gen != self._day_fill_gen:
+                        return
+                    sig.day_img_batch.emit(batch, gen)
+                    batch = []            # rebound, never cleared: the list just sent
+                    t_flush = time.monotonic()   # is still held by the queued signal
+            if batch and gen == self._day_fill_gen:
+                sig.day_img_batch.emit(batch, gen)
+            if gen == self._day_fill_gen:
+                sig.day_fill_done.emit(gen, done, scan.stats()[0] - listings0)
+
+        threading.Thread(target=_fill, daemon=True).start()
+
+    def _on_day_img_batch(self, items: list, gen: int):
+        """Worker → main thread: a slice of the Frame time column."""
+        # The generation FIRST: _hide_day_panel bumps it before it empties the table,
+        # and emptying the table fires a selection change of its own.
+        if gen != self._day_fill_gen or self._day_dr is None:
+            return
+        tbl = self._day_table
+        tbl.setUpdatesEnabled(False)
+        try:
+            for row_idx, img_str, problem in items:
+                self._day_set_image_cell(row_idx, img_str or None, problem)
+            self._day_fill_rows += len(items)
+        finally:
+            tbl.setUpdatesEnabled(True)
+        if self._day_dr is not None:
+            self._set_day_title(self._day_dr, self._day_fill_rows)
+
+    def _on_day_fill_done(self, gen: int, rows: int, listings: int):
+        if gen != self._day_fill_gen:
+            return
+        if self._day_dr is not None:
+            self._set_day_title(self._day_dr)      # the counter goes away
+        self._log(f"Frame times filled in: {rows} shot(s), "
+                  f"{listings} folder reading(s).")
+
+    def _place_day_window(self):
+        """First open: a bit over half the main window wide, and no taller than the
+        list and the curve need — a window that covers the results behind it has to be
+        moved before anything can be compared."""
+        top = self.window()
+        geo = top.geometry() if top is not None else None
+        if geo is None or geo.width() < 200:
+            self._day_window.resize(900, 430)
+            return
+        w_px = max(int(geo.width() * 0.60), 700)
+        h_px = max(int(geo.height() * 0.46), 380)
+        self._day_window.resize(w_px, h_px)
+        self._day_window.move(geo.x() + (geo.width() - w_px) // 2,
+                              geo.y() + (geo.height() - h_px) // 2)
 
     def _fill_day_table(self, dr):
         """Columns come from the SEARCH-TIME state stored on dr — the left panel may
@@ -2135,12 +2453,15 @@ class ShotFinderWidget(QWidget):
         for c in extra_cols:
             headers.append(self._col_short(c))
             header_tips.append(self._col_channel(c))
-        # Last column: the file, like the Folder column of the day table. It is filled
-        # in LAZILY — a day can hold tens of thousands of shots and every path is an
-        # SMB probe, so nothing is resolved until a shot is previewed or its cell is
-        # clicked.
-        headers.append("Image")
-        header_tips.append("The frame belonging to this shot")
+        # Last column: the frame belonging to this shot, named by ITS OWN time — the
+        # camera's name is in the window title, and the file name it came from was so
+        # long that the column took half the window. The two times side by side also
+        # say how far the picture is from the PV sample.
+        # It is filled in in the background as the window opens (_start_day_prefill),
+        # and one at a time for whatever that has not reached yet.
+        headers.append("Frame time")
+        header_tips.append("The archived frame's own time — double-click the row to "
+                           "open its folder with the frame selected")
         self._day_img_col = len(headers) - 1
 
         tbl = self._day_table
@@ -2155,8 +2476,10 @@ class ShotFinderWidget(QWidget):
         hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for h_idx in range(len(headers)):
             hh.setSectionResizeMode(h_idx, QHeaderView.ResizeMode.ResizeToContents)
-        # The file name takes whatever width is left, so the column cannot end up
-        # behind a horizontal scrollbar.
+        # The frame time takes whatever width is left, so the column cannot end up
+        # behind a horizontal scrollbar. It is also the only column the background
+        # fill writes to, and Stretch means its width is never recomputed from the
+        # cells — a ResizeToContents column would be re-measured over every row.
         hh.setSectionResizeMode(self._day_img_col, QHeaderView.ResizeMode.Stretch)
 
         def _row_col_value(row, cc, row_ns):
@@ -2195,8 +2518,8 @@ class ShotFinderWidget(QWidget):
                 c_idx += 1
             img_item = QTableWidgetItem("")
             img_item.setForeground(QColor("#2d7dff"))
-            img_item.setToolTip("Click to find this shot's frame and open the folder "
-                               "with it selected")
+            img_item.setToolTip("Double-click this row to open the folder with the "
+                                "frame selected")
             tbl.setItem(r2, self._day_img_col, img_item)
 
     # ── the day's PV curve, next to the shot list ─────────────────────────────
@@ -2303,7 +2626,13 @@ class ShotFinderWidget(QWidget):
                 missing.append(short)
                 continue
             drawn += 1
-            axis.plot(xs, ys, "-", lw=0.8, color=colr, label=short)
+            # Held until the next sample, never sloped towards it — the archive says
+            # the value STAYED where it was until something new was written, which is
+            # also how the same curve is drawn in CS Studio and in the PV Search
+            # window (if_t._redraw). A slope between two samples an hour apart draws a
+            # value that was never measured.
+            axis.plot(xs, ys, "-", lw=0.8, color=colr, label=short,
+                      drawstyle="steps-post")
             axis.set_ylabel(f"{short}" + (f" [{unit}]" if unit and unit != "—" else ""),
                             fontsize=8, color=colr)
             axis.tick_params(axis="y", labelsize=7, colors=colr)
@@ -2396,10 +2725,25 @@ class ShotFinderWidget(QWidget):
         want_ns = int(clicked.replace(tzinfo=tz).timestamp() * 1_000_000_000)
         self._select_day_shot_by_ns(want_ns)
 
-    # ── the Image column of the shot list ─────────────────────────────────────
+    # ── the Frame time column of the shot list ────────────────────────────────
+
+    def _day_frame_time_text(self, path: Path) -> str:
+        """What the Frame time cell says: the moment the frame itself carries, in
+        Prague time and in the same shape as the Prague Time column, so the two can be
+        read against each other. The file name is the fallback for anything not named
+        the archive's way."""
+        ts_ns = _ts_from_stem(path)
+        if ts_ns is None:
+            return path.name
+        return _ns_to_prague(int(ts_ns)).strftime("%H:%M:%S.%f")[:-3]
 
     def _day_set_image_cell(self, row_idx: int, img, problem: str = ""):
-        """Fill one Image cell once the path is known (main thread only)."""
+        """Fill one Frame time cell once the path is known (main thread only).
+
+        The cell's UserRole is the memory of what the share answered, and it has THREE
+        states, not two: a path (there it is), "" (asked, and there is no frame) and
+        None (not asked yet). Without the empty string, a shot with no frame was asked
+        about again on every click and every arrow key."""
         if self._day_dr is None or self._day_img_col < 0:
             return
         if row_idx < 0 or row_idx >= self._day_table.rowCount():
@@ -2411,25 +2755,46 @@ class ShotFinderWidget(QWidget):
             item.setText("no image")
             item.setForeground(QColor("#cc0000"))
             item.setToolTip(problem or "No frame found for this shot")
-            item.setData(Qt.ItemDataRole.UserRole, None)
+            item.setData(Qt.ItemDataRole.UserRole, "")
             return
         p = Path(img)
-        item.setText(p.name)
+        item.setText(self._day_frame_time_text(p))
         item.setForeground(QColor("#2d7dff"))
-        item.setToolTip(f"{p}\nClick to open the folder with this frame selected")
+        item.setToolTip(f"{p}\nDouble-click this row to open the folder with this "
+                        f"frame selected")
         item.setData(Qt.ItemDataRole.UserRole, str(p))
 
-    def _on_day_cell_clicked(self, row: int, col: int):
-        """Click the Image cell — reveal the frame in Explorer, resolving the path
-        first when it is not known yet (off the UI thread: it is an SMB probe)."""
-        if col != self._day_img_col or self._day_dr is None:
+    def _day_cell_known(self, row: int):
+        """What the share has already answered for that row (main thread only):
+        a path, "" for "there is no frame", or None for "not asked yet"."""
+        if self._day_img_col < 0 or row < 0 or row >= self._day_table.rowCount():
+            return None
+        item = self._day_table.item(row, self._day_img_col)
+        return None if item is None else item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_day_row_double_clicked(self, index):
+        """DOUBLE-click a row — anywhere on it — opens the folder with that shot's
+        frame selected, resolving the path first when it is not known yet (off the UI
+        thread: it is a reading of the share).
+
+        Double-click and not a single click: browsing the list with the mouse must not
+        throw an Explorer window per row. And since Qt sends `clicked` before
+        `doubleClicked`, a single-click reveal would fire on every double-click too."""
+        if self._day_dr is None or index is None or not index.isValid():
             return
-        item = self._day_table.item(row, col)
+        row = index.row()
+        item = (self._day_table.item(row, self._day_img_col)
+                if self._day_img_col >= 0 else None)
         if item is None:
             return
         known = item.data(Qt.ItemDataRole.UserRole)
         if known:
             self._reveal_in_explorer(known)
+            return
+        if known == "":
+            # Already asked, and there is no frame. Asking again would only cost
+            # another reading of the share.
+            self._log(f"No frame for this shot — {item.toolTip() or 'nothing found'}")
             return
         if row >= len(self._day_rows):
             return
@@ -2447,7 +2812,8 @@ class ShotFinderWidget(QWidget):
         self._day_reveal_row = row
 
         def _resolve():
-            img = self._find_image_for_shot(dr, cam, dt_obj, shot.get("_ns"), cache)
+            img = self._find_image_for_shot(dr, cam, dt_obj, shot.get("_ns"), cache,
+                                            scan_cache=self._scan_cache)
             self._preview_sig.day_img.emit(row, str(img) if img else "",
                                            "" if img else "no frame within "
                                            f"{IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
@@ -2455,7 +2821,7 @@ class ShotFinderWidget(QWidget):
         threading.Thread(target=_resolve, daemon=True).start()
 
     def _on_day_img_resolved(self, row_idx: int, img_str: str, problem: str):
-        """Worker → main thread: the Image cell of one shot, and reveal it if the
+        """Worker → main thread: the Frame time cell of one shot, and reveal it if the
         click is what asked for it."""
         self._day_set_image_cell(row_idx, img_str or None, problem)
         if img_str and self._day_reveal_row == row_idx:
@@ -2478,10 +2844,9 @@ class ShotFinderWidget(QWidget):
     def _show_day_shot(self, *_a):
         """Picked shot of the opened day → the panel preview on the right."""
         dr = self._day_dr
-        # isHidden(), not isVisible(): the tab itself is invisible whenever another
-        # Image Tools tab is in front, and a redraw asked for then still belongs to the
-        # opened day.
-        if dr is None or self._day_panel.isHidden():
+        # The window's own visibility, not the panel's: a redraw asked for while
+        # another Image Tools tab is in front still belongs to the opened day.
+        if dr is None or not self._day_open():
             return
         sel = sorted(set(i.row() for i in self._day_table.selectedIndexes()))
         rows = [self._day_rows[i] for i in sel if i < len(self._day_rows)]
@@ -2514,10 +2879,21 @@ class ShotFinderWidget(QWidget):
             self._day_set_image_cell(row_idx, None, "no camera for these results")
             return
 
+        # What the share has already answered for this row, read here on the main
+        # thread: a path, "" for "there is no frame", or None for "nobody has asked".
+        # Holding the down-arrow through a filled list must not cost a reading of the
+        # share per row.
+        known = self._day_cell_known(row_idx)
+
         def _resolve_and_load():
             # Hour folders are resolved per shot on a worker thread: the shots in range
             # span the whole day, and probing an SMB folder on the UI thread freezes it.
-            img = self._find_image_for_shot(dr, cam, dt_obj, ns, cache)
+            # The reading and decoding of the frame below stays on this thread too,
+            # which is why the known-path case is not shortcut on the main thread.
+            if known is None:
+                img = self._find_image_for_shot(dr, cam, dt_obj, ns, cache)
+            else:
+                img = Path(known) if known else None
             if gen != self._preview_gen:
                 return
             if img is None:
@@ -2525,14 +2901,16 @@ class ShotFinderWidget(QWidget):
                     f"⚠ no image within {IMG_MATCH_TOL_NS/1e9:.0f}s for "
                     f"{dt_obj:%Y-%m-%d %H:%M:%S} ({cam})")
                 self._preview_sig.show.emit(None, "", gen)
-                self._preview_sig.day_img.emit(
-                    row_idx, "",
-                    f"no frame within {IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
+                if known is None:
+                    self._preview_sig.day_img.emit(
+                        row_idx, "",
+                        f"no frame within {IMG_MATCH_TOL_NS/1e9:.0f}s of this shot")
                 return
             self._current_preview_path = img
-            # The path is now known — the Image cell of this row can name it without
-            # a second walk of the share.
-            self._preview_sig.day_img.emit(row_idx, str(img), "")
+            if known is None:
+                # The path is now known — the Frame time cell of this row can name it
+                # without a second walk of the share.
+                self._preview_sig.day_img.emit(row_idx, str(img), "")
             self._load_and_show_preview(img, energy, gen, gname, auto, gam, con, off)
 
         threading.Thread(target=_resolve_and_load, daemon=True).start()
@@ -2667,6 +3045,11 @@ class ShotFinderWidget(QWidget):
         """One empty tab per camera of the search about to run (None = no camera)."""
         # The opened day belongs to rows that are about to be thrown away.
         self._hide_day_panel()
+        # And so do the remembered folder listings. A new search is the one moment
+        # where everything is dropped anyway, so it is also where the cache is emptied
+        # — otherwise a long session could hold fifteen hundred camera folders in
+        # memory, and a re-searched day would keep answering from yesterday's listing.
+        self._scan_cache.forget()
         self._results_tabs.blockSignals(True)
         while self._results_tabs.count():
             w = self._results_tabs.widget(0)
@@ -2753,11 +3136,17 @@ class ShotFinderWidget(QWidget):
         results = self._day_results
         row = next((i for i, dr in enumerate(results) if dr.day == want_day), None)
         if row is None:
-            # This camera has no row for that day — say nothing found rather than
-            # jumping to some other day.
+            # This camera has not answered for that day (yet). The wish is KEPT, so a
+            # row arriving later from a still-running search is selected the moment it
+            # lands (_maybe_restore_focus_row) instead of the day being lost.
             self._on_selection_changed()
             return
 
+        self._restore_focus_to_row(row, want_day, want_ns, want_panel)
+
+    def _restore_focus_to_row(self, row: int, want_day, want_ns, want_panel: bool):
+        """Put the remembered day (and shot) back on screen in the tab now in front."""
+        results = self._day_results
         self._restoring_focus = True
         try:
             # Select the day row FIRST: that fires _on_main_selection_changed, which
@@ -2765,15 +3154,39 @@ class ShotFinderWidget(QWidget):
             self._table.selectRow(row)
             dr = results[row]
             if want_panel and dr.rows_in_tol:
-                self._show_day_panel(dr)
-                self._select_day_shot_by_ns(want_ns)
+                # A shot list that fails to build must not also cost the selected day
+                # row — the row is the cheap half of the answer.
+                try:
+                    self._show_day_panel(dr)
+                    self._select_day_shot_by_ns(want_ns)
+                except Exception as exc:
+                    self._log(f"Shot list could not be reopened: "
+                              f"{type(exc).__name__}: {exc}")
+                    self._hide_day_panel()
         finally:
             self._restoring_focus = False
         # Restore left the remembered pick untouched; the preview/buttons still need
         # to be brought in line with the tab that is now in front.
         self._focus_day, self._focus_shot_ns = want_day, want_ns
-        self._focus_panel_open = want_panel and not self._day_panel.isHidden()
+        self._focus_panel_open = want_panel and self._day_open()
         self._on_selection_changed()
+
+    def _maybe_restore_focus_row(self, cam, day):
+        """A row that just arrived for the day the operator is waiting on.
+
+        Switching camera while a search is still running lands on a tab that has not
+        been filled that far yet; without this the day was dropped and never came back,
+        even once its row appeared."""
+        if day != self._focus_day or cam != self._current_cam_key():
+            return
+        if self._table.selectedIndexes():
+            return
+        results = self._day_results
+        row = next((i for i, dr in enumerate(results) if dr.day == day), None)
+        if row is None:
+            return
+        self._restore_focus_to_row(row, day, self._focus_shot_ns,
+                                   self._focus_panel_open)
 
     def _select_day_shot_by_ns(self, want_ns):
         """Pick the shot of the opened day whose timestamp matches — nearest wins, so
@@ -2813,7 +3226,7 @@ class ShotFinderWidget(QWidget):
     def _refresh_preview(self):
         """Re-render what is on screen with the current display settings: the shot
         picked in the opened day list, otherwise the selected day row."""
-        if not self._day_panel.isHidden() and self._day_table.selectedIndexes():
+        if self._day_open() and self._day_table.selectedIndexes():
             self._show_day_shot()
             return
         if self._table.selectedIndexes():
@@ -2845,33 +3258,84 @@ class ShotFinderWidget(QWidget):
 
     # ── SEARCH PROGRESS ───────────────────────────────────────────────────────
 
-    def _sync_prog_text(self, value: int):
-        """The words on the progress bar: what is being read, how far along, and
-        roughly how much is left. A bar with no text says nothing about a search
-        that runs for minutes."""
-        total = max(1, getattr(self, "_prog_total", 1))
-        parts = [getattr(self, "_prog_stage", "") or "working…",
-                 f"{value}/{total}"]
+    # The bar is driven in permille of the whole job, so a step that takes a minute
+    # still moves it; the count printed on it stays in whole days × cameras, which is
+    # what the operator counts in.
+    _PROG_SCALE = 1000
+
+    def _prog_take(self, owner: str, total_units: float, stage: str) -> None:
+        """Hand the one progress bar to `owner` ("search" or "cameras").
+
+        There is a single bar under Load data and two jobs that can want it. The
+        search always wins: a camera scan started earlier must go quiet rather than
+        overwrite what the search is saying."""
+        if owner != "search" and getattr(self, "_prog_owner", None) == "search":
+            return
+        self._prog_owner = owner
+        self._prog_total = max(1e-9, float(total_units))
+        self._prog_units = 0.0
+        self._prog_t0 = time.monotonic()
+        self._prog_stage = stage
+        self._prog_hits = 0
+        # Nothing can be said about the time left until the job says so. A job that
+        # never says anything (the camera scan) therefore shows no estimate at all,
+        # which is better than one it cannot stand behind.
+        self._prog_eta = -1.0
+        self._prog.setRange(0, self._PROG_SCALE)
+        self._prog.setValue(0)
+        self._prog.setVisible(True)
+        self._prog_lbl.setVisible(True)
+        self._sync_prog_text(0.0)
+
+    def _prog_release(self, owner: str) -> None:
+        """Put the bar away — unless the other job has taken it over meanwhile."""
+        if getattr(self, "_prog_owner", None) != owner:
+            return
+        self._prog_owner = None
+        self._prog.setVisible(False)
+        self._prog_lbl.setVisible(False)
+
+    def _sync_prog_text(self, units: float):
+        """How far along and roughly how much is left, on the bar; what is being read
+        right now, on the line under it. A bar with no words says nothing about a
+        search that runs for minutes.
+
+        The time left is NOT worked out here. It comes from the job itself (the `eta`
+        signal), because the work is not one uniform thing: reading the archiver runs
+        every day at once and is quick, looking the frames up then walks the share day
+        by day and is slow. Spreading one straight line over both halves is what made
+        the old estimate jump from two minutes to ten seconds and back."""
+        total = max(1.0, float(getattr(self, "_prog_total", 1.0)))
+        parts = [f"{int(units)}/{int(round(total))}"]
         hits = getattr(self, "_prog_hits", 0)
         if hits:
             parts.append(f"{hits} found")
-        t0 = getattr(self, "_prog_t0", None)
-        if t0 is not None and value > 0 and value < total:
-            elapsed = time.monotonic() - t0
-            left = elapsed / value * (total - value)
-            if left >= 90:
-                parts.append(f"~{left / 60:.0f} min left")
+        eta = float(getattr(self, "_prog_eta", -1.0) or -1.0)
+        if eta > 0 and units < total:
+            if eta >= 90:
+                # Rounded the way people round — 2.5 minutes is "3 min", not the "2"
+                # that Python's own rounding of a half gives.
+                parts.append(f"~{int(eta / 60 + 0.5)} min left")
             else:
-                parts.append(f"~{max(1, int(left))} s left")
+                parts.append(f"~{max(1, int(eta))} s left")
         self._prog.setFormat("  ·  ".join(parts))
+        self._prog_lbl.setText(getattr(self, "_prog_stage", "") or "working…")
 
-    def _on_progress(self, value: int):
-        self._prog.setValue(value)
-        self._sync_prog_text(value)
+    def _on_eta(self, secs: float):
+        """Seconds still to go, as measured by the job; -1 = say nothing."""
+        self._prog_eta = float(secs)
+        self._sync_prog_text(getattr(self, "_prog_units", 0.0))
+
+    def _on_progress(self, units: float):
+        self._prog_units = float(units)
+        total = max(1e-9, float(getattr(self, "_prog_total", 1.0)))
+        self._prog.setValue(
+            int(min(1.0, self._prog_units / total) * self._PROG_SCALE))
+        self._sync_prog_text(self._prog_units)
 
     def _on_stage(self, text: str):
         self._prog_stage = text
-        self._sync_prog_text(self._prog.value())
+        self._sync_prog_text(getattr(self, "_prog_units", 0.0))
 
     def _col_unit(self, col: str) -> str:
         if col in MJ_COLUMNS:
@@ -3457,16 +3921,24 @@ class ShotFinderWidget(QWidget):
         return "  |  ".join(parts)
 
     def _find_image_for_shot(self, dr, cam: str, dt_obj, ts_ns,
-                             hour_cache: dict) -> Path | None:
+                             hour_cache: dict,
+                             scan_cache: "DayScanCache | None" = None) -> Path | None:
         """Image belonging to ONE shot of a day result — see _find_image_in_day.
 
         dr.hour_folder is the hour of that day's best shot only, while the shots in range
         are spread over the whole day, so the day folder is taken from it and the hour is
         resolved per shot. Using the SEARCH-TIME folder also means a later change of the
-        image source cannot send old rows to another share."""
+        image source cannot send old rows to another share.
+
+        scan_cache: the tab's shared folder listings, so a second shot in an hour that
+        has already been read costs no reading at all. It defaults to the tab's own
+        cache; the answer is the same either way (the cached path is chosen by the same
+        tolerance, from the same listing), only the number of round trips differs."""
         day_dir = dr.hour_folder.parent if dr.hour_folder is not None else None
-        return _find_image_in_day(dr.day, cam, dt_obj, ts_ns, hour_cache,
-                                  images_root=self._images_root, day_dir=day_dir)[0]
+        return _find_image_in_day(
+            dr.day, cam, dt_obj, ts_ns, hour_cache,
+            images_root=self._images_root, day_dir=day_dir,
+            scan_cache=scan_cache if scan_cache is not None else self._scan_cache)[0]
 
     # ── WHAT SEND / SAVE ACT ON ───────────────────────────────────────────────
     #
@@ -3475,7 +3947,7 @@ class ShotFinderWidget(QWidget):
 
     def _export_scope(self) -> str:
         """"shot" only while the day detail is open AND it is what is asked for."""
-        if self._day_dr is None or self._day_panel.isHidden():
+        if self._day_dr is None or not self._day_open():
             return "day"
         return self._scope_cb.currentData() or "day"
 
@@ -3485,7 +3957,7 @@ class ShotFinderWidget(QWidget):
         cb = getattr(self, "_scope_cb", None)
         if cb is None:
             return
-        open_day = self._day_dr is not None and not self._day_panel.isHidden()
+        open_day = self._day_dr is not None and self._day_open()
         cb.setEnabled(open_day)
         if not open_day and cb.currentData() != "day":
             cb.blockSignals(True)
@@ -3624,18 +4096,20 @@ class ShotFinderWidget(QWidget):
             bc_out: dict = {}
             arr = _render_u8(arr_f, auto, full_scale, gamma, contrast, offset, bc_out)
             self._bc_applied = bc_out
-            g_applied = (bc_out.get("gamma")
-                         if (not auto and img_scale.is_auto_gamma(gamma)) else None)
+            # The note names what was APPLIED, so the pair comes out of bc_out: while an
+            # Auto box is on, the widget it stands for holds a zero.
+            a_con = int(bc_out.get("contrast", contrast))
+            a_off = int(bc_out.get("offset", offset))
             # pil.info, not a second open of the same file: a share read is 130–160 ms.
             # Branch on the MODE, not on full_scale: a 16-bit frame shown on its camera's
             # reference range has a full_scale of its own and is not an 8-bit source.
             self._scale_note = (
                 img_scale.meta_from_info(pil.info, arr_f).scale_note(
-                    auto, gamma, g_applied,
+                    auto, gamma, bc_out.get("gamma"),
                     img_scale.current_reference_bits(img_scale.camera_from_path(img_path)),
-                    contrast, offset)
+                    a_con, a_off)
                 if pil.mode in ("I", "I;16")
-                else f"8-bit source  ·  {'auto stretch' if auto else 'absolute scale'}")
+                else "8-bit source  ·  absolute scale")
 
             w, h = arr.shape[1], arr.shape[0]
 
@@ -3677,12 +4151,11 @@ class ShotFinderWidget(QWidget):
         each other:
           - Auto on → that row's own slider and reset button are greyed out (the
             app-wide 'checkbox beats slider' rule).
-          - Either Auto contrast or Auto brightness on → the whole Gamma row goes dead.
-            Both of them set the frame's two ends themselves, so gamma has nothing left
-            to bend and the render drops it (see img_scale.to_u8). The Slider tab keeps
-            its gamma row alive under Auto brightness because its subtraction mode still
-            uses it; this tab has no such mode, so a live-but-ignored slider would just
-            be a lie.
+        One rule, and it is the same for all three rows: an Auto box speaks for its own
+        row and for nothing else. Gamma used to go dead whenever either of the other two
+        Autos was on, because both of those ran a stretch that set the frame's two ends
+        itself. Each is now its own slider set automatically (see img_scale.render_u8),
+        and gamma composes with them exactly as it always did with the manual sliders.
         The name labels and the numeric readouts stay live either way: while Auto is on,
         the readout is exactly what the user wants to see — the value Auto picked, put
         there by _park_auto_bc."""
@@ -3692,7 +4165,7 @@ class ShotFinderWidget(QWidget):
         self._btn_contrast_reset.setEnabled(c_live)
         self._bright_slider.setEnabled(b_live)
         self._btn_bright_reset.setEnabled(b_live)
-        gamma_usable = c_live and b_live
+        gamma_usable = True
         g_live = gamma_usable and not self._cb_gamma_auto.isChecked()
         self._cb_gamma_auto.setEnabled(gamma_usable)
         self._lbl_gamma.setEnabled(gamma_usable)
@@ -3706,20 +4179,18 @@ class ShotFinderWidget(QWidget):
 
         Honours the 'Auto checkbox overrides its own slider' rule of each pair, exactly
         as the Slider tab does: Auto contrast zeroes the manual contrast, Auto brightness
-        zeroes the manual offset, and each leaves the other one live. Both Autos are the
-        same percentile pass (see img_scale.stretch_u8), so `auto` is set by either and
-        ticking both does not level the frame twice."""
-        auto_c = self._cb_auto_stretch.isChecked()
-        auto_b = self._cb_bright_auto.isChecked()
-        auto = auto_c or auto_b
-        if auto:
-            gamma = img_scale.GAMMA_SLIDER_NEUTRAL
-        elif self._cb_gamma_auto.isChecked():
-            gamma = img_scale.GAMMA_SLIDER_AUTO
-        else:
-            gamma = int(self._gamma_slider.value())
-        contrast = 0 if auto_c else int(self._contrast_slider.value())
-        offset = 0 if auto_b else int(self._bright_slider.value())
+        zeroes the manual offset, and each leaves the other one live. `auto` is the
+        AUTO_* mask of the boxes that are on — each fills in the value of ITS OWN control
+        from the frame (see img_scale.render_u8), so the two are different operations and
+        ticking both is the full stretch."""
+        auto = img_scale.auto_mask(self._cb_auto_stretch.isChecked(),
+                                   self._cb_bright_auto.isChecked())
+        gamma = (img_scale.GAMMA_SLIDER_AUTO if self._cb_gamma_auto.isChecked()
+                 else int(self._gamma_slider.value()))
+        contrast = (0 if (auto & img_scale.AUTO_CONTRAST)
+                    else int(self._contrast_slider.value()))
+        offset = (0 if (auto & img_scale.AUTO_BRIGHT)
+                  else int(self._bright_slider.value()))
         return auto, gamma, contrast, offset
 
     def _sync_bc_value_labels(self):
@@ -3924,11 +4395,20 @@ class ShotFinderWidget(QWidget):
         sig = self._sig_cam = _CamLoadSignals()
         sig.finished.connect(self._on_cameras_loaded)
         sig.log_msg.connect(self._log)
+        sig.progress.connect(self._on_cam_progress)
+        # Walking the share for the cameras of a new day takes as long as a small
+        # search, and it used to show nothing but the words "Loading cameras…".
+        self._cam_scan_list = list(scan_days)
+        if hasattr(self, "_prog"):
+            self._prog_take("cameras", len(scan_days) * 24,
+                            f"looking for cameras · {scan_days[0]}")
 
         def worker():
             seen: set[str] = set()
             cameras: list[str] = []
             days_with_data = 0
+            hours_done = 0
+            hours_total = len(scan_days) * 24
 
             def _scan_hour(hour_dir) -> list[str]:
                 try:
@@ -3964,6 +4444,8 @@ class ShotFinderWidget(QWidget):
                                         cameras.append(_name)
                             except Exception:
                                 pass
+                            hours_done += 1
+                            sig.progress.emit(hours_done, hours_total)
                 except Exception as exc:
                     sig.log_msg.emit(f"Camera load error ({day}): {exc}")
                 if found_here:
@@ -3989,8 +4471,19 @@ class ShotFinderWidget(QWidget):
         scan_days = list(reversed(days))[:CAM_SCAN_MAX_DAYS]
         return (str(self._images_root), tuple(scan_days))
 
+    def _on_cam_progress(self, done: int, total: int):
+        """Hour folders read while looking for the cameras of the picked days."""
+        if getattr(self, "_prog_owner", None) != "cameras":
+            return                      # a search has taken the bar over
+        scan_days = getattr(self, "_cam_scan_list", [])
+        i = min(done // 24, max(0, len(scan_days) - 1))
+        day_txt = f" · {scan_days[i]}" if scan_days else ""
+        self._prog_stage = f"looking for cameras{day_txt}"
+        self._on_progress(float(done))
+
     def _on_cameras_loaded(self, camera_names: list):
         self._cam_loading = False
+        self._prog_release("cameras")
         self._cam_scanned_key = getattr(self, "_cam_scan_pending_key", None)
         self._all_cameras = []
         for name in camera_names:
@@ -4144,16 +4637,9 @@ class ShotFinderWidget(QWidget):
 
         self._btn_open_slider.setEnabled(False)
         self._set_busy(True)
-        # One step per (day, camera): with several cameras the bar used to stand still
-        # for a whole day's worth of picture look-ups and then jump.
-        self._prog_total = len(days) * max(1, len(cams))
-        self._prog_t0 = time.monotonic()
-        self._prog_stage = "starting…"
-        self._prog_hits = 0
-        self._prog.setVisible(True)
-        self._prog.setRange(0, self._prog_total)
-        self._prog.setValue(0)
-        self._sync_prog_text(0)
+        # One step per (day, camera), but each step is filled in fractions as the PVs
+        # are read and the cameras answered — see _ProgressTracker.
+        self._prog_take("search", len(days) * max(1, len(cams)), "starting…")
         self._search_running = True
         self._result_lbl.setText(
             f"Searching {len(days)} days…"
@@ -4162,6 +4648,7 @@ class ShotFinderWidget(QWidget):
         self._sig = _SearchSignals()
         self._sig.progress.connect(self._on_progress)
         self._sig.stage.connect(self._on_stage)
+        self._sig.eta.connect(self._on_eta)
         self._sig.result.connect(self._on_day_result)
         self._sig.done.connect(self._on_search_done)
         self._sig.log_msg.connect(self._log)
@@ -4176,7 +4663,28 @@ class ShotFinderWidget(QWidget):
 
         _emit_log = self._sig.log_msg.emit
         _emit_stage = self._sig.stage.emit
+        _emit_eta = self._sig.eta.emit
         n_cams = max(1, len(cams))
+
+        # ── how long is left, measured instead of extrapolated ────────────────
+        # The days that actually did work, each with the seconds it took. A day the
+        # archiver had nothing for is finished in a blink and must NOT be averaged in,
+        # or it would promise the rest of the search in the same blink. The middle
+        # value is taken rather than the average, so neither one slow day nor one
+        # empty one can swing the number.
+        _day_secs: "list[float]" = []
+        # Two days at least: one day says nothing about the spread.
+        _ETA_MIN_DAYS = 2
+
+        def _emit_day_eta(days_left: int) -> None:
+            if days_left <= 0 or len(_day_secs) < _ETA_MIN_DAYS:
+                _emit_eta(-1.0)
+                return
+            ordered = sorted(_day_secs)
+            mid = len(ordered) // 2
+            typical = (ordered[mid] if len(ordered) % 2
+                       else (ordered[mid - 1] + ordered[mid]) / 2.0)
+            _emit_eta(typical * days_left)
 
         def _fail_days(day, reason: str) -> None:
             """A day that produced no searchable result still gets a row — in EVERY
@@ -4188,13 +4696,15 @@ class ShotFinderWidget(QWidget):
                      "search_cols": search_cols, "extra_cols": extra_cols,
                      "criteria_csv": criteria_csv, "cam": _cam})
 
-        # Cumulative step counter — one step per (day, camera). The absolute value is
-        # emitted, so a step can never be counted twice by two code paths.
-        _done = [0]
+        # How far the search has got, in fractions of a (day × camera) step. The
+        # absolute value is emitted, so a step can never be counted twice by two
+        # code paths.
+        _prog = _ProgressTracker(days, n_cams, self._sig.progress.emit)
 
-        def _bump(k: int = 1) -> None:
-            _done[0] += k
-            self._sig.progress.emit(_done[0])
+        def _bump(k: int = 1, _day=None) -> None:
+            """One camera of `_day` is finished."""
+            if _day is not None:
+                _prog.cam_done(_day, k)
 
         def worker():
             all_cols = list(search_cols) + [
@@ -4205,28 +4715,55 @@ class ShotFinderWidget(QWidget):
             try:
                 _chans = [CPVA_CHANNEL_MAP.get(c, c) for c in all_cols]
                 _dkeys = [d.strftime("%Y-%m-%d") for d in days]
+                _day_of = {d.strftime("%Y-%m-%d"): d for d in days}
                 if _chans and _dkeys:
                     _emit_log(f"Pre-warming {len(_chans)}×{len(_dkeys)} channel-days…")
-                    _emit_stage(f"reading {len(_chans)} PV(s) over {len(_dkeys)} day(s)")
-                    cpva.warm_days(_chans, _dkeys, timeout=CPVA_HTTP_TIMEOUT)
+                    _emit_stage(f"reading {len(_chans)} PV(s) over "
+                                f"{len(_dkeys)} day(s) · 0/{len(_chans) * len(_dkeys)}")
+
+                    def _warmed(_ch, _dk, _n, _tot):
+                        # Each channel-day belongs to ITS day, so the bar fills the
+                        # days the warm-up has actually finished — not a single blob
+                        # that lands at the end.
+                        _d = _day_of.get(_dk)
+                        if _d is not None:
+                            _prog.pv_step(_d, 1.0 / max(1, len(_chans)))
+                        _emit_stage(f"reading {len(_chans)} PV(s) over "
+                                    f"{len(_dkeys)} day(s) · {_n}/{_tot}")
+
+                    cpva.warm_days(_chans, _dkeys, timeout=CPVA_HTTP_TIMEOUT,
+                                   on_done=_warmed)
             except Exception:
                 pass
             for i, day in enumerate(days):
                 # How many of this day's camera steps are already counted, so a throw
                 # halfway through the camera loop cannot count them a second time.
                 cams_done = 0
+                # This day's own clock, and whether it did any frame work at all — only
+                # such a day may be used to say how long the next ones will take.
+                _t_day = time.monotonic()
+                _day_worked = False
                 try:
                     _emit_log(f"{day}: querying API+CSV for cols={all_cols}")
                     _emit_stage(f"reading PV data · {day}")
+
+                    def _col_done(_n, _tot, _d=day):
+                        # A day the warm-up did not cover (or could not finish) is
+                        # read here, one PV at a time — the bar follows that too.
+                        _prog.pv_step(_d, 1.0 / max(1, _tot))
+                        _emit_stage(f"reading PV data · {_d} · {_n}/{_tot} PV(s)")
+
                     rows, per_col, col_meta = _load_api_for_day(
-                        day, all_cols, log=_emit_log, csv_root=csv_root)
+                        day, all_cols, log=_emit_log, csv_root=csv_root,
+                        on_col_done=_col_done)
+                    _prog.pv_done(day)
                     if not rows:
                         st = col_meta.get(search_cols[0], {}).get("status")
                         why = ("archiver did not answer for this day"
                                if st == "error" else "no samples archived for this PV")
                         _emit_log(f"{day}: no data (API + CSV) — {why}")
                         _fail_days(day, why)
-                        _bump(n_cams)
+                        _prog.day_done(day)
                         continue
 
                     # Clip the candidate shots to THIS DAY's picked window. per_col is
@@ -4242,7 +4779,7 @@ class ShotFinderWidget(QWidget):
                         why = "no samples inside the chosen hours"
                         _emit_log(f"{day}: {n_all} samples, none in the time window")
                         _fail_days(day, why)
-                        _bump(n_cams)
+                        _prog.day_done(day)
                         continue
 
                     self._sig.log_msg.emit(
@@ -4323,7 +4860,7 @@ class ShotFinderWidget(QWidget):
                         why = f"'{self._col_short(day_col)}' has no numeric values here"
                         self._sig.log_msg.emit(f"{day}: {why}")
                         _fail_days(day, why)
-                        _bump(n_cams)
+                        _prog.day_done(day)
                         continue
 
                     raw_best = best.get(day_col, "")
@@ -4366,6 +4903,7 @@ class ShotFinderWidget(QWidget):
                     # the worker thread — SMB probing must stay off the UI thread — with
                     # the same resolver every other place in this tab uses, so the
                     # neighbouring hours are tried here too.
+                    _day_worked = True
                     for _ci, _cam in enumerate(cams):
                         _emit_stage(
                             f"looking for the frame · {day} · "
@@ -4378,9 +4916,13 @@ class ShotFinderWidget(QWidget):
                         elif day_dir is None:
                             img_problem = "no images archived for this day"
                         else:
+                            # Through the tab's shared folder cache: twenty cameras of
+                            # one shot then cost ONE reading of the hour folder
+                            # instead of twenty, and the same answer.
                             img_path, cam_folder = _find_image_in_day(
                                 day, _cam, dt_obj, best_ns, {},
-                                images_root=images_root, day_dir=day_dir)
+                                images_root=images_root, day_dir=day_dir,
+                                scan_cache=self._scan_cache)
                             folder_path = cam_folder
                             if cam_folder is None:
                                 # Nothing of this camera in the shot's hour or its
@@ -4422,13 +4964,21 @@ class ShotFinderWidget(QWidget):
                             "reason":       img_problem or "",
                         })
                         cams_done += 1
-                        _bump()
+                        _prog.cam_done(day)
 
                 except Exception as e:
                     self._sig.log_msg.emit(f"{day}: error — {e}")
                     _fail_days(day, f"search failed: {type(e).__name__}: {e}")
-                    _bump(max(0, n_cams - cams_done))
+                    _prog.day_done(day)
+                finally:
+                    # The estimate is rebuilt after every day, from the days that
+                    # really were searched — never from the ones the archiver had
+                    # nothing for, which finish in a blink.
+                    if _day_worked:
+                        _day_secs.append(time.monotonic() - _t_day)
+                    _emit_day_eta(len(days) - (i + 1))
 
+            _emit_eta(-1.0)
             self._sig.done.emit()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -4480,6 +5030,7 @@ class ShotFinderWidget(QWidget):
         n_lines = max(pv_str.count("\n") + 1, 1)
         if n_lines > 1:
             table.setRowHeight(r, 18 * n_lines + 8)
+        self._maybe_restore_focus_row(result.get("cam"), day)
 
     def _on_day_result(self, result):
         if result is None:
@@ -4660,6 +5211,7 @@ class ShotFinderWidget(QWidget):
         n_lines = max(len(pv_lines), len(diff_lines), 1)
         if n_lines > 1:
             table.setRowHeight(r, 18 * n_lines + 8)
+        self._maybe_restore_focus_row(cam, day)
 
     def _on_table_cell_clicked(self, row: int, col: int):
         """Click the Folder cell (col 6): open Explorer with the matched image
@@ -4687,11 +5239,11 @@ class ShotFinderWidget(QWidget):
                                  f"Could not open folder:\n{type(e).__name__}: {e}")
 
     def _on_table_double_clicked(self, index):
-        """Double-click a day row — list that day's shots in the panel underneath.
+        """Double-click a day row — that day's shots open in a window of their own.
 
-        The picked shot is drawn in the preview on the right, where the day row's own
-        picture already appears; this used to be a modal dialog carrying its own copy of
-        the table and of the picture."""
+        The window carries the shot list and the day's PV curve, nothing else: the
+        picked shot is drawn in the preview on the right of the main window, where the
+        day row's own picture already appears."""
         r = index.row()
         if r < 0 or r >= len(self._day_results):
             return
@@ -4708,7 +5260,7 @@ class ShotFinderWidget(QWidget):
     def _on_search_done(self):
         self._search_running = False
         self._set_busy(False)
-        self._prog.setVisible(False)
+        self._prog_release("search")
         # Counted over every camera tab, not just the visible one: a search that filled
         # three tabs must not report only the one in front.
         all_results = self._all_results()

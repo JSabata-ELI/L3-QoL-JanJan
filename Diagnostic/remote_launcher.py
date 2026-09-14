@@ -459,11 +459,83 @@ def _report_menu_state(state: dict, failed: bool, err: str) -> None:
     # person is actually asking. This console line is the whole record.
 
 
-def _food_answer(args: str, settings: dict) -> str:
-    """The /food reply, from the saved menu.
+def _food_order(req, settings: dict, email: str, om) -> str:
+    """`/food order` / `/food cancel` from the listener. Never raises.
+
+    Runs on the poll loop rather than a thread: three portal requests, and the
+    next Webex poll can wait those few seconds — a thread here would need its
+    own reply path and could outlive the message it answers.
+    """
+    if req.error:
+        return f"⚠ {req.error}"
+    # Read live: the number typed back is resolved against the PORTAL's list,
+    # so a list from hours ago would have somebody order by a number that no
+    # longer points at the meal they read.
+    cache, _err = _fresh_cache(om, settings)
+    day = req.day or om.next_food_day(cache)
+    if req.mode == "order" and not req.picks:
+        # Changes nothing, so no password — same reasoning as the app's copy.
+        return (om.answer_food(day.isoformat(), cache)
+                + "\n\nPick with `/food order " + day.strftime("%d.%m.")
+                + " 1 pin:yourword` (main course 1), or `… soup 2 main 1 "
+                  "pin:yourword`.")
+    allowed, why = om.may_order(settings, email, req.password)
+    if not allowed:
+        return f"⛔ {why}."
+    if not settings.get("okbase_enabled"):
+        return ("⚠ The canteen menu is switched off in Settings, so I cannot "
+                "order anything.")
+    out: dict = {}
+    outcome = om.change_order(
+        settings, day, req.picks, req.mode == "cancel", session_out=out,
+        authorise=lambda: om.spend_order_code(settings, req.password))
+    _save_okbase_cookies(out.get("cookies", ""), settings)
+    if outcome.already:
+        # Nothing changed, no code spent — answer with the day's list, which is
+        # what the person was choosing from.
+        return (om.render_already_ordered(outcome, req.lang) + "\n\n"
+                + om.answer_food(outcome.day, cache))
+    reply = om.render_order_outcome(outcome, req.mode == "cancel", req.lang)
+    if not outcome.error:
+        left = om.codes_left(settings)
+        if left <= om.CODES_LOW_AT:
+            reply += (f"\n\n_{left} ordering code(s) left — make a new list in "
+                      "Settings → Canteen menu._")
+        # Read the week again so the saved copy — the one the app and `/food
+        # orders` both read — agrees with what was just done.
+        om.refresh(settings)
+    return reply
+
+
+def _fresh_cache(om, settings: dict) -> tuple[dict, str]:
+    """The menu read from OKbase now; the saved copy if that fails.
+
+    Every reading reply goes through here, so nobody is handed a menu from
+    hours ago as though it were today's. A read that fails is not a refusal —
+    the saved copy is still the answer, and it carries its own note about how
+    old it is — so the reason comes back as the second value for the caller to
+    put underneath. Reading the portal only works where the saved sign-in
+    decrypts, because the credentials belong to one Windows account.
+    """
+    try:
+        cache, err = om.refresh(settings)
+    except Exception as e:  # noqa: BLE001 - must keep listening no matter what
+        cache, err = {}, str(e)
+    if cache:
+        return cache, ""
+    return om.load_cache(settings), err
+
+
+def _food_answer(args: str, settings: dict, email: str = "") -> str:
+    """The /food reply, read from OKbase and falling back to the saved menu.
 
     Imported here rather than at the top so a problem in the menu reader can
     never stop this listener doing its main job, which is starting the app.
+
+    `/food order` and `/food cancel` are done here too — the person asking for
+    lunch should not have to start the app first — but only for the sender the
+    canteen sign-in belongs to, and never from the words alone: the day's state
+    is read from the portal at that moment (see okbase_menu.change_order).
     """
     try:
         import okbase_menu
@@ -471,17 +543,14 @@ def _food_answer(args: str, settings: dict) -> str:
         return f"⚠ I cannot read the menu right now ({e})."
     try:
         req = okbase_menu.parse_food_args(args)
-        if req.mode == "refresh":
-            # Only works where the saved sign-in decrypts — the credentials are
-            # one Windows account's. When it doesn't, say so and show what is
-            # already saved rather than refusing outright.
-            cache, err = okbase_menu.refresh(settings)
-            if not cache:
-                cache = okbase_menu.load_cache(settings)
-                return (okbase_menu.answer_food("", cache)
-                        + f"\n\n_Could not read OKbase again: {err}_")
-            return okbase_menu.answer_food("", cache)
-        return okbase_menu.answer_food(args, okbase_menu.load_cache(settings))
+        if req.mode in ("order", "cancel"):
+            return _food_order(req, settings, email, okbase_menu)
+        wanted = "" if req.mode == "refresh" else args
+        cache, err = _fresh_cache(okbase_menu, settings)
+        text = okbase_menu.answer_food(wanted, cache)
+        if err:
+            text += f"\n\n_Could not read OKbase again: {err}_"
+        return text
     except Exception as e:  # noqa: BLE001 - must keep listening no matter what
         return f"⚠ I could not put the menu together ({e})."
 
@@ -616,7 +685,7 @@ def main() -> None:
                     # A sign-in pasted in a minute ago must not have to wait for
                     # the next keepalive before `/food refresh` can use it.
                     _reload_okbase_settings(settings)
-                    webex.post_text(_food_answer(rest, settings))
+                    webex.post_text(_food_answer(rest, settings, email))
                     continue
                 if is_app_running():
                     if is_tracking():

@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QSlider, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox, QFileDialog,
     QMessageBox, QSizePolicy, QScrollArea, QFrame, QToolButton, QButtonGroup,
     QColorDialog, QSplitter, QDialog, QInputDialog, QAbstractButton, QMenu,
-    QTableWidget, QTableWidgetItem, QHeaderView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QStyle,
 )
 
 try:
@@ -338,12 +338,14 @@ GAMMA_SLIDER_MIN = getattr(img_scale, "GAMMA_SLIDER_MIN", 30)
 GAMMA_SLIDER_MAX = getattr(img_scale, "GAMMA_SLIDER_MAX", 150)
 GAMMA_SLIDER_NEUTRAL = getattr(img_scale, "GAMMA_SLIDER_NEUTRAL", 100)
 AUTO_GAMMA_TARGET = getattr(img_scale, "AUTO_GAMMA_TARGET", 0.45)
+CONTRAST_MIN = getattr(img_scale, "CONTRAST_MIN", -384)
+CONTRAST_MAX = getattr(img_scale, "CONTRAST_MAX", 384)
 
 
 @dataclass
 class _ViewSettings:
     brightness: int = 0                  # additive offset, -255..255
-    contrast: int = 0                    # multiplicative gain, -127..127
+    contrast: int = 0                    # multiplicative gain, CONTRAST_MIN..MAX
     gamma_slider: int = GAMMA_SLIDER_NEUTRAL
     auto_contrast: bool = False          # percentile stretch drives the display window
     auto_bright: bool = False            # ImageJ-style auto level
@@ -374,10 +376,13 @@ def _gamma_value(view: _ViewSettings, gray_stat: np.ndarray) -> float:
 
 
 def _contrast_gain(contrast: int) -> float:
-    """Slider value in [-127, 127] → multiplicative gain (0 → 1.0). Same curve as the
-    Image Slider, so the same number means the same thing in both tabs."""
-    c = float(max(-127, min(127, contrast)))
-    return (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+    """Slider value → multiplicative gain (0 → 1.0). Same curve as the Image Slider, so
+    the same number means the same thing in both tabs: every CONTRAST_PER_DOUBLING units
+    double the gain."""
+    if img_scale is not None:
+        return img_scale.contrast_gain(contrast)
+    c = float(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast)))
+    return 2.0 ** (c / 64.0)
 
 
 def auto_window(gray_stat: np.ndarray) -> "tuple[int, int]":
@@ -1539,7 +1544,12 @@ def _region_caption(a: "_Annot", st: dict, slot, unit: str) -> str:
     The tool's own tooltip promises "min, max, mean and more for that area"; a caption
     showing two of those makes the panel a liar and sends the reader looking for the
     rest. Three lines: what the values are, how big the area is, and how much of it
-    there is."""
+    there is.
+
+    The size line is the region's OUTSIDE measurement — for an ellipse the full axes,
+    never the radii. Two numbers beside a round shape read as two radii, so a circle
+    says "⌀ 139 px" (one number, because there is only one) and an ellipse says
+    "axes 254 × 194 px". A rectangle keeps its plain width × height."""
     if not st:
         return ""
     lines = [f"{unit}:  min {st['min']:.0f}   max {st['max']:.0f}   "
@@ -1547,11 +1557,16 @@ def _region_caption(a: "_Annot", st: dict, slot, unit: str) -> str:
     x0, y0, x1, y1 = a.bbox()
     w, h = max(0.0, x1 - x0), max(0.0, y1 - y0)
     ppm = slot.px_per_mm
-    size = f"{w:.0f} × {h:.0f} px"
-    if ppm:
-        size += f"  =  {_fmt_mm(w / ppm)} × {_fmt_mm(h / ppm)}"
+    if a.kind == A_ROI_ELLIPSE and round(w) == round(h):
+        size = f"⌀ {w:.0f} px"
+        if ppm:
+            size += f"  =  {_fmt_mm(w / ppm)}"
+    else:
+        size = ("axes " if a.kind == A_ROI_ELLIPSE else "") + f"{w:.0f} × {h:.0f} px"
+        if ppm:
+            size += f"  =  {_fmt_mm(w / ppm)} × {_fmt_mm(h / ppm)}"
     lines.append(size)
-    tail = f"{st['count']} px"
+    tail = f"{st['count']} px²"
     if ppm:
         tail += f"   {st['count'] / (ppm ** 2):.4g} mm²"
     tail += f"   sum {st['sum']:.4g}"
@@ -3075,8 +3090,9 @@ def _draw_scale_bar(p: QPainter, a: "_Annot", to_widget, scale: float, col: QCol
 def _draw_caption(p: QPainter, a: "_Annot", to_widget, scale: float, col: QColor):
     """Measurement caption, drawn on a dark plate so it stays readable over both a
     black background and a saturated spot."""
-    x0, y0, _, _ = a.bbox()
+    x0, y0, _, y1 = a.bbox()
     anchor = to_widget(x0, y0)
+    below = to_widget(x0, y1)
     f = QFont("Segoe UI", max(7, int(round(9 * min(max(scale, 0.6), 2.0)))))
     p.setFont(f)
     fm = QFontMetrics(f)
@@ -3084,7 +3100,20 @@ def _draw_caption(p: QPainter, a: "_Annot", to_widget, scale: float, col: QColor
     lines = a.label.split("\n")
     w = max(fm.horizontalAdvance(t) for t in lines) + 8
     h = fm.height() * len(lines) + 4
-    r = QRectF(anchor.x(), anchor.y() - h - 3, w, h)
+    # The plate has to stay inside what is being painted — on screen the visible
+    # canvas, on Save the picture itself. A region drawn along the top edge would
+    # otherwise hang its numbers above the view, where they cannot be read: in that
+    # case the plate drops under the region, and either way it is pushed back inside.
+    area = QRectF(p.window())
+    y = anchor.y() - h - 3
+    if y < area.top() + 2:
+        y = below.y() + 3
+    x = anchor.x()
+    if area.width() > w + 4:
+        x = min(max(x, area.left() + 2), area.right() - w - 2)
+    if area.height() > h + 4:
+        y = min(max(y, area.top() + 2), area.bottom() - h - 2)
+    r = QRectF(x, y, w, h)
     p.setPen(Qt.PenStyle.NoPen)
     p.setBrush(QBrush(QColor(0, 0, 0, 165)))
     p.drawRect(r)
@@ -3165,7 +3194,99 @@ _TOOLBTN_QSS = (
     "QToolButton:checked:hover { background: #3a7ec6; border-color: #255a94; }"
     "QToolButton:disabled { background: #f4f4f4; border-color: #dcdcdc; }"
 )
-_CHECK_QSS = "QCheckBox { color: #111; } QCheckBox::indicator { width: 13px; height: 13px; }"
+#  The side panel's scroll bar. The plain one is a pale grey sliver on a pale grey
+#  panel — there is nothing to see and little to grab. This one has a track that is
+#  visibly a track, a handle dark enough to read against it at a glance, and no end
+#  arrows, which are two more tiny targets nobody uses. The width is stated because
+#  the panel reserves exactly this much room for it.
+_SCROLLBAR_QSS = (
+    "QScrollBar:vertical { background: #d8dce2; width: 16px; margin: 0px;"
+    " border: none; }"
+    "QScrollBar::handle:vertical { background: #6c7580; min-height: 28px;"
+    " border-radius: 4px; margin: 2px; }"
+    "QScrollBar::handle:vertical:hover { background: #4a5566; }"
+    "QScrollBar::handle:vertical:pressed { background: #2f3a49; }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px;"
+    " background: none; border: none; }"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+    " { background: none; }"
+    "QScrollBar:horizontal { background: #d8dce2; height: 16px; margin: 0px;"
+    " border: none; }"
+    "QScrollBar::handle:horizontal { background: #6c7580; min-width: 28px;"
+    " border-radius: 4px; margin: 2px; }"
+    "QScrollBar::handle:horizontal:hover { background: #4a5566; }"
+    "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal"
+    " { width: 0px; background: none; border: none; }"
+    "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal"
+    " { background: none; }"
+)
+#  The tick a stylesheet needs, drawn here.
+#
+#  A stylesheet that gives QCheckBox::indicator a size takes the whole indicator over
+#  from the style — and then draws NOTHING unless it is also handed a background, a
+#  border and, for the ticked state, an image. The old rule set the size and stopped
+#  there, which is why the Fill box was an empty gap in the strip: no border on the
+#  pale row, and no mark at all when it was on. A stylesheet can only take its mark
+#  from a file, so the tick is painted here and written beside the settings file.
+_CHECK_PX = 15
+
+
+def _check_mark_url() -> str:
+    """Path to the white tick, painting it on first use. Empty when it cannot be
+    written, in which case the ticked box is a plain solid blue square — still
+    unmistakably on."""
+    try:
+        # Read at call time: the settings path is stated further down the file.
+        path = _UI_STATE_PATH.parent / "check_mark.png"
+        if not path.exists():
+            n = _CHECK_PX * 2                     # 2x, so it stays clean when scaled
+            img = QImage(n, n, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(Qt.GlobalColor.transparent)
+            q = QPainter(img)
+            q.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidthF(n * 0.15)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            q.setPen(pen)
+            q.drawPolyline(QPolygonF([
+                QPointF(n * 0.21, n * 0.52), QPointF(n * 0.42, n * 0.73),
+                QPointF(n * 0.79, n * 0.26)]))
+            q.end()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not img.save(str(path), "PNG"):
+                return ""
+        return path.as_posix()
+    except Exception:
+        return ""
+
+
+_CHECK_QSS_CACHE = ""
+
+
+def _check_qss() -> str:
+    """Every state of a tick box, stated. Built on first use, not at import: the tick
+    is a file that has to be written, and the settings folder may not exist yet."""
+    global _CHECK_QSS_CACHE
+    if _CHECK_QSS_CACHE:
+        return _CHECK_QSS_CACHE
+    url = _check_mark_url()
+    mark = f' image: url("{url}");' if url else ""
+    _CHECK_QSS_CACHE = (
+        "QCheckBox { color: #111; spacing: 5px; }"
+        "QCheckBox:disabled { color: #8a8a8a; }"
+        f"QCheckBox::indicator {{ width: {_CHECK_PX}px; height: {_CHECK_PX}px;"
+        " border: 1px solid #7b8492; border-radius: 3px; background: #ffffff; }"
+        "QCheckBox::indicator:hover { border-color: #2f6fb5; background: #eaf3ff; }"
+        f"QCheckBox::indicator:checked {{ background: #2f6fb5; border-color: #24557f;"
+        f"{mark} }}"
+        "QCheckBox::indicator:checked:hover { background: #3a7ec6;"
+        " border-color: #24557f; }"
+        "QCheckBox::indicator:disabled { background: #f0f0f0; border-color: #cfcfcf; }"
+        "QCheckBox::indicator:checked:disabled { background: #a9bed6;"
+        " border-color: #97a9bd; }"
+    )
+    return _CHECK_QSS_CACHE
 
 
 def _btn(text: str, tip: str = "", danger: bool = False,
@@ -3722,6 +3843,9 @@ class _PlotWidget(QWidget):
         super().__init__(parent)
         self.setMinimumSize(420, 260)
         self.setMouseTracking(True)
+        self.setToolTip("Move the mouse over the curve to read the value under the "
+                        "pointer. Use “Copy values” or “Save CSV” below for the "
+                        "numbers themselves.")
         self._x = np.zeros(0)
         self._y = np.zeros(0)
         self._unit = ""
@@ -3901,14 +4025,14 @@ class ProfileDialog(QDialog):
         self._width_sb.valueChanged.connect(self._on_width)
         row.addWidget(self._width_sb)
         self._cb_fit = QCheckBox("Gaussian fit")
-        self._cb_fit.setStyleSheet(_CHECK_QSS)
+        self._cb_fit.setStyleSheet(_check_qss())
         self._cb_fit.setToolTip("Fit a Gaussian on a pedestal and draw it over the trace")
         self._cb_fit.toggled.connect(self._refresh)
         row.addWidget(self._cb_fit)
         row.addStretch(1)
         b_copy = _btn("Copy values", "Copy the samples to the clipboard as text")
         b_copy.clicked.connect(self._copy)
-        b_csv = _btn("Save CSV…", "Write the samples to a CSV file")
+        b_csv = _btn("Save CSV", "Write the samples to a CSV file")
         b_csv.clicked.connect(self._save_csv)
         row.addWidget(b_copy); row.addWidget(b_csv)
         lay.addLayout(row)
@@ -4065,9 +4189,9 @@ class _TableDialog(QDialog):
         row.addStretch(1)
         b_copy = _btn("Copy", "Copy the whole table to the clipboard")
         b_copy.clicked.connect(self._copy)
-        b_csv = _btn("Save CSV…", "Write the table to a CSV file")
+        b_csv = _btn("Save CSV", "Write the table to a CSV file")
         b_csv.clicked.connect(self._save_csv)
-        b_close = _btn("Close", "")
+        b_close = _btn("Close", "Shut this window")
         b_close.clicked.connect(self.close)
         for b in (b_copy, b_csv, b_close):
             row.addWidget(b)
@@ -4144,9 +4268,9 @@ class _CurveDialog(QDialog):
         row.addStretch(1)
         b_copy = _btn("Copy values", "Copy the samples to the clipboard as text")
         b_copy.clicked.connect(self._copy)
-        b_csv = _btn("Save CSV…", "Write the samples to a CSV file")
+        b_csv = _btn("Save CSV", "Write the samples to a CSV file")
         b_csv.clicked.connect(self._save_csv)
-        b_close = _btn("Close", "")
+        b_close = _btn("Close", "Shut this window")
         b_close.clicked.connect(self.close)
         for b in (b_copy, b_csv, b_close):
             row.addWidget(b)
@@ -4214,6 +4338,7 @@ class _PlayDialog(QDialog):
 
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, 0)
+        self._slider.setToolTip("Drag to step through the images by hand")
         self._slider.valueChanged.connect(self._on_slider)
         lay.addWidget(self._slider)
 
@@ -4233,15 +4358,17 @@ class _PlayDialog(QDialog):
         self._ms.setValue(200)
         self._ms.setSuffix(" ms")
         self._ms.setFixedWidth(84)
+        self._ms.setToolTip("How long each image is shown")
         self._ms.valueChanged.connect(
             lambda v: self._timer.setInterval(int(v)) if self._timer.isActive() else None)
         row.addWidget(self._ms)
         self._cb_loop = QCheckBox("Repeat")
-        self._cb_loop.setStyleSheet(_CHECK_QSS)
+        self._cb_loop.setStyleSheet(_check_qss())
         self._cb_loop.setChecked(True)
+        self._cb_loop.setToolTip("Start again from the first image at the end")
         row.addWidget(self._cb_loop)
         row.addStretch(1)
-        b_close = _btn("Close", "")
+        b_close = _btn("Close", "Shut this window")
         b_close.clicked.connect(self.close)
         row.addWidget(b_close)
         lay.addLayout(row)
@@ -4852,6 +4979,32 @@ def _ico_mark_cross(p, c):
     p.drawLine(QPointF(5.0, 10.0), QPointF(15.0, 10.0))
 
 
+# ── the same three marks as the Image Slider's Draw buttons ──────────────────
+# The Slider carries them as the text glyphs ✚ ◯ ◻ and those bare shapes are what
+# the operator recognises, so the Finder's buttons show the bare shape too. Painted
+# rather than typed: a font glyph is whatever weight the system font feels like and
+# has no greyed-out artwork of its own.
+def _ico_shape_circle(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 2.0))
+    p.drawEllipse(QPointF(10.0, 10.0), 6.6, 6.6)
+
+
+def _ico_shape_square(p, c):
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 2.0, join=Qt.PenJoinStyle.MiterJoin))
+    p.drawRect(QRectF(3.6, 3.6, 12.8, 12.8))
+
+
+def _ico_shape_cross(p, c):
+    # One unbroken plus, arms meeting in the middle — the Slider's ✚, not the
+    # Workshop's point marker, whose arms stop short to leave the read-out visible.
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.setPen(_ipen(c, 2.6, cap=Qt.PenCapStyle.FlatCap))
+    p.drawLine(QPointF(10.0, 3.0), QPointF(10.0, 17.0))
+    p.drawLine(QPointF(3.0, 10.0), QPointF(17.0, 10.0))
+
+
 def _ico_marks_clear(p, c):
     """A marked frame with the mark struck out. The stroke runs corner to corner
     so it stays readable at 20 px, where a small × inside the frame turns to mush."""
@@ -4876,6 +5029,9 @@ _ICON_RECIPES_ACTION = {
     # ...and by the Image Finder's wall, for the same reason.
     "mark_circle": _ico_mark_circle, "mark_square": _ico_mark_square,
     "mark_cross": _ico_mark_cross, "marks_clear": _ico_marks_clear,
+    # The bare shapes, as the Image Slider shows them.
+    "shape_circle": _ico_shape_circle, "shape_square": _ico_shape_square,
+    "shape_cross": _ico_shape_cross,
 }
 
 
@@ -4933,7 +5089,7 @@ _SECTION_ACCENTS = {
 
 COMPARE_MODES = ["Off", "Side by side", "Blend", "Difference"]
 
-#  What "Save all…" and the animation can be written as.
+#  What "Save all" and the animation can be written as.
 _SAVE_FORMATS = ("PNG", "TIFF", "JPEG")
 _FORMAT_SUFFIX = {"PNG": "png", "TIFF": "tiff", "JPEG": "jpg"}
 
@@ -4962,6 +5118,11 @@ class WorkshopWidget(QWidget):
         self._encircled_dlg: "_CurveDialog | None" = None
         self._play_dlg: "_PlayDialog | None" = None
         self._save_task_busy = False
+        #  Side panel: the widgets and the width last measured for them.
+        self._panel_scroll: "QScrollArea | None" = None
+        self._panel: "QWidget | None" = None
+        self._panel_fitted = 0
+        self._panel_refitted = False
 
         self._raw_sig = _RawSignals()
         self._raw_sig.done.connect(self._on_raw_loaded)
@@ -5014,12 +5175,20 @@ class WorkshopWidget(QWidget):
     def _on_section_toggled(self, key: str, expanded: bool):
         self._ui_state[f"sec_{key}"] = bool(expanded)
         self._save_ui_state()
+        # Opening a group can bring in a row wider than anything shown so far.
+        self._fit_panel_width()
 
-    def _add_section(self, key: str, title: str, default_expanded: bool = True):
+    def _add_section(self, key: str, title: str, default_expanded: bool = True,
+                     tip: str = ""):
         cls = _section_cls()
         sec = cls(title, key, self._ui_state.get(f"sec_{key}", default_expanded),
                   accent=_SECTION_ACCENTS.get(key, "#4a78c0"))
         sec.toggled.connect(self._on_section_toggled)
+        # The tip goes on the coloured bar itself, not on the section, so hovering a
+        # control inside never falls back to "what this whole group is for".
+        hdr = getattr(sec, "_header", None) or getattr(sec, "_hdr", None)
+        if tip and hdr is not None:
+            hdr.setToolTip(tip)
         self._panel_layout.addWidget(sec)
         return sec
 
@@ -5039,7 +5208,12 @@ class WorkshopWidget(QWidget):
         panel_scroll.setWidgetResizable(True)
         panel_scroll.setFrameShape(QFrame.Shape.NoFrame)
         panel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Set before the width is measured below: the bar's own width is part of what
+        # the panel has to reserve, and the plain one is 2 px narrower than this.
+        panel_scroll.setStyleSheet(_SCROLLBAR_QSS)
+        self._panel_scroll = panel_scroll
         panel = QWidget()
+        self._panel = panel
         self._panel_layout = QVBoxLayout(panel)
         self._panel_layout.setContentsMargins(2, 2, 6, 2)
         self._panel_layout.setSpacing(2)
@@ -5069,11 +5243,20 @@ class WorkshopWidget(QWidget):
         self._canvas.tool_requested.connect(self._set_tool)
         self._canvas._menu_request = self._canvas_menu
 
+        # The panel is exactly as wide as its widest control needs, plus room for its
+        # scroll bar. It used to open at a flat 260 px while the buttons inside asked
+        # for 271 and the bar took another 15, so the right-hand edge of every wide
+        # button, every drop-down arrow and every slider was cut off — and with the
+        # sideways bar switched off there was no way to reach it.
+        need = self._panel_width_needed(panel, panel_scroll)
+        panel_scroll.setMinimumWidth(need)
+        self._panel_fitted = need
+
         split.addWidget(panel_scroll)
         split.addWidget(self._canvas)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([260, 900])
+        split.setSizes([need, 900])
         root.addWidget(split, 1)
 
         self._status_lbl = QLabel("No images. Use “➤ Workshop” in Image Finder, "
@@ -5082,6 +5265,59 @@ class WorkshopWidget(QWidget):
             "QLabel { background: #eef1f5; border: 1px solid #d5dae1; border-radius: 3px;"
             " padding: 3px 6px; color: #1c2530; font-size: 11px; }")
         root.addWidget(self._status_lbl)
+
+    def _fit_panel_width(self):
+        """Measure again and widen the panel if it has grown too narrow for its words.
+
+        The width found while building is taken from a panel that has never been on a
+        screen, so the font metrics behind it are not yet the ones that will be
+        painted: on a display at 125 % or 150 % every label comes out wider than
+        measured and the right-hand button of each pair loses its last word. So the
+        measurement is repeated once the panel is really shown, and again whenever a
+        group is opened. It only ever widens — narrowing it would yank the picture
+        area sideways while the operator is working in it."""
+        scroll = getattr(self, "_panel_scroll", None)
+        panel = getattr(self, "_panel", None)
+        if scroll is None or panel is None:
+            return
+        need = self._panel_width_needed(panel, scroll)
+        if need > getattr(self, "_panel_fitted", 0):
+            self._panel_fitted = need
+            scroll.setMinimumWidth(need)
+            if scroll.width() < need:
+                scroll.resize(need, scroll.height())
+
+    @staticmethod
+    def _panel_width_needed(panel: QWidget, scroll: QScrollArea) -> int:
+        """How wide the panel has to be for nothing inside it to be cut off.
+
+        Measured with EVERY section open, because a collapsed body is not counted by
+        the layout — take the width while Measure is shut and the panel would grow the
+        moment it is opened. The bodies are shown and hidden again directly, without
+        going through set_expanded, so no toggle is reported and the remembered
+        open/shut state is left exactly as it was."""
+        was = []
+        for i in range(panel.layout().count()):
+            w = panel.layout().itemAt(i).widget()
+            body = getattr(w, "body", None) if w is not None else None
+            if body is not None:
+                was.append((body, body.isHidden()))
+                body.setVisible(True)
+        panel.layout().invalidate()
+        panel.layout().activate()
+        need = panel.layout().sizeHint().width()
+        for body, hidden in was:
+            body.setVisible(not hidden)
+        panel.layout().invalidate()
+        panel.layout().activate()
+
+        bar = scroll.verticalScrollBar().sizeHint().width()
+        if bar <= 0:
+            bar = scroll.style().pixelMetric(
+                QStyle.PixelMetric.PM_ScrollBarExtent, None, scroll)
+        # Six pixels of slack rather than two: a size hint is the width a control
+        # wants, and being one pixel under it is already a word with a "…" on the end.
+        return int(need + max(bar, 16) + 6)
 
     # ---- tool strip ----------------------------------------------------------
 
@@ -5186,7 +5422,7 @@ class WorkshopWidget(QWidget):
         self._text_sb.valueChanged.connect(self._on_style_changed)
 
         self._fill_cb = QCheckBox("Fill")
-        self._fill_cb.setStyleSheet(_CHECK_QSS)
+        self._fill_cb.setStyleSheet(_check_qss())
         self._fill_cb.setToolTip("Draw rectangles, ellipses and polygons filled")
         self._fill_cb.toggled.connect(self._on_style_changed)
         row2.addWidget(self._fill_cb)
@@ -5264,7 +5500,7 @@ class WorkshopWidget(QWidget):
             ("History", "Ctrl+Shift+D", "Remove every drawn and measured item",
              c.clear_annots, "Clear drawing"),
 
-            ("Images", "Ctrl+O", "Open a file", self._open_dialog, "Open file…"),
+            ("Images", "Ctrl+O", "Open a file", self._open_dialog, "Open file"),
             ("Images", "Ctrl+Right", "Next image", lambda: self._step_slot(1), ""),
             ("Images", "Ctrl+Left", "Previous image", lambda: self._step_slot(-1), ""),
             ("Images", "Ctrl+D", "Copy this image, or the selected region, to a new one",
@@ -5282,23 +5518,23 @@ class WorkshopWidget(QWidget):
              "Flip across"),
             ("Edit picture", "Ctrl+Shift+H", "Mirror top to bottom",
              lambda: self._flip(0), "Flip down"),
-            ("Edit picture", "Ctrl+E", "Resize", self._resize_dialog, "Resize…"),
+            ("Edit picture", "Ctrl+E", "Resize", self._resize_dialog, "Resize"),
             ("Edit picture", "Ctrl+Alt+R", "Rotate by any angle", self._rotate_free,
-             "Rotate by angle…"),
+             "Rotate by angle"),
             ("Edit picture", "Ctrl+Shift+E", "Straighten along the selected line",
              self._straighten, "Straighten"),
             ("Edit picture", "Ctrl+Alt+B", "Join blocks of pixels into one",
-             self._bin_dialog, "Bin…"),
+             self._bin_dialog, "Bin"),
             ("Edit picture", "Ctrl+M", "Subtract the reference image",
              lambda: self._do_diff(False), "Subtract"),
             ("Edit picture", "Ctrl+Shift+M", "Difference against the reference image",
              lambda: self._do_diff(True), "Difference"),
 
-            ("Filters", "Ctrl+Alt+M", "Median filter", self._filter_median, "Median…"),
-            ("Filters", "Ctrl+Alt+L", "Blur", self._filter_blur, "Blur…"),
-            ("Filters", "Ctrl+Alt+H", "Sharpen", self._filter_sharpen, "Sharpen…"),
+            ("Filters", "Ctrl+Alt+M", "Median filter", self._filter_median, "Median"),
+            ("Filters", "Ctrl+Alt+L", "Blur", self._filter_blur, "Blur"),
+            ("Filters", "Ctrl+Alt+H", "Sharpen", self._filter_sharpen, "Sharpen"),
             ("Filters", "Ctrl+Alt+G", "Remove the background",
-             self._filter_background, "Remove background…"),
+             self._filter_background, "Remove background"),
 
             ("Combine", "Ctrl+Alt+C", "Combine every open image into a new one",
              self._do_project, "Combine into a new image"),
@@ -5309,12 +5545,12 @@ class WorkshopWidget(QWidget):
             ("Measure", "Ctrl+P", "Plot the profile line",
              lambda: self._show_profile(c.selected()), "Plot profile"),
             ("Measure", "Ctrl+T", "Every measurement in one table",
-             self._show_results, "Results table…"),
+             self._show_results, "Results table"),
             ("Measure", "Ctrl+J", "The histogram as numbers",
-             self._show_histogram_numbers, "Histogram numbers…"),
+             self._show_histogram_numbers, "Histogram numbers"),
 
             ("Beam", "Ctrl+B", "Beam report — width, roundness, tilt",
-             self._show_beam_report, "Beam report…"),
+             self._show_beam_report, "Beam report"),
             ("Beam", "Ctrl+Shift+B", "Radial profile", self._show_radial,
              "Radial profile"),
 
@@ -5325,16 +5561,16 @@ class WorkshopWidget(QWidget):
              "Fit"),
             ("View", "Ctrl+1", "Show at true size, 1:1", c.zoom_reset, "1:1"),
 
-            ("Save", "Ctrl+S", "Save as PNG", lambda: self._save("png"), "Save PNG…"),
+            ("Save", "Ctrl+S", "Save as PNG", lambda: self._save("png"), "Save PNG"),
             ("Save", "Ctrl+Shift+S", "Save as TIFF", lambda: self._save("tiff"),
-             "Save TIFF…"),
+             "Save TIFF"),
             ("Save", "Ctrl+Alt+J", "Save as JPEG", lambda: self._save("jpg"),
-             "Save JPEG…"),
+             "Save JPEG"),
             ("Save", "Ctrl+Alt+T", "Save the measured values as a 16-bit TIFF",
-             self._save_data_tiff, "Save the values as TIFF…"),
-            ("Save", "Ctrl+Shift+P", "Play the images", self._play_images, "Play…"),
+             self._save_data_tiff, "Save the values as TIFF"),
+            ("Save", "Ctrl+Shift+P", "Play the images", self._play_images, "Play"),
             ("Save", "Ctrl+Shift+A", "Save an animation", self._save_animation,
-             "Save animation…"),
+             "Save animation"),
             ("Save", "Ctrl+Shift+C", "Copy to the clipboard", self._copy_clipboard,
              "Copy"),
 
@@ -5360,6 +5596,11 @@ class WorkshopWidget(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         self._set_shortcuts_enabled(True)
+        # First time on screen the panel finally knows its screen, its scaling and
+        # its real fonts, so the width it was given while building is checked again.
+        if not self._panel_refitted:
+            self._panel_refitted = True
+            QTimer.singleShot(0, self._fit_panel_width)
 
     def hideEvent(self, e):
         super().hideEvent(e)
@@ -5435,6 +5676,7 @@ class WorkshopWidget(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(_SCROLLBAR_QSS)
         body = QWidget()
         body.setStyleSheet("QWidget { background: #ffffff; }")
         grid = QGridLayout(body)
@@ -5471,7 +5713,7 @@ class WorkshopWidget(QWidget):
 
         brow = QHBoxLayout()
         brow.addStretch(1)
-        b_close = _btn("Close", "")
+        b_close = _btn("Close", "Shut this window")
         b_close.clicked.connect(dlg.close)
         brow.addWidget(b_close)
         outer.addLayout(brow)
@@ -5509,8 +5751,8 @@ class WorkshopWidget(QWidget):
         act("Redo", self._redo, slot is not None and bool(slot.redo_stack))
         menu.addSeparator()
         act("Measure the whole picture", self._measure_whole, slot is not None)
-        act("Results table…", self._show_results, slot is not None)
-        act("Beam report…", self._show_beam_report,
+        act("Results table", self._show_results, slot is not None)
+        act("Beam report", self._show_beam_report,
             slot is not None and wk_beam is not None)
         act("Plot profile", lambda: self._show_profile(self._canvas.selected()),
             slot is not None and any(a.kind == A_PROFILE for a in slot.annots))
@@ -5536,12 +5778,12 @@ class WorkshopWidget(QWidget):
         a_ov.setCheckable(True)
         a_ov.setChecked(self._cb_burn.isChecked())
         a_ov.toggled.connect(self._cb_burn.setChecked)
-        act("Save PNG…", lambda: self._save("png"), slot is not None)
+        act("Save PNG", lambda: self._save("png"), slot is not None)
         act("Duplicate", self._duplicate_slot, slot is not None)
         menu.addSeparator()
         act("Fit the whole picture", self._canvas.fit_to_view, slot is not None)
         act("True size, 1:1", self._canvas.zoom_reset, slot is not None)
-        act("Shortcuts…", self._show_shortcuts)
+        act("Shortcuts", self._show_shortcuts)
         menu.exec(global_pos)
 
     def _step_slot(self, delta: int):
@@ -5560,7 +5802,11 @@ class WorkshopWidget(QWidget):
     # ---- sections ------------------------------------------------------------
 
     def _build_images_section(self):
-        sec = self._add_section("images", "Images", True)
+        sec = self._add_section(
+            "images", "Images", True,
+            "The pictures the Workshop is holding, and which of them is the "
+            "reference the Compare and Combine groups work against. Click to open "
+            "or shut the group.")
         lay = sec.body_layout
 
         self._info_lbl = QLabel("—")
@@ -5576,14 +5822,14 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._slot_list)
 
         row = QHBoxLayout()
-        b_open = _btn("Open file…", "Open one or more images from disk")
+        b_open = _btn("Open file", "Open one or more images from disk")
         b_open.clicked.connect(self._open_dialog)
         b_rm = _btn("Remove", "Take this image out of the Workshop", danger=True)
         b_rm.clicked.connect(self._remove_slot)
         b_clear = _btn("Clear all", "Take every image out of the Workshop", danger=True)
         b_clear.clicked.connect(self._clear_all)
         for b in (b_open, b_rm, b_clear):
-            row.addWidget(b)
+            row.addWidget(b, 1)
         lay.addLayout(row)
 
         row_b = QHBoxLayout()
@@ -5599,7 +5845,7 @@ class WorkshopWidget(QWidget):
                                 "Open the folder this frame came from in the Image "
                                 "Slider")
         self._btn_slider.clicked.connect(self._show_in_slider)
-        row_b.addWidget(self._btn_dup); row_b.addWidget(b_paste)
+        row_b.addWidget(self._btn_dup, 1); row_b.addWidget(b_paste, 1)
         lay.addLayout(row_b)
         lay.addWidget(self._btn_slider)
 
@@ -5610,13 +5856,17 @@ class WorkshopWidget(QWidget):
         self._ref_combo.setToolTip("Used by subtraction and by the comparison views")
         self._ref_combo.currentIndexChanged.connect(self._on_ref_changed)
         lay.addWidget(self._ref_combo)
-        b_ref_file = _btn("Load reference from file…",
+        b_ref_file = _btn("Load reference from file",
                           "Bring in an image from disk and use it as the reference")
         b_ref_file.clicked.connect(self._load_ref_from_file)
         lay.addWidget(b_ref_file)
 
     def _build_display_section(self):
-        sec = self._add_section("display", "Display", True)
+        sec = self._add_section(
+            "display", "Display", True,
+            "How the picture LOOKS: false colour, which values are shown, contrast, "
+            "brightness and gamma. The picture data stays as it arrived. Click to "
+            "open or shut the group.")
         lay = sec.body_layout
 
         note = _small_label("These settings only change how the image looks. "
@@ -5640,7 +5890,7 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._hist)
 
         self._contrast_sl, self._contrast_val, self._cb_auto_contrast = self._slider_row(
-            lay, "Contrast", -127, 127, 0,
+            lay, "Contrast", CONTRAST_MIN, CONTRAST_MAX, 0,
             "Spreads the values above the background — a multiplying gain",
             auto_tip="Put the black and white points on the data automatically "
                      "(0.5 % … 99.5 %) and park them on the histogram")
@@ -5672,7 +5922,7 @@ class WorkshopWidget(QWidget):
         head.addWidget(val)
         head.addStretch(1)
         cb = QCheckBox("Auto")
-        cb.setStyleSheet(_CHECK_QSS)
+        cb.setStyleSheet(_check_qss())
         if auto_tip:
             cb.setToolTip(auto_tip)
         head.addWidget(cb)
@@ -5694,7 +5944,11 @@ class WorkshopWidget(QWidget):
         return sl, val, cb
 
     def _build_measure_section(self):
-        sec = self._add_section("measure", "Measure", False)
+        sec = self._add_section(
+            "measure", "Measure", False,
+            "Numbers out of the selected region or the whole picture, the table of "
+            "several regions, and how many micrometres one pixel is. Click to open "
+            "or shut the group.")
         lay = sec.body_layout
 
         self._measure_src_lbl = _small_label("—")
@@ -5718,11 +5972,11 @@ class WorkshopWidget(QWidget):
         b_whole.clicked.connect(self._measure_whole)
         b_profile = _btn("Plot profile", "Plot the values along the selected profile line")
         b_profile.clicked.connect(lambda: self._show_profile(self._canvas.selected()))
-        row.addWidget(b_whole); row.addWidget(b_profile)
+        row.addWidget(b_whole, 1); row.addWidget(b_profile, 1)
         lay.addLayout(row)
 
         self._cb_keep_regions = QCheckBox("Keep several regions")
-        self._cb_keep_regions.setStyleSheet(_CHECK_QSS)
+        self._cb_keep_regions.setStyleSheet(_check_qss())
         self._cb_keep_regions.setToolTip(
             "Off: a new region replaces the old one, so the numbers above always "
             "belong to the region on screen.\nOn: regions pile up — the cells show "
@@ -5731,15 +5985,15 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._cb_keep_regions)
 
         row2 = QHBoxLayout()
-        b_table = _btn("Results table…",
+        b_table = _btn("Results table",
                        "Every region, ruler, angle and point on this image in one "
                        "table, ready to copy or save as CSV")
         b_table.clicked.connect(self._show_results)
-        b_hist = _btn("Histogram numbers…",
+        b_hist = _btn("Histogram numbers",
                       "The numbers behind the histogram: how many pixels at each "
                       "intensity")
         b_hist.clicked.connect(self._show_histogram_numbers)
-        row2.addWidget(b_table); row2.addWidget(b_hist)
+        row2.addWidget(b_table, 1); row2.addWidget(b_hist, 1)
         lay.addLayout(row2)
 
         #  Scale. One number decides it all: how much of the object one pixel covers.
@@ -5762,7 +6016,7 @@ class WorkshopWidget(QWidget):
             f"{BASLER_PIXEL_UM} µm pixels, which is what this starts at.\n"
             "That is the size AT THE SENSOR: with a lens or a magnifier in front, put "
             "in the size the picture really has on the object — or measure it with "
-            "“Set scale…”.\n"
+            "“Set scale”.\n"
             "A camera acquiring with 2×2 binning stores one pixel per four, so double "
             "it there.\nThe value stays for the next image you open.")
         self._sensor_um_sb.valueChanged.connect(self._on_sensor_um)
@@ -5777,7 +6031,7 @@ class WorkshopWidget(QWidget):
         lay.addLayout(srow)
 
         srow2 = QHBoxLayout()
-        b_setscale = _btn("Set scale…",
+        b_setscale = _btn("Set scale",
                           "Draw a ruler over something of a known size, select it, "
                           "then enter that size here — the pixel size is worked out "
                           "from it")
@@ -5785,24 +6039,27 @@ class WorkshopWidget(QWidget):
         b_clrscale = _btn(f"Camera ({BASLER_PIXEL_UM} µm)",
                           "Back to the camera's own pixel size")
         b_clrscale.clicked.connect(self._clear_scale)
-        srow2.addWidget(b_setscale); srow2.addWidget(b_clrscale)
+        srow2.addWidget(b_setscale, 1); srow2.addWidget(b_clrscale, 1)
         lay.addLayout(srow2)
 
         srow3 = QHBoxLayout()
         self._btn_scalebar = _btn(
-            "Add scale bar…",
+            "Add scale bar",
             "Draw a bar of a known length into the picture, so a saved copy carries "
             "its own scale. Drag it anywhere with Select.")
         self._btn_scalebar.clicked.connect(self._add_scale_bar)
         b_nobar = _btn("Remove bar", "Take the scale bar off again")
         b_nobar.clicked.connect(self._remove_scale_bar)
-        srow3.addWidget(self._btn_scalebar); srow3.addWidget(b_nobar)
+        srow3.addWidget(self._btn_scalebar, 1); srow3.addWidget(b_nobar, 1)
         lay.addLayout(srow3)
 
     # ---- beam ---------------------------------------------------------------
 
     def _build_beam_section(self):
-        sec = self._add_section("beam", "Beam", False)
+        sec = self._add_section(
+            "beam", "Beam", False,
+            "Spot size and shape: width, roundness, the radial profile and how much "
+            "energy sits inside a circle. Click to open or shut the group.")
         lay = sec.body_layout
         note = _small_label(
             "Spot size and shape, measured on the selected region or on the whole "
@@ -5831,7 +6088,7 @@ class WorkshopWidget(QWidget):
         lay.addLayout(brow)
 
         grid = QGridLayout(); grid.setSpacing(3)
-        ops = [("Beam report…", "Centre, D4σ width, FWHM, roundness and the tilt of "
+        ops = [("Beam report", "Centre, D4σ width, FWHM, roundness and the tilt of "
                                 "the long axis, in one table", self._show_beam_report),
                ("Radial profile", "Average value against distance from the centre of "
                                   "mass — the shape of the spot with the noise "
@@ -5850,7 +6107,11 @@ class WorkshopWidget(QWidget):
     # ---- filters ------------------------------------------------------------
 
     def _build_filters_section(self):
-        sec = self._add_section("filters", "Filters", False)
+        sec = self._add_section(
+            "filters", "Filters", False,
+            "Smoothing, sharpening, edges and background removal. These CHANGE the "
+            "picture itself, and every step can be undone. Click to open or shut "
+            "the group.")
         lay = sec.body_layout
         warn = _small_label(
             "These change the picture itself, and the measured intensity behind it the "
@@ -5861,15 +6122,15 @@ class WorkshopWidget(QWidget):
         lay.addWidget(warn)
 
         grid = QGridLayout(); grid.setSpacing(3)
-        ops = [("Median…", "Replaces each pixel by the middle value of its "
+        ops = [("Median", "Replaces each pixel by the middle value of its "
                            "neighbours — the filter for hot pixels and speckle",
                 self._filter_median),
-               ("Blur…", "Gaussian blur, for noise that is spread out rather than "
+               ("Blur", "Gaussian blur, for noise that is spread out rather than "
                          "in single pixels", self._filter_blur),
-               ("Sharpen…", "Adds back what a blur would remove", self._filter_sharpen),
+               ("Sharpen", "Adds back what a blur would remove", self._filter_sharpen),
                ("Edges", "Bright where the picture changes fastest",
                 self._filter_edges),
-               ("Remove background…", "Take off a constant level, a sloping plane, a "
+               ("Remove background", "Take off a constant level, a sloping plane, a "
                                       "curved surface or everything larger than a "
                                       "rolling ball", self._filter_background)]
         for i, (text, tip, fn) in enumerate(ops):
@@ -5880,7 +6141,11 @@ class WorkshopWidget(QWidget):
         self._filter_buttons = [grid.itemAt(i).widget() for i in range(grid.count())]
 
     def _build_edit_section(self):
-        sec = self._add_section("edit", "Edit picture", False)
+        sec = self._add_section(
+            "edit", "Edit picture", False,
+            "Turning, mirroring, resizing, binning, straightening, and subtracting "
+            "the reference. These CHANGE the picture itself, and every step can be "
+            "undone. Click to open or shut the group.")
         lay = sec.body_layout
         warn = _small_label("These change the picture itself. Every step can be undone.")
         warn.setWordWrap(True)
@@ -5893,7 +6158,7 @@ class WorkshopWidget(QWidget):
                ("Rotate right", "rotate_right", "Turn 90° clockwise",
                 lambda: self._rotate(-1)),
                ("180°", "", "Turn upside down", lambda: self._rotate(2)),
-               ("Resize…", "", "Scale the picture to a different size",
+               ("Resize", "", "Scale the picture to a different size",
                 self._resize_dialog),
                ("Flip across", "flip_h", "Mirror left to right", lambda: self._flip(1)),
                ("Flip down", "flip_v", "Mirror top to bottom", lambda: self._flip(0))]
@@ -5904,11 +6169,11 @@ class WorkshopWidget(QWidget):
         lay.addLayout(grid)
 
         grid2 = QGridLayout(); grid2.setSpacing(3)
-        ops2 = [("Rotate by angle…", "", "Turn by any angle. The picture grows so "
+        ops2 = [("Rotate by angle", "", "Turn by any angle. The picture grows so "
                                         "nothing is cut off.", self._rotate_free),
                 ("Straighten", "", "Turn so that the selected straight line, ruler or "
                                    "arrow becomes horizontal", self._straighten),
-                ("Bin…", "", "Join blocks of pixels into one — 2 × 2 or more. Averaging "
+                ("Bin", "", "Join blocks of pixels into one — 2 × 2 or more. Averaging "
                              "keeps the scale, adding is what a detector does when it "
                              "is binned on the chip.", self._bin_dialog)]
         for i, (text, icon, tip, fn) in enumerate(ops2):
@@ -5929,7 +6194,11 @@ class WorkshopWidget(QWidget):
     # ---- combine ------------------------------------------------------------
 
     def _build_combine_section(self):
-        sec = self._add_section("combine", "Combine images", False)
+        sec = self._add_section(
+            "combine", "Combine images", False,
+            "Makes a NEW picture out of the ones already open — an average, an "
+            "envelope, a sum, or the active one and the reference in red and green. "
+            "Nothing existing is changed. Click to open or shut the group.")
         lay = sec.body_layout
         note = _small_label(
             "Makes a NEW image out of the ones already open. Nothing existing is "
@@ -5963,7 +6232,11 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._btn_merge)
 
     def _build_compare_section(self):
-        sec = self._add_section("compare", "Compare", False)
+        sec = self._add_section(
+            "compare", "Compare", False,
+            "Shows the active picture against the reference — side by side, mixed "
+            "together, or as the difference. Only the view changes. Click to open "
+            "or shut the group.")
         lay = sec.body_layout
         self._compare_cb = QComboBox()
         self._compare_cb.setToolTip("Show the active image against the reference image")
@@ -5982,10 +6255,14 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._blend_lbl)
 
     def _build_save_section(self):
-        sec = self._add_section("save", "Save", True)
+        sec = self._add_section(
+            "save", "Save", True,
+            "Writing it out: the picture as a file, the measured values as a plain "
+            "TIFF, an animation of every open picture, and the drawing itself as a "
+            "session. Click to open or shut the group.")
         lay = sec.body_layout
         self._cb_burn = QCheckBox("Save with overlay")
-        self._cb_burn.setStyleSheet(_CHECK_QSS)
+        self._cb_burn.setStyleSheet(_check_qss())
         self._cb_burn.setChecked(bool(self._ui_state.get("save_overlay", True)))
         self._cb_burn.setToolTip(
             "Ticked: everything drawn on the picture goes into the file — text, "
@@ -5996,20 +6273,20 @@ class WorkshopWidget(QWidget):
         lay.addWidget(self._cb_burn)
 
         row = QHBoxLayout()
-        b_png = _btn("Save PNG…", "Write the picture as a PNG file — with or without "
+        b_png = _btn("Save PNG", "Write the picture as a PNG file — with or without "
                                   "the drawing, as “Save with overlay” says")
         b_png.clicked.connect(lambda: self._save("png"))
-        b_tif = _btn("Save TIFF…", "Write the picture as a TIFF file — with or without "
+        b_tif = _btn("Save TIFF", "Write the picture as a TIFF file — with or without "
                                    "the drawing, as “Save with overlay” says")
         b_tif.clicked.connect(lambda: self._save("tiff"))
-        b_jpg = _btn("Save JPEG…", "Write the picture as a JPEG file — smaller, but "
+        b_jpg = _btn("Save JPEG", "Write the picture as a JPEG file — smaller, but "
                                    "it throws detail away; never save data as JPEG")
         b_jpg.clicked.connect(lambda: self._save("jpg"))
         row.addWidget(b_png); row.addWidget(b_tif); row.addWidget(b_jpg)
         lay.addLayout(row)
 
         row2 = QHBoxLayout()
-        b_all = _btn("Save all…", "Write every image in the Workshop into one folder")
+        b_all = _btn("Save all", "Write every image in the Workshop into one folder")
         b_all.clicked.connect(self._save_all)
         b_clip = _btn("Copy", "Put what you see on the clipboard")
         b_clip.clicked.connect(self._copy_clipboard)
@@ -6017,7 +6294,7 @@ class WorkshopWidget(QWidget):
         lay.addLayout(row2)
 
         self._btn_data_tiff = _btn(
-            "Save the values as TIFF…",
+            "Save the values as TIFF",
             "The measured counts as a plain 16-bit TIFF: no palette, no display "
             "stretch, no drawing. This is the file to open in ImageJ or read from a "
             "script.")
@@ -6036,7 +6313,7 @@ class WorkshopWidget(QWidget):
         self._anim_ms.setToolTip("How long each image is shown")
         arow.addWidget(self._anim_ms)
         self._cb_anim_loop = QCheckBox("Repeat")
-        self._cb_anim_loop.setStyleSheet(_CHECK_QSS)
+        self._cb_anim_loop.setStyleSheet(_check_qss())
         self._cb_anim_loop.setChecked(True)
         self._cb_anim_loop.setToolTip("Play the animation over and over")
         arow.addWidget(self._cb_anim_loop)
@@ -6044,9 +6321,9 @@ class WorkshopWidget(QWidget):
         lay.addLayout(arow)
 
         arow2 = QHBoxLayout()
-        self._btn_play = _btn("Play…", "Look at the animation before saving it")
+        self._btn_play = _btn("Play", "Look at the animation before saving it")
         self._btn_play.clicked.connect(self._play_images)
-        self._btn_anim = _btn("Save animation…",
+        self._btn_anim = _btn("Save animation",
                               "Write an animated GIF, PNG or WebP. Images of different "
                               "sizes are centred on black rather than stretched.")
         self._btn_anim.clicked.connect(self._save_animation)
@@ -6055,11 +6332,11 @@ class WorkshopWidget(QWidget):
 
         lay.addWidget(_small_label("Session — the drawing, the regions and the scale"))
         srow = QHBoxLayout()
-        b_ssave = _btn("Save session…",
+        b_ssave = _btn("Save session",
                        "Write down everything drawn on every open image, so the work "
                        "is not lost when the Workshop is closed")
         b_ssave.clicked.connect(self._save_session)
-        b_sload = _btn("Load session…",
+        b_sload = _btn("Load session",
                        "Re-open the images from a saved session and put the drawing "
                        "back on them")
         b_sload.clicked.connect(self._load_session)
@@ -6794,7 +7071,7 @@ class WorkshopWidget(QWidget):
             QMessageBox.information(
                 self, "Set scale",
                 "Draw a ruler across something of a known size first, then press "
-                "“Set scale…” again.")
+                "“Set scale” again.")
             return
         dpx = math.hypot(sel.pts[1][0] - sel.pts[0][0], sel.pts[1][1] - sel.pts[0][1])
         val, ok = QInputDialog.getDouble(
@@ -7028,7 +7305,7 @@ class WorkshopWidget(QWidget):
             QMessageBox.information(
                 self, "Scale bar",
                 "Set a scale first: draw a ruler across something of a known size, "
-                "then press “Set scale…”.\nWithout that the Workshop has no idea how "
+                "then press “Set scale”.\nWithout that the Workshop has no idea how "
                 "long a millimetre is on this picture.")
             return
         h, w = slot.base.shape[:2]
@@ -7809,7 +8086,7 @@ class WorkshopWidget(QWidget):
     def _save_data_tiff(self):
         """The measured values as a plain 16-bit TIFF.
 
-        Separate from "Save TIFF…" on purpose, and both are needed. That one writes
+        Separate from "Save TIFF" on purpose, and both are needed. That one writes
         what is on SCREEN — the display stretch, the palette and the drawing baked into
         8-bit RGB, which is what a report wants. This one writes what was MEASURED, so
         the file can be read back and measured again."""

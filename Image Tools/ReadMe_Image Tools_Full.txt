@@ -65,13 +65,37 @@ DAYS SIDE BY SIDE
   - The days come up as tiles filling the window, sized so that
     even the smallest picture is as large as the arrangement
     allows.
-  - Every day is drawn on the SAME scale, and ONE set of
-    brightness / contrast / gamma controls applies to all of them.
-    This is deliberately unlike the Image Slider, where a control
-    only affects the cameras that were selected when you moved it:
-    here the whole point is that the same colour means the same
-    intensity in every day. A per-day setting would make the
-    comparison lie.
+  - Every day is drawn on the SAME scale, and with NOTHING MARKED
+    one set of brightness / contrast / gamma / colour controls
+    applies to all of them — the whole point being that the same
+    colour means the same intensity in every day.
+  - MARK a picture and those controls apply to it alone. Clicking a
+    picture is what marks it, and EVERY CLICK ADDS: click picture
+    after picture and all of them stay marked. Click a marked one
+    again to let just that one go. SHIFT+CLICK marks a whole
+    CAMERA — every day of it on the wall at once, which on the
+    day-by-day view would otherwise be one click per day — and adds
+    it to whatever was already marked; Shift again on a camera that
+    is wholly marked takes it back off. To let EVERYTHING go: press
+    Esc, or right-click and choose "Unmark every picture", or click
+    the empty black background where there is any. Nothing is ever
+    unmarked behind your back — a plain click used to drop whatever
+    was marked before it. A
+    control changes whatever was marked AT THE MOMENT YOU MOVED IT
+    and nothing else, so marking another picture afterwards never
+    drags someone else's settings onto it — the same rule the Image
+    Slider follows.
+  - The count of marked pictures is at the foot of the Image /
+    Display group, and hovering it lists all of these gestures.
+  - A picture that is no longer on the shared setting SAYS SO under
+    itself: "(adjusted)" when its brightness differs, "(own
+    palette)" when only its colours do. Without that, one opened-up
+    day would quietly look like a strong one. "Reset" puts every
+    picture back on the shared setting.
+  - Two readings stay over the whole wall whatever is marked: "Auto"
+    and the difference from the reference day. Both are worked out
+    across all the days at once, and a per-picture version of either
+    would mean nothing.
   - Why that matters: the archive does NOT store the camera's own
     numbers. It stretches every frame by its own factor to fill the
     16-bit file, so a weak day and a strong one can both sit near
@@ -92,11 +116,19 @@ REFERENCE DAY
     to drop it. The reference day itself stays shown as it is.
 
 SAVING THE VIEW
-  - "Save view" writes the WHOLE view into one file — every row,
-    including the ones below the fold, with the days labelled and a
-    strip under the picture naming the tab, the cameras, the days,
-    how the frames were picked and the reference day. Neither of the
-    other tabs can do this; they save frames one at a time.
+  - "Save view" writes the WHOLE view into one file — every row
+    below the fold AND every camera off to the right, with the days
+    labelled and a strip under the picture naming the tab, the
+    cameras, the days, how the frames were picked and the reference
+    day. Neither of the other tabs can do this; they save frames one
+    at a time.
+  - The file is as large as it needs to be for everything in it to
+    be READABLE: the size is worked out from the pictures themselves
+    so that the smallest tile on the wall comes out at its camera's
+    own resolution. There is nothing to set. It used to be a fixed
+    two times the window, which was fine for six tiles and threw
+    four fifths of every picture away once there were twenty-four.
+    The log line after saving says the pixel size that came out.
   - It asks two things first: PNG or PDF, and this tab or every tab.
     Every tab with PNG writes one file per tab, named after it; PDF
     puts one tab per page, each page as big as its own picture so
@@ -107,28 +139,66 @@ SAVING THE VIEW
     where it came from.
 
 THE DAY-BY-DAY TAB
-  - A row is a DAY, and the next row down is the next day. A column
-    is one camera, in the same place all the way down, sorted by
-    name. When a day carries several picks — four marked regions, or
-    five picked moments — they sit side by side inside that day's own
-    row, each camera owning one column per pick, and the banner says
-    how many. (Before, all four shared one slot and three of them
-    were painted underneath the fourth.)
-  - About three rows fill the pane and then it scrolls, and a plain
-    mouse wheel steps a WHOLE DAY per notch. Ctrl+wheel still zooms.
+  - A row is a CAMERA, and the next row down is the next camera,
+    sorted by name. A column is one DAY, in the same place all the
+    way down. So five cameras over five days come out as a five-by-
+    five grid: one camera per line, its days running across it.
+    (It used to be the other way round — a row was a day and a column
+    a camera — which put every camera of one day on one single
+    horizontal line.)
+  - When a day carries several picks — four marked regions, or five
+    picked moments — they sit side by side inside each camera's row,
+    that day owning one column per pick, and the banner says how
+    many. (Before, all four shared one slot and three of them were
+    painted underneath the fourth.)
+  - FOUR DAYS FILL THE WINDOW and the rest are off to the right:
+    scroll sideways for them, and down for more cameras. Dividing the
+    window by however many columns there are, which is what it did,
+    turned twelve of them into twelve slivers a couple of centimetres
+    wide, and a picture that size answers nothing.
+  - The grey banner runs the whole width of the row and names the
+    CAMERA, plus how many days its line reaches across. The name
+    stays at the left of the window however far you scroll sideways —
+    otherwise the row stops saying which camera it is. The day and the
+    time are written under each picture.
+  - About three rows fill the window and then it scrolls, and a plain
+    mouse wheel steps a WHOLE CAMERA per notch. Ctrl+wheel still
+    zooms.
+  - Within one camera and one day the pictures are ordered BY TIME —
+    the time of the picture that was found, whether a click or a
+    marked stretch found it. A clicked moment and a marked stretch
+    can both be "number 1", so ordering by the number put two of
+    them in the same place.
   - Several moments picked at once give a tab per camera plus this
     one, exactly like a day search — the flat grid of every camera
     against every moment is what the exported file is for.
 
 LOOKING AT ONE DAY CLOSELY
-  - Click a day to open that frame in a close-up WINDOW, sized well
-    above the stored picture, with the arrows under it stepping
-    through the rest of the wall. The wall stays clickable behind it,
-    so the next day can be opened without closing the window first.
-  - This used to be a permanent "One frame" tab beside the walls: a
-    half-size picture nobody switched to. The close-up is now as big
-    as the screen allows, which is what looking at a frame closely
-    was asking for.
+  - Clicking a picture MARKS it; it does not open anything. It used
+    to do both at once, so every attempt to brighten one day threw a
+    window over the very comparison being made, and the only way to
+    mark a picture without that was to hold Ctrl — which nobody
+    guesses.
+  - THE CAMERA LIST IN THE PANEL FOLLOWS THE SAME RULE. Clicking a
+    camera there marks all of that camera's pictures on the wall and
+    opens nothing; every click adds another camera, and clicking one
+    that is already marked takes it back off. It used to open the
+    close-up window as well, for exactly the reason above.
+    Double-click still takes the camera out of the search.
+  - DOUBLE-CLICK a picture, or right-click it and choose "View", to
+    open it in a WINDOW sized well above the stored picture, with
+    the arrows under it stepping through the rest of the wall. The
+    wall stays clickable behind it, so the next day can be opened
+    without closing the window first.
+  - THE "DETAILED VIEW" TAB is the other way: last in the row of
+    tabs, one picture filling the pane, and ◀ ▶ under it (or the
+    left and right arrow keys) stepping through THE MARKED PICTURES
+    — or through the whole wall when nothing is marked. It and the
+    window are the same page built twice and they share one place in
+    the list, so stepping in one moves the other.
+  - Both used to be a permanent "One frame" tab: a half-size picture
+    nobody switched to. What looking at a frame closely was asking
+    for is a picture as big as the screen allows.
   - "Open in Image Slider" hands over the frames that are on the
     wall — the ones actually picked, each with its own day caption.
     (It used to open the first camera's whole folder and ignore the
@@ -136,11 +206,14 @@ LOOKING AT ONE DAY CLOSELY
 
 SEARCH
   - The Source group is laid out the way the Image Slider's Source
-    group is: "Time window" and "Cameras" side by side,
-    "PV Search..." under them, and "Load data" at the bottom — the
-    button that actually goes and reads the frames. Actions (Save
-    As..., Folder, Workshop and the list of picked cameras) sits
-    directly below Source.
+    group is: "Time window" and "PV Search" side by side — the two
+    that say WHEN to look — "Cameras" on its own row under them,
+    and "Load data" at the bottom — the button that actually goes
+    and reads the frames. Actions (Save As..., Folder, Workshop and
+    the list of picked cameras) sits directly below Source.
+  - The log — every line the tab writes about what it is doing — is
+    a short box at the very bottom of the left panel. It used to be
+    a band across the whole tab under the pictures.
   - "Time window" opens the calendar — the SAME window the Image
     Slider and the Shot Finder open. A plain click takes
     one day. Ctrl+click adds or removes one day, weekends included.
@@ -238,23 +311,60 @@ PV SEARCH
     window: a plain click takes one day, Ctrl+click adds or removes
     one, Ctrl+Shift+click takes the range back to the last day you
     clicked. Under the calendar every marked day is listed with what
-    is picked on it — moments and regions; click a day to show it.
-    A day that carries something picked is never unmarked, so
-    building the set up day by day cannot lose what came before.
+    is picked on it — "3 moments, 1 region" — and each day OPENS:
+    click the arrow and the moments and regions on that day are
+    listed underneath with their times. Click a day to show it in
+    the graph. A day that carries something picked is never
+    unmarked, so building the set up day by day cannot lose what
+    came before. This list is not saved, so closing the window
+    forgets the picks.
+    The Search button sits directly UNDER this list, where what is
+    picked is written out, rather than at the far foot of the panel.
+    There is no Cancel beside it — the window's ✕, or Esc, closes it.
 
   - PICKING MOMENTS. Click the graph: every click adds one more
     moment, on this day or on any other marked day, and they are all
     searched together. Each pick snaps to the nearest real sample of
     the primary value and carries a number on the graph — the same
-    number the tiles wear. Ctrl+Z, or the "Undo" button beside the
-    moment line, takes the last pick back (a marked region too);
-    "Clear" forgets every moment. The result is one wall of
-    every camera at every picked moment.
+    number the tiles wear. Ctrl+Z takes the last pick back (a marked
+    region too); one pick at a time comes off by the ✕ on its own
+    row in the table under the graph. The result is one wall of every
+    camera at every picked moment.
 
-  - Moments and marked regions can both be on screen. When a moment
-    is picked, the moments are what gets searched and the moment line
-    says the regions are being ignored; "Clear" brings them back.
-    Neither one deletes the other any more.
+  - A CLICK IS A MOMENT, ANY DRAG IS A RANGE. Press and let go
+    without moving and you get one moment; move the mouse at all
+    while the button is down and you get a marked stretch of time,
+    however narrow it looks on screen. It used to take a drag of five
+    screen pixels before it counted — which on a whole-day graph is
+    four minutes, a band plainly visible on screen — and anything
+    shorter was silently turned into a single moment instead.
+
+  - MOMENTS AND MARKED REGIONS ARE BOTH SEARCHED. Four clicks and
+    four drags give eight pictures from every camera, not four. The
+    Search button says how many there are altogether ("Search 8
+    selections"), the line over the table under the graph says how
+    many pictures per camera that is, and the banner over each day's
+    row on the wall names both halves.
+    ONE RUN OF NUMBERS COVERS BOTH. Whether a pick was made by a
+    click or by a drag, it gets the next free number and no two picks
+    ever share one — so on the wall every picture simply wears its
+    number ("2)"), with no "r" in front of anything. Before this the
+    moments were numbered across the whole window while the regions
+    started again at 1 on each day, so "2" named two different picks
+    at once and the wall had to letter one of them to keep them
+    apart. Within one camera and one day the pictures are in the
+    order of their own times.
+    Before this, only the moments were searched: the regions were
+    dropped at search time and the status line called them ignored,
+    so four drags could disappear on one stray click. Neither one
+    deletes the other, and neither one is dropped.
+  - A marked region needs a primary value chosen (its picture comes
+    from that value's peak inside the region). Without one the
+    window says so and refuses, instead of losing the regions.
+  - Turning the regions into times costs one reading of the archive
+    per day — not one per camera — so it is the same handful of
+    requests whether you asked for two cameras or twenty. A small
+    box shows the progress and can be cancelled.
 
   - THE GRAPH, two ways. "One day" shows one marked day at a time —
     the arrows at the top right step through them and say which one
@@ -300,11 +410,20 @@ PV SEARCH
     channel; what is added is ticked, selected and scrolled to, and
     the status line names it. "Remove" takes the selected rows off
     and says which. Nothing on that list is silent any more.
-    "Own axis" gives the selected value a scale of its own — two
+    "Own axis" gives the SELECTED value a scale of its own — two
     values in the same unit but a thousand times apart share a scale
-    on which neither can be read. "Edit" changes the value's name and
-    unit; it writes them to the shared list, so every tab shows the
-    same name afterwards.
+    on which neither can be read. It is a setting of that one value
+    and nothing else: the rows that have it wear an amber band, the
+    scale on the left stays the one most of the curves are on, and
+    each value put on its own gets a new scale on the right. "Edit"
+    is the row itself — WHICH CHANNEL it reads (Search there is the
+    same archiver-wide value search as everywhere else: type words,
+    best match first), its name on screen and its unit. A row is no
+    longer welded to the value it started as, so "PAP1" can be
+    pointed at anything. Name and unit go to the shared list, so
+    every tab shows the same name afterwards; for a channel the
+    shared list does not know, they are kept for this window and it
+    says so.
 
   - THE FORMULAS on the shared value list are drawn too, over the
     whole day, marked "(formula)". What they are built from is read
@@ -323,16 +442,46 @@ PV SEARCH
     every zoom and hand-set range), "Copy" (the graph to the
     clipboard) and "Save" (the graph as a PNG).
 
-  - THE MARKED RANGE, IN NUMBERS. Under the graph: how many samples
-    each value has in the marked region, its mean, its spread and the
-    two extremes — with the median, the peak-to-peak, the first and
-    last value and the trend in the row's tooltip. Pick which region
-    with the box above the table; a region just dragged takes the
-    place by itself. A value with NO sample inside the range still
-    gets a row: the value it was already sitting at, in amber, with
-    "0" and the word "held", because a setting that did not move is
-    not a broken sensor. Only when there is nothing before the range
-    either does it read as dashes.
+  - EVERYTHING YOU PICKED, IN ONE TABLE. Under the graph is one
+    list of the moments AND the marked stretches together, in time
+    order, each with its number, its colour, its day, its time (or
+    its two times and how long it is), and a ✕ at the end of the row.
+    The ✕ throws that one pick away; Ctrl+Z brings it back like any
+    other pick. Until this table existed the stretches were listed
+    only in the narrow left panel and the moments nowhere, so the
+    only way to drop a moment was to undo every pick made after it
+    and make them all again. That narrow list in the panel is gone
+    now — it said the same thing twice, in a quarter of the width.
+    THE NUMBERS DO NOT MOVE WHEN YOU DELETE ONE. Pick four things,
+    throw the third away, and what is left still reads 1, 2, 4 —
+    on the graph, in the table and on the wall — so the number you
+    were talking about is still the same picture. "Renumber" is the
+    only thing that counts them again from one, 1…n straight down
+    the table.
+    The line above the table counts what is picked and says how many
+    pictures per camera that is.
+
+  - AND WHAT THE VALUES DID, ON THE SAME ROW. The right-hand half of
+    that table is what used to be a page of its own called "Marked
+    ranges" — so the range and its numbers can be looked at together
+    instead of one at a time. For each marked stretch, per plotted
+    value: how many samples it has in that stretch, its mean, its
+    spread and the two extremes — with the median, the peak-to-peak,
+    the first and last value and the trend in the row's tooltip. A
+    stretch takes one row per plotted value, with its number, day and
+    times merged down the block, so the numbers can never be read
+    against the wrong range. A clicked moment is one row and leaves
+    those columns as dashes: it is one picture, not a range, and
+    there is nothing to average over.
+    A value with NO sample inside the stretch still gets its numbers:
+    the value it was already sitting at, in amber, with "0" and the
+    word "held", because a setting that did not move is not a broken
+    sensor. Only when there is nothing before the stretch either does
+    it read as dashes.
+    The bar between the graph and this table can be DRAGGED: a plot
+    with five or six curves on it needs the height, and the table
+    only needs it while its numbers are being read. Pulled all the
+    way down it closes and the graph takes the whole pane.
 
   - WALKING THE DAY, AND KEEPING WHAT YOU FIND. Back in the tab, the
     two arrows under "PV Search" step to the shot before or after the
@@ -380,28 +529,35 @@ DISPLAY
     actually used, and unticking gives you your own value back. All
     three apply to the preview AND to what Save / Send to Workshop
     write, so an exported frame looks like the one you saw.
-  - Con (Contrast, -127..+127, default 0): a gain around the frame's own
+  - Con (Contrast, -384..+384, default 0): a gain around the frame's own
     black level — it spreads the values apart or squeezes them together.
-    Its Auto box is what used to be the separate "Auto stretch"
-    checkbox: the frame is spread over its own p0.5..p99.5 window, which
-    makes a dim frame readable and gives up the comparability above, so
-    leave it off unless you need it.
+    Every 64 steps double the gain, so +64 is twice, +128 four times and
+    the top of the slider 64 times; the dim cameras need 40 times before
+    anything is visible, which is why the slider goes that far.
+    Its Auto box sets THIS SLIDER for you: the gain that spreads the
+    frame's own p0.5..p99.5 window over the whole range. Nothing else
+    moves — the dark background stays where it is. It makes a dim frame
+    readable and gives up the comparability above, so leave it off
+    unless you need it.
     The Binary and False Colors palettes always map per frame, whatever
     this box says — that is how those two are meant to work.
   - Bri (Brightness, -255..+255, default 0): an offset added to every
     pixel — it lifts or darkens the whole frame, it does not spread it.
-    Its Auto box is the auto LEVEL: the same p0.5..p99.5 window placed
-    on the data, because no amount of shifting can spread a narrow
-    range. Auto contrast and Auto brightness are one and the same pass,
-    so ticking both does not level the frame twice.
+    Its Auto box sets THIS SLIDER for you too: the offset that puts the
+    frame's dark background at 0. It only shifts — on a dim frame that
+    alone changes very little, because spreading is the other box's job.
+    Tick both Autos and you get the full stretch: the background at
+    black and the picture spread over the whole range.
+    Whichever box you tick, the number beside the slider is the number
+    it chose, and it is a real setting: type it in by hand with Auto off
+    and you get the same picture back.
   - Gam (Gamma, 0.30-1.50, default 1.00): below 1.00 lifts the dark end
     WITHOUT giving up comparability — the curve depends only on the
     pixel value, so one colour still means one intensity. 0.50 is the
     working point on these cameras. Auto picks the curve per frame
     (median to 45 % of the range), which does give up comparability.
-    The whole row is greyed out while Auto contrast or Auto brightness
-    is on, because either of those already sets both ends of the frame
-    and gamma then has nothing left to bend.
+    The row stays usable whatever the other two Autos are doing — a
+    curve and a gain work together, the same as with the sliders.
   - Under the preview: the frame's peak in raw counts, how much of the
     camera's full scale that is, the sensor bit depth, which of the two
     mappings produced the picture, and any gamma, contrast or brightness
@@ -499,6 +655,13 @@ TIMESTAMP COLOURS (multi-camera tiles)
 
 PLAYBACK
   - Scrub with the slider or use Play/Stop.
+  - The grey ◀ ▶ arrows move ONE IMAGE per click (← / → do the same).
+    HOLD one down and it keeps going, faster the longer you hold it:
+    two images a second for the first second, then three, then four,
+    and five a second from the third second on. Let go and it stops
+    where it is. Five a second is the top speed on purpose — every
+    image is a read off the share for every camera on screen, so a
+    faster arrow would only queue up pictures you have already passed.
   - Play speed: 0.10 to 5 %/s, as a % of the loaded frames per second
     of real time. So 1 %/s over 6000 loaded frames plays 60 frames a
     second. Speeds above 5 %/s were removed: on a window of any size
@@ -529,6 +692,16 @@ DISPLAY OPTIONS
     brightness of a camera does not repaint its palette.
     Saving works the same way — each camera is written out with the
     palette it is shown with.
+  - WHAT THE PANEL SHOWS is the other half of that rule: click a camera
+    and the palette, the three rows and their Auto boxes jump to THAT
+    camera's own settings. Set one camera to 0 / 50 / 0, click another
+    that was never touched and you see 0 / 0 / 0; click back and the
+    0 / 50 / 0 is there again. Clicking a camera never changes it —
+    it only changes what you are looking at in the panel.
+    With several cameras selected that are NOT set the same, the rows
+    that differ show a "≠" instead of a number and an amber line under
+    them names those rows. Move any of the controls and every selected
+    camera is set to what you moved it to, so the "≠" goes away.
   - Color palette: Default, Grayscale, Gradient, Binary, False Colors,
     Rainbow, Hot, Black & White, Viridis, Plasma, Inferno, Jet, Turbo.
     Binary and Rainbow are the NI Vision palettes of those names.
@@ -554,9 +727,11 @@ DISPLAY OPTIONS
     False Colors is the dark blue → violet → pink → white ramp, crowded
     at the bottom so faint detail keeps most of the range; it is spread
     over the frame's own range, so it shows the signal even without Auto.
-  - Brightness: additive offset, -255 to +255. Auto is a full auto
-    level of the frame (p0.5..p99.5 onto 0..255), the same window
-    ImageJ's auto display range uses.
+  - Brightness: additive offset, -255 to +255. Auto sets that same
+    slider for you: the offset that puts the frame's dark background at
+    0. It only shifts the picture, it never spreads it — on a dim frame
+    that alone changes very little, and spreading is what Contrast and
+    its own Auto are for.
   - Gamma: slider 0.30-1.50 with its own Auto box and reset, next to
     Brightness and Contrast. This is the control for "the picture is
     dark but I want to keep the numbers honest": below 1.00 it lifts the
@@ -571,19 +746,27 @@ DISPLAY OPTIONS
     range; being per-frame it gives up comparability the same way Auto
     contrast does, and it parks the greyed-out slider on the value it
     used so you can always read what you are looking at.
-    Auto contrast already sets both ends of the frame, so the whole
-    gamma row is greyed out while it is on - two corrections fighting
-    over the same pixels is not a setting worth having.
+    The gamma row stays usable whatever the other two Autos are doing -
+    a curve and a gain work together, exactly as they do when you set
+    the sliders by hand.
   - Contrast: multiplicative gain around the frame's own black level,
     so raising it spreads the signal instead of crushing the picture.
-    Auto is the same auto level as Auto brightness — either box gives
-    the picture an auto-scaling viewer (ImageJ, Windows Photos) shows,
-    and ticking both does not level the frame twice.
+    Every 64 steps double the gain (+64 twice, +128 four times, the end
+    of the slider 64 times) — the dim cameras need about 40 times before
+    anything can be seen, which is why it reaches that far.
+    Auto sets that same slider for you: the gain that spreads the
+    frame's own p0.5..p99.5 window over the whole range, with the dark
+    background left where it is. Tick Auto contrast AND Auto brightness
+    together and you get the picture an auto-scaling viewer (ImageJ,
+    Windows Photos) shows — the background pulled to black and the rest
+    spread out.
     While an "Auto" box is ticked its slider is greyed out but still
-    moves to the value the auto pass actually applied; unticking it
-    puts your own value back.
+    moves to the value that box chose. That number is a real setting:
+    untick Auto, type it in, and the picture is the same. Unticking puts
+    your own value back rather than keeping Auto's, so a tick and an
+    untick never lose what you had set.
   - The three rows are labelled "Con:", "Bri:" and "Gam:" and each shows
-    the number in use to the right of its slider (contrast -127..+127,
+    the number in use to the right of its slider (contrast -384..+384,
     brightness -255..+255, gamma 0.30-1.50) — the setting on screen is
     always readable, including the value an "Auto" box picked. The names
     are abbreviated to make room for that number; hover the name, the
@@ -608,6 +791,36 @@ DISPLAY OPTIONS
     the difference statistics are shown next to it. The reference is
     named in a green "Ref:" strip under the camera name, and a
     warning appears if it no longer belongs to the loaded set.
+      · The statistics say HOW MANY PIXELS ARE ABOVE THE BACKGROUND
+        of the difference frame (the background being its darkest
+        value, which on a difference is 0 and is printed only when it
+        is not), WHAT SHARE OF THE FRAME that is, the AVERAGE and the
+        BRIGHTEST difference on the 0-255 display scale, and - the
+        line that says whether anything actually happened - HOW MANY
+        PIXELS DIFFER BY AT LEAST 10, 25, 50 AND 100. A bare count of
+        everything that is not exactly the reference is dominated by
+        sensor noise and reads the same on a quiet frame as on a
+        changed one; the level counts do not. All of it is counted
+        after the diff threshold and before the visibility offset, so
+        the numbers stay physical.
+      · Under them sits a small histogram: how many pixels differ at
+        each brightness, 0 on the left, 255 on the right, with tick
+        numbers across the axis, the count the tallest bar stands for
+        written top-left, and a red line at the brightest pixel. Only
+        the pixels above the background are counted - the background
+        alone is nearly the whole frame and would flatten every other
+        bar - and the bars are on a square-root scale, so a handful
+        of very bright pixels is still visible.
+      · EVERY CAMERA GETS ITS OWN BLOCK: its name and numbers, then
+        its own histogram directly beneath them. (There used to be
+        one histogram for the whole grid - the selected camera's -
+        above a list of numbers for all of them, so the picture
+        described a different camera than the lines above it.) The
+        blocks scroll once they fill their box, so a many-camera grid
+        cannot push the settings column off the screen.
+      · What used to be printed here and no longer is: the size of
+        the frame (the same on every frame) and the darkest lit
+        pixel (the diff threshold read back).
   - Pixel normalization: the 16-bit value against the camera's own
     range. No per-frame auto-scaling, so one palette colour always
     means one intensity, and low-signal cameras (the PDxM1 diodes)
@@ -654,6 +867,17 @@ OVERLAYS
   - Circle, square, and cross overlays — drag to position/resize.
     The cross follows the mouse while the button is held: click to drop
     it, hold to drag it, click somewhere else to move it there.
+  - SEVERAL CAMERAS AT ONCE. The Draw and Cal buttons work on the
+    cameras you have marked — on all of them if you have marked none.
+    Draw and one click puts the same mark on every marked camera at the
+    same place in the picture: click the middle of one camera and it
+    lands in the middle of the others too, whatever size their pictures
+    are. Only the shape you moved is copied, so moving the cross leaves
+    their circles alone. Cal measures each marked camera on its own
+    picture — one click, one result per camera — and if it cannot find
+    the shape on some of them, it names those cameras in one message.
+    Marking a camera is done on its name bar; while Draw is switched on
+    a click on the picture draws instead of marking.
   - Overlay settings: configure size, opacity, and limits.
   - Overlays can be burned into exported images ("Save with overlay").
     With it ticked, the PV values are added as a white bar under the
@@ -666,10 +890,19 @@ OVERLAYS
     bar itself cannot be drawn, the "Saved" box says so and the reason
     is written to image_tools_diag.log.
   - PDxM1 / PDxM2 diode cameras have a configurable measuring grid:
-    set the number of rows and columns and drag individual lines.
-    Every line is stored as an absolute position in the image, so
-    moving one does not shift the others, and cameras of the same
-    type share one configuration.
+    right-click the picture to open it, set the number of rows and
+    columns and drag individual lines. Every line is stored as an
+    absolute position in the image, so moving one does not shift the
+    others, and cameras of the same type share one configuration.
+  - PCW3_NF carries the permanent reference square that is set on the
+    camera itself. The camera screen draws that square, but it is not
+    written into the stored picture, so the Slider draws it back on.
+    It is on from the start; right-click the picture to switch it off
+    or to nudge its edges, and the position is remembered. It is drawn
+    on screen only — a picture you save stays the plain stored frame.
+  - Right-clicking a picture opens settings ONLY on those cameras: the
+    diodes and PCW3_NF. Elsewhere there is nothing to set, so nothing
+    opens. Right-click and DRAG still zooms on every camera.
 
 MULTI-CAMERA LAYOUT
   - The arrangement is made in the "Camera" window, in the Layout
@@ -784,6 +1017,11 @@ CAMERA SIZES
     screen.
   - Each camera has its own slider; one camera can be the master
     that the others follow in time.
+  - A CAMERA YOU MOVE YOURSELF STAYS WHERE YOU PUT IT. Move the master
+    and every other camera jumps to the master's moment — that is what
+    the master is for. Move any OTHER camera's slider and it keeps that
+    moment: nothing pulls it back until you move the master again. The
+    ⟳ Refresh button leaves the positions alone as well.
 
 SPATIAL CONTRAST
   - With several cameras on screen it measures the one camera you have
@@ -826,9 +1064,10 @@ POINTING ANALYSIS
     to each day's part of the bar — the HH:MM readout alone would not
     say which day it is.
   - Delete mode: click a point to delete just that one, or drag a
-    rectangle to delete everything inside it. Undo delete (or Ctrl+Z
-    over the graph) takes back the last deletion, one step at a time;
-    Restore All brings back everything.
+    rectangle to delete everything inside it. While it is switched on
+    the button is red. Undo delete (or Ctrl+Z over the graph) takes
+    back the last deletion, one step at a time; Restore All brings
+    back everything.
   - Save Plot exports the current zoom state to PNG. The day markers
     are part of the figure; the draggable cursor and its time readout
     are not. With graphs for several cameras it first asks whether to
@@ -925,12 +1164,21 @@ PV VALUES
         and of the row in the picker.
       · Names survive a restart, and taking a PV off the picture
         does not throw the name away.
-  - Own formulas (derived PVs), the same idea as in the CSS Logger:
+  - Formulas (derived PVs), the same idea as in the CSS Logger:
     every PV carries a CHANNEL LETTER shown in the Letter column
-    (A, B, …),
-    and a formula row at the bottom of the picker computes a new PV
-    from those letters as a Python expression — B/D, A*0.749,
-    round(A-B, 2). Give it a name and, if it has one, a unit.
+    (A, B, …), and a formula computes a new PV from those letters as
+    a Python expression — B/D, A*0.749, round(A-B, 2).
+      · A FORMULA IS A ROW OF THE TABLE, like any other PV. Press
+        "+ Add formula" and a row appears; write the expression
+        straight into its PV column (that is what the row reads, so
+        that is where it belongs), the name in "Displayed name" and
+        the unit in "Unit". There is no separate formula block under
+        the tables any more — it was a second place to edit the same
+        row. The syntax is in the tooltip of the PV column and of
+        every expression box.
+      · The Unit box is open for a formula and for a PV you added
+        yourself. A preset's unit is a code constant and is only
+        shown.
       · The letters are positional, so they move when the PV list
         changes. Each formula stores which PV every letter stood for
         and is re-lettered from that, so adding or removing a PV can
@@ -1067,6 +1315,16 @@ PV VALUES
     value that renders narrower (4.5 after 12.34, or "n/a") cannot
     make it jump either. Changing the selection or the font size
     re-measures it.
+  - HOW BIG THE PANEL IS, in "Overlay settings" beside the font and
+    the colours: "Panel size (w x h)". Both boxes read "auto" at 0,
+    which is what the panel has always done — exactly as big as the
+    values. Type a number and that side is held at that many pixels
+    whatever the values do, so a box laid out over the picture stays
+    the size it was put at, and a long value cannot widen it either.
+    "Fit to text" puts both back to auto. A size smaller than the
+    text needs cuts the text off — the font size above is what makes
+    the numbers fit. The size is remembered, like the font and the
+    colours.
   - A value carried over as "(older shot)" / "(-28 s)" keeps that
     flag when it is burned into a saved image, so the file cannot
     claim a reading the panel did not. A frame saved sooner than the
@@ -1230,6 +1488,10 @@ WHAT IS SEARCHED
     today. Nothing happens until OK; Cancel throws the change away.
     There is no Live mode here; this tab searches what is already
     archived.
+    It opens on 07:00 to 20:00 — the shift, not the whole calendar
+    day. Nothing is shot at four in the morning, and a window that
+    started at midnight made every search read hours that hold
+    nothing.
     What this replaced was a pair of calendars of its own, Start
     point and End point, which could only pick whole hours and only a
     run of days from one date to another.
@@ -1238,9 +1500,27 @@ WHAT IS SEARCHED
     cameras saved in one tab is offered in the other. The cameras
     you picked stay listed on the panel below the button.
   - "Load data" reads the PV data for those days and finds the
-    matching frames. While it runs, the bar under it says what it is
-    reading, how far along it is, how many matches are in and roughly
-    how long is left.
+    matching frames. While it runs, the bar under it says how far
+    along it is and how many matches are in, and the grey line under
+    the bar says what is being read right now - the PV data of a
+    given day, or the frame of a given camera. The bar fills
+    gradually inside a single day as well, so one day with one camera
+    no longer sits at zero for the whole wait.
+  - How long is left appears only once it has been MEASURED. The work
+    has two halves of very different speed: the PV data of all the
+    days is read at once and is quick, then the frames are looked for
+    on the network drive day by day, which is the slow part. So
+    nothing is promised while the PV data is being read, and from the
+    second searched day onwards the estimate is the middle of the
+    times the finished days actually took, times the days left. Days
+    the archiver had nothing for are left out of that middle - they
+    finish in a blink and would promise the rest of the search in a
+    blink too. Before, one straight line was drawn through both
+    halves, and the number jumped from minutes to seconds and back.
+  - The same bar appears when you change the picked days: before
+    anything can be searched, the cameras of those days have to be
+    looked up on the network drive, and that walk is now counted in
+    hour folders instead of showing only "Loading cameras…".
   - There used to be a Lab / Office switch next to the Time window
     button. Both of its settings pointed at the SAME network path
     for the pictures, the archiver answers the same from the lab and
@@ -1300,30 +1580,59 @@ TECHNICAL NOTES
     restart.
   - Back Ref and PAP1 are displayed in mJ when < 1 J.
   - Clicking the Folder cell reveals the matched file in Explorer;
-    double-clicking a row opens every shot of that day inside the
-    tolerance in a second, shorter table under the results table.
+    double-clicking a row opens a window with every shot of that day
+    inside the tolerance, and that day's graph beside it. There is
+    nothing else in that window, and its title says which day and
+    which camera it lists.
   - Clicking a shot in that list shows its image in the picture area
-    on the right — the same place the day's own picture appears, so
-    the results stay visible. The value line under the picture is the
-    same one. Every shot is looked up in the hour folder of its own
+    of the main window — the same place the day's own picture appears,
+    so the results stay visible. The value line under the picture is
+    the same one. Every shot is looked up in the hour folder of its own
     time, so shots outside the hour of the day's best shot show up too.
-  - The divider between the two tables can be dragged. "✕" closes the
-    shot list; it also closes itself when another day row is clicked
-    or when a new search is started.
+  - The window opens centred on the program, about two thirds its
+    width and not quite half its height, with the graph taking the
+    bigger half of it: the list is a few narrow columns, the graph is
+    what the day is actually read from. Move it or resize it and it
+    stays that way until you close the program. The divider between
+    the list and the graph can be dragged. Esc or the window's own ✕
+    closes it; it also closes itself when another day row is clicked
+    or a new search is started.
   - Switching to another camera's tab keeps your place: the same day
     stays selected, the shot list stays open and the shot with the
     same time stays picked, so you see that exact moment through the
-    other camera.
-  - The last column of the shot list is the picture belonging to that
-    shot. Click it to open the folder with the file selected. It is
-    filled in only for the shot you look at or the one you click - a
-    day can hold tens of thousands of shots, and finding every file
-    would mean tens of thousands of trips to the share.
+    other camera. If you switch while the search is still running and
+    that camera has not reached your day yet, the day is selected the
+    moment its row arrives.
+  - The last column of the shot list is "Frame time": the time the
+    PICTURE itself carries, in Prague time and in the same shape as
+    the Prague Time column beside it, so you can read the two against
+    each other and see how far the frame sits from the PV sample. It
+    used to print the whole file name, camera and all, which is why
+    that one column took half the window - and the camera is named in
+    the title anyway. The full path is in the bubble.
+  - Double-click a row - anywhere on it - to open the folder with
+    that frame selected. A single click only picks the shot, so the
+    list can be read through without an Explorer window per row.
+  - The column fills itself the moment the window opens, without
+    being clicked, starting at the row you are looking at and
+    wrapping round to the top. While it runs the title counts the
+    frames named so far. It used to be filled one row at a time, when
+    a row was picked, because every row meant its own trip to the
+    network drive; now each HOUR of the day is read once and every
+    shot in it is answered from memory, so a whole day costs a few
+    seconds instead of a trip per shot.
   - Next to the shot list is the day's own graph: every PV you
     searched by over the whole day, the target and its tolerance, a
     red dot on each shot in range and a black line on the shot you
     are looking at. Clicking in the graph picks the nearest shot, so
     you can see at a glance where in the day this frame sits.
+  - The curve HOLDS its value until the next sample arrives, drawn as
+    flat runs with a step at each sample - the same way CS Studio
+    draws it, and the same way the PV Search window does. The archive
+    says the value stayed where it was until something new was
+    written, so sloping from one sample to the next drew values that
+    were never measured; a gap of an hour came out as a diagonal
+    across the whole graph.
   - Sending and saving live in "Save & Send" in the left panel. "Act
     on" chooses what they mean: the whole selected day(s), or only the
     shot picked in the shot list. The shot choice is available while
@@ -1337,19 +1646,21 @@ TECHNICAL NOTES
     over, greys out its slider and parks it on the value Auto used;
     unticking gives you your own value back. All three apply to the
     preview and to Save Images alike.
-  - Con (Contrast, -127..+127, default 0): a gain around the frame's own
-    black level. Its Auto box is what used to be the separate "Auto
-    stretch" checkbox — each frame spread over its own p0.5..p99.5
-    window: dim frames become readable, result rows stop being
-    comparable. Binary and False Colors always map per frame regardless.
+  - Con (Contrast, -384..+384, default 0): a gain around the frame's own
+    black level; every 64 steps double it. Its Auto box sets that same
+    slider for you — the gain that spreads the frame over its own
+    p0.5..p99.5 window, with the dark background left where it is: dim
+    frames become readable, result rows stop being comparable. Binary
+    and False Colors always map per frame regardless.
   - Bri (Brightness, -255..+255, default 0): an offset added to every
-    pixel. Its Auto box is the auto level — the same p0.5..p99.5 window
-    placed on the data, one pass shared with Auto contrast.
+    pixel. Its Auto box sets that slider too — the offset that puts the
+    frame's dark background at 0. It only shifts; spreading is the
+    Contrast box's job, and ticking both gives the full stretch.
   - Gam (Gamma, 0.30-1.50, default 1.00): below 1.00 brightens the dark
     end and result rows STAY comparable, because the curve depends only
     on the pixel value. Auto is per frame (median to 45 % of the range)
-    and therefore does not. The row is greyed out while Auto contrast or
-    Auto brightness is on.
+    and therefore does not. The row stays usable whatever the other two
+    Autos are doing.
   - Under the palette selector: the previewed frame's peak in raw
     counts, % of the camera's full scale, bit depth, which mapping was
     used, and any gamma, contrast or brightness on top of it — an
@@ -1803,7 +2114,7 @@ TAB 5 — WORKSHOP
 =================================================================
 
 Look at, measure and mark up images handed over from the other tabs
-("➤ Workshop"). You can also open a file with "Open file…" or drop
+("➤ Workshop"). You can also open a file with "Open file" or drop
 one straight onto the picture.
 
 THE ONE THING TO KNOW
@@ -1898,13 +2209,13 @@ RIGHT CLICK ON THE PICTURE
   measure the whole picture, the results table, the beam report, the
   value under the pointer (it can be copied, or turned into a
   marker), delete the selected item, copy, "Save with overlay",
-  Save PNG…, duplicate, fit and true size. It stays out of the way under Magnify and while
+  Save PNG, duplicate, fit and true size. It stays out of the way under Magnify and while
   you are clicking out a polygon or an angle, because there right
   click already means something else.
 
 IMAGES
   Every received image is a slot — switch between them, remove one,
-  or clear them all. "Open file…" takes several files at once. The
+  or clear them all. "Open file" takes several files at once. The
   reference image chosen here is what the subtraction, the merge and
   the comparison views work against.
   - Duplicate makes a copy as a new image. With a region selected it
@@ -1940,15 +2251,22 @@ MEASURE
   the source file could be read; "8-bit intensity" when only the
   picture itself is there. The line above the numbers always says
   which of the two you are looking at.
+  The region writes its own numbers beside itself on the picture.
+  The middle line is its OUTSIDE measurement: a rectangle says
+  "254 × 194 px", an ellipse says "axes 254 × 194 px" — the full
+  axes, not the radii — and a circle says "⌀ 139 px", one number,
+  because a circle only has one. The area below it is counted from
+  the pixels really inside the shape, so an ellipse is π·a·b and
+  not the box around it.
   - "Keep several regions" lets regions pile up instead of each new
     one replacing the last. The cells then show whichever region is
     selected, and the results table is where you read them all.
-  - "Results table…" lists every region, ruler, angle, marker and
+  - "Results table" lists every region, ruler, angle, marker and
     profile line on this picture in one table, with the whole
     picture on the first row for comparison. Copy puts it on the
-    clipboard, "Save CSV…" writes a file, and Refresh reads the
+    clipboard, "Save CSV" writes a file, and Refresh reads the
     numbers again after you have moved something.
-  - "Histogram numbers…" is the histogram as a table: 256 rows with
+  - "Histogram numbers" is the histogram as a table: 256 rows with
     the value range, how many pixels, the share and the running
     total — again with Copy and Save CSV.
   Scale: one box, "One pixel is …", says how much of the object a
@@ -1965,7 +2283,7 @@ MEASURE
   - 4.4 µm is the size AT THE SENSOR. With a lens or a magnifier in
     front, one pixel covers something else on the object — put that
     size in the box, or measure it: draw a ruler across something
-    whose size you know, select it, press "Set scale…" and type that
+    whose size you know, select it, press "Set scale" and type that
     size in millimetres. The pixel size is worked out from it, and
     the Scale line then says "measured with a ruler" instead of
     "camera pixel size", so you can always see which is in force.
@@ -1975,7 +2293,7 @@ MEASURE
     one, so that pixel covers 8.8 µm. OM1NF does this, OM1FF does
     not. On a binned frame, type the doubled value in; it is not read
     out of the picture yet.
-  - "Add scale bar…" then draws a bar of a length you choose into
+  - "Add scale bar" then draws a bar of a length you choose into
     the picture, so a saved copy carries its own scale. It suggests
     a round number, sits on a dark plate so it stays readable over
     a bright spot, and can be dragged anywhere with Select. Change
@@ -1990,7 +2308,7 @@ BEAM (spot size and shape)
   a background of a few counts spread over the whole frame outweighs
   the spot itself and the width comes out roughly the size of the
   frame. Set 0 % to measure the values exactly as they are.
-  - "Beam report…" — centre of mass, peak and where it is, the D4σ
+  - "Beam report" — centre of mass, peak and where it is, the D4σ
     width across and down, the same on the long and short axis with
     the tilt of the long axis, the roundness (1.0 = round), and the
     FWHM and 1/e² widths read off the row and column through the
@@ -2023,14 +2341,14 @@ BEAM (spot size and shape)
     say so.
 
 FILTERS (changes the picture, undoable)
-  - Median… — replaces each pixel by the middle value of its
+  - Median — replaces each pixel by the middle value of its
     neighbours. The filter for hot pixels and speckle: it removes
     the outlier without smearing an edge, which a blur cannot do.
-  - Blur… — Gaussian blur, for noise that is spread out rather than
+  - Blur — Gaussian blur, for noise that is spread out rather than
     sitting in single pixels.
-  - Sharpen… — adds back what a blur would remove.
+  - Sharpen — adds back what a blur would remove.
   - Edges — bright where the picture changes fastest.
-  - Remove background… — four kinds: a constant level (a percentile
+  - Remove background — four kinds: a constant level (a percentile
     of the picture), a sloping plane, a curved surface (for
     vignetting or a glow), or a rolling ball of a size you give,
     which keeps everything smaller than the ball and treats
@@ -2038,17 +2356,17 @@ FILTERS (changes the picture, undoable)
     off the picture and off the counts, so the two stay in step.
 
 EDIT PICTURE (changes the picture, undoable)
-  Rotate left / right / 180°, flip across or down, Resize…, and
+  Rotate left / right / 180°, flip across or down, Resize, and
   Subtract or Difference against the reference image. Anything you
   have drawn moves with the picture.
-  - "Rotate by angle…" turns by any angle you type. The picture
+  - "Rotate by angle" turns by any angle you type. The picture
     grows so no corner is cut off, which means the corners it grows
     into are black — and they are real pixels, so keep a measuring
     region away from them.
   - "Straighten" turns the picture so that a line, arrow or ruler
     you drew along an edge becomes level. Draw it first, then press
     the button.
-  - "Bin…" joins blocks of pixels into one — 2 × 2, 4 × 4 and so on.
+  - "Bin" joins blocks of pixels into one — 2 × 2, 4 × 4 and so on.
     "Average" keeps the scale and just trades resolution for less
     noise; "Sum" adds the counts up, which is what a camera does
     when it is binned on the chip, and the full scale moves with
@@ -2084,28 +2402,28 @@ SAVE
   in the right-click menu on the picture, the bar at the bottom says
   which way each file was written, and the choice is remembered for
   next time.
-  Save PNG…, Save TIFF… or Save JPEG… then writes the copy. (Never
-  keep data as JPEG — it throws detail away.) "Save all…" asks for a
+  Save PNG, Save TIFF or Save JPEG then writes the copy. (Never
+  keep data as JPEG — it throws detail away.) "Save all" asks for a
   format and writes every image in the Workshop into one folder, and
   "Copy" puts the picture on the clipboard. All of them follow the
   same switch.
-  - "Save the values as TIFF…" is the other kind of TIFF and both
+  - "Save the values as TIFF" is the other kind of TIFF and both
     are needed. This one writes what was MEASURED: the camera's own
     pixel intensity as a plain 16-bit file, no palette, no display
     settings, no drawing. That is the file to open in ImageJ or from a
-    script. The ordinary "Save TIFF…" writes what is on SCREEN,
+    script. The ordinary "Save TIFF" writes what is on SCREEN,
     which is what a report or a presentation wants.
   - Animation from every open image: set the frame time, tick
-    Repeat, then "Play…" to look at it first and "Save animation…"
+    Repeat, then "Play" to look at it first and "Save animation"
     to write an animated GIF, PNG or WebP. Images of different sizes
     are centred on black rather than stretched, so what you are
     comparing is not changed on the way. Useful for showing a drift
     over a series of shots.
-  - Session: "Save session…" writes down everything drawn on every
+  - Session: "Save session" writes down everything drawn on every
     open image, the regions, the scale and the display settings, so
     the work is not lost when the Workshop closes. It stores where
     each picture came from, not the picture itself — that keeps the
-    file tiny, and "Load session…" re-opens them and puts the
+    file tiny, and "Load session" re-opens them and puts the
     drawing back. An image that was handed over without a file
     behind it cannot come back, and the program says how many.
 
@@ -2198,10 +2516,25 @@ FOR WHOEVER WORKS ON THE CODE
 
     python testing/test_day_split.py
 
-    test_pv_stats_and_formula.py  the marked range's statistics, the
+    test_pv_stats_and_formula.py  the marked ranges' statistics, the
                              graph controls and a formula over time
+    test_pv_own_axis_and_edit.py  "Own axis" applying to one value
+                             only, and "Edit" pointing a row at
+                             another channel
     test_saved_moments.py    the session-only list of saved moments
-    test_wall_regions.py     one row per day, a column per camera
+    test_wall_regions.py     one row per camera, a column per day
+    test_wall_rows_wide.py   four days fill the window, the rest
+                             scroll sideways, and the saved file
+                             holds every one of them
+    test_wall_click_select.py  a click marks a picture and opens
+                             nothing, and every click ADDS; a double
+                             click opens it
+    render_day_wall.py       renders five cameras over five days so
+                             the Day-by-day wall can be LOOKED at
+                             (needs a real screen, not offscreen)
+    test_detail_view.py      the Detailed view tab and its arrows
+    test_moments_and_regions.py  clicked moments AND marked regions
+                             both searched, on every camera
     test_wall_export.py      Save view: PNG or PDF, one tab or all
     test_pv_regions_persist.py  a marked region never disappears
     test_pv_alias_and_order.py  SBW4 under either name; cameras or
@@ -2214,6 +2547,8 @@ FOR WHOEVER WORKS ON THE CODE
     bench_pv_wait.py         the PV panel waiting for the archiver
     bench_pv_live_multi.py   the same with several cameras
     bench_master_sync.py     the sliders following the master
+    test_hold_and_slave_free.py  a held frame arrow speeding up, and
+                             a camera you moved yourself staying put
     bench_live_slave_refresh.py  every camera repainting live
     bench_live_pv_load.py    PV reads not starving the pictures
     bench_drag.py            dragging the slider

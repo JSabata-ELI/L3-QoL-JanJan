@@ -375,49 +375,24 @@ def to_absolute_u8(arr16: np.ndarray, full_scale: float = FULL_SCALE_16,
     applied here, at the ONE step that turns an absolute value into a code, so every
     caller — refined render, preview proxy, Finder, Shot Finder — bends it identically.
     Works on any float array of 16-bit values, including a 256-entry LUT."""
-    frac = np.clip(arr16.astype(np.float32) * (1.0 / float(full_scale)), 0.0, 1.0)
+    return np.clip(absolute_f(arr16, full_scale, gamma), 0, 255).astype(np.uint8)
+
+
+def absolute_f(arr: np.ndarray, full_scale: float = FULL_SCALE_16,
+               gamma: float = GAMMA_NEUTRAL) -> np.ndarray:
+    """to_absolute_u8 without the rounding: the same mapping, left as float 0..255.
+
+    The manual Contrast / Brightness pair is applied to THIS, not to the uint8 result.
+    A dim frame occupies a handful of 8-bit codes, so a gain applied after the rounding
+    spreads those few codes into posterised bands — which is exactly what the Contrast
+    slider used to do while Auto contrast (which worked on the 16-bit data) came out
+    smooth, and why the two looked like different controls."""
+    frac = np.clip(np.asarray(arr, dtype=np.float32) * (1.0 / float(full_scale)),
+                   0.0, 1.0)
     if gamma != GAMMA_NEUTRAL:
         frac = np.power(frac, float(gamma), dtype=np.float32)
-    return np.clip(frac * 255.0, 0, 255).astype(np.uint8)
+    return frac * 255.0
 
-
-def to_u8(arr: np.ndarray, auto: bool = False,
-          full_scale: float = FULL_SCALE_16,
-          gamma: "int | float | None" = None,
-          out: "dict | None" = None) -> np.ndarray:
-    """Frame → uint8 for display. THE decision point for what a palette colour means.
-
-    Absolute (`auto=False`, the default): `value / full_scale`, the camera's own range.
-    One colour is then one intensity, comparable between frames and between cameras —
-    which is the whole reason a palette can be read as a measurement.
-
-    `auto=True` is the explicit per-frame percentile stretch: it makes a dim frame
-    readable at the price of comparability, so it belongs behind a visible switch and
-    never in a default.
-
-    `gamma` is in SLIDER units (percent, or the AUTO sentinel), because that is what the
-    UI and the cache keys carry. It bends the absolute curve without costing
-    comparability; Auto resolves per frame and does cost it. Ignored when `auto` is on —
-    the percentile stretch already sets both ends, so stacking gamma on top would be two
-    corrections fighting over the same frame.
-
-    `full_scale` is 65535 for the archive's 16-bit frames (see the module docstring) and
-    255 for an 8-bit source, which is already on its own full scale. Decide it from the
-    decoded image's MODE, not from `arr.max()`: a genuinely dark 16-bit frame can hold
-    nothing above 255 and would then be brightened 257×.
-
-    `out`, when given, receives what this render ACTUALLY applied: "gamma" on the
-    absolute path, and the equivalent "contrast"/"offset" slider pair on the auto
-    stretch. That is what lets a greyed-out Auto control show a number instead of
-    sitting at zero while the picture on screen is clearly stretched — an adjustment
-    nobody can name is an adjustment nobody can reproduce."""
-    if auto:
-        return stretch_u8(arr, full_scale=full_scale, out=out)
-    g = (auto_gamma(arr, full_scale) if is_auto_gamma(gamma)
-         else gamma_from_slider(gamma))
-    if out is not None:
-        out["gamma"] = g
-    return to_absolute_u8(arr, full_scale, g)
 
 
 def stat_sample(a: np.ndarray) -> np.ndarray:
@@ -438,8 +413,8 @@ def percentile_window(arr: np.ndarray, p_low: float = 0.5,
     """(lo, hi) percentile window of `arr`, or None when the data is uniform.
 
     Falls back to min/max if the percentile window is degenerate. The ONE place this
-    window is computed — `stretch_u8` here and `is_t._stretch_arr_f` (which also
-    reports the equivalent slider positions) both go through it."""
+    window is computed — `render_u8`'s Auto boxes, `apply_bc_u8`'s, and `stretch_u8`
+    all go through it, so they cannot disagree about where a frame's black is."""
     if arr.size == 0:
         return None
     s = stat_sample(arr)
@@ -456,6 +431,12 @@ def stretch_u8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
                full_scale: float = FULL_SCALE_16,
                out: "dict | None" = None) -> np.ndarray:
     """Percentile contrast stretch → uint8. NOT comparable between frames.
+
+    The DAY WALL's shared pair comes from here (if_t._shared_auto_pair): one window over
+    a pooled sample of every day, converted to the Contrast/Brightness pair it is worth.
+    The per-frame display path does not use it — there, Auto contrast and Auto brightness
+    each derive their own half of this same window inside render_u8, which is what makes
+    each box the operation of its own slider.
 
     Take the stretch on the 16-BIT data, never on an 8-bit rendering of it: frames from
     the dim cameras occupy a handful of 8-bit codes (a PFM frame runs p0.5..p99.5 ≈
@@ -492,9 +473,11 @@ def stretch_u8(arr: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
 # can act: the mapping decides which count a colour sits on, and these two are the
 # viewer's adjustment on top of that decision. Living here means the Slider, the Finder
 # and the Shot Finder cannot drift apart on what "Con +20" does.
-CONTRAST_MIN = -127
-CONTRAST_MAX = 127
+CONTRAST_MIN = -384
+CONTRAST_MAX = 384
 CONTRAST_NEUTRAL = 0
+# Slider units per doubling of the gain: +64 is 2x, +128 is 4x, -64 is half.
+CONTRAST_PER_DOUBLING = 64.0
 BRIGHTNESS_MIN = -255
 BRIGHTNESS_MAX = 255
 BRIGHTNESS_NEUTRAL = 0
@@ -506,60 +489,169 @@ HIGH_PCT = 99.5
 
 
 def contrast_gain(contrast: "int | float") -> float:
-    """Contrast slider value in [-127, +127] → multiplicative gain (0 → 1.0)."""
+    """Contrast slider value → multiplicative gain (0 → 1.0, +64 → 2×, −64 → ½×).
+
+    A plain doubling curve: every CONTRAST_PER_DOUBLING units multiply the gain by two.
+    Over the old ±127 range it reproduces the old rational curve to within 2 % on the
+    positive side, so a number written down earlier still means what it meant.
+
+    What it adds is REACH. The old curve stopped at 3.9× at the top of its slider, while
+    the dim cameras need 40× before their frames are visible (a PFM frame runs
+    p0.5..p99.5 over six 8-bit codes). That gap is why Auto contrast could not be "the
+    Contrast slider set automatically" and had to be a stretch of its own — the two then
+    looked nothing alike, which is the bug this curve exists to remove."""
     c = float(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast)))
-    return (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+    return 2.0 ** (c / CONTRAST_PER_DOUBLING)
 
 
 def contrast_slider_from_gain(gain: float) -> int:
     """Inverse of contrast_gain: the slider value whose gain is `gain` (1.0 → 0).
 
-    Used to park a greyed-out Contrast slider on what an Auto pass actually applied.
-    The gain tops out near 3.9× at +127 while the auto stretch of a dim frame needs 5×
-    and more, so the parked number saturates — which is why unticking Auto restores the
-    user's own value instead of keeping what was parked."""
+    This is what makes Auto contrast reproducible: the value it reports is a value the
+    slider can actually be set to, and setting the slider there gives the same picture.
+    It saturates only past 64× (the end of the slider), where Auto is genuinely at the
+    end of its travel and says so."""
     if not (gain > 0) or not math.isfinite(gain):
         return CONTRAST_NEUTRAL
-    c = 127.0 * 259.0 * (gain - 1.0) / (259.0 + 127.0 * gain)
+    c = CONTRAST_PER_DOUBLING * math.log(gain, 2.0)
     return int(round(max(float(CONTRAST_MIN), min(float(CONTRAST_MAX), c))))
 
 
-def apply_bc_u8(arr8: np.ndarray, contrast: int = 0, offset: int = 0) -> np.ndarray:
-    """uint8 frame → uint8 with manual contrast and brightness applied.
+# Which Auto boxes are on, as ONE value: it travels through cache keys, render dicts
+# and worker arguments, where a second boolean would have to be threaded through every
+# one of them. AUTO_CONTRAST is 1, so a plain `auto=True` still means "Auto contrast".
+AUTO_NONE = 0
+AUTO_CONTRAST = 1
+AUTO_BRIGHT = 2
+
+
+def auto_mask(auto_contrast: bool, auto_bright: bool) -> int:
+    """The two Auto checkboxes → the `auto` value render_u8 takes."""
+    return ((AUTO_CONTRAST if auto_contrast else 0)
+            | (AUTO_BRIGHT if auto_bright else 0))
+
+
+def auto_bc_pair(lo: float, hi: float, auto: "int | bool",
+                 contrast: int = 0, offset: int = 0) -> "tuple[int, int]":
+    """(contrast, offset) with each ticked Auto box's value filled in.
+
+    `lo` / `hi` are the frame's black and highlight level, both already on the 0..255
+    display scale. THE one place an Auto box turns into a slider value, so the 16-bit
+    render, the preview proxy and the 8-bit subtraction path cannot disagree about what
+    Auto means."""
+    a = int(auto or 0)
+    c = int(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast or 0)))
+    off = int(max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, offset or 0)))
+    if hi > lo:
+        if a & AUTO_CONTRAST:
+            c = contrast_slider_from_gain(255.0 / (hi - lo))
+        if a & AUTO_BRIGHT:
+            off = int(round(max(float(BRIGHTNESS_MIN),
+                                min(float(BRIGHTNESS_MAX), -lo))))
+    return c, off
+
+
+def apply_bc_u8(arr8: np.ndarray, contrast: int = 0, offset: int = 0,
+                auto: "int | bool" = AUTO_NONE,
+                out: "dict | None" = None) -> np.ndarray:
+    """uint8 frame → uint8 with the Contrast / Brightness pair applied.
+
+    For sources that are ALREADY 8-bit (a subtraction difference, an 8-bit file). Where
+    the full-precision values still exist, render_u8 is the one to call — a gain applied
+    after the rounding to 8 bits posterises a dim frame.
 
     Contrast pivots on the frame's own BLACK LEVEL, not on mid-grey. Mid-grey is
     unusable on these frames: an absolute-scale frame sits around code 29, so
     gain*(29-128)+128 drives it further DOWN and a contrast of +20 — one nudge of the
     slider — turns the picture black. Pivoting on the black level means contrast only
     spreads what is above the background, which is what the control is for and what
-    makes small moves small."""
+    makes small moves small.
+
+    `auto` is the AUTO_* mask, and means here what it means in render_u8: each box fills
+    in the value of its own control from this frame's percentile window."""
+    a = int(auto or 0)
     c = int(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast or 0)))
     off = int(max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, offset or 0)))
-    if not c and not off:
+    if not c and not off and not a:
         return arr8
     arr = arr8.astype(np.float32)
+    pivot = 0.0
+    if c or a:
+        s = stat_sample(arr)
+        pivot = float(np.percentile(s, BLACK_PCT))
+        c, off = auto_bc_pair(pivot, float(np.percentile(s, HIGH_PCT)), a, c, off)
+    if out is not None:
+        if a & AUTO_CONTRAST:
+            out["contrast"] = c
+        if a & AUTO_BRIGHT:
+            out["offset"] = off
     if c:
-        pivot = float(np.percentile(stat_sample(arr), BLACK_PCT))
         arr = (arr - pivot) * contrast_gain(c) + pivot
     if off:
         arr = arr + off
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
-def render_u8(arr: np.ndarray, auto: bool = False,
+
+def render_u8(arr: np.ndarray, auto: "int | bool" = AUTO_NONE,
               full_scale: float = FULL_SCALE_16,
               gamma: "int | float | None" = None,
               contrast: int = 0, offset: int = 0,
               out: "dict | None" = None) -> np.ndarray:
     """Frame → uint8 for display: the WHOLE display pipeline in one call.
 
-    Scale mapping first (absolute with gamma, or the per-frame auto stretch), then the
-    manual Contrast / Brightness pair on the 8-bit result. That order is the one the
-    Slider uses, so the same four settings give the same picture in every tab.
+    Order: absolute scale mapping (bent by gamma) → contrast gain → brightness offset,
+    all in full precision, rounded to 8 bits once at the very end.
 
-    `out` is passed through to `to_u8` — see there."""
-    arr8 = to_u8(arr, auto, full_scale, gamma, out=out)
-    return apply_bc_u8(arr8, contrast, offset)
+    `auto` is the AUTO_* mask of the boxes that are ticked, and each one only decides
+    the VALUE OF ITS OWN control:
+      AUTO_CONTRAST → the gain that spreads this frame's p0.5..p99.5 window over the
+                      whole range. Nothing else: the black level stays where it is,
+                      exactly as when the Contrast slider is dragged.
+      AUTO_BRIGHT   → the offset that puts this frame's p0.5 black level at 0. Nothing
+                      else: no spreading, exactly as when the Brightness slider is
+                      dragged.
+    Ticking both gives the full percentile stretch, because the two compose into it.
+    That is the whole design: an Auto box is its own slider set automatically, never a
+    third operation of its own. Until this was written both boxes ran the same stretch,
+    so the two Autos were indistinguishable and neither one resembled its slider.
+
+    `out`, when given, receives what was ACTUALLY applied — "gamma" always, plus
+    "contrast" / "offset" for whichever Auto box is on — so a greyed-out control can
+    show its number instead of sitting at zero while the picture is clearly changed."""
+    a = int(auto or 0)
+    auto_c = bool(a & AUTO_CONTRAST)
+    auto_b = bool(a & AUTO_BRIGHT)
+    arr_f = np.asarray(arr, dtype=np.float32)
+    g = (auto_gamma(arr_f, full_scale) if is_auto_gamma(gamma)
+         else gamma_from_slider(gamma))
+    if out is not None:
+        out["gamma"] = g
+    c = int(max(CONTRAST_MIN, min(CONTRAST_MAX, contrast or 0)))
+    off = int(max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, offset or 0)))
+    # The black level the gain pivots on — and, for the Auto boxes, the window that
+    # decides their value. Measured on the full-precision data and mapped through the
+    # SAME curve the picture is drawn with, so the two anchors land exactly where the
+    # picture's own p0.5 / p99.5 land, gamma included.
+    black = 0.0
+    if auto_c or auto_b or c:
+        win = percentile_window(arr_f, BLACK_PCT, HIGH_PCT)
+        if win is not None:
+            lo, hi = (float(v) for v in absolute_f(
+                np.asarray(win, dtype=np.float32), full_scale, g))
+            black = lo
+            c, off = auto_bc_pair(lo, hi, a, c, off)
+    if out is not None:
+        if auto_c:
+            out["contrast"] = c
+        if auto_b:
+            out["offset"] = off
+    v = absolute_f(arr_f, full_scale, g)
+    if c:
+        v = (v - black) * contrast_gain(c) + black
+    if off:
+        v = v + off
+    return np.clip(v, 0, 255).astype(np.uint8)
 
 
 # ── counts / bit depth ────────────────────────────────────────────────────────
@@ -654,9 +746,11 @@ class FrameMeta:
         the one the archiver stretched it by — that halves or doubles the picture, so a
         silent rescale would be exactly the lie this line exists to prevent.
 
-        `contrast` / `offset` are the manual pair. They are named for the same reason as
-        gamma: they move which count a colour sits on, so they must never be invisible
-        on a line whose whole job is to say what the intensities mean."""
+        `contrast` / `offset` are the pair that was APPLIED — the user's numbers, or the
+        ones an Auto box worked out. They are named for the same reason as gamma: they
+        move which count a colour sits on, so they must never be invisible on a line
+        whose whole job is to say what the intensities mean. `auto_stretch` is the AUTO_*
+        mask, and only decides which of them is marked "(auto)"."""
         parts = []
         if self.max_value is not None:
             parts.append(f"peak {self.max_value:.0f} counts")
@@ -667,19 +761,22 @@ class FrameMeta:
             parts.append(f"{self.bit_depth}-bit")
         if ref_bits and self.bit_depth and int(ref_bits) != int(self.bit_depth):
             parts.append(f"shown on {int(ref_bits)}-bit range")
-        if auto_stretch:
-            parts.append("auto stretch")
-        else:
-            parts.append("absolute scale")
-            g = (gamma_applied if gamma_applied is not None
-                 else gamma_from_slider(gamma))
-            if g is not None and abs(g - GAMMA_NEUTRAL) > 0.005:
-                parts.append(f"gamma {g:.2f}"
-                             + (" (auto)" if is_auto_gamma(gamma) else ""))
+        parts.append("absolute scale")
+        g = (gamma_applied if gamma_applied is not None
+             else gamma_from_slider(gamma))
+        if g is not None and abs(g - GAMMA_NEUTRAL) > 0.005:
+            parts.append(f"gamma {g:.2f}"
+                         + (" (auto)" if is_auto_gamma(gamma) else ""))
+        # `auto_stretch` is the AUTO_* mask: the pair below is what Auto actually set, so
+        # each is named as the setting it is and marked as Auto's choice rather than the
+        # user's. Naming them is the whole job of this line.
+        a = int(auto_stretch or 0)
         if contrast:
-            parts.append(f"contrast {int(contrast):+d}")
+            parts.append(f"contrast {int(contrast):+d}"
+                         + (" (auto)" if a & AUTO_CONTRAST else ""))
         if offset:
-            parts.append(f"brightness {int(offset):+d}")
+            parts.append(f"brightness {int(offset):+d}"
+                         + (" (auto)" if a & AUTO_BRIGHT else ""))
         return "  ·  ".join(parts)
 
 

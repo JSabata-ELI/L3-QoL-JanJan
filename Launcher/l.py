@@ -181,18 +181,36 @@ def _archive_exe_label(p: Path, folder_ver: tuple | None = None) -> str:
         return "v" + ".".join(vm.groups())
     return p.stem
 
-def _find_versioned_py(version_dir: Path, exe_path: Path) -> Path | None:
-    """Najde hlavní .py soubor pro danou verzi (stejný název jako exe, nebo první nalezený s verzí)."""
-    py_stem = exe_path.stem  # e.g. "Image Tools v1.2.1__20260511_125840" or "Image Tools v2.5.4"
-    candidate = version_dir / (py_stem + ".py")
-    if candidate.exists():
-        return candidate
-    # Fallback: first .py file in the folder with version in name (timestamped or normalized)
-    for f in version_dir.glob("*.py"):
-        exe_like = f.name[:-3] + ".exe"
-        if ARCHIVE_EXE_RE.match(exe_like) or ARCHIVE_EXE_PLAIN_RE.match(exe_like):
-            return f
-    return None
+# The main script of an archived snapshot carries the version in its name
+# ("Image Tools v2.5.4.py", optionally timestamped or with a " (2)" dedup
+# suffix); the helper modules beside it keep their plain names (is_t.py …).
+ARCHIVE_PY_RE = re.compile(
+    r"^.+\s+v(\d+)\.(\d+)\.(\d+)(?:__\d{8}_\d{6}|\s+\(\d+\))?\.py$",
+    re.IGNORECASE
+)
+
+# Folders inside archive\ that are not a version snapshot.
+ARCHIVE_NON_VERSION_DIRS = {"unknown", "_temp_latest"}
+
+
+def _find_versioned_py(version_dir: Path, exe_path: Path | None = None) -> Path | None:
+    """The main .py of an archived snapshot.
+
+    Named after the exe when one was archived with it; otherwise the one .py in
+    the folder that carries a version in its name — which is how a snapshot
+    holding sources only (no exe archived, or the exe deleted by hand) is found.
+    """
+    if exe_path is not None:
+        # e.g. "Image Tools v1.2.1__20260511_125840" or "Image Tools v2.5.4"
+        candidate = version_dir / (exe_path.stem + ".py")
+        if candidate.exists():
+            return candidate
+    cands = [f for f in version_dir.glob("*.py") if ARCHIVE_PY_RE.match(f.name)]
+    if not cands:
+        return None
+    # Canonical name first, so a " (2)" dedup copy never wins.
+    cands.sort(key=lambda p: (" (" in p.stem, "__" in p.stem, p.name.lower()))
+    return cands[0]
 
 
 def scan_archive_versions(program_dir: Path) -> list[dict]:
@@ -205,24 +223,35 @@ def scan_archive_versions(program_dir: Path) -> list[dict]:
 
     entries = []
 
-    # Nová struktura: archive/vX.Y.Z/*.exe — jeden záznam na složku verze.
+    # Nová struktura: archive/vX.Y.Z/ — jeden záznam na složku verze. The exe is
+    # optional: a snapshot that kept only its sources is listed as well, because
+    # those sources are what actually gets run (see _launch_exe).
     for version_subdir in archive_dir.iterdir():
         if not version_subdir.is_dir():
+            continue
+        if version_subdir.name.lower() in ARCHIVE_NON_VERSION_DIRS:
             continue
         folder_ver = parse_version(version_subdir.name)  # (maj, min, patch) | None
         # Prefer the canonical name over " (2)" dedup copies.
         exes = sorted(version_subdir.glob("*.exe"),
                       key=lambda p: (" (" in p.stem, p.name.lower()))
-        for exe in exes:
-            if not (ARCHIVE_EXE_RE.match(exe.name) or ARCHIVE_EXE_PLAIN_RE.match(exe.name)):
-                continue
-            entries.append({
-                "exe_path": exe,
-                "py_path": _find_versioned_py(version_subdir, exe),
-                "label": _archive_exe_label(exe, folder_ver),
-                "_ver": _archive_exe_version(exe, folder_ver),
-            })
-            break  # one exe per version folder
+        exe = None
+        for cand in exes:
+            if ARCHIVE_EXE_RE.match(cand.name) or ARCHIVE_EXE_PLAIN_RE.match(cand.name):
+                exe = cand
+                break  # one exe per version folder
+        main_py = _find_versioned_py(version_subdir, exe)
+        if exe is None and main_py is None:
+            continue
+        ref = exe if exe is not None else main_py
+        entries.append({
+            "exe_path": exe,
+            "py_path": main_py,
+            # A folder that brought its own _internal needs no swap at all.
+            "has_internal": (version_subdir / "_internal").is_dir(),
+            "label": _archive_exe_label(ref, folder_ver),
+            "_ver": _archive_exe_version(ref, folder_ver),
+        })
 
     # Stará flat struktura: archive/*.exe (zpětná kompatibilita)
     for exe in archive_dir.glob("*.exe"):
@@ -230,6 +259,7 @@ def scan_archive_versions(program_dir: Path) -> list[dict]:
             entries.append({
                 "exe_path": exe,
                 "py_path": None,
+                "has_internal": False,
                 "label": _archive_exe_label(exe),
                 "_ver": _archive_exe_version(exe),
             })
@@ -441,7 +471,10 @@ def _build_version_list(current_exes: list[Path], program_dir: Path) -> list[dic
     for p in sorted(current_exes, key=_exe_version, reverse=True):
         m = _VER_ANYWHERE_RE.search(p.stem)
         label = m.group(1) if m else p.stem
-        result.append({"exe_path": p, "label": label})
+        # These sit in the program folder already, next to its _internal, so
+        # _launch_exe starts them where they lie — nothing is moved.
+        result.append({"exe_path": p, "py_path": None,
+                       "has_internal": False, "label": label})
 
     # Archivní verze
     result.extend(scan_archive_versions(program_dir))
@@ -536,6 +569,25 @@ def clamp_label(text: str, max_len: int = 22) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "..."
+
+def _find_python() -> Path | None:
+    """An interpreter able to run an archived .py snapshot, or None.
+
+    pythonw.exe is preferred over python.exe: these are windowed programs, and
+    python.exe would park an empty black console behind every one of them.
+    """
+    if not getattr(sys, "frozen", False):
+        beside = Path(sys.executable).parent / "pythonw.exe"
+        return beside if beside.exists() else Path(sys.executable)
+    for name in ("pythonw", "python", "py"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    return None
+
+
+OLD_RUN_LOG = CONFIG_PATH.parent / "old_version_run.log"
+
 
 def _launch_no_zone_check(path: Path) -> bool:
     """Launch exe via ShellExecuteEx with SEE_MASK_NOZONECHECKS — suppresses security dialog for network paths."""
@@ -637,32 +689,96 @@ class ScrollableFrame(ttk.Frame):
             return  # LOCK scroll when everything fits
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-def find_misplaced_timestamped_exes(programs: dict[str, dict]) -> list[tuple[Path, Path]]:
+# A stray in archive\ carries a version but no timestamp — the loose twin of a
+# file that belongs inside archive\vX.Y.Z\. Timestamped names are left alone:
+# those are the old flat archive, which the launcher still lists as versions.
+STRAY_ARCHIVE_RE = re.compile(
+    r"^.+\s+v(\d+)\.(\d+)\.(\d+)(?:\s+\(\d+\))?\.(?:exe|py)$",
+    re.IGNORECASE
+)
+
+
+def find_misplaced_version_files(programs: dict[str, dict]) -> list[tuple[Path, Path | None]]:
+    """Files that carry a version but do not sit where that version lives.
+
+    Returns (source, destination) pairs; a destination of None means the file is
+    a byte-for-byte duplicate of the one already in its version folder and is
+    only taking up room, so it is offered for deletion instead of a move.
+
+    Two kinds are found:
+      * an exe with a timestamp lying in the program folder — it belongs in
+        archive\\;
+      * an exe or script lying loose in archive\\ itself — it belongs in its own
+        archive\\vX.Y.Z\\ folder. Neither the version list nor the old cleanup
+        ever looked at these, so they stayed invisible.
     """
-    Projde hlavní složky všech programů a vrátí seznam
-    (exe_path, cílová_archive_cesta) pro každý exe s timestampou.
-    """
-    misplaced = []
+    misplaced: list[tuple[Path, Path | None]] = []
     for name, info in programs.items():
         program_dir: Path = info.get("program_dir")
         if not program_dir:
             continue
+        archive_dir = program_dir / "archive"
+
         for p in program_dir.glob("*.exe"):
             if TIMESTAMPED_EXE_RE.match(p.name):
-                archive_dir = program_dir / "archive"
                 misplaced.append((p, archive_dir / p.name))
+
+        if not archive_dir.is_dir():
+            continue
+        for p in sorted(archive_dir.iterdir()):
+            if not p.is_file() or p.suffix.lower() not in (".exe", ".py"):
+                continue
+            if TIMESTAMPED_EXE_RE.match(p.name) or ARCHIVE_EXE_RE.match(p.name):
+                continue
+            m = STRAY_ARCHIVE_RE.match(p.name)
+            if not m:
+                continue
+            target = archive_dir / ("v" + ".".join(m.groups()))
+            twin = target / p.name
+            try:
+                same = twin.is_file() and twin.stat().st_size == p.stat().st_size
+            except OSError:
+                same = False
+            misplaced.append((p, None if same else twin))
     return misplaced
 
-def prompt_move_misplaced(parent: tk.Tk, misplaced: list[tuple[Path, Path]]):
+def apply_misplaced_cleanup(misplaced: list[tuple[Path, Path | None]]) -> list[str]:
+    """Carry out the moves and deletions; returns one line per file that failed."""
+    errors = []
+    for src, dst in misplaced:
+        try:
+            if dst is None:
+                src.unlink()
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            # Same name but a different size: two builds really do differ, so
+            # neither is thrown away. The " (2)" suffix is a name the version
+            # list already reads, and the plain one still wins there.
+            base, n = dst, 2
+            while dst.exists():
+                dst = base.with_name(f"{base.stem} ({n}){base.suffix}")
+                n += 1
+            shutil.move(str(src), str(dst))
+        except Exception as e:
+            errors.append(f"{src.name}: {e}")
+    return errors
+
+
+def prompt_move_misplaced(parent: tk.Tk, misplaced: list[tuple[Path, Path | None]]):
     """Zobrazí souhrnnou hlášku a nabídne přesun."""
-    lines = "\n".join(
-        f"  {src.parent.name}\\{src.name}"
-        for src, _ in misplaced
-    )
+    rows = []
+    for src, dst in misplaced:
+        where = src.parent.name
+        if dst is None:
+            rows.append(f"  {where}\\{src.name}\n"
+                        f"      the same file is already filed away — delete this copy")
+        else:
+            rows.append(f"  {where}\\{src.name}\n"
+                        f"      move to  {dst.parent.name}\\")
     msg = (
-        f"The following versioned files were found outside the archive folder:\n\n"
-        f"{lines}\n\n"
-        f"Move them to their archive folders?"
+        "The following versioned files are not where their version lives:\n\n"
+        + "\n".join(rows)
+        + "\n\nTidy them up?"
     )
 
     confirmed = tk.BooleanVar(value=False)
@@ -685,7 +801,7 @@ def prompt_move_misplaced(parent: tk.Tk, misplaced: list[tuple[Path, Path]]):
     def on_no():
         dlg.destroy()
 
-    ttk.Button(btn_row, text="Move", width=10, command=on_yes).pack(side="left", padx=8)
+    ttk.Button(btn_row, text="Tidy up", width=10, command=on_yes).pack(side="left", padx=8)
     ttk.Button(btn_row, text="Skip", width=10, command=on_no).pack(side="left", padx=8)
 
     parent.wait_window(dlg)
@@ -693,17 +809,11 @@ def prompt_move_misplaced(parent: tk.Tk, misplaced: list[tuple[Path, Path]]):
     if not confirmed.get():
         return
 
-    errors = []
-    for src, dst in misplaced:
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            src.rename(dst)
-        except Exception as e:
-            errors.append(f"{src.name}: {e}")
+    errors = apply_misplaced_cleanup(misplaced)
     if errors:
         messagebox.showerror(
-            "Move failed",
-            "Some files could not be moved:\n\n" + "\n".join(errors),
+            "Cleanup failed",
+            "Some files could not be tidied up:\n\n" + "\n".join(errors),
             parent=parent,
         )
 
@@ -1122,7 +1232,7 @@ class Launcher(tk.Tk):
         self._rebuild_buttons()
         self.status.configure(text=f"Source: {selected_root} | Found: {len(self.programs)} programs.")
 
-        misplaced = find_misplaced_timestamped_exes(self.programs)
+        misplaced = find_misplaced_version_files(self.programs)
         if misplaced:
             self.after(200, lambda: prompt_move_misplaced(self, misplaced))
 
@@ -1134,7 +1244,7 @@ class Launcher(tk.Tk):
         if not self.programs:
             messagebox.showinfo("Clean", "No programs loaded. Select a data source first.")
             return
-        misplaced = find_misplaced_timestamped_exes(self.programs)
+        misplaced = find_misplaced_version_files(self.programs)
         stuck = find_programs_in_swap_state(self.programs)
         if not misplaced and not stuck:
             messagebox.showinfo("Clean", "No misplaced files found.")
@@ -1481,7 +1591,10 @@ class Launcher(tk.Tk):
                 for v in versions:
                     menu.add_command(
                         label=v["label"],
-                        command=lambda p=v["exe_path"], d=info["program_dir"], py=v.get("py_path"): self._launch_exe(p, d, py),
+                        command=lambda p=v.get("exe_path"), d=info["program_dir"],
+                                       py=v.get("py_path"),
+                                       hi=v.get("has_internal", False):
+                            self._launch_exe(p, d, py, hi),
                     )
                 mb["menu"] = menu
                 mb.grid(row=1, column=1, sticky="ew")
@@ -1708,91 +1821,148 @@ class Launcher(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _launch_exe(self, exe_path: Path, program_dir: Path, py_path: Path | None = None):
-        """Spusti archivni verzi programu.
-        Zkopiruje exe docasne do program_dir (kde je _internal/), pocka na dokonceni, pak temp kopii smaze."""
+    def _launch_exe(self, exe_path: Path | None, program_dir: Path,
+                    py_path: Path | None = None, has_internal: bool = False):
+        """Start an older version of a program.
+
+        The archived .exe IS the whole old program: every build carries its own
+        code inside the exe (34 MB apiece, a different size per version), while
+        the _internal folder beside it holds only the shared Python runtime and
+        the third-party packages, which every version can use. Measured on the
+        published copy: a running build's sys.path holds _internal and its
+        sub-folders and nothing else, so the .py files lying in the program
+        folder are never imported by a running exe.
+
+        So the archived exe is what gets started. All it needs is an _internal
+        beside it, which is why a version out of the archive is put into the
+        program folder for the run. Its .py snapshot rides along, so the folder
+        never shows an old exe with the newest sources next to it.
+        """
         internal_dir = program_dir / "_internal"
-        label = exe_path.name
+        ref = exe_path if exe_path is not None else py_path
+        if ref is None:
+            messagebox.showerror("Cannot start", "This version has no files to start.")
+            return
+        label = ref.name
+        snapshot_dir = ref.parent
 
-        if internal_dir.exists():
-            # Full swap: hide current version, place archive version in program_dir, restore after close.
-            temp_dir = program_dir / "archive" / "_temp_latest"
-            current_exes = [p for p in program_dir.glob("*.exe") if not TIMESTAMPED_EXE_RE.match(p.name)]
-            current_pys = list(program_dir.glob("*.py"))
-            staged_exe = program_dir / exe_path.name
-            staged_py = (program_dir / py_path.name) if py_path else None
-
+        # Already has everything beside it: a version folder that brought its
+        # own _internal, a one-file program that needs none, or an exe that is
+        # in the program folder anyway. Nothing is moved for these — and the
+        # last case is the important one, because moving the current exes out of
+        # the way used to move away the very exe that was about to be started.
+        if exe_path is not None and (has_internal
+                                     or not internal_dir.exists()
+                                     or exe_path.parent == program_dir):
             def worker():
-                swapped_files: list[Path] = []
-                did_swap = False
                 try:
-                    if temp_dir.exists():
-                        self.after(0, messagebox.showerror, "Launch blocked",
-                                   f"A previous old-version launch of this program did not clean up.\n\n"
-                                   f"Use the Clean button or restart the launcher to restore it first.")
-                        self.after(0, self.status.configure, {"text": "Ready."})
-                        return
-                    temp_dir.mkdir(parents=True, exist_ok=True)
-                    for f in current_exes + current_pys:
-                        shutil.move(str(f), str(temp_dir / f.name))
-                    did_swap = True
-                    shutil.copy2(str(exe_path), str(staged_exe))
-                    swapped_files.append(staged_exe)
-                    if py_path and py_path.exists():
-                        shutil.copy2(str(py_path), str(staged_py))
-                        swapped_files.append(staged_py)
-                    self.after(0, self.status.configure, {"text": f"Running: {label}"})
-                    proc = subprocess.Popen([str(staged_exe)], cwd=str(program_dir))
-                    proc.wait()
+                    if not _launch_no_zone_check(exe_path):
+                        subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
+                    self.after(0, self.status.configure, {"text": f"Started: {label}"})
                 except Exception as e:
                     self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
                     self.after(0, self.status.configure, {"text": "Launch failed."})
-                finally:
-                    for f in swapped_files:
-                        try:
-                            f.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                    if did_swap and temp_dir.exists():
-                        try:
-                            for f in list(temp_dir.iterdir()):
-                                shutil.move(str(f), str(program_dir / f.name))
-                            temp_dir.rmdir()
-                        except Exception:
-                            pass
+
+            self.status.configure(text=f"Starting: {label} ...")
+            threading.Thread(target=worker, daemon=True).start()
+            return
+
+        # From here on the version comes out of the archive and has to borrow
+        # the program folder's _internal, so the folder is swapped for the run.
+        python_exe = None
+        if exe_path is None:
+            # Sources only. Running them needs Python, and they have to be put
+            # in the program folder too: the programs look for their icon,
+            # settings and picture folders next to their own file.
+            python_exe = _find_python()
+            if python_exe is None:
+                messagebox.showerror(
+                    "Python needed",
+                    f"{label}\n\n"
+                    "Only the source files of this version were kept, and there "
+                    "is no Python on this computer to run them with.",
+                )
+                return
+
+        temp_dir = program_dir / "archive" / "_temp_latest"
+        current_files = [p for p in program_dir.glob("*.exe")
+                         if not TIMESTAMPED_EXE_RE.match(p.name)]
+        current_files += list(program_dir.glob("*.py"))
+
+        # The exe, its main script, and the helper modules beside it (plain
+        # names). Any other versioned script in the folder — a " (2)" duplicate,
+        # a leftover from another version — is left out of the way.
+        snapshot_files = [f for f in (exe_path, py_path) if f is not None]
+        snapshot_files += sorted(f for f in snapshot_dir.glob("*.py")
+                                 if f != py_path and not ARCHIVE_PY_RE.match(f.name))
+
+        staged_start = program_dir / (exe_path or py_path).name
+        cmd = ([str(staged_start)] if exe_path is not None
+               else [str(python_exe), str(staged_start)])
+
+        def worker():
+            staged: list[Path] = []
+            did_swap = False
+            try:
+                if temp_dir.exists():
+                    self.after(0, messagebox.showerror, "Launch blocked",
+                               f"A previous old-version launch of this program did not clean up.\n\n"
+                               f"Use the broom button or restart the launcher to restore it first.")
                     self.after(0, self.status.configure, {"text": "Ready."})
-
-        elif py_path is not None and py_path.exists():
-            # Fallback: run .py via Python (needs Python in PATH)
-            launch_py = py_path
-
-            def worker():
-                try:
-                    if getattr(sys, "frozen", False):
-                        _py = (shutil.which("pythonw") or shutil.which("python")
-                               or shutil.which("py"))
-                        if not _py:
-                            raise RuntimeError("Python interpreter not found in PATH.")
-                        pythonw = Path(_py)
-                    else:
-                        pythonw = Path(sys.executable).parent / "pythonw.exe"
-                        if not pythonw.exists():
-                            pythonw = Path(sys.executable)
-                    subprocess.Popen([str(pythonw), str(launch_py)], cwd=str(launch_py.parent))
-                    self.after(0, self.status.configure, {"text": f"Started: {label}"})
-                except Exception as e:
-                    self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
-                    self.after(0, self.status.configure, {"text": "Launch failed."})
-
-        else:
-            # Last resort: run .exe directly without _internal
-            def worker():
-                try:
-                    subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
-                    self.after(0, self.status.configure, {"text": f"Started: {label}"})
-                except Exception as e:
-                    self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
-                    self.after(0, self.status.configure, {"text": "Launch failed."})
+                    return
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                # Marked before the first move: whatever lands in the temp
+                # folder has to be put back even if a later move fails.
+                did_swap = True
+                for f in current_files:
+                    shutil.move(str(f), str(temp_dir / f.name))
+                for f in snapshot_files:
+                    dst = program_dir / f.name
+                    shutil.copy2(str(f), str(dst))
+                    staged.append(dst)
+                env = dict(os.environ)
+                env["PYTHONDONTWRITEBYTECODE"] = "1"
+                self.after(0, self.status.configure, {"text": f"Running: {label}"})
+                if python_exe is None:
+                    proc = subprocess.Popen(cmd, cwd=str(program_dir), env=env)
+                    proc.wait()
+                else:
+                    # pythonw shows nothing when old sources fail to start (a
+                    # helper file that was never archived, an import that needs
+                    # a package this computer lacks), so what they printed is
+                    # kept and shown instead of silence.
+                    OLD_RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+                    with OLD_RUN_LOG.open("w", encoding="utf-8", errors="replace") as errf:
+                        proc = subprocess.Popen(cmd, cwd=str(program_dir), env=env,
+                                                stdout=errf, stderr=errf)
+                        proc.wait()
+                    if proc.returncode:
+                        try:
+                            tail = "\n".join(
+                                OLD_RUN_LOG.read_text(encoding="utf-8", errors="replace")
+                                .strip().splitlines()[-12:])
+                        except Exception:
+                            tail = ""
+                        detail = (":\n\n" + tail) if tail else "."
+                        self.after(0, messagebox.showerror, "Old version stopped",
+                                   f"{label}\n\nIt ended with an error" + detail)
+            except Exception as e:
+                self.after(0, messagebox.showerror, "Launch failed", f"{label}\n\n{e}")
+                self.after(0, self.status.configure, {"text": "Launch failed."})
+            finally:
+                for f in staged:
+                    try:
+                        f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if did_swap and temp_dir.exists():
+                    try:
+                        for f in list(temp_dir.iterdir()):
+                            shutil.move(str(f), str(program_dir / f.name))
+                        temp_dir.rmdir()
+                    except Exception:
+                        pass
+                self.after(0, self.status.configure, {"text": "Ready."})
 
         self.status.configure(text=f"Starting: {label} ...")
         threading.Thread(target=worker, daemon=True).start()

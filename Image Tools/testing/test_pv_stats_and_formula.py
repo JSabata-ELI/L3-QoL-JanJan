@@ -94,13 +94,19 @@ def make_dialog(m, checked=()):
 
 def add_region(dlg, h0, h1):
     dlg._regions.append({"id": dlg._region_seq, "t_start_ns": ns_at(h0),
-                         "t_end_ns": ns_at(h1), "color": "#C62828", "day": DAY})
+                         "t_end_ns": ns_at(h1), "color": "#C62828", "day": DAY,
+                         "no": dlg._next_pick_no()})
     dlg._region_seq += 1
-    dlg._rebuild_regions_ui()
+    dlg._regions_changed()
+
+
+# The statistics have no table of their own any more: they are the right-hand
+# columns of the ONE picks table. These are the columns they landed in.
+C_DAY, C_TIME, C_PV, C_N, C_MEAN, C_STD, C_MIN, C_MAX = 3, 4, 6, 7, 8, 9, 10, 11
 
 
 def cell(dlg, row, col):
-    it = dlg._stat_table.item(row, col)
+    it = dlg._pick_table.item(row, col)
     return (it.text(), it.foreground().color().name(), it.toolTip()) if it else None
 
 
@@ -116,61 +122,88 @@ def check_stats(m):
     dlg = make_dialog(m, checked=(ENERGY_CH, STEP_CH))
     B.wait_for(lambda: bool(dlg._seeds), timeout_s=15.0)
 
-    check("no range marked yet, so the table is empty",
-          dlg._stat_table.rowCount() == 0)
-    check("and it says what to do", "Drag" in dlg._lbl_range.text(),
-          dlg._lbl_range.text())
+    check("nothing picked yet, so the table is empty",
+          dlg._pick_table.rowCount() == 0)
+    check("and it says what to do", "Click" in dlg._lbl_picks.text(),
+          dlg._lbl_picks.text())
 
     add_region(dlg, 9, 10)
-    check("the region is offered as the range",
-          dlg._stats_cb.count() == 1, f"{dlg._stats_cb.count()} entry")
-    check("the range is named with its times",
-          "09:00:00" in dlg._lbl_range.text() and "10:00:00" in dlg._lbl_range.text(),
-          dlg._lbl_range.text())
-    check("one row per checked PV", dlg._stat_table.rowCount() == 2,
-          f"{dlg._stat_table.rowCount()} row(s)")
+    check("the range is counted in the caption",
+          "1 region" in dlg._lbl_picks.text(), dlg._lbl_picks.text())
+    check("one row per checked PV", dlg._pick_table.rowCount() == 2,
+          f"{dlg._pick_table.rowCount()} row(s)")
+    day_c, time_c = dlg._pick_table.item(0, C_DAY), dlg._pick_table.item(0, C_TIME)
+    check("the range names its DAY and both its times",
+          day_c is not None and time_c is not None
+          and DAY.strftime("%d.%m.%Y") in day_c.text()
+          and "09:00:00" in time_c.text() and "10:00:00" in time_c.text(),
+          f"{day_c.text() if day_c else '?'}  {time_c.text() if time_c else '?'}")
+    check("and the pick's own cells are merged down the PVs of that range",
+          dlg._pick_table.rowSpan(0, 0) == 2,
+          str(dlg._pick_table.rowSpan(0, 0)))
 
-    rows = {dlg._stat_table.item(r, 0).text(): r
-            for r in range(dlg._stat_table.rowCount())}
+    rows = {dlg._pick_table.item(r, C_PV).text(): r
+            for r in range(dlg._pick_table.rowCount())}
     r_e = rows.get("SBW4")
     check("SBW4 has a row", r_e is not None, repr(list(rows)))
-    n_txt, _ink, tip = cell(dlg, r_e, 1)
+    n_txt, _ink, tip = cell(dlg, r_e, C_N)
     # 09:00:00 to 10:00:00 inclusive, one sample every 10 s = 361.
     check("it counted the samples in the hour", n_txt == "361",
           f"n = {n_txt}")
-    mean_txt = cell(dlg, r_e, 2)[0]
+    mean_txt = cell(dlg, r_e, C_MEAN)[0]
     check("the mean is the archived value, not a normalised one",
           10.0 <= float(mean_txt) <= 11.0, mean_txt)
     check("min and max are the real extremes",
-          cell(dlg, r_e, 4)[0] == "10" and cell(dlg, r_e, 5)[0] == "11",
-          f"{cell(dlg, r_e, 4)[0]} … {cell(dlg, r_e, 5)[0]}")
+          cell(dlg, r_e, C_MIN)[0] == "10" and cell(dlg, r_e, C_MAX)[0] == "11",
+          f"{cell(dlg, r_e, C_MIN)[0]} … {cell(dlg, r_e, C_MAX)[0]}")
     for want in ("median", "peak-to-peak", "trend"):
         check(f"the tooltip carries the {want}", want in tip, repr(tip[:60]))
 
     r_s = rows.get("WAVEPLATE")
     check("the setting has a row too, not left off", r_s is not None,
           repr(list(rows)))
-    n_txt, ink, tip = cell(dlg, r_s, 1)
+    n_txt, ink, tip = cell(dlg, r_s, C_N)
     check("with n = 0", n_txt == "0", n_txt)
     check("and the spread reads 'held', never a dash",
-          cell(dlg, r_s, 3)[0] == "held", cell(dlg, r_s, 3)[0])
+          cell(dlg, r_s, C_STD)[0] == "held", cell(dlg, r_s, C_STD)[0])
     check("in amber, so it cannot be read as a mean of real samples",
           ink.lower() == "#8a6114", ink)
     check("the value is the one it was already sitting at",
-          cell(dlg, r_s, 2)[0] == f"{SEED_VALUE:.4g}", cell(dlg, r_s, 2)[0])
+          cell(dlg, r_s, C_MEAN)[0] == f"{SEED_VALUE:.4g}",
+          cell(dlg, r_s, C_MEAN)[0])
     check("and the extremes are that same value, not 'unknown'",
-          cell(dlg, r_s, 4)[0] == cell(dlg, r_s, 5)[0] == f"{SEED_VALUE:.4g}")
+          cell(dlg, r_s, C_MIN)[0] == cell(dlg, r_s, C_MAX)[0]
+          == f"{SEED_VALUE:.4g}")
     check("the tooltip says it is held and why",
           "Held forward" in tip and "when it changes" in tip, repr(tip[-80:]))
 
-    # A second region: the numbers follow the one the combo is on.
+    # A second region: BOTH are in the table, so two ranges can be read against
+    # each other. There is no second page and no drop-down — that is the point.
     add_region(dlg, 11, 12)
-    check("both regions are offered", dlg._stats_cb.count() == 2)
-    check("the newest is selected",
-          dlg._stats_cb.currentIndex() == 1, str(dlg._stats_cb.currentIndex()))
-    dlg._stats_cb.setCurrentIndex(0)
-    check("switching back re-reads the first range",
-          "09:00:00" in dlg._lbl_range.text(), dlg._lbl_range.text())
+    check("both ranges are in the table at once",
+          dlg._pick_table.rowCount() == 4, f"{dlg._pick_table.rowCount()} row(s)")
+    times = [dlg._pick_table.item(r, C_TIME).text()
+             for r in (0, 2) if dlg._pick_table.item(r, C_TIME) is not None]
+    check("each with its own times", len(times) == 2
+          and "09:00:00" in times[0] and "11:00:00" in times[1], repr(times))
+    check("and the caption counts them",
+          "2 regions" in dlg._lbl_picks.text(), dlg._lbl_picks.text())
+    check("no drop-down is left to pick one range",
+          not hasattr(dlg, "_stats_cb"))
+    check("and no page of its own either",
+          not hasattr(dlg, "_stat_table") and not hasattr(dlg, "_bottom_tabs"))
+
+    # A moment on the same table: it is one row, and it claims no statistics.
+    dlg._set_moment_from_x(dlg._ns_to_x(ns_at(9) + 600_000_000_000, DAY))
+    m_row = next(r for r in range(dlg._pick_table.rowCount())
+                 if dlg._pick_table.item(r, 2) is not None
+                 and dlg._pick_table.item(r, 2).text() == "Moment")
+    check("a moment takes ONE row whatever is plotted",
+          dlg._pick_table.rowSpan(m_row, 0) == 1,
+          str(dlg._pick_table.rowSpan(m_row, 0)))
+    check("and says dashes rather than a mean of one sample",
+          cell(dlg, m_row, C_N)[0] == "—" and cell(dlg, m_row, C_MEAN)[0] == "—",
+          f"{cell(dlg, m_row, C_N)[0]} / {cell(dlg, m_row, C_MEAN)[0]}")
 
     # A range with nothing anywhere near it: no samples, no seed.
     ARCHIVE[ENERGY_CH] = []
@@ -178,13 +211,16 @@ def check_stats(m):
     dlg._seeds = {}
     dlg._reload_series()
     B.wait_for(lambda: bool(dlg._series), timeout_s=15.0)
-    dlg._refresh_stats()
-    rows = {dlg._stat_table.item(r, 0).text(): r
-            for r in range(dlg._stat_table.rowCount())}
-    n_txt, ink, tip = cell(dlg, rows["SBW4"], 1)
+    dlg._picks_changed(with_stats=True)
+    rows = {}
+    for r in range(dlg._pick_table.rowCount()):
+        it = dlg._pick_table.item(r, C_PV)
+        if it is not None and it.text():
+            rows.setdefault(it.text(), r)
+    n_txt, ink, tip = cell(dlg, rows["SBW4"], C_N)
     check("a PV with nothing at all says 0 and grey dashes",
-          n_txt == "0" and cell(dlg, rows["SBW4"], 2)[0] == "—",
-          f"{n_txt} / {cell(dlg, rows['SBW4'], 2)[0]}")
+          n_txt == "0" and cell(dlg, rows["SBW4"], C_MEAN)[0] == "—",
+          f"{n_txt} / {cell(dlg, rows['SBW4'], C_MEAN)[0]}")
     check("and says nothing was archived up to that point",
           "none before it either" in tip, repr(tip[:70]))
     dlg.close()

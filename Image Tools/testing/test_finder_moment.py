@@ -70,6 +70,21 @@ FRAME_STEP_S = 5
 FRAMES = 24                      # two minutes of them
 
 
+def day_list_rows(dlg) -> "list[str]":
+    """Every row of the day list under the calendar, days and picks alike.
+
+    That list is where the picks are written out now — there is no summary band
+    beside the Search button any more, so this is what "the panel says which
+    moment" has to be asked of."""
+    out = []
+    for i in range(dlg._day_list.topLevelItemCount()):
+        top = dlg._day_list.topLevelItem(i)
+        out.append(top.text(0))
+        for j in range(top.childCount()):
+            out.append(top.child(j).text(0))
+    return out
+
+
 def prague_bounds(day: date, hour: int) -> int:
     """Wall-clock `hour` on `day` in Prague, as unix ns."""
     from zoneinfo import ZoneInfo
@@ -185,9 +200,12 @@ def check_dialog(m, stamps):
               dlg._moment_ns == stamps[4],
               f"{dlg._moment_ns} vs {stamps[4]}")
         check("the button offers to search it",
-              "moment" in dlg._btn_search.text().lower(), dlg._btn_search.text())
-        check("and the panel says which moment", "10:00:2" in dlg._lbl_moment.text()
-              or ":" in dlg._lbl_moment.text(), dlg._lbl_moment.text())
+              dlg._btn_search.text() == "🎯 Search 1 selection",
+              dlg._btn_search.text())
+        rows = day_list_rows(dlg)
+        check("and the day list under the calendar says which moment",
+              any(r.startswith("moment 1)") and ":" in r for r in rows),
+              " | ".join(rows))
         cfg = dlg.get_config()
         check("the config carries the moment and no regions",
               cfg.get("moment_ns") == stamps[4] and not cfg.get("regions"),
@@ -201,7 +219,8 @@ def check_dialog(m, stamps):
               (dlg._set_moment_from_x(dlg._ns_to_x(stamps[9], day)) or True)
               and dlg._moments == [stamps[4], stamps[9]], str(dlg._moments))
         check("the button counts them",
-              "2 moments" in dlg._btn_search.text(), dlg._btn_search.text())
+              dlg._btn_search.text() == "🎯 Search 2 selections",
+              dlg._btn_search.text())
         cfg = dlg.get_config()
         check("the config carries every pick, in the order clicked",
               cfg.get("moments_ns") == [stamps[4], stamps[9]],
@@ -214,10 +233,11 @@ def check_dialog(m, stamps):
         check("Undo takes the last moment off", dlg._moments == [stamps[4]],
               str(dlg._moments))
 
-        # A moment and a region can both be picked. The moments are what gets
-        # searched — said on the label, never by deleting the other one: a click
-        # deleting N drags (or N drags deleting a click) is what made the old rule
-        # wrong in both directions.
+        # A moment and a region can both be picked, and BOTH are searched (since
+        # 07.09.2026). Neither deletes the other — a click deleting N drags (or N
+        # drags deleting a click) is what made the old rule wrong in both
+        # directions — and neither is quietly dropped at search time either, which
+        # is what "the regions are ignored while a moment is picked" used to mean.
         # Two hours wide. The whole run of synthetic frames spans two MINUTES, which
         # on an axis showing a whole day is a third of a pixel — and `_is_drag`
         # rightly calls that a click, not a drag.
@@ -227,24 +247,40 @@ def check_dialog(m, stamps):
         check("dragging a region keeps the picked moment",
               dlg._moments == [stamps[4]] and len(dlg._regions) == 1,
               f"moments {dlg._moments}, {len(dlg._regions)} region(s)")
-        check("the label says the regions are ignored while a moment is picked",
-              "ignored" in dlg._lbl_moment.text(), dlg._lbl_moment.text())
+        check("the table says BOTH are searched, and how many frames that is",
+              "1 moment" in dlg._lbl_picks.text()
+              and "1 region" in dlg._lbl_picks.text()
+              and "2 frame" in dlg._lbl_picks.text(), dlg._lbl_picks.text())
+        check("and the button counts them together",
+              dlg._btn_search.text() == "🎯 Search 2 selections",
+              dlg._btn_search.text())
+        check("the region wears the number AFTER the moment, never a second '1'",
+              dlg._regions[0]["no"] == 2, str(dlg._regions[0].get("no")))
         dlg._set_moment_from_x(dlg._ns_to_x(stamps[9], day))
         check("clicking a moment keeps the regions", len(dlg._regions) == 1,
               str(dlg._regions))
-        check("and get_config searches the moments, not the regions",
-              dlg.get_config().get("moments_ns") == [stamps[4], stamps[9]],
-              str(dlg.get_config().get("moments_ns")))
+        cfg2 = dlg.get_config()
+        check("and get_config carries the moments AND the regions",
+              cfg2.get("moments_ns") == [stamps[4], stamps[9]]
+              and sum(len(v) for v in cfg2.get("regions").values()) == 1,
+              f"{cfg2.get('moments_ns')} / {cfg2.get('regions')}")
+        check("the days are the union of both, not the region days alone",
+              set(cfg2.get("days")) >= set(dlg._moment_days()),
+              f"{cfg2.get('days')} vs {dlg._moment_days()}")
         check("undoing the region drag brings the region back and nothing else",
               (dlg._undo_pick() or True) and dlg._moments == [stamps[4]]
               and len(dlg._regions) == 1,
               f"moments {dlg._moments}, {len(dlg._regions)} region(s)")
 
-        dlg._clear_moment()
-        check("Clear forgets every moment", dlg._moments == [])
+        # There is no "Clear" button any more — one pick at a time comes off by
+        # the ✕ on its row, and that is the path this checks.
+        for _t in list(dlg._moments):
+            dlg._delete_moment(_t)
+        check("deleting the moments one by one empties them", dlg._moments == [])
         check("and leaves the regions alone", len(dlg._regions) == 1)
-        check("the button goes back to the regions wording",
-              "region" in dlg._btn_search.text().lower(), dlg._btn_search.text())
+        check("the button counts what is left",
+              dlg._btn_search.text() == "🎯 Search 1 selection",
+              dlg._btn_search.text())
         dlg._clear_regions()
         check("with nothing picked the config carries no moment",
               dlg.get_config().get("moment_ns") is None)

@@ -68,10 +68,24 @@ THE ORANGE HIGHLIGHT
 
 RUNNING AN OLD VERSION
 
-  An old program file cannot run on its own — it needs the support
-  folder that sits next to the current one. So the Launcher briefly
-  puts the current files aside, drops the old ones in, runs them,
-  and puts the current ones back when you close the program.
+  An archived program file is the whole old program, but it cannot
+  run from the archive folder: it needs the support folder — the big
+  one with the Python runtime in it — and there is only one of those,
+  next to the current program. It suits every version, so it is not
+  copied per version.
+
+  So the Launcher swaps: it briefly puts the current program file and
+  its source files aside, drops the old ones in, runs the old
+  program, and puts the current ones back when you close it. The
+  whole old set goes in together, never an old program file with the
+  newest sources beside it.
+
+  Versions that are already in the program folder — the last few are
+  usually kept there side by side — are simply started where they
+  are. Nothing is moved for those.
+
+  A version that kept only its source files is run with Python, if
+  there is Python on the computer.
 
   If a program is killed rather than closed, that swap can be left
   half done. The Launcher then refuses to start it again and offers

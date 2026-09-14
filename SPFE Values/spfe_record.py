@@ -76,7 +76,9 @@ def fetch_moment(fields: Fields, when: datetime, slot: str,
                 if log_fn:
                     log_fn(f"   {pv}: value is not a number ({value!r})")
                 continue
-            rec.values[column] = float(value)
+            # `scale` turns the channel's own unit into the row's: the dazzler
+            # archives 0.33 where the table says 33 %.
+            rec.values[column] = float(value) * row.scale
     return rec
 
 

@@ -184,6 +184,13 @@ class Row:
     # nearest ten, 0 leaves it alone. A tuple, not a list, because Row is
     # frozen -- a list would be shared, mutable and unhashable.
     round_to: tuple[float, ...] = ()
+    # What the PV's number is multiplied by on the way in, for a channel whose
+    # unit is not the unit of the row: the dazzler archives 0.33 and the row is
+    # a percentage, so 100 makes it 33. Applied ONCE, when the value is read
+    # out of the archiver, so the log, the table, the workbook, the ranges and
+    # anything typed by hand are all the same quantity. A value already in the
+    # log is not touched by changing this -- migrate the file instead.
+    scale: float = 1.0
 
     @property
     def is_manual(self) -> bool:
@@ -376,6 +383,7 @@ def load_fields(path: Path | None = None) -> Fields:
                 default_from=str(r.get("default_from", "")).strip(),
                 url=str(r.get("url", "")).strip(),
                 round_to=_rounding_steps(r.get("round"), max(1, len(pvs))),
+                scale=float(r.get("scale", 1.0) or 1.0),
             ))
         if rows:
             groups.append((label, rows))

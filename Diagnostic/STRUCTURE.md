@@ -1,15 +1,16 @@
 # Diagnostic — STRUCTURE
 
-> Verified against source: 2026-09-02 · `monitor_tab.py` 8679 L · `okbase_menu.py` 1782 L ·
-> `alerting.py` 1178 L · `chart_history.py` 878 L · `remote_launcher.py` 711 L ·
-> `cpva_api.py` 585 L · `bot_commands.py` 481 L · `edge_cdp.py` 471 L ·
-> `main.py` 395 L · `shared_pvs.py` 364 L · `okbase_capture.py` 242 L ·
+> Verified against source: 2026-09-11 · `monitor_tab.py` 9090 L · `okbase_menu.py` 2948 L ·
+> `alerting.py` 1178 L · `chart_history.py` 888 L · `edge_cdp.py` 885 L ·
+> `remote_launcher.py` 765 L · `cpva_api.py` 585 L · `bot_commands.py` 481 L ·
+> `main.py` 485 L · `shared_pvs.py` 364 L · `okbase_capture.py` 248 L ·
 > `notify_provision.py` 238 L · `memstats.py` 187 L ·
 > `operation_history_logic.py` 128 L · `secrets_util.py` 70 L ·
-> tests: `test_okbase_menu.py` 895 L · `test_monitor_frozen.py` 608 L ·
-> `test_alerting.py` 565 L · `test_rule_change_grace.py` 309 L ·
-> `test_bot_commands.py` 243 L · `test_edge_cdp.py` 221 L ·
-> `testing/` 10 test files + `bench_long_plot.py`
+> tests: `test_okbase_menu.py` 895 L · `testing/test_okbase_orders.py` 790 L ·
+> `test_monitor_frozen.py` 640 L · `test_alerting.py` 565 L ·
+> `test_edge_cdp.py` 340 L · `test_rule_change_grace.py` 332 L ·
+> `test_bot_commands.py` 243 L · `testing/test_stale_sso_cookie.py` 225 L ·
+> `testing/` 14 test files + `bench_long_plot.py`
 
 PySide6 app: live PV monitoring and alerting off the CPVA archive, with a two-way
 Webex bot. The **PV Monitor** tab is the program in practice.
@@ -504,6 +505,7 @@ the network or the disk returns a value plus an error string, the same disciplin
 | `render_status(cache)` | the `/food status` answer the listener can give without the app |
 | `local_cache_path()` / `shared_cache_path(...)` / `read_cache` / `write_cache` / `load_cache(settings)` | `menu_cache.json` in `%APPDATA%\Diagnostic` **and** next to the shared PV list; the newer of the two wins |
 | `OKBASE_KEYS` / `user_settings_path()` / `load_user_settings()` / `save_user_settings(values)` | the sign-in, in `%APPDATA%\Diagnostic\okbase.json` — the one file every build, the source run and the listener all read, so a rebuild inherits it instead of arriving blank. `save_user_settings` **merges**: the Settings dialog and a background session renewal are two writers |
+| `ORDER_HELP` | the ordering commands as one block, so `/help` (`monitor_tab._cmd_help`) and `/food help` (`FOOD_HELP`) cannot drift apart. **Last** in both, and a section of its own rather than one bullet among twenty: it is the only command in this program that writes to somebody's HR portal, and while it was a bullet the words got typed wrong twice |
 | `parse_food_args(args)` / `answer_food(args, cache)` | the `/food` words, and the markdown reply. `;` and `,` are treated as spacing, and a language word (`cz` / `en`) may sit anywhere in the line |
 | `next_food_day(cache, now)` / `LUNCH_OVER_AT` | which day a **bare** `/food` means: today until 14:30, then the next day the saved menu has meals on — Friday afternoon lands on Monday, not on an empty Saturday. `FoodRequest.default_day` is what marks the request as free to move; a named day never is |
 | `split_languages(name)` | the Czech and English halves of one field. Decided by **diacritics, not position** — the order is not reliable — and left whole when both halves look Czech, because `"Řízek vepřový/kuřecí"` is one dish |
@@ -651,6 +653,41 @@ three of these came back within seconds and two of them said the wrong thing:
 twice a second, whether the launched process is alive, whether the port answers
 and where the tab is, for the first seconds of a launch.
 
+#### Yesterday's sign-on cookie is not a sign-in (2026-09-11)
+
+The morning after an overnight restart, **Sign in with Edge** came back in a few
+seconds saying it had signed in, and the check that runs straight after it said
+*"the saved OKbase session has expired — sign in again"*. Every retry did the
+same, so the one button meant to repair a lapsed sign-in could not repair
+anything, and neither could the operator.
+
+The walk accepted the sign-on cookie **because of its name**. The window keeps a
+browser profile of its own, so `_shibsession_…` from the day before is still in
+it every morning — measured on this PC: the cookie in the profile was made
+2026-09-10 14:25 and the morning's attempts never touched it — while the portal
+had long forgotten the session behind it.
+
+So presence is no longer read as liveness:
+
+- `session_alive(port)` asks the portal from **inside the window**
+  (`Runtime.evaluate` → `fetch(okbase_menu.ALIVE_PATH)`, `redirect: 'manual'` so
+  a bounce to the sign-on service is not mistaken for a cheerful 200). It
+  answers **alive / dead / unknown**, and, exactly as everywhere else in this
+  program, only a plain refusal — 401, 403, a redirect — counts as dead. A 502
+  or a page the request cannot be made from is `unknown` and is taken as a yes;
+  the caller verifies anyway, and throwing away a good sign-in costs an
+  authenticator prompt.
+- Only the cookies **already in the profile at the first look** are put to that
+  question. A cookie that appears later was minted by the sign-in happening in
+  this window, and asking about it races the portal's own redirect — losing that
+  race would discard the sign-in the person had just completed.
+- A refused cookie is remembered, `forget_site()` clears **the portal's cookies
+  only**, and the tab is sent back to `sso_start_url()`. Microsoft's cookies are
+  deliberately kept: they are what makes the second sign-in silent.
+
+`testing/test_stale_sso_cookie.py` holds all of it offline — no browser, no
+network.
+
 ### Two kinds of failure, and why they must never share a message
 
 `session_state()` answers **alive / signed-out / unreachable**, and only 401 and
@@ -780,6 +817,27 @@ which would move that wait to closing the program. The verify job passes
 `write=False`: it runs on details the operator may still cancel, so it must not
 overwrite the saved menu, the saved sign-in or the remembered request template.
 
+**With one exception, added 2026-09-10: a sign-in that has just been PROVED to
+work is saved immediately** (`_keep_working_signin`, called from
+`_on_okbase_verified`). The two sign-in buttons used to only fill the text box,
+so nothing reached the disk until the whole dialog was confirmed with Save —
+which produced the one state nobody can debug from the outside: the dialog
+saying *"The sign-in works"* while the bot, the background jobs and the
+always-on listener all went on using the expired cookie still on disk. The
+listener never sees this dialog at all, so nothing could have healed it there.
+Only the sign-in and the three things a paste carries with it are written;
+everything else still waits for Save, which is what `write=False` was
+protecting. A working sign-in is not in that category — it is a fact the
+program just established, and there is no version of "the operator might not
+have meant it". A failed write is reported and **not** called saved.
+
+`_menu_signin_recovered()` is the other half: it clears every field that quotes
+the verdict — `_menu_error`, which `/food` appends its sentence from, and
+`_menu_last_ok` / `_menu_last_decisive` / `_menu_last_check`, which `/food
+status` and the status line read — and re-reads the week. Leaving any one of
+them behind is what had the operator told to renew a sign-in they had just
+renewed. Pinned by `testing/test_signin_is_kept.py`.
+
 `/service/v3/api-docs` is compiled in but **broken on this instance**, and there
 are no public OKbase API docs. The request was therefore **captured from the
 portal's own front end** (2026-08-26, DevTools → Network → `nacti-vse` → Copy as
@@ -844,11 +902,238 @@ transient `_opensaml_req_ss…` request-state cookies. There is **no** remember-
 cookie here — the Shibboleth session is what can outlive `JSESSIONID`, and it is
 kept because `parse_cookies` keeps everything.
 
-**Why the cache is the point.** The menu changes at most once a day, so answering
-`/food` needs no live session. Only `refresh()` needs credentials, and those are
-DPAPI blobs belonging to one Windows account on one PC. So the app fetches and
-writes `menu_cache.json`; both `/food` handlers only ever read it, which is how the
-command still answers with the app closed.
+### Signing up for lunch, and off it — `/food order` / `/food cancel`
+
+Added 2026-09-09, captured live the same day. The portal has one save endpoint
+and it is **not** "add this meal":
+
+```
+POST /rest/stravovani/objednavky/uloz
+{…the same body nacti-vse takes…,
+ "objednavky": {
+   "2026-09-07": [{"zadna": true}],                      ← nothing ordered
+   "2026-09-08": [{"polozkyIdMap": {"POLEVKA": 572619,
+                                    "HLAVNI_JIDLO": 572622},
+                   "zadna": false}],                     ← an existing order
+   "2026-09-11": [{"polozkyIdMap": {"HLAVNI_JIDLO": 572642},
+                   "objednavkaId": 0}]}}                 ← a NEW order
+```
+
+Four things in that, each of which breaks the feature if it is "tidied up":
+
+* **it takes the whole displayed week, not the changed day.** So the current
+  state has to be read first and sent back with the one change applied
+  (`desired_week`). A body built from the changed day alone would cancel every
+  other day of that week — the one bug here that costs somebody their lunch,
+  and the reason `test_okbase_orders.py` asserts "Thursday's order was NOT
+  wiped" on every path;
+* **a new order carries `objednavkaId: 0` and no `zadna`; an existing one
+  carries `zadna: false` and no `objednavkaId`.** Both shapes are what the page
+  itself sends; `_order_entry` reproduces them exactly rather than sending one
+  shape for both cases;
+* **the meal is addressed by `listky[day].polozky[].id`**, filed under its
+  course code (`POLEVKA` / `HLAVNI_JIDLO`) — one meal per course. That is why
+  `Meal` now carries `item_id` and `code`, and why a current order holding a
+  meal whose course the answer does not explain **aborts the whole save**: with
+  no key to file it under, the day would read as "that meal is gone";
+* **`uloz` answering 200 is not proof.** `change_order` reads the week back and
+  compares, because the portal validates the whole week and a day it declines
+  comes back unchanged.
+
+Measured live on 2026-09-09, and worth knowing before it looks like a bug: a
+save **re-creates the order rows of every still-open day in the week**, changed
+or not — the `objednavky[day].id` of an untouched day comes back different
+afterwards (575186 → 575281), and its `datumObjednani` moves to now. The
+*contents* are identical, which is what everything here compares on. Never
+treat that id as stable, and never use it to tell "did my change land".
+
+**The cutoff is not a clock.** `listky[day].stav` is `ZVEREJNENY` while a day
+takes orders and `UZAVRENY` once it has closed (`parse_day_states` →
+`DAY_OPEN` / `DAY_CLOSED`). Nominally that happens at 10:00 on the day itself,
+but the operator reports it sometimes comes earlier — so the state, read from
+the portal *at the moment of ordering*, is the only thing allowed to decide, and
+a refusal from `uloz` is quoted to the person rather than interpreted. Never
+compute this from the time of day.
+
+**Everything reads live; the cache is the fallback.** `/food`, `/food week`,
+`/food orders` and the "pick a number" list all fetch from OKbase first —
+`MonitorWidget._freshen_then_reply` (async: `_menu_reply_pending` +
+`_menu_reply_args` + `_menu_reply_suffix`, answered in `_on_menu_done`) and
+`remote_launcher._fresh_cache` (blocking, on the poll loop, same as an order).
+`change_order` has always read live and resolves the typed numbers against
+*that* menu, which is why the list a person picks from must be live too:
+ordering "meal 2" of a list nobody is looking at any more is worse than saying
+the menu moved.
+
+A failed read needs **no branch**: nothing is written over `_menu_cache`, so
+the reply is the saved copy carrying its own age note (`_stale_note`,
+`_food_reply`'s expired/unreachable lines, the listener's "Could not read
+OKbase again"). Asked for on 2026-09-10 — `/food` at 13:43 answered with a menu
+read at 13:38, which is exactly the "old values shown as current" the house
+rule forbids. The app falls back without fetching when the menu is switched
+off or a menu job is already running; `/food status` and `/food help` never
+fetch at all.
+
+**Who may order.** This is the only Webex command that writes to somebody's HR
+portal, and **the one-time code is the protection — by default the only one**
+(`may_order()`).
+
+`okbase_order_codes` (Settings → *Ordering codes*) is what is required: one of
+them on the command as `pin:yourcode`, and with none stored no order is
+accepted at all.
+
+`okbase_order_emails` (Settings → *Restrict ordering to*) is **optional and
+empty by default**, which means any sender with a valid code. That was the
+operator's decision on 2026-09-10, and the reasoning is sound: lunch gets
+ordered from more than one account — a shared `l3hapls_…` mailbox as well as a
+personal address — so a list of addresses to keep in step with that is a lock
+that mostly locks its owner out. It gives up little, because a code is good
+once **and only ever appears in the chat inside the very message that spends
+it**: there is no window in which a bystander could read one and use it. Fill
+the field in only to pin ordering to particular senders; a sender turned away
+is told which address was seen, since "you are not allowed" is unhelpable when
+the truth is "that is your other address" (this operator holds
+`…@eli-laser.eu` and `…@eli-beams.eu` — see
+[[reference-sharepoint-identity-split]]).
+
+**An order already there is merged into, not replaced.** `order` on a booked
+day re-orders it course by course: `change_order` builds the day from what is
+booked (course code → item id, taken from the menu read in the same request)
+and then applies the picks over the top, so a course nobody named keeps its
+meal. `resolve_picks` returns a `{course: item id or None}` map for that, and
+`0` (`DROP_NUMBER`) is the number that resolves to `None` — the only way to
+take one course off without touching the other. Replacing the whole day
+instead would silently drop a meal the person never mentioned, which is the
+failure this shape exists to avoid.
+
+The one thing still turned away is a command asking for **exactly** what is
+already booked: `OrderOutcome.already`, `render_already_ordered`, checked
+before the `authorise` hook so no code is spent on a save that would be a
+no-op. `change` / `instead` / `změnit` (`REPLACE_WORDS`) are now plain synonyms
+of `order` and gate nothing; they stay because they are what people type.
+Decided 2026-09-10, replacing the earlier rule that a booked day had to be
+unlocked with the word `change` — in practice that turned away the ordinary
+"I changed my mind" and taught nobody anything.
+
+**A code plus a meal is an order, verb or not.** `/food friday main 1
+pin:bakoli` was typed at the live bot and came back as the *menu*, because the
+line carried no `order`. Nobody types a one-time code to read a menu, so a
+`pin:` together with a named meal is now read as an order however it was
+worded. A code with no meal, or a meal with no code, is still just the menu.
+
+### The one-time codes
+
+A **fixed** password is the wrong instrument here, and this is the reasoning to
+keep: a chat message is permanent, so a password typed into a room stays
+readable to everyone who can see that room, for ever — after its first use it
+protects nothing. A one-time code does not have that problem, because what
+stays visible has already been spent.
+
+`new_order_codes()` makes a hundred pronounceable made-up words (`bakoli`,
+`severu`), three consonant-vowel syllables of plain ASCII. Why not real words
+and why not digits:
+
+* a **dictionary word** would be far too easy to guess — a few thousand common
+  words, a hundred of them live, so one guess in a few dozen would land. From
+  syllables there are ~1.06 million;
+* **plain ASCII** because these get typed on a phone keyboard, where a
+  diacritic is awkward and one more thing that can arrive differently encoded;
+* they still read and type **like a word**, which a string of digits does not.
+
+Stored as **one salt plus a fingerprint per code**, not a DPAPI blob:
+
+```json
+"okbase_order_codes": {"salt": "<b64>", "rounds": 200000, "hashes": ["<b64>", …]}
+```
+
+* **hashed, not encrypted**, because nothing ever needs a code back — only a
+  yes/no on one just typed. Every other secret here is DPAPI-encrypted for the
+  opposite reason: the portal wants the actual cookie;
+* **one salt for the whole list**, so checking a typed code costs one
+  derivation and a set lookup instead of up to a hundred derivations. That is
+  the difference between telling somebody their code is wrong at once and going
+  to the portal first to find out. Sharing the salt costs nothing real: what
+  the hashing defends against is somebody *reading* the file, and anyone who can
+  read it can already decrypt the sign-in beside it and order with no code;
+* a spent code is **deleted**, not flagged — nothing to un-flag, no flag to get
+  wrong. `spend_order_code` re-reads the file, strikes one off and writes it
+  back, so it is correct even though the app's worker thread is always holding a
+  copy made minutes earlier. If the write fails it **refuses**: a code that
+  could not be struck off is a code that would work twice.
+
+**When a code is spent is a design decision, not an accident.** `may_order`
+checks the code but does not spend it; `change_order` calls its `authorise`
+hook at the last possible moment — the day read and found open, the body built,
+the save next — and that is where the code is struck off. So a closed day, a
+meal number that does not exist and a day with no menu all cost nothing. Both
+halves are pinned by tests.
+
+`_take_password` runs on the **raw** command text, before the parser lowercases
+anything, and the code is a **labelled** word (`pin:`, `pw:`, `heslo:`, `kod:`,
+`code:`). Both matter: a code is compared case- and punctuation-blind through
+`normalise_code`, but it may read like anything — including a day or a number —
+so it has to be taken out by its label before any other word is looked at.
+Nothing typed is ever rendered, logged, or quoted back, not even in a refusal.
+
+`CODES_LOW_AT` (10): from there down, a successful order says how many are left.
+A count under every reply would be noise; finding out the list is empty at the
+moment you want lunch would not.
+
+**Tests must never reach the real file.** Spending writes
+`%APPDATA%\Diagnostic\okbase.json`, so both ordering tests stub
+`load_user_settings` / `save_user_settings` **at the top of the file**, not just
+around the part that spends. Learned the hard way: the first run of
+`test_order_wiring.py` put a list of test codes into the operator's own
+settings. Same for `testing/shot_order_codes.py`.
+
+**Looking is not changing.** `/food order friday` with no meal named prints the
+day's list and is answered *before* both gates: `/food friday` already shows
+that to anybody, so asking for a code to see it would be theatre.
+
+**The menu marks what is ordered** — `ORDERED_MARK` in front of the name, so
+the number and the mark sit together at the start of the line where the eye
+already is (after the price it would land mid-line once a phone wraps it).
+Matched on `item_id`, never on the name: the same dish appears on more than one
+day and a name is not what the portal ordered. A day already collected is
+marked like any other — it *is* what was ordered.
+
+The marks alone cannot cover two cases, and `_order_note` says so rather than
+letting either read as "nothing ordered": a saved copy written before item ids
+were kept (`/food refresh` fixes it), and an order for a meal that is not on
+the menu that copy holds.
+
+`testing/live_order.py` goes straight to `change_order` and asks for no code,
+on purpose: it runs as this Windows account, where the DPAPI sign-in decrypts —
+already a stronger claim than a word typed into a chat room.
+
+The words are parsed by `_parse_order_words`: a day anywhere in the line, and
+numbers per course, because that is how `render_meals` numbers them — soups 1, 2
+and mains 1, 2, 3. A bare number means the main course. Both languages'
+weekday, verb and course words are accepted (the replies stay English; what is
+*typed* at the bot is typed by Czech speakers).
+
+**`order` / `cancel` are looked for anywhere in the line, not only first.**
+Fixed 2026-09-10 after `/food friday cancel pin:…` was typed at the live bot
+and **printed the menu** — the mode was decided by `words[0]`, so a day in front
+won and the verb was never seen. That is the worst shape a bug can take here: it
+looks like the command was understood and the day was simply not cancelled. Same
+house rule as the day and the meal — two independent things may be said in
+either order.
+
+Run in two places, as `/food` is: `monitor_tab._cmd_food_order` while the app is
+open (a daemon thread, `_order_job`, guarded by a **timestamp** rather than a
+busy flag so a job that dies cannot refuse every later order until restart), and
+`remote_launcher._food_order` while it is closed. Both re-read the sign-in first,
+and both trigger a menu re-read afterwards so the saved copy agrees with what
+was just done.
+
+**Why the cache is still the point.** Both `/food` handlers now try `refresh()`
+first, but `refresh()` needs credentials, and those are DPAPI blobs belonging
+to one Windows account on one PC. On any other PC, and whenever the portal is
+down or the pasted session has expired, the live read returns nothing and
+`menu_cache.json` — written by the app's daily fetch and by `_menu_upkeep`
+while the app is closed — is what answers. It is the reason `/food` never
+comes back empty-handed.
 
 **Freshness is judged when answering, not when fetching** (the house rule): a cache
 older than `STALE_AFTER_HOURS` gets a bold warning above the menu, and a day outside
@@ -864,7 +1149,8 @@ process. Built `--onefile` as its own exe (see the Dev Tools STRUCTURE for why).
 | Function | Role |
 |----------|------|
 | `_split_command(raw)` | strips the mention, then returns `(first word, the rest)` — only the **first word** has to be the command, and `/food week` needs its argument. (Fixed 2026-08-19: it used to compare the whole message with `/rundiagnostic`, so the tag Webex writes made it never match — the command looked ignored in exactly the kind of room where the tag is compulsory.) |
-| `_food_answer(args, settings)` | the `/food` reply, from the saved `menu_cache.json`. `okbase_menu` is imported **inside** the function, so a problem there can never stop this listener doing its main job. Answered only while the app is **closed** — `is_app_running()` gates it, or every menu would be posted twice |
+| `_fresh_cache(om, settings)` | one door for every reading reply: `refresh()` first, `load_cache()` if that comes back with nothing, and the reason handed back for the caller to print under the menu |
+| `_food_answer(args, settings)` | the `/food` reply, through `_fresh_cache`. `okbase_menu` is imported **inside** the function, so a problem there can never stop this listener doing its main job. Answered only while the app is **closed** — `is_app_running()` gates it, or every menu would be posted twice |
 | `_menu_upkeep(settings, state)` / `_save_okbase_cookies(cookies)` | keeps the OKbase sign-in alive and reads the menu once a day **while the app is closed**. This is what stops a pasted browser session expiring overnight: this is the process that is always up. Gated on `is_app_running()` for the same reason `/food` is, plus one more — both writing `okbase_session_cookie` would let the app's older in-memory copy overwrite a renewed one |
 | `is_app_running()` / `is_tracking()` / `_pid_alive(pid)` | from `run_status.json`, with `diagnostic.lock` as the legacy fallback |
 | `_version_key(name)` / `newest_build()` | version folders under `C:\Dev\dist\Diagnostic` ordered **as numbers**, so `v1.0.10` beats `v1.0.9`; a folder with no exe is skipped rather than shadowing the working version below it |
@@ -960,6 +1246,38 @@ python test_okbase_menu.py      the canteen menu, pinned against a live
                                 pasted cURL in both flavours, and that a day
                                 the cache cannot answer for says so instead
                                 of showing another day's food
+python testing/test_okbase_orders.py
+                                ordering lunch, offline: the words (a day
+                                anywhere in the line, numbers per course, both
+                                languages), numbers to item ids, and the save
+                                body against a made-up portal — that a change
+                                to one day never wipes the rest of the week,
+                                that a new order and an existing one get the
+                                two different shapes the page sends, that a
+                                closed day and a number past the end never
+                                reach the portal at all, that the portal's own
+                                refusal is quoted, and that a save which is
+                                accepted but not kept is caught
+python testing/test_order_wiring.py
+                                that ordering is actually WIRED UP, in the app
+                                and in the listener: the command reaches the
+                                worker with the sender's address, every refusal
+                                (wrong sender, no password, wrong password,
+                                nobody allowed, switched off, a closed day)
+                                happens before the portal is touched, a wrong
+                                password is never echoed back, showing a day
+                                needs no password at all, reading still answers
+                                everybody, and the busy guard is a stamp — a
+                                job that dies does not refuse every later order
+python testing/test_signin_is_kept.py
+                                that a sign-in proved to work is SAVED there
+                                and then, that what a paste carried with it is
+                                kept too, that nothing else the operator typed
+                                is written, that a failed write is not called
+                                saved, and that every field quoting the old
+                                "expired" verdict is cleared — the bug where
+                                the dialog said "the sign-in works" and the
+                                bot went on saying the opposite
 python -m pytest test_edge_cdp.py
                                 the Sign in with Edge plumbing, offline: the
                                 hand-written websocket framing (masking, the
@@ -970,6 +1288,16 @@ python -m pytest test_edge_cdp.py
                                 builds round-trips through parse_cookies,
                                 and that the launch flags never go headless
                                 and never lose --user-data-dir
+python -m pytest testing/test_stale_sso_cookie.py
+                                that the window never hands back a sign-on
+                                cookie the portal has forgotten: the stale one
+                                is put to the portal and thrown out, the tab is
+                                sent back to the company sign-on, the sign-in
+                                that follows is the one returned, a live cookie
+                                is returned at once, an unreachable portal costs
+                                nothing, a cookie minted during the walk is not
+                                second-guessed, and Microsoft's cookies survive
+                                the clear-out
 python testing/test_cancel_plot.py
                                 /cancel: the chunks still queued are never
                                 fetched, a cancelled fetch answers with

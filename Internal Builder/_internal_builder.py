@@ -134,9 +134,16 @@ except ImportError:
     pass
 
 # ── win32 ─────────────────────────────────────────────────────────────────────
+# win32crypt is what Diagnostic locks its saved passwords with (DPAPI,
+# secrets_util.py). Its import there is wrapped in try/except, so when it is
+# missing the program starts perfectly and just stops being able to read its own
+# secrets — nothing on screen says why. Deploy Libraries then DELETES the copy
+# Diagnostic's own build put in _internal, because this library has no such
+# file, so it has to be listed here.
 try:
     import win32com.client as win32
     import pythoncom
+    import win32crypt
 except ImportError:
     pass
 
@@ -162,6 +169,7 @@ if __name__ == "__main__":
         "--collect-all", "orjson",
         "--collect-data", "certifi",
         "--hidden-import", "zoneinfo._tzdata",
+        "--hidden-import", "win32crypt",
         "--distpath", r"C:\Dev\dist",
         "--noconfirm",
         str(script),

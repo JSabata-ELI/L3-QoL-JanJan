@@ -1009,6 +1009,28 @@ def _fmt_cursor_value(v: float) -> str:
     return f"{v:.4e}"                     # truly tiny — e-notation unavoidable
 
 
+def _fmt_percent_of(value: float, reference: float) -> str:
+    """`value` as a percentage of `reference`, to hundredths.
+
+    Used for the selection statistics: a scatter of 0.07 on a channel that reads
+    1.0 means 7 %, and that is the number an operator judges a shot by — the
+    absolute figure says nothing without the average beside it.
+
+    A reference of zero (or one so small that the ratio explodes) has no honest
+    percentage, so it says so instead of printing a huge number.
+    """
+    try:
+        v = float(value)
+        r = abs(float(reference))
+    except (TypeError, ValueError):
+        return "—"
+    if v != v or r != r:                  # NaN on either side
+        return "—"
+    if r == 0 or r < abs(v) * 1e-9:
+        return "—"
+    return f"{100.0 * v / r:.2f} %"
+
+
 def parse_user_datetime(s: str) -> datetime | None:
     s = s.strip()
     if not s:

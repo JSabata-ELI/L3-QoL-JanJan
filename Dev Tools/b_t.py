@@ -37,6 +37,30 @@ def _save_devtools_config(data: dict):
     except Exception:
         pass
 
+def _new_workdir(name: str) -> Path:
+    """A private PyInstaller work folder for this one build.
+
+    Every build used to share %TEMP%\\universal_builder_pyinstaller and delete
+    the whole folder when it finished. A second Builder window — or simply a
+    helper built next to a project — therefore pulled the ground out from under
+    a build that was still running. PyInstaller only notices minutes later, when
+    it writes base_library.zip into a directory that is no longer there, and
+    reports it as "No such file or directory" somewhere under Temp.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name) or "build"
+    root = Path(tempfile.gettempdir()) / "universal_builder_pyinstaller"
+    # A failed build keeps its folder for inspection, so sweep yesterday's away
+    # rather than letting them pile up. Only old ones — never a running build's.
+    try:
+        cutoff = time.time() - 24 * 3600
+        for old in root.iterdir():
+            if old.stat().st_mtime < cutoff:
+                shutil.rmtree(str(old), ignore_errors=True)
+    except Exception:
+        pass
+    return root / f"{safe}_{os.getpid()}_{int(time.time() * 1000) % 1_000_000}"
+
+
 def _versions_txt_path() -> Path | None:
     cfg = _load_devtools_config()
     scratch = cfg.get("scratch")
@@ -303,12 +327,18 @@ class BuilderUI(ttk.Frame):
             pass
 
     def _clear_local_log(self):
-        try:
-            self._local_log.configure(state="normal")
-            self._local_log.delete("1.0", "end")
-            self._local_log.configure(state="disabled")
-        except Exception:
-            pass
+        # Both panes show the same text, so Clear empties both.
+        cm = getattr(self, "_cm_ref", None)
+        for w in (self._local_log, self._log_widget,
+                  getattr(cm, "log", None)):
+            if w is None:
+                continue
+            try:
+                w.configure(state="normal")
+                w.delete("1.0", "end")
+                w.configure(state="disabled")
+            except Exception:
+                pass
 
     def guess_main_py(self, project_dir: Path) -> Path | None:
         pys = [p for p in project_dir.glob("*.py") if p.name != "__init__.py"]
@@ -1309,8 +1339,8 @@ class BuilderUI(ttk.Frame):
             shutil.rmtree(str(verdir), onerror=_on_rm_error)
         verdir.mkdir(parents=True, exist_ok=True)
 
-        # Dočasné složky pro PyInstaller
-        workdir = Path(tempfile.gettempdir()) / "universal_builder_pyinstaller"
+        # Dočasné složky pro PyInstaller — vlastní pro každý build
+        workdir = _new_workdir(name)
         specdir = workdir / "spec"
         builddir = workdir / "build"
         specdir.mkdir(parents=True, exist_ok=True)
@@ -1636,7 +1666,7 @@ class BuilderUI(ttk.Frame):
             shutil.rmtree(str(verdir), onerror=_on_rm_error)
         verdir.mkdir(parents=True, exist_ok=True)
 
-        workdir = Path(tempfile.gettempdir()) / "universal_builder_pyinstaller"
+        workdir = _new_workdir(name)
         specdir = workdir / "spec"
         builddir = workdir / "build"
         specdir.mkdir(parents=True, exist_ok=True)

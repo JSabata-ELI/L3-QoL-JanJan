@@ -116,6 +116,14 @@ def sso_start_url(page: str = MENU_PAGE) -> str:
     return f"{root}/okbase/web-client/web{SSO_START_QUERY}"
 
 
+def rest_base(page: str = MENU_PAGE) -> str:
+    """The REST base of the instance `page` belongs to — what okbase_menu talks
+    to. Derived from the page so a second instance is asked about itself."""
+    if "/okbase/" not in page:
+        return om.BASE_DEFAULT
+    return page.split("/okbase/", 1)[0] + "/okbase/service"
+
+
 # --------------------------------------------------------------------------- #
 # Where things are
 # --------------------------------------------------------------------------- #
@@ -430,6 +438,36 @@ def cookie_line(jar: dict[str, str]) -> str:
     return "; ".join(f"{name}={value}" for name, value in jar.items())
 
 
+def forget_site(ws: _Ws, host: str) -> tuple[int, str]:
+    """Drop the portal's cookies from the profile. (how many, error).
+
+    Only that one host. Microsoft's own cookies are deliberately left alone:
+    they are what makes the next sign-in silent, and clearing them would turn a
+    five-second walk back into an authenticator prompt for nothing.
+    """
+    cookies, err = all_cookies(ws)
+    if err:
+        return 0, err
+    host = (host or "").lower().lstrip(".")
+    gone = 0
+    last = ""
+    for c in cookies:
+        domain = str(c.get("domain") or "").lower().lstrip(".")
+        if not domain or not (host == domain or host.endswith("." + domain)):
+            continue
+        name = str(c.get("name") or "")
+        if not name:
+            continue
+        _, err = ws.call("Network.deleteCookies",
+                         {"name": name, "domain": c.get("domain") or domain,
+                          "path": c.get("path") or "/"})
+        if err:
+            last = err
+        else:
+            gone += 1
+    return gone, last
+
+
 # --------------------------------------------------------------------------- #
 # The tab, as opposed to the browser
 # --------------------------------------------------------------------------- #
@@ -544,6 +582,54 @@ def pick_account(port: int, account: str) -> tuple[str, str]:
     return str((result.get("result") or {}).get("value") or ""), ""
 
 
+# Is the sign-in in this window ALIVE, or only present? Asked from inside the
+# page, so it goes out with the browser's own cookies and needs nothing pasted
+# anywhere first. `redirect: 'manual'` matters: a portal that has forgotten the
+# session answers with a bounce to the sign-on service, and a followed redirect
+# would come back as a cheerful 200 from a login page.
+_ALIVE_JS = r"""
+(function (url) {
+  return fetch(url, {credentials: 'same-origin', redirect: 'manual',
+                     cache: 'no-store'})
+    .then(function (r) {
+      if (r.type === 'opaqueredirect') return 'redirect';
+      return String(r.status);
+    })
+    .catch(function (e) { return 'error:' + e; });
+})(%s)
+"""
+
+ALIVE = "alive"
+DEAD = "dead"
+UNKNOWN = "unknown"
+
+
+def session_alive(port: int, base: str = "") -> str:
+    """Whether the window's OKbase session really works: ALIVE / DEAD / UNKNOWN.
+
+    UNKNOWN is a full answer and not a failure. The page may be on Microsoft
+    (where this request is not ours to make), or the portal may be having a bad
+    minute, and neither says the sign-in is gone. Only a plain refusal — 401,
+    403, or a bounce to the sign-on service — is read as DEAD, because that is
+    the one that costs the operator a wasted "sign in again".
+    """
+    result, err = _in_page(port, "Runtime.evaluate", {
+        "expression": _ALIVE_JS % json.dumps((base or om.BASE_DEFAULT) + om.ALIVE_PATH),
+        "awaitPromise": True, "returnByValue": True})
+    if err:
+        return UNKNOWN
+    answer = str((result.get("result") or {}).get("value") or "")
+    if answer == "redirect":
+        return DEAD
+    if answer.isdigit():
+        code = int(answer)
+        if 200 <= code < 300:
+            return ALIVE
+        if code in (401, 403):
+            return DEAD
+    return UNKNOWN
+
+
 # --------------------------------------------------------------------------- #
 # The whole job
 # --------------------------------------------------------------------------- #
@@ -611,6 +697,11 @@ def renew(host: str = "", page: str = MENU_PAGE,
     sign-in page is stepped over and the account is picked. Everything after
     that — a password, an authenticator prompt — is the person's, in a window
     that is deliberately visible and in front.
+
+    A sign-on cookie left over in the profile is checked against the portal
+    before it is handed back, and thrown out if the portal has forgotten it.
+    Microsoft's cookies are kept, so that second sign-in usually needs no clicks
+    either.
     """
     def say(text: str) -> None:
         if progress is not None:
@@ -620,6 +711,7 @@ def renew(host: str = "", page: str = MENU_PAGE,
                 pass
 
     host = host or page.split("//", 1)[-1].split("/", 1)[0]
+    base_rest = rest_base(page)
     port = _free_port()
     say("opening a browser window…")
     proc, err = launch(page, port)
@@ -656,6 +748,9 @@ def renew(host: str = "", page: str = MENU_PAGE,
         picked = ""            # the Microsoft page the account was picked on
         told = ""              # the page last named out loud, so each is said once
         closed = False         # the window went away before the sign-in finished
+        refused: set[str] = set()   # sign-on cookies the portal has disowned
+        inherited: set[str] | None = None   # what was in the profile beforehand
+        swept = False          # the profile has been cleared out once already
         while time.monotonic() < deadline:
             cookies, err = all_cookies(ws)
             if err:
@@ -669,9 +764,44 @@ def renew(host: str = "", page: str = MENU_PAGE,
                 closed = True
                 break
             jar = cookies_for(cookies, host)
-            if jar:
+            sso = {v for n, v in jar.items()
+                   if n.lower().startswith(SSO_COOKIE_PREFIX)}
+            if inherited is None:
+                # Whatever is already in the profile at the first look is from
+                # some earlier day and is the only thing worth doubting. A
+                # cookie that appears LATER was minted by the sign-in happening
+                # in this window, and is taken at its word — asking about it
+                # races the portal's own redirect, and losing that race would
+                # throw away the very sign-in the person just completed.
+                inherited = set(sso)
+            if jar and not (sso & refused):
+                # A jar still carrying a disowned sign-on cookie is not kept as
+                # the fallback either: it is exactly the thing that would be
+                # handed back at the end as "usable until the portal's timeout".
                 best = jar
-            if any(n.lower().startswith(SSO_COOKIE_PREFIX) for n in jar):
+            if sso and not (sso & refused):
+                # The cookie being THERE is not the sign-in working. The window
+                # keeps its own profile, so yesterday's sign-on cookie is still
+                # sitting in it the next morning; handing that back said "signed
+                # in" and the very next check said "expired — sign in again",
+                # with no way for the operator to get out of the loop. So the
+                # portal is asked, from inside the window, before an inherited
+                # cookie is called a sign-in. UNKNOWN is accepted as a yes: only
+                # a refusal is acted on.
+                if (sso & inherited) and session_alive(port, base_rest) == DEAD:
+                    refused.update(sso)
+                    say("the saved sign-in is no longer valid — signing in afresh…")
+                    if not swept:
+                        swept = True
+                        forget_site(ws, host)
+                    # Everything the walk had already done was done for the dead
+                    # session; the pages will come round again for the new one.
+                    pushed = picked = told = ""
+                    best = {}
+                    navigate(port, sso_start_url(page))
+                    bring_to_front(port)
+                    time.sleep(POLL_S)
+                    continue
                 say("signed in — closing the window.")
                 return cookie_line(jar), ""
 

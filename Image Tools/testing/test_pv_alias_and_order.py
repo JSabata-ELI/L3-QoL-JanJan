@@ -263,8 +263,11 @@ def check_order(m):
         state["cams"] = [("C03-040-PTM11WNF-_-IMG", "PTM11WNF", Path("x"))]
         m.ImageFinderWidget._run_pending_pv_search(self)
 
-    def load_moments(self, ts_list):
-        state["ran"] = list(ts_list)
+    def load_moments(self, picks):
+        # `_load_moments` takes PICKS now — a bare timestamp or a dict saying which
+        # moment or which region it is. Only the instants matter here.
+        state["ran"] = [int(p["ts"]) if isinstance(p, dict) else int(p)
+                        for p in picks]
 
     stub = types.SimpleNamespace(
         _pending_pv_cfg=None,
@@ -273,10 +276,12 @@ def check_order(m):
         _load_moments=lambda ts: load_moments(stub, ts),
         _run_multiday_search=lambda cfg: state.update(ran="regions"),
         _run_condition_search=lambda cfg, cond: state.update(ran="condition"),
+        _resolve_region_picks_async=lambda regs, primary, on_done: on_done([]),
         _log=lambda msg: state["logs"].append(msg))
     stub._run_pending_pv_search = (
         m.ImageFinderWidget._run_pending_pv_search.__get__(stub))
     stub._start_pv_search = m.ImageFinderWidget._start_pv_search.__get__(stub)
+    stub._start_pick_search = m.ImageFinderWidget._start_pick_search.__get__(stub)
     start = stub._start_pv_search
 
     picks = [1786953620000000000, 1786953645000000000]
@@ -316,12 +321,28 @@ def check_order(m):
     # with — the whole point of letting the halves be answered in either order.
     state.update(ran=None)
     seen = {}
-    stub._run_multiday_search = lambda cfg: seen.update(cams=cfg["cameras"])
+    stub._start_pick_search = (
+        lambda cfg, moments, regions: seen.update(
+            cams=cfg["cameras"], moments=list(moments),
+            regions=sum(len(v) for v in regions.values())))
     start({**cfg, "moments_ns": [], "moment_ns": None,
            "regions": {date(2026, 9, 1): [(1, 2)]},
-           "days": [date(2026, 9, 1)]})
+           "days": [date(2026, 9, 1)],
+           "primary_channel": "L3-SBW4-PM311:Energy"})
     check("a region search runs on the cameras checked now",
           seen.get("cams") == state["cams"], str(seen.get("cams")))
+    check("and the region reaches the pick search",
+          seen.get("regions") == 1 and seen.get("moments") == [],
+          f"{seen.get('regions')} region(s), moments {seen.get('moments')}")
+
+    # Both halves at once is the case that used to lose the regions outright.
+    seen.clear()
+    start({**cfg, "regions": {date(2026, 9, 1): [(1, 2)]},
+           "days": [date(2026, 9, 1)],
+           "primary_channel": "L3-SBW4-PM311:Energy"})
+    check("moments AND regions both reach the pick search",
+          seen.get("moments") == picks and seen.get("regions") == 1,
+          f"{seen.get('moments')} / {seen.get('regions')} region(s)")
 
 
 def main() -> int:

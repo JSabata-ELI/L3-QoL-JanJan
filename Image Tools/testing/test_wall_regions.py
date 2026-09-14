@@ -79,13 +79,13 @@ def check_cells(m):
           sorted({c["row_key"] for c in cells})
           == [(DAY, 1), (DAY, 2), (DAY, 3), (DAY, 4)],
           repr(sorted({c['row_key'] for c in cells})))
-    check("the wall's own row for it is the DAY",
-          {m._DayWall._cell_row_key(c) for c in cells} == {DAY},
-          repr({m._DayWall._cell_row_key(c) for c in cells}))
     labels = sorted({c["cam"] for c in cells})
-    check("and its column is (camera, region number)",
+    check("the wall's own row for it is the CAMERA",
+          {m._DayWall._cell_row_key(c) for c in cells} == set(labels),
+          repr({m._DayWall._cell_row_key(c) for c in cells}))
+    check("and its column is (day, region number)",
           sorted({m._DayWall._cell_col_key(c) for c in cells})
-          == sorted((lbl, i) for lbl in labels for i in (1, 2, 3, 4)),
+          == sorted((DAY, i) for i in (1, 2, 3, 4)),
           repr(sorted({m._DayWall._cell_col_key(c) for c in cells})))
 
     # A cell with no region at all — the old contract.
@@ -111,16 +111,17 @@ def check_rows(m, cells):
     wall.set_cells([dict(c) for c in cells])
     wall.set_canvas(1000, 600)
 
-    # THE RULE: a row is a day, the next row is the next day. Four regions on one
-    # day do not split it into four rows — they sit side by side inside that row,
-    # each camera owning one column per region.
+    # THE RULE: a row is a camera, the next row is the next camera. Four regions on
+    # one day do not split it into four rows — they sit side by side inside each
+    # camera's row, the day owning one column per region.
     rows, cols = wall._row_order()
-    check("one day = one row", rows == [DAY], repr(rows))
-    check("two cameras × four regions = eight columns", len(cols) == 8,
+    check("two cameras = two rows", rows == sorted({c["cam"] for c in cells}),
+          repr(rows))
+    check("one day × four regions = four columns", len(cols) == 4,
           f"{len(cols)} column(s)")
-    check("the columns are sorted by camera name, then by region number",
+    check("the columns are sorted by day, then by region number",
           cols == sorted(cols, key=lambda t: (str(t[0]), t[1])), repr(cols))
-    check("and a column belongs to ONE camera",
+    check("and a column belongs to ONE day",
           [c[0] for c in cols] == sorted(c[0] for c in cols), repr(cols))
 
     rects = [wall._rects[i] for i in range(len(wall.cells()))]
@@ -131,14 +132,16 @@ def check_rows(m, cells):
     check("and no two cells share one", len(set(keys)) == len(keys),
           f"{len(set(keys))} distinct of {len(keys)}")
     ys = sorted({r.y() for r in rects})
-    check("all eight sit on the one row", len(ys) == 1, repr(ys))
+    check("the eight sit on two rows, one per camera", len(ys) == 2, repr(ys))
     check("about three rows fit the pane",
           abs(wall.row_pitch() - 600 // 3) <= 2, f"pitch {wall.row_pitch()} px")
 
     heads = [txt for _r, txt in wall._row_heads]
-    check("one banner, for the day", len(heads) == 1, repr(heads))
-    check("it names the day, spelled out", "Tuesday" in heads[0], repr(heads[0]))
-    check("and says the day carries four", "4 regions" in heads[0], repr(heads[0]))
+    check("one banner per camera", len(heads) == 2, repr(heads))
+    check("it names the camera", heads[0].startswith(sorted({c["cam"] for c in cells})[0]),
+          repr(heads[0]))
+    check("and says the line carries four regions",
+          "4 regions" in heads[0], repr(heads[0]))
 
     # One region on a day says nothing about a count.
     one = cells_for(m, [region(1, 1, 8, 9)])
@@ -151,7 +154,7 @@ def check_rows(m, cells):
           all("region" not in txt for _r, txt in w2._row_heads),
           repr([t for _r, t in w2._row_heads]))
 
-    # Several DAYS are what makes several rows.
+    # Several DAYS are what makes several columns now — the rows are the cameras.
     many = cells_for(m, [region(1, 2, 8, 9), region(2, 2, 9, 10)])
     for c in many[:2]:
         c["day"] = date(2026, 9, 2)
@@ -161,11 +164,15 @@ def check_rows(m, cells):
     w3.resize(1000, 600)
     w3.set_cells([dict(c) for c in many])
     w3.set_canvas(1000, 600)
-    check("two days = two rows", len(w3._row_order()[0]) == 2,
+    check("two cameras = two rows", len(w3._row_order()[0]) == 2,
           repr(w3._row_order()[0]))
-    check("the days run top to bottom in date order",
+    check("the cameras run top to bottom by name",
           w3._row_order()[0] == sorted(w3._row_order()[0]),
           repr(w3._row_order()[0]))
+    check("and the days run left to right in date order",
+          [k[0] for k in w3._row_order()[1]]
+          == sorted(k[0] for k in w3._row_order()[1]),
+          repr(w3._row_order()[1]))
 
     # Hit-testing must reach the cell that is actually painted there.
     hit_ok = True

@@ -14,6 +14,9 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 | `l.py` | Single file. The whole launcher (tkinter/ttk). |
 | `icon.ico` | Window / taskbar icon (see `set_app_icon`). |
 | `%APPDATA%\Launcher\config.json` | Persisted settings — not in the repo. |
+| `%APPDATA%\Launcher\old_version_run.log` | Output of the last archived-version run (`OLD_RUN_LOG`) — not in the repo. |
+| `testing/test_archive_versions.py` | What the version menu offers for each shape of `archive/` folder. |
+| `testing/test_old_version_launch.py` | Each route: an in-folder exe is started without moving anything, an archived exe is swapped in **with its sources**, a sources-only folder runs its own code, a one-file exe runs in place. |
 
 ---
 
@@ -94,14 +97,25 @@ user move a program to another group (or reset it) and the choice is persisted.
   `(0, 0)` timestamp and still sorts by version.
 - `_archive_exe_label(p, folder_ver)` — `"v1.2.3  (2025-01-01  12:00:00)"` for
   timestamped names, plain `"v1.2.3"` for normalized ones.
-- `_find_versioned_py(version_dir, exe)` — the matching `.py` snapshot next to the
-  archived exe (both name spellings).
+- `ARCHIVE_PY_RE` — a snapshot's **main script**: `Name v1.2.3.py`, optionally
+  `__20250101_120000` or a ` (2)` dedup suffix. The helper modules beside it keep
+  their plain names, so this is what tells the two apart.
+- `_find_versioned_py(version_dir, exe=None)` — the snapshot's main `.py`: named
+  after the exe when one was archived with it, otherwise the one versioned `.py`
+  in the folder. `exe=None` is how a **source-only** snapshot is found.
+- `ARCHIVE_NON_VERSION_DIRS` — `unknown`, `_temp_latest`: folders inside `archive/`
+  that are not a version.
 
 **archive/ layout handling (`scan_archive_versions`):**
 1. `archive/vX.Y.Z/` — **one entry per version folder**; the canonical name is
    preferred over ` (2)` dedup copies (sort key puts `" ("` last, then `break`).
+   **The exe is optional**: a folder holding only sources is listed too and run
+   with Python (route 3). `exe_path` is then `None`. Each entry also carries
+   `has_internal` — whether the folder brought its own `_internal/`.
 2. `archive/*.exe` — legacy flat layout, still supported.
 3. Everything is sorted by the precomputed `_ver` key (removed again before return).
+   Folders in `ARCHIVE_NON_VERSION_DIRS` are skipped — `archive/unknown/` holds
+   versioned `.py` files and would otherwise become a bogus entry.
 
 ### Update indicator
 - `_schedule_version_poll()` → `self.after(10000, ...)` — 10 s poll
@@ -117,15 +131,51 @@ user move a program to another group (or reset it) and the choice is persisted.
 |-------------------|-------------|
 | `_launch_no_zone_check(path)` | `ShellExecuteEx` + `SEE_MASK_NOZONECHECKS` — suppresses the "unblock" dialog for exes on network shares |
 | `launch(name)` | Current version, background thread, auto-acknowledges |
-| `_launch_exe(exe, program_dir, py_path)` | Archived version — see swap below |
+| `_find_python()` | `pythonw` (no console behind a windowed app) → `python` → `py`; `None` if there is none |
+| `_launch_exe(exe, program_dir, py_path, has_internal)` | An older version — see the routes below |
 | `open_folder(name)` / `open_notes()` | Explorer / shared notes.txt |
 
-**Old-version swap (`_launch_exe`, when `program_dir/_internal` exists):**
-the archived exe needs the program folder's `_internal/`, so the current exe/py
-files are *moved* to `archive/_temp_latest/`, the archived pair is copied in, the
-process is started and waited on, and the originals are moved back in `finally`.
-If `_temp_latest` already exists the launch is refused (a previous swap did not
-finish). Fallbacks: run the `.py` via `pythonw`, or start the exe in place.
+**Running an older version (`_launch_exe`).** The archived exe **is** the whole
+old program: for `--onedir`, PyInstaller embeds the PYZ (the app's own modules) in
+the exe, and `_internal/` holds only the interpreter, the extension modules and
+the third-party packages — interchangeable between versions. Measured on the
+published copy (`Software/Image Tools`): the three exes in the folder are ~34 MB
+each and differ in size per version; `_internal/base_library.zip` holds 155
+stdlib bootstrap `.pyc` and none of the app's modules; and the app's own
+`debug_syspath.txt` dump shows `sys.path` is `_internal` plus its sub-folders and
+nothing else — so **the loose `.py` in the program folder are never imported by a
+running exe**. Do not "fix" old versions by running their sources instead; the
+exe is correct.
+
+Routes, in order:
+
+1. **Start where it lies** — `exe_path.parent == program_dir` (the last few builds
+   are kept side by side in the published folder), or `has_internal` (the version
+   folder brought its own `_internal/`), or `program_dir/_internal` does not exist
+   at all (a `--onefile` helper needs none). Nothing is moved.
+   Route 1 exists because of the bug it replaced: the swap moved every
+   non-timestamped `*.exe` of `program_dir` into `_temp_latest` *including the exe
+   about to be started*, then `copy2(exe_path, program_dir/exe_path.name)` read a
+   path it had just emptied → `FileNotFoundError`, "Launch failed". Every version
+   sitting in the program folder was unlaunchable from the menu.
+2. **Swap into `program_dir`** — an archived version needs to borrow the folder's
+   `_internal`. The current non-timestamped `*.exe` + all `*.py` are **moved** to
+   `archive/_temp_latest/`; the archived exe **and its whole `.py` snapshot** are
+   copied in (previously only the main `.py` was, leaving the folder with no
+   helper sources); the exe is started with `cwd=program_dir` and waited on; the
+   originals are moved back in `finally`. `did_swap` is set *before* the first
+   move so a failure part-way still restores. Helper selection: the main script
+   plus every `.py` **not** matching `ARCHIVE_PY_RE`, so a ` (2)` duplicate or
+   another version's script stays out.
+3. **Sources only** (`exe_path is None`) — staged the same way and run via
+   `_find_python()` with `PYTHONDONTWRITEBYTECODE=1`. Staged rather than run in the
+   archive folder because the programs resolve `icon.ico`, settings and asset
+   folders against `Path(__file__).parent`. A non-zero exit shows the tail of
+   `OLD_RUN_LOG` (`%APPDATA%\Launcher\old_version_run.log`) — `pythonw` has no
+   console, so an import failure would otherwise be completely silent.
+
+If `_temp_latest` already exists routes 2 and 3 are refused (a previous swap did
+not finish); the broom button and every scan offer to restore it.
 
 ### Maintenance helpers
 | Function | Description |

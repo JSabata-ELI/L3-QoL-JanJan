@@ -23,6 +23,35 @@ the parts behave as they do.
   the two buttons never do the same thing, left is "read this", right is "look
   closer". A day that carries a pick is never unmarked by a calendar click.
 
+  MOMENTS AND REGIONS ARE SEARCHED TOGETHER. Both kinds are picks, and a pick is a
+  frame per camera. A region is only a moment worked out from the peak of the
+  primary PV inside it, and both end at the same frame resolver, so there is one
+  pipeline: `_start_pick_search` → `_resolve_region_picks_async` → `_load_moments`,
+  asking for CAMERAS × EVERY PICK. What this replaced returned on the moments and
+  never looked at the regions again — four drags gone in silence.
+
+  WHAT IS PICKED IS A LIST, AND THE LIST CAN BE EDITED. Both kinds are on one
+  table under the graph (the "Picks" page beside the range statistics), each row
+  with its own ✕. A NUMBER STAYS WITH ITS PICK: delete pick 3 and the rest read
+  1, 2, 4 — on the graph, in the tables and in what is handed to the wall —
+  because a number that moves while the list is being tidied is not the number
+  being talked about. "Renumber" is the only thing that closes the gaps.
+
+  A CLICK ON A TILE MARKS IT, AND EVERY CLICK ADDS. It does not open anything.
+  Marking is how a control is aimed (brightness, contrast, gamma, palette,
+  rotation, marks — the marked frames, or the whole wall when nothing is marked),
+  and a click that also threw a window over the wall made that unusable. Clicking
+  picture after picture keeps all of them marked; clicking a marked one lets that
+  one go, and Esc (or right click → Unmark every picture, or a click on empty
+  black canvas where there is any) lets everything go. SHIFT+CLICK
+  marks a whole CAMERA — every day of it on the wall, since a camera is what gets
+  asked for and it owns a whole row of the Day-by-day wall — and adds it to
+  whatever is already marked. Looking closely is its own act: double click, right
+  click → View, or the Detailed view tab, which walks the marked frames with ◀ ▶
+  and the arrow keys. THE CAMERA LIST IN THE PANEL FOLLOWS THE SAME RULE: a click
+  there adds that camera's frames to what is marked and opens nothing (it used to
+  throw the close-up over the wall being compared).
+
   ONE GRAPH, ALWAYS. Every checked PV is drawn in a single graph, grouped by UNIT
   with one y axis per unit (further ones on outward-offset spines), so a joule and a
   motor count are never plotted against the same scale and NO VALUE IS NORMALISED —
@@ -101,7 +130,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QSizePolicy, QSplitter, QTabWidget, QProgressBar,
     QButtonGroup, QSpinBox, QToolButton, QMenu, QStyle,
     QListWidget, QListWidgetItem, QGroupBox, QStackedWidget, QColorDialog,
-    QDoubleSpinBox, QRadioButton,
+    QDoubleSpinBox, QRadioButton, QTreeWidget, QTreeWidgetItem,
 )
 
 try:
@@ -222,17 +251,59 @@ def _import_daypicker():
     """Load the shared day/time picker (sibling daypicker.py) the same way as
     cpva_client and img_scale: one instance per process, registered before exec.
     It owns HOW A DAY AND A TIME WINDOW ARE PICKED, so this tab cannot drift away
-    from the Slider's calendar again."""
+    from the Slider's calendar again.
+
+    Three locations are searched because a built app has no single answer. Next to
+    this file means _internal, and _internal never survives the trip to the
+    share: copying a program there does not bring its _internal at all, and
+    "Deploy Libraries" (Dev Tools/cm_t.py) fills the destination's one from a
+    single shared runtime library, deleting whatever that library does not have.
+    daypicker.py is not in it and cannot be. The copy compiled into the exe
+    (build_config.json -> hidden_imports) and the loose file the deploy drops
+    beside the exe are the fallbacks."""
+    import importlib
     import importlib.util as _ilu
     mod = sys.modules.get("daypicker")
     if mod is not None:
         return mod
-    p = Path(__file__).resolve().parent / "daypicker.py"
-    spec = _ilu.spec_from_file_location("daypicker", p)
-    mod = _ilu.module_from_spec(spec)
-    sys.modules["daypicker"] = mod     # register BEFORE exec (re-entrancy safe)
-    spec.loader.exec_module(mod)
-    return mod
+
+    if getattr(sys, "frozen", False):
+        try:
+            return importlib.import_module("daypicker")   # compiled into the exe
+        except ImportError:
+            pass
+
+    tried: list = []
+    for _d in (str(Path(__file__).resolve().parent),
+               getattr(sys, "_MEIPASS", ""),
+               os.path.dirname(os.path.abspath(sys.executable))):
+        if not _d:
+            continue
+        p = os.path.join(_d, "daypicker.py")
+        if p in tried:
+            continue
+        tried.append(p)
+        if not os.path.isfile(p):
+            continue
+        spec = _ilu.spec_from_file_location("daypicker", p)
+        mod = _ilu.module_from_spec(spec)
+        sys.modules["daypicker"] = mod     # register BEFORE exec (re-entrancy safe)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop("daypicker", None)
+            raise
+        return mod
+
+    try:
+        return importlib.import_module("daypicker")
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "daypicker.py was not found. Looked in:\n  " + "\n  ".join(tried)
+        + "\nand in the modules compiled into the program itself. A built copy "
+          "needs 'daypicker' in build_config.json -> hidden_imports."
+    )
 
 
 daypicker = _import_daypicker()
@@ -426,6 +497,15 @@ class _MomentSignals(QObject):
     done = Signal(int, float, int)      # (generation, ms spent, folder readings)
 
 
+class _RegionPickSignals(QObject):
+    """A marked region turned into the one instant to pull a frame from.
+
+    One instance per widget, for the same reason as `_MomentSignals`."""
+    done = Signal(object, int)          # (list of picks, generation)
+    progress = Signal(int, str)         # (regions resolved, what is being read)
+    log_msg = Signal(str)
+
+
 class _MomentResolveTask(QRunnable):
     """(moment, camera) pairs → the file holding each camera's frame.
 
@@ -512,6 +592,45 @@ def _set_action_icon(btn, name: str, ink: str = "#1e2530"):
         btn.setIconSize(QSize(16, 16))
     except Exception:
         pass
+
+
+_TICK_PNG: "str | None" = None
+
+def _tick_image_url() -> str:
+    """A PAINTED white tick, as a `url(...)` for a stylesheet — or "" if it could
+    not be written.
+
+    A list row's check box cannot be given an icon the way a button can, and left
+    to the style its tick is a hairline in the theme's own ink: on a coloured row
+    it vanished completely. A stylesheet indicator takes an image and nothing else,
+    so the tick is drawn once into a PNG beside the other temporary files and every
+    checkable list points at it. Returning "" is harmless — the box then reads as
+    filled-or-empty, which is still legible."""
+    global _TICK_PNG
+    if _TICK_PNG is None:
+        _TICK_PNG = ""
+        try:
+            import tempfile
+            p = Path(tempfile.gettempdir()) / "image_tools_tick_w.png"
+            if not p.exists():
+                pm = QPixmap(15, 15)
+                pm.fill(QColor(0, 0, 0, 0))
+                pt = QPainter(pm)
+                pt.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                pen = QPen(QColor("#ffffff"))
+                pen.setWidthF(2.6)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                pt.setPen(pen)
+                pt.drawPolyline([QPointF(3.0, 8.0), QPointF(6.2, 11.4),
+                                 QPointF(12.0, 4.0)])
+                pt.end()
+                pm.save(str(p), "PNG")
+            if p.exists():
+                _TICK_PNG = str(p).replace("\\", "/")
+        except Exception:
+            _TICK_PNG = ""
+    return f' image: url("{_TICK_PNG}");' if _TICK_PNG else ""
 
 
 def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
@@ -1368,7 +1487,7 @@ def _render_u8(arr, auto: bool, full_scale: float = None, gamma=None,
     return img_scale.render_u8(arr, auto, full_scale, gamma, contrast, offset, out)
 
 
-def _scale_note(info: dict, arr, auto: bool, full_scale: float = None, gamma=None,
+def _scale_note(info: dict, arr, auto: "int | bool", full_scale: float = None, gamma=None,
                 path=None, pil_mode: str = None,
                 contrast: int = 0, offset: int = 0,
                 gamma_applied: "float | None" = None) -> str:
@@ -1385,23 +1504,24 @@ def _scale_note(info: dict, arr, auto: bool, full_scale: float = None, gamma=Non
     "8-bit source" is decided by the PIL MODE when it is given: a 16-bit frame drawn on
     its camera's reference range also has a full_scale of its own (see img_scale), so
     testing the number alone would label it an 8-bit file."""
-    applied = None
-    if not auto:
-        applied = gamma_applied
-        if applied is None:
-            applied = (img_scale.auto_gamma(arr, full_scale or img_scale.FULL_SCALE_16)
-                       if img_scale.is_auto_gamma(gamma)
-                       else img_scale.gamma_from_slider(gamma))
+    applied = gamma_applied
+    if applied is None:
+        applied = (img_scale.auto_gamma(arr, full_scale or img_scale.FULL_SCALE_16)
+                   if img_scale.is_auto_gamma(gamma)
+                   else img_scale.gamma_from_slider(gamma))
     is_8bit = (pil_mode not in ("I", "I;16")) if pil_mode is not None else (
         full_scale is not None and full_scale != img_scale.FULL_SCALE_16)
     if is_8bit:
-        mode = "auto stretch" if auto else "absolute scale"
+        a = int(auto or 0)
+        mode = "absolute scale"
         if applied is not None and abs(applied - img_scale.GAMMA_NEUTRAL) > 0.005:
             mode += f"  ·  gamma {applied:.2f}"
         if contrast:
-            mode += f"  ·  contrast {int(contrast):+d}"
+            mode += (f"  ·  contrast {int(contrast):+d}"
+                     + (" (auto)" if a & img_scale.AUTO_CONTRAST else ""))
         if offset:
-            mode += f"  ·  brightness {int(offset):+d}"
+            mode += (f"  ·  brightness {int(offset):+d}"
+                     + (" (auto)" if a & img_scale.AUTO_BRIGHT else ""))
         return f"8-bit source  ·  {mode}"
     return img_scale.meta_from_info(info, arr).scale_note(
         auto, gamma, applied,
@@ -1483,6 +1603,15 @@ def _make_mpl_toolbar(nav_cls, canvas, parent=None):
         "QToolButton:hover { background: #d6d6d6; border-radius: 3px; }"
         "QLabel { color: #202020; }")
     _repaint_mpl_toolbar_icons(toolbar)
+    # THE HOST HAS DONE ITS ONE JOB and must now get out of the way. The caller puts
+    # the TOOLBAR into a layout, which re-parents it away and leaves this widget
+    # behind as a child of the window that no layout owns — and a child no layout
+    # owns sits at (0, 0) of its parent at its default size. Painted in the window's
+    # own ground it is invisible until something scrolls under it: that was the
+    # background-coloured rectangle in the top-left corner of the PV Search panel,
+    # standing still however far the panel was scrolled.
+    host.setFixedSize(0, 0)
+    host.hide()
     return toolbar
 
 
@@ -2805,6 +2934,10 @@ class ImageFinderWidget(QWidget):
         # The moments the wall is showing, in the order they were picked.
         self._moments_ns: "list[int]" = []
         self._moment_ns: "int | None" = None
+        # What each of those timestamps IS: a clicked moment or a marked region, and
+        # its own number. Both kinds go on one wall, so a tile has to be able to say
+        # which of the two found it. Keyed by the timestamp that was asked for.
+        self._pick_info: "dict[int, dict]" = {}
         # Every sample of the primary PV from the last PV Search — what the
         # prev/next shot arrows step through, kept so walking the day never
         # reopens the window.
@@ -2819,6 +2952,10 @@ class ImageFinderWidget(QWidget):
         # be answered in either order.
         self._pending_pv_cfg: "dict | None" = None
         self._moment_gen = 0
+        # Generation token for the "turn the marked regions into instants" step, so a
+        # second search started while the first is still reading cannot land on top
+        # of it.
+        self._region_gen = 0
         self._moment_stop = threading.Event()
         self._moment_items: list = []
         self._moment_sig = _MomentSignals()
@@ -2952,8 +3089,9 @@ class ImageFinderWidget(QWidget):
 
         # ══════════════════ Group: SOURCE ════════════════════════════════════
         # The Image Slider's Source pattern: one button opens the calendar, the
-        # button next to it picks the cameras, PV Search sits underneath. The panel
-        # itself stays short — the calendar is only interesting while choosing.
+        # button next to it names the moment, and the camera picker sits underneath.
+        # The panel itself stays short — the calendar is only interesting while
+        # choosing.
         ll = s_time.body_layout
 
         src_row = QHBoxLayout(); src_row.setSpacing(4)
@@ -2961,16 +3099,6 @@ class ImageFinderWidget(QWidget):
         self._btn_time_window.setToolTip(
             "Pick the day (or days) and the hour to search.")
         self._btn_time_window.clicked.connect(self._open_time_window)
-        self._btn_cameras = QPushButton("📷  Cameras")
-        self._btn_cameras.setToolTip(
-            "Choose which cameras to search. The list is the cameras found in the "
-            "selected day(s); presets are shared with the Image Slider.")
-        self._btn_cameras.clicked.connect(self._open_camera_picker)
-        src_row.addWidget(self._btn_time_window)
-        src_row.addWidget(self._btn_cameras)
-        ll.addLayout(src_row)
-
-        # PV Search — under the two pickers it works with.
         self._btn_pv_search = QPushButton("🎯 PV Search")
         self._btn_pv_search.setToolTip(
             "Plot a PV for a day, then click it to pick moments (every click adds "
@@ -2978,7 +3106,16 @@ class ImageFinderWidget(QWidget):
             "The cameras do not have to be chosen first — whichever of the two is "
             "set second, the search starts when both are in.")
         self._btn_pv_search.clicked.connect(self._open_pv_region_search)
-        ll.addWidget(self._btn_pv_search)
+        src_row.addWidget(self._btn_time_window)
+        src_row.addWidget(self._btn_pv_search)
+        ll.addLayout(src_row)
+
+        self._btn_cameras = QPushButton("📷  Cameras")
+        self._btn_cameras.setToolTip(
+            "Choose which cameras to search. The list is the cameras found in the "
+            "selected day(s); presets are shared with the Image Slider.")
+        self._btn_cameras.clicked.connect(self._open_camera_picker)
+        ll.addWidget(self._btn_cameras)
 
         # Walking through the shots around the moment on screen. THE ARROWS ARE
         # HERE, not in the PV window: following a stretch of the day must not mean
@@ -3229,7 +3366,11 @@ class ImageFinderWidget(QWidget):
         self._sel_table.setMaximumHeight(180)
         self._sel_table.setToolTip(
             "The cameras that will be searched.\n"
-            "Click a camera to preview its first frame, double-click to unpick it.")
+            "Click a camera to mark all its frames on the wall — every click adds "
+            "another camera, and clicking one that is already marked takes it back "
+            "off; double-click to unpick it.\n"
+            "Nothing opens — the close-up is a double click on a tile, or right "
+            "click → View.")
         self._sel_table.clicked.connect(self._on_sel_table_clicked)
         self._sel_table.doubleClicked.connect(self._on_sel_table_double_clicked)
         ll.addWidget(self._sel_table)
@@ -3437,17 +3578,30 @@ class ImageFinderWidget(QWidget):
         top_row.addWidget(left_scroll)
         root.addLayout(top_row, 1)
 
-        # ── Log box — full width of the tab, fixed height ─────────────────────
+        # ── Log box — the bottom of the left panel, not the width of the tab ───
+        # It used to span the whole tab under the pictures, where 100 px of the
+        # window's height went to a running commentary nobody reads while looking at
+        # a frame. It is a short box at the foot of the panel now: same text, same
+        # scroll back through it, and every pixel it gave up went to the pictures.
+        root.addWidget(_section_label("Log"), 0)
         self._log_box = QPlainTextEdit()
         self._log_box.setReadOnly(True)
-        self._log_box.setFixedHeight(100)
-        self._log_box.setStyleSheet("font-family:Consolas,monospace;font-size:10px;")
+        self._log_box.setFixedHeight(84)
+        self._log_box.setStyleSheet(
+            "QPlainTextEdit { background:#ffffff; color:#111111;"
+            " border:1px solid #b0b0b0; font-family:Consolas,monospace;"
+            " font-size:10px; }"
+            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
+            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
+            " border-radius:3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            " { height:0px; }")
         self._log_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._log_box.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse |
             Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
-        page.addWidget(self._log_box, 0)
+        root.addWidget(self._log_box, 0)
 
         # left_side uses stretch=0 so it stays at the panel's own width;
         # preview_col gets all remaining space via stretch=1
@@ -3456,7 +3610,7 @@ class ImageFinderWidget(QWidget):
         # ── View — right column, full height ──────────────────────────────────
         # One result set, several ways to read it, as tabs: the close-up of a single
         # frame, one wall per camera (its days next to each other), and the day-by-day
-        # wall where each row is a day and each column the same camera throughout.
+        # wall where each row is one CAMERA and each column the same day throughout.
         # These used to be split between this tab and a pop-up window that opened after
         # every search; there is now one place to look.
         preview_col = QWidget()
@@ -3480,107 +3634,35 @@ class ImageFinderWidget(QWidget):
         self._wall = _DayWall(shared=self._wall_shared)
         self._wire_wall(self._wall)
 
-        # The close-up is no longer a tab. It was a permanent half-size picture next to
-        # the walls that nobody switched to; what the tile click is actually asking for
-        # is "show me this one, big". So the page below is built exactly as before but
-        # goes into a window of its own (_show_frame_window), opened by clicking a tile
-        # and sized well above the stored frame.
-        single_page = QWidget()
-        spl = QVBoxLayout(single_page)
-        spl.setContentsMargins(4, 4, 4, 4); spl.setSpacing(2)
-        # Explicitly dark, not "whatever the theme gives": a frame viewer has to be a
-        # dark surround or the picture's own black edges cannot be told from the page.
-        single_page.setAutoFillBackground(True)
-        _fp_pal = single_page.palette()
-        _fp_pal.setColor(QPalette.ColorRole.Window, QColor("#202020"))
-        _fp_pal.setColor(QPalette.ColorRole.WindowText, QColor("#eeeeee"))
-        single_page.setPalette(_fp_pal)
-        self._frame_page = single_page
+        # The close-up is no longer a tab of its own. It was a permanent half-size
+        # picture next to the walls that nobody switched to; what a tile asks for is
+        # "show me this one, big". The SAME page is built twice by `_make_frame_page`
+        # — once for the window a right click → View opens, once for the Detailed
+        # view tab — so the two look and step alike without a second renderer: one
+        # frame list, one index, one background read (`_preview_show`).
+        self._frame_page, self._frame_view = self._make_frame_page()
+        self._detail_page, self._detail_view = self._make_frame_page()
+        self._frame_views = [self._frame_view, self._detail_view]
         self._frame_dlg: "QDialog | None" = None
+
+        # The old names still point at the close-up's own widgets, so every caller
+        # outside the two frame methods is untouched.
+        self._preview_lbl       = self._frame_view["img"]
+        self._preview_cam_lbl   = self._frame_view["cam"]
+        self._preview_ts_lbl    = self._frame_view["ts"]
+        self._preview_scale_lbl = self._frame_view["scale"]
+        self._preview_counter   = self._frame_view["counter"]
+        self._prev_btn          = self._frame_view["prev"]
+        self._next_btn          = self._frame_view["next"]
 
         self._view_tabs = QTabWidget()
         self._view_tabs.setDocumentMode(True)
         self._view_tabs.addTab(self._wrap_scroll(self._wall), "Days side by side")
         self._wall_pages = {0: self._wall}
+        self._detail_tab_idx = self._view_tabs.addTab(self._detail_page,
+                                                      self._DETAIL_TAB_TITLE)
         self._view_tabs.currentChanged.connect(self._on_view_tab_changed)
         pcl.addWidget(self._view_tabs, 1)
-
-        pcl = spl        # everything below builds the single-frame page
-
-        self._preview_lbl = QLabel()
-        self._preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview_lbl.setStyleSheet("background:#1a1a1a; border-radius:3px;")
-        self._preview_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._preview_lbl.setMinimumSize(100, 100)
-        # Scale pixmap to fit the label automatically when label is resized
-        self._preview_lbl.setScaledContents(False)
-        pcl.addWidget(self._preview_lbl, 1)
-
-        lbl_row = QHBoxLayout()
-        lbl_row.setContentsMargins(0, 0, 0, 0)
-        lbl_row.setSpacing(2)
-        self._preview_cam_lbl = QLabel("")
-        self._preview_cam_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._preview_cam_lbl.setStyleSheet(
-            "font-size: 20px; font-weight: bold; color: #eee; background: #444; "
-            "padding: 2px 6px; border-radius: 2px;")
-        self._preview_cam_lbl.setFixedHeight(34)
-        self._preview_ts_lbl = QLabel("")
-        self._preview_ts_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._preview_ts_lbl.setStyleSheet(
-            "font-size: 20px; color: #ffd54f; background: #333; "
-            "padding: 2px 6px; border-radius: 2px;")
-        self._preview_ts_lbl.setFixedHeight(34)
-        lbl_row.addWidget(self._preview_cam_lbl, 1)
-        lbl_row.addWidget(self._preview_ts_lbl, 2)
-        pcl.addLayout(lbl_row, 0)
-
-        # What the displayed intensities MEAN. Without it a frame at 3 % of full scale
-        # is indistinguishable from a broken render, and a palette is decoration rather
-        # than a reading.
-        self._preview_scale_lbl = QLabel("")
-        self._preview_scale_lbl.setAlignment(Qt.AlignmentFlag.AlignRight
-                                            | Qt.AlignmentFlag.AlignVCenter)
-        self._preview_scale_lbl.setStyleSheet(
-            "font-size: 11px; color: #bbb; background: transparent; padding: 0 6px;")
-        pcl.addWidget(self._preview_scale_lbl, 0)
-
-        # Step through the loaded frames. These arrows lived in the panel on the left,
-        # far from the picture they move — nobody found them, and the page looked like
-        # it could only ever show one frame. They belong under the frame.
-        # Dark ink on a light button, and the counter light on the dark page — the row
-        # sits under a black picture now, where the old #333 counter and the themed
-        # buttons were all but invisible.
-        _nav_btn_css = (
-            "QPushButton { background:#e8e8e8; color:#111; border:1px solid #9a9a9a;"
-            " border-radius:3px; font-size:16px; font-weight:700; padding:2px 0; }"
-            "QPushButton:hover:enabled { background:#ffffff; }"
-            "QPushButton:disabled { background:#4a4a4a; color:#8a8a8a;"
-            " border:1px solid #5f5f5f; }")
-        nav_prev_row = QHBoxLayout(); nav_prev_row.setSpacing(8)
-        nav_prev_row.addStretch(1)
-        self._prev_btn = QPushButton("◀"); self._prev_btn.setFixedSize(52, 30)
-        self._prev_btn.setToolTip("Previous loaded frame")
-        self._prev_btn.setStyleSheet(_nav_btn_css)
-        self._prev_btn.clicked.connect(self._preview_prev)
-        self._next_btn = QPushButton("▶"); self._next_btn.setFixedSize(52, 30)
-        self._next_btn.setToolTip("Next loaded frame")
-        self._next_btn.setStyleSheet(_nav_btn_css)
-        self._next_btn.clicked.connect(self._preview_next)
-        # "0 / 0" from the start, not an empty label: the row has to read as frame
-        # navigation before anything is loaded, or it looks like decoration again.
-        self._prev_btn.setEnabled(False)
-        self._next_btn.setEnabled(False)
-        self._preview_counter = QLabel("0 / 0")
-        self._preview_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview_counter.setMinimumWidth(90)
-        self._preview_counter.setStyleSheet(
-            "font-size:14px; font-weight:700; color:#eeeeee;")
-        nav_prev_row.addWidget(self._prev_btn)
-        nav_prev_row.addWidget(self._preview_counter, 0)
-        nav_prev_row.addWidget(self._next_btn)
-        nav_prev_row.addStretch(1)
-        pcl.addLayout(nav_prev_row, 0)
 
         outer.addWidget(preview_col, 1)
 
@@ -3874,6 +3956,11 @@ class ImageFinderWidget(QWidget):
         sc.setWidget(wall)
         wall._scroll_host = sc
         sc.zoomed.connect(lambda notches, w=wall: self._zoom_wall(w, notches))
+        # The day banner's words ride with the viewport (see _paint_into), and Qt
+        # only repaints what a scroll newly exposed — so the whole wall is asked to
+        # repaint, or the day label smears across the band.
+        sc.horizontalScrollBar().valueChanged.connect(
+            lambda _v, w=wall: w.update() if w.layout_mode() == "rows" else None)
         return sc
 
     def _zoom_wall(self, wall: "_DayWall", notches: int):
@@ -3903,6 +3990,200 @@ class ImageFinderWidget(QWidget):
 
     def _all_walls(self) -> list:
         return list(self._wall_pages.values())
+
+    # ── One frame, big: the close-up window and the Detailed view tab ─────────
+    _DETAIL_TAB_TITLE = "Detailed view"
+
+    # Dark ink on a light button, and the counter light on the dark page — the row
+    # sits under a black picture, where themed buttons and a #333 counter were all
+    # but invisible.
+    _NAV_BTN_CSS = (
+        "QPushButton { background:#e8e8e8; color:#111; border:1px solid #9a9a9a;"
+        " border-radius:3px; font-size:16px; font-weight:700; padding:2px 0; }"
+        "QPushButton:hover:enabled { background:#ffffff; }"
+        "QPushButton:disabled { background:#4a4a4a; color:#8a8a8a;"
+        " border:1px solid #5f5f5f; }")
+
+    def _make_frame_page(self) -> "tuple[QWidget, dict]":
+        """The frame page — picture, captions, the scale note and the ◀ ▶ row.
+
+        Built TWICE: the close-up window and the Detailed view tab are the same
+        thing in two places, and a second copy of the code would be a second look
+        and a second set of bugs. Both are driven by `_preview_show`, so they share
+        one frame list, one index and one background read — step forward in the tab
+        and the window is on the same frame.
+
+        Returns the page and its widgets: `img`, `cam`, `ts`, `scale`, `prev`,
+        `next`, `counter`.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(4, 4, 4, 4); lay.setSpacing(2)
+        # Explicitly dark, not "whatever the theme gives": a frame viewer has to be a
+        # dark surround or the picture's own black edges cannot be told from the page.
+        #
+        # BOTH the palette and a stylesheet, and the stylesheet is the one that
+        # matters here: main.py paints `QWidget { background:#f3f3f3 }` over the whole
+        # application, and an application stylesheet beats a widget's palette. The
+        # page came out pale grey, and with it the light-on-dark counter ("3 / 8",
+        # #eee) and the scale note (#bbb) were invisible. A widget's OWN stylesheet
+        # does win, so it is named and painted here.
+        page.setObjectName("framePage")
+        page.setStyleSheet("QWidget#framePage { background: #202020; color: #eee; }")
+        # The page itself takes the keyboard focus, and handles no key — so ← and →
+        # travel up the parent chain to `keyPressEvent` below. Focus on one of the
+        # arrow BUTTONS instead would be swallowed by Qt's own arrow-key focus
+        # navigation between them, and the keys would do nothing.
+        page.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        page.setAutoFillBackground(True)
+        pal = page.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor("#202020"))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor("#eeeeee"))
+        page.setPalette(pal)
+
+        img = QLabel()
+        img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        img.setStyleSheet("background:#1a1a1a; border-radius:3px;")
+        img.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        img.setMinimumSize(100, 100)
+        img.setScaledContents(False)      # scaled by hand, keeping the aspect
+        lay.addWidget(img, 1)
+
+        lbl_row = QHBoxLayout()
+        lbl_row.setContentsMargins(0, 0, 0, 0)
+        lbl_row.setSpacing(2)
+        cam = QLabel("")
+        cam.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        cam.setStyleSheet(
+            "font-size: 20px; font-weight: bold; color: #eee; background: #444; "
+            "padding: 2px 6px; border-radius: 2px;")
+        cam.setFixedHeight(34)
+        ts = QLabel("")
+        ts.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ts.setStyleSheet(
+            "font-size: 20px; color: #ffd54f; background: #333; "
+            "padding: 2px 6px; border-radius: 2px;")
+        ts.setFixedHeight(34)
+        lbl_row.addWidget(cam, 1)
+        lbl_row.addWidget(ts, 2)
+        lay.addLayout(lbl_row, 0)
+
+        # What the displayed intensities MEAN. Without it a frame at 3 % of full scale
+        # is indistinguishable from a broken render, and a palette is decoration rather
+        # than a reading.
+        scale = QLabel("")
+        scale.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        scale.setStyleSheet(
+            "font-size: 11px; color: #bbb; background: transparent; padding: 0 6px;")
+        lay.addWidget(scale, 0)
+
+        # Step through the frames. These arrows lived in the panel on the left, far
+        # from the picture they move — nobody found them. They belong under the frame.
+        nav = QHBoxLayout(); nav.setSpacing(8)
+        nav.addStretch(1)
+        prev = QPushButton("◀"); prev.setFixedSize(52, 30)
+        prev.setToolTip("Previous frame  (←)")
+        prev.setStyleSheet(self._NAV_BTN_CSS)
+        prev.clicked.connect(self._preview_prev)
+        nxt = QPushButton("▶"); nxt.setFixedSize(52, 30)
+        nxt.setToolTip("Next frame  (→)")
+        nxt.setStyleSheet(self._NAV_BTN_CSS)
+        nxt.clicked.connect(self._preview_next)
+        # Neither button takes the focus, so clicking one does not stop the arrow
+        # keys working — mouse and keyboard both stay live at the same time.
+        prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        nxt.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # "0 / 0" from the start, not an empty label: the row has to read as frame
+        # navigation before anything is loaded, or it looks like decoration.
+        prev.setEnabled(False)
+        nxt.setEnabled(False)
+        counter = QLabel("0 / 0")
+        counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        counter.setMinimumWidth(90)
+        counter.setStyleSheet("font-size:14px; font-weight:700; color:#eeeeee;")
+        nav.addWidget(prev)
+        nav.addWidget(counter, 0)
+        nav.addWidget(nxt)
+        nav.addStretch(1)
+        lay.addLayout(nav, 0)
+
+        return page, {"img": img, "cam": cam, "ts": ts, "scale": scale,
+                      "prev": prev, "next": nxt, "counter": counter}
+
+    def _detail_tab_is_current(self) -> bool:
+        """Is the Detailed view the tab on screen? A frame is only rendered for a
+        page somebody can see — a share read for a hidden label is 130-160 ms
+        thrown away."""
+        idx = getattr(self, "_detail_tab_idx", None)
+        return idx is not None and self._view_tabs.currentIndex() == idx
+
+    def _frame_page_visible(self) -> bool:
+        return self._frame_window_is_open() or self._detail_tab_is_current()
+
+    def _sync_detail_tab(self):
+        """Point the Detailed view at THE MARKED FRAMES — or at the whole wall when
+        nothing is marked, which is the rule every display control follows
+        (`_wall_target_paths`).
+
+        The frame being looked at is KEPT when it survives the change, so marking a
+        second tile does not throw the operator back to the start of the list."""
+        if not hasattr(self, "_detail_tab_idx") or not hasattr(self, "_wall"):
+            return
+        paths = self._wall_target_paths()
+        if not paths:
+            self._view_tabs.setTabText(self._detail_tab_idx, self._DETAIL_TAB_TITLE)
+            return
+        cells = {c.get("path"): c for c in self._wall.cells()}
+        # The wall's own order, not the selection set's — a set has none, and the
+        # arrows have to walk the frames in the order they are on screen.
+        wall_order = [c["path"] for c in self._wall.cells()
+                      if c.get("path") is not None]
+        want = set(paths)
+        ordered = [p for p in wall_order if p in want]
+        for p in paths:                      # anything not on this wall, at the end
+            if p not in cells:
+                ordered.append(p)
+        if not ordered:
+            return
+        cur = None
+        if self._preview_paths and 0 <= self._preview_idx < len(self._preview_paths):
+            cur = self._preview_paths[self._preview_idx]
+        idx = ordered.index(cur) if cur in ordered else 0
+        cams = [(cells.get(p, {}).get("cam") or Path(p).parent.name)
+                for p in ordered]
+        self._preview_set_files(ordered, "", cams, index=idx)
+        self._sync_detail_title()
+
+    def _sync_detail_title(self):
+        idx = getattr(self, "_detail_tab_idx", None)
+        if idx is None:
+            return
+        n = len(self._preview_paths)
+        txt = self._DETAIL_TAB_TITLE
+        if n:
+            txt += f"  ({self._preview_idx + 1}/{n})"
+        self._view_tabs.setTabText(idx, txt)
+
+    def keyPressEvent(self, event):
+        """← → step through the frames while the Detailed view is on screen.
+
+        Only there: on a wall the arrow keys belong to the scroll area, and stealing
+        them would make the wall unscrollable from the keyboard.
+
+        ESC UNMARKS EVERYTHING. Every click on the wall adds now, so this — and the
+        right-click menu, and a click on empty canvas — is how the whole wall comes
+        back into scope. A full wall leaves no empty canvas to click, which is why
+        the keystroke is here and not only there."""
+        if event.key() == Qt.Key.Key_Escape and self._wall_shared.sel:
+            for w in self._all_walls():
+                w.clear_selection()
+            return
+        if self._detail_tab_is_current() and len(self._preview_paths) > 1:
+            if event.key() == Qt.Key.Key_Left:
+                self._preview_prev(); return
+            if event.key() == Qt.Key.Key_Right:
+                self._preview_next(); return
+        super().keyPressEvent(event)
 
     # ── The close-up window ───────────────────────────────────────────────────
     def _frame_window_is_open(self) -> bool:
@@ -3976,6 +4257,13 @@ class ImageFinderWidget(QWidget):
         elif hasattr(self, "_btn_fit"):
             self._btn_fit.setEnabled(False)
             self._btn_fit.setText("Fit")
+        # Arriving on the Detailed view is when it gets its frames and its first
+        # render: nothing is read off the share for a page nobody is looking at.
+        if self._detail_tab_is_current():
+            self._sync_detail_tab()
+            self._preview_show()
+            # The PAGE takes the focus, and passes ← → up to keyPressEvent.
+            self._detail_page.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _results_from_files(self, files: "list[Path]") -> dict:
         """Turn a plain list of frames into the {camera: [(day, hour, path, meta,
@@ -4049,10 +4337,14 @@ class ImageFinderWidget(QWidget):
                     "status": status,
                 })
         if one_moment:
-            # Camera first, pick second: with several moments picked the wall is a
-            # tab per camera, and inside a camera's tab the tiles read in the order
-            # the moments were clicked.
-            cells.sort(key=lambda c: (c["cam"], c.get("pick") or 0))
+            # Camera first, TIME second: inside a camera's tab the tiles read in the
+            # order the frames were found. Sorting on the pick number instead put a
+            # moment and a region that both happen to be "2" next to each other in
+            # an order that means nothing on the clock.
+            def _by_time(c):
+                ts = c.get("ts_ns") or (c.get("meta") or {}).get("asked_ns")
+                return (c["cam"], str(c["day"]), int(ts or 0), c.get("pick") or 0)
+            cells.sort(key=_by_time)
             self._build_wall_tabs(cells, moment_ns=moment_ns,
                                   moments_ns=moments_ns)
             return
@@ -4066,9 +4358,17 @@ class ImageFinderWidget(QWidget):
 
     def _build_wall_tabs(self, cells: list, moment_ns: "int | None" = None,
                          moments_ns: "list | None" = None):
-        # Every tab is a wall now — the close-up moved to a window of its own — so the
-        # whole bar is rebuilt.
+        # Every wall tab is rebuilt from scratch. The Detailed view is NOT a wall and
+        # must SURVIVE that: it is lifted out of the bar first, or the loop below
+        # would delete the very page the operator is looking a frame at (and every
+        # `self._detail_view` widget with it, leaving dangling C++ objects).
         self._view_tabs.blockSignals(True)
+        det = getattr(self, "_detail_page", None)
+        if det is not None:
+            i = self._view_tabs.indexOf(det)
+            if i >= 0:
+                self._view_tabs.removeTab(i)
+            det.setParent(None)
         while self._view_tabs.count() > 0:
             page = self._view_tabs.widget(0)
             self._view_tabs.removeTab(0)
@@ -4079,7 +4379,11 @@ class ImageFinderWidget(QWidget):
         picks = [int(t) for t in (moments_ns or [])]
         if moment_ns is not None and not picks:
             picks = [int(moment_ns)]
-        if moment_ns is not None and len(picks) <= 1:
+        # A region on the wall means more than one pick per camera per day even when
+        # only one moment was clicked, so the one-wall shortcut below would collapse
+        # a mixed search into a single tab and hide half of it.
+        any_region = any(c.get("region") for c in cells)
+        if moment_ns is not None and len(picks) <= 1 and not any_region:
             # ONE moment, every camera — one wall. A tab per camera would each hold
             # a single tile, which is the opposite of what this view is for. With
             # SEVERAL moments picked that reasoning no longer holds: the wall then
@@ -4099,6 +4403,7 @@ class ImageFinderWidget(QWidget):
             self._day_wall = wall
             for c in cells:
                 self._cam_walls[c["cam"]] = wall
+            self._readd_detail_tab(det)
             self._view_tabs.blockSignals(False)
             self._last_wall_tab = idx
             self._wall = wall
@@ -4131,6 +4436,7 @@ class ImageFinderWidget(QWidget):
         idx = self._view_tabs.addTab(self._wrap_scroll(day_wall), title)
         self._wall_pages[idx] = day_wall
         self._day_wall = day_wall
+        self._readd_detail_tab(det)
         self._view_tabs.blockSignals(False)
 
         first_wall = min(self._wall_pages) if self._wall_pages else 0
@@ -4141,6 +4447,16 @@ class ImageFinderWidget(QWidget):
         self._view_tabs.setCurrentIndex(first_wall)
         self._on_view_tab_changed(first_wall)
         self._on_wall_selection_changed()
+
+    def _readd_detail_tab(self, det):
+        """Put the Detailed view back as the LAST tab after the walls were rebuilt.
+
+        Last on purpose: the walls are what a search produced and are read left to
+        right, and one frame at a time is where you go afterwards."""
+        if det is None:
+            return
+        self._detail_tab_idx = self._view_tabs.addTab(det, self._DETAIL_TAB_TITLE)
+        self._sync_detail_title()
 
     def _rebuild_baseline_combo(self, cells: list):
         self._baseline_cb.blockSignals(True)
@@ -4158,17 +4474,19 @@ class ImageFinderWidget(QWidget):
             if c.get("pick"):
                 txt = f"{c['pick']})  {txt}"
             reg = c.get("region") or {}
-            if reg.get("index"):
-                txt += f"   region {reg['index']}"
-                if reg.get("t_start_ns"):
-                    try:
-                        _a = datetime.fromtimestamp(
-                            int(reg["t_start_ns"]) / 1e9, tz=timezone.utc)
-                        if PRAGUE is not None:
-                            _a = _a.astimezone(PRAGUE)
-                        txt += "  " + _a.strftime("%H:%M:%S")
-                    except Exception:
-                        pass
+            # NOT "region 2" after a leading "2)" — the number in front already
+            # names the pick, and one run of numbers now covers both kinds. What
+            # the range still adds is the time it STARTED, which the frame's own
+            # time does not say.
+            if reg.get("t_start_ns"):
+                try:
+                    _a = datetime.fromtimestamp(
+                        int(reg["t_start_ns"]) / 1e9, tz=timezone.utc)
+                    if PRAGUE is not None:
+                        _a = _a.astimezone(PRAGUE)
+                    txt += "   from " + _a.strftime("%H:%M:%S")
+                except Exception:
+                    pass
             self._baseline_cb.addItem(txt, i)
         self._baseline_cb.blockSignals(False)
 
@@ -4197,9 +4515,10 @@ class ImageFinderWidget(QWidget):
         self._wall_draw_btns: dict = {}
         self._wall_shape_colors = getattr(self, "_wall_shape_colors", {})
         self._wall_color_btns = getattr(self, "_wall_color_btns", {})
-        cells = (("circle", "Circle", "mark_circle", QColor(255, 255, 0, 230), 0, 0),
-                 ("square", "Square", "mark_square", QColor(0, 200, 255, 230), 0, 1),
-                 ("cross",  "Cross",  "mark_cross",  QColor(0, 255, 0, 220),   1, 0))
+        # The bare shape, the same one the Image Slider's Draw buttons show.
+        cells = (("circle", "Circle", "shape_circle", QColor(255, 255, 0, 230), 0, 0),
+                 ("square", "Square", "shape_square", QColor(0, 200, 255, 230), 0, 1),
+                 ("cross",  "Cross",  "shape_cross",  QColor(0, 255, 0, 220),   1, 0))
         for kind, label, icon, col, r, c in cells:
             btn = keep(QPushButton(label))
             _set_action_icon(btn, icon)
@@ -4274,6 +4593,18 @@ class ImageFinderWidget(QWidget):
 
         self._sel_wall_lbl = QLabel("0 frames selected")
         self._sel_wall_lbl.setStyleSheet("color:#888; font-size:11px;")
+        # The one place the marking gestures are written down. They are not
+        # guessable, and the count above is what the operator is already looking at
+        # when wondering how to change it.
+        self._sel_wall_lbl.setToolTip(
+            "Every control in this group aims at the marked frames — or at the "
+            "whole wall when nothing is marked.\n\n"
+            "Every click ADDS: click picture after picture and all of them stay "
+            "marked. Click a marked one again to let that one go.\n"
+            "Shift+click marks a whole CAMERA (every day it has on the wall), and "
+            "adds it to whatever is already marked.\n"
+            "Esc, or right click → Unmark every picture, lets everything go.\n\n"
+            "Double click, or right click → View, opens a picture close up.")
         self._sel_wall_lbl.setAlignment(Qt.AlignmentFlag.AlignRight |
                                         Qt.AlignmentFlag.AlignVCenter)
         keep(self._sel_wall_lbl)
@@ -4351,6 +4682,9 @@ class ImageFinderWidget(QWidget):
                 ("1 frame selected" if n == 1 else f"{n} frames selected"))
         for w in self._all_walls():
             w.update()
+        # The Detailed view walks WHAT IS MARKED, so marking is what re-aims it.
+        # (`_sync_detail_tab` goes through `_preview_set_files`, which renders.)
+        self._sync_detail_tab()
 
     def _sync_wall_display(self):
         """Push the display controls onto the walls.
@@ -4367,13 +4701,16 @@ class ImageFinderWidget(QWidget):
             # Scoped: the slider moved THESE frames and must leave the rest of the wall
             # exactly where it was, so the shared values are held at what they were.
             shared = getattr(self, "_wall_display_shared", (auto, gamma, contrast, offset))
+            # The palette follows the same rule now (see _DayWall.apply_gradient), so
+            # the wall-wide one is likewise held at what it was.
+            grad_shared = getattr(self, "_wall_grad_shared", grad)
         else:
             shared = (auto, gamma, contrast, offset)
+            grad_shared = grad
         self._wall_display_shared = shared
-        # The palette is a colour scheme, not an intensity, so it always applies to the
-        # whole wall — a per-frame palette would be a second legend on the same picture.
+        self._wall_grad_shared = grad_shared
         for w in self._all_walls() or [self._wall]:
-            w.set_display(grad, *shared)
+            w.set_display(grad_shared, *shared)
             if sel:
                 w.apply_adjust(sel, contrast, offset, gamma)
 
@@ -4406,15 +4743,25 @@ class ImageFinderWidget(QWidget):
             return
         cell = cells[idx]
         menu = QMenu(self)
-        act_open = menu.addAction("🔍 Open close-up")
+        act_open = menu.addAction("🔍 View (close-up)")
         act_again = menu.addAction("↻ Search again…")
         act_pick = menu.addAction("📂 Pick image from folder…")
         menu.addSeparator()
         is_base = (self._wall.baseline_idx() == idx)
         act_ref = menu.addAction("Clear reference day" if is_base else "Set as reference day")
         act_clear = menu.addAction("Clear marks on this frame")
+        menu.addSeparator()
+        # Every click on the wall adds, so this is the one-gesture way back to
+        # "nothing marked = the whole wall" — a full wall has no empty canvas to
+        # click on. Esc does the same thing.
+        act_unmark = menu.addAction("Unmark every picture")
+        act_unmark.setEnabled(bool(self._wall_shared.sel))
         chosen = menu.exec(gpos)
         if chosen is None:
+            return
+        if chosen is act_unmark:
+            for w in self._all_walls():
+                w.clear_selection()
             return
         if chosen is act_open:
             self._on_wall_tile_clicked(idx)
@@ -4700,12 +5047,17 @@ class ImageFinderWidget(QWidget):
             if vw > 1 and vh > 1 and (old[0] <= 1 or old[1] <= 1):
                 wall.set_canvas(vw, vh)
             wall._relayout()
+            factor = wall.export_scale()
             img = wall.composite_image()
         finally:
             if old[0] and old[1]:
                 wall.set_canvas(old[0], old[1])
         if img is None:
             return None
+        # The size is worth saying: it is what decides whether every camera in the
+        # file can actually be read, and it is not a number the operator can guess.
+        self._log(f"SAVE VIEW [{tab_name}]: {img.width()} × {img.height()} px "
+                  f"({factor:.1f}× the screen)")
         line = self._provenance_line(self._wall_provenance(wall, tab_name))
         if line:
             try:
@@ -4866,43 +5218,10 @@ class ImageFinderWidget(QWidget):
         self._log("STOP: cancelled pending scans.")
 
     # ── Inline preview panel ──────────────────────────────────────────────────
-    def _preview_load_cam(self, cam: dict):
-        """Enumerate one camera's folder in the background, then show its first
-        image. Called from the picked-cameras list."""
-        folder = cam.get("path")
-        if folder is None:
-            return
-        cam_name = cam.get("label") or folder.name
-        self._preview_from_view = False
-
-        self._preview_gen += 1
-        scan_gen = self._preview_gen
-
-        def _scan():
-            try:
-                if not folder.exists():
-                    return
-                files = sorted(
-                    [p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS],
-                    key=lambda p: p.name)
-            except Exception:
-                files = []
-
-            def _on_done():
-                if getattr(self, "_preview_gen", 0) != scan_gen:
-                    return
-                if not files:
-                    self._preview_counter.setText("0 / 0")
-                    return
-                self._preview_paths = files
-                self._preview_cam_names = []
-                self._preview_idx   = 0
-                self._preview_cam   = cam_name
-                self._preview_show()
-
-            QTimer.singleShot(0, _on_done)
-
-        threading.Thread(target=_scan, daemon=True).start()
+    # `_preview_load_cam` lived here: the whole-folder scan a click in the picked
+    # camera list used to trigger, so the close-up could open on that camera's
+    # first frame. The click marks the camera on the wall now and opens nothing,
+    # and no other caller ever wanted a camera's raw folder.
 
     def _preview_set_files(self, files: list, cam_name: str = "",
                            cam_names: "list[str] | None" = None,
@@ -4943,18 +5262,22 @@ class ImageFinderWidget(QWidget):
         energy_text = getattr(self, "_preview_energy_text", "")
         if energy_text:
             pm = self._paint_pv_bar(pm, energy_text)
-        self._preview_scale_lbl.setText(getattr(self, "_preview_scale_note", ""))
+        note = getattr(self, "_preview_scale_note", "")
         # Park the greyed-out sliders on what the Auto passes actually applied to this
         # frame, so the number on screen is the number in the picture (same contract as
         # the Slider tab's Auto controls).
         self._park_auto_bc(getattr(self, "_bc_applied", None))
-        lbl = self._preview_lbl
-        avail_w = max(lbl.width(),  200)
-        avail_h = max(lbl.height(), 200)
-        pm = pm.scaled(avail_w, avail_h,
-                       Qt.AspectRatioMode.KeepAspectRatio,
-                       Qt.TransformationMode.SmoothTransformation)
-        lbl.setPixmap(pm)
+        # Both pages get it — the close-up window and the Detailed view tab. One is
+        # usually hidden, and scaling for a hidden label costs nothing worth avoiding
+        # while it keeps the two in step: switch to the other and the frame is there.
+        for view in getattr(self, "_frame_views", []):
+            view["scale"].setText(note)
+            lbl = view["img"]
+            avail_w = max(lbl.width(),  200)
+            avail_h = max(lbl.height(), 200)
+            lbl.setPixmap(pm.scaled(avail_w, avail_h,
+                                    Qt.AspectRatioMode.KeepAspectRatio,
+                                    Qt.TransformationMode.SmoothTransformation))
 
     @staticmethod
     def _paint_pv_bar(pm: QPixmap, energy_text: str) -> QPixmap:
@@ -5005,15 +5328,18 @@ class ImageFinderWidget(QWidget):
         idx   = self._preview_idx
         total = len(self._preview_paths)
         path  = self._preview_paths[idx]
-        self._preview_counter.setText(f"{idx + 1} / {total}")
-        self._prev_btn.setEnabled(total > 1)
-        self._next_btn.setEnabled(total > 1)
         # Use per-file cam name if available, fallback to folder name
         per_file_cam = (self._preview_cam_names[idx]
                         if self._preview_cam_names and idx < len(self._preview_cam_names)
                         else None)
         raw_cam = per_file_cam or self._preview_cam or path.parent.name
-        self._preview_cam_lbl.setText(extract_display_label(raw_cam))
+        cam_txt = extract_display_label(raw_cam)
+        for view in getattr(self, "_frame_views", []):
+            view["counter"].setText(f"{idx + 1} / {total}")
+            view["prev"].setEnabled(total > 1)
+            view["next"].setEnabled(total > 1)
+            view["cam"].setText(cam_txt)
+        self._sync_detail_title()
         ns = extract_ns_from_stem(path.stem)
         if ns is not None:
             try:
@@ -5029,7 +5355,8 @@ class ImageFinderWidget(QWidget):
                 ts_str = path.stem
         else:
             ts_str = path.stem
-        self._preview_ts_lbl.setText(ts_str)
+        for view in getattr(self, "_frame_views", []):
+            view["ts"].setText(ts_str)
 
         # PV overlay text for the bar painted in _on_preview_ready (main thread).
         self._preview_energy_text = ""
@@ -5043,11 +5370,12 @@ class ImageFinderWidget(QWidget):
         # The table reports on THIS frame, so it follows the preview.
         self._pv_refresh_table()
 
-        # With the close-up shut there is nothing to draw into. The captions and the
-        # PV table above still had to be updated — they are read from the panel — but
-        # rendering the frame would be a read off the share for a picture nobody can
-        # see. Opening the window calls back in here.
-        if not self._frame_window_is_open():
+        # With the close-up shut AND the Detailed view tab not on screen there is
+        # nothing to draw into. The captions and the PV table above still had to be
+        # updated — they are read from the panel — but rendering the frame would be a
+        # read off the share for a picture nobody can see. Opening the window, or
+        # arriving on the tab, calls back in here.
+        if not self._frame_page_visible():
             return
 
         self._preview_gen += 1
@@ -5074,11 +5402,13 @@ class ImageFinderWidget(QWidget):
                 bc_out: dict = {}
                 arr8 = _render_u8(arr, auto, full_scale, gamma, contrast, offset, bc_out)
                 self._bc_applied = bc_out
-                g_applied = (bc_out.get("gamma")
-                             if (not auto and img_scale.is_auto_gamma(gamma)) else None)
-                self._preview_scale_note = _scale_note(img.info, arr, auto, full_scale,
-                                                       gamma, path, img.mode,
-                                                       contrast, offset, g_applied)
+                # The note names what was APPLIED, so it reads Auto's numbers out of
+                # bc_out rather than the zeros the widgets hold while Auto is on.
+                self._preview_scale_note = _scale_note(
+                    img.info, arr, auto, full_scale, gamma, path, img.mode,
+                    int(bc_out.get("contrast", contrast)),
+                    int(bc_out.get("offset", offset)),
+                    bc_out.get("gamma"))
                 lut = GRADIENTS.get(grad_name)
                 if lut is not None:
                     pil_img = PilImage.fromarray(
@@ -5099,9 +5429,10 @@ class ImageFinderWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # The picture lives in the close-up window now, which has its own resize
-        # handler; re-fitting on the tab's resize would render for nothing.
-        if self._preview_paths and self._frame_window_is_open():
+        # The close-up window has its own resize handler; this one is for the
+        # Detailed view tab, which grows with the tab itself. Debounced by 50 ms so
+        # dragging the window edge does not re-render on every pixel.
+        if self._preview_paths and self._frame_page_visible():
             QTimer.singleShot(50, self._preview_show)
 
     def _capture_selection_state(self) -> dict[str, int]:
@@ -5128,13 +5459,26 @@ class ImageFinderWidget(QWidget):
         return "" if it is None else (it.data(Qt.ItemDataRole.UserRole) or "")
 
     def _on_sel_table_clicked(self, index):
-        """Single click in the picked list → preview that camera's first frame."""
-        cam = self._cam_by_name(self._sel_table_name(index.row()))
-        if cam is not None:
-            # The frame is shown in the close-up window, so the click has to open it —
-            # otherwise the list says "click to preview" and nothing appears.
-            self._show_frame_window()
-            self._preview_load_cam(cam)
+        """Single click in the picked list → MARK that camera on the wall.
+
+        It does not open anything. The click used to throw the close-up window
+        over the wall being compared, which is the same gesture the tiles
+        themselves gave up for exactly that reason: a click marks, and looking
+        closely is its own act (double click a tile, right click → View, or the
+        Detailed view tab).
+
+        EVERY CLICK ADDS a camera to what is marked, and clicking one that is
+        already marked takes it back off — the same rule as on the wall itself,
+        where a click used to drop whatever was marked before it."""
+        name = self._sel_table_name(index.row())
+        if not name:
+            return
+        wall = getattr(self, "_wall", None)
+        if wall is None:
+            return
+        label = extract_display_label(name)
+        if not wall.mark_camera(label):
+            self._log(f"{label}: nothing on the wall to mark yet.")
 
     def _on_sel_table_double_clicked(self, index):
         """Double-click in the picked list → unpick that camera."""
@@ -5169,7 +5513,15 @@ class ImageFinderWidget(QWidget):
         # nothing to do with which files are in a folder, and throwing the listing
         # away cost a re-read of the share for nothing.
         self._log(f"GRADIENT -> {name}")
+        # The palette is aimed like every other display control: at the marked frames,
+        # or at the whole wall when nothing is marked. It used to be wall-wide always;
+        # picking out the one day worth a colour scale is the same act as opening up
+        # its brightness, and the tile says "(own palette)" so nothing is hidden.
+        sel = list(self._wall_shared.sel)
         self._sync_wall_display()
+        if sel:
+            for w in self._all_walls() or [self._wall]:
+                w.apply_gradient(sel, name)
         if self._preview_paths:
             self._preview_show()
 
@@ -5179,12 +5531,11 @@ class ImageFinderWidget(QWidget):
         each other:
           - Auto on → that row's own slider and reset button are greyed out (the
             app-wide 'checkbox beats slider' rule).
-          - Either Auto contrast or Auto brightness on → the whole Gamma row goes dead.
-            Both of them set the frame's two ends themselves, so gamma has nothing left
-            to bend and the render drops it (see img_scale.to_u8). The Slider tab keeps
-            its gamma row alive under Auto brightness because its subtraction mode still
-            uses it; this tab has no such mode, so a live-but-ignored slider would just
-            be a lie.
+        One rule, and it is the same for all three rows: an Auto box speaks for its own
+        row and for nothing else. Gamma used to go dead whenever either of the other two
+        Autos was on, because both of those ran a stretch that set the frame's two ends
+        itself. Each is now its own slider set automatically (see img_scale.render_u8),
+        and gamma composes with them exactly as it always did with the manual sliders.
         The name labels and the numeric readouts stay live either way: while Auto is on,
         the readout is exactly what the user wants to see — the value Auto picked, put
         there by _park_auto_bc."""
@@ -5194,7 +5545,7 @@ class ImageFinderWidget(QWidget):
         self._btn_contrast_reset.setEnabled(c_live)
         self._bright_slider.setEnabled(b_live)
         self._btn_bright_reset.setEnabled(b_live)
-        gamma_usable = c_live and b_live
+        gamma_usable = True
         g_live = gamma_usable and not self._cb_gamma_auto.isChecked()
         self._cb_gamma_auto.setEnabled(gamma_usable)
         self._lbl_gamma.setEnabled(gamma_usable)
@@ -5208,20 +5559,18 @@ class ImageFinderWidget(QWidget):
 
         Honours the 'Auto checkbox overrides its own slider' rule of each pair, exactly
         as the Slider tab does: Auto contrast zeroes the manual contrast, Auto brightness
-        zeroes the manual offset, and each leaves the other one live. Both Autos are the
-        same percentile pass (see img_scale.stretch_u8), so `auto` is set by either and
-        ticking both does not level the frame twice."""
-        auto_c = self._cb_auto_stretch.isChecked()
-        auto_b = self._cb_bright_auto.isChecked()
-        auto = auto_c or auto_b
-        if auto:
-            gamma = img_scale.GAMMA_SLIDER_NEUTRAL
-        elif self._cb_gamma_auto.isChecked():
-            gamma = img_scale.GAMMA_SLIDER_AUTO
-        else:
-            gamma = int(self._gamma_slider.value())
-        contrast = 0 if auto_c else int(self._contrast_slider.value())
-        offset = 0 if auto_b else int(self._bright_slider.value())
+        zeroes the manual offset, and each leaves the other one live. `auto` is the
+        AUTO_* mask of the boxes that are on — each fills in the value of ITS OWN control
+        from the frame (see img_scale.render_u8), so the two are different operations and
+        ticking both is the full stretch."""
+        auto = img_scale.auto_mask(self._cb_auto_stretch.isChecked(),
+                                   self._cb_bright_auto.isChecked())
+        gamma = (img_scale.GAMMA_SLIDER_AUTO if self._cb_gamma_auto.isChecked()
+                 else int(self._gamma_slider.value()))
+        contrast = (0 if (auto & img_scale.AUTO_CONTRAST)
+                    else int(self._contrast_slider.value()))
+        offset = (0 if (auto & img_scale.AUTO_BRIGHT)
+                  else int(self._bright_slider.value()))
         return auto, gamma, contrast, offset
 
     def _sync_bc_value_labels(self):
@@ -6504,8 +6853,19 @@ class ImageFinderWidget(QWidget):
         """One moment — the single-moment way in, kept for every old caller."""
         self._load_moments([int(ts_ns)])
 
-    def _load_moments(self, ts_list: "list[int]"):
-        """Every picked camera's frame at every picked moment, onto one wall.
+    def _load_moments(self, ts_list: "list"):
+        """Every picked camera's frame at every pick, onto one wall.
+
+        A PICK is either a moment that was clicked or a marked region, and this one
+        path serves both: a region is nothing more than a moment worked out from the
+        peak of the primary PV inside it, and both ends at the same resolver
+        (`_resolve_moment_one`). Keeping two engines is what made a search of four
+        moments AND four regions return only the moments.
+
+        `ts_list` is a list of nanosecond timestamps, or of dicts
+        `{"ts": ns, "kind": "moment"|"region", "index": n, "region": {…}}` — the
+        dicts carry which pick a tile answers, so a caption can say "region 2" and
+        the wall can put the tiles in the order the frames came back.
 
         (camera, moment) pairs already answered come straight out of memory; only
         the rest are asked for, sixteen at a time, through the shared folder cache.
@@ -6514,10 +6874,30 @@ class ImageFinderWidget(QWidget):
         a handful of moments costs barely more than picking one."""
         cams = self._checked_cameras()
         moments: list = []
-        for t in ts_list or []:
-            t = int(t)
-            if t not in moments:
-                moments.append(t)      # pick order, not sorted — one numbering
+        info: dict = {}
+        for p in ts_list or []:
+            if isinstance(p, dict):
+                t = int(p.get("ts"))
+                rec = {"kind": p.get("kind") or "moment",
+                       "index": p.get("index"),
+                       "region": p.get("region")}
+            else:
+                t = int(p)
+                rec = {"kind": "moment", "index": None, "region": None}
+            if t in info:
+                continue               # the same instant asked for twice is one tile
+            info[t] = rec
+            moments.append(t)          # pick order, not sorted — one numbering
+        # A pick with no number of its own gets its place in the list, so the caption
+        # and the graph agree even when the caller handed over bare timestamps.
+        n_moment = 0
+        for t in moments:
+            rec = info[t]
+            if rec["kind"] == "moment":
+                n_moment += 1
+                if rec["index"] is None:
+                    rec["index"] = n_moment
+        self._pick_info = info
         if not moments:
             return
         if not cams:
@@ -6555,8 +6935,15 @@ class ImageFinderWidget(QWidget):
         head = when.strftime("%d.%m.%Y %H:%M:%S")
         if len(moments) > 1:
             head += f" + {len(moments) - 1} more"
-        self._log(f"[moment] {head} — {len(names)} camera(s) × "
-                  f"{len(moments)} moment(s), {len(jobs)} to look for")
+        # Both kinds are counted, and the product is spelled out: "how many cameras
+        # times how many picks" is the number the operator checks the wall against.
+        n_reg = sum(1 for t in moments if info[t]["kind"] == "region")
+        what = f"{len(moments) - n_reg} moment(s)"
+        if n_reg:
+            what += f" + {n_reg} region(s)"
+        self._log(f"[moment] {head} — {len(names)} camera(s) × {what} = "
+                  f"{len(names) * len(moments)} frame(s) wanted, "
+                  f"{len(jobs)} to look for")
         if not jobs:
             self._on_moment_done(gen, 0.0, 0)
             return
@@ -6578,8 +6965,11 @@ class ImageFinderWidget(QWidget):
         if gen != self._moment_gen or not moments:
             return
         # The same ordinal the graph drew and the label listed — one numbering for
-        # the whole feature, so tile 2 IS pick 2.
+        # the whole feature, so tile 2 IS pick 2. `_pick_info` carries it, because a
+        # region's number is its own (region 2 on the graph is region 2 on the wall)
+        # and is NOT its place in the combined list.
         order = {t: i + 1 for i, t in enumerate(moments)}
+        info = getattr(self, "_pick_info", None) or {}
         results: dict = {}
         found = 0
         for it in self._moment_items:
@@ -6594,8 +6984,15 @@ class ImageFinderWidget(QWidget):
                 dt = dt.astimezone(PRAGUE)
             meta = {"ptm1": None, "sbw4": None, "source": "pv",
                     "asked_ns": asked, "note": it.get("note") or ""}
-            if len(moments) > 1:
-                meta["pick"] = order.get(asked)
+            rec = info.get(asked) or {}
+            if rec.get("kind") == "region":
+                # A region-driven tile carries its region, which is what names it in
+                # the reference-day list, the row banner and the saved file's strip.
+                meta["region"] = rec.get("region")
+                meta["pick_kind"] = "region"
+                meta["pick"] = rec.get("index")
+            elif len(moments) > 1:
+                meta["pick"] = rec.get("index") or order.get(asked)
             if path is not None:
                 found += 1
                 status = "found"
@@ -6609,9 +7006,11 @@ class ImageFinderWidget(QWidget):
         cost = ("from memory" if ms <= 0 else
                 f"found in {ms / 1000:.1f} s, {reads} folder read(s)")
         misses = len(self._moment_items) - found
-        note = f"[moment] {found} frame(s) — {cost}"
+        n_cams = len(self._checked_cameras())
+        note = (f"[moment] {found} of {n_cams * len(moments)} frame(s) "
+                f"({n_cams} camera(s) × {len(moments)} pick(s)) — {cost}")
         if misses:
-            note += (f"   ·   {misses} (camera, moment) pair(s) had nothing "
+            note += (f"   ·   {misses} (camera, pick) pair(s) had nothing "
                      "near the moment picked")
         self._log(note)
 
@@ -7414,23 +7813,165 @@ class ImageFinderWidget(QWidget):
         if stamps:
             self._shot_stamps = stamps
         cond = cfg.get("condition")
-        moments = [int(t) for t in (cfg.get("moments_ns") or [])]
-        if not moments and cfg.get("moment_ns") is not None:
-            moments = [int(cfg["moment_ns"])]
-        if moments:
-            # Moments, pointed at. Nothing to search FOR, so it skips the
-            # day-and-camera search engine entirely and goes to the frames.
-            self._load_moments(moments)
-            return
         if cond:
             self._log(f"VIEW (PV condition): {len(cfg['cameras'])} cams × "
                       f"{len(cfg['days'])} day(s), {cond['label']} {cond['op']} "
                       f"{cond['value']:g} over {cond['scope']}")
-        else:
-            self._log(f"VIEW (PV region): {len(cfg['cameras'])} cams × "
-                      f"{len(cfg['days'])} day(s), "
-                      f"{sum(len(v) for v in cfg['regions'].values())} region(s)")
+            self._run_multiday_search(cfg)
+            return
+        moments = [int(t) for t in (cfg.get("moments_ns") or [])]
+        if not moments and cfg.get("moment_ns") is not None:
+            moments = [int(cfg["moment_ns"])]
+        cfg["moment_nos"] = [int(n) for n in (cfg.get("moment_nos") or [])]
+        regions_by_day = cfg.get("regions") or {}
+        if moments or regions_by_day:
+            # BOTH HALVES, ALWAYS. Moments used to win outright and the regions were
+            # dropped on the floor here — four marked spans silently gone, on a
+            # button that had already said it would search only the moments. They go
+            # on ONE wall now, because a region is only a moment worked out from the
+            # PV's peak and both end at the same frame resolver.
+            self._start_pick_search(cfg, moments, regions_by_day)
+            return
+        self._log(f"VIEW (PV region): {len(cfg['cameras'])} cams × "
+                  f"{len(cfg['days'])} day(s), no pick")
         self._run_multiday_search(cfg)
+
+    def _start_pick_search(self, cfg: dict, moments: "list[int]",
+                           regions_by_day: dict):
+        """Moments and marked regions, resolved into one list of picks.
+
+        A moment is already an instant. A region is not: the instant to pull a frame
+        from is the PEAK of the primary PV inside it, which costs one archiver read
+        per (day, region) and nothing per camera — `_region_targets` is written that
+        way on purpose. So the regions are turned into instants first, on a worker,
+        and then everything goes down the single `_load_moments` path.
+        """
+        # The number a moment wears comes from the window that picked it, so a set
+        # tidied up in there (2 deleted, 1-3-4 left) reaches the wall wearing the
+        # numbers that were on the graph.
+        nos = [int(n) for n in (cfg.get("moment_nos") or [])]
+        picks: list = [{"ts": int(t), "kind": "moment",
+                        "index": (nos[i] if i < len(nos) else i + 1)}
+                       for i, t in enumerate(moments)]
+        n_reg = sum(len(v) for v in regions_by_day.values())
+        self._log(f"VIEW (PV picks): {len(cfg['cameras'])} cams × "
+                  f"({len(picks)} moment(s) + {n_reg} region(s))")
+        if not n_reg:
+            self._load_moments(picks)
+            return
+        primary = cfg.get("primary_channel")
+        if not primary:
+            # The dialog refuses to close in this state; a stale config could still
+            # reach here, and dropping the regions in silence is the bug being fixed.
+            QMessageBox.information(
+                self, "PV Search",
+                f"{n_reg} region(s) are marked, but no primary PV is chosen — the "
+                "peak inside a region cannot be found without one. Pick one in PV "
+                "Search, or clear the regions.")
+            if picks:
+                self._load_moments(picks)
+            return
+        self._resolve_region_picks_async(
+            regions_by_day, primary,
+            on_done=lambda reg_picks: self._load_moments(picks + reg_picks))
+
+    def _resolve_region_picks_async(self, regions_by_day: dict,
+                                    primary_channel: str, on_done):
+        """Each marked region → the instant of its primary-PV peak, in the background.
+
+        Days × regions archiver reads at up to three seconds each, so this cannot sit
+        on the main thread: a five-day search with four regions a day would freeze the
+        window for a minute with nothing on screen to say why. Hence the small
+        progress box with a Cancel, the same shape the multi-day search uses."""
+        self._region_gen = getattr(self, "_region_gen", 0) + 1
+        gen = self._region_gen
+        total = sum(len(v) for v in regions_by_day.values())
+        cancel_evt = threading.Event()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Reading the marked regions…")
+        dlg.setMinimumWidth(420)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(f"Looking for the peak of {primary_channel} in "
+                     f"{total} marked region(s)…")
+        lbl.setWordWrap(True)
+        bar = QProgressBar()
+        bar.setRange(0, total)
+        bar.setFormat("%v / %m")
+        lay.addWidget(lbl)
+        lay.addWidget(bar)
+        btn = QPushButton("Cancel")
+
+        def _cancel():
+            cancel_evt.set()
+            lbl.setText("Cancelling… (finishing the current request)")
+            btn.setEnabled(False)
+        btn.clicked.connect(_cancel)
+        lay.addWidget(btn)
+
+        # NO PARENT: a signal carrier parented to the widget would outlive every
+        # search it was made for (~3 KB each). This one is held by the local frame
+        # and by the worker's closure, so it dies with them.
+        sig = _RegionPickSignals()
+        done_n = {"n": 0}
+
+        def _on_progress(step: int, text: str):
+            # `step` is how many regions this message finished — 0 for a "now reading
+            # this day" line, or the bar would run past its own maximum.
+            done_n["n"] += int(step)
+            bar.setValue(done_n["n"])
+            lbl.setText(text)
+
+        def _on_done(picks, g: int):
+            try:
+                dlg.accept()
+            except RuntimeError:
+                pass
+            if g != self._region_gen:
+                return
+            # Out of the nested event loop first: the wall load must not start while
+            # the progress box is still the thing running the loop.
+            got = list(picks or [])
+            QTimer.singleShot(0, lambda: on_done(got))
+
+        sig.progress.connect(_on_progress)
+        sig.log_msg.connect(self._log)
+        sig.done.connect(_on_done)
+
+        def worker():
+            out: list = []
+            try:
+                for day in sorted(regions_by_day.keys(), key=str):
+                    regs = regions_by_day[day] or []
+                    if cancel_evt.is_set():
+                        break
+                    sig.progress.emit(0, f"{day}: reading {len(regs)} region(s)…")
+                    targets = self._region_targets(
+                        day, regs, primary_channel, cancelled=cancel_evt,
+                        log_fn=lambda m: sig.log_msg.emit(m))
+                    for tgt in targets:
+                        info = tgt.get("info") or {}
+                        out.append({
+                            "ts": int(tgt["target_ns"]),
+                            "kind": "region",
+                            "index": info.get("index"),
+                            "region": {
+                                "index": info.get("index"),
+                                "count": info.get("count"),
+                                "label": info.get("label"),
+                                "color": info.get("color"),
+                                "t_start_ns": int(tgt["region"][0]),
+                                "t_end_ns": int(tgt["region"][1]),
+                            },
+                        })
+                        sig.progress.emit(1, f"{day}: region {info.get('index')} done")
+            except Exception as e:
+                sig.log_msg.emit(f"[regions] could not be read — {e}")
+            sig.done.emit(out, gen)
+
+        threading.Thread(target=worker, daemon=True).start()
+        dlg.exec()
 
     def _run_condition_search(self, cfg: dict, condition: dict):
         """PV-condition search: find ONE moment, then take it from every camera.
@@ -9342,7 +9883,13 @@ _COND_MAX_FRAME_TRIES = 4
 # How far the pointer may travel and still count as a CLICK rather than a drag.
 # Measured in screen pixels: a few seconds is an enormous drag on a zoomed-in axis
 # and no movement at all across a week.
-_PV_CLICK_SLOP_PX = 5
+#
+# TWO pixels, not five. ANY drag marks a range; only a press that did not move
+# picks a moment. On a whole-day axis five pixels is four minutes — a band the
+# operator deliberately dragged, plainly visible on screen — and it was being
+# thrown away and turned into a single moment instead. This is a tremor
+# allowance for a click, nothing more.
+_PV_CLICK_SLOP_PX = 2
 
 
 def _day_bounds_ns_for(day) -> "tuple[int, int]":
@@ -9392,8 +9939,9 @@ class _SaveViewDialog(QDialog):
             b.setStyleSheet(_RADIO_STYLE)
         lay.addWidget(self._this)
         lay.addWidget(self._all)
-        note = QLabel("Rows below the fold are included — the file holds the "
-                      "whole view, not what happens to be on screen.")
+        note = QLabel("Rows below the fold and columns off to the right are "
+                      "included, each frame at its own full resolution — the file "
+                      "holds the whole view, not what happens to be on screen.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#555;font-size:10px;")
         lay.addWidget(note)
@@ -9420,12 +9968,28 @@ class _PVBrowseDialog(QDialog):
 
         self._filter = QLineEdit()
         self._filter.setPlaceholderText("Type to filter channels…")
+        self._filter.setStyleSheet("background:#ffffff;color:#111111;")
         self._filter.textChanged.connect(self._apply_filter)
         lay.addWidget(self._filter)
 
         self._list = QListWidget()
         self._list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._list.itemDoubleClicked.connect(lambda *_: self.accept())
+        # White cells, dark ink, a LIGHT blue band on the picked row. Left to the
+        # style this box came out with a near-black ground and the selected channel
+        # written in dark ink on black — the one row you had just clicked was the
+        # one that could not be read.
+        self._list.setStyleSheet(
+            "QListWidget { background:#ffffff; color:#111111;"
+            " border:1px solid #b0b0b0; }"
+            "QListWidget::item { padding:2px 3px; }"
+            "QListWidget::item:selected { background:#cfe4fb; color:#111111; }"
+            "QListWidget::item:hover { background:#eef5fd; }"
+            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
+            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
+            " border-radius:3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            " { height:0px; }")
         lay.addWidget(self._list, 1)
 
         self._status = QLabel("Loading channels…")
@@ -9523,7 +10087,19 @@ class PVRegionSearchDialog(QDialog):
     def __init__(self, cams: list, initial_qdates, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PV Search")
-        self.resize(1180, 800)
+        # As large as the screen allows: six curves, up to five value axes and the
+        # table of marked ranges all live on the right-hand side, and at 1180×800
+        # the plot itself was left about 560 px wide.
+        # …but never larger than the screen it opens on, or the Search button at
+        # the foot of the sidebar lands under the taskbar.
+        _w, _h = 1520, 960
+        try:
+            _av = QApplication.primaryScreen().availableGeometry()
+            _w = min(_w, _av.width() - 40)
+            _h = min(_h, _av.height() - 60)
+        except Exception:
+            pass
+        self.resize(max(1100, _w), max(720, _h))
         self._cams = cams
         self._regions: list[dict] = []      # {id, t_start_ns, t_end_ns, color, day}
         self._region_seq = 0
@@ -9539,12 +10115,25 @@ class PVRegionSearchDialog(QDialog):
         # sitting at when the day opened. Without it a setting that last moved
         # yesterday draws as nothing at all today.
         self._seeds: dict = {}
+        # (region id, channel) → the five number cells already worked out for it.
+        # Every archived sample of every plotted PV over every marked range is read
+        # to fill them, so a change that touches no range — clicking one more
+        # moment — redraws the table out of this instead. Thrown away whenever the
+        # series themselves change.
+        self._stat_cache: dict = {}
         # Extra y axes (one per unit beyond the first). Kept so a redraw can take
         # them off the figure — they belong to the drawing, not to the window.
         self._axes_extra: list = []
         self._pv_colour: "dict[str, str]" = {}
         # Channels the operator has put on an axis of their own — see _unit_key_for.
+        # ONE CHANNEL AT A TIME: the set is keyed by channel, the row that carries
+        # it wears an amber band, and the button under the list only ever adds or
+        # removes the row that is selected.
         self._own_axis: "set[str]" = set()
+        # Units typed in Edit for a channel the shared PV list does not know. The
+        # registry is still the master for everything it holds; this is the only
+        # place a Browse-added channel can be given the unit that decides its axis.
+        self._local_unit: "dict[str, str]" = {}
         # formula name → why it has no curve (unbound letter, no source, too many
         # points). Printed rather than left as a silent gap.
         self._derived_reason: "dict[str, str]" = {}
@@ -9553,6 +10142,9 @@ class PVRegionSearchDialog(QDialog):
         # picked; the window says which, rather than quietly drawing it.
         self._alias_used: "dict[str, str]" = {}
         self._load_gen = 0
+        # One sentence to put in front of the next load's own status line — see
+        # _on_series_loaded.
+        self._status_note = ""
         self._span = None                   # left drag — mark a region
         self._zoom_span = None              # right drag — zoom the time axis
         # What the strip of controls under the graph is set to. `ax.clear()` throws
@@ -9575,7 +10167,16 @@ class PVRegionSearchDialog(QDialog):
         # being searched is built up across as many days as are marked. Undo
         # (Ctrl+Z or the Undo button) is what takes one back off.
         self._moments: "list[int]" = []
-        # Snapshots of (moments, regions) — one per picking gesture, for Undo.
+        # moment timestamp → the NUMBER it wears, everywhere it is named. A number
+        # is handed out once, when the moment is picked, and then it STAYS: deleting
+        # pick 3 leaves 1, 2, 4 rather than silently renaming what is left, because
+        # the numbers are read off the graph and off the wall while the list is
+        # being tidied. "Renumber" under the picks table closes the gaps, and it is
+        # the only thing that ever does. Regions carry the same number in `r["no"]`,
+        # counted down each day of its own.
+        self._moment_no: "dict[int, int]" = {}
+        # Snapshots of (moments, regions, moment numbers) — one per picking gesture,
+        # for Undo.
         self._pick_undo: list = []
         self._press_x: "float | None" = None
         self._xlim_stack: list = []          # right-drag zoom history
@@ -9609,7 +10210,6 @@ class PVRegionSearchDialog(QDialog):
         self._seed_default_pvs()
         self._sync_pv_buttons()
         self._refresh_day_list()
-        self._sync_moment_label()
         self._reload_series()
 
     # ── The graph's own controls ────────────────────────────────────────────
@@ -9695,7 +10295,20 @@ class PVRegionSearchDialog(QDialog):
                 except Exception:
                     pass
         if self._show_legend and handles:
-            ax.legend(handles=handles, labels=labels, loc="upper right", fontsize=8)
+            # Four curves or more and the legend box in the corner covers the part
+            # of the plot the curves are usually in, so it moves out from under
+            # them: two or three columns along the TOP, above the axes.
+            # In "All days" mode the strip just above the axes already carries the
+            # day names, so there the legend stays in the corner.
+            if len(handles) > 3 and self._mode == "one":
+                ax.legend(handles=handles, labels=labels, fontsize=8,
+                          loc="lower left", bbox_to_anchor=(0.0, 1.005),
+                          ncol=min(4, max(2, (len(handles) + 1) // 2)),
+                          frameon=True, borderaxespad=0.0,
+                          columnspacing=1.1, handlelength=1.6)
+            else:
+                ax.legend(handles=handles, labels=labels, loc="upper right",
+                          fontsize=8)
         elif ax.get_legend() is not None:
             ax.get_legend().remove()
         # A hand-set value range beats the automatic one, and survives a redraw.
@@ -9873,94 +10486,283 @@ class PVRegionSearchDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Save graph", f"Could not save:\n{e}")
 
-    # ── Statistics of the marked range ──────────────────────────────────────
-    def _build_stats(self, parent_lay):
-        """Count, mean, spread and the extremes over one marked region.
+    # ── Everything picked, in one list ──────────────────────────────────────
+    # NO `color:` on ::item. A stylesheet rule on the item beats the colour the
+    # item itself is given, and every ink that MEANS something — a region's own
+    # colour, the amber of a held value — was quietly repainted #111111 by it.
+    # The dark default ink comes from the widget rule instead, and every cell
+    # here states its own colour anyway.
+    _PICK_TABLE_CSS = (
+        "QTableWidget { font-size: 11px; background: #ffffff; color: #111111;"
+        "  gridline-color: #dfe3e8; border: 1px solid #c4c8cf; }"
+        "QTableWidget::item { padding: 0px 3px; }"
+        "QHeaderView { background: #e8ebef; }"
+        "QHeaderView::section { background: #e8ebef; color: #1e2530;"
+        "  font-weight: 600; padding: 2px 3px; border: 0px;"
+        "  border-right: 1px solid #d0d5db; border-bottom: 1px solid #c4c8cf; }"
+        "QTableCornerButton::section { background: #e8ebef; border: 0px; }"
+        "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
+        "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
+        "  border-radius:3px; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+        "  { height:0px; }")
 
-        A PV with NO sample in the range still gets a row: the value it was already
-        sitting at, held forward and said out loud in amber. Three dashes there read
-        as "this channel is broken", which is the one thing the range must not say
-        about a setting that simply did not move."""
+    # The columns, by name. Six say WHAT was picked, six say what the PVs were
+    # doing inside it, and the ✕ takes it off again.
+    _C_NO, _C_DOT, _C_WHAT, _C_DAY, _C_TIME, _C_LEN = 0, 1, 2, 3, 4, 5
+    _C_PV, _C_N, _C_MEAN, _C_STD, _C_MIN, _C_MAX = 6, 7, 8, 9, 10, 11
+    _C_DEL = 12
+    # The cells that describe the pick itself — merged down a block when one
+    # region needs a row per PV.
+    _PICK_COLS = (0, 1, 2, 3, 4, 5)
+
+    def _build_picks(self, parent_lay):
+        """BOTH kinds of pick, in one table, each with its own ✕ — and what the
+        plotted PVs did inside it.
+
+        A moment and a marked region are the same thing to the search — one frame
+        per camera — so they belong on one list. The sidebar only ever listed the
+        regions, and a moment could be taken back only by Undo, in the order it was
+        made: four picks deep, taking the second one off meant undoing three good
+        ones and making them again.
+
+        The count / mean / spread / extremes on the right used to be a page of
+        their own called "Marked ranges", which meant the range and its numbers
+        could never be looked at together."""
         head = QHBoxLayout(); head.setSpacing(6)
-        head.addWidget(_section_label("Marked range"))
-        self._stats_cb = QComboBox()
-        self._stats_cb.setMinimumWidth(260)
-        self._stats_cb.setToolTip("Which marked region the numbers are for.")
-        self._stats_cb.currentIndexChanged.connect(lambda *_: self._refresh_stats())
-        head.addWidget(self._stats_cb, 1)
-        self._lbl_range = QLabel("")
-        self._lbl_range.setStyleSheet("color:#333333;font-size:11px;")
-        head.addWidget(self._lbl_range, 0)
+        head.addWidget(_section_label("Picks"))
+        self._lbl_picks = QLabel("")
+        self._lbl_picks.setStyleSheet("color:#333333;font-size:11px;")
+        head.addWidget(self._lbl_picks, 0)
+        head.addStretch(1)
+        self._btn_renumber = QPushButton("Renumber")
+        self._btn_renumber.setFixedHeight(22)
+        self._btn_renumber.setToolTip(
+            "Close the gaps: the picks become 1…n in the order this table lists "
+            "them.\n\nNothing renumbers itself. Delete pick 3 and the rest keep "
+            "their numbers (1, 2, 4) until this is pressed, so the number on the "
+            "graph is the number being talked about while the list is being "
+            "tidied.")
+        self._btn_renumber.clicked.connect(self._renumber_picks)
+        head.addWidget(self._btn_renumber, 0)
         parent_lay.addLayout(head)
 
-        self._stat_table = QTableWidget(0, 6)
-        self._stat_table.setHorizontalHeaderLabels(
-            ["PV", "n", "Mean", "± Std", "Min", "Max"])
-        hh = self._stat_table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for c in (1, 2, 3, 4, 5):
-            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        self._pick_table = QTableWidget(0, 13)
+        self._pick_table.setHorizontalHeaderLabels(
+            ["#", "", "What", "Day", "Time", "Length",
+             "PV", "n", "Mean", "± Std", "Min", "Max", ""])
+        hh = self._pick_table.horizontalHeader()
+        # The six description columns stay the width of what they carry, the PV
+        # name gets a hand-set width the operator can drag, and the four number
+        # columns share whatever is left — so the table fills its pane instead of
+        # leaving a wide empty strip, which is what the old slack column was.
+        for c, w in ((self._C_NO, 34), (self._C_DOT, 22), (self._C_WHAT, 66),
+                     (self._C_DAY, 88), (self._C_TIME, 150), (self._C_LEN, 64),
+                     (self._C_DEL, 32)):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
+            self._pick_table.setColumnWidth(c, w)
+        hh.setSectionResizeMode(self._C_PV, QHeaderView.ResizeMode.Interactive)
+        self._pick_table.setColumnWidth(self._C_PV, 130)
+        hh.setSectionResizeMode(self._C_N, QHeaderView.ResizeMode.ResizeToContents)
+        for c in (self._C_MEAN, self._C_STD, self._C_MIN, self._C_MAX):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
         hh.setHighlightSections(False)
-        self._stat_table.verticalHeader().setVisible(False)
-        self._stat_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._stat_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self._stat_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._stat_table.setWordWrap(False)
-        # A table has to look like a table: light cells, dark text, a header band
-        # that is visibly a header. Left to the style it comes out of Windows dark
-        # mode black on black.
-        self._stat_table.setStyleSheet(
-            "QTableWidget { font-size: 11px; background: #ffffff; color: #111111;"
-            "  gridline-color: #dfe3e8; border: 1px solid #c4c8cf; }"
-            "QTableWidget::item { padding: 0px 3px; color: #111111; }"
-            "QHeaderView { background: #e8ebef; }"
-            "QHeaderView::section { background: #e8ebef; color: #1e2530;"
-            "  font-weight: 600; padding: 2px 3px; border: 0px;"
-            "  border-right: 1px solid #d0d5db; border-bottom: 1px solid #c4c8cf; }"
-            "QTableCornerButton::section { background: #e8ebef; border: 0px; }")
-        self._stat_table.setToolTip(
-            "Count, mean, spread and the extremes over the marked region. Hover a "
-            "row for the median, the peak-to-peak, the first and last value and "
-            "the trend across the range.")
-        parent_lay.addWidget(self._stat_table)
+        self._pick_table.verticalHeader().setVisible(False)
+        self._pick_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._pick_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._pick_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pick_table.setWordWrap(False)
+        self._pick_table.setStyleSheet(self._PICK_TABLE_CSS)
+        self._pick_table.setToolTip(
+            "Every moment and every marked region that will be searched — one "
+            "frame per camera each — and what the plotted PVs did inside a marked "
+            "region. ✕ takes one off; Ctrl+Z puts it back.\n\nHover a row of "
+            "numbers for the median, the peak-to-peak, the first and last value "
+            "and the trend across the range.")
+        self._pick_table.setMinimumHeight(130)
+        parent_lay.addWidget(self._pick_table, 1)
 
-    def _stats_region(self) -> "dict | None":
-        rid = self._stats_cb.currentData()
-        for r in self._regions:
-            if r["id"] == rid:
-                return r
-        return None
+    def _pick_rows(self) -> list:
+        """Every pick, in clock order: {kind, no, day, t, r}."""
+        rows = []
+        for t in self._moments:
+            t = int(t)
+            rows.append({"kind": "moment", "no": self._moment_number(t),
+                         "day": self._local_dt(t).date(), "t": t, "r": None})
+        for day, lst in self._regions_by_day().items():
+            for i, r in enumerate(lst, 1):
+                rows.append({"kind": "region",
+                             "no": self._region_number(r) or i,
+                             "day": day, "t": int(r["t_start_ns"]), "r": r})
+        rows.sort(key=lambda d: (d["day"], d["t"], d["kind"]))
+        return rows
 
-    def _refresh_stats_combo(self):
-        """One entry per marked region, in the sidebar's own order and numbering.
+    def _refresh_pick_table(self, with_stats: bool = True):
+        """Fill the one table: every pick, and what the PVs did inside it.
 
-        A region that has just been dragged takes the selection: its numbers are
-        what the drag was for. An older pick keeps it, so reading one range is not
-        interrupted by a redraw."""
-        prev = self._stats_cb.currentData()
-        known = getattr(self, "_stats_ids", set())
-        self._stats_cb.blockSignals(True)
-        self._stats_cb.clear()
-        by_day = self._regions_by_day()
-        ids = set()
-        for day in sorted(by_day.keys()):
-            for i, r in enumerate(by_day[day], 1):
-                self._stats_cb.addItem(
-                    f"{day.strftime('%d.%m.')}  {i})  {self._fmt_region_span(r)}",
-                    r["id"])
-                ids.add(r["id"])
-        fresh = [r["id"] for r in self._regions if r["id"] not in known]
-        idx = -1
-        if fresh:
-            idx = self._stats_cb.findData(fresh[-1])
-        if idx < 0:
-            idx = self._stats_cb.findData(prev)
-        if idx < 0 and self._regions:
-            idx = self._stats_cb.findData(self._regions[-1]["id"])
-        if idx >= 0:
-            self._stats_cb.setCurrentIndex(idx)
-        self._stats_cb.blockSignals(False)
-        self._stats_ids = ids
+        `with_stats` False keeps the numbers that are already on screen instead of
+        working them out again. Clicking a moment changes no marked range, and
+        re-reading every PV over every range behind every click is what made a
+        second click feel slow."""
+        if not hasattr(self, "_pick_table"):
+            return
+        rows = self._pick_rows()
+        names = [(lbl, ch) for lbl, ch in self._checked_channels()]
+        n_m = sum(1 for d in rows if d["kind"] == "moment")
+        n_r = len(rows) - n_m
+        if rows:
+            # Only the halves that are actually there. "0 moments · 2 regions"
+            # spends the line on the kind that was not picked.
+            bits = []
+            if n_m:
+                bits.append(f"{n_m} moment{'s' if n_m != 1 else ''}")
+            if n_r:
+                bits.append(f"{n_r} region{'s' if n_r != 1 else ''}")
+            bits.append(f"{len(rows)} frame(s) per camera")
+            if n_r and names:
+                bits.append(f"{len(names)} PV{'s' if len(names) != 1 else ''}")
+            self._lbl_picks.setText("   ·   ".join(bits))
+        else:
+            self._lbl_picks.setText(
+                "Click the graph for a moment, drag it for a region.")
+        self._btn_renumber.setEnabled(bool(rows))
+        # UNPARENT the old ✕ buttons before they are replaced. Qt only schedules
+        # an index widget for deletion, and a widget still parented to the
+        # viewport goes on painting where it was — after the pane was widened
+        # that is a second ✕, half a column to the left of the real one.
+        for r_i in range(self._pick_table.rowCount()):
+            w = self._pick_table.cellWidget(r_i, self._C_DEL)
+            if w is not None:
+                w.hide()
+                w.setParent(None)
+                self._pick_table.removeCellWidget(r_i, self._C_DEL)
+        # A merged cell left over from the previous fill makes the row underneath
+        # it invisible, so every span goes before the row count is set again.
+        #
+        # And then EVERY cell is emptied, not just the ones about to be written.
+        # A pick that needs several rows writes its description into the first of
+        # them and merges the rest — so the cells under the merge are never
+        # written, and whatever the previous fill left in them stayed there: mark a
+        # region after picking three moments and rows 2 and 3 still held moments 2
+        # and 3, hidden under the merge but read back by everything that asks the
+        # table what is in it.
+        self._pick_table.clearSpans()
+        self._pick_table.clearContents()
+        # A region needs one row per plotted PV; a moment is always one row.
+        heights = [max(1, len(names)) if d["kind"] == "region" else 1
+                   for d in rows]
+        self._pick_table.setRowCount(sum(heights))
+        row = 0
+        for block, d in enumerate(rows):
+            is_reg = (d["kind"] == "region")
+            r = d["r"]
+            span = heights[block]
+            first = row
+            # Every other pick on a faintly greyer ground, so a block of several
+            # PV rows reads as ONE pick.
+            band = "#ffffff" if block % 2 == 0 else "#f6f8fa"
+            if is_reg:
+                time_txt = (f"{self._hms(r['t_start_ns'])}"
+                            f"–{self._hms(r['t_end_ns'])}")
+                len_txt = self._region_length(r)
+                dot_ink = r.get("color") or "#111111"
+            else:
+                time_txt = self._local_dt(d["t"]).strftime("%H:%M:%S")
+                len_txt = "—"
+                dot_ink = "#111111"
+            cells = [f"{d['no']})", "■",
+                     ("Region" if is_reg else "Moment"),
+                     d["day"].strftime("%d.%m.%Y"), time_txt, len_txt]
+            for c, txt in zip(self._PICK_COLS, cells):
+                it = QTableWidgetItem(txt)
+                # Light cells, dark ink, and the ONE coloured thing on the row is
+                # the square that says which shaded band on the graph this is.
+                it.setBackground(QColor(band))
+                it.setForeground(QColor(dot_ink if c == self._C_DOT
+                                        else "#111111"))
+                it.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter
+                    if c in (self._C_NO, self._C_DOT)
+                    else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                if c == self._C_DAY:
+                    it.setToolTip(_fmt_day_long(d["day"]))
+                if c == self._C_TIME and is_reg:
+                    it.setToolTip(self._fmt_region(r))
+                self._pick_table.setItem(first, c, it)
+            if span > 1:
+                for c in self._PICK_COLS:
+                    self._pick_table.setSpan(first, c, span, 1)
+                self._pick_table.setSpan(first, self._C_DEL, span, 1)
+            # The numbers. A moment has no range to average over, so it says so
+            # with dashes rather than pretending to a mean of one sample.
+            if is_reg and names:
+                lo, hi = int(r["t_start_ns"]), int(r["t_end_ns"])
+                for k, (label, ch) in enumerate(names):
+                    self._fill_stat_row(first + k, label, ch, r["day"], lo, hi,
+                                        band, rid=r["id"], live=with_stats)
+            else:
+                self._fill_blank_stats(first, band,
+                                       "No PV is checked in the list on the left."
+                                       if is_reg else
+                                       "A moment is one frame, not a range — "
+                                       "there is nothing to average over.")
+            btn = QToolButton(); btn.setText("✕")
+            btn.setFixedSize(20, 20)
+            btn.setStyleSheet(
+                "QToolButton { background:#e8e8e8; color:#111;"
+                " border:1px solid #9a9a9a; border-radius:3px; font-weight:700; }"
+                "QToolButton:hover { background:#ffffff; }")
+            btn.setToolTip("Delete this region" if is_reg else "Delete this moment")
+            # Deferred by one turn of the event loop ON PURPOSE: deleting a pick
+            # rebuilds this table, which destroys the very button whose click is
+            # still being delivered.
+            if is_reg:
+                btn.clicked.connect(
+                    lambda _=False, rid=r["id"]: QTimer.singleShot(
+                        0, lambda: self._delete_region(rid)))
+            else:
+                btn.clicked.connect(
+                    lambda _=False, ts=d["t"]: QTimer.singleShot(
+                        0, lambda: self._delete_moment(ts)))
+            # In its own little host, centred. A cell widget dropped straight into
+            # a cell merged down five PV rows sits at the TOP of the block, half a
+            # table away from the row its ✕ belongs to.
+            host = QWidget()
+            host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            host.setStyleSheet(f"QWidget {{ background:{band}; }}")
+            hl = QHBoxLayout(host)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(btn, 0, Qt.AlignmentFlag.AlignCenter)
+            self._pick_table.setCellWidget(first, self._C_DEL, host)
+            for k in range(span):
+                self._pick_table.setRowHeight(first + k, 22 if span == 1 else 20)
+            row += span
+
+    def _fill_blank_stats(self, row: int, band: str, why: str):
+        """The six number cells of a row that has no statistics.
+
+        They still get a light cell of their own: an item that is never set is
+        painted by the style, and this PC is in Windows dark mode — the right half
+        of the row came out black."""
+        for c in (self._C_PV, self._C_N, self._C_MEAN, self._C_STD,
+                  self._C_MIN, self._C_MAX):
+            cell = QTableWidgetItem("—" if c != self._C_PV else "")
+            cell.setBackground(QColor(band))
+            cell.setForeground(QColor("#999999"))
+            cell.setToolTip(why)
+            cell.setTextAlignment(Qt.AlignmentFlag.AlignLeft
+                                  | Qt.AlignmentFlag.AlignVCenter)
+            self._pick_table.setItem(row, c, cell)
+
+    # ── Statistics of the marked ranges ─────────────────────────────────────
+    # They have no table of their own any more: the count, the mean, the spread
+    # and the extremes are the right-hand columns of the picks table, on the same
+    # row as the range they describe.
+    #
+    # A PV with NO sample in the range still gets its numbers: the value it was
+    # already sitting at, held forward and said out loud in amber. Three dashes
+    # there read as "this channel is broken", which is the one thing the range must
+    # not say about a setting that simply did not move.
 
     def _samples_in(self, channel: str, day, lo: int, hi: int) -> "list[tuple]":
         series = (self._series.get(day) or {}).get(channel) or []
@@ -9987,51 +10789,57 @@ class PVRegionSearchDialog(QDialog):
             return float(seed[1]), int(seed[0])
         return None
 
-    def _refresh_stats(self):
-        """Fill the table for the region the combo is on."""
-        if not hasattr(self, "_stat_table"):
-            return
-        r = self._stats_region()
-        names = [(lbl, ch) for lbl, ch in self._checked_channels()]
-        if r is None or not names:
-            self._stat_table.setRowCount(0)
-            self._lbl_range.setText(
-                "Drag on the graph to mark a region." if names
-                else "No PV checked.")
-            return
-        day, lo, hi = r["day"], int(r["t_start_ns"]), int(r["t_end_ns"])
-        self._lbl_range.setText(
-            f"{self._local_dt(lo).strftime('%d.%m. %H:%M:%S')} → "
-            f"{self._local_dt(hi).strftime('%H:%M:%S')}")
-        self._stat_table.setRowCount(len(names))
-        for row, (label, ch) in enumerate(names):
-            unit = self._pv_meta_for(ch).get("unit") or ""
-            it = QTableWidgetItem(label)
-            it.setForeground(QColor(self._colour_for(ch)))
-            it.setToolTip(ch + (f"   [{unit}]" if unit else ""))
-            self._stat_table.setItem(row, 0, it)
-            vals = [float(v) for (_t, v) in self._samples_in(ch, day, lo, hi)
-                    if _is_finite(v)]
-            times = [t for (t, v) in self._samples_in(ch, day, lo, hi)
-                     if _is_finite(v)]
-            if not vals:
-                self._fill_held_row(row, label, ch, day, lo, unit)
-            else:
-                arr = np.asarray(vals, dtype=float)
-                std = float(arr.std(ddof=1)) if arr.size > 1 else float("nan")
-                tip = self._stats_tip(label, unit, arr, times, std)
-                for c, txt in ((1, str(arr.size)),
-                               (2, f"{arr.mean():.4g}"),
-                               (3, "—" if arr.size < 2 else f"{std:.3g}"),
-                               (4, f"{arr.min():.4g}"),
-                               (5, f"{arr.max():.4g}")):
-                    cell = QTableWidgetItem(txt)
-                    cell.setForeground(QColor("#111111"))
-                    cell.setToolTip(tip)
-                    self._stat_table.setItem(row, c, cell)
-            self._stat_table.setRowHeight(row, 20)
-        head_h = self._stat_table.horizontalHeader().height()
-        self._stat_table.setMaximumHeight(20 * max(len(names), 1) + head_h + 6)
+    def _region_length(self, r: dict) -> str:
+        secs = max(0, (int(r["t_end_ns"]) - int(r["t_start_ns"])) // 1_000_000_000)
+        if secs >= 3600:
+            return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+        if secs >= 60:
+            return f"{secs // 60}m{secs % 60:02d}s"
+        return f"{secs}s"
+
+    def _fill_stat_row(self, row: int, label: str, ch: str, day, lo: int, hi: int,
+                       band: str, rid: int = -1, live: bool = True):
+        """One PV over one range — the PV name and the five number columns.
+
+        `live` False takes the numbers from the last time they were worked out.
+        They cannot have changed unless the archived series did, and reading every
+        sample of every PV over every marked range is what made each new click on
+        the graph slower than the one before it."""
+        unit = self._pv_meta_for(ch).get("unit") or ""
+        it = QTableWidgetItem(label)
+        it.setForeground(QColor(self._colour_for(ch)))
+        it.setBackground(QColor(band))
+        it.setToolTip(ch + (f"   [{unit}]" if unit else ""))
+        self._pick_table.setItem(row, self._C_PV, it)
+        key = (int(rid), ch)
+        cells = None if live else self._stat_cache.get(key)
+        if cells is None:
+            cells = self._stat_cells(label, ch, day, lo, hi, unit)
+            self._stat_cache[key] = cells
+        for c, (txt, ink, tip) in zip(
+                (self._C_N, self._C_MEAN, self._C_STD, self._C_MIN, self._C_MAX),
+                cells):
+            cell = QTableWidgetItem(txt)
+            cell.setForeground(QColor(ink))
+            cell.setBackground(QColor(band))
+            cell.setToolTip(tip)
+            self._pick_table.setItem(row, c, cell)
+
+    def _stat_cells(self, label: str, ch: str, day, lo: int, hi: int,
+                    unit: str) -> list:
+        """`[(text, ink, tooltip)] × 5` — n, mean, ± std, min, max."""
+        got = [(t, v) for (t, v) in self._samples_in(ch, day, lo, hi)
+               if _is_finite(v)]
+        if not got:
+            return self._held_cells(label, ch, day, lo, unit)
+        arr = np.asarray([float(v) for (_t, v) in got], dtype=float)
+        times = [t for (t, _v) in got]
+        std = float(arr.std(ddof=1)) if arr.size > 1 else float("nan")
+        tip = self._stats_tip(label, unit, arr, times, std)
+        return [(txt, "#111111", tip) for txt in
+                (str(arr.size), f"{arr.mean():.4g}",
+                 "—" if arr.size < 2 else f"{std:.3g}",
+                 f"{arr.min():.4g}", f"{arr.max():.4g}")]
 
     def _stats_tip(self, label: str, unit: str, y, t: list, std: float) -> str:
         """What the range DID, for the row's tooltip — the six columns only say how
@@ -10053,8 +10861,8 @@ class PVRegionSearchDialog(QDialog):
                 bits.append(f"trend = {rate:+.4g} {unit or 'units'} per minute")
         return "\n".join(bits)
 
-    def _fill_held_row(self, row: int, label: str, channel: str, day, lo: int,
-                       unit: str):
+    def _held_cells(self, label: str, channel: str, day, lo: int,
+                    unit: str) -> list:
         """A PV with no sample inside the range: the value from before it, held.
 
         Amber, `n = 0` and the word "held" rather than a spread, so it can never be
@@ -10081,11 +10889,7 @@ class PVRegionSearchDialog(QDialog):
             cells = (("0", "#8a6114"), (f"{val:.4g}", "#8a6114"),
                      ("held", "#8a6114"), (f"{val:.4g}", "#8a6114"),
                      (f"{val:.4g}", "#8a6114"))
-        for c, (txt, ink) in enumerate(cells, start=1):
-            cell = QTableWidgetItem(txt)
-            cell.setForeground(QColor(ink))
-            cell.setToolTip(tip)
-            self._stat_table.setItem(row, c, cell)
+        return [(txt, ink, tip) for (txt, ink) in cells]
 
     # ── The marked days ─────────────────────────────────────────────────────
     def _focus_day(self):
@@ -10140,16 +10944,65 @@ class PVRegionSearchDialog(QDialog):
         _gate_row, self._wd_checks = daypicker.weekday_gate_row()
         side.addWidget(_gate_row)
 
-        # One row per marked day with how many regions sit on it — a multi-day pick
-        # is otherwise invisible once the graph is on a single day.
-        self._day_list = QListWidget()
-        self._day_list.setMaximumHeight(92)
-        self._day_list.setToolTip("The marked days. Click one to show it in the graph.")
+        # One row per marked day with what sits on it — a multi-day pick is
+        # otherwise invisible once the graph is on a single day. Each day OPENS:
+        # the moments and the regions picked on it are listed underneath, so the
+        # count on the row can be checked against the times behind it. This is the
+        # only place the picks are written out; there is no summary band any more.
+        self._day_list = QTreeWidget()
+        self._day_list.setHeaderHidden(True)
+        self._day_list.setIndentation(14)
+        # Room for a day and the first few picks under it. A box the height of two
+        # rows is why the opened day used to be worth nothing: the arrow turned and
+        # the moments were below the fold. A third shorter than it was, to make
+        # room for the Search button directly underneath it.
+        self._day_list.setMinimumHeight(82)
+        self._day_list.setMaximumHeight(126)
+        self._day_list.setToolTip(
+            "The marked days. Click one to show it in the graph; click the arrow to "
+            "open it and see the moments and regions picked on that day.")
         self._day_list.setStyleSheet(
-            "QListWidget { background:#ffffff; color:#111; border:1px solid #b0b0b0; }"
-            "QListWidget::item:selected { background:#1565C0; color:#ffffff; }")
-        self._day_list.currentRowChanged.connect(self._on_day_row_changed)
+            "QTreeWidget { background:#ffffff; color:#111;"
+            " border:1px solid #b0b0b0; }"
+            "QTreeWidget::item { padding:1px 2px; }"
+            "QTreeWidget::item:selected { background:#1565C0; color:#ffffff; }"
+            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
+            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
+            " border-radius:3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            " { height:0px; }")
+        self._day_list.currentItemChanged.connect(self._on_day_item_changed)
+        # Which days are open is remembered: the list is rebuilt on every pick, and
+        # a day that closed itself the moment a moment was added to it would make
+        # the one thing this list is for impossible to watch.
+        self._day_open: "set" = set()
+        self._day_list.itemExpanded.connect(self._on_day_expanded)
+        self._day_list.itemCollapsed.connect(self._on_day_collapsed)
         side.addWidget(self._day_list)
+
+        # THE SEARCH BUTTON, right under the list of what is picked. It used to be
+        # pinned at the very bottom of the panel, a whole screen away from the
+        # thing it acts on. There is no Cancel beside it — the window's ✕ and Esc
+        # close it, which is what everyone used anyway.
+        self._btn_search = QPushButton("🎯 Search")
+        self._btn_search.setFixedHeight(30)
+        # BLUE, not grey. It is the one action of the whole panel and the light grey
+        # read as another caption; this is the same blue as Shot Finder's Load data.
+        self._btn_search.setStyleSheet(
+            "QPushButton { background:#2d7dff; color:#ffffff; font-weight:700;"
+            " border:1px solid #1a6aee; border-radius:4px; padding:2px 8px; }"
+            "QPushButton:hover { background:#1a6aee; }"
+            "QPushButton:pressed { background:#1257c9; }")
+        self._btn_search.clicked.connect(self._on_accept)
+        # Opened with no camera picked: that is allowed, and the tab asks for them
+        # after Search. Said here so it does not look like the window is unaware.
+        self._btn_search.setToolTip(
+            "Search every picked moment and marked region — one frame per camera "
+            "for each."
+            + ("\n\nNo camera is picked yet — the camera picker opens when you "
+               "press this, and the search then starts by itself."
+               if not self._cams else ""))
+        side.addWidget(self._btn_search)
 
         self._lbl_tz = QLabel("Prague time")
         self._lbl_tz.setStyleSheet("color:#555555;font-size:10px;")
@@ -10165,11 +11018,24 @@ class PVRegionSearchDialog(QDialog):
         # legible.
         self._pv_list.setMinimumHeight(150)
         self._pv_list.setMaximumHeight(190)
+        # The TICK is the thing this list is read for, and Qt's own is a hairline
+        # in the theme's ink — on the selected row it was drawn white on blue and
+        # disappeared altogether. So the box is stated here, the same one every
+        # check box in the program wears: a white square with a dark edge when
+        # off, a solid blue square when on. The selected row is therefore a LIGHT
+        # blue band with dark ink, not a full blue one — a blue tick on a blue row
+        # is no tick at all.
         self._pv_list.setStyleSheet(
             "QListWidget { background:#ffffff; color:#111111;"
             " border:1px solid #b0b0b0; }"
-            "QListWidget::item { padding:1px 2px; }"
-            "QListWidget::item:selected { background:#1565C0; color:#ffffff; }"
+            "QListWidget::item { padding:2px 2px; }"
+            "QListWidget::item:selected { background:#cfe4fb; color:#111111; }"
+            "QListWidget::indicator { width:15px; height:15px;"
+            " border:2px solid #4a4a4a; border-radius:3px; background:#ffffff; }"
+            "QListWidget::indicator:hover { border:2px solid #2d7dff;"
+            " background:#f4f8ff; }"
+            "QListWidget::indicator:checked { border:2px solid #0D47A1;"
+            " background:#2d7dff;" + _tick_image_url() + " }"
             "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
             "QScrollBar::handle:vertical { background:#8a8a8a;"
             " min-height:20px; border-radius:3px; }"
@@ -10268,23 +11134,12 @@ class PVRegionSearchDialog(QDialog):
                               self._cond_scope_regs]
         self._on_cond_toggled(False)
 
-        # Regions
-        side.addWidget(_section_label("Regions"))
-        reg_scroll = QScrollArea()
-        reg_scroll.setWidgetResizable(True)
-        reg_scroll.setMaximumHeight(132)
-        self._regions_host = QWidget()
-        self._regions_lay = QVBoxLayout(self._regions_host)
-        self._regions_lay.setContentsMargins(0, 0, 0, 0)
-        self._regions_lay.setSpacing(2)
-        reg_scroll.setWidget(self._regions_host)
-        side.addWidget(reg_scroll)
-        btn_clear = QPushButton("Clear all regions")
-        btn_clear.clicked.connect(self._clear_regions)
-        side.addWidget(btn_clear)
+        # NO list of regions here. It used to sit at the bottom of the sidebar and
+        # said exactly what the picks table under the graph says — the same
+        # regions, the same numbers, the same ✕ — in a quarter of the width.
 
         # The sidebar is taller than a small screen now (calendar + days + PVs +
-        # condition + regions), so its middle scrolls instead of squashing its rows.
+        # condition), so its middle scrolls instead of squashing its rows.
         # The host keeps a real minimum width — a QScrollArea's own sizeHint does not.
         side_w = QWidget(); side_w.setLayout(side)
         side_w.setMinimumWidth(292)
@@ -10294,52 +11149,12 @@ class PVRegionSearchDialog(QDialog):
         side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         side_scroll.setWidget(side_w)
 
-        # THE MOMENT, and the status and the Search button, sit OUTSIDE the scroll,
-        # pinned to the bottom. Scrolling to find the button that runs the search is
-        # the one thing this panel must never make anyone do — and the moment that
-        # was just clicked is the answer the whole window exists to produce, so it
-        # cannot be somewhere below the fold either.
-        # Two rows, not one: with the buttons beside it the label had about 150 px
-        # and the count was elided to "3 moments on 1 day   ·   last ↑" — the thing
-        # the window exists to report, cut off. The label owns its own full-width
-        # row and the buttons sit under it.
-        mom_col = QVBoxLayout(); mom_col.setSpacing(3)
-        mom_row = QHBoxLayout(); mom_row.setSpacing(4)
-        self._lbl_moment = QLabel("No moment picked.")
-        self._lbl_moment.setWordWrap(True)
-        # The answer the window exists to produce, so it wears a colour of its own —
-        # a pale amber band with DARK ink. The amber-on-near-black version of this
-        # block came from the dark port and was the brightest thing in a light panel.
-        self._lbl_moment.setStyleSheet(
-            "QLabel { background:#fff3c4; color:#3a2c00; border:1px solid #d6b656;"
-            " border-radius:3px; padding:3px 6px; font-size:12px;"
-            " font-weight:600; }")
-        self._lbl_moment.setToolTip(
-            "Click the graph to pick a moment. Every click adds one more — on this "
-            "day or on any other marked day — and they are all searched together. "
-            "Each pick snaps to the nearest real sample of the primary PV: a time "
-            "between two samples has no shot behind it.")
-        self._btn_undo_pick = QPushButton("Undo")
-        self._btn_undo_pick.setFixedWidth(72)
-        self._btn_undo_pick.setToolTip(
-            "Take the last pick back — a moment or a marked region  (Ctrl+Z).")
-        self._btn_undo_pick.setEnabled(False)
-        self._btn_undo_pick.clicked.connect(self._undo_pick)
-        _set_action_icon(self._btn_undo_pick, "undo")
-        self._btn_clear_moment = QPushButton("Clear")
-        self._btn_clear_moment.setFixedWidth(58)
-        self._btn_clear_moment.setToolTip("Forget every picked moment.")
-        self._btn_clear_moment.setEnabled(False)
-        self._btn_clear_moment.clicked.connect(self._clear_moment)
-        mom_col.addWidget(self._lbl_moment)
-        mom_row.addStretch(1)
-        mom_row.addWidget(self._btn_undo_pick, 0)
-        mom_row.addWidget(self._btn_clear_moment, 0)
-        mom_col.addLayout(mom_row)
-
         # Ctrl+Z anywhere in the window. The graph canvas has the keyboard focus
         # most of the time, so this has to be a window-wide shortcut rather than a
-        # key handler on the panel.
+        # key handler on the panel. There is no Undo BUTTON any more — a pick is
+        # taken off by the ✕ on its own row in the picks table, which is the thing
+        # anyone actually reaches for — but the keystroke costs no screen space and
+        # still takes back a mis-drag.
         _sc_undo = QShortcut(QKeySequence.StandardKey.Undo, self)
         _sc_undo.setContext(Qt.ShortcutContext.WindowShortcut)
         _sc_undo.activated.connect(self._undo_pick)
@@ -10348,26 +11163,11 @@ class PVRegionSearchDialog(QDialog):
         self._status.setWordWrap(True)
         self._status.setStyleSheet("color:#333333;font-size:10px;")
 
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self._btn_search = bb.addButton("🎯 Search",
-                                        QDialogButtonBox.ButtonRole.AcceptRole)
-        self._btn_search.clicked.connect(self._on_accept)
-        # Opened with no camera picked: that is allowed, and the tab asks for them
-        # after Search. Said here so it does not look like the window is unaware.
-        self._btn_search.setToolTip(
-            "Search the picked moments (or the marked regions)."
-            + ("\n\nNo camera is picked yet — the camera picker opens when you "
-               "press this, and the search then starts by itself."
-               if not self._cams else ""))
-        bb.rejected.connect(self.reject)
-
         side_col = QWidget()
         side_lay = QVBoxLayout(side_col)
         side_lay.setContentsMargins(0, 0, 0, 0); side_lay.setSpacing(4)
         side_lay.addWidget(side_scroll, 1)
-        side_lay.addLayout(mom_col, 0)
         side_lay.addWidget(self._status, 0)
-        side_lay.addWidget(bb, 0)
         side_col.setFixedWidth(312)
         # THE SIDEBAR IS LIGHT, like every other panel in the program. It was ported
         # from the CSS Logger's dark Spectra tab and for a while it kept that tab's
@@ -10456,11 +11256,58 @@ class PVRegionSearchDialog(QDialog):
         hint.setStyleSheet("color:#555555;font-size:11px;")
         right.addWidget(hint)
         self._build_graph_controls(right)
-        self._build_stats(right)
+
+        # The graph and the table of marked ranges share the right-hand side
+        # through a HANDLE the operator can drag. Five or six PVs on one plot need
+        # the height, and the table only needs it while its numbers are being read
+        # — so which of the two gets the room is a decision that changes minute to
+        # minute and cannot be fixed here. Dragged to the bottom the table closes
+        # and the graph takes the whole pane. It opens with three quarters of the
+        # height on the graph.
+        graph_w = QWidget()
+        graph_lay = QVBoxLayout(graph_w)
+        graph_lay.setContentsMargins(0, 0, 0, 0)
+        graph_lay.setSpacing(4)
+        while right.count():                      # move what was built into it
+            item = right.takeAt(0)
+            if item.widget() is not None:
+                graph_lay.addWidget(item.widget())
+            elif item.layout() is not None:
+                graph_lay.addLayout(item.layout())
+        graph_lay.setStretch(graph_lay.indexOf(self._canvas), 1)
+        graph_w.setMinimumHeight(240)
+
+        # Under the graph: WHAT IS PICKED, on a page of its own. It had no table at
+        # all — the regions were listed in the 275 px sidebar and the moments
+        # nowhere, so a moment could only be taken back by Undo, in the order it
+        # was made.
+        # ONE table, not two pages. What is picked and what the beam was doing
+        # inside it are the same row of the same list now — the statistics that
+        # used to live on a "Marked ranges" page are the right-hand columns here.
+        # With one page left there was nothing for a tab bar to switch between.
+        bottom = QWidget()
+        picks_lay = QVBoxLayout(bottom)
+        picks_lay.setContentsMargins(0, 2, 0, 0)
+        picks_lay.setSpacing(3)
+        self._build_picks(picks_lay)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(graph_w)
+        split.addWidget(bottom)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setChildrenCollapsible(True)
+        split.setHandleWidth(8)
+        split.setStyleSheet(
+            "QSplitter::handle:vertical { background:#d5d9de;"
+            " border-top:1px solid #b9bec4; border-bottom:1px solid #b9bec4; }"
+            "QSplitter::handle:vertical:hover { background:#b7c6d6; }")
+        split.setSizes([640, 210])
+        right.addWidget(split, 1)
         right_w = QWidget(); right_w.setLayout(right)
         root.addWidget(right_w, 1)
 
-        self._rebuild_regions_ui()
+        self._regions_changed()
         self._sync_day_header()
 
     def showEvent(self, event):
@@ -10514,6 +11361,7 @@ class PVRegionSearchDialog(QDialog):
                 self._pv_list.scrollToItem(
                     it, QAbstractItemView.ScrollHint.PositionAtCenter)
                 break
+        self._refresh_own_axis_marks()
         self._refresh_primary_combo()
 
     # ── What a channel IS ─────────────────────────────────────────────────
@@ -10545,10 +11393,19 @@ class PVRegionSearchDialog(QDialog):
         return tip
 
     def _set_pv_row_tip(self, it, extra: str = ""):
-        """The row's own tooltip, with an optional note under it."""
+        """The row's own tooltip, with an optional note under it.
+
+        The own-axis note is added HERE rather than by whoever set the flag: the
+        tooltips are rebuilt from scratch after every load, and a note written on
+        the row by hand was wiped out by the next one."""
         ch = it.data(Qt.ItemDataRole.UserRole)
         base = self._pv_row_tip(ch)
-        it.setToolTip(base + ("\n\n" + extra if extra else ""))
+        notes = []
+        if ch in getattr(self, "_own_axis", ()):
+            notes.append("On a value axis of its own.")
+        if extra:
+            notes.append(extra)
+        it.setToolTip(base + ("\n\n" + "\n".join(notes) if notes else ""))
 
     def _registry_name_for(self, channel: str) -> str:
         """The registry's name for a channel, so this window reads the SAME unit and
@@ -10584,12 +11441,14 @@ class PVRegionSearchDialog(QDialog):
         got = self._ch_meta.get(channel)
         if got is None:
             name = self._registry_name_for(channel)
-            unit = ""
-            try:
-                if name:
-                    unit = _get_slider_module().pv_units_for(name) or ""
-            except Exception:
+            unit = self._local_unit.get(channel)
+            if unit is None:
                 unit = ""
+                try:
+                    if name:
+                        unit = _get_slider_module().pv_units_for(name) or ""
+                except Exception:
+                    unit = ""
             got = {"name": name, "unit": unit, "step": None}
             self._ch_meta[channel] = got
         return got
@@ -10691,14 +11550,16 @@ class PVRegionSearchDialog(QDialog):
     def _sync_search_button(self):
         if not hasattr(self, "_btn_search"):
             return
+        # ONE count, not two. Which of them was made by a click and which by a drag
+        # is on every row of the table below the graph; the button only has to say
+        # how many there are, and "Search 6 moments + 2 regions" was long enough to
+        # be cut off in the panel.
         if self._cond_is_on():
             txt = "🎯 Search by condition"
-        elif len(self._moments) > 1:
-            txt = f"🎯 Search these {len(self._moments)} moments"
-        elif self._moments:
-            txt = "🎯 Search this moment"
         else:
-            txt = "🎯 Search these regions"
+            n = len(self._moments) + len(self._regions)
+            txt = (f"🎯 Search {n} selection" + ("s" if n != 1 else "")) \
+                if n else "🎯 Search"
         self._btn_search.setText(txt)
 
     def _browse_pvs(self):
@@ -10732,6 +11593,7 @@ class PVRegionSearchDialog(QDialog):
             if first_new is None:
                 first_new = it
         self._pv_list.blockSignals(False)
+        self._refresh_own_axis_marks()
         self._refresh_primary_combo()
         # Show the new row instead of leaving it below the fold.
         if first_new is not None:
@@ -10750,8 +11612,17 @@ class PVRegionSearchDialog(QDialog):
         gone: list = []
         for it in rows:
             gone.append(it.text())
-            self._alias_used.pop(it.data(Qt.ItemDataRole.UserRole), None)
+            ch = it.data(Qt.ItemDataRole.UserRole)
+            self._alias_used.pop(ch, None)
+            # Everything this window remembered about the row goes with it,
+            # otherwise adding the same PV back brings a stale unit or a stale
+            # own-axis flag along with it.
+            self._own_axis.discard(ch)
+            self._local_unit.pop(ch, None)
+            self._ch_meta.pop(ch, None)
             self._pv_list.takeItem(self._pv_list.row(it))
+        self._refresh_own_axis_marks()
+        self._sync_pv_buttons()
         self._refresh_primary_combo()
         self._announce_pv_change([], [], gone, [])
         self._reload_series()
@@ -10761,114 +11632,280 @@ class PVRegionSearchDialog(QDialog):
         return it.data(Qt.ItemDataRole.UserRole) if it is not None else None
 
     def _sync_pv_buttons(self):
-        """The two per-PV buttons follow whichever row is selected."""
+        """The two per-PV buttons follow whichever row is selected — and SAY which
+        PV they are about.
+
+        "Own axis" is a property of ONE PV, and a single button at the bottom of
+        the list reads as a switch for the whole graph. So its label carries the
+        selected PV's name, and the rows that have it wear a mark of their own
+        (see _refresh_own_axis_marks)."""
         ch = self._selected_channel()
         for b in (self._btn_own_axis, self._btn_pv_edit):
             b.setEnabled(ch is not None)
         self._btn_own_axis.blockSignals(True)
         self._btn_own_axis.setChecked(bool(ch and ch in self._own_axis))
         self._btn_own_axis.blockSignals(False)
+        if ch:
+            lbl = self._pv_label_for(ch)
+            self._btn_own_axis.setToolTip(
+                f"Give {lbl} a value axis of its own — this PV only.\n"
+                "Two PVs in the same unit but three orders of magnitude apart "
+                "share an axis on which neither can be read.\n"
+                "The rows on an axis of their own are the amber ones.")
+            self._btn_pv_edit.setToolTip(
+                f"{lbl} — which channel the row reads, its name on screen and "
+                "its unit.")
+        else:
+            self._btn_own_axis.setToolTip(
+                "Click a PV on the list first. Own axis belongs to one PV, not "
+                "to the graph.")
+            self._btn_pv_edit.setToolTip("Click a PV on the list first.")
+
+    def _refresh_own_axis_marks(self):
+        """The rows that are on an axis of their own, marked on the list itself.
+
+        Without this the only record of the setting is the state of one button,
+        which changes as the selection moves — so it read as a switch for every
+        PV at once. Amber band, dark ink: a background is never set without its
+        foreground."""
+        if not hasattr(self, "_pv_list"):
+            return
+        self._pv_list.blockSignals(True)
+        for i in range(self._pv_list.count()):
+            it = self._pv_list.item(i)
+            ch = it.data(Qt.ItemDataRole.UserRole)
+            own = ch in self._own_axis
+            it.setBackground(QColor("#ffeec2" if own else "#ffffff"))
+            it.setForeground(QColor("#111111"))
+            self._set_pv_row_tip(it)
+        self._pv_list.blockSignals(False)
 
     def _toggle_own_axis(self, on: bool):
         ch = self._selected_channel()
         if not ch:
+            self._status.setText(
+                "Click a PV on the list first — Own axis belongs to one PV.")
+            self._btn_own_axis.blockSignals(True)
+            self._btn_own_axis.setChecked(False)
+            self._btn_own_axis.blockSignals(False)
             return
         if on:
             self._own_axis.add(ch)
         else:
             self._own_axis.discard(ch)
+        on_now = sorted(self._pv_label_for(c) for c in self._own_axis)
         self._status.setText(
             f"{self._pv_label_for(ch)} "
             + ("now has a value axis of its own." if on
-               else "shares the axis of its unit again."))
+               else "shares the axis of its unit again.")
+            + ("   ·   own axis: " + ", ".join(on_now) if on_now
+               else "   ·   no PV on an axis of its own."))
+        self._refresh_own_axis_marks()
         self._redraw()
 
     def _edit_selected_pv(self):
-        """The selected PV's name and unit, written to the SHARED registry.
+        """WHICH CHANNEL the selected row reads, plus its name on screen and its
+        unit.
 
-        The name and the unit belong to the PV registry the Image Slider keeps, not
-        to this window: `is_t.PV_LABELS` and `is_t.PV_CUSTOM_UNITS` are the two
-        dictionaries every tab reads and the Slider saves. Keeping a second copy
-        here is exactly how one PV came to mean two things in two tabs, so this
-        writes theirs — and it refuses when the channel is not on the shared list,
-        because there is then nothing to write it against."""
-        ch = self._selected_channel()
-        if not ch:
+        The channel is the part that was missing: a preset row was welded to the
+        channel it was seeded with, so a row called "PAP1" could never be pointed
+        at anything else and the only way to plot a different PV was to add a
+        second row with Browse. Search opens the same archiver-wide PV search the
+        Image Slider's picker uses (words are tokens, matched anywhere in the
+        name, best first), and the row then reads whatever was picked.
+
+        Name and unit go to the PV registry the Image Slider keeps — `is_t.PV_LABELS`
+        and `is_t.PV_CUSTOM_UNITS`, the two dictionaries every tab reads and the
+        Slider saves — whenever the channel is on the shared list. For a channel
+        that is not, the unit is kept for this window only (there is nothing in the
+        registry to write it against) and the name is simply the row's own text."""
+        it_row = self._pv_list.currentItem()
+        if it_row is None:
             return
-        name = self._registry_name_for(ch)
+        ch0 = it_row.data(Qt.ItemDataRole.UserRole)
+        if not ch0:
+            return
         try:
             sl = _get_slider_module()
         except Exception as e:
             QMessageBox.information(self, "Edit PV",
                                     f"The PV registry is not reachable:\n{e}")
             return
-        if not name:
-            QMessageBox.information(
-                self, "Edit PV",
-                f"{ch}\n\nThis channel is not on the shared PV list, so it has no "
-                "name or unit to edit. Add it in the Image Slider's "
-                "\"Select PV channels\" first and it will be known here too.")
-            return
+        derived = _is_derived_key(ch0)
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Edit PV")
+        dlg.setMinimumWidth(460)
         _paint_dialog(dlg)
         lay = QVBoxLayout(dlg)
-        # A dialog is light grey with dark ink (the app stylesheet), so these two
-        # notes are DARK grey — the dark sidebar's #c8c8c8 is invisible here.
-        info = QLabel(f"{name}\n{ch}")
-        info.setStyleSheet("color:#444;font-size:11px;")
-        lay.addWidget(info)
+
+        state = {"ch": ch0}
+
+        # ── Which channel the row reads ───────────────────────────────────
+        lay.addWidget(QLabel("Reads channel"))
+        ch_row = QHBoxLayout(); ch_row.setSpacing(4)
+        e_ch = QLineEdit(_derived_name(ch0) + "   (formula)" if derived else ch0)
+        e_ch.setReadOnly(True)
+        e_ch.setStyleSheet("background:#ffffff;color:#111111;")
+        btn_pick = QPushButton("Search")
+        btn_pick.setFixedWidth(90)
+        ch_row.addWidget(e_ch, 1); ch_row.addWidget(btn_pick, 0)
+        lay.addLayout(ch_row)
+
         e_lbl, e_unit = QLineEdit(), QLineEdit()
-        e_lbl.setText(sl.pv_label_for(name))
-        e_unit.setText(sl.pv_units_for(name) or "")
         for lbl, w in (("Name on screen", e_lbl), ("Unit", e_unit)):
             w.setStyleSheet("background:#ffffff;color:#111111;")
             lay.addWidget(QLabel(lbl))
             lay.addWidget(w)
-        try:
-            lo, hi = sl.pv_limits_for(name)
-        except Exception:
-            lo = hi = None
-        note = QLabel(
-            "Alarm limits: "
-            + (f"{lo:g} … {hi:g}" if lo is not None and hi is not None else "none")
-            + "\nLimits and formulas are set in the Image Slider's "
-              "\"Select PV channels\" — one place for the whole program.")
+
+        # A dialog is light grey with dark ink (the app stylesheet), so these two
+        # notes are DARK grey — the dark sidebar's #c8c8c8 is invisible here.
+        note = QLabel("")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#555;font-size:10px;")
+        note.setStyleSheet("color:#444;font-size:10px;")
         lay.addWidget(note)
+
+        def _load(ch: str, keep_label: str = None):
+            """Fill the three fields from whatever the channel is known to be."""
+            state["ch"] = ch
+            if _is_derived_key(ch):
+                e_ch.setText(_derived_name(ch) + "   (formula)")
+                e_lbl.setText(keep_label or it_row.text())
+                e_unit.setText(self._pv_meta_for(ch).get("unit") or "")
+                note.setText(
+                    "A formula, not a channel: it is computed from other PVs. Its "
+                    "sources and its expression are set in the Image Slider's "
+                    "\"Select PV channels\".")
+                return
+            e_ch.setText(ch)
+            name = self._registry_name_for(ch)
+            if name:
+                e_lbl.setText(keep_label or sl.pv_label_for(name))
+                e_unit.setText(self._local_unit.get(ch)
+                               or sl.pv_units_for(name) or "")
+                try:
+                    lo, hi = sl.pv_limits_for(name)
+                except Exception:
+                    lo = hi = None
+                note.setText(
+                    f"On the shared PV list as \"{name}\".\nAlarm limits: "
+                    + (f"{lo:g} … {hi:g}"
+                       if lo is not None and hi is not None else "none")
+                    + "\nThe name and the unit are saved for the whole program. "
+                      "Limits and formulas are set in the Image Slider's "
+                      "\"Select PV channels\".")
+            else:
+                e_lbl.setText(keep_label
+                              or _PV_PRESET_LABELS.get(ch) or ch.split(":")[-1])
+                e_unit.setText(self._local_unit.get(ch, ""))
+                note.setText(
+                    "Not on the shared PV list. The name shows on this window's "
+                    "list and in the graph legend; the unit decides which value "
+                    "axis the curve sits on. Both are kept for this window only — "
+                    "add the channel in the Image Slider's \"Select PV channels\" "
+                    "to make them known everywhere.")
+
+        def _pick():
+            br = _PVBrowseDialog(dlg)
+            br.setWindowTitle("Read which channel")
+            if br.exec() != QDialog.DialogCode.Accepted:
+                return
+            picked = br.selected_channels()
+            if not picked:
+                return
+            new_ch = picked[0]
+            # A channel already on the list would give two rows the same identity —
+            # the same colour, the same axis, the same statistics row.
+            for i in range(self._pv_list.count()):
+                other = self._pv_list.item(i)
+                if other is not it_row and \
+                        other.data(Qt.ItemDataRole.UserRole) == new_ch:
+                    QMessageBox.information(
+                        dlg, "Edit PV",
+                        f"{new_ch}\n\nis already on the list as "
+                        f"\"{other.text()}\". Two rows cannot read the same "
+                        "channel.")
+                    return
+            _load(new_ch)
+
+        btn_pick.clicked.connect(_pick)
+        if derived:
+            btn_pick.setEnabled(False)
+            btn_pick.setToolTip(
+                "A formula has no single channel to read — it is computed from "
+                "others.")
+        else:
+            btn_pick.setToolTip(
+                "Search every archiver channel and point this row at another one.")
+        _load(ch0, keep_label=it_row.text())
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                               QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
         lay.addWidget(bb)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+
+        ch = state["ch"]
         new_lbl = e_lbl.text().strip()
         new_unit = e_unit.text().strip()
-        try:
-            if new_lbl and new_lbl != name:
-                sl.PV_LABELS[name] = new_lbl
-            else:
-                sl.PV_LABELS.pop(name, None)
+        name = self._registry_name_for(ch)
+        if name:
+            try:
+                if new_lbl and new_lbl != name:
+                    sl.PV_LABELS[name] = new_lbl
+                else:
+                    sl.PV_LABELS.pop(name, None)
+                if new_unit:
+                    sl.PV_CUSTOM_UNITS[name] = new_unit
+                else:
+                    sl.PV_CUSTOM_UNITS.pop(name, None)
+            except Exception as e:
+                QMessageBox.warning(self, "Edit PV", f"Could not save:\n{e}")
+                return
+            self._local_unit.pop(ch, None)
+            shown = sl.pv_label_for(name)
+        else:
             if new_unit:
-                sl.PV_CUSTOM_UNITS[name] = new_unit
+                self._local_unit[ch] = new_unit
             else:
-                sl.PV_CUSTOM_UNITS.pop(name, None)
-        except Exception as e:
-            QMessageBox.warning(self, "Edit PV", f"Could not save:\n{e}")
-            return
+                self._local_unit.pop(ch, None)
+            shown = new_lbl or ch
+
+        moved = (ch != ch0)
+        if moved:
+            # The row is a different PV now, so everything this window keyed on the
+            # old channel goes with it — the colour included: a colour that names a
+            # curve must come from the PV, never linger from the one before it.
+            it_row.setData(Qt.ItemDataRole.UserRole, ch)
+            if ch0 in self._own_axis:
+                self._own_axis.discard(ch0)
+                self._own_axis.add(ch)
+            self._local_unit.pop(ch0, None)
+            self._pv_colour.pop(ch0, None)
+            self._pv_colour.pop(ch, None)
+            self._alias_used.pop(ch0, None)
+            self._ch_meta.pop(ch0, None)
         # The unit decides which axis the curve sits on, so both caches go.
         self._ch_meta.pop(ch, None)
         self._reg_by_channel = None
-        for i in range(self._pv_list.count()):
-            it = self._pv_list.item(i)
-            if it.data(Qt.ItemDataRole.UserRole) == ch:
-                it.setText(sl.pv_label_for(name))
+        it_row.setText(shown)
+        self._set_pv_row_tip(it_row)
+        self._refresh_own_axis_marks()
+        self._sync_pv_buttons()
         self._refresh_primary_combo()
+        if moved:
+            self._status_note = f"{shown} now reads {ch}"
+            self._status.setText(f"{shown} now reads {ch} — fetching…")
+            # A new channel has no samples in hand — it has to be fetched.
+            self._reload_series()
+            return
         self._status.setText(
-            f"{sl.pv_label_for(name)}: name and unit saved to the shared PV list.")
+            f"{shown}: name and unit saved"
+            + (" to the shared PV list." if name else " for this window."))
         self._redraw()
-        self._refresh_stats()
+        self._stat_cache.clear()
+        self._picks_changed(with_stats=True)
 
     def _announce_pv_change(self, added: list, dupes: list, gone: list,
                             picked: list):
@@ -10943,11 +11980,14 @@ class PVRegionSearchDialog(QDialog):
                                 if focus else None)
 
     def _refresh_day_list(self):
-        """One row per marked day, with what is picked on it.
+        """One row per marked day, with what is picked on it, and the picks
+        themselves as rows underneath it.
 
-        The counts are the whole point of the row: picks are made day by day and
-        the graph shows one day at a time, so without them the four moments picked
-        on Tuesday are invisible while Wednesday is on screen."""
+        The counts are the whole point of the day row: picks are made day by day
+        and the graph shows one day at a time, so without them the four moments
+        picked on Tuesday are invisible while Wednesday is on screen. Opening the
+        day says WHICH four — a count cannot say whether they are the four you
+        meant. This list is the only written record of the picks."""
         by_day = self._regions_by_day()
         counts = {d: len(v) for d, v in by_day.items()}
         moments: dict = {}
@@ -10956,6 +11996,7 @@ class PVRegionSearchDialog(QDialog):
             moments[k] = moments.get(k, 0) + 1
         self._day_list.blockSignals(True)
         self._day_list.clear()
+        child_ink = QColor("#333333")
         for i, d in enumerate(self._days):
             n = counts.get(d, 0)
             m = moments.get(d, 0)
@@ -10970,26 +12011,59 @@ class PVRegionSearchDialog(QDialog):
                 txt += "   ⚠ archiver"
             elif st == "empty":
                 txt += "   (no data)"
-            it = QListWidgetItem(txt)
-            # WHICH regions, not just how many — the count on the row cannot say
-            # whether the four spans are the four you meant.
-            tip = []
+            it = QTreeWidgetItem([txt])
+            it.setData(0, Qt.ItemDataRole.UserRole, i)
+            self._day_list.addTopLevelItem(it)
+            # The picks on that day, in the order they were made.
+            for t in [t for t in self._moments
+                      if self._local_dt(t).date() == d]:
+                ch = QTreeWidgetItem(
+                    [f"moment {self._moment_number(t)})   "
+                     + self._local_dt(t).strftime("%H:%M:%S")])
+                ch.setData(0, Qt.ItemDataRole.UserRole, i)
+                ch.setForeground(0, child_ink)
+                it.addChild(ch)
             for j, r in enumerate(by_day.get(d, []), 1):
-                tip.append(f"{j})  {self._fmt_region_span(r)}")
-            for j, t in enumerate(
-                    [t for t in self._moments
-                     if self._local_dt(t).date() == d], 1):
-                tip.append(f"moment {j})  " + self._local_dt(t).strftime("%H:%M:%S"))
-            if tip:
-                it.setToolTip("\n".join(tip))
-            self._day_list.addItem(it)
-        self._day_list.setCurrentRow(self._focus_i if self._days else -1)
+                ch = QTreeWidgetItem(
+                    [f"region {self._region_number(r) or j})   "
+                     f"{self._fmt_region_span(r)}"])
+                ch.setData(0, Qt.ItemDataRole.UserRole, i)
+                ch.setForeground(0, child_ink)
+                it.addChild(ch)
+            if not (m or n):
+                # Said on the row, not left as an empty arrow that opens on nothing.
+                it.setToolTip(0, "Nothing picked on this day yet.")
+            if d in self._day_open and it.childCount():
+                it.setExpanded(True)
+        cur = (self._day_list.topLevelItem(self._focus_i)
+               if 0 <= self._focus_i < len(self._days) else None)
+        self._day_list.setCurrentItem(cur)
         self._day_list.blockSignals(False)
         self._apply_day_paint()
         self._sync_day_header()
 
-    def _on_day_row_changed(self, row: int):
+    def _day_of_item(self, item) -> int:
+        """Which day a clicked row belongs to — a pick row answers with its day."""
+        if item is None:
+            return -1
+        v = item.data(0, Qt.ItemDataRole.UserRole)
+        return int(v) if isinstance(v, int) else -1
+
+    def _on_day_expanded(self, item):
+        i = self._day_of_item(item)
+        if 0 <= i < len(self._days):
+            self._day_open.add(self._days[i])
+
+    def _on_day_collapsed(self, item):
+        i = self._day_of_item(item)
+        if 0 <= i < len(self._days):
+            self._day_open.discard(self._days[i])
+
+    def _on_day_item_changed(self, cur, _prev=None):
+        row = self._day_of_item(cur)
         if row < 0 or row >= len(self._days):
+            return
+        if row == self._focus_i:
             return
         self._focus_i = row
         self._apply_day_paint()
@@ -11020,7 +12094,7 @@ class PVRegionSearchDialog(QDialog):
             return
         self._focus_i = (self._focus_i + delta) % len(self._days)
         self._day_list.blockSignals(True)
-        self._day_list.setCurrentRow(self._focus_i)
+        self._day_list.setCurrentItem(self._day_list.topLevelItem(self._focus_i))
         self._day_list.blockSignals(False)
         self._apply_day_paint()
         self._sync_day_header()
@@ -11138,6 +12212,7 @@ class PVRegionSearchDialog(QDialog):
             self._series = {}
             self._day_status = {}
             self._series_key = key
+            self._stat_cache.clear()
         days = self._shown_days()
         self._load_gen += 1
         gen = self._load_gen
@@ -11350,9 +12425,19 @@ class PVRegionSearchDialog(QDialog):
                 if why:
                     note = why
             self._set_pv_row_tip(it, note)
-        self._status.setText(msg)
-        # The numbers for the marked range come from the samples that just arrived.
-        self._refresh_stats()
+        # A note left by whatever asked for this load goes FIRST. Pointing a row at
+        # another channel starts a fetch, and the fetch's own "Loaded N samples"
+        # arrived a second later and wiped the one sentence saying what had
+        # changed.
+        pending = getattr(self, "_status_note", "")
+        self._status_note = ""
+        self._status.setText((pending + "   ·   " if pending else "") + msg)
+        # The numbers for the marked ranges come from the samples that just
+        # arrived, so whatever was worked out before them is stale.
+        if hasattr(self, "_stat_cache"):
+            self._stat_cache.clear()
+        if hasattr(self, "_pick_table"):
+            self._picks_changed(with_stats=True)
 
     # ── Plot ────────────────────────────────────────────────────────────────
     def _hold_xy(self, channel: str, day) -> tuple:
@@ -11415,14 +12500,31 @@ class PVRegionSearchDialog(QDialog):
         groups: dict = {}
         for label, ch in self._checked_channels():
             groups.setdefault(self._unit_key_for(ch), []).append((label, ch))
+        # WHICH GROUP KEEPS THE MAIN AXIS. The shared ones do, and the PVs put on
+        # an axis of their own take the extra axes on the right — in that order,
+        # never the other way round.
+        #
+        # Left to the order the PV list happens to be in, "Own axis" on the FIRST
+        # PV handed the main axis to that one PV and moved every other curve onto
+        # a new axis: the one thing the setting is not supposed to touch. That is
+        # what made a per-PV setting look like a switch for the whole graph.
+        # Biggest shared group first, so the axis on the left is the one most of
+        # the curves are on.
+        def _group_rank(item):
+            key, members = item
+            return (1 if key.startswith("@own:") else 0, -len(members), key)
+
+        ordered_groups = sorted(groups.items(), key=_group_rank)
         handles: list = []
-        for k, (unit_key, members) in enumerate(groups.items()):
+        for k, (unit_key, members) in enumerate(ordered_groups):
             if k == 0:
                 axis = ax
             else:
                 axis = ax.twinx()
                 if k >= 2:
-                    axis.spines["right"].set_position(("outward", 46 * (k - 1)))
+                    # 46 px apart is more than the numbers need and, with five
+                    # axes, took 180 px off the width of the plot itself.
+                    axis.spines["right"].set_position(("outward", 40 * (k - 1)))
                 self._axes_extra.append(axis)
             for label, ch in members:
                 colour, dash = self._style_for(ch)
@@ -11503,6 +12605,27 @@ class PVRegionSearchDialog(QDialog):
         self._canvas.draw_idle()
         self._install_span()
 
+    def _paint_pick_number(self, x: float, n: int, edge: str = "#111111",
+                           dy: float = -3.0):
+        """The badge one pick wears on the graph — a moment and a region alike.
+
+        It sits just under the top of the axes, in its own white box, so it stays
+        readable over a curve. One helper for both kinds on purpose: the regions
+        used to be told apart by their colour alone, so the number the table, the
+        day list and the finished frames all called them by was the one thing that
+        could not be read off the graph.
+
+        `dy` drops the regions one badge lower than the moments. A region marked
+        around a moment starts within a few pixels of it, and two badges printed
+        at the same height over each other are two numbers and neither legible."""
+        self._ax.annotate(
+            str(int(n)),
+            xy=(x, 1.0), xycoords=("data", "axes fraction"),
+            xytext=(2, dy), textcoords="offset points",
+            ha="left", va="top", fontsize=8, color="#111111", zorder=6,
+            bbox=dict(boxstyle="round,pad=0.15", fc="#ffffff",
+                      ec=edge, lw=0.9 if edge != "#111111" else 0.5))
+
     def _paint_region_spans(self):
         shown = set(self._shown_days())
         for r in self._regions:
@@ -11513,6 +12636,13 @@ class PVRegionSearchDialog(QDialog):
             if x0 != x0 or x1 != x1:      # NaN — the day is not on the axis
                 continue
             self._ax.axvspan(x0, x1, alpha=0.25, color=r["color"], zorder=0)
+            # The number goes on the LEFT edge of the band, where the eye reads it
+            # as belonging to this band and not to whatever starts next — in a box
+            # outlined in the band's own colour, and one badge lower than a
+            # moment's, so the two never print over each other.
+            n = self._region_number(r)
+            if n:
+                self._paint_pick_number(x0, n, edge=r["color"], dy=-16.0)
 
     def _paint_moment_cursor(self):
         """Every picked moment, on the axis it was picked from.
@@ -11523,7 +12653,7 @@ class PVRegionSearchDialog(QDialog):
         if not self._moments:
             return
         shown = set(self._shown_days())
-        for i, t_ns in enumerate(self._moments, 1):
+        for t_ns in self._moments:
             day = self._local_dt(t_ns).date()
             if day not in shown:
                 continue
@@ -11531,14 +12661,7 @@ class PVRegionSearchDialog(QDialog):
             if x != x:                   # NaN — not on this axis
                 continue
             self._ax.axvline(x, color="#111111", lw=1.4, ls="--", zorder=5)
-            # The number sits just under the top of the axes, in its own white box,
-            # so it stays readable over a curve.
-            self._ax.annotate(
-                str(i), xy=(x, 1.0), xycoords=("data", "axes fraction"),
-                xytext=(2, -3), textcoords="offset points",
-                ha="left", va="top", fontsize=8, color="#111111", zorder=6,
-                bbox=dict(boxstyle="round,pad=0.15", fc="#ffffff",
-                          ec="#111111", lw=0.5))
+            self._paint_pick_number(x, self._moment_number(t_ns))
 
     def _make_span(self, on_select, colour: str, button: int):
         """One span selector, bound to ONE mouse button.
@@ -11612,8 +12735,8 @@ class PVRegionSearchDialog(QDialog):
         """The moment picked LAST — what a single-moment reader wants.
 
         Read-only on purpose: the picks live in `self._moments`, and every change
-        goes through `_add_moment` / `_undo_pick` / `_clear_moment` so that the
-        undo history, the label and the graph can never disagree with it."""
+        goes through `_set_moment_from_x` / `_delete_moment` / `_undo_pick` so that
+        the undo history, the table and the graph can never disagree with it."""
         return self._moments[-1] if self._moments else None
 
     def _moment_days(self) -> list:
@@ -11653,9 +12776,61 @@ class PVRegionSearchDialog(QDialog):
     def _push_pick_undo(self):
         """Remember what was picked BEFORE the gesture about to happen."""
         self._pick_undo.append((list(self._moments),
-                                [dict(r) for r in self._regions]))
+                                [dict(r) for r in self._regions],
+                                dict(self._moment_no)))
         while len(self._pick_undo) > 200:
             self._pick_undo.pop(0)
+
+    # ── The numbers the picks wear ──────────────────────────────────────────
+    def _next_pick_no(self) -> int:
+        """ONE counter for moments and regions alike.
+
+        A pick is a pick: whichever way it was made, it wears a number that
+        belongs to nothing else. The moments used to be numbered across the whole
+        window while the regions started again at 1 on every day, so "2" named two
+        different picks at once — which is why the wall had to write `r2)` on one
+        of them to tell them apart. Now every number is unique and the frames can
+        simply say 1, 2, 3."""
+        used = [int(n) for n in self._moment_no.values()]
+        used += [int(r.get("no") or 0) for r in self._regions]
+        return (max(used) + 1) if used else 1
+
+    def _moment_number(self, t_ns: int) -> int:
+        """The number of one picked moment, handed out once and kept."""
+        t_ns = int(t_ns)
+        n = self._moment_no.get(t_ns)
+        if not n:
+            n = self._next_pick_no()
+            self._moment_no[t_ns] = n
+        return int(n)
+
+    @staticmethod
+    def _region_number(r: dict) -> int:
+        return int(r.get("no") or 0)
+
+    def _renumber_picks(self):
+        """Close the gaps deleting left — and ONLY when this is pressed.
+
+        Moments and regions share ONE run of numbers, 1…n in the order the table
+        lists them: down the days, and down the clock inside a day. Nothing
+        renumbers itself: a number that moves while the list is being tidied makes
+        the number on the graph, the number on the wall and the number being
+        talked about three different things."""
+        if not self._moments and not self._regions:
+            return
+        self._push_pick_undo()
+        moment_no: dict = {}
+        for i, d in enumerate(self._pick_rows(), 1):
+            if d["kind"] == "region":
+                d["r"]["no"] = i
+            else:
+                moment_no[int(d["t"])] = i
+        self._moment_no = moment_no
+        self._redraw()
+        self._regions_changed()
+        self._refresh_day_list()
+        self._status.setText(
+            f"Renumbered {len(self._moments) + len(self._regions)} selection(s).")
 
     def _set_moment_from_x(self, x: float):
         """One click on the graph = one more moment on the list.
@@ -11676,78 +12851,54 @@ class PVRegionSearchDialog(QDialog):
             return
         self._push_pick_undo()
         self._moments.append(t_ns)
+        self._moment_no[t_ns] = self._next_pick_no()
         self._redraw()
-        self._sync_search_button()
-        self._sync_moment_label()
+        # NOT `_regions_changed`: a moment changes no region, and that call
+        # drags the range statistics — every PV over every marked range — behind
+        # every single click.
+        self._picks_changed()
         self._refresh_day_list()
 
     def _undo_pick(self):
-        """Ctrl+Z / the Undo button — take the last pick back.
+        """Ctrl+Z — take the last pick back.
 
         It undoes marking a region as well as picking a moment, because both are
-        the same gesture on the same graph and one button that only half worked
-        would be worse than none."""
+        the same gesture on the same graph and a shortcut that only half worked
+        would be worse than none. There is no Undo button beside it: one pick at a
+        time comes off by the ✕ on its own row in the table below the graph."""
         if not self._pick_undo:
             self._status.setText("Nothing to undo — no moment or region picked yet.")
             return
-        moments, regions = self._pick_undo.pop()
+        snap = self._pick_undo.pop()
+        moments, regions = snap[0], snap[1]
         self._moments = list(moments)
         self._regions = [dict(r) for r in regions]
+        self._moment_no = dict(snap[2]) if len(snap) > 2 else {}
         self._redraw()
-        self._rebuild_regions_ui()
-        self._sync_search_button()
-        self._sync_moment_label()
+        self._regions_changed()
         self._refresh_day_list()
         self._status.setText(
-            f"Undone. {len(self._moments)} moment(s), "
-            f"{len(self._regions)} region(s) left.")
+            f"Undone. {len(self._moments) + len(self._regions)} selection(s) left.")
 
-    def _clear_moment(self):
-        """Forget EVERY picked moment (the regions stay)."""
-        if not self._moments:
+    def _delete_moment(self, t_ns: int):
+        """Take ONE moment off the list — the ✕ on its row in the picks table.
+
+        The numbers of the moments that stay are not touched (see `_renumber_picks`)
+        and Undo puts this back like any other picking gesture."""
+        t_ns = int(t_ns)
+        if t_ns not in self._moments:
             return
         self._push_pick_undo()
-        self._moments = []
+        self._moments = [t for t in self._moments if t != t_ns]
+        self._moment_no.pop(t_ns, None)
         self._redraw()
-        self._sync_search_button()
-        self._sync_moment_label()
+        self._picks_changed()
         self._refresh_day_list()
 
-    def _moment_list_text(self) -> str:
-        """Every picked moment, one per line — for the tooltip."""
-        out = []
-        for i, t in enumerate(self._moments, 1):
-            out.append(f"{i})  " + self._local_dt(t).strftime("%d.%m.%Y  %H:%M:%S"))
-        return "\n".join(out)
-
-    def _sync_moment_label(self):
-        n = len(self._moments)
-        self._btn_clear_moment.setEnabled(n > 0)
-        self._btn_undo_pick.setEnabled(bool(self._pick_undo))
-        if n == 0:
-            self._lbl_moment.setText("No moment picked.")
-            self._lbl_moment.setToolTip(
-                "Click the graph to pick a moment. Every click adds one more — on "
-                "this day or on any other marked day — and they are all searched "
-                "together. Ctrl+Z takes the last one back.")
-            return
-        if n == 1:
-            txt = self._local_dt(self._moments[0]).strftime("%d.%m.%Y  %H:%M:%S")
-        else:
-            days = len(self._moment_days())
-            last = self._local_dt(self._moments[-1]).strftime("%d.%m. %H:%M:%S")
-            txt = (f"{n} moments, {days} day{'s' if days != 1 else ''}"
-                   f"  ·  last {last}")
-        # Both picked at once is legal, but only the moments are searched. Said
-        # here rather than by silently deleting the regions, which is what used to
-        # happen and cost N drags to a single click.
-        if self._regions:
-            txt += "  ·  regions ignored"
-        self._lbl_moment.setText(txt)
-        self._lbl_moment.setToolTip(
-            self._moment_list_text()
-            + ("\n\nThe marked regions are ignored while a moment is picked — "
-               "press Clear to search them instead." if self._regions else ""))
+    # There is no summary line under the sidebar any more. It said "6 moments and
+    # 2 marked regions — both are searched, giving 8 frame(s) per camera", which is
+    # the header of the picks table and the text on the Search button, twice over,
+    # in the one place there was no room for it.
 
     def _zoom_out(self):
         """One step back out. Right click is "look wider", and it never changes
@@ -11823,8 +12974,8 @@ class PVRegionSearchDialog(QDialog):
             self._region_seq += 1
             color = _PV_REGION_COLORS[rid % len(_PV_REGION_COLORS)]
             self._regions.append({"id": rid, "t_start_ns": t_start, "t_end_ns": t_end,
-                                  "color": color, "day": day})
-            self._ax.axvspan(a, b, alpha=0.25, color=color, zorder=0)
+                                  "color": color, "day": day,
+                                  "no": self._next_pick_no()})
             added += 1
         if not added:
             self._pick_undo.pop()
@@ -11834,11 +12985,13 @@ class PVRegionSearchDialog(QDialog):
         # used to delete them, which cost one click to redo — but the reverse
         # (a click deleting N drags) is what made this rule wrong in both
         # directions, so neither side deletes the other now.
-        self._canvas.draw_idle()
-        self._rebuild_regions_ui()
+        #
+        # A full redraw rather than painting the band here by hand: the band now
+        # carries a NUMBER, and drawing it in two places is how one of the two
+        # ends up without it.
+        self._redraw()
+        self._regions_changed()
         self._refresh_day_list()
-        self._sync_search_button()
-        self._sync_moment_label()
 
     # ── Regions UI ──────────────────────────────────────────────────────────
     @staticmethod
@@ -11855,96 +13008,53 @@ class PVRegionSearchDialog(QDialog):
         repeating the date on every row was what pushed the times out of the
         275 px sidebar."""
         a, b = int(r["t_start_ns"]), int(r["t_end_ns"])
-        secs = max(0, (b - a) // 1_000_000_000)
-        if secs >= 3600:
-            length = f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
-        elif secs >= 60:
-            length = f"{secs // 60}m{secs % 60:02d}s"
-        else:
-            length = f"{secs}s"
-        return f"{self._hms(a)}–{self._hms(b)}  ({length})"
+        return (f"{self._hms(a)}–{self._hms(b)}"
+                f"  ({self._region_length(r)})")
 
     def _fmt_region(self, r: dict) -> str:
         """The old one-line form, day included — still used where there is no day
         header to carry it (the day list's tooltip)."""
         return f"{r['day'].strftime('%d.%m')}  {self._fmt_region_span(r)}"
 
-    def _rebuild_regions_ui(self):
-        while self._regions_lay.count():
-            item = self._regions_lay.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                # Unparent BEFORE deleteLater: a widget only taken out of the layout
-                # keeps its parent and goes on painting where it was until the delete
-                # is actually delivered, which drew the old rows over the new ones.
-                w.setParent(None)
-                w.deleteLater()
-        if not self._regions:
-            empty = QLabel("Drag on the graph\nto add a region.")
-            empty.setStyleSheet("color:#666;font-size:11px;")
-            self._regions_lay.addWidget(empty)
-            self._regions_lay.addStretch(1)
-            if hasattr(self, "_stats_cb"):
-                self._refresh_stats_combo()
-                self._refresh_stats()
-            return
-        # Grouped by day, numbered inside the day — the same numbering the wall's
-        # row banners use, so "region 2" is one thing in both places.
-        by_day = self._regions_by_day()
-        for day in sorted(by_day.keys()):
-            lst = by_day[day]
-            head = QLabel(f"{_fmt_day_long(day)}   —   {len(lst)} region"
-                          f"{'s' if len(lst) != 1 else ''}")
-            head.setStyleSheet(
-                "QLabel { background:#333333; color:#ffffff; font-size:11px;"
-                " font-weight:700; padding:2px 4px; }")
-            self._regions_lay.addWidget(head)
-            for i, r in enumerate(lst, 1):
-                row = QHBoxLayout()
-                row.setContentsMargins(2, 0, 2, 0)
-                num = QLabel(f"{i})")
-                num.setStyleSheet("font-size:11px; color:#555555;")
-                num.setFixedWidth(18)
-                dot = QLabel("■")
-                dot.setStyleSheet(f"color:{r['color']};font-size:13px;")
-                lbl = QLabel(self._fmt_region_span(r))
-                lbl.setStyleSheet("font-size:11px; color:#111111;")
-                # Elide in the MIDDLE: the sidebar is 275 px and the end of the
-                # line (the length) must not be the half that is lost.
-                lbl.setTextFormat(Qt.TextFormat.PlainText)
-                lbl.setToolTip(self._fmt_region(r))
-                btn = QToolButton(); btn.setText("✕")
-                btn.setFixedSize(20, 20)
-                btn.setStyleSheet(
-                    "QToolButton { background:#e8e8e8; color:#111;"
-                    " border:1px solid #9a9a9a;"
-                    " border-radius:3px; font-weight:700; }"
-                    "QToolButton:hover { background:#ffffff; }")
-                btn.setToolTip("Delete region")
-                btn.clicked.connect(
-                    lambda _=False, rid=r["id"]: self._delete_region(rid))
-                row.addWidget(num); row.addWidget(dot)
-                row.addWidget(lbl, 1); row.addWidget(btn)
-                w = QWidget(); w.setLayout(row)
-                w.setFixedHeight(24)
-                self._regions_lay.addWidget(w)
-        self._regions_lay.addStretch(1)
-        # The statistics below the graph describe one of these regions, so they are
-        # rebuilt from the same place the rows are — every caller gets both.
-        if hasattr(self, "_stats_cb"):
-            self._refresh_stats_combo()
-            self._refresh_stats()
+    def _regions_changed(self):
+        """A marked region was added, deleted or renumbered.
+
+        There is no separate list of regions any more — the sidebar used to carry
+        one, in a quarter of the width, saying exactly what the picks table under
+        the graph says. What is left is the one thing that really does have to
+        happen: the table is filled again, statistics and all."""
+        self._picks_changed(with_stats=True)
+
+    def _picks_changed(self, with_stats: bool = False):
+        """EVERYTHING that names the picks, from one place.
+
+        The picks table and the Search button used to be refreshed by hand at each
+        of the seven places a pick can change, and deleting a region reached none
+        of them — the button went on offering to search regions that were no longer
+        marked.
+
+        `with_stats` is False for a change that touches no marked range — one more
+        moment clicked — so the numbers already on screen are reused instead of
+        every PV being read over every range again."""
+        self._refresh_pick_table(with_stats=with_stats)
+        self._sync_search_button()
 
     def _delete_region(self, rid: int):
+        if not any(r["id"] == rid for r in self._regions):
+            return
+        self._push_pick_undo()
         self._regions = [r for r in self._regions if r["id"] != rid]
         self._redraw()
-        self._rebuild_regions_ui()
+        self._regions_changed()
         self._refresh_day_list()
 
     def _clear_regions(self):
+        if not self._regions:
+            return
+        self._push_pick_undo()
         self._regions = []
         self._redraw()
-        self._rebuild_regions_ui()
+        self._regions_changed()
         self._refresh_day_list()
 
     # ── Accept ────────────────────────────────────────────────────────────
@@ -11965,20 +13075,23 @@ class PVRegionSearchDialog(QDialog):
                 QMessageBox.information(self, title, "Mark at least one day."); return
             self.accept()
             return
-        if self._moments:
-            # A moment needs no primary PV: the time was pointed at, not derived
-            # from a peak. (One is still used to snap the click, when there is one.)
-            self.accept()
-            return
-        if not self._regions:
+        if not self._moments and not self._regions:
             QMessageBox.information(
                 self, title,
                 "Click the graph to pick a moment — every click adds one more — "
                 "or drag to mark a region.")
             return
-        if self._primary_cb.currentData() is None:
-            QMessageBox.information(self, title,
-                                    "Check at least one PV and pick a primary PV."); return
+        # A moment needs no primary PV: the time was pointed at, not derived from a
+        # peak. A REGION does, whether or not a moment is picked as well — both are
+        # searched now, so the check can no longer be skipped by the moment branch
+        # returning first.
+        if self._regions and self._primary_cb.currentData() is None:
+            QMessageBox.information(
+                self, title,
+                "A marked region needs a primary PV — the frame comes from that "
+                "PV's peak inside the region. Check at least one PV and pick a "
+                "primary one, or clear the regions.")
+            return
         self.accept()
 
     def _regions_by_day(self) -> dict:
@@ -12005,7 +13118,10 @@ class PVRegionSearchDialog(QDialog):
             regions_by_day[day] = [
                 {"t_start_ns": int(r["t_start_ns"]),
                  "t_end_ns":   int(r["t_end_ns"]),
-                 "index":      i + 1,
+                 # The number the region WEARS, not where it happens to sit in the
+                 # list: delete region 2 and the third one is still "3" on the
+                 # graph, in the tables and on the wall, until Renumber is pressed.
+                 "index":      self._region_number(r) or (i + 1),
                  "count":      n,
                  "color":      r.get("color"),
                  "label":      self._fmt_region_span(r)}
@@ -12022,20 +13138,29 @@ class PVRegionSearchDialog(QDialog):
                             else "days"),
             }
         # In condition mode the search covers every MARKED day, not only the days
-        # that happen to carry a region.
-        days = (sorted(self._days) if cond is not None
-                else sorted(regions_by_day.keys()))
+        # that happen to carry a region. Otherwise it is every day something was
+        # picked ON — the UNION of the region days and the moment days, because a
+        # day carrying only moments used to be missing from every count and label
+        # that reads this.
+        if cond is not None:
+            days = sorted(self._days)
+        else:
+            days = sorted(set(regions_by_day.keys()) | set(self._moment_days()))
         return {
             "cameras":         self._cams,
             "days":            days,
             "regions":         regions_by_day,
             "condition":       cond,
-            # Set only when a moment was clicked, and then it is the whole answer:
-            # the tab reads it and goes straight to the frames. `moments_ns` is
-            # every pick in the order they were clicked; `moment_ns` is the first
-            # of them, so a reader that only understands one moment still works.
+            # WHAT WAS PICKED, both kinds. The tab searches the moments and the
+            # regions together (`_start_pick_search`); `moments_ns` is every clicked
+            # moment in the order they were clicked, and `moment_ns` is the first of
+            # them, so a reader that only understands one moment still works.
             "moments_ns":      ([] if cond is not None
                                 else [int(t) for t in self._moments]),
+            # …and the number each of them wears, aligned with `moments_ns`.
+            "moment_nos":      ([] if cond is not None
+                                else [self._moment_number(t)
+                                      for t in self._moments]),
             "moment_ns":       (None if cond is not None or not self._moments
                                 else int(self._moments[0])),
             "primary_channel": self._primary_cb.currentData(),
@@ -12136,8 +13261,8 @@ class _WallScroll(QScrollArea):
     The frames grow INSIDE the pane: the window does not move and neither does
     anything else in the tab. A plain wheel still scrolls, which is how a wall
     taller than its pane gets read — and on the Day-by-day wall one notch steps a
-    whole DAY, because a row there IS a day and half a day of scroll is a view of
-    nothing in particular.
+    whole CAMERA, because a row there IS a camera and half a row of scroll is a view
+    of nothing in particular.
 
     The wall itself has no use for a wheel event, so it arrives here on its own —
     no filter on every child is needed. The app-wide wheel guard does not touch
@@ -12165,7 +13290,7 @@ class _WallScroll(QScrollArea):
                 self.zoomed.emit(int(round(notches))
                                  or (1 if notches > 0 else -1))
                 return
-        # A plain wheel on the Day-by-day wall steps whole days, one row a notch.
+        # A plain wheel on the Day-by-day wall steps whole cameras, one row a notch.
         w = self.widget()
         if isinstance(w, _DayWall) and w.layout_mode() == "rows":
             notches = event.angleDelta().y() / 120.0
@@ -12253,18 +13378,19 @@ class _DayWall(QWidget):
         self._load_gen = 0
         # "grid" — every tile the same size, at most four across, as large as the
         #          pane allows. What a comparison wall wants, and the default.
-        # "rows" — one row per day, the cameras always in the same order.
+        # "rows" — one row per CAMERA, the days always in the same order.
         # "pack" — the Slider's free-form partition, biggest frame wins. Kept only
         #          for a caller that explicitly asks for it.
         self._layout_mode = "grid"
-        self._row_heads: "list[tuple[QRect, str]]" = []   # day banners in rows mode
+        self._row_heads: "list[tuple[QRect, str]]" = []   # camera banners in rows mode
         self._multi_cam = False             # set by set_cells — see _caption
         self._zoom = 1.0                    # 1.0 = fits the pane exactly
         self._fit_w = self._fit_h = 0       # last known pane size — see _avail
+        self._scroll_host = None            # the _WallScroll around it, set by _wrap_scroll
 
         # Display state — the shared values every un-adjusted tile uses.
         self._grad_name = "Grayscale"
-        self._auto      = False
+        self._auto      = img_scale.AUTO_NONE   # AUTO_* mask, see set_display
         self._gamma     = None
         self._contrast  = 0
         self._offset    = 0
@@ -12297,6 +13423,7 @@ class _DayWall(QWidget):
         # because then the day is the same on every tile and saying it ten times
         # over tells the operator nothing.
         self._multi_cam = len({c.get("cam", "") for c in self._cells}) > 1
+        self._assign_col_slots()
         self._pix.clear()
         self._rects = []
         self._auto_pair = None
@@ -12383,12 +13510,15 @@ class _DayWall(QWidget):
         self.update()
 
     # ── display state ─────────────────────────────────────────────────────────
-    def set_display(self, grad_name: str, auto: bool, gamma, contrast: int, offset: int):
-        key = (grad_name, bool(auto), gamma, int(contrast), int(offset))
+    def set_display(self, grad_name: str, auto: "int | bool", gamma,
+                    contrast: int, offset: int):
+        # `auto` is the AUTO_* mask, kept as the mask: each box contributes only its own
+        # half of the shared pair below, the other half stays on the user's slider.
+        key = (grad_name, int(auto or 0), gamma, int(contrast), int(offset))
         if key == (self._grad_name, self._auto, self._gamma, self._contrast, self._offset):
             return
         self._grad_name, self._auto, self._gamma, self._contrast, self._offset = (
-            grad_name, bool(auto), gamma, int(contrast), int(offset))
+            grad_name, int(auto or 0), gamma, int(contrast), int(offset))
         self._auto_pair = None
         self._pix.clear()
         self.update()
@@ -12446,8 +13576,8 @@ class _DayWall(QWidget):
     # ── per-frame state ───────────────────────────────────────────────────────
     def set_layout_mode(self, mode: str):
         """"grid" — every tile the same size, at most four across, as large as they go.
-        "rows" — one row per day, the cameras always in the same order, for reading down
-        a column and seeing one camera change.
+        "rows" — one row per CAMERA, the days always in the same order, for reading
+        along a line and seeing one camera change from day to day.
         "pack" — the Slider's free-form partition, where the biggest frame wins."""
         if mode == self._layout_mode:
             return
@@ -12458,7 +13588,8 @@ class _DayWall(QWidget):
 
     def layout_mode(self) -> str:
         """Which of the three layouts this wall is on. The pane asks, so a plain
-        wheel can step whole days on the Day-by-day wall and scroll on the others."""
+        wheel can step whole cameras on the Day-by-day wall and scroll on the
+        others."""
         return self._layout_mode
 
     # ── zoom ──────────────────────────────────────────────────────────────────
@@ -12504,14 +13635,34 @@ class _DayWall(QWidget):
         self.update()
         self.selection_changed.emit()
 
-    def apply_adjust(self, paths, contrast: int, offset: int, gamma, rot: "int | None" = None):
-        """Give these frames their own contrast / brightness / gamma (and rotation).
-        `paths` empty means the whole wall goes back to the shared setting."""
+    def apply_adjust(self, paths, contrast: int, offset: int, gamma,
+                     rot: "int | None" = None, grad: "str | None" = None):
+        """Give these frames their own contrast / brightness / gamma / palette (and
+        rotation). `paths` empty means the whole wall goes back to the shared
+        setting."""
         for p in paths:
             cur = dict(self._shared.adj.get(p) or {})
             cur.update({"contrast": int(contrast), "offset": int(offset), "gamma": gamma})
             if rot is not None:
                 cur["rot"] = int(rot) % 360
+            if grad is not None:
+                cur["grad"] = str(grad)
+            self._shared.adj[p] = cur
+        self._pix.clear()
+        self.update()
+
+    def apply_gradient(self, paths, grad: str):
+        """The palette for these frames only.
+
+        It used to be wall-wide on purpose — one colour meaning one intensity in
+        every tile — and that is still what it does with nothing selected. But
+        picking out the one day worth looking at and giving it a colour scale is the
+        same act as opening up its brightness, so it follows the selection like
+        every other display control. An affected tile says "(adjusted)" in its
+        caption, which is what keeps the comparison honest."""
+        for p in paths:
+            cur = dict(self._shared.adj.get(p) or {})
+            cur["grad"] = str(grad)
             self._shared.adj[p] = cur
         self._pix.clear()
         self.update()
@@ -12619,34 +13770,79 @@ class _DayWall(QWidget):
 
     @staticmethod
     def _cell_row_key(cell: dict):
-        """The row a cell belongs on: THE DAY.
+        """The row a cell belongs on: THE CAMERA.
 
-        A row is a day and the next row is the next day — the operator's rule.
-        Several picks on one day (four marked regions, five picked moments) do not
-        split it into four rows; they sit side by side inside that one row, which is
-        what `_cell_col_key` is for."""
-        return cell.get("day")
+        A row is one camera all the way across and the next row is the next camera —
+        the operator's rule. The days run left to right inside the row, so five
+        cameras over five days read as a five-by-five grid. It used to be the other
+        way round (a row was a day, a column a camera), which put every camera of one
+        day on one line and was the whole complaint.
+
+        Several picks of one camera on one day (four marked regions, five picked
+        moments) do not split it into four rows; they sit side by side inside that one
+        row, which is what `_cell_col_key` is for."""
+        return cell.get("cam", "")
+
+    def _assign_col_slots(self):
+        """Number the tiles a camera owns within one day, IN THE ORDER THE FRAMES
+        WERE FOUND.
+
+        NOT by the pick number. A day carries moments and marked regions together,
+        and what decides the order is the thing the operator asked for: the time of
+        the frame that came back. So the tiles of one camera read left to right in
+        time, whichever kind of pick found them — which is also what keeps them in
+        order when a pick is deleted and the numbers left behind have a gap in them.
+
+        A cell with no frame has no time of its own; it falls back to the time that
+        was ASKED for, and then to its pick number, so a camera that saw nothing
+        still holds its place in the row instead of being pushed to the end."""
+        def when(c: dict) -> tuple:
+            ts = c.get("ts_ns")
+            if ts:
+                return (0, int(ts))
+            asked = (c.get("meta") or {}).get("asked_ns")
+            if asked:
+                return (0, int(asked))
+            reg = c.get("region") or {}
+            if reg.get("t_start_ns"):
+                return (0, int(reg["t_start_ns"]))
+            return (1, int(c.get("pick") or 0))
+
+        # Grouped on (camera, day) OUTRIGHT, not through `_cell_row_key`: which of
+        # the two is the row and which the column is `_cell_row_key`'s business, but
+        # the thing being numbered is always "the picks one camera has on one day".
+        groups: dict = {}
+        for c in self._cells:
+            groups.setdefault((c.get("cam", ""), c.get("day")), []).append(c)
+        for lst in groups.values():
+            for slot, c in enumerate(sorted(lst, key=when), start=1):
+                c["col_slot"] = slot
 
     @staticmethod
     def _cell_col_key(cell: dict) -> tuple:
-        """The column a cell belongs in: `(camera, which pick)`.
+        """The column a cell belongs in: `(day, which pick)`.
 
-        A column is ONE camera all the way down the wall. When a day carries several
-        picks that camera owns several adjacent columns — the same columns in every
-        row, so a day that is missing a pick leaves a gap rather than shifting the
-        camera underneath a different one. Keying the column on the camera alone is
-        what gave four frames of one day the same rectangle: three were painted
-        under the fourth and clicking picked one that was not on screen."""
-        reg = cell.get("region") or {}
-        idx = cell.get("pick") or reg.get("index")
-        return (cell.get("cam", ""), idx if idx is not None else 0)
+        A column is ONE day all the way down the wall. When that day carries several
+        picks it owns several adjacent columns — the same columns in every row, so a
+        camera that is missing a pick leaves a gap rather than sliding underneath a
+        different day. Keying the column on the day alone is what gave four frames of
+        one day the same rectangle: three were painted under the fourth and clicking
+        picked one that was not on screen.
+
+        `col_slot` is the time order `_assign_col_slots` worked out; the pick's own
+        number is the fallback for a caller that built cells without it."""
+        slot = cell.get("col_slot")
+        if slot is None:
+            reg = cell.get("region") or {}
+            slot = cell.get("pick") or reg.get("index") or 0
+        return (cell.get("day"), slot)
 
     def _row_order(self) -> "tuple[list, list]":
-        """(days top to bottom, columns left to right).
+        """(cameras top to bottom, columns left to right).
 
-        The columns are sorted by camera NAME and then by the pick's own number, and
-        the same list is used for every row — that is the whole reason to look at the
-        wall this way."""
+        The columns are sorted by DAY and then by the pick's own number, and the same
+        list is used for every row — that is the whole reason to look at the wall this
+        way: one camera per line, the same days under each other."""
         rows, cols = [], []
         for c in self._cells:
             k, col = self._cell_row_key(c), self._cell_col_key(c)
@@ -12658,16 +13854,38 @@ class _DayWall(QWidget):
         cols.sort(key=lambda t: (str(t[0]), t[1]))
         return rows, cols
 
-    def _row_head_text(self, day) -> str:
-        """The banner over one row: the day, and what is on it when the day carries
-        several picks."""
-        head = _fmt_day_long(day)
-        picks = sorted({self._cell_col_key(c)[1] for c in self._cells
-                        if self._cell_row_key(c) == day
-                        and (c.get("pick") or (c.get("region") or {}).get("index"))})
-        if len(picks) > 1:
-            kind = "moments" if any(c.get("pick") for c in self._cells) else "regions"
-            head += f"   ·   {len(picks)} {kind}"
+    def _row_head_text(self, cam) -> str:
+        """The banner over one row: the CAMERA, how many days it spans, and what is on
+        it when those days carry several picks."""
+        head = str(cam or "")
+        # BOTH kinds are counted. It used to choose one word for the whole wall from
+        # `any(pick)`, so a day carrying four moments AND four regions was announced
+        # as "4 moments" — which is what made the search look as if it had dropped
+        # the regions even on the days where it had not.
+        #
+        # A region's tile carries BOTH `pick` and `region["index"]` — the same
+        # number twice — so counting `pick` over every tile put the regions into
+        # the moment count as well, and a day of four regions read "4 moments +
+        # 4 regions". Only a tile with no region of its own is a moment.
+        on_day = [c for c in self._cells if self._cell_row_key(c) == cam]
+        regions = {(c.get("region") or {}).get("index") for c in on_day
+                   if (c.get("region") or {}).get("index")}
+        moments = {c.get("pick") for c in on_day
+                   if c.get("pick") and not (c.get("region")
+                                             or c.get("pick_kind") == "region")}
+        # HOW MANY DAYS this camera's line reaches across — its own phrase, not part
+        # of the "moments + regions" pair. Only worth saying when it is more than one:
+        # the tiles' own captions name the day either way.
+        days = {c.get("day") for c in on_day}
+        if len(days) > 1:
+            head += f"   ·   {len(days)} days"
+        bits = []
+        if len(moments) > 1 or (moments and regions):
+            bits.append(f"{len(moments)} moment" + ("s" if len(moments) != 1 else ""))
+        if len(regions) > 1 or (moments and regions):
+            bits.append(f"{len(regions)} region" + ("s" if len(regions) != 1 else ""))
+        if bits:
+            head += "   ·   " + " + ".join(bits)
         return head
 
     def row_pitch(self) -> int:
@@ -12676,48 +13894,74 @@ class _DayWall(QWidget):
         if not rows or not cols:
             return max(1, self._DAY_HDR_H + 90)
         _W, H = self._avail()
-        row_h = max(90, int(H / self._ROWS_IN_VIEW) - self._DAY_HDR_H)
+        row_h = max(90, int(H * self._zoom / self._ROWS_IN_VIEW) - self._DAY_HDR_H)
         return self._DAY_HDR_H + row_h
 
+    def row_col_width(self) -> float:
+        """How wide one column of the Day-by-day wall is.
+
+        FOUR COLUMNS FILL THE PANE and the rest is scrolled to sideways — the
+        operator's rule, and the same `_MAX_COLS` the grid mode obeys. Dividing the
+        pane by every column is what this replaces: twelve days came out as twelve
+        slivers, and a picture two centimetres wide answers nothing.
+
+        Fewer than four still tile the pane edge to edge, so three days are not left
+        with a quarter of the window empty."""
+        _rows, cols = self._row_order()
+        n = len(cols)
+        if n <= 0:
+            return 1.0
+        W, _H = self._avail()
+        return max(20.0, W / min(self._MAX_COLS, n) * self._zoom)
+
     def rows_content_height(self) -> int:
-        """How tall the wall needs to be in rows-by-day mode, so the scroll area that
-        holds it knows what to scroll.
+        """How tall the wall needs to be in one-row-per-camera mode, so the scroll
+        area that holds it knows what to scroll.
 
         The row height comes from the PANE, not from the frames' aspect: three rows
         fill it and the rest is scrolled to. Sizing a row off the mean aspect made a
-        row as tall as one frame wanted to be, which with wide frames left two days
-        visible and with tall ones eight."""
+        row as tall as one frame wanted to be, which with wide frames left two
+        cameras visible and with tall ones eight."""
         rows, cols = self._row_order()
         if not rows or not cols:
             return max(1, self.height())
         return len(rows) * self.row_pitch()
 
     def _relayout_rows(self):
-        """One row per day; one column per (camera, pick), the same in every row."""
+        """ONE ROW PER CAMERA; one column per (day, pick), the same in every row."""
         rows, cols = self._row_order()
         self._rects = [QRect() for _ in self._cells]
         self._row_heads = []
         if not rows or not cols:
             return
-        W = max(1, self.width())
+        # The PANE's width, never this widget's own: with more than four columns the
+        # widget is deliberately wider than the pane, so measuring itself would make
+        # every pass wider than the last. Same reason as _avail's for the height.
+        W = max(1, self._avail()[0])
         pitch = self.row_pitch()
         row_h = pitch - self._DAY_HDR_H
         total_h = len(rows) * pitch
         pos = {}
         n = len(cols)
-        for r, day in enumerate(rows):
+        cw = self.row_col_width()
+        total_w = cw * n
+        for r, row_key in enumerate(rows):
             y = r * pitch
-            self._row_heads.append((QRect(0, y, W, self._DAY_HDR_H),
-                                    self._row_head_text(day)))
+            self._row_heads.append(
+                (QRect(0, y, int(round(max(W, total_w))), self._DAY_HDR_H),
+                 self._row_head_text(row_key)))
             for cidx, col in enumerate(cols):
-                x0 = int(round(cidx * W / n))
-                x1 = int(round((cidx + 1) * W / n))
-                pos[(day, col)] = QRect(x0, y + self._DAY_HDR_H,
-                                        max(20, x1 - x0), row_h)
+                x0 = int(round(cidx * cw))
+                x1 = int(round((cidx + 1) * cw))
+                pos[(row_key, col)] = QRect(x0, y + self._DAY_HDR_H,
+                                            max(20, x1 - x0), row_h)
         for i, c in enumerate(self._cells):
             self._rects[i] = pos.get((self._cell_row_key(c), self._cell_col_key(c)),
                                      QRect(0, 0, 0, 0))
         self.setMinimumHeight(total_h)
+        # A single pixel of rounding must not raise the sideways bar: it takes height
+        # from the viewport, the rows re-lay out shorter, and that must not feed back.
+        self.setMinimumWidth(int(round(total_w)) if total_w > W + 2 else 0)
 
     def _avail(self) -> "tuple[int, int]":
         """The room the tiles have to fit into.
@@ -12903,9 +14147,16 @@ class _DayWall(QWidget):
             self._render_key = key
         cell = self._cells[idx]
         adj = self._shared.adj.get(cell.get("path")) or {}
+        # The palette and the intensity are separate adjustments. A tile given only
+        # its own palette must keep the wall's brightness — and Auto with it — or
+        # picking a colour scale would silently drop the frame back to the raw
+        # sliders at 0.
+        has_intensity = any(k in adj for k in ("contrast", "offset", "gamma"))
+        grad_name = adj.get("grad") or self._grad_name
         # The per-frame values ride in the cache entry, not the wall-wide key: adjusting
         # one tile must not throw away the other forty-nine pixmaps.
-        akey = (adj.get("contrast"), adj.get("offset"), adj.get("gamma"), adj.get("rot", 0))
+        akey = (adj.get("contrast"), adj.get("offset"), adj.get("gamma"),
+                adj.get("rot", 0), adj.get("grad"))
         hit = self._pix.get(idx)
         if hit is not None and hit[0] == akey:
             return hit[1]
@@ -12926,7 +14177,7 @@ class _DayWall(QWidget):
                 arr = np.abs(arr.astype(np.float32) * (k / float(full_scale))
                              - base[0].astype(np.float32) * (k / float(base[1])))
                 full_scale = k
-        if adj:
+        if has_intensity:
             # This frame was picked out and adjusted by hand. Its own numbers replace
             # the wall's — including Auto, which is a shared reading it has opted out
             # of — and the caption says so, because it is no longer comparable.
@@ -12934,9 +14185,13 @@ class _DayWall(QWidget):
                               int(adj.get("contrast", 0)), int(adj.get("offset", 0)))
         elif self._auto:
             # Auto becomes one shared pair on the absolute path — never a per-tile
-            # stretch, which would level every day to its own content.
+            # stretch, which would level every day to its own content. Each Auto box
+            # takes only its own half of that pair; the other half stays on the slider.
             a_con, a_off = auto_pair or (0, 0)
-            arr8 = _render_u8(arr, False, full_scale, self._gamma, a_con, a_off)
+            arr8 = _render_u8(
+                arr, False, full_scale, self._gamma,
+                a_con if (self._auto & img_scale.AUTO_CONTRAST) else self._contrast,
+                a_off if (self._auto & img_scale.AUTO_BRIGHT) else self._offset)
         else:
             arr8 = _render_u8(arr, False, full_scale, self._gamma,
                               self._contrast, self._offset)
@@ -12945,7 +14200,7 @@ class _DayWall(QWidget):
             arr8 = np.ascontiguousarray(np.rot90(arr8, k=(4 - rot // 90) % 4))
         h, w = arr8.shape[:2]
         try:
-            lut = _get_slider_module().GRADIENTS.get(self._grad_name)
+            lut = _get_slider_module().GRADIENTS.get(grad_name)
         except Exception:
             lut = None
         if lut is None:
@@ -12973,16 +14228,23 @@ class _DayWall(QWidget):
                    "blind": "no shot data"}
 
     def _caption(self, cell: dict) -> str:
-        if self._multi_cam:
+        # THE DAY, on the Day-by-day wall: the row's own banner already names the
+        # camera, so repeating it under every tile of that line says nothing and the
+        # one thing the tile is not otherwise told apart by — which day it is — had
+        # no room left. Everywhere else the old rule stands.
+        if self._multi_cam and self._layout_mode != "rows":
             # Many cameras at one moment: the camera is what tells the tiles apart.
             txt = str(cell.get("cam") or "")
         else:
             day = cell.get("day")
             txt = day.strftime("%d.%m.") if hasattr(day, "strftime") else str(day or "")
-        # Several moments picked: which pick this tile answers, the same number the
-        # graph drew beside it. Without it two tiles of one camera minutes apart
-        # cannot be told from one another.
-        pick = cell.get("pick")
+        # Several picks: which one this tile answers, the same number the graph drew
+        # beside it. Without it two tiles of one camera minutes apart cannot be told
+        # from one another. A PLAIN number, whether the pick was a click or a drag:
+        # the numbering runs through both now, so nothing needs an `r` to keep
+        # region 2 apart from moment 2 — there is only ever one 2.
+        reg = cell.get("region") or {}
+        pick = reg.get("index") if reg else cell.get("pick")
         if pick:
             txt = f"{pick})  {txt}" if txt else f"{pick})"
         ts = cell.get("ts_ns")
@@ -13007,10 +14269,16 @@ class _DayWall(QWidget):
         # deliberately keeps it: the moment was right, this camera just saw nothing.
         if _m.get("blank"):
             txt += "  (nothing on it)"
-        if self._shared.adj.get(cell.get("path")):
+        _adj = self._shared.adj.get(cell.get("path")) or {}
+        if _adj:
             # Plain words, matching "(reference)" — this has to be legible in the caption
-            # strip at any tile size, which a decorative glyph is not.
-            txt += "  (adjusted)"
+            # strip at any tile size, which a decorative glyph is not. WHAT was changed
+            # is named: a tile off the shared brightness is no longer comparable at all,
+            # while one that only wears a different palette still is.
+            if any(k in _adj for k in ("contrast", "offset", "gamma")):
+                txt += "  (adjusted)"
+            elif "grad" in _adj:
+                txt += "  (own palette)"
         return txt
 
     def _paint_into(self, painter: QPainter, rects: list, scale: float = 1.0):
@@ -13023,6 +14291,18 @@ class _DayWall(QWidget):
         if self._layout_mode == "rows":
             hf = painter.font()
             hf.setBold(True)
+            # WHICH CAMERA a row is must stay readable however far the wall is
+            # scrolled sideways, so the words ride with the viewport while the band
+            # spans the whole width. Scrolled off the left edge, the banner named
+            # nothing.
+            x_pad = int(10 * scale)
+            if live:
+                sc = self._scroll_host
+                try:
+                    if sc is not None:
+                        x_pad += sc.horizontalScrollBar().value()
+                except RuntimeError:
+                    pass
             for hr, txt in self._row_heads:
                 r = (hr if scale == 1.0 else
                      QRect(int(hr.x() * scale), int(hr.y() * scale),
@@ -13030,7 +14310,7 @@ class _DayWall(QWidget):
                 painter.fillRect(r, QColor("#333"))
                 painter.setFont(hf)
                 painter.setPen(QPen(QColor("#eee")))
-                painter.drawText(r.adjusted(int(10 * scale), 0, 0, 0),
+                painter.drawText(r.adjusted(x_pad, 0, 0, 0),
                                  Qt.AlignmentFlag.AlignVCenter |
                                  Qt.AlignmentFlag.AlignLeft, txt)
                 painter.setFont(f)
@@ -13176,12 +14456,64 @@ class _DayWall(QWidget):
             self._relayout()
         self._paint_into(painter, self._rects)
 
-    def composite_image(self, scale: float = 2.0) -> "QImage | None":
+    # What one saved view may cost, in pixels. 80 Mpx is about 9600 × 8300 — a large
+    # PNG, but one that can be opened; RGB888 makes it ~240 MB while it is being
+    # painted, which is why there is a ceiling at all.
+    _EXPORT_MAX_PX = 80_000_000
+
+    def export_scale(self) -> float:
+        """How much bigger than the screen the saved view has to be.
+
+        Not a fixed multiplier. The old one (2×) was set when a wall held a handful
+        of tiles; with four cameras × eight picks on a row a tile is drawn about
+        300 px wide and 2× still threw four fifths of a 1280 px frame away, so the
+        file could not be read even though the frames were there.
+
+        So the SMALLEST tile decides: whatever factor puts its own native pixels on
+        screen 1:1 is the factor for the whole picture, floored at the old 2× and
+        capped by `_EXPORT_MAX_PX`. Captions scale with it (`_paint_into`), so
+        nothing grows without its words growing too.
+        """
+        need = 2.0
+        for i, cell in enumerate(self._cells):
+            if i >= len(self._rects):
+                break
+            r = self._rects[i]
+            entry = self._raw.get(cell.get("path"))
+            if not entry or r.width() <= 0 or r.height() <= 0:
+                continue
+            arr = entry[0]
+            h, w = arr.shape[:2]
+            if self._rot_of(cell) in (90, 270):
+                w, h = h, w
+            # The room the picture itself gets inside the tile, not the tile.
+            pw = max(1, r.width() - 2 * self._GAP)
+            ph = max(1, r.height() - self._CAPTION_H - 2 * self._GAP)
+            a = max(0.05, float(w) / max(1.0, float(h)))
+            drawn_w = max(1.0, min(float(pw), ph * a))
+            need = max(need, float(w) / drawn_w)
+        W0 = max(1, self.width(), self.minimumWidth())
+        H0 = max(1, self.height(), self.minimumHeight())
+        if W0 * H0 * need * need > self._EXPORT_MAX_PX:
+            need = max(2.0, (self._EXPORT_MAX_PX / float(W0 * H0)) ** 0.5)
+        return need
+
+    def composite_image(self, scale: "float | None" = None) -> "QImage | None":
         """The whole wall as ONE image, captions included — the thing neither existing
-        tab can produce, since both save frames singly."""
+        tab can produce, since both save frames singly.
+
+        `scale` left out means `export_scale()` — as large as the frames themselves
+        are. A caller that states one gets exactly that."""
         if not self._cells or not self._rects:
             return None
-        W = int(self.width() * scale); H = int(self.height() * scale)
+        if scale is None:
+            scale = self.export_scale()
+        # The widget is deliberately BIGGER than its pane when the wall is wider or
+        # taller than the pane, and on a tab that was never shown Qt has not grown it
+        # to its minimum yet — so the minimum is what the picture must cover.
+        w_px = max(self.width(), self.minimumWidth())
+        h_px = max(self.height(), self.minimumHeight())
+        W = int(w_px * scale); H = int(h_px * scale)
         if W <= 0 or H <= 0:
             return None
         big = [QRect(int(r.x() * scale), int(r.y() * scale),
@@ -13237,7 +14569,12 @@ class _DayWall(QWidget):
                 a = datetime.fromtimestamp(int(asked) / 1e9, tz=timezone.utc)
                 if PRAGUE is not None:
                     a = a.astimezone(PRAGUE)
-                lines.append(f"moment {pick} picked:  " + a.strftime("%H:%M:%S"))
+                # "region 2", not "moment 2", when the pick was a dragged range —
+                # the tooltip used to call every pick a moment.
+                kind = ("region" if (cell.get("region")
+                                     or cell.get("pick_kind") == "region")
+                        else "moment")
+                lines.append(f"{kind} {pick} picked:  " + a.strftime("%H:%M:%S"))
             except Exception:
                 pass
         if ts:
@@ -13285,6 +14622,16 @@ class _DayWall(QWidget):
         pos = event.position()
         i = self._hit(pos.toPoint())
         if i < 0:
+            # EMPTY CANVAS LETS EVERYTHING GO. No click clears the marks any more —
+            # every one of them adds — so this is the way back to "nothing marked =
+            # the whole wall". A row banner is not empty canvas: it is a label, and
+            # clicking a label must not throw the marking away.
+            if (event.button() == Qt.MouseButton.LeftButton
+                    and not self._draw_mode and self._shared.sel
+                    and not self._on_row_head(pos.toPoint())):
+                self.clear_selection()
+                event.accept()
+                return
             super().mousePressEvent(event)
             return
         if event.button() == Qt.MouseButton.RightButton:
@@ -13298,20 +14645,86 @@ class _DayWall(QWidget):
             if self._begin_overlay(i, pos):
                 return
         if event.button() == Qt.MouseButton.LeftButton:
-            # Selecting and opening are the same gesture on purpose: you click the frame
-            # you want to look at, and that is the frame the brightness controls should
-            # be aiming at when you reach for them.
+            # A click MARKS the frame and nothing else. It used to open the close-up
+            # in the same gesture, so every attempt to aim the brightness or the
+            # palette at one tile threw a window over the wall being compared.
+            # Looking closely is its own act now: double click, or right click →
+            # View, or the Detailed view tab.
             path = self._cells[i].get("path")
             if path is not None:
-                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                    self.set_selected(path, path not in self._shared.sel)
+                shift = bool(event.modifiers()
+                             & Qt.KeyboardModifier.ShiftModifier)
+                if shift:
+                    # SHIFT marks the whole CAMERA — every frame it has on this wall.
+                    # On the Day-by-day wall a camera owns a whole row, and "give this
+                    # camera its own brightness" would otherwise be twelve clicks
+                    # along it.
+                    self._select_camera(self._cells[i].get("cam"))
                     return
-                self._shared.sel.clear()
-                self._shared.sel.add(path)
-                self.selection_changed.emit()
-                self.update()
-            self.tile_clicked.emit(i)
+                # EVERY CLICK ADDS. It used to clear the marking first, so marking a
+                # second picture dropped the first and there was no way to build a set
+                # without knowing about Ctrl. Ctrl+click is the same act, kept because
+                # it is in every tooltip and in everyone's fingers.
+                self.set_selected(path, path not in self._shared.sel)
+                return
         super().mousePressEvent(event)
+
+    def mark_camera(self, cam, add: bool = True) -> bool:
+        """Mark one camera from OUTSIDE the wall — the panel's camera list.
+
+        The same act as SHIFT+click on one of its tiles. Returns False when this
+        camera has nothing on the wall, so the caller can say so instead of
+        looking like the click did nothing.
+
+        `add` is kept only so the old call sites read the same; there is no
+        replace-everything behaviour left to ask for."""
+        if not any(c.get("cam") == cam and c.get("path") is not None
+                   for c in self._cells):
+            return False
+        self._select_camera(cam)
+        return True
+
+    def _select_camera(self, cam):
+        """ADD every frame this camera has on the wall to what is marked — or take
+        the whole camera back off when all of it is already in.
+
+        It used to REPLACE the marking, so marking a second camera dropped the
+        first: exactly the complaint about the picture wall. Nothing clears the
+        marking behind the operator's back any more; a click on empty canvas is
+        what lets everything go."""
+        paths = [c["path"] for c in self._cells
+                 if c.get("cam") == cam and c.get("path") is not None]
+        if not paths:
+            return
+        have = set(self._shared.sel)
+        all_in = all(p in have for p in paths)
+        for p in paths:
+            if all_in:
+                have.discard(p)
+            else:
+                have.add(p)
+        self._shared.sel.clear()
+        self._shared.sel.update(have)
+        self.selection_changed.emit()
+        self.update()
+
+    def _on_row_head(self, pos) -> bool:
+        """True when this point is inside one of the row banners — the grey bands that
+        name the camera. They are not pictures and not empty canvas either."""
+        return any(hr.contains(pos) for hr, _txt in self._row_heads)
+
+    def mouseDoubleClickEvent(self, event):
+        """Double click is the quick way into the close-up.
+
+        The single click gave it up when it became the way to MARK a tile; the
+        gesture has to stay somewhere on the picture itself, or the only route to a
+        frame's own window would be a menu."""
+        if event.button() == Qt.MouseButton.LeftButton and not self._draw_mode:
+            i = self._hit(event.position().toPoint())
+            if i >= 0:
+                self.tile_clicked.emit(i)
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event):
         self._drag_idx = -1

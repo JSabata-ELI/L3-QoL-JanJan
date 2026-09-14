@@ -18,6 +18,12 @@
     "           number for the whole row. Only the SCREEN and the workbook are",
     "           rounded -- spfe_log.csv keeps the measured value, so the",
     "           out-of-range statistics still see the real spread.",
+    "  scale    what the PV's number is multiplied by on the way in, for a channel",
+    "           whose unit is not the unit of the row: the dazzler archives 0.33 and",
+    "           the row is a percentage, so 100 makes it 33. Unlike 'round' this DOES",
+    "           change what is written into spfe_log.csv, so the log, the table, the",
+    "           workbook and the ranges all hold the same quantity. Changing it does",
+    "           not touch values already recorded -- migrate the file instead.",
     "  manual   'text' or 'number' -- typed by the operator instead of read from a PV",
     "  default  what a manual row shows until somebody types over it. Written into",
     "           the record when a moment is recorded, so the file says what the",
@@ -29,12 +35,16 @@
     "  check    false switches the out-of-range statistics off for this row",
     "",
     "STILL TO BE FILLED IN: Pumplaser DAC, Humidity, Oscillator Power, Oscillator",
-    "Bandwidth and DAZZ2 have no PV -- the archiver has no channel with pump, dac,",
-    "humid, osc or dazz in its name. L3-SPFE-AOD03-002 is the only dazzler the",
-    "archiver knows; DAZZ1 reads its Power_RB.",
+    "Bandwidth and DAZZ1 have no PV -- the archiver has no channel with pump, dac,",
+    "humid or osc in its name. L3-SPFE-AOD03-002 is the only dazzler the archiver",
+    "knows, and it is DAZZ2 (confirmed 2026-09-07); DAZZ2 reads its Power_RB.",
     "",
     "A dazzler has ONE percentage, not two. The second number the table used to",
-    "show (Amplitude_RB, labelled 'intensity') was a guess and is gone."
+    "show (Amplitude_RB, labelled 'intensity') was a guess and is gone.",
+    "",
+    "The channel archives the percentage as a fraction, 0..1, so it is scaled by",
+    "100 and shown to one decimal: 0.332 is 33.2 %. It is not rounded either --",
+    "'round': 1 used to turn every reading into 0."
   ],
 
   "groups": [
@@ -68,11 +78,11 @@
     {
       "label": "Dazzlers",
       "rows": [
-        {"key": "dazz1", "label": "DAZZ1",
+        {"key": "dazz1", "label": "DAZZ1", "pvs": [""],
+         "unit": "%", "decimals": 1, "round": 0},
+        {"key": "dazz2", "label": "DAZZ2",
          "pvs": ["L3-SPFE-AOD03-002:Power_RB"],
-         "unit": "%", "decimals": 0, "round": 1},
-        {"key": "dazz2", "label": "DAZZ2", "pvs": [""],
-         "unit": "%", "decimals": 0, "round": 1}
+         "unit": "%", "decimals": 1, "round": 0, "scale": 100}
       ]
     },
     {

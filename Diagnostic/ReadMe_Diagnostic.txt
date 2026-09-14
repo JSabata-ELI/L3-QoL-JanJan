@@ -218,7 +218,15 @@ THE CANTEEN MENU
   the day it is showing, and /food today still means today.
 
   The meals are grouped by course - soups first, then main courses -
-  and numbered inside each group.
+  and numbered inside each group. What you have ordered that day is
+  marked in the list:
+
+      1) Rajcatova s cizrnou - 30 Kc
+      2) [v] Cibulacka s krutony - 30 Kc
+
+  So /food alone already answers "and what am I having". The mark
+  goes by the meal's own number in the portal, not by its name, so a
+  dish that turns up on two days is never marked on the wrong one.
 
   The canteen writes the Czech and English name into one field, and
   not always both. So by default you get the Czech name with the
@@ -230,6 +238,104 @@ THE CANTEEN MENU
   Where only one language exists, that one is shown either way - a
   blank line where lunch should be would be worse. It combines with
   everything: /food week; en, /food friday; cz.
+
+
+SIGNING UP FOR LUNCH, AND OFF IT
+
+      /food order friday 1 pin:bakoli
+      /food order friday soup 2 main 1 pin:severu
+      /food cancel friday pin:tumida
+      /food order friday          shows Friday's list, orders nothing
+      /food orders                what you have ordered from today on
+
+  The numbers are the ones printed under each course, so read the
+  menu first and then pick from it. A number on its own means the
+  main course.
+
+  The words may come in any order and in either language, so all of
+  these are the same thing:
+
+      /food cancel friday pin:bakoli
+      /food friday cancel pin:bakoli
+      /food patek zrusit pin:bakoli
+
+  One thing has to be set up first, in Settings -> Canteen menu:
+  press the button at "Ordering codes" and you get 100 words. Until
+  then no order is accepted, and the menu still reads normally.
+
+  The code is the protection, and by default the only one - it does
+  not matter which account the order arrives from, so you can order
+  from a shared mailbox as easily as from your own. That is safe
+  because a code works once and only ever appears in the chat inside
+  the very message that uses it up: there is no moment when somebody
+  could read one and still use it.
+
+  If you do want ordering tied to particular senders, fill their
+  addresses into "Restrict ordering to". Empty means anybody with a
+  valid code.
+
+  ALREADY ORDERED
+
+  A day you have already booked is simply re-ordered, one course at
+  a time. Say only the course you want to move and the other one
+  stays as it is:
+
+      booked:  soup 1 + main 2
+      /food order friday soup 2 pin:yourcode
+      now:     soup 2 + main 2
+
+  The number 0 is how a course comes off:
+
+      /food order friday soup 0 pin:yourcode    soup off, main kept
+
+  To drop the whole day: /food cancel friday pin:yourcode
+
+  The word change means exactly the same as order, so both work.
+
+  Asking for exactly what you already have changes nothing and uses
+  no code:
+
+      Friday 11.09. - that is already what you have ordered:
+      - Main courses: Sekana s bramborovou kasi - 147 Kc
+
+      Nothing has been changed and no code was used.
+
+  ONE-TIME CODES - why it works this way
+
+  A chat keeps every message for ever. A fixed password typed into a
+  chat would therefore stay readable to anyone who can see it, and
+  after the first use it would protect nothing. So the codes are
+  one-time: each one works once and is then struck off the list, and
+  the code left behind in the chat is already spent and useless.
+
+  The button gives you 100 of them at once, shown that one time only.
+  Copy them out or save them to a file and keep them where you will
+  have them when you want lunch - a note on your phone. Only
+  fingerprints are stored, so they cannot be shown to you again and
+  cannot be recovered from the settings file.
+
+  A day that turns out to be closed, or a meal number that does not
+  exist, costs you no code - a code is used up only when the portal
+  is really being asked to change something. From ten codes down,
+  every reply reminds you how many are left. Making a new list
+  replaces the old one.
+
+  Making a new list, or losing the list, never touches the orders you
+  have already placed.
+
+  Looking is not changing: /food order friday with no meal named just
+  prints Friday's list, and asks for nothing - /food friday shows the
+  same thing to anybody anyway.
+
+  Ordering always asks the portal first, so it knows whether the day
+  is still open. The canteen closes a day around 10:00 that morning,
+  but sometimes earlier - so nothing is worked out from the clock. If
+  the day has closed you are told so, and if the portal refuses for
+  some other reason you get its own words back.
+
+  Afterwards the reply names the meal it actually ordered, read back
+  out of the portal - not the one it meant to order. If those two
+  ever differ, you find out immediately.
 
   The menu comes from the OKbase portal, which needs a sign-in, so
   fill in Settings -> Canteen menu once. If OKbase asks you for a
@@ -313,11 +419,18 @@ THE CANTEEN MENU
   Ask /food status any time and it tells you what it has saved, what
   it is doing at that moment, and whether the sign-in still works.
 
-  It is read once a day and saved, which is why the bot can answer
-  /food with the program closed. Every answer says when the menu was
-  read, and if that was a long time ago it says so in bold rather
-  than passing old food off as today's. /food refresh reads it again
-  on the spot.
+  Every /food reads OKbase on the spot, so the answer takes a second
+  or two and shows what the portal holds right now - the menu is
+  still being edited during the morning, and the day can close for
+  orders at any time. /food refresh is the same read, answered with
+  today.
+
+  If the portal does not answer, you get the last saved copy instead
+  and the reply says so - when it was read, and why it could not get
+  newer. Old food is never passed off as today's.
+
+  The menu is also read once a day on its own and saved, which is
+  why the bot can answer /food even with the program closed.
 
 
 LEFT RUNNING FOR WEEKS

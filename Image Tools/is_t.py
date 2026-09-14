@@ -236,6 +236,14 @@ PROXY_HOLD_MAX   = 25       # consecutive holds tolerated for an in-flight displ
                             # _inflight key can never park the preview forever
 PROXY_REFINE_MS  = 200      # settle time before the full-quality re-render
 PROXY_TOPUP_MS   = 2000     # debounce for extending the preview after a refresh
+HOLD_STEP_RATES  = (2, 3, 4, 5)   # frames per second while a frame arrow is HELD DOWN, one
+                            # rung per whole second held (see _hold_step_tick). The press always
+                            # moves exactly one frame, so a plain click is unchanged and the
+                            # first repeat only arrives 1/2 s later — that half second is
+                            # what separates a click from a hold, with no separate delay to
+                            # tune. Capped at 5/s on purpose: every step is a share read per
+                            # camera (130-160 ms each, see _proxy_try_paint_cam), so a faster
+                            # ramp would only queue reads the user has already scrolled past.
 HQ_SETTLE_MS     = 500      # stillness required before multi-cam TILES are re-rendered at
                             # native resolution. A second, slower tier on top of
                             # PROXY_REFINE_MS rather than a re-tune of it: the 200 ms refine
@@ -356,18 +364,60 @@ def _import_daypicker():
     """Load the shared day/time picker (sibling daypicker.py), same rule again:
     one instance per process, registered before exec. It owns HOW A DAY AND A TIME
     WINDOW ARE PICKED — the calendar, the click rules, the per-day table — so no
-    tab can grow a calendar of its own again."""
+    tab can grow a calendar of its own again.
+
+    Three locations are searched because a built app has no single answer. Next to
+    this file means _internal, and _internal never survives the trip to the
+    share: copying a program there does not bring its _internal at all, and
+    "Deploy Libraries" (Dev Tools/cm_t.py) fills the destination's one from a
+    single shared runtime library, deleting whatever that library does not have.
+    daypicker.py is not in it and cannot be. The copy compiled into the exe
+    (build_config.json -> hidden_imports) and the loose file the deploy drops
+    beside the exe are the fallbacks."""
     import sys as _sys
+    import importlib
     import importlib.util as _ilu
     mod = _sys.modules.get("daypicker")
     if mod is not None:
         return mod
-    p = Path(__file__).resolve().parent / "daypicker.py"
-    spec = _ilu.spec_from_file_location("daypicker", p)
-    mod = _ilu.module_from_spec(spec)
-    _sys.modules["daypicker"] = mod    # register BEFORE exec (re-entrancy safe)
-    spec.loader.exec_module(mod)
-    return mod
+
+    if getattr(_sys, "frozen", False):
+        try:
+            return importlib.import_module("daypicker")   # compiled into the exe
+        except ImportError:
+            pass
+
+    tried: list = []
+    for _d in (str(Path(__file__).resolve().parent),
+               getattr(_sys, "_MEIPASS", ""),
+               os.path.dirname(os.path.abspath(_sys.executable))):
+        if not _d:
+            continue
+        p = os.path.join(_d, "daypicker.py")
+        if p in tried:
+            continue
+        tried.append(p)
+        if not os.path.isfile(p):
+            continue
+        spec = _ilu.spec_from_file_location("daypicker", p)
+        mod = _ilu.module_from_spec(spec)
+        _sys.modules["daypicker"] = mod    # register BEFORE exec (re-entrancy safe)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            _sys.modules.pop("daypicker", None)
+            raise
+        return mod
+
+    try:
+        return importlib.import_module("daypicker")
+    except ImportError:
+        pass
+    raise RuntimeError(
+        "daypicker.py was not found. Looked in:\n  " + "\n  ".join(tried)
+        + "\nand in the modules compiled into the program itself. A built copy "
+          "needs 'daypicker' in build_config.json -> hidden_imports."
+    )
 
 
 daypicker = _import_daypicker()
@@ -1833,14 +1883,20 @@ QCheckBox::indicator:checked:disabled { border: 2px solid #a9c6ee; background: #
 # name and the meaning are one hover away — the tooltip goes on the name label, the
 # slider AND the readout, so every part of the row explains itself.
 _BC_NAME_W = 34          # room for "Con:" / "Bri:" / "Gam:" so the three sliders align
-_BC_VALUE_W = 38         # room for "-127", "-255", "0.10" without the row jittering
+_BC_VALUE_W = 40         # room for "-384", "-255", "0.10" without the row jittering
 
 _TT_CONTRAST = (
-    "Contrast (-127 to +127) — multiplicative gain around the frame's own black level.\n"
-    "0 = untouched; positive spreads the values apart, negative squeezes them together.")
+    f"Contrast ({img_scale.CONTRAST_MIN} to +{img_scale.CONTRAST_MAX}) — multiplicative "
+    "gain around the frame's own black level.\n"
+    "0 = untouched; positive spreads the values apart, negative squeezes them together.\n"
+    f"Every {int(img_scale.CONTRAST_PER_DOUBLING)} steps double the gain, so +"
+    f"{int(img_scale.CONTRAST_PER_DOUBLING)} is 2x and +"
+    f"{img_scale.CONTRAST_MAX} is {int(img_scale.contrast_gain(img_scale.CONTRAST_MAX))}x "
+    "— the reach the dim cameras need.")
 _TT_BRIGHTNESS = (
     "Brightness (-255 to +255) — additive offset: the number is added to every pixel.\n"
-    "0 = untouched; positive lifts the whole frame, negative darkens it.")
+    "0 = untouched; positive lifts the whole frame, negative darkens it.\n"
+    "It only shifts, it never spreads — spreading is what Contrast is for.")
 _TT_GAMMA = (
     f"Gamma ({img_scale.GAMMA_MIN:.2f}–{img_scale.GAMMA_MAX:.2f}) — the number shown is "
     "the exponent of the display curve.\n"
@@ -1865,6 +1921,10 @@ def _bc_value_label(text: str, tooltip: str) -> QLabel:
     lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     lbl.setToolTip(tooltip)
     lbl.setProperty("autoval", False)
+    # Set while the selected cameras hold DIFFERENT values for this row: there is no one
+    # number to print, so the box says so instead of showing one camera's and passing it
+    # off as everybody's (see _bc_value_set_mixed).
+    lbl.setProperty("mixed", False)
     # Not the :disabled grey (#9a9a9a): this number is live and worth reading, it just
     # is not a setting. #6a6a6a is the darkest grey that still reads as clearly muted
     # next to #111 and keeps 4.6:1 against the panel background — one step lighter
@@ -1872,6 +1932,10 @@ def _bc_value_label(text: str, tooltip: str) -> QLabel:
     lbl.setStyleSheet(
         "QLabel { font-weight: 700; color: #111; }"
         'QLabel[autoval="true"] { font-weight: 600; color: #6a6a6a; font-style: italic; }'
+        # Amber on the same light panel as the warning line below the rows, so the two
+        # read as one message. Dark ink, never a coloured background: the box is 40 px
+        # wide and a filled chip that size is a smudge.
+        'QLabel[mixed="true"] { font-weight: 800; color: #b36b00; font-style: normal; }'
         "QLabel:disabled { color: #9a9a9a; }")
     return lbl
 
@@ -1881,18 +1945,43 @@ def _bc_value_label(text: str, tooltip: str) -> QLabel:
 _TT_AUTO_VALUE = (
     "\n\nAuto is on: this is the value Auto MEASURED, not a setting you made.\n"
     "With several cameras it is the master camera's (the one with the radio button) — "
-    "every other camera is levelled from its own frame and has its own value.")
+    "every other camera works its own value out from its own frame.")
+
+
+def _bc_repolish(lbl: QLabel) -> None:
+    """A dynamic property in a stylesheet selector only takes effect on a repolish."""
+    st = lbl.style()
+    st.unpolish(lbl)
+    st.polish(lbl)
 
 
 def _bc_value_set_auto(lbl: QLabel, on: bool, base_tooltip: str) -> None:
     """Switch one readout between "setting" (black) and "measured" (grey + note)."""
     if bool(lbl.property("autoval")) != bool(on):
         lbl.setProperty("autoval", bool(on))
-        # A dynamic property in a stylesheet selector only takes effect on a repolish.
-        st = lbl.style()
-        st.unpolish(lbl)
-        st.polish(lbl)
+        _bc_repolish(lbl)
+    if lbl.property("mixed"):
+        return   # the mixed note owns the tooltip while it is up
     lbl.setToolTip(base_tooltip + _TT_AUTO_VALUE if on else base_tooltip)
+
+
+# Shown in a readout instead of a number when the selected cameras disagree about that
+# row. Not a number, because any number there would be a lie about the other cameras.
+_TT_MIXED_VALUE = (
+    "\n\nThe selected cameras are NOT on the same value here.\n"
+    "Move this control and all of them are set to what you move it to.")
+
+
+def _bc_value_set_mixed(lbl: QLabel, on: bool, base_tooltip: str) -> None:
+    """Switch one readout between its number and the "they differ" mark."""
+    if bool(lbl.property("mixed")) != bool(on):
+        lbl.setProperty("mixed", bool(on))
+        _bc_repolish(lbl)
+    if on:
+        lbl.setText("≠")
+        lbl.setToolTip(base_tooltip + _TT_MIXED_VALUE)
+    else:
+        lbl.setToolTip(base_tooltip)
 
 
 # Pin-stepping buttons (Timestamps group). Amber so they read as "marker
@@ -2666,41 +2755,12 @@ def _norm16_to8_full_scale(arr16: np.ndarray,
 
 
 def _gain_to_contrast_slider(gain: float) -> int:
-    """Inverse of the manual contrast curve in _apply_contrast: return the slider
-    value whose gain matches `gain` (1.0 → 0). Used to park the disabled Contrast
-    slider where Auto actually put it.
+    """Inverse of the manual contrast curve: the slider value whose gain matches `gain`
+    (1.0 → 0). Used to park the disabled Contrast slider where Auto actually put it.
 
     The curve itself lives in img_scale, where the Finder and the Shot Finder read it
     too — a slider marked +30 has to mean one gain in all three tabs."""
     return img_scale.contrast_slider_from_gain(gain)
-
-
-def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
-                   out: dict | None = None) -> np.ndarray:
-    """Percentile contrast stretch on a full-precision float array → uint8.
-
-    Used for auto-stretch so weak images are stretched from their REAL data range
-    (before any lossy 8-bit conversion). Clipping a small fraction at the top end
-    means a few hot/saturated pixels can't dominate the scale and crush the rest of
-    the frame to black. Falls back to min/max if the percentile window is degenerate,
-    then to a flat black image only if the data is truly uniform.
-
-    `out`, when given, receives {"contrast": slider value equivalent to the applied
-    stretch} so the UI can show where Auto landed.
-    """
-    # The window itself comes from img_scale so the Finder / Shot Finder Auto stretch is
-    # the same stretch, not a lookalike. Only the slider decomposition below is local.
-    win = img_scale.percentile_window(arr_f, p_low, p_high)
-    if win is None:
-        return np.zeros(arr_f.shape, dtype=np.uint8)
-    lo, hi = win
-    if out is not None:
-        # Gain relative to the absolute-scale (non-auto) rendering of the same frame,
-        # and the black level it subtracted — the Contrast/Brightness slider pair that
-        # reproduces this stretch (see _bc_auto_level for the decomposition).
-        out["contrast"] = _gain_to_contrast_slider(_FULL_SCALE_16 / (hi - lo))
-        out["offset"] = int(round(max(-255.0, min(255.0, -lo * (255.0 / _FULL_SCALE_16)))))
-    return np.clip((arr_f - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
 
 
 # ---------------- 8-BIT BRIGHTNESS / CONTRAST PRIMITIVES ----------------
@@ -2710,7 +2770,8 @@ def _stretch_arr_f(arr_f: np.ndarray, p_low: float = 0.5, p_high: float = 99.5,
 # palette keeps RGB sources in colour and must still honour the sliders.
 _BLACK_PCT = 0.5      # percentile treated as the frame's black level
 _HIGH_PCT  = 99.5     # percentile treated as the frame's highlight level
-# Auto brightness is an auto LEVEL, not a shift: see _bc_auto_level.
+# The same two percentiles img_scale uses, so the manual pivot, both Auto boxes and the
+# preview proxy all agree on where this frame's black and highlight are.
 
 
 # Percentile anchors are read from a subsample, not from every pixel. np.percentile on
@@ -2768,42 +2829,13 @@ def _contrast_gain(contrast: int) -> float:
     return img_scale.contrast_gain(contrast)
 
 
-def _bc_auto_level(arr: np.ndarray, stat: np.ndarray,
-                   out: dict | None = None) -> np.ndarray:
-    """Auto brightness: ImageJ-style auto level — p0.5..p99.5 mapped onto 0..255.
-
-    NO additive rule can do this job, which is why both of the ones tried before failed
-    on the real frames. Parking p99.5 at 255 added +190 and clipped everything into a
-    white rectangle. Parking the MEDIAN at mid-grey failed the other way: the median IS
-    the background here, and the whole tonal range lives in 5-25 % of the scale, so the
-    frame was lifted into a flat light field with its contrast untouched — measured on
-    C03-051-WRT2DPNF, absolute-scale p0.5..p99.5 of 2..53 came out as 126..177, and the
-    picture was gone. A shift cannot spread a narrow range; only a gain can. ImageJ's
-    auto display range is exactly that gain, and matching it is what the control is for.
-
-    `out` receives the Contrast gain and Brightness offset that reproduce this level, so
-    the greyed-out sliders can be parked on it: the stretch is (x - lo) * gain, and
-    _apply_bc's manual pair pivots contrast on the same black level, so the equivalent
-    manual setting is gain = 255/(hi-lo) with an offset of -lo."""
-    s = _stat_sample(stat)
-    lo = float(np.percentile(s, _BLACK_PCT))
-    hi = float(np.percentile(s, _HIGH_PCT))
-    if hi <= lo:
-        # Degenerate percentile window (flat frame, or one dominated by a single code):
-        # fall back to the real min/max before giving up on the frame entirely.
-        lo, hi = float(stat.min()), float(stat.max())
-    if hi <= lo:
-        return arr
-    gain = 255.0 / (hi - lo)
-    if out is not None:
-        out["contrast"] = _gain_to_contrast_slider(gain)
-        out["offset"] = int(round(max(-255.0, min(255.0, -lo))))
-    return (arr - lo) * gain
-
-
 def _apply_stretch(img: QImage, p_low: float = 0.5, p_high: float = 99.5,
                    out: dict | None = None) -> QImage:
-    """Percentile contrast stretch of an 8-bit image (grayscale or colour)."""
+    """Percentile contrast stretch of an 8-bit image (grayscale or colour).
+
+    The DETECTION helpers' stretch, not the display one — the display path is
+    _apply_bc / img_scale.render_u8, where the stretch is the Contrast and Brightness
+    controls doing their own jobs."""
     if img.isNull():
         return img
     w, h = img.width(), img.height()
@@ -2830,9 +2862,9 @@ def _autostretch_gray(img: QImage, p_low: float = 0.5, p_high: float = 99.5,
     return _apply_stretch(img, p_low, p_high, out)
 
 
-def _apply_bc(img: QImage, contrast: int = 0, auto_bright: int = 0, offset: int = 0,
-              out: dict | None = None) -> QImage:
-    """Manual contrast, then Auto brightness (auto level) OR a manual brightness offset.
+def _apply_bc(img: QImage, contrast: int = 0, offset: int = 0,
+              auto: int = img_scale.AUTO_NONE, out: dict | None = None) -> QImage:
+    """The Contrast / Brightness pair on an image that is ALREADY 8-bit.
 
     Contrast is a multiplicative gain pivoted on the frame's own BLACK LEVEL, not on
     mid-grey. Mid-grey was unusable here: an absolute-scale frame sits around code 29,
@@ -2841,44 +2873,37 @@ def _apply_bc(img: QImage, contrast: int = 0, auto_bright: int = 0, offset: int 
     level means contrast only spreads the signal ABOVE the background, which is what the
     control is for and what makes small moves small.
 
-    `auto_bright` here is the 8-bit fallback path — subtraction frames and any 8-bit
-    source. The 16-bit renders auto-level in full precision earlier (see
-    load_image_scaled) and pass auto_bright=0, so the frame is never levelled twice.
+    `auto` is img_scale's AUTO_* mask and means the same here as everywhere else: each
+    ticked box fills in the value of ITS OWN control from this frame's percentile window
+    (img_scale.auto_bc_pair). This path serves the sources that have no full-precision
+    data left — a subtraction difference, an 8-bit file. Everything with 16-bit pixels
+    goes through img_scale.render_u8 instead, which does the same arithmetic before the
+    rounding to 8 bits.
 
-    `out`, when given, receives {"contrast", "offset"}: the slider pair equivalent to
-    the Auto pass, for the greyed-out sliders."""
+    `out`, when given, receives {"contrast", "offset"} for the ticked boxes, so the
+    greyed-out sliders can be parked on what Auto actually applied."""
     if img.isNull():
         return img
-    if not contrast and not auto_bright and not offset:
+    if not contrast and not offset and not auto:
         return img
     w, h = img.width(), img.height()
     if w <= 0 or h <= 0:
         return img
     arr, stat, is_gray = _img_planes(img)
+    s = _stat_sample(stat)
+    pivot = float(np.percentile(s, _BLACK_PCT))
+    contrast, offset = img_scale.auto_bc_pair(
+        pivot, float(np.percentile(s, _HIGH_PCT)), auto, contrast, offset)
+    if out is not None:
+        if auto & img_scale.AUTO_CONTRAST:
+            out["contrast"] = contrast
+        if auto & img_scale.AUTO_BRIGHT:
+            out["offset"] = offset
     if contrast:
-        pivot = float(np.percentile(_stat_sample(stat), _BLACK_PCT))
-        gain = _contrast_gain(contrast)
-        arr = (arr - pivot) * gain + pivot
-        stat = arr if is_gray else (stat - pivot) * gain + pivot
-    if auto_bright:
-        arr = _bc_auto_level(arr, stat, out)
-    else:
-        off = int(max(-255, min(255, offset)))
-        if off:
-            arr = arr + off
+        arr = (arr - pivot) * _contrast_gain(contrast) + pivot
+    if offset:
+        arr = arr + offset
     return _img_from_planes(arr, is_gray, w, h)
-
-
-def _apply_brightness_offset(img: QImage, offset: int) -> QImage:
-    return _apply_bc(img, offset=offset)
-
-
-def _apply_contrast(img: QImage, contrast: int) -> QImage:
-    return _apply_bc(img, contrast=contrast)
-
-
-def _apply_auto_brightness(img: QImage, out: dict | None = None) -> QImage:
-    return _apply_bc(img, auto_bright=1, out=out)
 
 
 # Brightness/contrast/gamma render params carried through the async load pipeline.
@@ -2941,6 +2966,50 @@ def _diff_stats_get(key) -> "dict | None":
         return _DIFF_STATS.get(key)
 
 
+# How many bars the little difference histogram is drawn with. 64 buckets of 4
+# intensity steps each: wide enough to read at ~130 px in the INFO panel, and cheap
+# enough (a bincount over the lit pixels only) to run on every subtraction frame.
+_DIFF_HIST_BINS  = 64
+_DIFF_HIST_STEP  = 256 // _DIFF_HIST_BINS
+
+
+# Difference levels reported next to the pixel count: "how many pixels differ from
+# the reference by at least this much, on the 0–255 display scale". A bare count of
+# non-zero pixels says almost nothing — one count per level says how STRONG the
+# difference is, which is the question actually being asked of a subtraction frame.
+_DIFF_LEVELS = (10, 25, 50, 100)
+
+
+def _diff_counts256(vals: np.ndarray) -> np.ndarray:
+    """Per-intensity counts (0–255) of the LIT pixels (those above the background).
+    Background is deliberately not counted — it is almost the whole frame and would
+    flatten every other bar to nothing. Everything else (the histogram bars and every
+    level count) is read off this one array, so the extra numbers are free."""
+    if vals.size == 0:
+        return np.zeros(256, dtype=np.int64)
+    v = np.clip(vals, 0, 255).astype(np.uint8).ravel()
+    return np.bincount(v, minlength=256)[:256].astype(np.int64)
+
+
+def _diff_hist_from_counts(counts: np.ndarray) -> list:
+    """Bucketed bars for the small histogram in the INFO panel."""
+    if counts is None or int(counts.sum()) == 0:
+        return []
+    return counts.reshape(_DIFF_HIST_BINS, _DIFF_HIST_STEP).sum(axis=1).astype(np.int64).tolist()
+
+
+def _diff_levels_from_counts(counts: np.ndarray) -> list:
+    """[(level, pixels at or above that level), …] for _DIFF_LEVELS."""
+    if counts is None:
+        return []
+    tail = counts[::-1].cumsum()[::-1]      # tail[k] = pixels whose value is ≥ k
+    return [(lv, int(tail[lv])) for lv in _DIFF_LEVELS]
+
+
+def _diff_hist(vals: np.ndarray) -> list:
+    return _diff_hist_from_counts(_diff_counts256(vals))
+
+
 def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int = 0,
                           sub_offset: int = 0, stats_out: dict | None = None) -> QImage:
     """|current − reference| as a Grayscale8 QImage.
@@ -2972,13 +3041,30 @@ def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int
     nz = diff > 0
     n_nz = int(nz.sum())
     if stats_out is not None:
-        vals = diff[nz]
+        # What the operator actually reads: how many pixels are ABOVE THE BACKGROUND of
+        # this frame, what share of the frame that is, how strong the difference is on
+        # average, how bright the brightest pixel is, and — the number a bare count
+        # never gave — how many pixels differ by AT LEAST each of _DIFF_LEVELS. The
+        # background is the frame's own floor (min over EVERY pixel, so nearly always 0
+        # on a diff), not a constant, because a frame whose floor has been lifted must
+        # not report its whole area as "lit". The darkest lit pixel is not reported: it
+        # is just the diff threshold read back.
+        bg = float(diff.min())
+        above = diff > bg
+        n_above = int(above.sum())
+        vals = diff[above]
+        total = int(diff.size)
+        counts = _diff_counts256(vals)
         stats_out.update({
             "count": n_nz,
-            "total": int(diff.size),
-            "mean": float(vals.mean()) if n_nz else 0.0,
-            "min":  float(vals.min())  if n_nz else 0.0,
-            "max":  float(vals.max())  if n_nz else 0.0,
+            "bg":    bg,
+            "above": n_above,
+            "total": total,
+            "pct":   (100.0 * n_above / total) if total else 0.0,
+            "mean":  float(vals.mean()) if vals.size else 0.0,
+            "max":   float(diff.max()),
+            "levels": _diff_levels_from_counts(counts),
+            "hist":  _diff_hist_from_counts(counts),
         })
     if sub_offset and n_nz:
         diff[nz] += float(sub_offset)
@@ -2986,6 +3072,231 @@ def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int
     out = QImage(diff.tobytes(), img.width(), img.height(),
                  img.width(), QImage.Format.Format_Grayscale8)
     return out.copy()
+
+
+class _DiffHistogram(QWidget):
+    """The little picture behind the difference numbers: how many lit pixels there are
+    at each brightness, drawn straight into the INFO panel.
+
+    Every colour is set here. Nothing is left to the palette — this PC runs Windows in
+    dark mode, so an unpainted widget comes out black and the bars with it.
+
+    Bar heights are on a SQUARE-ROOT scale. On a linear one the first bucket (the
+    faintest differences, always the most numerous by orders of magnitude) is the only
+    bar you can see and the bright tail — the interesting half — is a flat line.
+    """
+
+    _H_BARS   = 34          # bars only
+    _H_BARS_C = 26          # …when several cameras share the panel
+    _H_AXIS   = 12          # the tick line under them
+    _BG       = "#ffffff"
+    _BORDER   = "#c0c0c0"
+    _BAR      = "#2e7d32"
+    _BAR_TOP  = "#1b5e20"
+    _GRID     = "#e2e2e2"
+    _AXIS_FG  = "#555555"
+    _SCALE_FG = "#8a8a8a"
+    _PEAK     = "#c62828"
+    _MEAN     = "#1565c0"
+
+    # Candidate tick sets, densest first. The densest one whose labels do not touch
+    # is the one drawn, so a 265 px panel gets 0/32/…/255 and a 120 px tile-sized one
+    # falls back to 0/128/255 instead of printing numbers on top of each other.
+    _TICK_SETS = (
+        (0, 32, 64, 96, 128, 160, 192, 224, 255),
+        (0, 64, 128, 192, 255),
+        (0, 85, 170, 255),
+        (0, 128, 255),
+        (0, 255),
+    )
+
+    def __init__(self, parent=None, compact: bool = False):
+        super().__init__(parent)
+        self._hist: list = []
+        self._peak: float = 0.0
+        self._mean: float = 0.0
+        self._caption: str = ""
+        self._compact = bool(compact)
+        self.setFixedHeight(self._bars_h() + self._H_AXIS)
+        self.setToolTip(
+            "How many pixels differ from the reference at each brightness, 0–255 left "
+            "to right.\nOnly the pixels above the background are counted — the "
+            "background alone is nearly the\nwhole frame and would flatten every "
+            "other bar.\nBar heights are on a square-root scale, so a handful of very "
+            "bright pixels is still visible.\nThe grey number top-left is how many "
+            "pixels the tallest bar stands for.\nThe red line marks the brightest "
+            "pixel; the blue number is the average difference of the counted "
+            "pixels.")
+        self.setVisible(False)
+
+    def _bars_h(self) -> int:
+        return self._H_BARS_C if self._compact else self._H_BARS
+
+    def set_compact(self, compact: bool):
+        compact = bool(compact)
+        if compact == self._compact:
+            return
+        self._compact = compact
+        self.setFixedHeight(self._bars_h() + self._H_AXIS)
+        self.update()
+
+    def set_data(self, hist: "list | None", peak: float = 0.0, mean: float = 0.0,
+                 caption: str = ""):
+        """Show one histogram, or hide the widget when there is nothing to draw."""
+        self._hist = list(hist or [])
+        self._peak = float(peak or 0.0)
+        self._mean = float(mean or 0.0)
+        self._caption = caption or ""
+        has = any(self._hist)
+        self.setVisible(has)
+        if has:
+            self.update()
+
+    def _pick_ticks(self, w: int, fm) -> tuple:
+        """The densest tick set whose labels still have 4 px of air between them."""
+        for ticks in self._TICK_SETS:
+            ok = True
+            prev_right = -1000
+            for t in ticks:
+                txt = str(t)
+                tw = fm.horizontalAdvance(txt)
+                cx = 1 + (w - 3) * t / 255.0
+                left = cx - tw / 2
+                if t == 0:
+                    left = 1
+                elif t == 255:
+                    left = w - 1 - tw
+                if left < prev_right + 4:
+                    ok = False
+                    break
+                prev_right = left + tw
+            if ok:
+                return ticks
+        return (0, 255)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        bars_h = h - self._H_AXIS
+        p.fillRect(0, 0, w, bars_h, QColor(self._BG))
+
+        f = QFont(self.font())
+        f.setPixelSize(9)
+        p.setFont(f)
+        fm = QFontMetrics(f)
+        ticks = self._pick_ticks(w, fm)
+
+        # Grid first, so the bars are drawn over it.
+        p.setPen(QPen(QColor(self._GRID), 1))
+        for t in ticks:
+            if t in (0, 255):
+                continue
+            gx = 1 + int((w - 3) * t / 255.0)
+            p.drawLine(gx, 1, gx, bars_h - 2)
+
+        p.setPen(QPen(QColor(self._BORDER), 1))
+        p.drawRect(0, 0, w - 1, bars_h - 1)
+
+        n = len(self._hist)
+        top_count = max(self._hist) if n else 0
+        if n and top_count > 0:
+            top = math.sqrt(top_count)
+            bw = (w - 2) / n
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(self._BAR)))
+            for i, c in enumerate(self._hist):
+                if c <= 0:
+                    continue
+                bh = max(1, int(round((bars_h - 3) * math.sqrt(c) / top)))
+                x0 = 1 + int(i * bw)
+                x1 = 1 + int((i + 1) * bw)
+                p.fillRect(QRect(x0, bars_h - 1 - bh, max(1, x1 - x0), bh),
+                           QColor(self._BAR if bh > 2 else self._BAR_TOP))
+            # Where the brightest pixel sits, on the same 0–255 axis as the bars.
+            if self._peak > 0:
+                xp = 1 + int((w - 3) * min(255.0, self._peak) / 255.0)
+                p.setPen(QPen(QColor(self._PEAK), 1))
+                p.drawLine(xp, 1, xp, bars_h - 2)
+            # The bar scale and the peak value, written INSIDE the picture. Both sit
+            # on a white pad: they are printed over the bars, and grey-on-dark-green
+            # would be exactly the unreadable text this house style forbids.
+            scale_txt = f"max {top_count:,}".replace(",", " ")
+            peak_txt = f"peak {self._peak:.0f}" if self._peak > 0 else ""
+            sw = fm.horizontalAdvance(scale_txt)
+            p.fillRect(QRect(2, 1, sw + 4, 11), QColor(255, 255, 255, 215))
+            p.setPen(QPen(QColor(self._SCALE_FG), 1))
+            p.drawText(QRect(4, 1, sw, 11),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       scale_txt)
+            if peak_txt:
+                pw = fm.horizontalAdvance(peak_txt)
+                p.fillRect(QRect(w - 4 - pw - 2, 1, pw + 4, 11),
+                           QColor(255, 255, 255, 215))
+                p.setPen(QPen(QColor(self._PEAK), 1))
+                p.drawText(QRect(w - 4 - pw, 1, pw, 11),
+                           Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                           peak_txt)
+                # The average difference, immediately LEFT of the peak — drawn only
+                # when it fits beside the scale on the other end, so a narrow tile
+                # loses the mean instead of printing it over "max".
+                if self._mean > 0:
+                    mean_txt = f"mean {self._mean:.1f}"
+                    mw = fm.horizontalAdvance(mean_txt)
+                    mx = w - 4 - pw - 2 - 6 - mw
+                    if mx - 2 > 2 + sw + 4 + 6:
+                        p.fillRect(QRect(mx - 2, 1, mw + 4, 11),
+                                   QColor(255, 255, 255, 215))
+                        p.setPen(QPen(QColor(self._MEAN), 1))
+                        p.drawText(QRect(mx, 1, mw, 11),
+                                   Qt.AlignmentFlag.AlignRight
+                                   | Qt.AlignmentFlag.AlignVCenter, mean_txt)
+
+        # Tick marks + numbers under the bars.
+        p.setPen(QPen(QColor(self._AXIS_FG), 1))
+        for t in ticks:
+            tx = 1 + int((w - 3) * t / 255.0)
+            p.drawLine(tx, bars_h, tx, bars_h + 2)
+            txt = str(t)
+            tw = fm.horizontalAdvance(txt)
+            lx = tx - tw // 2
+            if t == 0:
+                lx = 1
+            elif t == 255:
+                lx = w - 1 - tw
+            p.drawText(QRect(lx, bars_h + 2, tw, self._H_AXIS - 2),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, txt)
+        p.end()
+
+
+class _DiffCamBlock(QWidget):
+    """One camera's difference readout in the INFO panel: its name and numbers on top,
+    its own histogram underneath.
+
+    Subtraction used to draw ONE histogram for the whole grid — the selected camera's
+    — while the numbers were listed for every camera, so the picture belonged to a
+    different camera than the line above it as soon as the selection moved. Each
+    camera gets its own block now, and the block is the thing that is shown or hidden,
+    so a camera with no reference set contributes nothing at all.
+    """
+
+    def __init__(self, parent=None, compact: bool = False):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.lbl = QLabel("")
+        self.lbl.setWordWrap(True)
+        self.lbl.setStyleSheet("font-size: 10px; color: #1b5e20; padding: 0;")
+        lay.addWidget(self.lbl)
+        self.hist = _DiffHistogram(compact=compact)
+        lay.addWidget(self.hist)
+
+    def set_block(self, text: str, hist: "list | None", peak: float,
+                  mean: float = 0.0):
+        self.lbl.setText(text or "")
+        self.lbl.setVisible(bool(text))
+        self.hist.set_data(hist, peak, mean)
+        self.setVisible(bool(text) or self.hist.isVisible())
 
 
 # ---------------- FAST IMAGE LOAD ----------------
@@ -3150,9 +3461,9 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
     if img.isNull():
         return QImage()
 
-    # True once a full-precision percentile stretch has already been applied to 16-bit
-    # data, so the 8-bit _apply_stretch pass below is skipped (would be redundant).
-    did_autostretch = False
+    # True once the Contrast / Brightness pair has been applied in full precision on the
+    # 16-bit data, so the 8-bit pass at the end must not apply it a second time.
+    did_bc = False
 
     # "Default" is the VIEW-ONLY palette: the file as it sits in the folder. No grayscale
     # conversion, no LUT, and — the reason for this block — no enhancement at all. Auto
@@ -3179,11 +3490,12 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
         contrast = 0
         brightness_offset = 0
 
-    # Auto contrast and Auto brightness are both auto-level passes (see _bc_auto_level):
-    # contrast asks for the gain, brightness asks for the same window to be placed on the
-    # data. One pass serves both, so ticking both does not level the frame twice.
-    auto_level = bool(brighten or auto_bright)
-    # Effective Auto contrast / brightness of this render, published for the sliders.
+    # The two Auto boxes as one value (see img_scale.render_u8). Each one sets the value
+    # of ITS OWN control from this frame — Auto contrast the gain, Auto brightness the
+    # black-level offset — so the two are different operations and each one is its own
+    # slider set automatically. Ticking both is the full percentile stretch.
+    auto_mask = img_scale.auto_mask(bool(brighten), bool(auto_bright))
+    # Effective Contrast / Brightness / Gamma of this render, published for the sliders.
     auto_out: dict = {}
 
     if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
@@ -3199,22 +3511,25 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             # IS the value. The LUT in GRADIENTS is the same rule at 8-bit resolution and
             # only serves the subtraction path below, which has no 16-bit data left.
             return _rgb_to_qimage(_ni_binary_rgb(arr16, full_scale))
-        if auto_level and ref_image is None:
-            # Auto-stretch: percentile-stretch the FULL-PRECISION 16-bit data so weak
-            # frames are revealed and a few hot pixels can't crush the rest to black.
-            # Done here (not on the 8-bit result) because the absolute-scale path
-            # below would otherwise lose the dim content before _apply_stretch
-            # can see it.
-            arr8 = _stretch_arr_f(arr16.astype(np.float32), out=auto_out)
-            did_autostretch = True
+        if ref_image is None:
+            # The whole display pipeline on the FULL-PRECISION data: absolute scale bent
+            # by gamma, then the contrast gain, then the brightness offset, rounded to 8
+            # bits once at the end. Doing the pair here rather than on the 8-bit result
+            # is what makes a dim frame come out smooth instead of posterised — those
+            # frames occupy a handful of 8-bit codes, and a gain applied after the
+            # rounding spreads those few codes into bands.
+            #
+            # Whatever Auto worked out, and the gamma it resolved, land in auto_out for
+            # the greyed-out sliders.
+            arr8 = img_scale.render_u8(arr16, auto_mask, full_scale, gamma,
+                                       contrast, brightness_offset, auto_out)
+            did_bc = True
         else:
-            # Absolute scale, optionally through the gamma curve. Auto gamma resolves from
-            # THIS frame's pixels, so the value it picked is published in auto_out for the
-            # greyed-out Gamma slider — same contract as Auto contrast / brightness.
+            # Subtraction: the difference is taken on the plain absolute-scale rendering
+            # of both frames, and the pair is applied to the difference further down.
             g = (img_scale.auto_gamma(arr16.astype(np.float32), full_scale)
                  if img_scale.is_auto_gamma(gamma) else img_scale.gamma_from_slider(gamma))
-            if auto_out is not None:
-                auto_out["gamma"] = g
+            auto_out["gamma"] = g
             arr8 = _norm16_to8_full_scale(arr16, g, full_scale)
         img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
     elif is_default:
@@ -3227,15 +3542,12 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
     if ref_image is not None:
         img = _apply_reference_diff(img, ref_image, sub_threshold, sub_offset, stats_out)
 
-    if auto_level and ref_image is None and not did_autostretch:
-        img = _apply_stretch(img, out=auto_out)
-        did_autostretch = True
-
-    # Only a subtraction frame can still need levelling here: the diff is built in 8-bit
-    # and deliberately skips the stretch above, so Auto brightness levels it in _apply_bc.
-    img = _apply_bc(img, contrast=contrast,
-                    auto_bright=1 if (auto_bright and not did_autostretch) else 0,
-                    offset=brightness_offset, out=auto_out)
+    # Everything that had no 16-bit pixels to work from: a subtraction difference, and
+    # any source that was already 8-bit. Same arithmetic as render_u8 above, one step
+    # later — see _apply_bc.
+    if not did_bc:
+        img = _apply_bc(img, contrast=contrast, offset=brightness_offset,
+                        auto=auto_mask, out=auto_out)
 
     _auto_bc_put(path, auto_out)
 
@@ -6259,6 +6571,11 @@ def _cam_type_key(cam_name: str) -> str:
     m = re.search(r'PD[1-4]M[12]', cam_name, re.IGNORECASE)
     return m.group(0).upper() if m else cam_name.strip()
 
+def _is_diode_cam(cam_name: str) -> bool:
+    """True only for the diode arrays (PD1M1, PD2M2, ...).  The reference grid and its
+    config dialog exist for these cameras only — everywhere else they are off."""
+    return bool(cam_name) and bool(re.search(r'PD[1-4]M[12]', cam_name, re.IGNORECASE))
+
 def _load_pdxm1_grid_configs() -> dict:
     try:
         if _PDXM1_GRID_CONFIGS_PATH.exists():
@@ -6372,6 +6689,92 @@ def get_pdxm1_grid_config(cam_name: str) -> Pdxm1GridConfig:
                 divs.append(gt + acc * (gb - gt))
             cfg.row_dividers = divs
     return cfg
+
+
+# ---------------- REFERENCE RECTANGLE (PCW3_NF) ----------------
+# Some cameras have a permanent reference square configured in the camera software
+# itself.  That square is drawn only by the live camera display and is NOT part of the
+# archived PNG, so the Slider would never show it.  We re-draw it here, on screen only.
+
+_CAM_REF_RECT_PATH = Path(os.environ.get("APPDATA", Path.home())) / "ELI_ImageTools" / "cam_ref_rects.json"
+
+# Cameras that carry a reference rectangle: regex -> config key.
+_REF_RECT_CAMS = (
+    (re.compile(r'PCW3.*NF', re.IGNORECASE), "PCW3_NF"),
+)
+
+
+def _ref_rect_key(cam_name: str) -> str:
+    """Config key for a camera's reference rectangle, or '' if it has none.
+
+    Matches both spellings of the name: the display form 'C03-081_PCW3_NF' and the
+    archive folder form 'C03-081-PCW3NF-_-IMG'."""
+    if not cam_name:
+        return ""
+    for rx, key in _REF_RECT_CAMS:
+        if rx.search(cam_name):
+            return key
+    return ""
+
+
+def _load_cam_ref_rects() -> dict:
+    try:
+        if _CAM_REF_RECT_PATH.exists():
+            return json.loads(_CAM_REF_RECT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cam_ref_rects(data: dict):
+    try:
+        _CAM_REF_RECT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CAM_REF_RECT_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+@_dataclass
+class CamRefRectConfig:
+    """One permanent reference rectangle, in fractions [0,1] of the full frame."""
+    # Measured off the camera screenshots (1024x1024 frame): 344,166 -> 868,684.
+    left:   float = 0.336
+    top:    float = 0.162
+    right:  float = 0.848
+    bottom: float = 0.668
+    color: str = "#ffffff"
+    width: int = 1
+    alpha: int = 200
+    # Unlike the diode grid this starts ON: the reference belongs on the picture the
+    # first time anyone opens the camera.  Whoever does not want it turns it off.
+    show: bool = True
+
+
+_REF_RECT_FIELDS = ("left", "top", "right", "bottom", "color", "width", "alpha", "show")
+
+
+def get_ref_rect_config(cam_name: str) -> "CamRefRectConfig | None":
+    """Reference rectangle for a camera, or None if the camera has none."""
+    key = _ref_rect_key(cam_name)
+    if not key:
+        return None
+    cfg = CamRefRectConfig()
+    saved = _load_cam_ref_rects()
+    d = saved.get(key)
+    if isinstance(d, dict):
+        for f in _REF_RECT_FIELDS:
+            if f in d:
+                setattr(cfg, f, d[f])
+    return cfg
+
+
+def save_ref_rect_config(cam_name: str, cfg: "CamRefRectConfig"):
+    key = _ref_rect_key(cam_name)
+    if not key:
+        return
+    data = _load_cam_ref_rects()
+    data[key] = _asdict(cfg)
+    _save_cam_ref_rects(data)
 
 
 def _draw_outlined_text(p, rect, align_flags, text, font, fill_color, outline_px: int):
@@ -6876,6 +7279,185 @@ class Pdxm1GridConfigDialog(QDialog):
         data = _load_pdxm1_grid_configs()
         data[self._key] = _asdict(self._cfg)
         _save_pdxm1_grid_configs(data)
+
+
+class CamRefRectDialog(QDialog):
+    """Switch the permanent reference rectangle on/off and fine-tune its position.
+
+    Opened by a right-click on a camera that has one (today: PCW3_NF).  Edges are kept
+    as fractions of the frame, so they survive a change of camera resolution; the pixel
+    readout beside each box is for the 1024x1024 frames the camera writes today."""
+
+    _PIX_REF = 1024  # frame side the pixel readout is computed for
+
+    def __init__(self, cam_name: str, img_view=None, parent=None):
+        super().__init__(parent)
+        self._cam_name = cam_name
+        self._key = _ref_rect_key(cam_name)
+        self._cfg = get_ref_rect_config(cam_name) or CamRefRectConfig()
+        self._img_view = img_view
+        self._orig_cfg = CamRefRectConfig(**_asdict(self._cfg))
+        if img_view is not None:
+            img_view._ref_rect_override = self._cfg
+            img_view.update()
+        self.setWindowTitle(f"Reference frame — {self._key}")
+        self.setStyleSheet("""
+            QDialog     { background-color: #f0f0f0; }
+            QLabel      { color: #111111; background: transparent; }
+            QDoubleSpinBox, QSpinBox { color: #111111; background-color: #ffffff;
+                          border: 1px solid #aaaaaa; padding: 1px 3px; }
+            QPushButton { color: #111111; background-color: #e0e0e0;
+                          border: 1px solid #aaaaaa; padding: 3px 10px; }
+            QPushButton:hover   { background-color: #d0d0d0; }
+            QPushButton:pressed { background-color: #c0c0c0; }
+        """ + _CHECKBOX_STYLE)
+        self._build_ui()
+
+    def _build_ui(self):
+        from PySide6.QtWidgets import QDoubleSpinBox, QGridLayout
+        lay = QVBoxLayout(self)
+
+        self._show_cb = QCheckBox("Show reference frame")
+        self._show_cb.setChecked(self._cfg.show)
+        self._show_cb.stateChanged.connect(self._on_show_toggled)
+        lay.addWidget(self._show_cb)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Position in the picture (% of width / height):"), 0, 0, 1, 3)
+        self._edge_sb = {}
+        self._edge_px = {}
+        for row, (fld, label) in enumerate(
+                (("left", "Left:"), ("top", "Top:"),
+                 ("right", "Right:"), ("bottom", "Bottom:")), start=1):
+            grid.addWidget(QLabel(label), row, 0)
+            sb = QDoubleSpinBox()
+            sb.setRange(0.0, 100.0)
+            sb.setDecimals(1)
+            sb.setSingleStep(0.1)
+            sb.setSuffix(" %")
+            sb.setValue(getattr(self._cfg, fld) * 100.0)
+            sb.valueChanged.connect(lambda v, f=fld: self._on_edge_changed(f, v))
+            grid.addWidget(sb, row, 1)
+            px = QLabel("")
+            grid.addWidget(px, row, 2)
+            self._edge_sb[fld] = sb
+            self._edge_px[fld] = px
+        lay.addLayout(grid)
+
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel("Line width:"))
+        self._lw_sb = QSpinBox(); self._lw_sb.setRange(1, 8); self._lw_sb.setValue(self._cfg.width)
+        self._lw_sb.valueChanged.connect(lambda v: self._set_cfg(width=int(v)))
+        style_row.addWidget(self._lw_sb)
+        style_row.addWidget(QLabel("  Opacity:"))
+        self._la_sb = QSpinBox(); self._la_sb.setRange(20, 255); self._la_sb.setValue(self._cfg.alpha)
+        self._la_sb.valueChanged.connect(lambda v: self._set_cfg(alpha=int(v)))
+        style_row.addWidget(self._la_sb)
+        style_row.addWidget(QLabel("  Colour:"))
+        self._lc_btn = QPushButton("")
+        self._lc_btn.setFixedWidth(46)
+        self._lc_btn.setStyleSheet(f"background:{self._cfg.color}; border:1px solid #888888;")
+        self._lc_btn.clicked.connect(self._pick_color)
+        style_row.addWidget(self._lc_btn)
+        style_row.addStretch()
+        lay.addLayout(style_row)
+
+        btn_row = QHBoxLayout()
+        btn_reset = QPushButton("Reset to measured default")
+        btn_reset.clicked.connect(self._reset_all)
+        btn_row.addWidget(btn_reset)
+        btn_row.addStretch()
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self._on_reject)
+        btn_row.addWidget(btns)
+        lay.addLayout(btn_row)
+
+        self._refresh_px_labels()
+        self.adjustSize()
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _refresh_px_labels(self):
+        for fld, lbl in self._edge_px.items():
+            lbl.setText(f"= {int(round(getattr(self._cfg, fld) * self._PIX_REF))} px")
+
+    def _live_update(self):
+        if self._img_view is not None:
+            self._img_view._ref_rect_override = self._cfg
+            self._img_view.update()
+
+    def _set_cfg(self, **kw):
+        for k, v in kw.items():
+            setattr(self._cfg, k, v)
+        self._live_update()
+
+    def _on_edge_changed(self, field: str, value: float):
+        setattr(self._cfg, field, value / 100.0)
+        # Keep the rectangle non-degenerate: a dragged edge pushes its partner along.
+        if self._cfg.right <= self._cfg.left:
+            if field == "left":
+                self._cfg.right = min(1.0, self._cfg.left + 0.005)
+                self._sync_box("right")
+            else:
+                self._cfg.left = max(0.0, self._cfg.right - 0.005)
+                self._sync_box("left")
+        if self._cfg.bottom <= self._cfg.top:
+            if field == "top":
+                self._cfg.bottom = min(1.0, self._cfg.top + 0.005)
+                self._sync_box("bottom")
+            else:
+                self._cfg.top = max(0.0, self._cfg.bottom - 0.005)
+                self._sync_box("top")
+        self._refresh_px_labels()
+        self._live_update()
+
+    def _sync_box(self, field: str):
+        sb = self._edge_sb[field]
+        sb.blockSignals(True)
+        sb.setValue(getattr(self._cfg, field) * 100.0)
+        sb.blockSignals(False)
+
+    def _pick_color(self):
+        from PySide6.QtWidgets import QColorDialog
+        c = QColorDialog.getColor(QColor(self._cfg.color), self, "Reference frame colour")
+        if c.isValid():
+            self._cfg.color = c.name()
+            self._lc_btn.setStyleSheet(f"background:{self._cfg.color}; border:1px solid #888888;")
+            self._live_update()
+
+    def _on_show_toggled(self, state: int):
+        self._cfg.show = bool(state)
+        self._live_update()
+
+    def _reset_all(self):
+        self._cfg = CamRefRectConfig()
+        for fld, sb in self._edge_sb.items():
+            sb.blockSignals(True)
+            sb.setValue(getattr(self._cfg, fld) * 100.0)
+            sb.blockSignals(False)
+        self._lw_sb.blockSignals(True); self._lw_sb.setValue(self._cfg.width); self._lw_sb.blockSignals(False)
+        self._la_sb.blockSignals(True); self._la_sb.setValue(self._cfg.alpha); self._la_sb.blockSignals(False)
+        self._show_cb.blockSignals(True); self._show_cb.setChecked(self._cfg.show); self._show_cb.blockSignals(False)
+        self._lc_btn.setStyleSheet(f"background:{self._cfg.color}; border:1px solid #888888;")
+        self._refresh_px_labels()
+        self._live_update()
+
+    def _on_accept(self):
+        if self._img_view is not None:
+            self._img_view._ref_rect_override = None
+            self._img_view.ref_rect_cfg = self._cfg
+            self._img_view.update()
+        self.accept()
+
+    def _on_reject(self):
+        if self._img_view is not None:
+            self._img_view._ref_rect_override = None
+            self._img_view.ref_rect_cfg = self._orig_cfg
+            self._img_view.update()
+        self.reject()
+
+    def save_config(self):
+        save_ref_rect_config(self._cam_name, self._cfg)
 
 
 # ---------------- CAMERA LAYOUT CONFIG ----------------
@@ -9447,6 +10029,11 @@ class ImageView(QWidget):
     # aspect differs from what the tile geometry was computed from. The auto layout
     # listens so tiles resize to the real frame instead of the name-based hint.
     frame_aspect_changed = Signal()
+    # The user just moved an overlay with the mouse ("cross" | "circle" | "square").
+    # The owner mirrors the new geometry onto every other selected camera, so one
+    # drag places the same mark on all of them. Geometry is normalized (0..1), so
+    # "the same place" holds across different sensor sizes.
+    overlay_edited = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -9499,6 +10086,11 @@ class ImageView(QWidget):
         self.pdxm1_cam_name: str = ''   # full camera name used to look up per-type grid config
         self._pdxm1_cfg_override = None  # set by Pdxm1GridConfigDialog for live preview
 
+        # Permanent reference rectangle (PCW3_NF): drawn on screen only, never saved
+        # into exported frames.  None = this camera has none.
+        self.ref_rect_cfg: "CamRefRectConfig | None" = None
+        self._ref_rect_override = None   # set by CamRefRectDialog for live preview
+
         # Zoom: normalized rect (ln, tn, rn, bn) inside the source image, or None = no zoom
         self._zoom_norm: "tuple[float,float,float,float] | None" = None
         # Right-click rubber-band state
@@ -9535,9 +10127,38 @@ class ImageView(QWidget):
     def reset_zoom(self):
         self.set_zoom(None)
 
-    def _name_bar_h(self) -> int:
-        """Height of the camera-name / timestamp strip."""
+    def _name_row_h(self) -> int:
+        """Height of ONE line of the camera-name / timestamp strip."""
         return max(8, self.cam_label_font_px) + 10
+
+    def _labels_wrapped(self) -> bool:
+        """True when the camera name and the timestamp cannot share one line.
+
+        A narrow view used to simply cut both of them off, and the only cure was a
+        label font small enough to be unreadable. They go on two lines instead — in
+        the strip above the picture, so the picture itself is never covered."""
+        if not (self.cam_label_text and self.cam_ts_text):
+            return False
+        w = self.width() - 8
+        if w <= 40:
+            return False
+        fpx = max(8, self.cam_label_font_px)
+        key = (w, fpx, self.cam_label_text, self.cam_ts_text)
+        if getattr(self, "_lbl_wrap_key", None) == key:
+            return self._lbl_wrap_val
+        f = QFont(); f.setPixelSize(fpx)
+        nw = QFontMetrics(f).horizontalAdvance(self.cam_label_text)
+        f2 = QFont(); f2.setPixelSize(max(8, fpx - 1))
+        tw = QFontMetrics(f2).horizontalAdvance(self.cam_ts_text)
+        val = (nw + tw + 24) > w
+        self._lbl_wrap_key = key
+        self._lbl_wrap_val = val
+        return val
+
+    def _name_bar_h(self) -> int:
+        """Height of the whole camera-name / timestamp strip (two lines when wrapped)."""
+        row = self._name_row_h()
+        return row * 2 if self._labels_wrapped() else row
 
     def _ref_bar_h(self) -> int:
         """Height of the reference badge strip (0 when no reference is set)."""
@@ -9654,6 +10275,7 @@ class ImageView(QWidget):
             max(0.0, min(1.0, (pos.y() - ir.top())  / ir.height()))
         )
         self.update()
+        self.overlay_edited.emit("cross")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
@@ -9800,6 +10422,7 @@ class ImageView(QWidget):
                 self.circle_r_norm  = max(self.circle_rx_norm, self.circle_ry_norm)
 
             self.update()
+            self.overlay_edited.emit("circle")
 
         # ── SQUARE ──────────────────────────────────────────────────────
         elif self._draw_mode == "square":
@@ -9847,6 +10470,7 @@ class ImageView(QWidget):
                 )
 
             self.update()
+            self.overlay_edited.emit("square")
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton and self._rb_start is not None:
@@ -9880,10 +10504,16 @@ class ImageView(QWidget):
                             max(0.0, min(1.0, rn_new)), max(0.0, min(1.0, bn_new))
                         ))
             else:
-                # Single click: open grid config dialog for any camera
+                # Single click (no drag): the camera's own settings window.
+                # Diodes get the reference grid; PCW3_NF gets its reference rectangle;
+                # every other camera has nothing to configure, so nothing opens.
                 cam_name = getattr(self, 'pdxm1_cam_name', '')
-                if cam_name:
+                if _is_diode_cam(cam_name):
                     dlg = Pdxm1GridConfigDialog(cam_name, img_view=self, parent=self)
+                    if dlg.exec() == QDialog.DialogCode.Accepted:
+                        dlg.save_config()
+                elif _ref_rect_key(cam_name):
+                    dlg = CamRefRectDialog(cam_name, img_view=self, parent=self)
                     if dlg.exec() == QDialog.DialogCode.Accepted:
                         dlg.save_config()
 
@@ -9896,13 +10526,28 @@ class ImageView(QWidget):
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
+        """Draw through a painter that is ALWAYS closed again.
+
+        A failure anywhere in the drawing used to leave the painter open on the
+        widget: Qt then complained "endPaint() called with active painter" on every
+        following repaint, the tile stopped updating, and the window died the moment
+        it was moved or resized. The drawing itself lives in `_paint_body`, so the
+        `finally` closes the painter whatever happens and one broken overlay costs
+        its own picture instead of the whole program."""
         p = QPainter(self)
+        try:
+            self._paint_body(p, event)
+        finally:
+            if p.isActive():
+                p.end()
+
+    def _paint_body(self, p, event):
         p.fillRect(self.rect(), self.bg_color)
         if self._pix is None or self._pix.isNull():
-            p.end(); return
+            return
         self._ensure_scaled()
         if self._scaled is None or self._scaled.isNull():
-            p.end(); return
+            return
 
         pm = self._scaled
         # One source of truth for where the frame sits: _img_rect. This used to
@@ -9910,7 +10555,7 @@ class ImageView(QWidget):
         # moved the overlays and left the picture itself hanging off the label bar.
         img_rect = self._img_rect()
         if img_rect is None:
-            p.end(); return
+            return
         p.drawPixmap(img_rect.x(), img_rect.y(), pm)
         # Rámeček kolem obrázku
         border_pen = QPen(QColor(80, 80, 80, 160))
@@ -9970,7 +10615,10 @@ class ImageView(QWidget):
                                   int(pt.y()) - self._handle_radius(),
                                   self._handle_radius()*2, self._handle_radius()*2)
         if self.energy_text and not self._pix.isNull():
-            from PySide6.QtGui import QFont, QFontMetrics
+            # No local import of QFont/QFontMetrics here: both are module-level
+            # already, and importing them INSIDE this branch made them local to the
+            # whole method — so with no energy text to draw, the camera name strip
+            # further down hit an unbound QFontMetrics and paintEvent died.
             available_w = img_rect.width() - 20
             font = QFont()
             display_text = self.energy_text
@@ -10031,19 +10679,30 @@ class ImageView(QWidget):
                 # image top edge (the old "-1" left a visible gap line).
                 lbl_h = self._name_bar_h()
                 lbl_y = max(0, img_rect.top() - self._label_bar_h())
-            name_w = lbl_w // 3
-            ts_w = lbl_w - name_w
+            # Two lines when the view is too narrow for name + timestamp side by
+            # side (see _labels_wrapped): the name keeps the first line to itself
+            # and the timestamp takes the whole second one. The reserved strip is
+            # already two rows tall, so the picture does not move under them.
+            wrapped = self._labels_wrapped()
+            row_h = self._name_row_h()
+            if wrapped:
+                name_rect = QRect(lbl_x, lbl_y, lbl_w, row_h)
+                ts_rect = QRect(lbl_x, lbl_y + row_h, lbl_w, row_h)
+            else:
+                name_w = lbl_w // 3
+                name_rect = QRect(lbl_x, lbl_y, name_w, lbl_h)
+                ts_rect = QRect(lbl_x + name_w, lbl_y, lbl_w - name_w, lbl_h)
             font = _QFont(); font.setPixelSize(_fpx)
             p.setFont(font)
             if self.cam_label_text:
-                name_rect = QRect(lbl_x, lbl_y, name_w, lbl_h)
                 p.fillRect(name_rect, QColor(0x44, 0x44, 0x44, 220 if self.cam_label_use_overlay else 255))
                 p.setPen(QColor(0xee, 0xee, 0xee))
                 p.drawText(name_rect.adjusted(4, 0, -4, 0),
                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                           self.cam_label_text)
+                           QFontMetrics(font).elidedText(
+                               self.cam_label_text, Qt.TextElideMode.ElideMiddle,
+                               max(8, name_rect.width() - 8)))
             if self.cam_ts_text:
-                ts_rect = QRect(lbl_x + name_w, lbl_y, ts_w, lbl_h)
                 p.fillRect(ts_rect, QColor(0x33, 0x33, 0x33, 220 if self.cam_label_use_overlay else 255))
                 p.setPen(QColor(0xff, 0xd5, 0x4f))
                 ts_font = _QFont(); ts_font.setPixelSize(max(8, _fpx - 1))
@@ -10076,8 +10735,10 @@ class ImageView(QWidget):
                 cy = img_rect.top()  + int(ny * img_rect.height())
                 p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
 
-        # Camera grid overlay (configurable via right-click → Grid Config…)
-        if self.show_pdxm1_grid and img_rect is not None and not self._pix.isNull():
+        # Diode grid overlay (configurable by right-clicking a diode camera).
+        # Diodes only: a stale saved flag must not resurrect it on another camera.
+        if (self.show_pdxm1_grid and img_rect is not None and not self._pix.isNull()
+                and _is_diode_cam(getattr(self, 'pdxm1_cam_name', ''))):
             from PySide6.QtGui import QFont as _GFont
             _gcam = getattr(self, 'pdxm1_cam_name', '')
             if _gcam:
@@ -10129,6 +10790,35 @@ class ImageView(QWidget):
                                     Qt.AlignmentFlag.AlignCenter, lbl,
                                     gfont, fc, _gcfg.font_outline)
 
+        # Permanent reference rectangle (PCW3_NF).  The camera software draws it on the
+        # live screen but it is not in the archived frame, so we re-draw it here.
+        _rcfg = self._ref_rect_override if self._ref_rect_override is not None else self.ref_rect_cfg
+        if (_rcfg is not None and _rcfg.show and img_rect is not None
+                and not self._pix.isNull()):
+            # Fractions are of the FULL frame; remap through the zoom crop so the
+            # rectangle stays on the same sensor pixels when the tile is zoomed.
+            ln, tn = _rcfg.left, _rcfg.top
+            rn, bn = _rcfg.right, _rcfg.bottom
+            if self._zoom_norm is not None:
+                zl, zt, zr, zb = self._zoom_norm
+                zw, zh = (zr - zl), (zb - zt)
+                if zw > 1e-9 and zh > 1e-9:
+                    ln = (ln - zl) / zw; rn = (rn - zl) / zw
+                    tn = (tn - zt) / zh; bn = (bn - zt) / zh
+            # Skip entirely when the rectangle lies outside the visible crop.
+            if rn > 0.0 and ln < 1.0 and bn > 0.0 and tn < 1.0:
+                rx = img_rect.left() + int(ln * img_rect.width())
+                ry = img_rect.top()  + int(tn * img_rect.height())
+                rw_px = max(1, int((rn - ln) * img_rect.width()))
+                rh_px = max(1, int((bn - tn) * img_rect.height()))
+                rc = QColor(_rcfg.color); rc.setAlpha(max(0, min(255, _rcfg.alpha)))
+                rpen = QPen(rc); rpen.setWidth(max(1, _rcfg.width))
+                p.setPen(rpen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setClipRect(img_rect)
+                p.drawRect(rx, ry, rw_px, rh_px)
+                p.setClipping(False)
+
         # Zoom rubber-band
         if self._rb_start is not None and self._rb_current is not None:
             rb = QRect(self._rb_start, self._rb_current).normalized()
@@ -10136,8 +10826,6 @@ class ImageView(QWidget):
             p.setPen(pen)
             p.setBrush(QBrush(QColor(255, 200, 0, 30)))
             p.drawRect(rb)
-
-        p.end()
 
     # ------------------------------------------------------------------ circle
     def calibrate_circle_from_pixmap(self) -> bool:
@@ -10517,18 +11205,25 @@ class CameraView(QWidget):
         top_row.setSpacing(4)
         top_row.setContentsMargins(0, 0, 0, 0)
 
-        self._name_lbl = QLabel(_strip_cam_name(cam_name))
+        self._name_full = _strip_cam_name(cam_name)
+        self._name_lbl = QLabel(self._name_full)
         self._name_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self._name_lbl.setStyleSheet(
             "font-size: 12px; color: #eee; background: #444; "
             "padding: 2px 4px; border-radius: 2px;")
-        top_row.addWidget(self._name_lbl, 1)
+        self._name_lbl.setMinimumWidth(1)   # see _relayout_labels
+        # Stretch 0: the name gets the width it actually needs, and the timestamp
+        # (stretch 1, right-aligned) absorbs whatever is left. Splitting the row 1:2
+        # was the original fault — a camera name wider than a third of the tile was
+        # cut off no matter how much empty space sat next to the timestamp.
+        top_row.addWidget(self._name_lbl, 0)
 
         self._ts_lbl = QLabel("")
         self._ts_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._ts_kind = 0        # 0 exact / 1 nearest preloaded / 2 behind
         self._ts_lbl.setStyleSheet(self._TS_STYLE_OK)
-        top_row.addWidget(self._ts_lbl, 2)
+        self._ts_lbl.setMinimumWidth(1)
+        top_row.addWidget(self._ts_lbl, 1)
 
         self._refresh_dot = QLabel()
         self._refresh_dot.setFixedSize(12, 12)
@@ -10541,6 +11236,23 @@ class CameraView(QWidget):
         top_row.addWidget(self._refresh_dot)
 
         lay.addLayout(top_row)
+        self._top_row = top_row
+
+        # Second header line, used only when the tile is too narrow to hold the camera
+        # name and the timestamp side by side. The timestamp moves down here instead of
+        # being cut off or forcing the operator to shrink the label font to nothing.
+        # It is a WIDGET, not a bare layout, so it can be hidden outright — an empty
+        # layout would still eat its spacing above the picture.
+        self._ts_row_w = QWidget()
+        _ts_row = QHBoxLayout(self._ts_row_w)
+        _ts_row.setContentsMargins(0, 0, 0, 0)
+        _ts_row.setSpacing(0)
+        self._ts_row_lay = _ts_row
+        self._ts_row_w.setVisible(False)
+        lay.addWidget(self._ts_row_w)
+        self._ts_wrapped = False
+        self._lbl_wrap_busy = False
+        self._ts_seen_len = 0
 
         self._ref_lbl = QLabel("")
         self._ref_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -10563,9 +11275,93 @@ class CameraView(QWidget):
         # everything else is left to it untouched.
         self._tile_cursor = None
         for w in (self.img_view, self._name_lbl, self._ts_lbl,
-                  self._refresh_dot, self._ref_lbl):
+                  self._refresh_dot, self._ref_lbl, self._ts_row_w):
             w.installEventFilter(self)
         self.setMouseTracking(True)
+
+    # ── header that fits: wrap instead of cutting off ─────────────────────────────
+    # A tile can be narrower than its own camera name plus a timestamp. Shrinking the
+    # label font is the only thing that used to help, and past about 9 px the text is
+    # unreadable. So the header reflows instead: first the timestamp drops onto a
+    # second line of its own, and only if the name STILL does not fit is it shortened
+    # in the middle (the full name stays in the tooltip). Both are done in the strip
+    # ABOVE the picture, which grows by exactly one line — the picture is never
+    # covered or overlapped.
+    _WRAP_HYST_PX = 8      # extra room demanded before un-wrapping, so a tile being
+                           # dragged to the threshold width cannot flicker
+
+    def _header_pad(self) -> int:
+        """Horizontal padding+border the two labels add on top of their text."""
+        return 10          # 4 px padding each side, plus a 2 px safety margin
+
+    def _relayout_labels(self):
+        """Decide one/two header lines and shorten the name to whatever room is left."""
+        if not hasattr(self, "_ts_row_w") or self._lbl_wrap_busy:
+            return   # still being built
+        avail = self.width() - 6          # the layout's 3 px side margins
+        if avail <= 24:
+            return
+        pad = self._header_pad()
+        name_w = self._name_lbl.fontMetrics().horizontalAdvance(self._name_full) + pad
+        ts_w = self._ts_lbl.fontMetrics().horizontalAdvance(self._ts_lbl.text()) + pad
+        if not self._ts_lbl.text():
+            ts_w = 0
+        dot_w = self._refresh_dot.width()
+        sp = self._top_row.spacing()
+        need = name_w + (ts_w + sp if ts_w else 0) + dot_w + sp
+        want = self._ts_wrapped
+        if need > avail:
+            want = True
+        elif need <= avail - self._WRAP_HYST_PX:
+            want = False
+        if want != self._ts_wrapped and ts_w:
+            self._lbl_wrap_busy = True
+            try:
+                self._set_ts_wrapped(want)
+            finally:
+                self._lbl_wrap_busy = False
+        elif not ts_w and self._ts_wrapped:
+            self._lbl_wrap_busy = True
+            try:
+                self._set_ts_wrapped(False)
+            finally:
+                self._lbl_wrap_busy = False
+        room = avail - dot_w - sp
+        if not self._ts_wrapped and ts_w:
+            room -= ts_w + sp
+        self._fit_name_label(max(18, room))
+
+    def _set_ts_wrapped(self, wrap: bool):
+        if wrap == self._ts_wrapped:
+            return
+        if wrap:
+            self._top_row.removeWidget(self._ts_lbl)
+            self._ts_row_lay.addWidget(self._ts_lbl, 1)
+            self._ts_row_w.setVisible(True)
+        else:
+            self._ts_row_lay.removeWidget(self._ts_lbl)
+            self._top_row.insertWidget(1, self._ts_lbl, 1)
+            self._ts_row_w.setVisible(False)
+        self._ts_lbl.setVisible(True)
+        self._ts_wrapped = wrap
+
+    def _fit_name_label(self, room: int):
+        """Show the full camera name, or the middle-elided one when it does not fit."""
+        fm = self._name_lbl.fontMetrics()
+        full = self._name_full
+        if fm.horizontalAdvance(full) + self._header_pad() <= room:
+            shown, tip = full, ""
+        else:
+            shown = fm.elidedText(full, Qt.TextElideMode.ElideMiddle,
+                                  max(8, room - self._header_pad()))
+            tip = full
+        if shown != self._name_lbl.text():
+            self._name_lbl.setText(shown)
+            self._name_lbl.setToolTip(tip)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_labels()
 
     def image_overhead_px(self) -> int:
         """Vertical pixels of a tile NOT used by the image (label header + layout
@@ -10581,6 +11377,11 @@ class CameraView(QWidget):
                     self._ts_lbl.sizeHint().height(),
                     self._refresh_dot.height())
         overhead = m.top() + m.bottom() + row_h + lay.spacing()
+        # The wrapped timestamp is a real second line of header. Left out of this the
+        # auto layout would hand the picture room the header has already taken, and
+        # the frame would be pushed under the label instead of sitting below it.
+        if getattr(self, "_ts_wrapped", False) and self._ts_row_w.isVisible():
+            overhead += self._ts_lbl.sizeHint().height() + lay.spacing()
         if self._ref_lbl.isVisible():
             overhead += self._ref_lbl.sizeHint().height() + lay.spacing()
         return int(overhead)
@@ -10598,6 +11399,12 @@ class CameraView(QWidget):
         want = ("~" + text) if kind == 1 else text
         if want != self._ts_lbl.text():
             self._ts_lbl.setText(want)
+            # Only a CHANGE OF LENGTH can change whether the header still fits, and
+            # the timestamp is the same length on every frame — so the reflow runs on
+            # the first frame and then effectively never again.
+            if len(want) != self._ts_seen_len:
+                self._ts_seen_len = len(want)
+                self._relayout_labels()
         if kind == getattr(self, "_ts_kind", None):
             return
         self._ts_kind = kind
@@ -10689,6 +11496,9 @@ class CameraView(QWidget):
         self._ref_lbl.setStyleSheet(
             f"font-size: {max(8, px - 1)}px; color: #222; background: #c8e6c9; "
             "padding: 1px 4px; border-radius: 2px;")
+        # A bigger font can stop the header fitting on one line (and a smaller one can
+        # let it fit again), so the reflow is part of changing the size.
+        self._relayout_labels()
 
     def set_ref_status(self, text: str):
         if text:
@@ -10888,12 +11698,6 @@ class CameraView(QWidget):
 
     def eventFilter(self, obj, event):
         return bool(self._tile_mouse(obj, event)) or super().eventFilter(obj, event)
-
-    def _open_pdxm1_grid_config(self):
-        dlg = Pdxm1GridConfigDialog(self.img_view.pdxm1_cam_name, img_view=self.img_view, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            dlg.save_config()
-            self.img_view.update()
 
 
 class _TileDragHost:
@@ -11163,6 +11967,10 @@ class MultiCameraGrid(QWidget):
     Layout se volí automaticky: PDxM1 kamery → pravý sloupec (portrét), ostatní → levá strana (2×N).
     """
     camera_selected = Signal(int)  # index naposledy kliknuté kamery
+    # (camera index, shape) — a tile's overlay was just dragged by the user.
+    # Re-emitted from every tile so the panel can mirror it onto the other
+    # selected cameras (see ImageView.overlay_edited).
+    overlay_edited = Signal(int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -11228,15 +12036,18 @@ class MultiCameraGrid(QWidget):
         for i, name in enumerate(cam_names):
             cv = CameraView(i, name, self)
             cv.clicked.connect(self._on_cam_clicked)
+            cv.img_view.overlay_edited.connect(
+                lambda shape, _i=i: self.overlay_edited.emit(_i, shape))
             self._cam_views.append(cv)
             # Obnov overlay stav pokud ho máme uložený
             if name in self._overlay_store:
                 self._restore_iv_overlay(cv.img_view, self._overlay_store[name])
-            # Enable grid overlay for all cameras; show flag comes from saved config
-            # (defaults to hidden for all cameras, diodes included).
-            _cam_cfg = get_pdxm1_grid_config(name)
-            cv.img_view.show_pdxm1_grid = _cam_cfg.show
+            # Grid overlay: diodes only, and hidden until the user turns it on.
             cv.img_view.pdxm1_cam_name  = name
+            cv.img_view.show_pdxm1_grid = (_is_diode_cam(name)
+                                           and get_pdxm1_grid_config(name).show)
+            # Permanent reference rectangle (None for cameras that have none).
+            cv.img_view.ref_rect_cfg = get_ref_rect_config(name)
 
         self._selected_idx = 0
         self._selected_set = set()
@@ -12695,6 +13506,9 @@ class PvConfigDialog(QDialog):
 
     _MAX_RESULTS = 200
     _ROW_H = 22
+    # Tallest the search-result list ever gets; below that it is as tall as its
+    # results, and with none it is hidden (see _sync_results_visible).
+    _RESULTS_MAX_H = 158
 
     # Column widths, in px, shared by both tables so their columns line up even though
     # they are two independent grids. Only the PV column stretches. Each is the width of
@@ -12738,6 +13552,47 @@ class PvConfigDialog(QDialog):
                   "goes below Min or above Max.\n"
                   "Leave empty for no limit — an empty box is never watched.")
 
+    # Every tick box in this dialog is painted here. Left to the platform they came out
+    # as a hairline outline the same colour as the panel behind them — on a dialog whose
+    # whole point is "ticked = this PV is read", the one control that carries the
+    # meaning was the one you could not see.
+    _CB_QSS = (
+        "QCheckBox { spacing: 6px; color: #111; background: transparent; }"
+        "QCheckBox::indicator { width: 15px; height: 15px; border: 2px solid #4a4a4a;"
+        " border-radius: 3px; background: #ffffff; }"
+        "QCheckBox::indicator:hover { border: 2px solid #2d7dff; background: #f4f8ff; }"
+        "QCheckBox::indicator:checked { border: 2px solid #2d7dff; background: #2d7dff;"
+        " image: none; }"
+    )
+
+    # Every box you type in, in this dialog. Set, not inherited: under this PC's
+    # dark-mode palette the platform painted the numbers in an amber that is barely
+    # there on white, and one column of the table came out in a different ink from the
+    # rest for no reason the operator could see.
+    _EDIT_QSS     = "QLineEdit { font-size: 11px; color: #111; background: #ffffff; }"
+    _EDIT_QSS_BAD = "QLineEdit { font-size: 11px; color: #111; background: #ffe0e0; }"
+
+    # Section captions, and the light box the presets sit in. Both colours are set:
+    # this PC runs Windows in dark mode, so an unpainted box comes out black.
+    _HEAD_QSS = "font-size: 11px; font-weight: 700; color: #1a1a1a; padding: 2px 0 0 0;"
+    _BOX_QSS  = ("QFrame#pvBox { background: #fafafa; color: #111;"
+                 " border: 1px solid rgba(128,128,128,0.45); border-radius: 3px; }")
+
+    # A formula is typed in the PV column of the table, so the syntax is explained
+    # where it is typed: on the column header, on the button that adds a row, and on
+    # every expression box. It used to be a paragraph under the tables, which is the
+    # one place nobody was looking while typing.
+    _FORMULA_TIP = (
+        "A formula is written in the CHANNEL LETTERS of the second column — "
+        "e.g. B/D, A*0.749, round(A-B, 2).\n"
+        "Each formula remembers which PV every letter stands for, so the letters "
+        "follow the PVs when the list changes.\n"
+        "A formula may use the letter of a formula defined above it. A source PV is "
+        "read as soon as it is in the list,\nwhether it is shown on the picture or "
+        "not.\n"
+        "Give the formula a name in \"Displayed name\" — that is the name it is "
+        "printed under.")
+
     def __init__(self, enabled: "list[str]", custom: "dict[str, str]",
                  derived: "list[dict] | None" = None,
                  labels: "dict[str, str] | None" = None,
@@ -12749,9 +13604,10 @@ class PvConfigDialog(QDialog):
         # Wider than the old 620: the picked list is a multi-column table now, and the
         # channel names it prints are long. The extra width over 700 is the two alarm
         # threshold columns — without it they came straight out of the PV column, which
-        # is the one column here that genuinely needs the room. Still grows only where
-        # the operator fills it in (the two tables and the formulas share the height).
-        self.resize(820, 640)
+        # is the one column here that genuinely needs the room. Shorter than it was: the
+        # formula block underneath is gone and the result list only takes room while it
+        # has results, so 640 px came up as a window with a hole in the middle.
+        self.resize(830, 540)
 
         hidden = {str(n) for n in (hidden or ())}
         # A preset is in the list exactly when it was picked. No second tick anywhere.
@@ -12785,15 +13641,17 @@ class PvConfigDialog(QDialog):
         self._rows: list = []
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 8)
+        lay.setSpacing(5)
 
         # ── Add a PV ──────────────────────────────────────────────────────────
         add_head = QHBoxLayout()
-        _add_lbl = QLabel("Add a PV")
-        _add_lbl.setStyleSheet("font-weight: 700;")
-        add_head.addWidget(_add_lbl)
+        add_head.addWidget(self._head_label("Add a PV"))
         add_head.addStretch()
         b_add_formula = QPushButton("+ Add formula")
-        b_add_formula.setToolTip("Add a PV computed from the others")
+        b_add_formula.setToolTip("Add a row for a value COMPUTED from the PVs in the "
+                                 "list — it is written straight into the PV column of "
+                                 "the table below.\n\n" + self._FORMULA_TIP)
         b_add_formula.clicked.connect(lambda: self._add_derived_row())
         add_head.addWidget(b_add_formula)
         lay.addLayout(add_head)
@@ -12804,6 +13662,9 @@ class PvConfigDialog(QDialog):
             "Type any part of the PV name. Several words are AND-matched with\n"
             'wildcards between them: "hapls sbw4" finds every channel that holds\n'
             '"hapls" and, later, "sbw4". Click a result (or press Enter) to add it.')
+        self._search.setStyleSheet(
+            "QLineEdit { color: #111; background: #ffffff;"
+            " border: 1px solid rgba(128,128,128,0.55); padding: 3px 5px; }")
         self._search.textEdited.connect(self._on_search)
         self._search.returnPressed.connect(self._on_search_return)
         lay.addWidget(self._search)
@@ -12815,13 +13676,18 @@ class PvConfigDialog(QDialog):
         self._results.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._results.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        # Half the height it used to have: a search returns at most a handful of PVs
-        # worth reading, and the space it was claiming pushed the Selected PVs list and
-        # the formulas down the dialog. It still takes every spare pixel (stretch 1), so
-        # a taller window gives the results back their room.
-        self._results.setMinimumHeight(75)
+        # A search returns at most a handful of PVs worth reading, so this box asks for
+        # little and gives its spare room to the picked list. It is also HIDDEN while it
+        # is empty (see _sync_results_visible) — an empty result box was the largest
+        # thing in the dialog.
+        self._results.setMaximumHeight(self._RESULTS_MAX_H)
+        self._results.setStyleSheet(
+            "QTableWidget { background: #ffffff; color: #111;"
+            " border: 1px solid rgba(128,128,128,0.55); }"
+            "QTableWidget::item:selected { background: #cfe3ff; color: #111; }")
         self._results.cellClicked.connect(self._on_result_clicked)
-        lay.addWidget(self._results, 1)
+        self._results.setVisible(False)
+        lay.addWidget(self._results, 0)
 
         self._status = QLabel("")
         self._status.setStyleSheet("font-size: 10px; color: #555;")
@@ -12832,16 +13698,18 @@ class PvConfigDialog(QDialog):
         # state instead of only being a way to reach it. There is still exactly one
         # owner of "picked" — the box reads the list back (see _sync_preset_boxes), it
         # does not keep a second answer of its own.
-        pre_lbl = QLabel("Presets:")
-        pre_lbl.setStyleSheet("font-size: 10px; color: #555;")
-        lay.addWidget(pre_lbl)
+        lay.addWidget(self._head_label("Presets — the house PVs, one tick each"))
+        pre_box = QFrame()
+        pre_box.setObjectName("pvBox")
+        pre_box.setStyleSheet(self._BOX_QSS)
         self._preset_boxes: "dict[str, QCheckBox]" = {}
-        preset_grid = QGridLayout()
-        preset_grid.setHorizontalSpacing(4)
-        preset_grid.setVerticalSpacing(2)
+        preset_grid = QGridLayout(pre_box)
+        preset_grid.setContentsMargins(8, 6, 8, 6)
+        preset_grid.setHorizontalSpacing(10)
+        preset_grid.setVerticalSpacing(4)
         for i, name in enumerate(self._preset_grid_names()):
             cb = QCheckBox(name)
-            cb.setStyleSheet("QCheckBox { font-size: 10px; }")
+            cb.setStyleSheet(self._CB_QSS)
             # Deferred: ticking a recipe adds a formula row and rebuilds the tables,
             # and doing that from inside the box's own signal is how this crashes.
             cb.toggled.connect(lambda on, n=name: self._later(
@@ -12850,9 +13718,7 @@ class PvConfigDialog(QDialog):
             preset_grid.addWidget(cb, i // 4, i % 4)
         for c in range(4):
             preset_grid.setColumnStretch(c, 1)
-        lay.addLayout(preset_grid)
-
-        lay.addWidget(self._hline())
+        lay.addWidget(pre_box)
 
         # ── The picked PVs: two tables, split by the eye ───────────────────────
         picked_area = QScrollArea()
@@ -12881,47 +13747,12 @@ class PvConfigDialog(QDialog):
         picked_area.setWidget(picked_holder)
         lay.addWidget(picked_area, 2)
 
-        lay.addWidget(self._hline())
-
-        # ── Formulas ─────────────────────────────────────────────────────────
-        d_head = QHBoxLayout()
-        d_lbl = QLabel("Own formulas")
-        d_lbl.setStyleSheet("font-weight: 700;")
-        d_head.addWidget(d_lbl)
-        d_head.addStretch()
-        b_add = QPushButton("+ Add formula")
-        b_add.setToolTip("Add a PV computed from the others")
-        b_add.clicked.connect(lambda: self._add_derived_row())
-        d_head.addWidget(b_add)
-        lay.addLayout(d_head)
-
-        d_hint = QLabel(
-            "Python expression in the channel letters shown in the Letter column — "
-            "e.g. B/D, A*0.749, round(A-B, 2). Each formula remembers which PV every "
-            "letter stands for, so the letters follow the PVs when the list changes. "
-            "A formula may use an earlier formula's letter. A source PV is read as soon "
-            "as it is in the list, whether it is shown on the picture or not.")
-        d_hint.setWordWrap(True)
-        d_hint.setStyleSheet("font-size: 10px; color: #555;")
-        lay.addWidget(d_hint)
-        # Hint and row area are both hidden until there is a formula: with none, they were
-        # ~120 px of blank dialog under a heading, and the syntax it explains cannot be
-        # typed anywhere yet. See _sync_derived_visibility.
-        self._derived_hint = d_hint
-
-        self._derived_area = QScrollArea()
-        self._derived_area.setWidgetResizable(True)
-        self._derived_area.setFrameShape(QFrame.Shape.NoFrame)
-        self._derived_area.setMinimumHeight(0)
-        self._derived_area.setMaximumHeight(190)
-        d_holder = QWidget()
-        self._derived_layout = QVBoxLayout(d_holder)
-        self._derived_layout.setContentsMargins(0, 0, 0, 0)
-        self._derived_layout.setSpacing(2)
-        self._derived_layout.addStretch()
-        self._derived_area.setWidget(d_holder)
-        lay.addWidget(self._derived_area)
-
+        # There is no separate formula section any more. A formula IS a row of these
+        # tables: its expression is typed in the PV column (that is what the row
+        # reads), its name in "Displayed name" and its unit in "Unit". The old block
+        # underneath was a second place to edit the same row, with a paragraph of
+        # syntax nobody was looking at while typing — the syntax is now on the PV
+        # column header and on every expression box (_FORMULA_TIP).
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._on_accept)
@@ -12931,9 +13762,9 @@ class PvConfigDialog(QDialog):
         for d in (derived or []):
             # A formula that exists is picked (that is what being in the list means);
             # only whether it is PAINTED comes from the saved eye state.
-            self._add_derived_row(d, shown=(str(d.get("name") or "") not in hidden))
+            self._add_derived_row(d, shown=(str(d.get("name") or "") not in hidden),
+                                  rebuild=False)
         self._rebuild_picked_tables()
-        self._sync_derived_visibility()
 
         self._sig = _PvChannelListSignals()
         self._sig.loaded.connect(self._on_channels_loaded)
@@ -12958,15 +13789,13 @@ class PvConfigDialog(QDialog):
             out.append({"name": n, "kind": "own", "pv": ch, "rec": None,
                         "shown": self._shown.get(n, True)})
         for rec in self._derived_rows:
-            nm = rec["name"].text().strip()
-            if not nm:
-                continue            # an unnamed formula is not a PV yet
-            # The stored expression stands in while the box is still empty: a row
-            # built by the dialog itself (a recipe preset) is re-lettered into its box
-            # only at the END of the rebuild, so reading the box alone printed a bare
-            # "=" in the PV column until something else redrew the table.
-            out.append({"name": nm, "kind": "formula",
-                        "pv": rec["expr"].text().strip() or rec["canon"][0],
+            # A formula with no name yet is STILL a row here — that is where it is
+            # typed. It used to be dropped until it had a name, which with the old
+            # separate formula block was harmless and in the table would mean "+ Add
+            # formula" produced no row to type in at all. The accessors filter the
+            # nameless ones out instead.
+            out.append({"name": rec["name"].strip(), "kind": "formula",
+                        "pv": rec["expr"].strip(),
                         "rec": rec, "shown": bool(rec.get("shown", True))})
         return out
 
@@ -12975,13 +13804,14 @@ class PvConfigDialog(QDialog):
         same order pv_all_names() uses, so the panel, the overlay and the burn-in all
         agree on it. Being picked is being in the list: these are all READ."""
         self._sync_row_state()
-        return [e["name"] for e in self._picked_entries()]
+        return [e["name"] for e in self._picked_entries() if e["name"]]
 
     def hidden_names(self) -> "list[str]":
         """The picked PVs whose Show is off — read and listed, but not painted over the
         frame and not burned into a saved image. Same state as the sidebar's eye."""
         self._sync_row_state()
-        return [e["name"] for e in self._picked_entries() if not e["shown"]]
+        return [e["name"] for e in self._picked_entries()
+                if e["name"] and not e["shown"]]
 
     def custom_channels(self) -> "dict[str, str]":
         """Every added PV, name → channel. ✕ is what removes one, so everything here
@@ -13019,13 +13849,14 @@ class PvConfigDialog(QDialog):
         """Every formula, ticked or not, in row order: {name, expr, unit,
         bindings}. Unticking a formula must not delete it, and the order is what
         decides which formula may reference which (definition order)."""
+        self._sync_row_state()
         out: list = []
         for r in self._derived_rows:
-            name = r["name"].text().strip()
+            name = r["name"].strip()
             expr, bindings = r["canon"]
             if name and expr:
                 out.append({"name": name, "expr": expr,
-                            "unit": r["unit"].text().strip(),
+                            "unit": r["unit"].strip(),
                             "bindings": dict(bindings)})
         return out
 
@@ -13066,11 +13897,25 @@ class PvConfigDialog(QDialog):
                 "and an exactly typed PV name can still be added with Enter.")
 
     # ── search ───────────────────────────────────────────────────────────────
+    def _sync_results_visible(self):
+        """The result list is on screen only while it has results in it.
+
+        Empty, it was a ~130 px hole in the middle of the dialog — the largest thing in
+        the window was a box with nothing in it, and the list of picked PVs underneath
+        had to give up that room. With results, it is as tall as the results it holds
+        (up to its maximum), so three hits are not shown in a box built for eight."""
+        n = self._results.rowCount()
+        self._results.setVisible(n > 0)
+        if n:
+            self._results.setFixedHeight(
+                min(self._RESULTS_MAX_H, n * self._ROW_H + 6))
+
     def _on_search(self, text: str):
         tokens = cpva.split_query(text)
         self._results.setRowCount(0)
         if not tokens:
             self._set_idle_status()
+            self._sync_results_visible()
             return
         exclude = set(self._custom.values())
         scored = []
@@ -13098,6 +13943,7 @@ class PvConfigDialog(QDialog):
                                  "refine the search.")
         else:
             self._status.setText(f"{len(scored)} match(es) — click one to add it.")
+        self._sync_results_visible()
 
     def _on_result_clicked(self, row: int, _col: int):
         it = self._results.item(row, 0)
@@ -13174,11 +14020,8 @@ class PvConfigDialog(QDialog):
     def _recipe_row(self, name: str) -> "dict | None":
         """The formula row that IS this recipe, or None when it is not in the list."""
         for r in self._derived_rows:
-            try:
-                if r["name"].text().strip() == name:
-                    return r
-            except RuntimeError:
-                continue
+            if r["name"].strip() == name:
+                return r
         return None
 
     def _add_recipe(self, name: str):
@@ -13256,6 +14099,7 @@ class PvConfigDialog(QDialog):
             # reading the very same channel under a different name and no unit.
             self._search.clear()
             self._results.setRowCount(0)
+            self._sync_results_visible()
             self._add_preset(preset)
             self._status.setText(f'"{channel}" is the preset {preset} — added it.')
             self._search.setFocus()
@@ -13268,6 +14112,7 @@ class PvConfigDialog(QDialog):
             self._status.setText(f'Added "{channel}".')
         self._search.clear()
         self._results.setRowCount(0)
+        self._sync_results_visible()
         self._rebuild_picked_tables()
         self._search.setFocus()
 
@@ -13283,16 +14128,16 @@ class PvConfigDialog(QDialog):
         except RuntimeError:
             return
         if not txt:
-            box.setStyleSheet("")
+            box.setStyleSheet(self._EDIT_QSS)
             box.setToolTip(self._LIMIT_TIP)
             return
         v = _coerce_limit(txt)
         if v is None:
-            box.setStyleSheet("background: #ffe0e0;")
+            box.setStyleSheet(self._EDIT_QSS_BAD)
             box.setToolTip("This is not a number, so it is NOT being used as a limit.\n\n"
                            + self._LIMIT_TIP)
             return
-        box.setStyleSheet("")
+        box.setStyleSheet(self._EDIT_QSS)
         box.setToolTip(self._LIMIT_TIP)
         shown = f"{v:g}"
         if shown != txt:
@@ -13338,39 +14183,63 @@ class PvConfigDialog(QDialog):
         for row in self._rows:
             ent = row["ent"]
             name = ent["name"]
+            rec = ent.get("rec")
+            is_formula = ent["kind"] == "formula"
             try:
                 shown = row["chk"].isChecked()
             except RuntimeError:            # widget already deleted
                 continue
-            if ent["kind"] == "formula":
-                if ent["rec"] is not None:
-                    ent["rec"]["shown"] = shown
+            if is_formula:
+                if rec is None:
+                    continue
+                rec["shown"] = shown
             elif name in self._custom or name in PV_CHANNEL_MAP:
                 self._shown[name] = shown
             else:
                 continue                    # removed meanwhile — do not resurrect it
-            e = row.get("name_edit")
-            if e is not None:
-                try:
-                    txt = e.text().strip()
-                except RuntimeError:
-                    txt = None
-                if txt is not None:
-                    if txt:
-                        self._labels[name] = txt
-                    else:
-                        self._labels.pop(name, None)
-            u = row.get("unit_edit")
-            if u is not None:
-                try:
-                    txt = u.text().strip()
-                except RuntimeError:
-                    txt = None
-                if txt is not None:
-                    if txt:
-                        self._units[name] = txt
-                    else:
-                        self._units.pop(name, None)
+            # A formula is edited in the table now: the three boxes on its row ARE the
+            # formula. Its name is its identity, so a rename has to carry the alarm
+            # limits with it — they are keyed by name, and left behind they would be a
+            # threshold the operator set and then silently lost.
+            if is_formula:
+                new_name = self._text_of(row.get("name_edit"))
+                if new_name is not None:
+                    new_name = new_name.strip()
+                    if new_name != name:
+                        if name and name in self._limits:
+                            self._limits[new_name] = self._limits.pop(name)
+                        rec["name"] = new_name
+                        ent["name"] = name = new_name
+                expr_txt = self._text_of(row.get("expr_edit"))
+                if expr_txt is not None and expr_txt.strip() != rec["expr"]:
+                    rec["expr"] = expr_txt.strip()
+                    self._canon_from_text(rec, expr_txt)
+                u_txt = self._text_of(row.get("unit_edit"))
+                if u_txt is not None:
+                    rec["unit"] = u_txt.strip()
+                # The ⚠ and the red box are refreshed here as well as on the keystroke:
+                # a row can also change under a rename somewhere else in the table, and
+                # a formula that has just become uncomputable has to say so then too.
+                self._refresh_derived_row_state(rec)
+            else:
+                e = row.get("name_edit")
+                if e is not None:
+                    txt = self._text_of(e)
+                    if txt is not None:
+                        txt = txt.strip()
+                        if txt:
+                            self._labels[name] = txt
+                        else:
+                            self._labels.pop(name, None)
+                u = row.get("unit_edit")
+                if u is not None:
+                    txt = self._text_of(u)
+                    if txt is not None:
+                        txt = txt.strip()
+                        if txt:
+                            self._units[name] = txt
+                        else:
+                            self._units.pop(name, None)
             # Both threshold boxes are read as one pair: they are stored as one entry,
             # and reading them separately would let a half-typed Max drop a Min that is
             # already set.
@@ -13388,9 +14257,49 @@ class PvConfigDialog(QDialog):
 
     # ── the two picked-PV tables ─────────────────────────────────────────────
     @staticmethod
+    def _text_of(widget) -> "str | None":
+        """The text in a box that may already have been destroyed by a rebuild.
+        None means "there is nothing to read", never "it was empty"."""
+        if widget is None:
+            return None
+        try:
+            return widget.text()
+        except RuntimeError:
+            return None
+
+    def _canon_from_text(self, rec: dict, text: str):
+        """Store what was typed in a formula's PV box as (expr, bindings) — the letters
+        as written plus the PV each one currently means. Every later re-lettering works
+        from this, so it is captured as the row is read, not on OK."""
+        expr, bindings = pv_expr_from_display(text, getattr(self, "_by_letter", {}))
+        old = rec["canon"][1]
+        for letter in pv_expr_vars(expr):
+            # A letter whose PV has been deleted has no current meaning; keep the old
+            # binding so the row can still name the missing PV instead of reporting a
+            # bare "no such channel".
+            if letter not in bindings and letter in old:
+                bindings[letter] = old[letter]
+        rec["canon"] = (expr, bindings)
+
+    def _row_for_rec(self, rec: dict) -> "dict | None":
+        """The live table row of a formula, while one exists."""
+        for row in self._rows:
+            if row["ent"].get("rec") is rec:
+                return row
+        return None
+
+    def _head_label(self, text: str) -> QLabel:
+        """A section caption. One look for all of them, and both colours set — an
+        unpainted label comes out in the platform's own ink, which on this PC is the
+        dark-mode white nobody can read on a light dialog."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(self._HEAD_QSS)
+        return lbl
+
+    @staticmethod
     def _table_title(text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #333; "
+        lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a1a1a; "
                           "padding: 4px 0 1px 0;")
         return lbl
 
@@ -13422,13 +14331,17 @@ class PvConfigDialog(QDialog):
 
     def _cell(self, grid: QGridLayout, row: int, col: int, widget,
               head: bool = False, center: bool = False) -> QFrame:
-        """Put one control in one ruled table cell."""
+        """Put one control — or several, side by side — in one ruled table cell."""
         f = QFrame()
         f.setObjectName("pvHead" if head else "pvCell")
         h = QHBoxLayout(f)
         h.setContentsMargins(4, 2, 4, 2)
         h.setSpacing(0)
-        h.addWidget(widget)
+        widgets = widget if isinstance(widget, (list, tuple)) else (widget,)
+        for w in widgets:
+            # In a cell that holds several things, the box you type in takes the room
+            # and the little labels beside it keep their own width.
+            h.addWidget(w, 1 if (len(widgets) > 1 and isinstance(w, QLineEdit)) else 0)
         if center:
             h.setAlignment(Qt.AlignmentFlag.AlignCenter)
         grid.addWidget(f, row, col)
@@ -13440,11 +14353,21 @@ class PvConfigDialog(QDialog):
         would break wherever a title happens to be blank."""
         for c, title in enumerate(self._COL_TITLES):
             lbl = QLabel(title)
-            # No colour: the header must stay readable whatever palette the dialog
-            # comes up in, and bold at 9 px already reads as a header.
-            lbl.setStyleSheet("font-size: 9px; font-weight: 700;")
+            # The ink is set: on this PC an unpainted label is drawn in the dark-mode
+            # white, which on a light dialog is a header nobody can read.
+            lbl.setStyleSheet("font-size: 9px; font-weight: 700; color: #1a1a1a;")
             if title in ("Min", "Max"):
                 lbl.setToolTip(self._LIMIT_TIP)
+            elif title == "PV":
+                lbl.setToolTip(
+                    "What the row reads: the archiver channel — or, on a formula row, "
+                    "the expression\nit is computed from, typed straight into this "
+                    "column.\n\n" + self._FORMULA_TIP)
+            elif title == "Displayed name":
+                lbl.setToolTip("The name this value is printed under, over the picture "
+                               "and on a saved image.\n"
+                               "A PV left empty is printed under its own name; a "
+                               "formula has to be given one.")
             self._cell(grid, 0, c, lbl, head=True,
                        center=title in ("Show", "Min", "Max"))
 
@@ -13525,6 +14448,7 @@ class PvConfigDialog(QDialog):
 
         chk = QCheckBox()
         chk.setChecked(bool(ent["shown"]))
+        chk.setStyleSheet(self._CB_QSS)
         chk.setToolTip(
             "Ticked: this value is printed over the picture and burned into a saved\n"
             "image — the same eye as in the PV panel.\n"
@@ -13536,60 +14460,88 @@ class PvConfigDialog(QDialog):
         letter.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a5fb4;")
         self._cell(grid, row, 1, letter, center=True)
 
-        pv_lbl = QLabel()
-        pv_lbl.setStyleSheet("font-size: 11px;")
-        # The PV column carries what the row actually reads: the archiver channel, or
-        # the expression for a formula. Elided in the MIDDLE — a channel's tail
-        # (":Energy") is the half that says what it is.
-        pv_text = (f"= {ent['pv']}" if is_formula else ent["pv"]) or "—"
-        pv_lbl.setText(QFontMetrics(pv_lbl.font()).elidedText(
-            pv_text, Qt.TextElideMode.ElideMiddle, 210))
-        pv_lbl.setToolTip(pv_text if not is_formula else
-                          f"Formula: {pv_text}\nEdited in the formulas below.")
-        self._cell(grid, row, 2, pv_lbl)
+        expr_edit = None
+        warn = None
+        if is_formula:
+            # The PV column IS the formula: what the row reads is the expression, so
+            # that is what is typed here. The "=" in front says the number is computed
+            # and not a channel.
+            eq = QLabel("=")
+            eq.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a5fb4;")
+            eq.setFixedWidth(12)
+            expr_edit = QLineEdit(ent["pv"])
+            expr_edit.setPlaceholderText("expression, e.g. B/D")
+            expr_edit.setToolTip(self._FORMULA_TIP)
+            expr_edit.setStyleSheet(self._EDIT_QSS)
+            warn = QLabel("⚠")
+            warn.setFixedWidth(14)
+            warn.setStyleSheet("color: #b71c1c; font-weight: 700;")
+            warn.setVisible(False)
+            # Typing only re-reads the row (letters, bindings, the ⚠) — never a
+            # rebuild: a rebuild destroys the very box being typed in.
+            expr_edit.textEdited.connect(
+                lambda _t, r=ent["rec"], w=expr_edit: self._on_expr_typed(r, w))
+            expr_edit.editingFinished.connect(self._on_row_edit_finished)
+            self._cell(grid, row, 2, [eq, expr_edit, warn])
+        else:
+            pv_lbl = QLabel()
+            pv_lbl.setStyleSheet("font-size: 11px; color: #111;")
+            # The PV column carries what the row actually reads: the archiver channel.
+            # Elided in the MIDDLE — a channel's tail (":Energy") is the half that says
+            # what it is.
+            pv_text = ent["pv"] or "—"
+            pv_lbl.setText(QFontMetrics(pv_lbl.font()).elidedText(
+                pv_text, Qt.TextElideMode.ElideMiddle, 210))
+            pv_lbl.setToolTip(pv_text)
+            self._cell(grid, row, 2, pv_lbl)
 
         name_edit = None
         if is_formula:
-            # A formula's name IS the operator's own name for it, typed in the formula
-            # row. A second box for it here would be a name that two fields own.
-            shown_as = QLabel(name)
-            shown_as.setStyleSheet("font-size: 11px; color: #333;")
-            shown_as.setToolTip("A formula is already named by you — change it in the "
-                                "formula row below.")
-            self._cell(grid, row, 3, shown_as)
+            # A formula is named HERE — the box is its name, not a display alias, and
+            # the name is what the value is printed under. It used to be typed in the
+            # separate formula block, so the table showed a name it could not edit.
+            name_edit = QLineEdit(name)
+            name_edit.setPlaceholderText("name it")
+            name_edit.setStyleSheet(self._EDIT_QSS)
+            name_edit.setToolTip(
+                "The formula's name — it is printed under this name over the picture "
+                "and on saved\nimages, and other formulas refer to it by its channel "
+                "letter.\nA formula without a name is not stored.")
+            name_edit.editingFinished.connect(self._on_row_edit_finished)
+            self._cell(grid, row, 3, name_edit)
         else:
             name_edit = QLineEdit(self._labels.get(name, ""))
             name_edit.setPlaceholderText(name)
+            name_edit.setStyleSheet(self._EDIT_QSS)
             name_edit.setToolTip(
                 "Name to show in the PV panel, over the picture and on saved images.\n"
                 f"Empty = the PV's own name ({name}).")
             self._cell(grid, row, 3, name_edit)
 
         unit_edit = None
-        if kind == "own":
-            unit_edit = QLineEdit(self._units.get(name, ""))
-            unit_edit.setPlaceholderText(pv_unit_guess(ent["pv"]) or "?")
-            unit_edit.setToolTip(
-                "Unit printed after the value. The archiver's channel list does not "
-                "carry units, so for a PV of your own this is the only place it can "
-                "come from.\nEmpty = whatever the channel name gives away "
-                f"({pv_unit_guess(ent['pv']) or 'nothing'}).")
+        if kind in ("own", "formula"):
+            # A formula's unit is typed in this column too, exactly like an added PV's:
+            # both are units nothing else can know, and the row that owns the value is
+            # the row that should carry it.
+            unit_edit = QLineEdit(ent["rec"]["unit"] if is_formula
+                                  else self._units.get(name, ""))
+            unit_edit.setStyleSheet(self._EDIT_QSS)
+            if is_formula:
+                unit_edit.setPlaceholderText("unit")
+                unit_edit.setToolTip("Unit printed after the value. Leave it empty for "
+                                     "a ratio, which has none.")
+            else:
+                unit_edit.setPlaceholderText(pv_unit_guess(ent["pv"]) or "?")
+                unit_edit.setToolTip(
+                    "Unit printed after the value. The archiver's channel list does not "
+                    "carry units, so for a PV of your own this is the only place it can "
+                    "come from.\nEmpty = whatever the channel name gives away "
+                    f"({pv_unit_guess(ent['pv']) or 'nothing'}).")
             self._cell(grid, row, 4, unit_edit)
         else:
-            # A formula's unit is read off its own row, not out of PV_DERIVED: the row
-            # may have been typed a moment ago and not committed yet, and this column
-            # printing "—" for a unit that is right there below reads as lost.
-            if is_formula and ent["rec"] is not None:
-                try:
-                    u_text = ent["rec"]["unit"].text().strip()
-                except RuntimeError:
-                    u_text = ""
-            else:
-                u_text = pv_units_for(name)
-            u = QLabel(u_text or "—")
-            u.setStyleSheet("font-size: 11px;")
-            u.setToolTip("From the preset table" if kind == "preset"
-                         else "Typed in the formula row below")
+            u = QLabel(pv_units_for(name) or "—")
+            u.setStyleSheet("font-size: 11px; color: #111;")
+            u.setToolTip("From the preset table")
             self._cell(grid, row, 4, u)
 
         # Alarm thresholds. Every kind of PV gets them, formulas included — a formula
@@ -13599,6 +14551,7 @@ class PvConfigDialog(QDialog):
         for col, val, ph in ((5, lo, "min"), (6, hi, "max")):
             e = QLineEdit("" if val is None else f"{val:g}")
             e.setPlaceholderText(ph)
+            e.setStyleSheet(self._EDIT_QSS)
             e.setToolTip(self._LIMIT_TIP)
             e.setMaximumWidth(self._W_LIMIT - 8)      # the cell's own padding
             # A comma is accepted as the decimal mark as well as a dot — this keyboard
@@ -13614,7 +14567,7 @@ class PvConfigDialog(QDialog):
 
         kind_lbl = QLabel({"preset": "preset", "own": "archiver PV",
                            "formula": "formula"}[kind])
-        kind_lbl.setStyleSheet("font-size: 10px; color: #666;")
+        kind_lbl.setStyleSheet("font-size: 10px; color: #555;")
         kind_lbl.setToolTip({
             "preset": "One of the house PVs — its channel and unit are code constants.",
             "own": "An archiver PV you added by search or by name.",
@@ -13634,7 +14587,10 @@ class PvConfigDialog(QDialog):
 
         self._rows.append({"ent": ent, "chk": chk, "letter": letter,
                            "name_edit": name_edit, "unit_edit": unit_edit,
+                           "expr_edit": expr_edit, "warn": warn,
                            "min_edit": lim_edits[0], "max_edit": lim_edits[1]})
+        if is_formula:
+            self._refresh_derived_row_state(ent["rec"])
 
     # ── formulas ─────────────────────────────────────────────────────────────
     def _pending_names(self) -> "list[str]":
@@ -13642,102 +14598,51 @@ class PvConfigDialog(QDialog):
         from this and not from the committed module state, so a PV added a moment
         ago can already be used in a formula."""
         return (list(PV_CHANNEL_MAP) + list(self._custom)
-                + [r["name"].text().strip() for r in self._derived_rows
-                   if r["name"].text().strip()])
+                + [r["name"].strip() for r in self._derived_rows
+                   if r["name"].strip()])
 
-    def _add_derived_row(self, existing: "dict | None" = None, shown: bool = True):
+    def _add_derived_row(self, existing: "dict | None" = None, shown: bool = True,
+                         rebuild: bool = True):
         """One formula. It is PICKED by existing at all — the row used to start with a
         tick box for that, which was the same second meaning of "picked" the preset grid
-        had. Whether it is painted lives in rec["shown"] and is edited in the tables
-        above; keeping it on the record (not under its name) means renaming a formula
-        cannot drop its eye state."""
-        row = QWidget()
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(4)
-        letter_lbl = QLabel("—")
-        letter_lbl.setFixedWidth(20)
-        letter_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #1a5fb4;")
-        letter_lbl.setToolTip("Channel letter of this formula — other formulas can use "
-                              "it")
-        name_e = QLineEdit((existing or {}).get("name", ""))
-        name_e.setPlaceholderText("Name")
-        name_e.setMinimumWidth(110)
-        expr_e = QLineEdit()
-        expr_e.setPlaceholderText("Expression, e.g. B/D")
-        expr_e.setMinimumWidth(130)
-        unit_e = QLineEdit((existing or {}).get("unit", ""))
-        unit_e.setPlaceholderText("Unit")
-        unit_e.setFixedWidth(52)
-        unit_e.setToolTip("Units appended to the value (leave empty for a ratio)")
-        warn = QLabel("⚠")
-        warn.setFixedWidth(14)
-        warn.setStyleSheet("color: #b71c1c; font-weight: 700;")
-        warn.setVisible(False)
-        btn_del = QPushButton("✕")
-        btn_del.setFixedSize(22, 22)
-        btn_del.setToolTip("Remove this formula")
-        btn_del.setStyleSheet(
-            "QPushButton { color: #cc0000; font-weight: 700; border: none; padding: 0; }"
-            "QPushButton:hover { background: #ffd6d6; border-radius: 3px; }")
-        for w in (letter_lbl, name_e, expr_e, unit_e, warn):
-            h.addWidget(w, 1 if w is expr_e else 0)
-        h.addWidget(btn_del)
+        had. Whether it is painted lives in rec["shown"], edited by the Show column;
+        keeping it on the record (not under its name) means renaming a formula cannot
+        drop its eye state.
 
-        rec = {"widget": row, "letter": letter_lbl, "shown": bool(shown),
-               "name": name_e, "expr": expr_e,
-               "unit": unit_e, "warn": warn,
-               "canon": ((existing or {}).get("expr", "") or "",
+        The record is PLAIN TEXT, not widgets: the row it is edited in is a row of the
+        picked-PV table, which is thrown away and rebuilt on every change, and a record
+        made of those boxes would be a formula that dies with its own table."""
+        rec = {"shown": bool(shown),
+               "name": str((existing or {}).get("name", "") or ""),
+               "expr": str((existing or {}).get("expr", "") or ""),
+               "unit": str((existing or {}).get("unit", "") or ""),
+               "canon": (str((existing or {}).get("expr", "") or ""),
                          dict((existing or {}).get("bindings") or {}))}
         self._derived_rows.append(rec)
-        btn_del.clicked.connect(lambda _=False, r=rec: self._remove_derived_row(r))
-        # A name change re-letters everything below it, so it goes through the
-        # full refresh; an expression change only re-canonicalises its own row.
-        # The tables above print the name and the expression, so they follow too —
-        # on editingFinished, not per keystroke: a rebuild on every letter typed would
-        # fight the caret.
-        name_e.textEdited.connect(lambda _t: self._refresh_letters())
-        name_e.editingFinished.connect(self._rebuild_picked_tables)
-        expr_e.textEdited.connect(lambda _t, r=rec: self._on_derived_expr_edited(r))
-        expr_e.editingFinished.connect(self._rebuild_picked_tables)
-        unit_e.editingFinished.connect(self._rebuild_picked_tables)
-        self._derived_layout.insertWidget(self._derived_layout.count() - 1, row)
-        self._sync_derived_visibility()
-        self._rebuild_picked_tables()
+        if rebuild:
+            self._rebuild_picked_tables()
+            self._status.setText(
+                "Formula added — write it in the PV column, in the channel letters, "
+                "and give it a name.")
+        return rec
 
     def _remove_derived_row(self, rec: dict):
-        try:
-            self._limits.pop(rec["name"].text().strip(), None)
-        except RuntimeError:
-            pass                      # the row's widgets are already gone
-        self._derived_rows.remove(rec)
-        rec["widget"].setParent(None)
-        rec["widget"].deleteLater()
-        self._sync_derived_visibility()
+        self._limits.pop(rec["name"].strip(), None)
+        if rec in self._derived_rows:
+            self._derived_rows.remove(rec)
         self._rebuild_picked_tables()
 
-    def _sync_derived_visibility(self):
-        """Show the formula hint and row area only once a formula exists.
-
-        With no rows they were a heading followed by ~120 px of nothing, in a dialog whose
-        search results had to give up that space."""
-        has = bool(self._derived_rows)
-        self._derived_hint.setVisible(has)
-        self._derived_area.setVisible(has)
-
-    def _on_derived_expr_edited(self, rec: dict):
-        """Store what was typed as (expr, bindings) — the letters as written plus
-        the PV each one currently means. Every later re-lettering is derived from
-        this, so it must be captured on the keystroke, not on OK."""
-        expr, bindings = pv_expr_from_display(rec["expr"].text(), self._by_letter)
-        old = rec["canon"][1]
-        for letter in pv_expr_vars(expr):
-            # A letter whose PV has been deleted has no current meaning; keep the
-            # old binding so the row can still name the missing PV instead of
-            # reporting a bare "no such channel".
-            if letter not in bindings and letter in old:
-                bindings[letter] = old[letter]
-        rec["canon"] = (expr, bindings)
+    def _on_expr_typed(self, rec: dict, box: QLineEdit):
+        """A key was pressed in a formula's PV box: keep the record and the ⚠ up to
+        date, and nothing else. No rebuild — that would delete the box being typed in
+        — and no re-lettering either, which rewrites the text under the caret."""
+        if rec is None:
+            return
+        txt = self._text_of(box)
+        if txt is None:
+            return
+        rec["expr"] = txt.strip()
+        self._canon_from_text(rec, txt)
         self._refresh_derived_row_state(rec)
 
     def _refresh_letters(self):
@@ -13754,18 +14659,20 @@ class PvConfigDialog(QDialog):
         # EVERY preset whether it is picked or not, so A…H are fixed and adding or
         # removing a PV of your own cannot move them.
         for row in self._rows:
-            letter = self._by_name.get(row["ent"]["name"], "?")
+            nm = row["ent"]["name"]
+            # A formula that has not been named yet has no letter to hand out — "—",
+            # not a "?" that reads like a channel called ?.
+            letter = self._by_name.get(nm) or ("—" if not nm else "?")
             try:
                 row["letter"].setText(letter)
                 row["letter"].setToolTip(
+                    "This row has no channel letter until it is named"
+                    if letter == "—" else
                     f"Channel letter {letter} — write it in a formula, e.g. "
                     f"{letter}/B")
             except RuntimeError:        # row rebuilt under us
                 continue
         for rec in self._derived_rows:
-            nm = rec["name"].text().strip()
-            letter = self._by_name.get(nm, "—") if nm else "—"
-            rec["letter"].setText(letter)
             old_expr, old_bind = rec["canon"]
             # Carry the bindings through the re-lettering by hand instead of
             # re-reading them off the new text: a letter whose PV has been deleted
@@ -13800,14 +14707,19 @@ class PvConfigDialog(QDialog):
                     new_bind[lt] = pv
             text = pv_expr_rewrite(old_expr, lmap)
             rec["canon"] = (text, new_bind)
-            if text != rec["expr"].text():
+            rec["expr"] = text
+            box = (self._row_for_rec(rec) or {}).get("expr_edit")
+            if box is not None and self._text_of(box) != text:
                 # Keep the caret where the user left it: this runs while they are
                 # still typing a name in another field.
-                pos = rec["expr"].cursorPosition()
-                rec["expr"].blockSignals(True)
-                rec["expr"].setText(text)
-                rec["expr"].setCursorPosition(min(pos, len(text)))
-                rec["expr"].blockSignals(False)
+                try:
+                    pos = box.cursorPosition()
+                    box.blockSignals(True)
+                    box.setText(text)
+                    box.setCursorPosition(min(pos, len(text)))
+                    box.blockSignals(False)
+                except RuntimeError:
+                    pass                  # the row was rebuilt under us
             self._refresh_derived_row_state(rec)
 
     def _refresh_derived_row_state(self, rec: dict):
@@ -13815,24 +14727,35 @@ class PvConfigDialog(QDialog):
         cannot be computed — an unknown letter, a formula that refers to itself,
         or one that refers to a formula defined further down (those are evaluated
         in row order, so a forward reference has no value yet)."""
-        expr = rec["expr"].text()
-        nm = rec["name"].text().strip()
+        if rec is None:
+            return
+        row = self._row_for_rec(rec) or {}
+        box, warn = row.get("expr_edit"), row.get("warn")
+        expr = self._text_of(box)
+        if expr is None:
+            expr = rec["expr"]
+        nm = rec["name"].strip()
         try:
             idx = self._derived_rows.index(rec)
         except ValueError:
             idx = len(self._derived_rows)
-        later = {r["name"].text().strip() for r in self._derived_rows[idx:]
-                 if r["name"].text().strip()}
+        later = {r["name"].strip() for r in self._derived_rows[idx:]
+                 if r["name"].strip()}
         bindings = rec["canon"][1]
+        by_letter = getattr(self, "_by_letter", {})
+        by_name = getattr(self, "_by_name", {})
         lines, bad = [], False
+        if not nm and expr.strip():
+            lines.append("this formula has no name yet — it will not be stored")
+            bad = True
         for letter in pv_expr_vars(expr):
             # The binding is the truth; the letter map only fills in for a letter
             # that has just been typed and not yet canonicalised.
-            src = bindings.get(letter) or self._by_letter.get(letter)
+            src = bindings.get(letter) or by_letter.get(letter)
             if not src:
                 lines.append(f"{letter} = ?   (no such channel)")
                 bad = True
-            elif src not in self._by_name:
+            elif src not in by_name:
                 lines.append(f"{letter} = {src}   (this PV is no longer in the list)")
                 bad = True
             elif src == nm:
@@ -13849,20 +14772,30 @@ class PvConfigDialog(QDialog):
             except Exception as exc:
                 lines.append(f"invalid expression — {exc}")
                 bad = True
-        tip = "\n".join(lines)
-        rec["expr"].setToolTip(tip)
-        rec["warn"].setVisible(bad)
-        rec["warn"].setToolTip(tip)
+        tip = ("\n".join(lines) + "\n\n" + self._FORMULA_TIP) if lines \
+            else self._FORMULA_TIP
+        try:
+            if box is not None:
+                box.setToolTip(tip)
+                # A formula that cannot be computed says so in the box itself, not
+                # only in a ⚠ that has to be hovered.
+                box.setStyleSheet(self._EDIT_QSS_BAD if bad else self._EDIT_QSS)
+            if warn is not None:
+                warn.setVisible(bad)
+                warn.setToolTip(tip)
+        except RuntimeError:
+            pass                          # the row was rebuilt under us
 
     def _on_accept(self):
         """Refuse to close on a formula that could not be stored — a silently
         dropped row reads as "the program forgot my formula"."""
+        self._sync_row_state()
         problems: list = []
         seen: set = set()
         base = set(PV_CHANNEL_MAP) | set(self._custom)
         for i, r in enumerate(self._derived_rows, 1):
-            name = r["name"].text().strip()
-            expr = r["expr"].text().strip()
+            name = r["name"].strip()
+            expr = r["expr"].strip()
             if not name and not expr:
                 continue                      # empty row — just ignore it
             if not name:
@@ -13880,17 +14813,20 @@ class PvConfigDialog(QDialog):
                 except Exception as exc:
                     problems.append(f"Formula '{name or i}': invalid expression — {exc}")
         if problems:
-            QMessageBox.warning(self, "Own formulas",
+            QMessageBox.warning(self, "Formulas",
                                 "\n".join(problems[:8]))
             return
         self.accept()
 
-    @staticmethod
-    def _hline() -> QFrame:
-        f = QFrame()
-        f.setFrameShape(QFrame.Shape.HLine)
-        f.setFrameShadow(QFrame.Shadow.Sunken)
-        return f
+    def _on_row_edit_finished(self):
+        """A box in the table was left (Tab, Enter, a click elsewhere): read the rows
+        back into the dialog's own state, then re-letter.
+
+        Not a rebuild — the tables are only rebuilt by the Show box and the ✕, which
+        are clicks. Rebuilding on every field the operator leaves would delete the row
+        under the cursor while they were still working down it."""
+        self._sync_row_state()
+        self._refresh_letters()
 
 
 # Qt takes a tooltip away after ~10 s and then refuses to bring it back until the
@@ -14369,6 +15305,13 @@ class _PvOverlayPanel(QWidget):
         self.bg_opacity: int = 100      # 0–100 percent
         self.font_color: QColor = QColor("#000000")
         self.bg_color: QColor = QColor("#eae31e")
+        # The panel's own size in pixels, set in "Overlay settings". 0 = fit the text,
+        # which is what it has always done. A number here holds that side of the panel
+        # at exactly that many pixels whatever the values do — so the box over the
+        # picture stays the size the operator laid out, and the width high-water mark
+        # cannot grow it either.
+        self.panel_w: int = 0
+        self.panel_h: int = 0
 
         lay = QVBoxLayout(self)
         # Bottom margin is deepened by _apply_style to reserve the badge line.
@@ -14435,16 +15378,52 @@ class _PvOverlayPanel(QWidget):
         # it and a shrink from 24 px to 10 px would leave the panel at its old width.
         self._width_hwm = 0
         self._content.setMinimumWidth(0)
+        self._apply_panel_size()
         self.adjustSize()
         self.update()
 
-    def apply_settings(self, font_size_px: int, font_family: str, bg_opacity: int, font_color: QColor, bg_color: "QColor | None" = None):
+    _SIZE_MAX = 16_777_215        # Qt's QWIDGETSIZE_MAX — "no limit on this side"
+
+    def _apply_panel_size(self):
+        """Hold the panel at the size that was typed in, per side.
+
+        Both 0 gives back the original behaviour: the panel is exactly as big as its
+        text. A side that is set wins over everything else, the width high-water mark
+        included — otherwise a long value would push the panel wider than the size the
+        operator asked for and adjustSize() would keep it there."""
+        w, h = int(self.panel_w or 0), int(self.panel_h or 0)
+        if w > 0:
+            self.setMinimumWidth(w)
+            self.setMaximumWidth(w)
+            # The label must not demand more than the panel has; its minimum is the
+            # high-water mark, which is measured on the text and can exceed a small
+            # fixed width — and a minimum that big would silently widen the panel.
+            self._content.setMinimumWidth(0)
+            self._content.setMaximumWidth(max(1, w - 16))
+        else:
+            self.setMinimumWidth(self._badge_min_w())
+            self.setMaximumWidth(self._SIZE_MAX)
+            self._content.setMaximumWidth(self._SIZE_MAX)
+        if h > 0:
+            self.setMinimumHeight(h)
+            self.setMaximumHeight(h)
+        else:
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(self._SIZE_MAX)
+
+    def apply_settings(self, font_size_px: int, font_family: str, bg_opacity: int,
+                       font_color: QColor, bg_color: "QColor | None" = None,
+                       panel_w: "int | None" = None, panel_h: "int | None" = None):
         self.font_size_px = font_size_px
         self.font_family = font_family
         self.bg_opacity = bg_opacity
         self.font_color = font_color
         if bg_color is not None:
             self.bg_color = bg_color
+        if panel_w is not None:
+            self.panel_w = max(0, int(panel_w))
+        if panel_h is not None:
+            self.panel_h = max(0, int(panel_h))
         self._apply_style()
 
     def _render_rows(self):
@@ -14504,10 +15483,11 @@ class _PvOverlayPanel(QWidget):
             self._width_hwm = 0
             self._content.setMinimumWidth(0)
         self._render_rows()
-        w = self._content.sizeHint().width()
-        if w > self._width_hwm:
-            self._width_hwm = w
-            self._content.setMinimumWidth(w)
+        if not self.panel_w:
+            w = self._content.sizeHint().width()
+            if w > self._width_hwm:
+                self._width_hwm = w
+                self._content.setMinimumWidth(w)
         self.adjustSize()
         self.setVisible(True)
 
@@ -15590,12 +16570,22 @@ class Viewer(QWidget):
         s_src.body_layout.addWidget(self.btn_send_workshop)
 
         # ══════════════════ Section: TIMELINE & RANGE ═════════════
-        self.btn_prev = QPushButton("◀"); self.btn_prev.setToolTip("Previous image (←)"); self.btn_prev.setEnabled(False)
+        # Hold-to-repeat for the two frame arrows (see _hold_step_begin). Wired to
+        # pressed/released rather than clicked: clicked fires on RELEASE, so a hold would
+        # have ended with one extra step on top of everything the ramp already did.
+        self._hold_timer = QTimer(self)
+        self._hold_timer.timeout.connect(self._hold_step_tick)
+        self._hold_dir = 0        # -1 / +1 while a frame arrow is held; 0 = nothing held
+        self._hold_t0  = 0.0      # monotonic clock at the press — the ramp reads it
+        _hold_tip = "\nHold to keep stepping — 2, 3, 4, then 5 images per second"
+        self.btn_prev = QPushButton("◀"); self.btn_prev.setToolTip("Previous image (←)" + _hold_tip); self.btn_prev.setEnabled(False)
         self.btn_prev.setFixedWidth(32)
-        self.btn_prev.clicked.connect(lambda: self.step_frame(-1))
-        self.btn_next = QPushButton("▶"); self.btn_next.setToolTip("Next image (→)"); self.btn_next.setEnabled(False)
+        self.btn_prev.pressed.connect(lambda: self._hold_step_begin(-1))
+        self.btn_prev.released.connect(self._hold_step_end)
+        self.btn_next = QPushButton("▶"); self.btn_next.setToolTip("Next image (→)" + _hold_tip); self.btn_next.setEnabled(False)
         self.btn_next.setFixedWidth(32)
-        self.btn_next.clicked.connect(lambda: self.step_frame(+1))
+        self.btn_next.pressed.connect(lambda: self._hold_step_begin(+1))
+        self.btn_next.released.connect(self._hold_step_end)
         self.btn_play = QPushButton("Play"); self.btn_play.setEnabled(False)
         self.btn_play.setToolTip("Start playback")
         self.btn_play.clicked.connect(self.play)
@@ -15745,7 +16735,12 @@ class Viewer(QWidget):
         # The Auto checkbox overrides the slider — the app-wide "checkbox is
         # superior to slider" rule for each enhancement pair.
         self.cb_bright = QCheckBox("Auto"); self.cb_bright.setStyleSheet(_CHECKBOX_STYLE)
-        self.cb_bright.setToolTip("Auto-stretch contrast (percentile) — overrides the Contrast slider")
+        self.cb_bright.setToolTip(
+            "Auto contrast — sets the Contrast slider to the gain that spreads THIS "
+            "frame's p0.5..p99.5 window over the whole range.\n"
+            "It is the slider, chosen for you: the same operation, the black level left "
+            "where it is. The number it picked is shown in the readout.\n"
+            "Add Auto brightness to also pull the background down to black.")
         self.cb_bright.stateChanged.connect(self._on_contrast_auto_changed)
         row_contrast = QHBoxLayout()
         # Short names ("Con/Bri/Gam") so the numeric readout fits on the same row. The
@@ -15757,7 +16752,7 @@ class Viewer(QWidget):
         self.lbl_contrast_name.setToolTip(_TT_CONTRAST)
         row_contrast.addWidget(self.lbl_contrast_name)
         self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
-        self.contrast_slider.setRange(-127, 127)
+        self.contrast_slider.setRange(img_scale.CONTRAST_MIN, img_scale.CONTRAST_MAX)
         self.contrast_slider.setValue(0)
         self.contrast_slider.setToolTip(_TT_CONTRAST)
         self.contrast_slider.valueChanged.connect(self._on_contrast_slider_changed)
@@ -15776,7 +16771,11 @@ class Viewer(QWidget):
         s_disp.body_layout.addLayout(row_contrast)
         # Brightness: manual offset slider + "Auto" checkbox (auto-level).
         self.cb_bright_auto = QCheckBox("Auto"); self.cb_bright_auto.setStyleSheet(_CHECKBOX_STYLE)
-        self.cb_bright_auto.setToolTip("Auto-level brightness — overrides the Brightness slider")
+        self.cb_bright_auto.setToolTip(
+            "Auto brightness — sets the Brightness slider to the offset that puts THIS "
+            "frame's dark background at 0.\n"
+            "It is the slider, chosen for you: a plain shift, nothing spread apart. On a "
+            "dim frame that alone changes little — spreading is Auto contrast's job.")
         self.cb_bright_auto.stateChanged.connect(self._on_bright_auto_changed)
         row_bright_slider = QHBoxLayout()
         self.lbl_bright_name = QLabel("Bri:")
@@ -15784,7 +16783,7 @@ class Viewer(QWidget):
         self.lbl_bright_name.setToolTip(_TT_BRIGHTNESS)
         row_bright_slider.addWidget(self.lbl_bright_name)
         self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(-255, 255)
+        self.brightness_slider.setRange(img_scale.BRIGHTNESS_MIN, img_scale.BRIGHTNESS_MAX)
         self.brightness_slider.setValue(0)
         self.brightness_slider.setToolTip(_TT_BRIGHTNESS)
         self.brightness_slider.valueChanged.connect(self._on_brightness_slider_changed)
@@ -15835,6 +16834,21 @@ class Viewer(QWidget):
         row_gamma.addWidget(self.btn_gamma_reset)
         row_gamma.addWidget(self.cb_gamma_auto)
         s_disp.body_layout.addLayout(row_gamma)
+        # Shown only when the cameras a control would act on are NOT all on the same
+        # setting — the rows above then stand on the first one's values, and saying so is
+        # the difference between a readout and a guess. Amber ink on a pale amber ground,
+        # the same colour the "not the same value" marks in the readouts use.
+        self.lbl_disp_mixed = QLabel("")
+        self.lbl_disp_mixed.setWordWrap(True)
+        self.lbl_disp_mixed.setStyleSheet(
+            "font-size: 10px; font-weight: 700; color: #8a5300; "
+            "background: #fdf3d8; border: 1px solid #d8b25c; border-radius: 4px; "
+            "padding: 3px 5px;")
+        self.lbl_disp_mixed.setToolTip(
+            "Move any of the controls above and every selected camera is set to what "
+            "you move it to.")
+        self.lbl_disp_mixed.setVisible(False)
+        s_disp.body_layout.addWidget(self.lbl_disp_mixed)
         # Palette / gradient
         self.gradient_cb = PopupBelowComboBox()
         self.gradient_cb.setToolTip(
@@ -15922,7 +16936,6 @@ class Viewer(QWidget):
         self.btn_reset_zoom = QPushButton("⤢ Reset zoom")
         self.btn_reset_zoom.setToolTip("Reset zoom to full image (right-click drag to zoom in)")
         self.btn_reset_zoom.clicked.connect(self._on_reset_zoom)
-        s_disp.body_layout.addWidget(self.btn_reset_zoom)
         # Undo tile dragging. Only multi-camera has an arrangement, so the button is
         # enabled by _switch_to_multi_view and greyed out again for one camera.
         self.btn_reset_layout = QPushButton("⛶ Reset layout")
@@ -15931,7 +16944,11 @@ class Viewer(QWidget):
             "for these cameras, or the automatic one if none is saved")
         self.btn_reset_layout.setEnabled(False)
         self.btn_reset_layout.clicked.connect(self._on_reset_layout)
-        s_disp.body_layout.addWidget(self.btn_reset_layout)
+        row_reset = QHBoxLayout()
+        row_reset.setSpacing(4)
+        row_reset.addWidget(self.btn_reset_zoom, 1)
+        row_reset.addWidget(self.btn_reset_layout, 1)
+        s_disp.body_layout.addLayout(row_reset)
         # camera label size (moved here from old Camera Labels Settings group)
         row_cam_font = QHBoxLayout()
         row_cam_font.addWidget(QLabel("Label size:"))
@@ -15952,9 +16969,12 @@ class Viewer(QWidget):
         self.cb_square = QCheckBox("Square"); self.cb_square.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_square.setToolTip("Show square overlay on image")
 
-        self.cb_cross.stateChanged.connect(self._on_overlay_changed)
-        self.cb_circle.stateChanged.connect(self._on_overlay_changed)
-        self.cb_square.stateChanged.connect(self._on_overlay_changed)
+        # Each box carries its own shape: the handler writes ONLY that shape onto the
+        # selected cameras. Writing all three would let ticking Cross hide a circle
+        # that is on another selected camera but not on the last-clicked one.
+        self.cb_cross.stateChanged.connect(lambda _s: self._on_overlay_changed("cross"))
+        self.cb_circle.stateChanged.connect(lambda _s: self._on_overlay_changed("circle"))
+        self.cb_square.stateChanged.connect(lambda _s: self._on_overlay_changed("square"))
 
         self.btn_draw_cross  = QPushButton("✚ Draw")
         self.btn_draw_circle = QPushButton("◯ Draw")
@@ -16090,8 +17110,9 @@ class Viewer(QWidget):
         self.btn_pointing_path.setEnabled(False)
         self.btn_pointing_path.clicked.connect(self._toggle_pointing_path)
         row_pa2 = QHBoxLayout()
-        row_pa2.addWidget(self.btn_pointing_save)
-        row_pa2.addWidget(self.btn_pointing_path)
+        row_pa2.setSpacing(4)
+        row_pa2.addWidget(self.btn_pointing_save, 1)
+        row_pa2.addWidget(self.btn_pointing_path, 1)
         s_an.body_layout.addLayout(row_pa2)
         self.btn_pointing_select = QPushButton("🗑 Delete mode")
         self.btn_pointing_select.setToolTip(
@@ -16110,18 +17131,21 @@ class Viewer(QWidget):
             "Undo the last deletion (single point or rectangle) — Ctrl+Z on the graph")
         self.btn_pointing_undo.setEnabled(False)
         self.btn_pointing_undo.clicked.connect(self._undo_pointing_delete)
-        # Delete mode gets its own full-width row — the "ON" suffix makes it the
-        # widest label here and it was clipped when sharing a row with the other two.
-        s_an.body_layout.addWidget(self.btn_pointing_select)
-        row_pa3 = QHBoxLayout()
-        row_pa3.addWidget(self.btn_pointing_undo)
-        row_pa3.addWidget(self.btn_pointing_restore)
-        s_an.body_layout.addLayout(row_pa3)
         self.btn_pointing_close = QPushButton("✕ Close graph")
         self.btn_pointing_close.setEnabled(False)
         self.btn_pointing_close.setToolTip("Hide the pointing analysis graph")
         self.btn_pointing_close.clicked.connect(self._close_pointing_panel)
-        s_an.body_layout.addWidget(self.btn_pointing_close)
+        # Two per row: Delete mode | Undo delete, then Close graph | Restore all.
+        row_pa3 = QHBoxLayout()
+        row_pa3.setSpacing(4)
+        row_pa3.addWidget(self.btn_pointing_select, 1)
+        row_pa3.addWidget(self.btn_pointing_undo, 1)
+        s_an.body_layout.addLayout(row_pa3)
+        row_pa4 = QHBoxLayout()
+        row_pa4.setSpacing(4)
+        row_pa4.addWidget(self.btn_pointing_close, 1)
+        row_pa4.addWidget(self.btn_pointing_restore, 1)
+        s_an.body_layout.addLayout(row_pa4)
 
         self.lbl_pointing_status = QLabel("")
         self.lbl_pointing_status.setWordWrap(True)
@@ -16378,10 +17402,31 @@ class Viewer(QWidget):
         self.lbl_ref_status.setStyleSheet(_REF_STATUS_STYLE)
         self.lbl_diff_stats.setStyleSheet("font-size: 10px; color: #1b5e20; padding: 1px 0;")
         self.lbl_diff_stats.setToolTip(
-            "Pixels whose difference from the reference is non-zero (after the diff\n"
-            "threshold), their share of the frame, and the mean / min / max of those\n"
-            "differences on the 0–255 display scale. Measured on the frame as shown,\n"
-            "before the visibility offset is added.")
+            "How many pixels of the difference frame are ABOVE ITS BACKGROUND — the\n"
+            "background being the darkest value in the frame, which on a difference is\n"
+            "0 and is printed only when it is not — what share of the frame that is,\n"
+            "how strong the difference is on average, how bright the brightest pixel\n"
+            "is, and how many pixels differ by at least 10 / 25 / 50 / 100, all on the\n"
+            "0–255 display scale. Counted after the diff threshold and before the\n"
+            "visibility offset, so the numbers stay physical.")
+        # The same numbers as a picture — ONE BLOCK PER CAMERA. The blocks live in a
+        # height-capped scroll area: the INFO panel is anchored above the settings
+        # column and does not scroll itself, so an eight-camera grid would otherwise
+        # push the settings off the screen.
+        self._diff_hist_blocks: "list[_DiffCamBlock]" = []
+        self._diff_hist_inner = QWidget()
+        self._diff_hist_lay = QVBoxLayout(self._diff_hist_inner)
+        self._diff_hist_lay.setContentsMargins(0, 0, 0, 0)
+        self._diff_hist_lay.setSpacing(4)
+        self._diff_hist_box = QScrollArea()
+        self._diff_hist_box.setWidget(self._diff_hist_inner)
+        self._diff_hist_box.setWidgetResizable(True)
+        self._diff_hist_box.setFrameShape(QFrame.Shape.NoFrame)
+        self._diff_hist_box.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._diff_hist_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._diff_hist_box.setStyleSheet(
+            "QScrollArea { background: transparent; } QScrollBar:vertical { width: 8px; }")
+        self._diff_hist_box.setVisible(False)
         # lbl_date and lbl_selected_range are COMPATIBILITY SHIMS. The date of the frame
         # on screen and the picked windows are now one two-column table (_range_table);
         # writing either label goes through _set_current_day / _set_range_display. The
@@ -16501,12 +17546,15 @@ class Viewer(QWidget):
         self._multi_grid = MultiCameraGrid(self)
         self._multi_grid.setVisible(False)
         self._multi_grid.camera_selected.connect(self._on_multicam_selected)
+        self._multi_grid.overlay_edited.connect(self._on_overlay_edited)
         self._img_pointing_row.addWidget(self._multi_grid, 1)
 
         # PV overlay for multi-cam view — parented to _cam_row_widget so it floats
         # over the camera area. raise_() puts it above _multi_grid in z-order.
         self._pv_overlay_multi = _PvOverlayPanel(_cam_row_widget)
         self._pv_overlay_multi.move(8, 8)
+        # Both panels exist now, so the saved look (size, font, colours) can go on.
+        self._pv_load_overlay_style()
 
         self.pointing_panel = PointingPanel(self)
         self.pointing_panel.point_clicked.connect(self._on_pointing_point_clicked)
@@ -16567,6 +17615,7 @@ class Viewer(QWidget):
         ilay.addWidget(self.lbl_meta_status)
         ilay.addWidget(self.lbl_ref_status)
         ilay.addWidget(self.lbl_diff_stats)
+        ilay.addWidget(self._diff_hist_box)
         for lbl in [self.lbl_filename, self.lbl_meta_status,
                     self.lbl_ref_status, self.lbl_diff_stats]:
             lbl.setVisible(bool(lbl.text()))
@@ -16741,19 +17790,32 @@ class Viewer(QWidget):
         self._multi_grid.reset_layout()
 
     def _toggle_draw_mode(self, mode: str):
-        iv = self._active_img_view()
-        iv.set_draw_mode("" if iv._draw_mode == mode else mode)
-        if iv._draw_mode == "cross"  and not self.cb_cross.isChecked():
+        """Arm (or disarm) a drawing mode on EVERY camera the overlay controls are
+        aimed at, so a single click on any one of them puts the mark on all of
+        them at the same place (see _on_overlay_edited)."""
+        targets = self._overlay_targets()
+        new_mode = "" if self._draw_mode_of_targets() == mode else mode
+        for iv in targets:
+            iv.set_draw_mode(new_mode)
+        if new_mode == "cross"  and not self.cb_cross.isChecked():
             self.cb_cross.setChecked(True)
-        if iv._draw_mode == "circle" and not self.cb_circle.isChecked():
+        if new_mode == "circle" and not self.cb_circle.isChecked():
             self.cb_circle.setChecked(True)
-        if iv._draw_mode == "square" and not self.cb_square.isChecked():
+        if new_mode == "square" and not self.cb_square.isChecked():
             self.cb_square.setChecked(True)
         self._refresh_draw_btns()
 
+    def _draw_mode_of_targets(self) -> str:
+        """The drawing mode the targeted cameras are in. Read from the targets, not
+        from the last-clicked tile: unselecting a tile leaves it 'last clicked'
+        while the controls are aimed elsewhere."""
+        for iv in self._overlay_targets():
+            if iv._draw_mode:
+                return iv._draw_mode
+        return ""
+
     def _refresh_draw_btns(self):
-        iv = self._active_img_view()
-        m = iv._draw_mode
+        m = self._draw_mode_of_targets()
         on  = "QPushButton { background: #2d7dff; color: #fff; font-weight: 700; border-radius: 4px; }"
         self.btn_draw_cross.setStyleSheet (on if m == "cross"  else "")
         self.btn_draw_circle.setStyleSheet(on if m == "circle" else "")
@@ -17973,10 +19035,14 @@ class Viewer(QWidget):
         orig_op = overlay.bg_opacity
         orig_fc = QColor(overlay.font_color)
         orig_bc = QColor(overlay.bg_color)
+        orig_pw = overlay.panel_w
+        orig_ph = overlay.panel_h
 
         dlg = QDialog(self)
         dlg.setWindowTitle("PV Overlay Settings")
-        dlg.setFixedWidth(340)
+        # 340 was enough until the panel-size row arrived; at that width its second box
+        # read "140 p" and the button beside it "it to tex".
+        dlg.setFixedWidth(430)
         lay = QFormLayout(dlg)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
@@ -18018,16 +19084,49 @@ class Viewer(QWidget):
                 _preview()
         bc_btn.clicked.connect(_pick_bg_color)
 
+        # The panel's own size. 0 = as big as the text needs, which is what the panel
+        # has always done; a number holds that side at exactly that many pixels.
+        _SIZE_TIP = ("Size of the panel over the picture, in pixels.\n"
+                     "0 = fit the text (the panel is exactly as big as the values).\n"
+                     "A size smaller than the text needs cuts the text off — the font "
+                     "size above\nis what makes the numbers fit.")
+        size_w_sb = QSpinBox(); size_w_sb.setRange(0, 2000); size_w_sb.setValue(orig_pw)
+        size_w_sb.setSpecialValueText("auto")
+        size_w_sb.setSuffix(" px")
+        size_w_sb.setMinimumWidth(84)
+        size_w_sb.setToolTip(_SIZE_TIP)
+        size_h_sb = QSpinBox(); size_h_sb.setRange(0, 2000); size_h_sb.setValue(orig_ph)
+        size_h_sb.setSpecialValueText("auto")
+        size_h_sb.setSuffix(" px")
+        size_h_sb.setMinimumWidth(84)
+        size_h_sb.setToolTip(_SIZE_TIP)
+        b_size_fit = QPushButton("Fit to text")
+        b_size_fit.setToolTip("Back to a panel that is exactly as big as the values "
+                              "(both sizes to auto)")
+        b_size_fit.clicked.connect(lambda: (size_w_sb.setValue(0), size_h_sb.setValue(0)))
+        size_row = QHBoxLayout()
+        size_row.addWidget(size_w_sb)
+        _x_lbl = QLabel("×")
+        _x_lbl.setStyleSheet("color: #111;")
+        size_row.addWidget(_x_lbl)
+        size_row.addWidget(size_h_sb)
+        size_row.addWidget(b_size_fit)
+
         opacity_sl.valueChanged.connect(lambda v: (opacity_lbl.setText(f"{v}%"), _preview()))
         font_sb.valueChanged.connect(lambda _: _preview())
         font_cb.currentTextChanged.connect(lambda _: _preview())
+        size_w_sb.valueChanged.connect(lambda _: _preview())
+        size_h_sb.valueChanged.connect(lambda _: _preview())
 
         def _preview():
             overlay2 = getattr(self, "_pv_overlay_multi", None)
             for ov in [overlay, overlay2]:
                 if ov is not None:
                     ov.apply_settings(font_sb.value(), font_cb.currentText(),
-                                      opacity_sl.value(), _font_color[0], _bg_color[0])
+                                      opacity_sl.value(), _font_color[0], _bg_color[0],
+                                      panel_w=size_w_sb.value(),
+                                      panel_h=size_h_sb.value())
+                    ov.ensure_inside_parent()
 
         # How an out-of-limits value asks to be noticed. The limits themselves are set
         # per PV in "Select PV channels"; this is only what the panel does about them.
@@ -18045,6 +19144,7 @@ class Viewer(QWidget):
 
         lay.addRow("Font size (px):", font_sb)
         lay.addRow("Font:", font_cb)
+        lay.addRow("Panel size (w × h):", size_row)
         lay.addRow("Background opacity:", opacity_row)
         lay.addRow("Font color:", fc_btn)
         lay.addRow("Background color:", bc_btn)
@@ -18059,7 +19159,8 @@ class Viewer(QWidget):
             overlay2 = getattr(self, "_pv_overlay_multi", None)
             for ov in [overlay, overlay2]:
                 if ov is not None:
-                    ov.apply_settings(orig_fs, orig_ff, orig_op, orig_fc, orig_bc)
+                    ov.apply_settings(orig_fs, orig_ff, orig_op, orig_fc, orig_bc,
+                                      panel_w=orig_pw, panel_h=orig_ph)
             return
         self._pv_alarm_style = alarm_cb.currentData() or "text"
         # Switching away from the whole-panel flash has to take the red off NOW, not at
@@ -18068,8 +19169,46 @@ class Viewer(QWidget):
         self._pv_save_overlay_style()
 
     def _pv_save_overlay_style(self):
+        """Remember how the overlay looks. It used to save only the alarm style, so
+        the size, the font and the colours the operator set were gone at the next
+        start — and a panel size is exactly the sort of thing that is laid out once."""
         self._ui_state["pv_alarm_style"] = self._pv_alarm_style
+        ov = getattr(self, "_pv_overlay", None)
+        if ov is not None:
+            self._ui_state["pv_overlay_style"] = {
+                "font_size_px": int(ov.font_size_px),
+                "font_family":  str(ov.font_family),
+                "bg_opacity":   int(ov.bg_opacity),
+                "font_color":   ov.font_color.name(),
+                "bg_color":     ov.bg_color.name(),
+                "panel_w":      int(ov.panel_w),
+                "panel_h":      int(ov.panel_h),
+            }
         self._save_ui_state()
+
+    def _pv_load_overlay_style(self):
+        """Put the saved look back on both overlay panels (single-cam and multi-cam).
+        Anything missing or unreadable keeps the panel's own default."""
+        d = self._ui_state.get("pv_overlay_style")
+        if not isinstance(d, dict):
+            return
+        for ov in (getattr(self, "_pv_overlay", None),
+                   getattr(self, "_pv_overlay_multi", None)):
+            if ov is None:
+                continue
+            try:
+                fc = QColor(str(d.get("font_color") or ov.font_color.name()))
+                bc = QColor(str(d.get("bg_color") or ov.bg_color.name()))
+                ov.apply_settings(
+                    int(d.get("font_size_px", ov.font_size_px)),
+                    str(d.get("font_family") or ov.font_family),
+                    int(d.get("bg_opacity", ov.bg_opacity)),
+                    fc if fc.isValid() else ov.font_color,
+                    bc if bc.isValid() else ov.bg_color,
+                    panel_w=int(d.get("panel_w", 0) or 0),
+                    panel_h=int(d.get("panel_h", 0) or 0))
+            except Exception:
+                continue
 
     def _pv_text(self) -> str:
         """Return a formatted single-line PV string for burn-in under saved images.
@@ -18100,14 +19239,36 @@ class Viewer(QWidget):
     # ── Per-tile display settings ─────────────────────────────────────────────
     # Palette, auto-stretch, brightness, contrast and gamma are stored PER TILE.
     #
-    # Two rules, and they are the whole design:
+    # Three rules, and they are the whole design:
     #   1. A display control applies to the cameras selected in the layout, or to
     #      every camera when nothing is selected (see _disp_targets).
     #   2. It applies AT THE MOMENT THE CONTROL IS MOVED, to the tiles targeted
     #      right then — and nowhere else. Selecting a camera afterwards must never
     #      copy the current settings onto it: what a tile looks like is decided when
     #      the user changes something, not when the user clicks a tile.
+    #   3. The panel READS BACK the other way: select a camera and the rows show that
+    #      camera's own settings (_load_disp_from_targets). Select several that do not
+    #      agree and the rows that differ say so instead of showing one camera's number
+    #      as if it were everybody's. Nothing is written to a tile by selecting it.
     # Every render path therefore reads _cam_disp_get(cam_i), never the widgets.
+
+    def _disp_ui_snapshot(self) -> dict:
+        """The three rows as the CONTROLS stand — the checkbox states plus the user's own
+        slider values, which is what has to go back on screen when this tile is selected
+        again.
+
+        Not readable back out of `bc`: while an Auto box is on, `bc` carries zero for
+        that row and the slider is parked on Auto's measurement, so neither of them still
+        holds the number the user set. The manual backing values do (see
+        _on_contrast_slider_changed)."""
+        return {
+            "auto_c": bool(self.cb_bright.isChecked()),
+            "auto_b": bool(self.cb_bright_auto.isChecked()),
+            "auto_g": bool(self.cb_gamma_auto.isChecked()),
+            "con":    int(self._contrast_manual),
+            "bri":    int(self._brightness_manual),
+            "gam":    int(self._gamma_manual),
+        }
 
     def _disp_snapshot(self) -> dict:
         """The display controls, frozen into render parameters.
@@ -18115,11 +19276,15 @@ class Viewer(QWidget):
         `brighten` and `bc` are stored RAW — the view-only palette rule is applied when
         the record is read (_cam_disp_get), not when it is written. That way a tile put
         on Default and later moved to a colour palette gets its stretch back instead of
-        having been silently zeroed."""
+        having been silently zeroed.
+
+        `ui` is the same settings as the CONTROLS, for putting the panel back the way
+        this tile was set when it is selected again — the render never reads it."""
         return {
             "gid":      self.gradient_cb.currentIndex(),
             "brighten": 1 if self.cb_bright.isChecked() else 0,
             "bc":       self._bc_raw(),
+            "ui":       self._disp_ui_snapshot(),
         }
 
     def _cam_disp_reset(self, n: int):
@@ -18148,12 +19313,25 @@ class Viewer(QWidget):
         sel = [i for i in self._multi_grid.selected_cam_indices() if 0 <= i < n]
         return sel if sel else list(range(n))
 
-    def _apply_disp_to_targets(self, field: str) -> list[int]:
+    @staticmethod
+    def _bc_from_ui(ui: dict) -> "tuple[int, _RenderBC]":
+        """(brighten, bc) for a stored `ui` record — the same rules _bc_raw applies to
+        the live controls, so a tile that took only ONE row from the panel still gets a
+        complete, consistent set of render parameters out of its own other two."""
+        contrast = 0 if ui["auto_c"] else int(ui["con"])
+        gamma = (img_scale.GAMMA_SLIDER_AUTO if ui["auto_g"] else int(ui["gam"]))
+        bc = (_RenderBC(0, contrast, 1, gamma) if ui["auto_b"]
+              else _RenderBC(int(ui["bri"]), contrast, 0, gamma))
+        return (1 if ui["auto_c"] else 0), bc
+
+    def _apply_disp_to_targets(self, field) -> list[int]:
         """Write ONE display control into the targeted tiles and say which they were.
 
-        `field` is "palette" (the Palette combo) or "stretch" (Auto-stretch, Brightness,
-        Contrast, Gamma). Only what the user actually moved is copied: changing the
-        brightness of a tile must not also repaint its palette, and vice versa.
+        `field` is "palette" (the Palette combo), "stretch" (all three rows at once), or
+        a set of row names — "contrast", "bright", "gamma". Only what the user actually
+        moved is copied: nudging the contrast of two tiles that also disagree about
+        brightness must leave each one's brightness alone, and changing any of them must
+        not repaint the palette.
 
         The ONLY place _cam_disp is written outside a fresh camera load — call it from
         display-control handlers and from nowhere else (rule 2 above)."""
@@ -18161,6 +19339,9 @@ class Viewer(QWidget):
         d = self._cam_disp
         while len(d) < len(getattr(self, "_cam_items", []) or []):
             d.append(self._disp_snapshot())
+        rows = ({"contrast", "bright", "gamma"} if field == "stretch"
+                else (set() if field == "palette" else set(field)))
+        panel = self._disp_ui_snapshot()
         for i in targets:
             if i >= len(d):
                 continue
@@ -18168,10 +19349,123 @@ class Viewer(QWidget):
             if field == "palette":
                 rec["gid"] = self.gradient_cb.currentIndex()
             else:
-                rec["brighten"] = 1 if self.cb_bright.isChecked() else 0
-                rec["bc"] = self._bc_raw()
+                ui = self._disp_ui_of(rec)
+                if "contrast" in rows:
+                    ui["auto_c"], ui["con"] = panel["auto_c"], panel["con"]
+                if "bright" in rows:
+                    ui["auto_b"], ui["bri"] = panel["auto_b"], panel["bri"]
+                if "gamma" in rows:
+                    ui["auto_g"], ui["gam"] = panel["auto_g"], panel["gam"]
+                rec["ui"] = ui
+                rec["brighten"], rec["bc"] = self._bc_from_ui(ui)
             d[i] = rec
+        # Whatever was moved, the targeted tiles now agree about it, so the "they differ"
+        # marks have to be recomputed rather than left standing.
+        self._refresh_disp_diff_marks()
         return targets
+
+    def _bc_row_touched(self, row: str):
+        """Remember which of the three rows the user just moved, so the change lands on
+        the other selected cameras' SAME row and leaves their other two alone. A set,
+        not one name: two rows can be moved inside the 60 ms redraw debounce."""
+        if not hasattr(self, "_bc_rows_touched"):
+            self._bc_rows_touched = set()
+        self._bc_rows_touched.add(row)
+
+    def _apply_bc_rows_to_targets(self) -> list[int]:
+        """Hand the rows touched since the last redraw to the targeted tiles."""
+        rows = getattr(self, "_bc_rows_touched", None) or set()
+        self._bc_rows_touched = set()
+        return self._apply_disp_to_targets(rows if rows else "stretch")
+
+    # ── the panel follows the selection ──────────────────────────────────────
+    # The other half of the two rules above: a control acts on the tiles selected when
+    # it is moved, and the panel SHOWS what those same tiles are already set to. Click a
+    # camera and the three rows and the palette jump to that camera's own settings; click
+    # back and the earlier ones are there again. Nothing is written to a tile by
+    # selecting it — only read out of it.
+
+    _DISP_ROWS = (("Palette", "palette"), ("Contrast", "contrast"),
+                  ("Brightness", "bright"), ("Gamma", "gamma"))
+
+    def _disp_ui_of(self, rec: dict) -> dict:
+        return dict(rec.get("ui") or self._disp_ui_snapshot())
+
+    def _disp_target_records(self) -> list[dict]:
+        """The records of the tiles a display control would act on right now."""
+        d = getattr(self, "_cam_disp", None) or []
+        return [d[i] for i in self._disp_targets() if 0 <= i < len(d)]
+
+    def _disp_diff_flags(self) -> dict:
+        """Which rows the targeted tiles do NOT agree on."""
+        recs = self._disp_target_records()
+        if len(recs) < 2:
+            return {k: False for _, k in self._DISP_ROWS}
+        uis = [self._disp_ui_of(r) for r in recs]
+        return {
+            "palette":  len({int(r.get("gid", -1)) for r in recs}) > 1,
+            "contrast": len({(u["auto_c"], u["con"]) for u in uis}) > 1,
+            "bright":   len({(u["auto_b"], u["bri"]) for u in uis}) > 1,
+            "gamma":    len({(u["auto_g"], u["gam"]) for u in uis}) > 1,
+        }
+
+    def _refresh_disp_diff_marks(self):
+        """Put the "they differ" mark on the rows the selected cameras disagree on, and
+        the one-line warning under them, or take both away."""
+        if not hasattr(self, "lbl_disp_mixed"):
+            return
+        diff = (self._disp_diff_flags() if self._is_multi_cam()
+                else {k: False for _, k in self._DISP_ROWS})
+        _bc_value_set_mixed(self.lbl_contrast_val, diff["contrast"], _TT_CONTRAST)
+        _bc_value_set_mixed(self.lbl_bright_val, diff["bright"], _TT_BRIGHTNESS)
+        _bc_value_set_mixed(self.lbl_gamma_val, diff["gamma"], _TT_GAMMA)
+        # The readouts that are NOT mixed were blanked to "≠" the last time round, so
+        # write the numbers back before deciding on the warning line.
+        self._sync_bc_value_labels()
+        names = [n for n, k in self._DISP_ROWS if diff[k]]
+        if names:
+            self.lbl_disp_mixed.setText(
+                "⚠ The selected cameras differ in " + ", ".join(names).lower() + ".")
+        self.lbl_disp_mixed.setVisible(bool(names))
+
+    def _load_disp_from_targets(self):
+        """Put the display panel where the tiles it would act on already are.
+
+        The first of them decides the numbers; a row the others disagree on is marked
+        instead of pretending the number covers them all. Signals are blocked throughout:
+        this reads the tiles, it must never write them."""
+        if not self._is_multi_cam():
+            return
+        recs = self._disp_target_records()
+        if not recs:
+            return
+        ui = self._disp_ui_of(recs[0])
+        widgets = (self.gradient_cb, self.cb_bright, self.cb_bright_auto,
+                   self.cb_gamma_auto, self.contrast_slider, self.brightness_slider,
+                   self.gamma_slider)
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            gid = int(recs[0].get("gid", self.gradient_cb.currentIndex()))
+            if 0 <= gid < self.gradient_cb.count():
+                self.gradient_cb.setCurrentIndex(gid)
+            self.cb_bright.setChecked(ui["auto_c"])
+            self.cb_bright_auto.setChecked(ui["auto_b"])
+            self.cb_gamma_auto.setChecked(ui["auto_g"])
+            self._contrast_manual = int(ui["con"])
+            self._brightness_manual = int(ui["bri"])
+            self._gamma_manual = int(ui["gam"])
+            self._brightness_offset = int(ui["bri"])
+            self.contrast_slider.setValue(self._contrast_manual)
+            self.brightness_slider.setValue(self._brightness_manual)
+            self.gamma_slider.setValue(self._gamma_manual)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        # A tile on the Default palette greys its own pair out, so the enable rules are
+        # re-run from the palette this tile is actually on.
+        self._sync_bc_controls_enabled()
+        self._refresh_disp_diff_marks()
 
     def _redraw_disp_targets(self, targets: list[int]):
         """Re-render just the tiles a display control was aimed at, each at the frame
@@ -18215,11 +19509,17 @@ class Viewer(QWidget):
         """Kamera v gridu byla vybrána kliknutím."""
         if self._focus_mode:
             return   # v focus modu není výběr kamery potřeba
-        # Clear draw mode on ALL cameras except the newly selected one,
-        # so draw mode never silently stays active on a background camera.
+        # Re-aim the armed drawing mode at the cameras that are selected NOW, and
+        # clear it everywhere else, so it never silently stays active on a camera
+        # the controls are no longer pointing at.
+        mode = ""
+        for cv in self._multi_grid._cam_views:
+            if cv.img_view._draw_mode:
+                mode = cv.img_view._draw_mode
+                break
+        targets = set(self._overlay_target_indices())
         for i, cv in enumerate(self._multi_grid._cam_views):
-            if i != idx:
-                cv.img_view.set_draw_mode("")
+            cv.img_view.set_draw_mode(mode if i in targets else "")
 
         # Clear the stale preview from the previous camera and re-label the
         # Spatial Contrast panel. A click TOGGLES selection, so idx may well be the
@@ -18256,11 +19556,12 @@ class Viewer(QWidget):
             self.cb_square.blockSignals(False)
             self._refresh_draw_btns()
 
-        # Palette / auto-stretch / brightness / contrast are NOT touched here, and this
-        # is the whole point of _cam_disp: a tile keeps whatever it was last given, so
-        # selecting it never drags the panel's current settings onto it. Selection only
-        # decides where the NEXT control change lands — see _disp_targets. All this
-        # handler may do is update the draw-mode / reference readouts above.
+        # Nothing is WRITTEN to a tile here, and that is the whole point of _cam_disp: a
+        # tile keeps whatever it was last given, so selecting it never drags the panel's
+        # current settings onto it. What does happen is the other direction — the panel
+        # is put where the newly selected tiles already are, so the rows read as that
+        # camera's settings rather than as the last thing anybody typed.
+        self._load_disp_from_targets()
 
         if (hasattr(self, '_sc_val_sc') and self._sc_val_sc.text() not in ("—", "")
                 and hasattr(self, '_run_spatial_contrast')):
@@ -18284,6 +19585,8 @@ class Viewer(QWidget):
         self._single_wrapper.setVisible(True)
         self._multi_grid.setVisible(False)
         self.btn_reset_layout.setEnabled(False)
+        # One camera has no second setting to differ from.
+        self._refresh_disp_diff_marks()
         self._per_cam_scroll.setVisible(False)
         self.slider.setVisible(True)
         self._slider_pad_row.setVisible(True)
@@ -18716,12 +20019,17 @@ class Viewer(QWidget):
         self._set_current_day(real_ts)
         self._pv_trigger_fetch()
 
-    def _per_cam_display_one(self, cam_idx: int, t_ns: int, defer_labels: bool = False):
+    def _per_cam_display_one(self, cam_idx: int, t_ns: int, defer_labels: bool = False,
+                             from_refine: bool = False):
         """Zobrazí frame pro jednu kameru na daném čase.
 
         `defer_labels` is set by _per_cam_nav_tick, which flushes the diff-stats label and
         re-colours the timestamps ONCE for the whole pass. Doing it per camera meant
-        O(cameras^2) label work per navigation step."""
+        O(cameras^2) label work per navigation step.
+
+        `from_refine` marks the call made BY the settle pass (_per_cam_redraw_in_place) and
+        stops a preview repaint from re-arming that same pass 200 ms later, forever — the
+        same trap _display_multicam_index's own from_refine flag exists for."""
         cam_items = self._cam_items[cam_idx] if cam_idx < len(self._cam_items) else []
         cam_ts    = self._cam_ts[cam_idx]    if cam_idx < len(self._cam_ts)    else []
         if not cam_items:
@@ -18794,7 +20102,8 @@ class Viewer(QWidget):
         # refreshes" — the dragged one hit the preview, the others queued reads.
         if self._proxy_try_paint_cam(cam_idx, cam_idx_f):
             self._cam_want[cam_idx] = None
-            self._schedule_refine()
+            if not from_refine:
+                self._schedule_refine()
             return
 
         # Coalesced load: remember the latest wanted frame and only kick off a load if
@@ -19278,6 +20587,50 @@ class Viewer(QWidget):
             self._nav_frame[i] = self._per_cam_ts_to_frame(i, slave_ts)
             self._per_cam_display_one(i, slave_ts)
 
+    def _per_cam_redraw_in_place(self, from_refine: bool = False):
+        """Re-render every tile ON THE FRAME IT IS ALREADY SHOWING, and put each handle back
+        on that frame's moment.
+
+        The per-camera answer to "redraw everything", and the reason it has to exist: the
+        merged-timeline redraw (_display_multicam_index) resolves ALL cameras from ONE
+        index, so a camera the user positioned himself was dragged back to the master's
+        moment by anything that redrew — the 200 ms settle pass fired ~200 ms after the
+        user let go of a SLAVE slider and undid the move he had just made, and ⟳ Refresh
+        did the same to the whole grid. With a master selected the slaves are supposed to
+        follow the master and nothing else: a slave stays where it was put until the MASTER
+        moves (_per_cam_sync_slaves), which is the only thing that may re-aim it.
+
+        The handles are re-set from each camera's own timestamp because a redraw can follow
+        a timeline extension (⟳ Refresh, live top-up): the axis grows, so the same moment
+        maps to a different slider position and a handle left alone would slide off its own
+        picture."""
+        if not self._is_multi_cam() or not self._per_cam_rows:
+            return
+        for cam_i in range(len(self._cam_items)):
+            cam_ts = self._cam_ts[cam_i] if cam_i < len(self._cam_ts) else []
+            if not cam_ts:
+                continue
+            # _cam_current_idx, the frame the tile was last ASKED for — the same truth
+            # _hq_upgrade_tiles refines each tile at. Deliberately NOT _nav_frame: that is
+            # only written by the deferred navigation path, so the direct callers (master
+            # switch, master deselect, live advance) leave it holding a frame from an
+            # earlier gesture, and redrawing from it threw those tiles backwards.
+            fi = self._cam_current_idx[cam_i] if cam_i < len(self._cam_current_idx) else 0
+            fi = max(0, min(len(cam_ts) - 1, fi))
+            t_ns = cam_ts[fi]
+            if cam_i < len(self._per_cam_rows):
+                self._per_cam_rows[cam_i].set_value(
+                    self._per_cam_ts_to_slider(cam_i, t_ns))
+            # _nav_frame is deliberately NOT written here. It is the navigation's own
+            # running position, written synchronously so a second step inside one tick
+            # still counts (see _nav_request); a redraw that pushed the last PAINTED frame
+            # back into it rolled that position backwards, and holding a frame arrow down
+            # then lost about one step in five to the settle pass firing between them.
+            self._per_cam_display_one(cam_i, t_ns, defer_labels=True,
+                                      from_refine=from_refine)
+        self._flush_cam_diff_stats()
+        self._cam_refresh_stale_marks()
+
     def _live_sync_one_slave(self, cam_idx: int):
         """One slave received a live frame — bring THAT tile to the master's moment.
 
@@ -19483,6 +20836,8 @@ class Viewer(QWidget):
         # Every new tile starts on the settings the panel is showing; from here on only
         # an actual control change may alter them, and only for the targeted tiles.
         self._cam_disp_reset(n)
+        # …so nothing differs yet: take down any "≠" left from the previous set.
+        self._refresh_disp_diff_marks()
         self._switch_to_multi_view()
         self._sc_set_enabled(True)
         # Build per-camera sliders (hidden global slider, show per-cam rows)
@@ -21022,10 +22377,11 @@ class Viewer(QWidget):
             # Pre-load grid_state into img_view so _start_scan saves and restores it
             if grid_state is not None:
                 MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
-            # Reference grid for single-cam view — show flag comes from saved
-            # config (defaults to hidden for all cameras, diodes included).
-            self.img_view.show_pdxm1_grid = get_pdxm1_grid_config(cam_names[0]).show
+            # Reference grid for single-cam view: diodes only, hidden until turned on.
             self.img_view.pdxm1_cam_name = cam_names[0]
+            self.img_view.show_pdxm1_grid = (_is_diode_cam(cam_names[0])
+                                             and get_pdxm1_grid_config(cam_names[0]).show)
+            self.img_view.ref_rect_cfg = get_ref_rect_config(cam_names[0])
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -21572,10 +22928,11 @@ class Viewer(QWidget):
             # Pre-load grid_state into img_view so _start_scan saves and restores it
             if grid_state is not None:
                 MultiCameraGrid._restore_iv_overlay(self.img_view, grid_state)
-            # Reference grid for single-cam view — show flag comes from saved
-            # config (defaults to hidden for all cameras, diodes included).
-            self.img_view.show_pdxm1_grid = get_pdxm1_grid_config(cam_names[0]).show
+            # Reference grid for single-cam view: diodes only, hidden until turned on.
             self.img_view.pdxm1_cam_name = cam_names[0]
+            self.img_view.show_pdxm1_grid = (_is_diode_cam(cam_names[0])
+                                             and get_pdxm1_grid_config(cam_names[0]).show)
+            self.img_view.ref_rect_cfg = get_ref_rect_config(cam_names[0])
             self._start_scan(existing, axis_override=axis_override,
                              folder_label=str(existing[0]))
         else:
@@ -21763,6 +23120,7 @@ class Viewer(QWidget):
             self.lbl_ref_status.setText("")
         if hasattr(self, "lbl_diff_stats"):
             self.lbl_diff_stats.setText("")
+        self._set_diff_hist(None)
         self.img_view.set_cam_ref_text("")
         # Captions belong to THIS push only. Set before the scan: it survives
         # _reset_ui_for_new_scan and is read by _set_info_for at scan-done time,
@@ -21916,7 +23274,12 @@ class Viewer(QWidget):
             total_frames = sum(len(c) for c in self._cam_items)
             self.lbl_scan_progress.setText(f"Frames: {total_frames}")
             self.lbl_index.setText(f"{(self.current_idx or 0) + 1} / {len(self.items)}")
-            if self.current_idx is not None:
+            if self._per_cam_rows:
+                # Every camera keeps the frame it is showing. Going through the merged
+                # index here snapped all of them to one moment, so a ⟳ Refresh threw away
+                # every per-camera position the user had set (see _per_cam_redraw_in_place).
+                self._per_cam_redraw_in_place()
+            elif self.current_idx is not None:
                 self._display_multicam_index(self.current_idx, update_slider=True)
 
         sig.done.connect(on_done)
@@ -22026,6 +23389,71 @@ class Viewer(QWidget):
                 return iv
         return self.img_view
 
+    def _overlay_target_indices(self) -> list[int]:
+        """Cameras the overlay controls act on: the selected ones, or every camera
+        when nothing is selected — the same rule the display controls follow
+        (_disp_targets)."""
+        if not self._is_multi_cam():
+            return []
+        n = len(self._multi_grid._cam_views)
+        if n == 0:
+            return []
+        sel = [i for i in self._multi_grid.selected_cam_indices() if 0 <= i < n]
+        return sel if sel else list(range(n))
+
+    def _overlay_targets(self) -> "list[ImageView]":
+        """The ImageViews an overlay control acts on. One camera → just its view."""
+        if not self._is_multi_cam():
+            return [self.img_view]
+        out = []
+        for i in self._overlay_target_indices():
+            iv = self._multi_grid.get_img_view(i)
+            if iv is not None:
+                out.append(iv)
+        return out or [self.img_view]
+
+    @staticmethod
+    def _copy_overlay_shape(src: "ImageView", dst: "ImageView", shape: str):
+        """Copy ONE overlay's geometry from src to dst. Everything is normalized to
+        the image rect, so the mark lands on the same spot of a differently sized
+        sensor."""
+        if shape == "cross":
+            dst.cross_pos_norm = QPointF(src.cross_pos_norm) \
+                if src.cross_pos_norm is not None else None
+            dst.show_cross = src.show_cross
+        elif shape == "circle":
+            dst.circle_center_norm = QPointF(src.circle_center_norm) \
+                if src.circle_center_norm is not None else None
+            dst.circle_r_norm  = src.circle_r_norm
+            dst.circle_rx_norm = src.circle_rx_norm
+            dst.circle_ry_norm = src.circle_ry_norm
+            dst.show_circle = src.show_circle
+        elif shape == "square":
+            dst.square_rect_norm = tuple(src.square_rect_norm) \
+                if src.square_rect_norm is not None else None
+            dst.show_square = src.show_square
+
+    def _on_overlay_edited(self, cam_idx: int, shape: str):
+        """A tile's overlay was dragged → put the same mark, at the same normalized
+        place, on every other camera the overlay controls are aimed at. Only the
+        shape that moved is copied, so a cross drag never disturbs a circle."""
+        if not self._is_multi_cam():
+            return
+        src = self._multi_grid.get_img_view(cam_idx)
+        if src is None:
+            return
+        targets = self._overlay_target_indices()
+        if cam_idx not in targets:
+            return   # dragged on a camera the controls are not aimed at
+        for i in targets:
+            if i == cam_idx:
+                continue
+            dst = self._multi_grid.get_img_view(i)
+            if dst is None:
+                continue
+            self._copy_overlay_shape(src, dst, shape)
+            dst.update()
+
     def _sync_overlay_checkboxes_from_iv(self, iv: "ImageView"):
         """Sync cb_cross/cb_circle/cb_square to match iv's current overlay state (no signal loops)."""
         self.cb_cross.blockSignals(True)
@@ -22039,53 +23467,85 @@ class Viewer(QWidget):
         self.cb_square.blockSignals(False)
         self._refresh_draw_btns()
 
-    def _on_overlay_changed(self):
-        iv = self._active_img_view()
-        iv.show_cross  = self.cb_cross.isChecked()
-        iv.show_circle = self.cb_circle.isChecked()
-        iv.show_square = self.cb_square.isChecked()
-        # If a checkbox was unchecked, clear draw mode for that shape
-        if not self.cb_cross.isChecked()  and iv._draw_mode == "cross":
-            iv.set_draw_mode("")
-        if not self.cb_circle.isChecked() and iv._draw_mode == "circle":
-            iv.set_draw_mode("")
-        if not self.cb_square.isChecked() and iv._draw_mode == "square":
-            iv.set_draw_mode("")
+    def _on_overlay_changed(self, shape: str = ""):
+        """One overlay tick box moved → show/hide THAT shape on every camera the
+        overlay controls are aimed at. `shape` says which box moved; with it empty
+        all three are written (the old whole-panel behaviour)."""
+        shapes = (shape,) if shape else ("cross", "circle", "square")
+        cbs = {"cross": self.cb_cross, "circle": self.cb_circle,
+               "square": self.cb_square}
+        for iv in self._overlay_targets():
+            for sh in shapes:
+                on = cbs[sh].isChecked()
+                setattr(iv, f"show_{sh}", on)
+                # If a box was unticked, the drawing mode for that shape goes with it
+                if not on and iv._draw_mode == sh:
+                    iv.set_draw_mode("")
+            iv.update()
         self._refresh_draw_btns()
-        iv.update()
+
+    def _cam_name_of_view(self, iv: "ImageView") -> str:
+        """Short camera name for a view, for the calibration report."""
+        if self._is_multi_cam():
+            for i, cv in enumerate(self._multi_grid._cam_views):
+                if cv.img_view is iv:
+                    return _strip_cam_name(self._cam_names[i]
+                                           if i < len(self._cam_names) else cv.cam_name)
+        return _strip_cam_name(self._cam_names[0] if self._cam_names else "camera")
+
+    def _calibrate_shape(self, shape: str):
+        """Run the auto-detection for one shape on EVERY camera the overlay controls
+        are aimed at. Each camera is calibrated on its own frame — one click, one
+        result per camera — and the cameras that failed are reported together."""
+        titles = {"circle": "Circle calibration", "cross": "Cross calibration",
+                  "square": "Square calibration"}
+        title = titles[shape]
+        targets = self._overlay_targets()
+        pending = [iv for iv in targets if iv._pix is not None and not iv._pix.isNull()]
+        if not pending:
+            QMessageBox.information(self, title, "Wait until an image is displayed.")
+            return
+        cb = {"circle": self.cb_circle, "cross": self.cb_cross,
+              "square": self.cb_square}[shape]
+        if not cb.isChecked():
+            cb.setChecked(True)
+        failed = []
+        for iv in pending:
+            if shape == "circle":
+                ok = iv.calibrate_circle_from_pixmap()
+            elif shape == "cross":
+                ok = iv.calibrate_cross_from_pixmap()
+            else:
+                ok = iv.calibrate_square_from_pixmap()
+            if ok:
+                if shape == "circle":
+                    iv.show_circle = True
+                elif shape == "cross":
+                    iv.show_cross = True
+                else:
+                    iv.show_square = True
+                iv.update()
+            else:
+                failed.append(self._cam_name_of_view(iv))
+        if failed:
+            what = {"circle": "detect a circle", "cross": "compute the centroid",
+                    "square": "detect a rectangle"}[shape]
+            tip = "" if shape == "cross" else "\nTip: enable Auto brightness first."
+            if len(failed) == len(pending):
+                QMessageBox.warning(self, title, f"Could not {what}.{tip}")
+            else:
+                QMessageBox.warning(
+                    self, title,
+                    f"Could not {what} on: {', '.join(failed)}.{tip}")
 
     def calibrate_circle(self):
-        iv = self._active_img_view()
-        if iv._pix is None or iv._pix.isNull():
-            QMessageBox.information(self, "Circle calibration", "Wait until an image is displayed."); return
-        if not self.cb_circle.isChecked(): self.cb_circle.setChecked(True)
-        ok = iv.calibrate_circle_from_pixmap()
-        if not ok:
-            QMessageBox.warning(self, "Circle calibration",
-                "Could not detect a circle.\nTip: enable Auto brightness first."); return
-        iv.show_circle = True; iv.update()
+        self._calibrate_shape("circle")
 
     def calibrate_cross(self):
-        iv = self._active_img_view()
-        if iv._pix is None or iv._pix.isNull():
-            QMessageBox.information(self, "Cross calibration", "Wait until an image is displayed."); return
-        if not self.cb_cross.isChecked():
-            self.cb_cross.setChecked(True)
-        ok = iv.calibrate_cross_from_pixmap()
-        if not ok:
-            QMessageBox.warning(self, "Cross calibration", "Could not compute centroid."); return
-        iv.show_cross = True; iv.update()
+        self._calibrate_shape("cross")
 
     def calibrate_square(self):
-        iv = self._active_img_view()
-        if iv._pix is None or iv._pix.isNull():
-            QMessageBox.information(self, "Square calibration", "Wait until an image is displayed."); return
-        if not self.cb_square.isChecked(): self.cb_square.setChecked(True)
-        ok = iv.calibrate_square_from_pixmap()
-        if not ok:
-            QMessageBox.warning(self, "Square calibration",
-                "Could not detect a rectangle.\nTip: enable Auto brightness first."); return
-        iv.show_square = True; iv.update()
+        self._calibrate_shape("square")
 
     # ================================================================ SUBTRACTION PARAMS / STATS
     def _sub_params(self, ref) -> "tuple[int, int]":
@@ -22097,17 +23557,43 @@ class Viewer(QWidget):
         return (int(self.sub_threshold_sb.value()), int(self.sub_offset_sb.value()))
 
     @staticmethod
-    def _fmt_diff_stats(st: dict, compact: bool = False) -> str:
-        """Difference summary line. `compact` fits one multi-cam tile per row in the
-        275 px info panel; the full form is used for the single-camera view."""
-        n, total = st.get("count", 0), st.get("total", 0)
-        if n <= 0:
-            return "0 px differ" if compact else "Diff: no pixels differ"
-        pct = (100.0 * n / total) if total else 0.0
+    def _fmt_px(n: int) -> str:
+        """Pixel counts run to millions — group them, or 1234567 is unreadable."""
+        return f"{int(n):,}".replace(",", " ")
+
+    @staticmethod
+    def _fmt_diff_levels(st: dict, compact: bool = False) -> str:
+        """"How many pixels differ by at least this much" — one figure per level.
+
+        This is the line the plain pixel count was missing: a count of everything that
+        is not exactly the reference is dominated by sensor noise and reads the same on
+        a quiet frame as on a changed one, while "1 200 pixels differ by 50 or more"
+        says whether anything actually happened."""
+        lv = st.get("levels") or []
+        if not lv:
+            return ""
         if compact:
-            return f"{n} px · avg {st['mean']:.1f} · {st['min']:.0f}–{st['max']:.0f}"
-        return (f"Diff: {n} px ({pct:.2f}%) · avg {st['mean']:.1f} · "
-                f"min {st['min']:.0f} · max {st['max']:.0f}")
+            return " · ".join(f"≥{t} {Viewer._fmt_px(n)}" for t, n in lv)
+        return "Differ by:  " + " · ".join(
+            f"≥ {t}: {Viewer._fmt_px(n)} px" for t, n in lv)
+
+    @staticmethod
+    def _fmt_diff_stats(st: dict, compact: bool = False) -> str:
+        """ONE number: how many pixels differ from the reference.
+
+        That is the whole line by the operator's request. Everything else the run
+        produces — the peak, the average, the per-level counts — is drawn inside the
+        histogram right below it, where it costs no extra row in the 275 px panel.
+        The background level is printed only when it is NOT 0."""
+        n = int(st.get("above", st.get("count", 0)) or 0)
+        bg = float(st.get("bg", 0.0) or 0.0)
+        bg_txt = "" if bg <= 0 else f" (bg {bg:.0f})"
+        if n <= 0:
+            return "0 px differ" if compact else f"Diff: no pixels above background{bg_txt}"
+        px = Viewer._fmt_px(n)
+        if compact:
+            return f"{px} px"
+        return f"Diff: {px} px differ{bg_txt}"
 
     def _update_diff_stats(self, key):
         """Refresh the single-cam difference-statistics line for the frame rendered
@@ -22115,11 +23601,78 @@ class Viewer(QWidget):
         labelled too."""
         if not self.cb_subtract.isChecked() or self._ref_path is None:
             self.lbl_diff_stats.setText("")
+            self._set_diff_hist(None)
             return
         st = _diff_stats_get(key)
         if st is None:
             return   # stats evicted / not a diff render — keep the last numbers
         self.lbl_diff_stats.setText(self._fmt_diff_stats(st))
+        self.lbl_diff_stats.setToolTip(self._fmt_diff_levels(st))
+        self._set_diff_hist(st)
+
+    # How tall the per-camera histogram column may grow before it starts scrolling.
+    # The INFO panel is anchored above the settings column and does not scroll, so
+    # without a cap an eight-camera grid would push the settings off the screen.
+    _DIFF_BOX_MAX_H = 210
+
+    def _show_diff_blocks(self, items: list):
+        """Render one block per camera: `items` is [(text, stats_dict), …], already in
+        display order. An empty list hides the whole box.
+
+        The blocks are pooled, not rebuilt: a subtraction run re-renders this on every
+        displayed frame, and creating widgets at 3 Hz is what a scrub tick cannot
+        afford."""
+        box = getattr(self, "_diff_hist_box", None)
+        if box is None:
+            return
+        items = [(t, s) for t, s in items if s]
+        if not items:
+            for b in self._diff_hist_blocks:
+                b.setVisible(False)
+            box.setVisible(False)
+            return
+        compact = len(items) > 1
+        while len(self._diff_hist_blocks) < len(items):
+            b = _DiffCamBlock(compact=compact)
+            self._diff_hist_lay.addWidget(b)
+            self._diff_hist_blocks.append(b)
+        for i, (text, st) in enumerate(items):
+            b = self._diff_hist_blocks[i]
+            b.hist.set_compact(compact)
+            b.set_block(text, st.get("hist"), float(st.get("max", 0.0) or 0.0),
+                        float(st.get("mean", 0.0) or 0.0))
+            # The per-level counts are no longer written on the line — they are one
+            # hover away instead of four columns of numbers per camera.
+            b.lbl.setToolTip(self._fmt_diff_levels(st))
+        for b in self._diff_hist_blocks[len(items):]:
+            b.setVisible(False)
+        box.setVisible(True)
+        # The height is MEASURED, not taken from the scroll area's own size hint: a
+        # QScrollArea hints at a default box size that has nothing to do with what is
+        # inside it, and the blocks carry word-wrapped labels whose height depends on
+        # the column width — so each one is asked heightForWidth at the real width.
+        w = box.viewport().width() or 259
+        want = self._diff_hist_lay.spacing() * max(0, len(items) - 1)
+        for b in self._diff_hist_blocks[:len(items)]:
+            lay = b.layout()
+            hfw = lay.heightForWidth(w) if lay.hasHeightForWidth() else -1
+            want += max(b.sizeHint().height(), hfw)
+        want = min(self._DIFF_BOX_MAX_H, max(24, want + 2))
+        # Only when it CHANGES: this runs on every displayed frame of a subtraction
+        # run, and setFixedHeight relayouts the whole INFO column whether the number
+        # is new or not.
+        if box.height() != want or box.minimumHeight() != want:
+            box.setFixedHeight(want)
+
+    def _set_diff_hist(self, st: "dict | None", caption: str = ""):
+        """Feed the histogram column with a SINGLE camera, or clear it. Guarded by
+        hasattr: the stats line is written from paths that run while the INFO panel is
+        still being built."""
+        if getattr(self, "_diff_hist_box", None) is None:
+            return
+        # The single-camera view prints its numbers in lbl_diff_stats above, so the
+        # block carries the picture alone unless a camera name was handed in.
+        self._show_diff_blocks([(caption, st)] if st else [])
 
     def _collect_cam_diff_stats(self, cam_i: int, key):
         """Record one tile's diff statistics WITHOUT rebuilding the label.
@@ -22139,14 +23692,22 @@ class Viewer(QWidget):
         """Write the collected statistics to the info line — once per display pass."""
         if not self.cb_subtract.isChecked():
             self.lbl_diff_stats.setText("")
+            self._set_diff_hist(None)
             return
-        lines = []
+        # ONE BLOCK PER CAMERA — name and numbers, then that camera's own histogram
+        # directly beneath them. There used to be a list of numbers here and a single
+        # histogram for the selected camera underneath, which meant the picture
+        # described a different camera than the lines above it. The numbers moved into
+        # the blocks, so the line above the box stays empty in the grid view.
+        items = []
         for c in sorted(self._cam_diff_stats):
             if c >= len(self._cam_ref_paths) or self._cam_ref_paths[c] is None:
                 continue
             name = _strip_cam_name(self._cam_names[c]) if c < len(self._cam_names) else f"cam {c}"
-            lines.append(f"{name}: {self._fmt_diff_stats(self._cam_diff_stats[c], compact=True)}")
-        self.lbl_diff_stats.setText("\n".join(lines))
+            items.append((f"{name}: {self._fmt_diff_stats(self._cam_diff_stats[c], compact=True)}",
+                          self._cam_diff_stats[c]))
+        self.lbl_diff_stats.setText("")
+        self._show_diff_blocks(items)
 
     def _update_cam_diff_stats(self, cam_i: int, key):
         """Collect + show, for the callers that update a single tile."""
@@ -22179,9 +23740,10 @@ class Viewer(QWidget):
         Every enable/disable of these nine widgets goes through here, so the two rules
         cannot overwrite each other.
 
-        Gamma follows the same two rules, plus one of its own: Auto CONTRAST already sets
-        both ends of the frame, so gamma has nothing left to bend and the whole gamma row
-        goes dead while that is on (the render ignores it — see img_scale.to_u8)."""
+        Gamma follows exactly the same two rules — no third one. It used to go dead
+        whenever Auto contrast was on, because Auto contrast was a stretch that set both
+        ends of the frame itself. It is now the Contrast slider set automatically, and
+        gamma composes with a gain the same way it always did with the manual slider."""
         view_only = self._is_view_only_palette()
         self.cb_bright.setEnabled(not view_only)
         self.cb_bright_auto.setEnabled(not view_only)
@@ -22191,7 +23753,7 @@ class Viewer(QWidget):
         self.btn_contrast_reset.setEnabled(c_live)
         self.brightness_slider.setEnabled(b_live)
         self.btn_brightness_reset.setEnabled(b_live)
-        gamma_usable = not view_only and not self.cb_bright.isChecked()
+        gamma_usable = not view_only
         g_live = gamma_usable and not self.cb_gamma_auto.isChecked()
         self.cb_gamma_auto.setEnabled(gamma_usable)
         self.gamma_slider.setEnabled(g_live)
@@ -22208,14 +23770,12 @@ class Viewer(QWidget):
         self.lbl_bright_val.setEnabled(live)
         self.lbl_gamma_val.setEnabled(gamma_usable)
         # …and while Auto owns the number, print it as a measurement rather than as a
-        # setting (see _bc_value_label). Auto CONTRAST also drives the gamma readout:
-        # it neutralises gamma, so what stands in that box is no longer the user's curve.
+        # setting (see _bc_value_label). One row, one Auto box, one readout.
         _bc_value_set_auto(self.lbl_contrast_val, self.cb_bright.isChecked(),
                            _TT_CONTRAST)
         _bc_value_set_auto(self.lbl_bright_val, self.cb_bright_auto.isChecked(),
                            _TT_BRIGHTNESS)
-        _bc_value_set_auto(self.lbl_gamma_val,
-                           self.cb_gamma_auto.isChecked() or self.cb_bright.isChecked(),
+        _bc_value_set_auto(self.lbl_gamma_val, self.cb_gamma_auto.isChecked(),
                            _TT_GAMMA)
 
     def _bc(self) -> _RenderBC:
@@ -22234,16 +23794,13 @@ class Viewer(QWidget):
         """Brightness/contrast/gamma render params, honoring the 'Auto checkbox overrides
         slider' rule for each pair: contrast Auto (cb_bright) zeroes the manual
         contrast; brightness Auto (cb_bright_auto) zeroes the manual offset; gamma Auto
-        sends the sentinel so the render resolves it per frame."""
+        sends the sentinel so the render resolves it per frame.
+
+        The three rows are independent — each Auto box speaks only for its own row (see
+        img_scale.render_u8)."""
         contrast = 0 if self.cb_bright.isChecked() else int(self.contrast_slider.value())
-        # Auto contrast sets both ends itself, so gamma is dropped rather than stacked on
-        # top of it — two corrections fighting over the same frame.
-        if self.cb_bright.isChecked():
-            gamma = img_scale.GAMMA_SLIDER_NEUTRAL
-        elif self.cb_gamma_auto.isChecked():
-            gamma = img_scale.GAMMA_SLIDER_AUTO
-        else:
-            gamma = int(self.gamma_slider.value())
+        gamma = (img_scale.GAMMA_SLIDER_AUTO if self.cb_gamma_auto.isChecked()
+                 else int(self.gamma_slider.value()))
         if self.cb_bright_auto.isChecked():
             return _RenderBC(0, contrast, 1, gamma)
         return _RenderBC(int(self._brightness_offset), contrast, 0, gamma)
@@ -22254,16 +23811,16 @@ class Viewer(QWidget):
         picture on screen is clearly stretched. Signals are blocked: no reload, no
         cache invalidation.
 
-        DISPLAY ONLY for contrast. Both now pivot on the frame's black level, so the
-        operation matches — but the slider's gain tops out at ~3.9x while the
-        auto-stretch of a dim frame needs 5x and more, so the parked number saturates
-        at +127 and does not reproduce the picture. Unticking Auto therefore restores
-        the user's own value instead (see _on_contrast_auto_changed).
+        The parked number is now a REAL setting: Auto contrast is the Contrast slider's
+        own operation with the value this frame needs, and Auto brightness the Brightness
+        slider's, so putting either slider on the number shown gives back exactly the
+        picture Auto made (the slider reaches 64x, well past what any frame here asks
+        for).
 
-        Brightness is display-only for the same reason of consistency: parking Auto's
-        offset as the backing value meant that ticking Auto on and off once replaced the
-        user's own brightness with Auto's (the black level it subtracted, e.g. -30 on a
-        typical frame) and there was no way back to it. An Auto checkbox has to be
+        It is still DISPLAY ONLY, and that is deliberate: unticking Auto restores the
+        user's own value (see _on_contrast_auto_changed). Keeping Auto's number as the
+        backing value meant that ticking a box on and off once silently replaced the
+        user's setting with Auto's, with no way back to it. An Auto checkbox has to be
         undoable."""
         if self._is_view_only_palette():
             # Nothing was applied, so there is nothing to park — and the cache can still
@@ -22272,18 +23829,22 @@ class Viewer(QWidget):
         vals = _auto_bc_get(path)
         if not vals:
             return
+        # A readout marked "≠" keeps its mark: the selected cameras are on different
+        # settings there, and one camera's measurement is not the answer for the others.
         c = vals.get("contrast")
         if c is not None and self.cb_bright.isChecked():
             self.contrast_slider.blockSignals(True)
             self.contrast_slider.setValue(int(c))
             self.contrast_slider.blockSignals(False)
-            self.lbl_contrast_val.setText(str(int(c)))
+            if not self.lbl_contrast_val.property("mixed"):
+                self.lbl_contrast_val.setText(str(int(c)))
         o = vals.get("offset")
         if o is not None and self.cb_bright_auto.isChecked():
             self.brightness_slider.blockSignals(True)
             self.brightness_slider.setValue(int(o))
             self.brightness_slider.blockSignals(False)
-            self.lbl_bright_val.setText(str(int(o)))
+            if not self.lbl_bright_val.property("mixed"):
+                self.lbl_bright_val.setText(str(int(o)))
         g = vals.get("gamma")
         if g is not None and self.cb_gamma_auto.isChecked():
             # Display only, like the other two: unticking Auto restores the user's own
@@ -22293,7 +23854,8 @@ class Viewer(QWidget):
             self.gamma_slider.blockSignals(True)
             self.gamma_slider.setValue(gv)
             self.gamma_slider.blockSignals(False)
-            self._set_gamma_label(gv)
+            if not self.lbl_gamma_val.property("mixed"):
+                self._set_gamma_label(gv)
 
     def _on_brightness_slider_changed(self, value):
         # Only user moves reach this (the Auto parking blocks signals), so this is the
@@ -22301,6 +23863,7 @@ class Viewer(QWidget):
         self._brightness_offset = value
         self._brightness_manual = int(value)
         self.lbl_bright_val.setText(str(int(value)))
+        self._bc_row_touched("bright")
         if not self.items or self.current_idx is None: return
         self._inflight.clear(); self._want_display_req.clear()
         if not self._brightness_debounce.isActive():
@@ -22314,6 +23877,7 @@ class Viewer(QWidget):
         # the value to return to when Auto is switched back off.
         self._contrast_manual = int(value)
         self.lbl_contrast_val.setText(str(int(value)))
+        self._bc_row_touched("contrast")
         if not self.items or self.current_idx is None: return
         self._inflight.clear(); self._want_display_req.clear()
         if not self._brightness_debounce.isActive():
@@ -22327,13 +23891,14 @@ class Viewer(QWidget):
         on = self.cb_bright.isChecked()
         self._sync_bc_controls_enabled()
         if not on:
-            # Auto off → the manual slider is live again, so it must not be left on
-            # the number Auto parked there (see _refresh_auto_bc_sliders): that is a
-            # different operation with the same gain and it wrecks the picture.
+            # Auto off → back to the user's own value, not the one Auto parked on the
+            # greyed-out slider (see _refresh_auto_bc_sliders). An Auto box has to be
+            # undoable.
             self.contrast_slider.blockSignals(True)
             self.contrast_slider.setValue(int(self._contrast_manual))
             self.contrast_slider.blockSignals(False)
         self._sync_bc_value_labels()
+        self._bc_row_touched("contrast")
         self._on_brightness_changed()
 
     def _set_gamma_label(self, slider_val: int):
@@ -22345,16 +23910,23 @@ class Viewer(QWidget):
         The sliders are the single source of truth for what is on screen — including
         while an Auto checkbox is on, because the Auto pass parks its own value there
         (see _refresh_auto_bc_sliders). Called from every path that can move a slider,
-        the parking included: that one blocks signals, so the handlers do not run."""
-        self.lbl_contrast_val.setText(str(int(self.contrast_slider.value())))
-        self.lbl_bright_val.setText(str(int(self.brightness_slider.value())))
-        self._set_gamma_label(int(self.gamma_slider.value()))
+        the parking included: that one blocks signals, so the handlers do not run.
+
+        A row the selected cameras disagree on is left showing its "≠" — there is no one
+        value for it, and the slider is only standing on the first camera's."""
+        if not self.lbl_contrast_val.property("mixed"):
+            self.lbl_contrast_val.setText(str(int(self.contrast_slider.value())))
+        if not self.lbl_bright_val.property("mixed"):
+            self.lbl_bright_val.setText(str(int(self.brightness_slider.value())))
+        if not self.lbl_gamma_val.property("mixed"):
+            self._set_gamma_label(int(self.gamma_slider.value()))
 
     def _on_gamma_slider_changed(self, value):
         # Only user moves reach this (the Auto parking blocks signals), so this is the
         # value to return to when Auto is switched back off.
         self._gamma_manual = int(value)
         self._set_gamma_label(int(value))
+        self._bc_row_touched("gamma")
         if not self.items or self.current_idx is None: return
         self._inflight.clear(); self._want_display_req.clear()
         if not self._brightness_debounce.isActive():
@@ -22375,6 +23947,7 @@ class Viewer(QWidget):
             self.gamma_slider.setValue(int(self._gamma_manual))
             self.gamma_slider.blockSignals(False)
             self._set_gamma_label(int(self._gamma_manual))
+        self._bc_row_touched("gamma")
         self._on_brightness_changed()
 
     def _on_bright_auto_changed(self):
@@ -22389,12 +23962,13 @@ class Viewer(QWidget):
             self.brightness_slider.setValue(int(self._brightness_manual))
             self.brightness_slider.blockSignals(False)
         self._sync_bc_value_labels()
+        self._bc_row_touched("bright")
         self._on_brightness_changed()
 
     def _apply_brightness_debounced(self):
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            self._redraw_disp_targets(self._apply_disp_to_targets("stretch"))
+            self._redraw_disp_targets(self._apply_bc_rows_to_targets())
             return
         idx = self.current_idx
         self._display_exact_index(idx, self.items[idx].ts_ns, update_slider=True)
@@ -22569,6 +24143,7 @@ class Viewer(QWidget):
             self.lbl_ref_status.setStyleSheet(_REF_WARN_STYLE)
             self.lbl_ref_status.setText("⚠ Subtraction on, no reference — click 'Set ref'")
             self.lbl_diff_stats.setText("")
+            self._set_diff_hist(None)
         elif not self._has_reference():
             self._set_ref_status("")
 
@@ -22620,9 +24195,9 @@ class Viewer(QWidget):
         # Caches are keyed on bc/brighten, so they stay — see _on_subtract_changed.
         if not self.items or self.current_idx is None: return
         if self._is_multi_cam():
-            # Only the cameras this change was aimed at — the rest keep the settings
-            # they were last given (see the _cam_disp block).
-            self._redraw_disp_targets(self._apply_disp_to_targets("stretch"))
+            # Only the cameras this change was aimed at, and only the ROW that changed —
+            # the rest keep the settings they were last given (see the _cam_disp block).
+            self._redraw_disp_targets(self._apply_bc_rows_to_targets())
             return
         self._inflight.clear(); self._want_display_req.clear()
         self._display_load_key = None; self._deferred_display = None
@@ -23451,10 +25026,10 @@ class Viewer(QWidget):
         pm = self._proxy_render_cache.get(key)
         if pm is not None and not pm.isNull():
             return pm
-        # Same rule as load_image_scaled: either Auto levels the frame, and one pass
-        # serves both — otherwise a preview paint and the refined render of the same
-        # frame would disagree the moment only Auto brightness was on.
-        brighten = 1 if (brighten or bc.auto) else 0
+        # The two Auto boxes as one value, exactly as load_image_scaled builds it: each
+        # box decides the value of its own control, so a preview paint and the refined
+        # render of the same frame cannot disagree about what Auto did.
+        auto = img_scale.auto_mask(bool(brighten), bool(bc.auto))
         lo, hi, mx = 0.0, _FULL_SCALE_16, _FULL_SCALE_16
         full_scale = _FULL_SCALE_16
         if isinstance(arr, tuple):
@@ -23467,24 +25042,20 @@ class Viewer(QWidget):
             return None
         h, w = arr.shape
         if arr.dtype == np.uint16:
-            # Legacy / PROXY_STORE_8BIT = False path. Same two mappings, in the same order,
-            # as load_image_scaled's 16-bit branch — so a preview paint and the refined
-            # render of the same frame cannot disagree about the tones.
-            if brighten:
-                arr8 = _stretch_arr_f(arr.astype(np.float32))
-            else:
-                arr8 = _norm16_to8_full_scale(
-                    arr, self._proxy_gamma(bc, arr, None, full_scale), full_scale)
+            # Legacy / PROXY_STORE_8BIT = False path. The whole pipeline in one call,
+            # exactly as load_image_scaled's 16-bit branch does it — so a preview paint
+            # and the refined render of the same frame cannot disagree about the tones.
+            arr8 = img_scale.render_u8(arr, auto, full_scale, bc.gamma,
+                                       bc.contrast, bc.offset)
             img = QImage(arr8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
         elif hi > 255.0:
             # 8-bit storage of a 16-bit source. The stored codes span p0.1..p99.9 of the
             # real 16-bit pixels (load_proxy_gray took those percentiles in the worker), so
             # `orig = lo + code * (hi - lo) / 255` recovers the 16-bit value to within one
-            # code. Both render modes are then a 256-entry LUT over that:
-            #   Auto ON  → the p0.5..p99.5 stretch _stretch_arr_f would have applied.
-            #   Auto OFF → the absolute full-scale mapping _norm16_to8_full_scale applies.
-            # Same two mappings, in the same order, as load_image_scaled's 16-bit branch, so
-            # a preview paint and the refined render of the same frame agree.
+            # code. The whole render is then a 256-entry LUT over that — the absolute
+            # full-scale mapping, then the contrast gain, then the brightness offset,
+            # which is what load_image_scaled's 16-bit branch does per pixel, so a
+            # preview paint and the refined render of the same frame agree.
             #
             # Doing it as a LUT is also what took ~1 ms per tile per tick off the GUI
             # thread: the percentile pass used to run on every render-cache miss, i.e. on
@@ -23502,35 +25073,37 @@ class Viewer(QWidget):
                                      * ((mx - hi) / n_tail))
             else:
                 orig[k + 1:] = hi
-            if brighten:
+            base = img_scale.absolute_f(
+                orig, full_scale, self._proxy_gamma(bc, arr, orig, full_scale))
+            con, off = bc.contrast, bc.offset
+            black = 0.0
+            if auto or con:
                 # p0.5/p99.5 of the STORED distribution, weighted by how many pixels sit at
                 # each code — a plain percentile of 0..255 would describe the LUT, not the
-                # picture.
+                # picture. Mapped through `base`, so the black and highlight levels are on
+                # the same 0..255 display scale the sliders work on.
                 counts = np.bincount(arr.ravel(), minlength=256).astype(np.float64)
                 cum = np.cumsum(counts)
                 total = cum[-1] if cum[-1] > 0 else 1.0
                 i_lo = int(np.searchsorted(cum, 0.005 * total))
                 i_hi = int(np.searchsorted(cum, 0.995 * total))
-                s_lo, s_hi = orig[min(i_lo, 255)], orig[min(i_hi, 255)]
+                s_lo, s_hi = float(base[min(i_lo, 255)]), float(base[min(i_hi, 255)])
                 if s_hi <= s_lo:
-                    s_lo, s_hi = orig[0], orig[255]
-                if s_hi <= s_lo:
-                    lut = np.zeros(256, dtype=np.uint8)
-                else:
-                    lut = np.clip((orig - s_lo) / (s_hi - s_lo) * 255.0,
-                                  0, 255).astype(np.uint8)
-            else:
-                lut = img_scale.to_absolute_u8(
-                    orig, full_scale,
-                    self._proxy_gamma(bc, arr, orig, full_scale))
+                    s_lo, s_hi = float(base[0]), float(base[255])
+                black = s_lo
+                con, off = img_scale.auto_bc_pair(s_lo, s_hi, auto, con, off)
+            if con:
+                base = (base - black) * img_scale.contrast_gain(con) + black
+            if off:
+                base = base + off
+            lut = np.clip(base, 0, 255).astype(np.uint8)
             arr8 = lut[arr]
             img = QImage(arr8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
         else:
+            # A source that was already 8-bit: the pair is applied to the codes, the one
+            # case where there is nothing more precise to apply it to.
             img = QImage(arr.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
-            if brighten:
-                img = _apply_stretch(img)
-        # auto_bright=0: the stretch above already did the auto level for bc.auto.
-        img = _apply_bc(img, contrast=bc.contrast, offset=bc.offset)
+            img = _apply_bc(img, contrast=bc.contrast, offset=bc.offset, auto=auto)
         if gradient_id >= 2:
             # Same adaptive rule as load_image_scaled, or the preview and the refined
             # render would paint one of these palettes on two different windows.
@@ -23762,10 +25335,14 @@ class Viewer(QWidget):
             return
         if self._is_multi_cam():
             # Undo the drag-speed downscale: back to the full tile size. Going FURTHER,
-            # to native, is the slower HQ_SETTLE_MS tier's job (_hq_upgrade_tiles) — it
-            # runs per camera, which is also why the independent per-cam mode bails out
-            # here: re-displaying the merged index would drag every camera to one moment.
-            if self._per_cam_master_idx < 0 and self._per_cam_rows:
+            # to native, is the slower HQ_SETTLE_MS tier's job (_hq_upgrade_tiles).
+            # Per-camera sliders redraw each tile on ITS OWN frame: re-displaying the
+            # merged index sharpened the picture and MOVED it at the same time, so 200 ms
+            # after releasing a slave slider the tile jumped back to the master's moment
+            # (see _per_cam_redraw_in_place). Only the independent mode used to bail out
+            # here, which left exactly that bug in the mode with a master selected.
+            if self._per_cam_rows:
+                self._per_cam_redraw_in_place(from_refine=True)
                 return
             self._display_multicam_index(self.current_idx, update_slider=False,
                                          from_refine=True)
@@ -24051,6 +25628,7 @@ class Viewer(QWidget):
             self._refresh_ref_warning()
         if hasattr(self, "lbl_diff_stats"):
             self.lbl_diff_stats.setText("")
+        self._set_diff_hist(None)
         self.img_view.clear()
         # Clear stale Spatial Contrast preview/overlay from whatever camera was
         # shown before — it belongs to that old camera, not the one being scanned in.
@@ -25715,6 +27293,43 @@ class Viewer(QWidget):
                     self.load_signals, bc, ref, sub_thr, sub_off, key=key))
 
     # ================================================================ STEP FRAME
+    # ── holding a frame arrow down ───────────────────────────────────────────────
+    # A press is always exactly one frame — the click behaviour nobody wanted changed.
+    # Keep the button down and the ramp in HOLD_STEP_RATES takes over: 2 images per second
+    # for the first second, then 3, then 4, then 5 for as long as it stays down.
+    #
+    # The rung is read from the CLOCK on every tick, not counted up — one rung per whole
+    # second held, which is the rule as it was asked for. Counting steps instead ("this
+    # rung owes 3 more frames") sounds equivalent and is not: a tick delayed by the GUI
+    # thread then pushes the whole ramp back, so a busy panel — the case the ramp exists
+    # for — crawled at 2/s for four seconds. Reading the clock means a stall costs the
+    # frames it swallowed and nothing more; the next tick is already at the rate the
+    # elapsed time calls for.
+    def _hold_step_begin(self, delta: int):
+        self._hold_dir = delta
+        self._hold_t0  = time.monotonic()
+        self.step_frame(delta)
+        self._hold_timer.setInterval(int(1000 / HOLD_STEP_RATES[0]))
+        self._hold_timer.start()
+
+    def _hold_step_end(self):
+        self._hold_timer.stop()
+        self._hold_dir = 0
+
+    def _hold_step_tick(self):
+        # The button may have been disabled under the cursor (folder closed, mode change),
+        # in which case `released` never comes — stop on the button's own state instead.
+        btn = self.btn_prev if self._hold_dir < 0 else self.btn_next
+        if not self._hold_dir or not btn.isDown() or not btn.isEnabled():
+            self._hold_step_end()
+            return
+        self.step_frame(self._hold_dir)
+        held = time.monotonic() - self._hold_t0
+        rate = HOLD_STEP_RATES[min(int(held), len(HOLD_STEP_RATES) - 1)]
+        interval = int(1000 / rate)
+        if interval != self._hold_timer.interval():
+            self._hold_timer.setInterval(interval)
+
     def step_frame(self, delta_idx):
         if self._is_playing: self.stop()
         # Per-cam slider mode: step the master camera, sync slaves
@@ -26523,8 +28138,9 @@ class Viewer(QWidget):
         self._style_pointing_select_btn(active)
 
     def _style_pointing_select_btn(self, on: bool):
-        self.btn_pointing_select.setText("🗑 Delete mode ON" if on
-                                         else "🗑 Delete mode")
+        # No "ON" suffix in the label: the button now shares its row with Undo
+        # delete, where 125 px is exactly the width the longer text needs, and the
+        # red-with-white-bold state already says the mode is armed.
         self.btn_pointing_select.setStyleSheet(
             "background-color: #c62828; color: white; font-weight: bold;"
             if on else "")

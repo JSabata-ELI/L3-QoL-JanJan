@@ -17,6 +17,7 @@ No Qt, no network:
     python testing/test_daypicker_sync.py
 """
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -49,6 +50,53 @@ def _first_difference(a: bytes, b: bytes) -> str:
     return "no line differs (line endings only)"
 
 
+def _deployed_layout():
+    """Rebuild what the share actually looks like, and load from it.
+
+    A deployed program is an exe with an _internal folder beside it — and that
+    _internal is the SHARED runtime library, so daypicker.py is not in it. The
+    loose copy the deploy drops next to the exe is. This lays that out in a
+    temporary folder, runs the loader's own search over it with the module code
+    lifted straight out of sp_t.py, and checks it comes back with the file.
+    """
+    import ast
+    import subprocess
+    import tempfile
+    import textwrap
+
+    src = (HERE / "sp_t.py").read_text(encoding="utf-8", errors="ignore")
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == "_import_daypicker"),
+              None)
+    if fn is None:
+        return False, "no _import_daypicker in sp_t.py"
+    body = ast.get_source_segment(src, fn)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "_internal").mkdir()          # the shared library — no daypicker
+        (root / "daypicker.py").write_bytes(COPY.read_bytes())
+        probe = root / "_internal" / "probe.py"
+        # What a frozen app sees: sys.executable is the exe in the program
+        # folder, sys._MEIPASS and __file__ are both inside _internal.
+        probe.write_text(
+            "import os, sys\n"
+            "sys.frozen = True\n"
+            "sys._MEIPASS = os.path.dirname(os.path.abspath(__file__))\n"
+            "sys.executable = os.path.join(\n"
+            "    os.path.dirname(sys._MEIPASS), 'CSS Logger.exe')\n"
+            + textwrap.dedent(body) + "\n"
+            "m = _import_daypicker()\n"
+            "print(os.path.abspath(m.__file__))\n",
+            encoding="utf-8")
+        r = subprocess.run([sys.executable, str(probe)],
+                           capture_output=True, text=True, cwd=str(root))
+    if r.returncode != 0:
+        return False, (r.stderr or "").strip().splitlines()[-1:] and \
+            (r.stderr or "").strip().splitlines()[-1] or "loader raised"
+    return True, r.stdout.strip()
+
+
 def main() -> int:
     print("test_daypicker_sync")
 
@@ -76,6 +124,29 @@ def main() -> int:
           "spec_from_file_location(\"daypicker\"" in sp_src
           and "\nimport daypicker" not in sp_src
           and "\nfrom daypicker import" not in sp_src)
+
+    # A built copy cannot rely on the file being next to sp_t.py. That folder is
+    # _internal, and the deploy REPLACES _internal with one shared runtime
+    # library (Dev Tools/cm_t.py, "Deploy Libraries") that carries no
+    # daypicker.py — which is exactly how the network copy lost it. Two things
+    # keep it alive: the module is compiled into the exe, and the loader knows
+    # more than one place to look.
+    cfg = json.loads((HERE / "build_config.json").read_text(encoding="utf-8"))
+    check("build_config.json compiles daypicker into the exe",
+          "daypicker" in cfg.get("hidden_imports", []),
+          f"hidden_imports = {cfg.get('hidden_imports')}")
+    check("the loader falls back to the compiled-in copy",
+          'import_module("daypicker")' in sp_src)
+    check("the loader looks beside the exe as well",
+          "_MEIPASS" in sp_src and "sys.executable" in sp_src)
+
+    # Same fault, same fix, in the other two programs that carry a copy.
+    for prog, mod in (("Image Tools", "is_t.py"), ("Image Tools", "if_t.py")):
+        src = (REPO / prog / mod).read_text(encoding="utf-8", errors="ignore")
+        check(f"{prog}/{mod} searches more than one folder",
+              "_MEIPASS" in src and 'import_module("daypicker")' in src)
+
+    check("the loader really finds a copy beside the exe", *_deployed_layout())
 
     if FAILURES:
         print("\nFAILED:")
