@@ -17,6 +17,8 @@ import ssl
 import orjson
 import requests
 import csv
+from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -150,9 +152,26 @@ CPVA_HTTP_TIMEOUT      = 10.0
 # The archiver only returns reliable data when the query window <= 1 h.
 CHUNK_SIZE_NS = int(3600 * 1e9)   # 1 hour in nanoseconds
 
+# That limit is really about how many samples come back, not the span. PumpON
+# changes a couple of times a day, and a single 30-day window was measured to
+# return exactly the same transitions as 720 consecutive hourly ones, so the
+# low-rate channels can be fetched in week-sized bites. Flow_GPM and Temp run at
+# ~5000 samples/h and must stay at CHUNK_SIZE_NS -- a 24 h window answers 500.
+SLOW_CHUNK_SIZE_NS = int(7 * 24 * 3600 * 1e9)   # 7 days
+
+# Measured ceiling: the archiver peaks near 160 req/s at 6-8 concurrent requests
+# and gets slower above that. This is a cap to stay under, not a target.
+MAX_PARALLEL_REQUESTS = 8
+
 
 _SESSION = requests.Session()
 _SESSION.verify = False
+# Default pool_maxsize is 10; anything less than the worker count makes requests
+# discard and re-open connections (a fresh TLS handshake) under load.
+_SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=MAX_PARALLEL_REQUESTS,
+    pool_maxsize=MAX_PARALLEL_REQUESTS,
+))
 
 
 # ---------------------------------------------------------------------------
@@ -257,13 +276,17 @@ def cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
 
 def _chunk_is_night(chunk_start_ns: int, chunk_end_ns: int) -> bool:
     """Return True if the entire chunk is within 22:00-06:00 Prague time (no data expected)."""
-    TZ = ZoneInfo("Europe/Prague")
     now_ns_val = int(datetime.now(timezone.utc).timestamp() * 1e9)
     # Never skip chunks that extend to current time or future
     if chunk_end_ns >= now_ns_val - 60 * 1_000_000_000:  # within 1 min of now
         return False
-    dt_start = datetime.fromtimestamp(chunk_start_ns / 1e9, tz=TZ)
-    dt_end   = datetime.fromtimestamp(chunk_end_ns   / 1e9, tz=TZ)
+    # A window can only lie wholly inside 22:00-06:00 if it is at most that long.
+    # Without this, comparing just the two end hours calls a whole week "night",
+    # because it starts and ends at midnight.
+    if chunk_end_ns - chunk_start_ns > 8 * 3600 * 1_000_000_000:
+        return False
+    dt_start = datetime.fromtimestamp(chunk_start_ns / 1e9, tz=TZ_PRAGUE)
+    dt_end   = datetime.fromtimestamp(chunk_end_ns   / 1e9, tz=TZ_PRAGUE)
     def is_night(h): return h >= 22 or h < 6
     return is_night(dt_start.hour) and is_night(dt_end.hour)
 
@@ -271,15 +294,16 @@ def _chunk_is_night(chunk_start_ns: int, chunk_end_ns: int) -> bool:
 def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
                                timeout: float = CPVA_HTTP_TIMEOUT,
                                log_fn=None,
-                               max_workers: int = 12) -> list[dict]:
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+                               max_workers: int = MAX_PARALLEL_REQUESTS,
+                               chunk_ns: int = CHUNK_SIZE_NS) -> list[dict]:
+    from concurrent.futures import as_completed
 
     chunks = []
     cs = start_ns
     i = 0
 
     while cs < end_ns:
-        ce = min(cs + CHUNK_SIZE_NS, end_ns)
+        ce = min(cs + chunk_ns, end_ns)
         if not _chunk_is_night(cs, ce):
             chunks.append((i, cs, ce))
         i += 1
@@ -288,8 +312,24 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
     if not chunks:
         return []
 
+    def fetch_one(cs: int, ce: int) -> list[dict]:
+        """One chunk, halved and retried if the archiver chokes on the window.
+
+        Guards the larger chunk_ns: a channel that turns out to be busier than
+        expected answers 500 rather than truncating, and splitting recovers it.
+        """
+        try:
+            return cpva_fetch_samples(channel, cs, ce, timeout)
+        except Exception:
+            if ce - cs <= CHUNK_SIZE_NS:
+                raise
+            mid = cs + (ce - cs) // 2
+            if log_fn:
+                log_fn(f"      {channel}: window too large, splitting")
+            return fetch_one(cs, mid) + fetch_one(mid, ce)
+
     if len(chunks) == 1:
-        return cpva_fetch_samples(channel, chunks[0][1], chunks[0][2], timeout)
+        return fetch_one(chunks[0][1], chunks[0][2])
 
     if log_fn:
         log_fn(f"      {channel}: {len(chunks)} chunks")
@@ -299,7 +339,7 @@ def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {
-            ex.submit(cpva_fetch_samples, channel, cs, ce, timeout): idx
+            ex.submit(fetch_one, cs, ce): idx
             for idx, cs, ce in chunks
         }
 
@@ -2631,23 +2671,27 @@ class CPVAExplorerApp:
         start_ns: int,
         end_ns: int,
         timeout: float = CPVA_HTTP_TIMEOUT,
+        max_workers: int = MAX_PARALLEL_REQUESTS,
     ):
         MINUTE_NS = 60 * 1_000_000_000
         CHECK_BEFORE_NS = 10 * MINUTE_NS
         DAY_TIMES = [(9, 0), (13, 30), (18, 0)]
 
-        def pump_is_on_at(ts_ns: int) -> bool:
-            state = 0.0
-            for pts, val in pump_samples:
-                if pts > ts_ns:
-                    break
-                state = val
-            return state == 1.0
+        # pump_samples is already sorted; binary-search it instead of walking it
+        # from the start on every one of the ~2000 lookups a long update makes.
+        pump_times = [pts for pts, _ in pump_samples]
 
-        result = []
+        def pump_is_on_at(ts_ns: int) -> bool:
+            # Step function: the last value at or before ts_ns.
+            i = bisect_right(pump_times, ts_ns)
+            return i > 0 and pump_samples[i - 1][1] == 1.0
 
         start_dt = datetime.fromtimestamp(start_ns / 1e9, tz=timezone.utc).astimezone(TZ_PRAGUE)
         end_dt = datetime.fromtimestamp(end_ns / 1e9, tz=timezone.utc).astimezone(TZ_PRAGUE)
+
+        # Decide which moments are worth a request before issuing any of them,
+        # so the whole day-walk costs nothing and the fetches can go out together.
+        wanted = []
 
         day = start_dt.date()
         end_day = end_dt.date()
@@ -2663,26 +2707,42 @@ class CPVAExplorerApp:
                 if not (pump_is_on_at(ts_ns - CHECK_BEFORE_NS) and pump_is_on_at(ts_ns)):
                     continue
 
-                raw = cpva_fetch_samples(
-                    pv_name,
-                    ts_ns,
-                    min(ts_ns + MINUTE_NS, end_ns),
-                    timeout
-                )
-
-                vals = []
-
-                for s in raw:
-                    v = cpva_decode_value(s)
-                    if isinstance(v, (int, float)):
-                        vals.append(float(v))
-
-                if vals:
-                    result.append((ts_ns, sum(vals) / len(vals)))
+                wanted.append(ts_ns)
 
             day += timedelta(days=1)
 
-        return result    
+        if not wanted:
+            return []
+
+        def fetch_average(ts_ns: int):
+            raw = cpva_fetch_samples(
+                pv_name,
+                ts_ns,
+                min(ts_ns + MINUTE_NS, end_ns),
+                timeout
+            )
+
+            vals = []
+
+            for s in raw:
+                v = cpva_decode_value(s)
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+
+            if not vals:
+                return None
+
+            return (ts_ns, sum(vals) / len(vals))
+
+        if len(wanted) == 1:
+            averaged = [fetch_average(wanted[0])]
+        else:
+            # map() keeps the input order, so the result stays sorted by time.
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(wanted))) as ex:
+                averaged = list(ex.map(fetch_average, wanted))
+
+        return [r for r in averaged if r is not None]
+
     
     def _update_archive_worker_impl(self, start_dt: datetime, end_dt: datetime):
         start_ns = int(start_dt.astimezone(timezone.utc).timestamp() * 1e9)
@@ -2708,7 +2768,8 @@ class CPVAExplorerApp:
                 start_ns - 24 * 3600 * 1_000_000_000,
                 end_ns,
                 timeout=timeout,
-                max_workers=8,
+                max_workers=MAX_PARALLEL_REQUESTS,
+                chunk_ns=SLOW_CHUNK_SIZE_NS,
                 log_fn=self._log,
             )
 

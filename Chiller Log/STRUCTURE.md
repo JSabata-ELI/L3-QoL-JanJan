@@ -1,6 +1,6 @@
 # Chiller Log — STRUCTURE
 
-> Verified against source: 2026-08-19 · `cpt.py` 3131 L
+> Verified against source: 2026-09-14 · `cpt.py` 3245 L
 
 Single-file tkinter app. Long-term (multi-year) trend log of the six chillers,
 built from the CPVA archiver and kept in a plain CSV next to the program.
@@ -36,8 +36,10 @@ would appear under **Scripts** once an exe exists.
 |--------|-----------------|
 | `CPVA_BASE_URL` | `https://10.78.0.57:8443/api/1.0/cpva`, `+ /samples`. |
 | `CPVA_HTTP_TIMEOUT` | 10 s, overridable from the config file. |
-| `CHUNK_SIZE_NS` | 1 hour. **The archiver only returns reliable data for windows ≤ 1 h**, so every request is chunked to that. |
-| `_SESSION` | one `requests.Session` with `verify = False`; `_SSL_CONTEXT` is the `urllib` equivalent, left over from before the session existed. |
+| `CHUNK_SIZE_NS` | 1 hour. The default chunk, and the only safe one for the fast channels. |
+| `SLOW_CHUNK_SIZE_NS` | 7 days, for low-rate channels — see **Chunk size** below. |
+| `MAX_PARALLEL_REQUESTS` | 8. Measured ceiling: the archiver peaks near 160 req/s at 6–8 concurrent requests and gets *slower* above that, so raising this does not help. |
+| `_SESSION` | one `requests.Session` with `verify = False` and an `HTTPAdapter` sized to `MAX_PARALLEL_REQUESTS` — the default `pool_maxsize` of 10 made loaded requests drop and re-handshake connections. `_SSL_CONTEXT` is the `urllib` equivalent, left over from before the session existed. |
 | `ARCHIVE_COLUMNS` | `datetime, source, ch1_flow…ch6_flow, ch1_temp…ch6_temp`. |
 | `ALLOWED_PVS` | Generated: `L3-UTIL-CHL03-00n:{Flow_GPM,Temp,PumpON}` for n = 1…6. |
 | `GRAPH_GROUPS` | `Flow_GPM` and `Temp`, six PVs each. |
@@ -71,8 +73,14 @@ For every day in the requested window, for each of the three times:
    would be a meaningless spike in a multi-year trend.
 3. Fetch that one minute of samples, keep the numeric ones, store the mean.
 
-`pump_is_on_at` walks the sorted `PumpON` sample list and takes the last value at
-or before the timestamp — a step function, not an interpolation.
+`pump_is_on_at` binary-searches (`bisect_right`) the sorted `PumpON` sample list
+and takes the last value at or before the timestamp — a step function, not an
+interpolation.
+
+The day-walk runs first and only collects the timestamps that pass the gate; the
+one-minute fetches for those are then issued together through a
+`ThreadPoolExecutor` (`ex.map`, so the result stays in time order). They used to
+go out one at a time, which was ~83 ms of pure waiting each.
 
 Consequence for the docs: **gaps in the log mean the pump was off (or had just come
 on)**, not that the fetch failed. The graph is drawn `steps-post` for the same
@@ -86,10 +94,29 @@ reason.
 |----------|-------------|
 | `_http_get_json(url, timeout)` | `requests` + `orjson`. |
 | `cpva_fetch_samples(channel, start_ns, end_ns, timeout)` | One window, one channel. |
-| `_chunk_is_night(start, end)` | True when the whole chunk lies in 22:00–06:00 Prague. Such chunks are **never requested** — nothing is recorded then. Guard: a chunk reaching within 60 s of now is never treated as night, so a late-evening update still catches up. |
-| `cpva_fetch_samples_chunked(...)` | Split into 1 h chunks, drop the night ones, fetch up to `max_workers` (12 default, 8 for `PumpON`) in a `ThreadPoolExecutor`, reassemble **in chunk order** from `results_map`. |
+| `_chunk_is_night(start, end)` | True when the whole chunk lies in 22:00–06:00 Prague. Such chunks are **never requested** — nothing is recorded then. Two guards: a chunk reaching within 60 s of now is never treated as night, so a late-evening update still catches up; and a window longer than 8 h is never night, because the test compares only the two end hours and a midnight-to-midnight week would otherwise look like night and be skipped entirely. |
+| `cpva_fetch_samples_chunked(...)` | Split into `chunk_ns` chunks (default `CHUNK_SIZE_NS`), drop the night ones, fetch up to `max_workers` in a `ThreadPoolExecutor`, reassemble **in chunk order** from `results_map`. A chunk that raises is halved and retried down to `CHUNK_SIZE_NS`, so an unexpectedly busy channel degrades instead of failing. |
 | `cpva_decode_value(sample)` | Number, string, single-element list → scalar; a short all-ASCII int list is decoded as text; anything else returned as-is. |
 | `cpva_fetch_channels()` | Returns `sorted(ALLOWED_PVS)` — no discovery call, the channel set is fixed. |
+
+### Chunk size
+
+The ≤ 1 h rule is about **how many samples come back, not the span**. Measured
+against the archiver:
+
+| Channel | Rate | Result |
+|---------|------|--------|
+| `Flow_GPM`, `Temp` | ~5000 samples/h | 1 h → 4990 samples ✓ · 6 h → 29 812 ✓ · 24 h → **HTTP 500** |
+| `PumpON` | ~1.5 transitions/h | a single 30-day window returns **exactly** the same transitions as 720 consecutive hourly ones |
+
+So `PumpON` is fetched at `SLOW_CHUNK_SIZE_NS`, and the fast channels stay at
+`CHUNK_SIZE_NS`. Hourly `PumpON` chunks were the single largest cost in an
+update: they re-fetched the same boundary values ~16× a day per chiller (1486
+samples over 30 days, of which **46** were distinct).
+
+Do not reach for the `count` query parameter to shrink the fast channels. It
+works — but it decimates the samples the one-minute mean is computed from, so
+the numbers written to the log would no longer match the ones already there.
 
 ---
 
