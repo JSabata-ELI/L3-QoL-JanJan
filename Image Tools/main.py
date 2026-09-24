@@ -61,57 +61,34 @@ def _icon_file() -> Path | None:
 
 
 def _icon_app_id(prefix, ico_path):
-    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
+    """A taskbar identity that is new on every launch.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it: an id that was once seen without a usable icon keeps drawing the
-    generic placeholder for good, whatever icon the window later carries, and
-    clearing the shell icon cache would have to be repeated on every PC.
+    it, so every *stable* id tried here eventually picked up a bad cache entry
+    and then drew the blank window placeholder for good: a fixed string, a hash
+    of the icon, and a hash tagged with the build's file name each broke within
+    days. Setting no id at all was no better -- Windows then keys the button on
+    the exe path and caches the picture there instead (Diagnostic v1.3.1,
+    measured 2026-09-17: the window icon, the exe's own icon resource and the
+    shell's own file icon all correct, the taskbar button blank).
 
-    Hashing the icon's own bytes into the id was the first fix, but a
-    content-only id can be poisoned just as well, and then it never recovers
-    because it only changes when the picture is redrawn. Measured again on
-    2026-09-03: Calibrations, CSS Logger, Git Work and Image Tools all drew
-    the blank window placeholder on the taskbar while their title bars carried
-    the right icon, and Diagnostic -- the only one whose id also carried its
-    file name -- drew its icon. So the running build's own file name, which
-    carries the version, goes into the hash too: every rebuild runs under an
-    id Windows has never seen, so it cannot be serving a stale picture for it,
-    on this PC or any other.
+    An id Windows has never seen has no cache entry, so the button falls back
+    to the window icon, which every program here sets itself -- measured on a
+    fresh id on 2026-09-04 and again on 2026-09-17. A random suffix per launch
+    makes every run a first-time id, which is why this is the one form that
+    cannot go stale. Nothing here needs a stable identity: no program registers
+    a shortcut, pins itself or sends Windows toasts. The one cost is pinning a
+    *running* taskbar button -- that pin would carry this run's id and would
+    not start the program again, so pin the exe instead.
 
-    Returns None when the icon cannot be read; the caller then sets no id at
-    all rather than burning an id on a run that has no picture to give it.
-    The same helper sits in every program here.
+    Returns None when there is no icon at all; the caller then sets no id and
+    the button keeps taking the exe's own picture.
     """
-    # A frozen build gets no taskbar identity at all, deliberately.
-    # Windows caches the taskbar picture per AppUserModelID and never re-reads
-    # it, so one bad cache entry breaks that build for good; tagging the id
-    # with the build's file name only postponed it (Diagnostic v1.1.3's id
-    # drew the blank placeholder within a day of the build). Measured
-    # 2026-09-04 with three otherwise identical windows: the app's own id ->
-    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
-    # from the exe's own resource, which the builder always embeds (verified
-    # on a purpose-built PyInstaller exe). With no id Windows keys the button
-    # on the exe itself, so there is no per-id cache left to go stale. An id
-    # is still worth having when running from source, where the process is
-    # python.exe and would otherwise wear the Python icon.
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
+    import os.path
+    if not ico_path or not os.path.exists(str(ico_path)):
         return None
-    if not ico_path:
-        return None
-    import hashlib
-    import os
-    import sys
-    try:
-        with open(ico_path, "rb") as fh:
-            data = fh.read()
-    except OSError:
-        return None
-    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
-                             else (sys.argv[0] or __file__))
-    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
-    return f"{prefix}.{tag.hexdigest()[:12]}"
+    import uuid
+    return f"{prefix}.{uuid.uuid4().hex[:12]}"
 
 
 # Note: do NOT add a WM_SETICON / SetClassLongPtr "force taskbar icon" helper
@@ -279,6 +256,17 @@ def build_main_window(folder_arg: Path | None = None) -> QMainWindow:
     shot_finder._btn_open_slider.setVisible(True)
     shot_finder._tab_widget = tabs
 
+    # ...and the other way round: the Slider and the Shot Finder hand a MOMENT to
+    # the Image Finder ("Send to Image Finder"), which is the tab that puts one
+    # instant side by side for every camera and every day. Nothing is copied — the
+    # Finder looks the frames up itself (finder.open_moments).
+    finder_idx = tabs.indexOf(finder)
+    viewer._finder_ref      = finder
+    viewer._finder_tab_idx  = finder_idx
+    viewer._tab_widget      = tabs
+    shot_finder._finder_ref     = finder
+    shot_finder._finder_tab_idx = finder_idx
+
     # Wire up Workshop — each tab gets a reference so it can send images
     workshop_idx = tabs.indexOf(workshop)
     finder._workshop_ref      = workshop
@@ -390,6 +378,15 @@ def main():
         QWidget      { background: #f3f3f3; color: #111; }
         QLabel       { background: transparent; }
         QPushButton  { padding: 5px 8px; }
+        /* `QWidget { color: #111 }` above applies to a DISABLED widget too — a
+           stylesheet overrides the palette, disabled state included — so a greyed-out
+           button came out in full black text with only a paler border, i.e. it looked
+           exactly like a live one and clicking it simply did nothing. Measured on the
+           Image Slider's Remove ref button: 26/255 of difference, all of it in the
+           border. Same rule, same reason, as _CHECKBOX_STYLE in is_t.py. A button that
+           paints itself (Stop All, Delete mode) sets its own stylesheet and is
+           unaffected. */
+        QPushButton:disabled { color: #9a9a9a; border-color: #d0d0d0; }
         QComboBox    { padding: 3px 6px; }
         QProgressBar { background: #fff; }
         QTabWidget::pane { border: 1px solid #ccc; }
@@ -404,6 +401,39 @@ def main():
         QToolTip {
             background: #ffffcc; color: #111;
             border: 1px solid #aaa; padding: 4px;
+        }
+        /* Scroll bars, app wide. The plain ones are a pale grey sliver on a pale
+           grey panel: nothing to see and little to grab. This is the Workshop bar
+           — a track that is visibly a track, a handle dark enough to read against
+           it, and no end arrows, which are two more tiny targets nobody uses.
+           Anything that sets its own bar (the tab panels do) overrides this. */
+        QScrollBar:vertical {
+            background: #d8dce2; width: 16px; margin: 0px; border: none;
+        }
+        QScrollBar::handle:vertical {
+            background: #6c7580; min-height: 28px; border-radius: 4px; margin: 2px;
+        }
+        QScrollBar::handle:vertical:hover   { background: #4a5566; }
+        QScrollBar::handle:vertical:pressed { background: #2f3a49; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px; background: none; border: none;
+        }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            background: none;
+        }
+        QScrollBar:horizontal {
+            background: #d8dce2; height: 16px; margin: 0px; border: none;
+        }
+        QScrollBar::handle:horizontal {
+            background: #6c7580; min-width: 28px; border-radius: 4px; margin: 2px;
+        }
+        QScrollBar::handle:horizontal:hover   { background: #4a5566; }
+        QScrollBar::handle:horizontal:pressed { background: #2f3a49; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+            width: 0px; background: none; border: none;
+        }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+            background: none;
         }
     """)
 

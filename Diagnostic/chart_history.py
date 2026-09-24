@@ -20,7 +20,7 @@ Three ideas do the work:
   request on ignorance is what froze the laptop on 2026-09-02.
 * **Condense while reading.** Each answer is turned into per-bin minimum,
   maximum, mean and count straight away, in the thread that received it, and
-  then dropped. About 900 bins - one per pixel of the picture - so the memory
+  then dropped. About 900 points along the curve, whatever the window - so the memory
   does not depend on how long the window is. The minimum and maximum are what
   keep a two-second spike visible in a six-month plot.
 * **Say what was not read.** A stretch that could not be fetched is not the
@@ -77,7 +77,9 @@ MEM_OWN_CEILING_BYTES = 4 * 1024 * 1024 * 1024
 MEM_PC_CEILING_PCT = 92.0
 MEM_CHECK_INTERVAL_S = 0.5
 
-# One bin per pixel of the 8 in x 110 dpi picture.
+# Points along the curve. Kept at 900 when the picture went to 8 in x 600 dpi
+# (4800 px) on 16 Sep 2026: one point per pixel would draw a one-off excursion
+# as a hairline, while 900 wider bins make it a ~5 px step that can be seen.
 DEFAULT_BINS = 900
 
 # Requests one /plot may spend before it starts sampling instead of reading

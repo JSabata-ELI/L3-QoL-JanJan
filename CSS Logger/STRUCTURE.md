@@ -638,6 +638,45 @@ Constants: `CHUNK_SIZE_NS` (1 h — still the unit for timeouts and the live
 tick), `MIN_CHUNK_NS` (1 min floor), `MAX_CHUNK_NS` (30 d, the widest single
 request), `RAW_START_CHUNK_NS` (4 h, raw mode's first try), `MIN_CHUNK_COUNT`.
 
+### The server's thinned series is not taken on trust
+
+`count=` ("Avg to" above zero) asks the archiver for its own decimated
+samples. Measured against the live archiver on 2026-09-21 over 10.-12.9.2026,
+that answer is wrong three different ways, and every one of them is silent —
+this is what a user sees as "a signal holding one value across the whole
+period":
+
+* **a level with nothing behind it.** `HAPLS-SPEC_CENT_PD1M1_LT7_DIAG1:SpectralCentroid`
+  holds **no** archived sample in that period (its neighbours are 11.8. and
+  19.9.), and the archiver answered with **4321 identical interpolated
+  points**, drawn as a solid three-day line;
+* **a level that stops early.** `L3-PCM3Y-MTR03-73:RawPos` answered with 630
+  identical points ending **61.5 h before the period did**, hiding the thirteen
+  positions the motor went through at 10:30. The same request asked raw returns
+  them;
+* **minute-means instead of steps.** `L3-PFWP6-MTR03-1:RawPos` — the waveplate,
+  and the master signal of the ramping work — has 1049 distinct archived
+  positions there and came back as 90 averages, topping out at 999 096 instead
+  of 1 000 000.
+
+| Piece | What it does |
+|-------|--------------|
+| `_probe_density` / `_channels_to_read_raw` | **before anything else is asked for**, one raw request per channel over the newest hour (the middle hour decides if that one is empty). Under `VERIFY_DENSE_PER_HOUR` the channel is read exactly as archived for the whole period — thinning a motor position is not a saving, it is damage, and a sparse channel is cheap to read in full. Skipped for periods under 4 h |
+| the sparse channel's chunk size | `MAX_CHUNK_NS`, not `RAW_START_CHUNK_NS`: it is sparse, so ask for the lot. Raw mode's cautious 4 h would be 2190 requests over a year for a channel holding a dozen samples |
+| `_decimated_is_suspect` | after the merge, a thinned series is rejected when it **never changes** (no bin reports `minimum != maximum`, no two values differ) or when it does not reach within `VERIFY_EDGE_FRACTION` of either end |
+| `_recheck_decimated` | probes those channels' density and re-reads the sparse ones raw. A dense channel whose series really is flat is a stuck meter — left alone, and said in the Log |
+| `VERIFY_MAX_SAMPLES` | both directions have the same cap: a re-read bigger than this is dropped, and a channel judged sparse from two quiet probe hours that turns out to hold more than this is thinned after all (one extra request). Holding a million sample dicts is worse than a coarse trace |
+| `FetchReport.rechecked` | the channels whose thinned series was thrown away |
+| `verify=False` | switches the whole thing off; used only inside the re-reads, so they cannot recurse |
+
+A separate bug in the same family, fixed with it: the archiver brackets a range
+on **both** sides, so `_last_before_in_range` picking `max(time)` of the reply
+returned the sample from **after** the window — the 10.9. window was seeded
+with a reading stamped 19.9. and held flat across the three days. Only samples
+older than the range end may answer now.
+
+Pinned by `testing/test_thinned_series_is_checked.py`.
+
 Measured against a fake archiver (`testing/test_long_window_fetch.py`): a year
 over 2 signals costs ~250 requests when the archiver refuses anything above 7
 days, and 4 when it serves the lot.

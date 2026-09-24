@@ -8,7 +8,7 @@ the BEHAVIOUR the operator was promised, not the implementation:
   2. plain click = one day · Ctrl+click = add one (weekends included) ·
      Ctrl+Shift+click = a stretch, XOR-ed in, weekends skipped unless ticked
   3. a second day switches the per-day time table on by itself
-  4. a day just added gets 08:00–19:00, or 08:00–now for today
+  4. a day just added gets 07:00–21:00, or 07:00–now for today
   5. always OK and Cancel — nothing takes effect until OK
   6. the house look: Monday first, red weekends, grey header band
   7. Live mode is the Image Slider's alone
@@ -91,21 +91,21 @@ def test_click_rules():
 def test_default_windows():
     print("\nrule 4 — the window a day gets when it is added")
     check("a past day is the whole lab day",
-          dp.default_window_for(PAST_A, NOW) == (8, 0, 19, 0),
+          dp.default_window_for(PAST_A, NOW) == (7, 0, 21, 0),
           str(dp.default_window_for(PAST_A, NOW)))
     check("today stops at the current hour",
-          dp.default_window_for(NOW.date(), NOW) == (8, 0, 15, 0),
+          dp.default_window_for(NOW.date(), NOW) == (7, 0, 15, 0),
           str(dp.default_window_for(NOW.date(), NOW)))
-    early = datetime(2026, 8, 25, 8, 20, tzinfo=dp.TZ_PRAGUE)
+    early = datetime(2026, 8, 25, 7, 20, tzinfo=dp.TZ_PRAGUE)
     check("and never opens on an empty window first thing in the morning",
-          dp.default_window_for(early.date(), early) == (8, 0, 9, 0),
+          dp.default_window_for(early.date(), early) == (7, 0, 8, 0),
           str(dp.default_window_for(early.date(), early)))
 
 
 def test_bounds():
     print("\nthe window in nanoseconds")
-    s, e = dp.seg_bounds_ns(dp.PickSeg(PAST_A, 8, 0, 19, 0))
-    check("08:00–19:00 is eleven hours", (e - s) == 11 * 3600 * 10**9)
+    s, e = dp.seg_bounds_ns(dp.PickSeg(PAST_A, 7, 0, 21, 0))
+    check("07:00–21:00 is fourteen hours", (e - s) == 14 * 3600 * 10**9)
     s, e = dp.seg_bounds_ns(dp.PickSeg(PAST_A, 0, 0, 23, 59))
     check("a 'to' of 23:59 means midnight, so a whole day is 24 h",
           (e - s) == 24 * 3600 * 10**9)
@@ -201,6 +201,35 @@ def test_live(app):
           not chosen.cb_now.isChecked())
 
 
+def test_now_button(app):
+    print("\nthe Now button — today and the hour it is")
+    d = dp.DayTimePicker(init_date=PAST_A, allow_live=True)
+    d.show(); app.processEvents()
+    d._set_days([PAST_A, PAST_B]); app.processEvents()
+    d.time_from.setTime(QTime(8, 0)); app.processEvents()
+    d.time_to.setTime(QTime(12, 0)); app.processEvents()
+
+    d._go_to_now(); app.processEvents()
+    today = datetime.now(dp.TZ_PRAGUE).date()
+    now_h = datetime.now(dp.TZ_PRAGUE).hour
+    check("it drops the other days and leaves today alone in the list",
+          d.selected_dates() == [today], str(d.selected_dates()))
+    check("the calendar cursor is on today",
+          dp.qdate_to_date(d.cal.selectedDate()) == today,
+          str(d.cal.selectedDate().toString("yyyy-MM-dd")))
+    check("the window is the current hour",
+          d.selected_times() == dp.last_hour_window(),
+          f"{d.selected_times()} vs {dp.last_hour_window()}")
+    check("and the From field on screen says so", d.time_from.time().hour() == now_h,
+          d.time_from.time().toString("HH:mm"))
+    check("Live mode is NOT switched on by it", not d.cb_now.isChecked())
+    # The window came from the button, not from typing, so a day added afterwards
+    # goes back to rule 4 instead of trailing this hour.
+    d._set_days([today, PAST_A]); app.processEvents()
+    check("a day added afterwards still gets 07:00–21:00",
+          d._per_day[PAST_A] == (7, 0, 21, 0), str(d._per_day[PAST_A]))
+
+
 def test_look(app):
     print("\nrule 6 — the house look, against the app's DARK stylesheet")
     app.setStyleSheet("QWidget { background: #2b2b2b; color: #ddd; }")
@@ -236,6 +265,7 @@ def main() -> int:
     test_bounds()
     test_dialog(app)
     test_live(app)
+    test_now_button(app)
     test_look(app)
     print()
     if FAILURES:

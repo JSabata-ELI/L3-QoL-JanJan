@@ -6,178 +6,165 @@ Bugs / suggestions: jan.moucka@eli-laser.eu
 Detailed version: ReadMe_Announcer_Full.txt  ("Details" button)
 -----------------------------------------------------------------
 
-WHAT IT WATCHES
+WHAT IT DOES
 
-  You give it a list of conditions — things that have to stay true.
-  While it is watching, it checks all of them twice a second, and the
-  moment one of them stops being true it raises the alarm: a flashing
-  image or colour, a sound, and the sentence you wrote for that
-  condition.
+  You give it a list of things that have to stay true. It checks all of
+  them twice a second, and the moment one of them stops being true it
+  raises the alarm: a flashing picture or colour, a sound, and the
+  sentence you wrote for that one thing.
 
-  There are three kinds, one per tab:
+  There are two kinds of thing to watch:
 
-    Screen areas  a rectangle of a screen still looks the way it did
-                  when you took its reference picture. Good for a
-                  status box, a warning lamp, a number, a camera
-                  window — anything drawn on a screen.
-    Values        a machine value stays under its limit. Two limits:
-                  the first only shows a warning badge, the second
-                  raises the alarm. A screen area can be attached to
-                  a value, and then both have to hold: the value
-                  under its limit AND the picture still matching.
-    Halls         you say where you are shooting, and the program
-                  tells you the moment the machine disagrees.
+    A value        an archived number stays inside its limits — a
+                   pressure, a voltage, how far a chiller is from its
+                   setpoint, an energy.
+    A screen area  a rectangle of a screen still looks the way it did
+                   when you took its reference picture. Good for a
+                   status box, a warning lamp, a number, a camera
+                   window — anything drawn on a screen.
 
-  It also shows badges for eight machine values that are out of
-  range — the helium pressure, the Alpha voltage, and how far each of
-  the six chillers is from its setpoint. Nothing to set up for those,
-  but they are only read while it is watching.
+  Each one carries a switch that says what happens when it goes wrong:
+
+    shows only         the row goes red and a badge appears. Nothing
+                       flashes, nothing beeps.
+    raises the alarm   that, and the flashing window and the sound.
 
 
-HOW THE SCREEN AREA CHECK WORKS
+PRESETS — SETS OF ALARMS
 
-  It keeps the reference picture and takes a new one twice a second.
-  If the average difference between them is bigger than the number
-  you set, that counts as a change.
+  A preset is a named set of alarms. Pick one in the drop-down at the
+  top of the window and it is the only set you see and the only set
+  that is watched, so a night shift and a commissioning run can each
+  have their own list and you switch between them with one click.
+  "All alarms" shows everything; "Unassigned" is everything you have
+  not put in a set.
 
-  So it does not understand what it is looking at. It only knows the
-  picture is no longer the same one. That is what makes it work on
-  anything.
+  Make and rename sets with "Manage presets". Put alarms in a set by
+  ticking Presets in the alarm's own editor, or by picking the rows
+  and RIGHT-CLICKING them — the menu says how many it is about, for
+  instance "Assign these 3 to a preset". Deleting a set never deletes
+  its alarms — they simply become Unassigned.
 
-
-SETTING UP A CONDITION
-
-  Screen area:
-  1. Press "Add screen area" and give it a name and the sentence you
-     want to see when it fires.
-  2. Pick the monitor and press "Draw area". The screen dims; drag
-     out the rectangle and let go. Esc cancels. The reference picture
-     is taken straight away and shown underneath.
-  3. Save. Tick it in the On column.
-
-  Value:
-  1. Press "Add value". The back-reflection energy is filled in for
-     you; any other PV name can be typed instead.
-  2. "Read now" shows what that value has been doing over the last
-     minute, so you can pick the two limits from a real number
-     instead of guessing.
-  3. Fill in "Warn over" and "Trip over" and save. Leave a box empty
-     to switch that level off.
-  4. Optional: tick "Also require a screen area" and draw one. The
-     condition then needs both halves — the value under its limit and
-     the picture still matching. Either one going wrong fires the
-     alarm, and the message says which of the two it was.
-
-  Hall:
-  1. Press "Add hall check" on the Halls tab.
-  2. "Shooting into" is where the beam is supposed to go, and "PSS
-     state" is whether the shot is meant to stay inside or go into the
-     experiment. Leave either one on "don't check".
-  3. "Switchyard may move for" is how long the switchyard is allowed
-     to be on its way before that counts as wrong.
-  4. "Read now", at the top of the tab, says what the machine is doing
-     this minute, so you can see what you are setting against.
-
-  The arrow button under the list re-takes the reference picture of
-  the selected condition — use it when what you are watching has
-  changed for a good reason and the new state should count as normal.
-
-  A value or hall condition needs no rectangle at all: with only those
-  in the list, Start still works.
+  Each preset also keeps its OWN place for the circle and for the
+  alarm picture, on the Alarm tab under "Where it appears": one set
+  can have them over the left screen and another over the right. A
+  preset you have not placed yet follows the last place you used. The
+  button "Use these places for every preset that has none" hands the
+  current places to all the sets still unplaced, and leaves the ones
+  you placed by hand alone.
 
 
-THE OLD SINGLE-RECTANGLE WATCH
+THE FOUR TABS
 
-  "Set reference" on the Screen areas tab still draws one quick
-  rectangle without giving it a name, and "Preview region" shows what
-  is inside it. It is watched alongside the conditions. Use it for a
-  one-off; use a condition for anything you want to keep.
+  Watch    Everything being watched, one row each, with what it is
+           reading right now and whether it is holding — in three
+           blocks: what is in range, what is not, and what is not
+           being watched at all. The green or red bar at the top names
+           the worst thing outright. The message log is underneath.
 
+  Values   The numbers. Click a limit and type — that is all there is
+           to changing a limit. Add value lets you search the
+           archiver's own list of channels by a few words from the
+           name, so you do not have to know it by heart.
 
-THE CIRCLE IS THE WHOLE STATE
+           Remove takes every row that is picked off the list. Pick as
+           many as you like — Ctrl-click or Shift-click — and it names
+           them all before it removes anything.
 
-  Grey     nothing to watch yet
-  Orange   ready, not watching
-  Green    watching
-  Red      something fired, the alarm is up
+           RIGHT-CLICK A ROW for the same things plus "Assign to a
+           preset". The menu says how many rows it is about, for
+           instance "Remove these 3".
 
+  Areas    The rectangles. Add area dims the screens; drag out the
+           rectangle and let go. The picture on the right shows the
+           area as it is now next to its reference, each with a black
+           edge round it so you can see where the rectangle ends, and
+           the live difference number underneath.
 
-WHEN THE ALARM GOES OFF
+           "Take the picture again" photographs the same rectangle
+           once more and keeps that as normal. It says the time it
+           did it, because a new picture of an unchanged screen looks
+           exactly like the old one.
 
-  The alarm window flashes, either its whole background in the
-  chosen colour or just the chosen image, and a sound plays.
-  Watching stops by itself, so it does not keep re-alarming.
+           Right-click a row here too, for the same menu.
 
-  The sentence you wrote for that condition appears as a red badge on
-  the small overlay and in the message log, so it is still readable
-  after the flashing has been dismissed.
-
-  Click the flashing area, or press Esc, to dismiss it and come back
-  to the control window.
-
-  A value that cannot be read never fires the alarm — the reason goes
-  into the message log instead. A condition that cannot fire at all
-  (a screen area with no reference, a value with no trip limit, a hall
-  check with nothing chosen) says so in the log when you press Start.
-
-
-WHERE THE BEAM GOES
-
-  Two machine values say it:
-
-    Beam fate    switchyard moving, E2, E3, E4, E5 ELI-LUIS or
-                 E5 ELI-MAIA
-    PSS state    shooting fully internally, or into the experiment
-
-  The line at the top of the Halls tab shows both, with the time they
-  last changed. A hall check compares them against what you set, and
-  fires the moment they differ.
-
-  While the switchyard is on its way, the badge is orange, not an
-  alarm — that is a passing state. It only becomes an alarm if the
-  switchyard is still moving after the number of seconds you set.
-
-  IMPORTANT: the beam fate is not being archived yet, so today it
-  reads "cannot be read" and a hall check set on it can never fire.
-  It says so out loud rather than quietly reporting that everything is
-  fine. The PSS state half works now.
+  Alarm    What the alarm looks like, what it sounds like, which
+           speaker it comes out of, and where on the screen it
+           appears. The sound starts switched OFF — tick it on here.
+           "Place the alarm window" lets you park the flash exactly
+           over something that is already on a monitor, so that thing
+           is what appears to blink. The Test buttons are there to be
+           used — an alarm nobody has ever seen or heard is an alarm
+           nobody knows is broken.
 
 
-THE MACHINE VALUE BADGES
+THE FOURTEEN VALUES IT STARTS WITH
 
-  They are read only while the screen watch is running, and only
-  then. Nothing is shown while a value is in range. When one goes
-  out, a badge appears with the value and an arrow for the direction.
+  Helium volume, the Alpha seeder voltage, and each of the six
+  chillers twice: once for how far it is from its setpoint, once for
+  whether the temperature itself is right. They are set to "shows
+  only", which is what they have always done.
 
-  Orange   past the first limit
-  Red      past the second limit
-  Purple   a chiller's actual temperature is outside the range it is
-           allowed to run in at all, whatever its setpoint says.
-           Purple beats orange and red and shows the real
-           temperature, because a chiller can sit exactly on its
-           setpoint and still be at the wrong temperature.
-
-  The limits are edited in Settings, under PV Limits, and save
-  themselves. The purple range is fixed in the program.
+  They are ordinary rows. Change them, switch them off, delete them.
+  "Restore the standard values" puts back any that are missing.
 
 
-THINGS THAT SAVE YOU WORK
+THE CIRCLE, AND WHAT IT MEANS
 
-  - The conditions, their reference pictures and their limits are all
-    kept in the settings file next to the program, so they are there
-    again next time.
-  - Region presets: save the quick rectangle under a name and load it
-    again instead of drawing it.
-  - Window positions are remembered, either globally or per preset,
-    and they are recorded by dragging the window where you want it —
-    there are no coordinates to type. A window comes back exactly
-    where it was left, and every window the program opens is kept
-    fully on a screen: if a remembered spot belongs to a monitor that
-    is not connected any more, or would leave part of the window over
-    an edge, it is moved just enough to be completely visible.
-  - While watching, the control panel turns into a small
-    see-through overlay: only the circle and the badges stay
-    visible, and clicks pass through the rest of it to whatever is
-    underneath.
+  grey     nothing is switched on
+  orange   ready, but not watching
+  green    watching
+  red      something fired
 
------------------------------------------------------------------
+  While it is watching, the window disappears and only the circle is
+  left, floating on top of everything. You can click straight through
+  the space around it, so it does not get in the way. Click the circle
+  to stop watching and bring the window back; drag it to move it.
+
+  The readings keep coming whether it is watching or not. Watching
+  only decides whether something wrong actually raises the alarm.
+
+  A RED EXCLAMATION MARK next to the circle means the readings have
+  not been arriving for over five minutes — the archiver is not
+  answering, or the channel is dead. Nothing else is written next to
+  the circle about it; the message log on the Watch tab says which
+  channel it is and what the archiver said.
+
+
+WHEN SOMETHING FIRES
+
+  The picture or colour flashes where you put it, the sound plays, and
+  the sentence you wrote appears next to the circle. Watching STOPS, so
+  it cannot go off again every half second.
+
+  Click the flash, or press Esc, to put it away. Then press Reset and
+  Start watching again. If the thing is still wrong it fires straight
+  away — that is the honest answer, not a bug.
+
+
+TWO THINGS WORTH KNOWING
+
+  A screen area does not understand what it is looking at. It only
+  knows the picture is no longer the same one. So draw the rectangle
+  TIGHT around the thing that matters: a small change inside a big
+  rectangle averages away to almost nothing.
+
+  A value that could not be read is never shown as fine. It goes grey
+  and says why — "nothing archived in the window" is a different thing
+  from "the archiver could not be reached", and the log says which.
+
+
+IF IT DISAPPEARS
+
+  It now writes down what happened to it, every time:
+
+    C:\Users\<you>\AppData\Local\Announcer\announcer_crash.log
+
+  Send that file with the report. Before, a crash left nothing behind
+  at all, so there was nothing to look at afterwards.
+
+  One thing that looks like a crash but is not: while you are drawing
+  an area the screens go dark and the window is out of the way. If the
+  keyboard has gone somewhere else, Esc may not reach it — a single
+  click anywhere cancels, and after two minutes it gives up on its
+  own and brings the window back.

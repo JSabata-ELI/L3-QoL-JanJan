@@ -73,6 +73,11 @@ class _Portal:
         self.asked += 1
         return self.alive[min(self.asked - 1, len(self.alive) - 1)]
 
+    def state(self, line, base="", timeout=0.0):
+        """The same verdict, asked the way the walk asks it now — of the portal
+        from here, with the cookie line, rather than from inside the page."""
+        return self.verdict(0, base)
+
     def navigate(self, port, url):
         self.went.append(url)
         return ""
@@ -90,9 +95,16 @@ def walk(monkeypatch):
     monkeypatch.setattr(edge_cdp, "bring_to_front", lambda port: "")
     monkeypatch.setattr(edge_cdp, "browser_is_up", lambda port: True)
 
+    monkeypatch.setattr(edge_cdp, "CHECK_EVERY_S", 0.0)
+
     def run(portal: _Portal, timeout_s: float = 2.0):
         monkeypatch.setattr(edge_cdp, "all_cookies", portal.cookies)
         monkeypatch.setattr(edge_cdp, "session_alive", portal.verdict)
+        # The portal is asked from HERE now, with the cookie line, so this is
+        # the door the walk goes through. `session_alive` is stubbed too: it is
+        # the fallback for a window that has a route this program has not, and
+        # nothing in these tests may reach the real portal either way.
+        monkeypatch.setattr(edge_cdp, "cookie_state", portal.state)
         monkeypatch.setattr(edge_cdp, "navigate", portal.navigate)
         return edge_cdp.renew(timeout_s=timeout_s)
 
@@ -140,9 +152,13 @@ def test_a_live_sign_in_is_handed_back_at_once(walk):
     assert portal.went == [], "a working sign-in must not be thrown away"
 
 
-def test_a_portal_that_cannot_answer_does_not_cost_a_good_sign_in(walk):
-    # UNKNOWN is not DEAD. A bad minute on the portal, or a page the request
-    # cannot be made from, must never wipe the profile and ask for a new prompt.
+def test_a_portal_that_cannot_answer_does_not_cost_a_good_sign_in(walk,
+                                                                  monkeypatch):
+    # UNKNOWN is not DEAD. A bad minute on the portal must never wipe the
+    # profile and put a person through a fresh prompt. It is not a YES either
+    # (see test_signin_undecided.py): the old cookie is handed back only after
+    # the wait below has gone by with nothing able to decide.
+    monkeypatch.setattr(edge_cdp, "UNDECIDED_GRACE_S", 0.05)
     portal = _Portal([_cookie("_shibsession_64656661", "today")], ["unknown"])
     line, err = walk(portal)
     assert err == ""

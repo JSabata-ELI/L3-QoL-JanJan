@@ -98,12 +98,28 @@ from then on the same set is one button.
 
 3.4 PRESETS
 
-    Built-in: all cameras, and one preset per section.
+    The program starts with a ready-made list: all cameras, and one
+    preset per section. From there the list is yours to arrange.
 
-    Your own: create, rename, or replace a built-in one with the same
-    name. Yours are stored next to the program, so they survive a
-    restart and travel with the folder. Hover a preset button to see
-    the cameras in it.
+    "Config presets" opens the Preset Manager:
+
+      - New writes a new preset; type a name, tick the cameras and
+        press Save. Save sits next to the name.
+      - Remove deletes the selected preset, whether it came with the
+        program or you made it. It asks first.
+      - Renaming is typing a new name over the old one and pressing
+        Save; the preset stays where it is in the list.
+      - Drag a row up or down to reorder the list. The preset buttons
+        in the main window follow that order.
+      - Search filters the camera list; a camera you ticked stays
+        ticked while it is hidden, and Save still writes it.
+      - Restore defaults puts the original presets back. Ones you
+        deleted return at the end of the list, ones you edited go back
+        to their original cameras, and your own presets are left alone.
+
+    The whole list lives in custom_presets.json next to the program, so
+    it survives a restart and travels with the folder. Hover a preset
+    button to see the cameras in it.
 
     Presets are toggles, and the active ones are highlighted. "Clear
     all" resets cameras, monitors and presets together.
@@ -131,20 +147,78 @@ from then on the same set is one button.
       stop it — set the number of rounds to zero for "keep going".
 
   Start live
-      Continuously, with the preview updating as it goes.
+      Continuously.
 
-All three use the same machinery underneath. Screen pictures are
-taken first, then the cameras. The progress bar counts through the
-run and keeps counting across rounds rather than restarting, so a
-long automatic run shows real progress. "Stop" interrupts the round
-in progress rather than waiting for it to finish.
+Copy and the automatic rounds share the same camera machinery. A
+Copy takes the screens first, then the cameras, with a progress bar
+counting through it. "Stop" ends an automatic run.
 
-The window is disabled while a run is in flight, so a second press
-cannot overlap the first.
+4.1 HOW THE ROUNDS ARE SPACED
 
-WITH PREVIEW ON, an automatic run does NOT open a window per round.
-It reuses one window with arrows to step back and forth through the
-rounds. Sixty rounds would otherwise be sixty windows.
+    The rounds sit on a fixed grid. Round one is the moment you press
+    Start; round two is exactly the interval later, round three twice
+    the interval, and so on — measured from the start of the run, not
+    from the end of the previous round. A round that takes longer than
+    usual therefore does not push the ones after it.
+
+    Every round also WRITES DOWN the moment it belongs to, and that
+    written-down moment is what the cameras are asked about. If the
+    copying falls a little behind, the pictures still come from the
+    round's own moment: the work may lag, the pictures do not.
+
+    All the cameras of a round are read at the same time, side by
+    side, instead of one after another. This is what keeps a round's
+    pictures together — read one at a time, six cameras could span
+    ten seconds.
+
+4.2 THE ARCHIVE'S CLOCK
+
+    This computer's clock runs seconds ahead of the facility, and the
+    archiver publishes about a second after the fact. So "now" by
+    this PC's clock is a moment the archive has nothing for at all.
+    Asked about it straight, every camera reports a picture half a
+    minute "too old" and the whole run is skipped — which is exactly
+    what happened on the first live try.
+
+    So the FIRST round simply takes the newest picture each camera
+    has, and measures from it how far the archive is behind. Every
+    round after it asks about its own moment shifted back by that
+    amount. The log line says what was measured.
+
+    If a whole round later falls out of range while the cameras are
+    still delivering NEW pictures, the offset itself must have moved;
+    it is re-measured from that round and the log says so.
+
+    The manual Copy button works the same way as the first round: it
+    means "what the cameras have now".
+
+4.3 WHICH PICTURE A CAMERA GIVES
+
+    From the second round on: the newest picture the camera had AT OR
+    BEFORE the round's moment. Never a later one — a picture taken
+    after the moment belongs to a different instant, however close it
+    looks.
+
+    If the camera's newest picture at that moment is more than ten
+    seconds old, it is left out of the round — unless it is the very
+    same picture the previous round used, in which case it is kept,
+    so a camera that is standing still still appears in every round.
+
+    The Diagnostics panel gets one line per round with how many
+    cameras answered, how far apart their pictures ended up
+    ("spread"), and how far behind the grid the copying was ("lag"),
+    followed by the age of each camera's picture.
+
+    A round that ends up more than ten seconds behind its own moment
+    is dropped, and says so — beyond that window the archive can no
+    longer answer for that moment. Its screen pictures are kept:
+    those are taken at the moment of the round itself, in parallel
+    with the camera work, so a screen picture and the camera frames
+    of a round always belong to the same instant.
+
+WITH PREVIEW ON, an automatic run opens ONE window with the first
+round and keeps it for the whole run — see section 6.1. Pictures
+appear in it as they are copied.
 
 
 =================================================================
@@ -240,25 +314,67 @@ rounds. Sixty rounds would otherwise be sixty windows.
     fix it, press one button, and the bad set is gone rather than
     sitting in the folder confusing somebody later.
 
+    DURING AN AUTOMATIC RUN the same window works differently,
+    because the run is still going on:
+
+      - It opens with the first round and stays open to the end. It
+        is one window, not one per round.
+      - Pictures appear in it as they are copied, so you can watch
+        the run instead of waiting for it.
+      - A bar at the top shows which round you are looking at, with
+        arrows to step between rounds and a "Follow latest" switch.
+        Following is on to begin with, so the window always shows the
+        round being copied. The moment you step with an arrow or pick
+        a round from the list, following switches off and the window
+        stays where you put it — a round you are studying is never
+        pulled away from under you. Tick "Follow latest" again to
+        rejoin the run.
+      - "Save" writes the annotated copies WITHOUT closing the
+        window, and "Delete this cycle" throws away only the round on
+        screen; "Delete and Try Again" is not offered, because the
+        round's moment has passed and there is nothing to retry.
+      - Under each picture is its own time and, in brackets, how far
+        behind the round's moment it is.
+
 6.2 THE VIEWING CONTROLS
 
     Contrast    a multiplying gain: it stretches the values apart
                 around mid grey.
     Brightness  an adding offset: it moves everything up or down.
+    Gamma       bends the middle of the scale: above 1 lifts the
+                midtones, below 1 deepens them, and black stays
+                black and white stays white either way.
 
-    Those two are genuinely different operations and are never
-    mixed. Each has an "Auto", and when Auto is on it parks its
-    slider on the value it worked out — so you can see what Auto
-    decided and take over from there rather than starting again.
+    These are genuinely different operations and are never mixed.
+    Contrast and brightness each have an "Auto", and when Auto is on
+    it parks its slider on the value it worked out — so you can see
+    what Auto decided and take over from there rather than starting
+    again.
 
     Auto contrast stretches the image so that its darkest and
     brightest real content fill the range, ignoring the extreme
     fraction of a percent at each end. Auto brightness lifts the
     image so its bright end reaches the top of the scale.
 
-    Zoom and Palette apply to the whole grid. The palettes are
-    Grayscale, Gradient, Hot, Viridis, Plasma, Inferno, Jet and
-    Turbo.
+    The ↺ next to each control puts it back to untouched, and
+    switches that control's Auto off with it — otherwise the next
+    redraw would simply park the slider back where Auto wants it and
+    the button would look dead.
+
+    Zoom and Palette, on the second row, apply to the whole grid.
+
+    THE PALETTE STARTS ON "ORIGINAL", which means the picture in the
+    colours it arrived in. A colour camera stays in colour no matter
+    what you do with contrast, brightness or gamma — those are
+    applied to each colour channel alike, so the hues do not shift.
+    (Before, colour survived only while every control sat at its
+    default, so ticking Auto contrast looked as though it had also
+    changed the palette. It had not; the picture had been flattened
+    to grey.)
+
+    "Grayscale" deliberately drops the colour. Everything after it —
+    Gradient, Hot, Viridis, Plasma, Inferno, Jet, Turbo — paints
+    false colours over the grey values.
 
     NONE OF THIS CHANGES THE FILES. Adjusting the view is looking,
     not editing.
@@ -268,7 +384,8 @@ rounds. Sixty rounds would otherwise be sixty windows.
     Hover a thumbnail for a larger popup; click it to open the
     editor. There you get, for that one image:
 
-      zoom, contrast and brightness with their Autos, palette
+      zoom, contrast and brightness with their Autos and ↺, gamma
+      with its ↺, palette
       crop, with a preview of the crop and a Clear crop
       drawing: freehand, straight line, rectangle, with a choice of
               colour and thickness
@@ -297,10 +414,17 @@ So the program keeps its own list of what is in each camera folder,
 and a background worker re-reads them every three seconds. Pressing
 Copy uses the list that is already there.
 
-The consequence: the FIRST run after starting the program is the slow
-one, and everything after it is quick. If a brand-new image is
-missing from a run, it may have appeared in the last three seconds —
-press Copy again.
+A folder only joins that background rotation once it has been read
+for the first time, so starting an automatic run reads every selected
+camera once up front. That is why the first round is no longer the
+slow one.
+
+A list that stops before the moment being asked about cannot answer
+it, so it is re-read on the spot. A brand-new picture is therefore
+never missed just because the list was a couple of seconds old.
+
+The consequence: the FIRST Copy after starting the program is the
+slow one, and everything after it is quick.
 
 
 =================================================================
@@ -333,18 +457,51 @@ press Copy again.
       high-resolution declaration has to happen before the first
       window appears.
 
-  An automatic run opened dozens of windows
-      Preview was off for some rounds and on for others. With
-      Preview on from the start, one window is reused.
+  An automatic run shows nothing until I press an arrow
+      Fixed. The preview now fills itself as the pictures are
+      copied. If the window is empty, check that Preview is ticked
+      and that the Diagnostics panel is not reporting every camera
+      as skipped.
+
+  Every camera is skipped, every round, as "too old"
+      The archive clock offset is wrong. The first round measures it;
+      if the run was started at a moment when no camera had a recent
+      picture, stop and start it again. The log line "Archive clock
+      runs ... behind this PC" says what was measured.
+
+  Auto contrast turns my colour picture grey
+      Fixed. Set the palette to "Original" (the default) and the
+      colours stay whatever the camera sent, whatever the sliders do.
+
+  The pictures of one round are seconds apart
+      Fixed. Every round asks all its cameras about one written-down
+      moment and reads them side by side. The Diagnostics line for
+      the round reports the "spread" — if that is still large, those
+      cameras genuinely have nothing closer in the archive, and the
+      per-camera ages on the next line say which ones.
+
+  A camera keeps missing from the rounds
+      Its newest picture at the round's moment is more than ten
+      seconds old and is not the same one as the round before — so
+      it is being left out on purpose. The Diagnostics panel names
+      it and gives the age.
+
+  The rounds come out slower than the interval
+      The copying cannot keep up, so some rounds are waiting. The
+      log says how many are waiting and how far behind it is; a
+      round more than ten seconds behind its own moment is dropped
+      and says so. Fewer cameras, or a longer interval, fixes it.
 
   The preview looks nothing like the real image
       Contrast, brightness or palette are set for something else.
       They change the view only; the file on disk is untouched.
 
   My preset disappeared
-      Custom presets live in a file next to the program. A
-      redeployment that replaced the folder without keeping that file
-      loses them.
+      The preset list lives in custom_presets.json next to the
+      program. A redeployment that replaced the folder without keeping
+      that file loses it, and the program starts again with the
+      original presets. A preset you deleted yourself comes back with
+      "Restore defaults" only if it was one of the originals.
 
   A camera name I expect is not in the list
       It is not in the program's camera table. That needs adding in

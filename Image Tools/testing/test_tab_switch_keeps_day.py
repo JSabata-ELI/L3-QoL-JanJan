@@ -14,6 +14,7 @@ Runs offscreen, no share and no archiver:
     python testing/test_tab_switch_keeps_day.py
 """
 import os
+import time
 import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -136,6 +137,39 @@ def test_switch_keeps_day(app, w):
           and w._day_rows[sel_row(w._day_table)]["_ns"] == want_ns)
 
 
+def test_closed_list_stays_closed(app, w):
+    """A list the operator CLOSED must not come back with the next camera.
+
+    The window was only hidden, and the "the operator is looking at a shot list"
+    wish stayed raised, so switching camera opened it again — the operator closed
+    the same window over and over."""
+    print("\nA closed shot list stays closed when the camera changes")
+    fill(w, {CAMS[0]: 5, CAMS[1]: 5})
+    app.processEvents()
+    w._results_tabs.setCurrentIndex(0)
+    w._table.selectRow(1)
+    w._on_table_double_clicked(w._table.model().index(1, 0))
+    app.processEvents()
+    check("list opened", day_open(w))
+
+    w._day_window.reject()                    # the ✕ / Esc of the real window
+    app.processEvents()
+    check("closing it takes it off the screen", not day_open(w))
+
+    w._results_tabs.setCurrentIndex(1)
+    app.processEvents()
+    check("it does NOT come back on the next camera", not day_open(w))
+    check("but the day row is still selected", sel_row(w._table) == 1,
+          f"selected row = {sel_row(w._table)}")
+
+    # And it can be opened again on that camera — closing it is not a one-way door.
+    w._on_table_double_clicked(w._table.model().index(1, 0))
+    app.processEvents()
+    check("and it opens again when asked for", day_open(w))
+    w._day_window.reject()
+    app.processEvents()
+
+
 def test_switch_without_list(app, w):
     print("\nA day selected but not opened stays selected")
     fill(w, {CAMS[0]: 4, CAMS[1]: 4})
@@ -236,6 +270,44 @@ def test_progress_tracker():
               f"ended at {seen[-1]:.3f}")
 
 
+def test_eta_clock():
+    """The time left: two phases timed apart, and seeded from the last run."""
+    print("\nThe time estimate: measured per phase, never guessed")
+    Clock = getattr(sf_t, "_EtaClock", None)
+    if Clock is None:
+        check("_EtaClock exists", False, "not implemented yet")
+        return
+
+    seen: "list[float]" = []
+    c = Clock(4, 6, seen.append)          # 4 channel-days, 6 frame steps
+    check("nothing is promised before anything is measured",
+          c.seconds_left() == -1.0, str(c.seconds_left()))
+    c.start("pv")
+    time.sleep(0.05)
+    c.step("pv"); c.step("pv")
+    check("still silent while the second phase has no measurement",
+          c.seconds_left() == -1.0, str(c.seconds_left()))
+    c.start("fr")
+    time.sleep(0.05)
+    c.step("fr"); c.step("fr")
+    left = c.seconds_left()
+    check("once both have, it is the sum of what is left", left > 0, f"{left:.3f} s")
+    pv_rate, fr_rate = c.rates()
+    check("and both rates are measured", pv_rate > 0 and fr_rate > 0,
+          f"pv {pv_rate:.3f} s, frame {fr_rate:.3f} s")
+
+    # A data run has no frames at all; an image run over loaded data has no PVs.
+    c2 = Clock(0, 4, lambda _s: None, seed_frame=0.5)
+    check("a run with no archiver work still speaks, from the seed",
+          abs(c2.seconds_left() - 2.0) < 1e-6, str(c2.seconds_left()))
+    c3 = Clock(4, 0, lambda _s: None, seed_pv=0.25)
+    check("and so does one with no frames", abs(c3.seconds_left() - 1.0) < 1e-6,
+          str(c3.seconds_left()))
+    c3.step("pv", 4)
+    check("a finished job has nothing left", c3.seconds_left() == 0.0,
+          str(c3.seconds_left()))
+
+
 def main():
     app = QApplication.instance() or QApplication([])
     app.setStyle("Fusion")
@@ -245,11 +317,13 @@ def main():
     w.resize(1400, 800)
 
     test_switch_keeps_day(app, w)
+    test_closed_list_stays_closed(app, w)
     test_switch_without_list(app, w)
     test_switch_to_no_data_day(app, w)
     test_nearest_shot(app, w)
     test_switch_mid_search(app, w)
     test_progress_tracker()
+    test_eta_clock()
 
     print()
     if FAILURES:

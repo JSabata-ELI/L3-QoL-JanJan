@@ -22,7 +22,7 @@ This module owns all of it. The rules, in full:
      takes any day — a click that silently does nothing reads as a broken widget.
   3. MORE THAN ONE DAY switches the per-day time table on by itself. No tick to
      find. One day → no table; two or more → a row per day with its own From/To.
-  4. A DAY JUST ADDED gets 08:00–19:00, or 08:00–the current hour if it is today.
+  4. A DAY JUST ADDED gets 07:00–21:00, or 07:00–the current hour if it is today.
      A day already in the list keeps the times it has.
   5. ALWAYS OK AND CANCEL. Nothing takes effect until OK.
   6. THE HOUSE LOOK — Monday first, white day cells, Sat/Sun red (spill-over days
@@ -65,8 +65,11 @@ TZ_PRAGUE = ZoneInfo("Europe/Prague")
 # Rule 4. The lab day, and the hours the archive actually holds anything worth
 # looking at. Deliberately two plain numbers and not a setting: every tab has to
 # open on the same window or "the same everywhere" means nothing.
-DEFAULT_FROM_HOUR = 8
-DEFAULT_TO_HOUR = 19
+# 07:00–21:00 since 16.09.2026, on the operator's word: nothing is ever shot
+# before seven or after nine in the evening, and the old 08–19 cut off shifts at
+# both ends — a day added to a month-long pick then had to be retyped by hand.
+DEFAULT_FROM_HOUR = 7
+DEFAULT_TO_HOUR = 21
 
 MONTHS = ("January", "February", "March", "April", "May", "June",
           "July", "August", "September", "October", "November", "December")
@@ -122,9 +125,9 @@ def default_window_for(day: _date, now: "datetime | None" = None
                        ) -> "tuple[int, int, int, int]":
     """Rule 4 — the window a day gets the moment it is added.
 
-    A past day is the whole lab day, 08:00–19:00. TODAY cannot be read past the
+    A past day is the whole lab day, 07:00–21:00. TODAY cannot be read past the
     current hour (the archive has not been written yet), so it ends at the hour
-    it is now — and never earlier than 09:00, or a day picked at 08:20 would open
+    it is now — and never earlier than 08:00, or a day picked at 07:20 would open
     on an empty window and read as "the archive is broken"."""
     now = now or datetime.now(TZ_PRAGUE)
     if day != now.date():
@@ -603,7 +606,7 @@ class DayTimePicker(QDialog):
         # A window handed in by the caller is a window the user already chose —
         # the pick they left last time, or the tab's own working span. It counts
         # as "chosen", so days added later follow IT rather than snapping back to
-        # 08:00–19:00. Only a genuinely fresh open falls through to rule 4.
+        # 07:00–21:00. Only a genuinely fresh open falls through to rule 4.
         caller_gave_window = hour_from_init is not None or hour_to_init is not None
         if hour_from_init is None: hour_from_init = d_hf
         if hour_to_init is None:   hour_to_init = d_ht
@@ -654,7 +657,7 @@ class DayTimePicker(QDialog):
         self.time_to.timeChanged.connect(self._on_times_changed)
 
         btn_now = QPushButton("Now")
-        btn_now.setToolTip("Move the calendar to today (nothing else changes)")
+        btn_now.setToolTip("Jump to today and the current hour")
         btn_now.setFixedWidth(52)
         btn_now.setStyleSheet(BUTTON_STYLE)
         btn_now.clicked.connect(self._go_to_now)
@@ -779,8 +782,8 @@ class DayTimePicker(QDialog):
     def _set_days(self, days: "list[_date]"):
         """Adopt a new day list.
 
-        A day that has just appeared gets rule 4's window — 08:00–19:00, or
-        08:00–now for today — unless the user has already chosen a window by hand,
+        A day that has just appeared gets rule 4's window — 07:00–21:00, or
+        07:00–now for today — unless the user has already chosen a window by hand,
         in which case it follows that. A day that is leaving takes its window with
         it, so re-adding it later starts clean rather than resurrecting an old one.
         """
@@ -811,9 +814,27 @@ class DayTimePicker(QDialog):
         self._set_days([keep])
 
     def _go_to_now(self):
-        """Now — move the calendar to today, and nothing else. It must never
-        change a mode, a window or the day list."""
-        self.cal.setSelectedDate(date_to_qdate(datetime.now(TZ_PRAGUE).date()))
+        """Now — back to today and the hour it is.
+
+        It used to move the calendar's cursor and nothing else, which left the pick
+        on whatever day and window was already there: the button said "now" and the
+        dialog still returned yesterday morning. It now makes the pick itself
+        today's current hour — one day, the last hour — which is what everyone
+        pressing it was after. Live mode is NOT touched: following new images is a
+        separate choice, and its own tick is right beside this button.
+        """
+        now_dt = datetime.now(TZ_PRAGUE)
+        self._now = now_dt
+        today = now_dt.date()
+        self._days = [today]
+        self._anchor = today
+        self._pinned.clear()
+        self._per_day = {today: last_hour_window(now_dt)}
+        # The window came from the button, not from the user's typing, so a day added
+        # afterwards falls back to rule 4's 07:00–21:00 instead of trailing this hour.
+        self._global_touched = False
+        self.cal.setSelectedDate(date_to_qdate(today))
+        self._show_times(self._per_day[today])
         self._refresh()
 
     # ── time controls ─────────────────────────────────────────────────────────

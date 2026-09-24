@@ -22,6 +22,7 @@ import json
 import os
 import re
 import socket
+import textwrap
 import threading
 import time
 from collections import deque
@@ -56,7 +57,7 @@ import shared_pvs
 from alerting import (
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EvalConfig,
     NotificationHub, Thresholds, Trend, _raw_severity, classify_trend,
-    describe_reason, detect_frozen, fmt_duration, write_run_status,
+    describe_reason, fmt_duration, write_run_status,
 )
 import bot_commands
 import memstats
@@ -295,15 +296,14 @@ DEFAULT_SETTINGS = {
     # single PV's own no-data), and once more when data flow resumes.
     "data_watchdog_enabled": True,
     "data_watchdog_fail_polls": 2,
-    # Frozen-value check ("not updating"): a PV that keeps returning the exact
-    # same reading for this long is no longer live, even though the archiver
-    # still answers — a dead sensor or stuck IOC. Reported in the State column
-    # and, with frozen_alert_enabled, once per episode over the alert channels.
-    # frozen_min_points guards against sparse data: the unchanged run must be
-    # carried by at least this many samples before it counts.
+    # "Not updating" check: the archiver answers, but its newest sample for this
+    # PV stops advancing, so the value shown is old. Reported in the State
+    # column and, with frozen_alert_enabled, once per episode over the alert
+    # channels. How old the newest sample may get is not a setting of its own —
+    # it follows the poll pacing, see _sample_age_limit_s. A value that simply
+    # does not change is NOT this fault; that half of the check was removed on
+    # 16 Sep 2026, see _update_frozen.
     "frozen_check_enabled": True,
-    "frozen_after_minutes": 120,
-    "frozen_min_points": 5,
     "frozen_alert_enabled": True,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
@@ -339,6 +339,11 @@ DEFAULT_SETTINGS = {
     "plot_max_workers": 10,
     "plot_request_budget": 600,     # requests before it samples instead
     "plot_bins": 900,               # points across the picture
+    # Resolution of every picture sent to the chat, alert plots included. The
+    # figure is 8 x 4 inches, so 600 dpi is 4800 x 2400 px — see CHART_DPI for
+    # the measured cost of each setting. One /plot can override it with
+    # `; 300dpi`.
+    "chart_dpi": 600,
     # channels
     "teams_enabled": True,
     "email_enabled": False,
@@ -785,6 +790,359 @@ class PVConfig:
         return [old_gate], [prof]
 
 
+# ---------------------------------------------------------------------------
+# Graph history: every archived reading, in numpy arrays
+# ---------------------------------------------------------------------------
+#
+# Until 23 Sep 2026 the graph held one number per poll: the mean of the last
+# `avg_last_n` readings. Measured that day on L3-UTIL-CHL03-006 (Utility
+# Chiller), that hid the thing the operator was looking for. The PV is written
+# 1.09x/s and takes five values all morning - 10.0, 19.9, 20.0, 20.1, 29.9 -
+# and dropped to 10.0 three times, for one sample each. The graph drew 19.54,
+# 19.56 and 19.20, which are not readings at all: they are 24 twenties and a
+# ten over 25, and 23 twenties and two tens over 25. CS Studio showed 10.
+#
+# The readings were already being fetched: every poll downloads the whole
+# `sample_window_s` and throws all but `avg_last_n` of them away. Keeping them
+# costs nothing on the network - only memory, which is why the storage below
+# is two numpy arrays rather than the deque of tuples it replaces. At the
+# measured 45.4 readings/s across the 31 monitored PVs, twelve hours is ~2.0 M
+# readings: ~235 MB as Python tuples, ~32 MB as int64 + float64.
+
+# Per-PV ceiling, as a rate, when converting `history_minutes` to a sample
+# count. 5 Hz is a 2.6x margin over the fastest PV measured (1.9 Hz gauges).
+HISTORY_ASSUMED_MAX_HZ = 5.0
+# ...and an absolute ceiling, so one PV suddenly written at 1 kHz cannot eat
+# the machine while nobody is looking. 400 k readings is 6.4 MB.
+HISTORY_HARD_CAP = 400_000
+# Total across all PVs above which the log says so, once.
+HISTORY_TOTAL_WARN_BYTES = 256 * 1024 * 1024
+
+_EMPTY_T = np.zeros(0, dtype=np.int64)
+_EMPTY_V = np.zeros(0, dtype=np.float64)
+
+
+def _envelope(t_ns, values, max_points: int):
+    """Reduce a series to at most `max_points` points, keeping every extreme.
+
+    The samples are split into equal-count columns and each column contributes
+    its lowest and its highest reading, in the order the two actually happened.
+
+    Why not simply keep every n-th reading, which is what this replaces: at 1 Hz
+    over a twelve-hour history a column is ~55 readings wide, so even thinning
+    keeps one of 55 and drops the rest. The three one-sample dips to 10 degC of
+    23 Sep 2026 fell in the 54. Taking the extremes instead cannot lose them -
+    a one-sample dip is its column's minimum by definition.
+
+    Guarantees the graph relies on:
+      * the times come back non-decreasing  -> np.searchsorted in _snap_at;
+      * the last point is the true newest reading -> _apply_limits takes it as
+        the right edge of the rolling window, and drawstyle="steps-post" draws
+        the final segment from it.
+    """
+    n = int(np.size(t_ns))
+    if n <= max_points:
+        return t_ns, values
+    ncol = max(1, max_points // 2)
+    per = -(-n // ncol)                       # ceil: readings per column
+    pad = per * ncol - n
+    if pad:
+        # Pad with the newest reading repeated. It can only fall in the last
+        # column, and it is a value that really occurred, so it can neither
+        # invent an extreme nor move one.
+        tt = np.concatenate((t_ns, np.full(pad, t_ns[-1], dtype=t_ns.dtype)))
+        vv = np.concatenate((values, np.full(pad, values[-1], dtype=np.float64)))
+    else:
+        tt, vv = t_ns, values
+    T = tt.reshape(ncol, per)
+    V = vv.reshape(ncol, per)
+    lo = V.argmin(axis=1)
+    hi = V.argmax(axis=1)
+    first = np.minimum(lo, hi)                # whichever extreme came first
+    second = np.maximum(lo, hi)
+    rows = np.arange(ncol)
+    out_t = np.empty(ncol * 2, dtype=t_ns.dtype)
+    out_v = np.empty(ncol * 2, dtype=np.float64)
+    out_t[0::2], out_v[0::2] = T[rows, first], V[rows, first]
+    out_t[1::2], out_v[1::2] = T[rows, second], V[rows, second]
+    if out_t[-1] != t_ns[-1]:                 # never lose the newest reading
+        out_t = np.append(out_t, t_ns[-1])
+        out_v = np.append(out_v, values[-1])
+    return out_t, out_v
+
+
+class _SampleHistory:
+    """One PV's archived readings, as two numpy arrays.
+
+    Looks enough like the `deque` it replaces (`append`, `len`, truthiness,
+    iteration, `[0]`, `.maxlen`) that code and tests which only know about a
+    deque keep working, and adds `arrays()` for callers that want the numpy
+    pair with no copy.
+
+    Storage is linear, not a wrap-around ring: `arrays()` is called for every
+    curve on every redraw, and a ring would have to concatenate its two halves
+    each time. The dead head left by pruning is reclaimed in one memmove, and
+    only once it is worth the move, so appending stays O(1) amortised.
+
+    Bounded twice. By time, which is what the operator sets ("History kept"),
+    and by a per-PV sample count, which is the memory backstop for a PV written
+    far faster than any measured here. Both invariants below are load-bearing:
+
+      * times are non-decreasing - np.searchsorted reads them;
+      * the last element is the newest reading - the graph's right edge.
+    """
+
+    _START_CAP = 4096          # 64 kB; doubles from here rather than
+    #                            allocating the full cap for every PV at launch
+
+    def __init__(self, span_ns: int, cap: int, initial=()):
+        self._span_ns = max(0, int(span_ns))
+        self._cap = max(16, int(cap))
+        size = min(self._cap, self._START_CAP)
+        self._t = np.zeros(size, dtype=np.int64)
+        self._v = np.zeros(size, dtype=np.float64)
+        self._n = 0
+        self.version = 0
+        self.dropped_old = 0   # readings the cap threw away, for the log
+        if len(initial):
+            t = np.fromiter((p[0] for p in initial), np.int64, len(initial))
+            v = np.fromiter((p[1] for p in initial), np.float64, len(initial))
+            self.append_samples(t, v)
+
+    # -- deque-compatible surface ------------------------------------------
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __bool__(self) -> bool:
+        return self._n > 0
+
+    def __iter__(self):
+        return zip(self._t[:self._n].tolist(), self._v[:self._n].tolist())
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return list(zip(self._t[:self._n][i].tolist(),
+                            self._v[:self._n][i].tolist()))
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError(i)
+        return int(self._t[i]), float(self._v[i])
+
+    def append(self, pair) -> None:
+        t, v = pair
+        self.append_samples(np.array([int(t)], dtype=np.int64),
+                            np.array([float(v)], dtype=np.float64))
+
+    @property
+    def maxlen(self) -> int:
+        return self._cap
+
+    # -- what the graph and the trend want ---------------------------------
+
+    def arrays(self):
+        """(times_ns, values) as views of the storage - no copy."""
+        return self._t[:self._n], self._v[:self._n]
+
+    def since(self, start_ns: int):
+        """The readings at or after `start_ns`, as (ts, value) pairs."""
+        if not self._n:
+            return []
+        i = int(np.searchsorted(self._t[:self._n], int(start_ns), side="left"))
+        return list(zip(self._t[i:self._n].tolist(), self._v[i:self._n].tolist()))
+
+    @property
+    def newest_ns(self) -> int:
+        return int(self._t[self._n - 1]) if self._n else 0
+
+    @property
+    def oldest_ns(self) -> int:
+        return int(self._t[0]) if self._n else 0
+
+    @property
+    def nbytes(self) -> int:
+        return int(self._t.nbytes + self._v.nbytes)
+
+    # -- mutation ----------------------------------------------------------
+
+    def append_samples(self, t, v) -> int:
+        """Add readings newer than the newest stored. Returns how many landed.
+
+        Every poll asks for `sample_window_s` but runs every `poll_interval_s`,
+        so with the shipped 60 s / 30 s roughly half of each answer is already
+        stored. Dropping the overlap here rather than in the caller makes
+        "sorted, no duplicates" a property of the type: the simulation path and
+        the backfill get it without knowing about it.
+        """
+        t = np.asarray(t, dtype=np.int64)
+        v = np.asarray(v, dtype=np.float64)
+        if t.size == 0:
+            return 0
+        if t.size > 1 and not np.all(np.diff(t) >= 0):
+            order = np.argsort(t, kind="stable")
+            t, v = t[order], v[order]
+        if self._n:
+            # Strictly newer. Two distinct readings sharing one nanosecond are
+            # indistinguishable on a graph, and keeping both would break the
+            # ordering that searchsorted depends on.
+            k = int(np.searchsorted(t, self._t[self._n - 1], side="right"))
+            t, v = t[k:], v[k:]
+            if t.size == 0:
+                return 0
+        self._make_room(t.size)
+        self._t[self._n:self._n + t.size] = t
+        self._v[self._n:self._n + v.size] = v
+        self._n += t.size
+        self._prune()
+        self.version += 1
+        return int(t.size)
+
+    def prepend_samples(self, t, v) -> int:
+        """Put older readings in front of what is already held (backfill).
+
+        When the two together overrun the cap it is the *incoming, older* block
+        that gets reduced to its extremes - never the live tail. Reducing the
+        tail would delete the freshest readings to make room for the stalest.
+        """
+        t = np.asarray(t, dtype=np.int64)
+        v = np.asarray(v, dtype=np.float64)
+        if t.size == 0:
+            return 0
+        if t.size > 1 and not np.all(np.diff(t) >= 0):
+            order = np.argsort(t, kind="stable")
+            t, v = t[order], v[order]
+        if self._n:
+            k = int(np.searchsorted(t, self._t[0], side="left"))
+            t, v = t[:k], v[:k]         # strictly older than what we hold
+            if t.size == 0:
+                return 0
+        if self._span_ns:
+            cut = self.newest_ns or int(t[-1])
+            i = int(np.searchsorted(t, cut - self._span_ns, side="left"))
+            t, v = t[i:], v[i:]
+        room = self._cap - self._n
+        if room <= 0:
+            return 0
+        if t.size > room:
+            t, v = _envelope(t, v, room)
+            if t.size > room:
+                # _envelope may add one point to land on the newest reading of
+                # the block it was given. Here that ceiling is free space, not
+                # a drawing budget, so give up the oldest point rather than
+                # the one that abuts the live tail.
+                t, v = t[-room:], v[-room:]
+        n_new = int(t.size)
+        self._grow_to(self._n + n_new)
+        self._t[n_new:n_new + self._n] = self._t[:self._n]
+        self._v[n_new:n_new + self._n] = self._v[:self._n]
+        self._t[:n_new] = t
+        self._v[:n_new] = v
+        self._n += n_new
+        self.version += 1
+        return n_new
+
+    def set_retention(self, span_ns: int, cap: int) -> None:
+        """Apply a changed "History kept" setting to what is already held."""
+        self._span_ns = max(0, int(span_ns))
+        self._cap = max(16, int(cap))
+        self._prune()
+        # Hand memory back when the operator lowers the setting - that is
+        # usually why they lowered it.
+        want = max(self._START_CAP, self._n)
+        if self._t.size > want * 2:
+            self._t = self._t[:self._n].copy()
+            self._v = self._v[:self._n].copy()
+        self.version += 1
+
+    def clear(self) -> None:
+        self._n = 0
+        self.version += 1
+
+    # -- internals ---------------------------------------------------------
+
+    def _prune(self) -> None:
+        drop = 0
+        if self._span_ns and self._n:
+            cut = int(self._t[self._n - 1]) - self._span_ns
+            drop = int(np.searchsorted(self._t[:self._n], cut, side="left"))
+        over = self._n - drop - self._cap
+        if over > 0:
+            # The cap, not the clock, is what bit: this PV is written faster
+            # than HISTORY_ASSUMED_MAX_HZ allowed for. Drop a quarter at a time
+            # so it is not one memmove per reading from here on.
+            drop += max(over, self._cap // 4)
+            self.dropped_old += 1
+        if drop <= 0:
+            return
+        drop = min(drop, self._n)
+        # Only actually compact once the dead head is worth a memmove.
+        if drop < self._n // 4 and self._n < self._t.size:
+            return
+        self._t[:self._n - drop] = self._t[drop:self._n]
+        self._v[:self._n - drop] = self._v[drop:self._n]
+        self._n -= drop
+
+    def _make_room(self, extra: int) -> None:
+        if self._n + extra <= self._t.size:
+            return
+        self._prune()
+        if self._n + extra > self._t.size:
+            self._grow_to(self._n + extra)
+
+    def _grow_to(self, need: int) -> None:
+        if need <= self._t.size:
+            return
+        size = max(self._START_CAP, self._t.size)
+        while size < need:
+            size *= 2
+        t = np.zeros(size, dtype=np.int64)
+        v = np.zeros(size, dtype=np.float64)
+        t[:self._n] = self._t[:self._n]
+        v[:self._n] = self._v[:self._n]
+        self._t, self._v = t, v
+
+
+def _history_arrays(hist):
+    """(times_ns, values) for a _SampleHistory or for a plain deque of pairs.
+
+    The fast path is the point: _SampleHistory hands back views of its own
+    storage, so the graph reduces the arrays it already holds. The deque path
+    is there because the tests build PVRuntime(history=deque([...])) directly,
+    two of them newest-first - everything downstream assumes oldest-first, so
+    the sort belongs here rather than in each caller.
+    """
+    fast = getattr(hist, "arrays", None)
+    if fast is not None:
+        return fast()
+    n = len(hist)
+    if not n:
+        return _EMPTY_T, _EMPTY_V
+    t = np.fromiter((p[0] for p in hist), np.int64, n)
+    v = np.fromiter((p[1] for p in hist), np.float64, n)
+    if n > 1 and not np.all(np.diff(t) >= 0):
+        order = np.argsort(t, kind="stable")
+        t, v = t[order], v[order]
+    return t, v
+
+
+def _history_retune(hist, span_ns: int, cap: int):
+    """Apply a changed retention setting; returns the buffer to keep."""
+    fn = getattr(hist, "set_retention", None)
+    if fn is not None:
+        fn(span_ns, cap)
+        return hist
+    if getattr(hist, "maxlen", None) != cap:      # a plain deque (tests)
+        return deque(hist, maxlen=cap)
+    return hist
+
+
+def _history_since(hist, start_ns: int):
+    """Just the recent readings, for callers that filter by time anyway."""
+    fn = getattr(hist, "since", None)
+    return fn(start_ns) if fn is not None else hist
+
+
 @dataclass
 class PVRuntime:
     current_value: Optional[float] = None
@@ -826,15 +1184,13 @@ class PVRuntime:
     # Updated column always shows something; this one never does, so the
     # freshness checks below use it.
     data_ts_ns: int = 0
-    # Frozen-value check (see alerting.detect_frozen): data keeps arriving but
-    # the reading never changes, or the newest sample itself stopped advancing.
-    # Either way the value on screen is not live.
+    # "Not updating" check (see _update_frozen): the archiver answers, but the
+    # newest sample it has stops advancing, so the value on screen is old. A
+    # value that merely stays the same is not this — see _update_frozen for the
+    # chiller measurement that removed that half of the check.
     frozen: bool = False
-    frozen_since_ns: int = 0
-    frozen_span_s: float = 0.0
-    frozen_bounded: bool = False
     frozen_reason: str = ""
-    # One notification per freeze episode (and one when it clears).
+    # One notification per episode (and one when it clears).
     frozen_notified: bool = False
 
     def in_grace(self, now_ns: int = 0) -> bool:
@@ -865,17 +1221,30 @@ def _out_of_range(v: float, vmin, vmax) -> bool:
     return (vmin is not None and v < vmin) or (vmax is not None and v > vmax)
 
 
-def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
-    """Return (avg_or_None, units, last_ts_ns, n_rejected, last_raw) from raw
-    CPVA samples.
+def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None,
+                        avg_from_ns: int = 0):
+    """Return (avg_or_None, units, last_ts_ns, n_rejected, last_raw, pairs).
 
     Readings outside [vmin, vmax] are treated as sensor errors and dropped
     from the average used for alerting/history; n_rejected counts how many
     were discarded this pass. last_raw is the most recent decoded reading
     regardless of range, for display purposes only.
+
+    `pairs` is (times_ns, values) of every in-range reading — the graph's
+    history. It used to be thrown away here, which is why a sub-second dip
+    could never reach the screen; see the note above _SampleHistory.
+
+    `avg_from_ns` exists for the one case where the fetched window is wider
+    than the configured one: after a skipped poll pass the next fetch reaches
+    back to the last reading already stored, so the graph has no hole. Only
+    the graph may see that extra stretch. Everything the thresholds use — the
+    average, n_rejected, last_ts, last_raw — is still taken from the
+    configured window alone, because n_rejected feeds the error string and the
+    bad-data flag, and widening it silently would change alerting.
     """
     vals, units, last_ts, rejected = [], "", 0, 0
     last_raw, last_raw_ts = None, -1
+    hist_t, hist_v = [], []
     for s in samples:
         v = api.cpva_decode_value(s)
         if isinstance(v, bool):
@@ -887,9 +1256,17 @@ def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
                 units = u
             t = s.get("time")
             ts = int(t) if isinstance(t, (int, float)) else 0
+            in_range = not _out_of_range(fv, vmin, vmax)
+            if in_range and ts:
+                # A reading with no usable time cannot be placed on the graph;
+                # it still counts towards the average, as it always has.
+                hist_t.append(ts)
+                hist_v.append(fv)
+            if ts and ts < avg_from_ns:
+                continue            # fetched only to close a gap in the graph
             if ts >= last_raw_ts:
                 last_raw, last_raw_ts = fv, ts
-            if _out_of_range(fv, vmin, vmax):
+            if not in_range:
                 rejected += 1
                 if ts:
                     last_ts = max(last_ts, ts)  # note freshness even if bad
@@ -897,10 +1274,12 @@ def _avg_recent_numeric(samples: list[dict], avg_n: int, vmin=None, vmax=None):
             vals.append(fv)
             if ts:
                 last_ts = max(last_ts, ts)
+    pairs = (np.asarray(hist_t, dtype=np.int64),
+             np.asarray(hist_v, dtype=np.float64)) if hist_t else (_EMPTY_T, _EMPTY_V)
     if not vals:
-        return None, units, last_ts, rejected, last_raw
+        return None, units, last_ts, rejected, last_raw, pairs
     recent = vals[-max(1, avg_n):]
-    return sum(recent) / len(recent), units, last_ts, rejected, last_raw
+    return sum(recent) / len(recent), units, last_ts, rejected, last_raw, pairs
 
 
 def _safe_emit(sig_fn, value):
@@ -911,18 +1290,29 @@ def _safe_emit(sig_fn, value):
 
 
 class _PollSignals(QObject):
-    done = Signal(object)   # {name: (val_or_None, units, last_ts_ns, err, n_rejected, raw_val)}
+    done = Signal(object)   # {name: (val, units, last_ts_ns, err, n_rejected,
+    #                                 raw_val, (times_ns, values))}
     log = Signal(str)
+
+
+# How far back a pass may reach to close a gap, as a multiple of the configured
+# sample window. A pass is skipped when the previous one is still fetching; the
+# next window then no longer touches the last stored reading and those readings
+# would be lost for good, because nothing ever asks for them again. Ten windows
+# (10 min at the shipped 60 s) covers any realistic stall without turning a
+# morning of downtime into one enormous request.
+POLL_GAP_MAX_WINDOWS = 10
 
 
 class _PollWorker(QRunnable):
     def __init__(self, sig: _PollSignals, names: list[str], settings: dict,
-                 ranges: Optional[dict] = None):
+                 ranges: Optional[dict] = None, newest: Optional[dict] = None):
         super().__init__()
         self._sig = sig
         self._names = names
         self._s = settings
         self._ranges = ranges or {}
+        self._newest = newest or {}    # {name: newest reading already stored}
 
     def run(self):
         window_ns = int(self._s["sample_window_s"] * 1e9)
@@ -930,13 +1320,19 @@ class _PollWorker(QRunnable):
         timeout = float(self._s["http_timeout_s"])
         end = api.now_ns()
         start = end - window_ns
+        floor = end - window_ns * POLL_GAP_MAX_WINDOWS
 
         def fetch_one(name):
             lo, hi = self._ranges.get(name, (None, None))
+            # Reach back to the last reading already held when a skipped pass
+            # left a gap, but never past the floor, and never let the extra
+            # stretch touch the numbers the thresholds see (avg_from_ns).
+            held = int(self._newest.get(name) or 0)
+            fetch_start = max(floor, min(start, held + 1)) if held else start
             try:
-                samples = api.cpva_fetch_samples(name, start, end, timeout)
-                val, units, last_ts, rejected, raw_val = _avg_recent_numeric(
-                    samples, avg_n, lo, hi)
+                samples = api.cpva_fetch_samples(name, fetch_start, end, timeout)
+                val, units, last_ts, rejected, raw_val, pairs = _avg_recent_numeric(
+                    samples, avg_n, lo, hi, avg_from_ns=start)
                 if rejected:
                     err = (f"dropped {rejected} out-of-range reading(s) "
                            f"[{_fmt(lo)}..{_fmt(hi)}]")
@@ -945,9 +1341,9 @@ class _PollWorker(QRunnable):
                 # last_ts is reported raw (0 = the window held no sample): the
                 # caller needs to tell "the archiver has nothing newer" from
                 # "we asked just now", which a fallback to `end` would hide.
-                return (val, units, last_ts, err, rejected, raw_val)
+                return (val, units, last_ts, err, rejected, raw_val, pairs)
             except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
-                return (None, "", 0, str(e), 0, None)
+                return (None, "", 0, str(e), 0, None, (_EMPTY_T, _EMPTY_V))
 
         # Archiver responses can take seconds each; fetching sequentially made
         # a full pass slower than the poll interval, so results were always
@@ -965,13 +1361,48 @@ class _PollWorker(QRunnable):
 
 
 class _BackfillSignals(QObject):
-    done = Signal(object)   # {name: [(ts_ns, value), ...] sorted by time}
+    done = Signal(object)   # {name: (times_ns, values)} oldest first
     log = Signal(str)
 
 
+def _decode_pairs(samples, vmin, vmax):
+    """Archiver dicts -> (times_ns, values), in range and with a usable time."""
+    t, v = [], []
+    for s in samples:
+        val = api.cpva_decode_value(s)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        ts = s.get("time")
+        ts = int(ts) if isinstance(ts, (int, float)) else 0
+        fv = float(val)
+        if not ts or _out_of_range(fv, vmin, vmax):
+            continue
+        t.append(ts)
+        v.append(fv)
+    if not t:
+        return _EMPTY_T, _EMPTY_V
+    ta = np.asarray(t, dtype=np.int64)
+    va = np.asarray(v, dtype=np.float64)
+    if ta.size > 1 and not np.all(np.diff(ta) >= 0):
+        order = np.argsort(ta, kind="stable")
+        ta, va = ta[order], va[order]
+    return ta, va
+
+
 class _BackfillWorker(QRunnable):
-    """Fetch archive samples covering the graph window so the plot starts
-    pre-filled with recent history instead of only data polled from now on."""
+    """Fill the graph's history from the archive, reducing as it reads.
+
+    Rewritten 23 Sep 2026, when the graph started keeping every reading rather
+    than one average per poll. The old shape collected every chunk of every PV
+    into Python lists and only reduced at the end, so "load older data" for
+    twelve hours would have held ~2 M readings of JSON for 31 PVs at once —
+    cpva_api.cpva_run_chunks says exactly this in its own docstring, and a raw
+    pull of that size has taken this PC down before.
+
+    So: one request at a time per worker, each answer decoded, reduced and
+    dropped in the thread that received it. What stays in memory is bounded by
+    the number of workers, not by the length of the window.
+    """
 
     def __init__(self, sig: _BackfillSignals, names: list[str],
                  start_ns: int, end_ns: int, timeout: float,
@@ -987,65 +1418,102 @@ class _BackfillWorker(QRunnable):
         self._workers = max(1, workers)
 
     def run(self):
-        # PVs are fetched concurrently and each PV's window is itself chunked
-        # into <=1 h requests, so the two multiply. Keep the product inside the
-        # HTTP connection pool (64): above it every extra request evicts a
-        # pooled connection and pays a fresh TLS handshake.
-        pv_workers = min(self._workers, max(1, len(self._names)))
-        chunk_workers = max(1, min(4, 48 // pv_workers))
+        names = list(self._names)
+        if not names or self._end <= self._start:
+            _safe_emit(self._sig.done.emit, {})
+            return
+        workers = min(self._workers, max(1, len(names)))
 
-        def fetch_one(name):
-            try:
-                # errors={} so one unreadable hour costs that hour, not the
-                # whole PV's history: what came back is still worth drawing.
-                bad = {}
-                out = api.cpva_fetch_samples_chunked(
-                    name, self._start, self._end, self._timeout,
-                    max_workers=chunk_workers, errors=bad)
-                if bad:
-                    _safe_emit(self._sig.log.emit,
-                               f"History backfill: part of "
-                               f"{api.shorten_pv_name(name)} could not be "
-                               f"read ({bad[name]}); using the rest.")
-                return name, out
-            except Exception as e:  # noqa: BLE001 - one bad PV can't kill the pass
-                _safe_emit(self._sig.log.emit,
-                           f"History backfill failed for "
-                           f"{api.shorten_pv_name(name)}: {e}")
-                return name, None
+        # An hour per request: the span the archiver is reliable at, and the
+        # one cpva_api splits further by itself if an hour still comes back too
+        # large. plan_tasks caps the total, so an absurd window is sampled
+        # across the whole range instead of refused or run for an hour.
+        span = {n: api.CHUNK_SIZE_NS for n in names}
+        try:
+            tasks, mode, _planned = chart_history.plan_tasks(
+                names, self._start, self._end, span,
+                budget=chart_history.DEFAULT_BUDGET)
+        except Exception as e:  # noqa: BLE001 - PlotTooBig, and anything like it
+            # Nothing is read, but the caller MUST still hear back: it clears
+            # the in-flight flag on the result, and without one the backfill
+            # would stay "running" until the app is restarted.
+            _safe_emit(self._sig.log.emit, f"History backfill: {e}")
+            _safe_emit(self._sig.done.emit, {})
+            return
+        if mode != "full":
+            # Sampling spreads the stretches over the whole range rather than
+            # stopping partway, but each stretch is still a full chunk, so it
+            # saves far less reading than it looks. Memory is bounded either
+            # way — the wait is not, so say so.
+            _safe_emit(self._sig.log.emit,
+                       f"History backfill: that is too much to read in full — "
+                       f"taking {len(tasks)} stretches spread across the whole "
+                       f"range instead. This will take a few minutes; the "
+                       f"graph keeps working while it runs.")
+        else:
+            hours = (self._end - self._start) / 3.6e12
+            _safe_emit(self._sig.log.emit,
+                       f"History backfill: reading {hours:.1f} h of "
+                       f"{len(names)} PV(s) in {len(tasks)} requests.")
 
-        # Sequential single-shot fetches over the full (multi-hour) history
-        # window made launch's backfill take minutes with several PVs -- the
-        # archiver is only reliable for <=1h windows, so a wide window was
-        # both slow and dubious. Same fix as _PollWorker: fetch PVs
-        # concurrently, each internally chunked into <=1h windows.
-        # PV concurrency follows the poll setting (Concurrent fetches). At the
-        # old fixed 4 the launch backfill of ~30 PVs took ~8 s of empty graph;
-        # at the poll default it is ~2 s, and the archiver is the same server
-        # that already takes the poll pass at that rate.
+        per_pv = max(1, len(tasks) // len(names))
+        # Each chunk keeps its own share of the per-PV budget, so the PV ends
+        # up near max_points however many chunks it took.
+        per_chunk = max(64, self._max_points // per_pv)
+        blocks: dict = {n: [] for n in names}
+        locks = {n: threading.Lock() for n in names}
+        failed: dict = {}
+
+        def absorb(task, samples):
+            lo, hi = self._ranges.get(task.channel, (None, None))
+            t, v = _decode_pairs(samples, lo, hi)
+            if t.size > per_chunk:
+                t, v = _envelope(t, v, per_chunk)
+            if t.size:
+                with locks[task.channel]:
+                    blocks[task.channel].append((t, v))
+            # `samples` dies here, which is the whole point of this rewrite.
+
+        def note_failure(task, exc):
+            with locks[task.channel]:
+                failed.setdefault(task.channel, str(exc) or type(exc).__name__)
+
+        # The same 24 GB backstop the plot reader uses. Its log callback runs
+        # in a worker thread and the signal may already be gone by then, so it
+        # goes through _safe_emit like every other cross-thread line here.
+        guard = chart_history._MemoryGuard(
+            None, lambda msg: _safe_emit(self._sig.log.emit, msg))
+        try:
+            api.cpva_run_chunks(
+                tasks, timeout=self._timeout, max_workers=workers,
+                on_result=absorb, on_error=note_failure,
+                cancel_fn=guard, span_hint={})
+        except Exception as e:  # noqa: BLE001 - keep whatever was read
+            _safe_emit(self._sig.log.emit,
+                       f"History backfill stopped early: {e}")
+        if guard.tripped:
+            _safe_emit(self._sig.log.emit,
+                       f"History backfill stopped: {guard.reason}. Using what "
+                       f"was read.")
+
+        for name, why in failed.items():
+            _safe_emit(self._sig.log.emit,
+                       f"History backfill: part of {api.shorten_pv_name(name)} "
+                       f"could not be read ({why}); using the rest.")
+
         out = {}
-        with ThreadPoolExecutor(max_workers=pv_workers) as ex:
-            futures = {ex.submit(fetch_one, n): n for n in self._names}
-            for fut in as_completed(futures):
-                name, samples = fut.result()
-                if samples is None:
-                    continue
-                lo, hi = self._ranges.get(name, (None, None))
-                pts = []
-                for s in samples:
-                    v = api.cpva_decode_value(s)
-                    if isinstance(v, bool) or not isinstance(v, (int, float)):
-                        continue
-                    t = s.get("time")
-                    ts = int(t) if isinstance(t, (int, float)) else 0
-                    if not ts or _out_of_range(float(v), lo, hi):
-                        continue
-                    pts.append((ts, float(v)))
-                pts.sort()
-                if len(pts) > self._max_points:  # thin evenly to fit the history
-                    step = len(pts) / self._max_points
-                    pts = [pts[int(i * step)] for i in range(self._max_points)]
-                out[name] = pts
+        for name, parts in blocks.items():
+            if not parts:
+                continue
+            parts.sort(key=lambda p: int(p[0][0]))
+            t = np.concatenate([a for a, _ in parts])
+            v = np.concatenate([b for _, b in parts])
+            if t.size > 1 and not np.all(np.diff(t) >= 0):
+                order = np.argsort(t, kind="stable")
+                t, v = t[order], v[order]
+            if t.size > self._max_points:
+                t, v = _envelope(t, v, self._max_points)
+            out[name] = (t, v)
         _safe_emit(self._sig.done.emit, out)
 
 
@@ -1274,19 +1742,14 @@ NOT_REFRESHED_LABEL = "not refreshed"
 def _frozen_tooltip(rt: "PVRuntime") -> str:
     """Why this PV is flagged as not updating, spelled out for the table."""
     lines = [f"⚠ NOT UPDATING — {rt.frozen_reason}."]
-    if rt.frozen_since_ns:
-        since = api.ns_to_prague(rt.frozen_since_ns).strftime("%d.%m. %H:%M:%S")
-        if rt.frozen_bounded:
-            lines.append(f"Last real change: {since}.")
-        else:
-            lines.append(f"Already at this value at {since}, the oldest data "
-                         "kept here — the freeze may well be older.")
-    lines.append("The archiver keeps answering, but the reading behind it has "
-                 "stopped moving, so the value shown is probably not live and "
-                 "any alert about it is based on old data.")
-    lines.append("If this PV is genuinely constant for hours (a switch, a "
-                 "setpoint), untick 'Report this PV as not updating…' in "
-                 "Edit PV.")
+    lines.append("The archiver answers, but it has no newer reading to give, "
+                 "so the value shown is old and any alert about it is based on "
+                 "old data.")
+    lines.append("A value that simply does not move is NOT reported here: as "
+                 "long as new readings keep arriving the PV is live, however "
+                 "steady the number is.")
+    lines.append("If this PV is archived only now and then on purpose, untick "
+                 "'Report this PV as not updating…' in Edit PV.")
     return "\n".join(lines)
 
 
@@ -2319,16 +2782,17 @@ class PVEditDialog(QDialog):
         self.enabled_chk.setChecked(pv.enabled)
         form.addRow("", self.enabled_chk)
         self.frozen_chk = QCheckBox(
-            "Report this PV as not updating when its value never changes")
+            "Report this PV as not updating when no new readings arrive")
         self.frozen_chk.setStyleSheet(_CHK_STYLE)
         self.frozen_chk.setToolTip(
-            "On (default): if this PV keeps returning exactly the same reading "
-            "for longer than 'Not updating after' in Settings, the State column "
-            "shows 'not updating' and an alert says the value is no longer "
-            "live. Catches a dead sensor or stuck IOC, which otherwise looks "
-            "like a perfectly steady value.\n"
-            "Turn it off for PVs that really do hold one value for hours — "
-            "switch positions, setpoints, enable flags.")
+            "On (default): if the archiver has no newer reading for this PV, "
+            "the State column shows 'not updating' and an alert says the value "
+            "shown is old.\n"
+            "A value that stays the same is never reported: while new readings "
+            "keep arriving the PV is live, however steady the number is (a "
+            "regulated chiller sits on one tenth of a degree for two hours).\n"
+            "Turn it off for PVs that are archived only now and then on "
+            "purpose.")
         self.frozen_chk.setChecked(pv.frozen_check)
         form.addRow("", self.frozen_chk)
         lay.addLayout(form)
@@ -3170,6 +3634,21 @@ class SettingsDialog(QDialog):
             "Range 0–168 h (one week).")
         self.plot_hours.setValue(int(s.get("alert_plot_hours", 12)))
         cl.addRow("Alert plot window (h, 0=off)", self.plot_hours)
+        self.chart_dpi = _NoWheelSpinBox()
+        self.chart_dpi.setRange(bot_commands.DPI_MIN, bot_commands.DPI_MAX)
+        self.chart_dpi.setSingleStep(50)
+        self.chart_dpi.setToolTip(
+            "How sharp every picture sent to the chat is — alert plots and "
+            "/plot alike. The picture is 8 × 4 inches, so this is its whole "
+            "size: 600 dpi = 4800 × 2400 px and about 300 kB; 110 dpi = "
+            "880 × 440 px, which breaks up as soon as it is zoomed into on a "
+            "phone; 1200 dpi = 9600 × 4800 px and 720 kB, meant for printing. "
+            "Nothing but the pixel count changes — the text and the lines keep "
+            f"the same proportions. Range {bot_commands.DPI_MIN}–"
+            f"{bot_commands.DPI_MAX}. One picture at a time can be asked for "
+            "differently with `; 300dpi` on /plot.")
+        self.chart_dpi.setValue(int(s.get("chart_dpi", CHART_DPI)))
+        cl.addRow("Picture resolution (dpi)", self.chart_dpi)
         lay.addWidget(ch)
 
         # --- Teams ---------------------------------------------------------
@@ -3566,14 +4045,19 @@ class SettingsDialog(QDialog):
         self.avg_n.setToolTip(
             "Each poll averages up to this many recent samples before comparing "
             "to thresholds, smoothing out noise. 1 = use the latest raw sample. "
-            "Range 1–500.")
+            "Range 1–500.\n\n"
+            "The graph is not affected: it draws every archived reading, "
+            "however this is set.")
         self.avg_n.setValue(int(s["avg_last_n"]))
         form.addRow("Average last N samples", self.avg_n)
         self.window_s = _NoWheelSpinBox(); self.window_s.setRange(5, 3600)
         self.window_s.setToolTip(
             "Time span (seconds) of archiver data fetched each poll to draw the "
             "'last N samples' from. Should comfortably cover N samples at the "
-            "PV's update rate. Range 5–3600 s.")
+            "PV's update rate. Range 5–3600 s.\n\n"
+            "It is also how far back each poll collects readings for the "
+            "graph, so keep it comfortably longer than the poll interval or "
+            "the graph will have gaps.")
         self.window_s.setValue(int(s["sample_window_s"]))
         form.addRow("Sample window (s)", self.window_s)
         self.debounce = _NoWheelSpinBox(); self.debounce.setRange(1, 20)
@@ -3665,9 +4149,15 @@ class SettingsDialog(QDialog):
         form.addRow("Trend 'steady' band (%)", self.trend_flat)
         self.hist = _NoWheelSpinBox(); self.hist.setRange(10, 10080)
         self.hist.setToolTip(
-            "How many minutes of polled samples are kept in memory per PV for "
-            "the live graph. Larger = longer graph history but more memory. "
-            "Range 10–10080 min (one week).")
+            "How far back the live graph keeps readings, per PV.\n\n"
+            "Every archived reading is kept, not one per poll, so the memory "
+            "depends on how fast each PV is written — about 16 bytes a "
+            "reading. The PVs monitored today are written ~45 readings a "
+            "second between them, which is ~32 MB for 12 hours. The half-"
+            "hourly memory line in the log says what it actually comes to.\n\n"
+            "Raising this does not fetch the older data; use the graph's "
+            "'Load older data from archive' for that. Range 10–10080 min "
+            "(one week).")
         self.hist.setValue(int(s["history_minutes"]))
         form.addRow("History kept (min)", self.hist)
         self.graph_win = _NoWheelSpinBox(); self.graph_win.setRange(1, 10080)
@@ -3679,36 +4169,28 @@ class SettingsDialog(QDialog):
             "data). Range 1–10080 min.")
         self.graph_win.setValue(int(s["graph_window_minutes"]))
         form.addRow("Graph window (min)", self.graph_win)
-        self.frozen_en = QCheckBox("Flag PVs whose value never changes")
+        self.frozen_en = QCheckBox("Flag PVs whose readings stop arriving")
         self.frozen_en.setStyleSheet(_CHK_STYLE)
         self.frozen_en.setToolTip(
-            "Watch for PVs that keep answering with exactly the same reading, "
-            "or whose newest archived sample stops advancing. Such a PV is not "
-            "live even though nothing else looks wrong: its State column shows "
-            "'not updating' and any limit alert about it says the value is old. "
-            "Individual PVs can opt out in Edit PV.")
+            "Watch for PVs whose newest archived sample stops advancing: the "
+            "archiver answers, but has nothing newer to give, so the value "
+            "shown is old. Its State column then shows 'not updating' and any "
+            "limit alert about it says the value is old. A value that simply "
+            "stays the same is not reported — new readings arriving is what "
+            "counts. Individual PVs can opt out in Edit PV.")
         self.frozen_en.setChecked(bool(s.get("frozen_check_enabled", True)))
         form.addRow("", self.frozen_en)
-        self.frozen_after = _NoWheelSpinBox(); self.frozen_after.setRange(5, 10080)
-        self.frozen_after.setToolTip(
-            "How long a reading may stay at exactly the same value before the "
-            "PV is reported as not updating. Keep it well above how long the "
-            "value can genuinely sit still — 120 min suits temperatures and "
-            "pressures. Range 5–10080 min (one week).")
-        self.frozen_after.setValue(int(s.get("frozen_after_minutes", 120)))
-        form.addRow("Not updating after (min)", self.frozen_after)
         self.frozen_alert = QCheckBox("Send an alert when a PV stops updating")
         self.frozen_alert.setStyleSheet(_CHK_STYLE)
         self.frozen_alert.setToolTip(
             "Send one notification when a PV stops updating and one when it "
-            "starts changing again (only for PVs with alerting on). When off, "
+            "starts arriving again (only for PVs with alerting on). When off, "
             "it is only shown in the table. Never repeats — this is a data "
             "fault, not a value excursion.")
         self.frozen_alert.setChecked(bool(s.get("frozen_alert_enabled", True)))
         form.addRow("", self.frozen_alert)
-        for w in (self.frozen_after, self.frozen_alert):
-            w.setEnabled(self.frozen_en.isChecked())
-            self.frozen_en.toggled.connect(w.setEnabled)
+        self.frozen_alert.setEnabled(self.frozen_en.isChecked())
+        self.frozen_en.toggled.connect(self.frozen_alert.setEnabled)
         self.valid_min = OptionalDoubleField("enable")
         self.valid_min.setToolTip(
             "Default sensor-error floor for every PV: readings below this are "
@@ -4161,6 +4643,7 @@ class SettingsDialog(QDialog):
     def _save(self):
         s = self._win.settings
         s["alert_plot_hours"] = self.plot_hours.value()
+        s["chart_dpi"] = self.chart_dpi.value()
         # Channels: skipped entirely when they are provisioned by the build —
         # re-saving them would DPAPI-encrypt the baked secrets for this account
         # only and break every other PC running the same build.
@@ -4249,7 +4732,6 @@ class SettingsDialog(QDialog):
         s["history_minutes"] = self.hist.value()
         s["graph_window_minutes"] = self.graph_win.value()
         s["frozen_check_enabled"] = self.frozen_en.isChecked()
-        s["frozen_after_minutes"] = self.frozen_after.value()
         s["frozen_alert_enabled"] = self.frozen_alert.isChecked()
         s["valid_min_default"] = self.valid_min.value()
         s["valid_max_default"] = self.valid_max.value()
@@ -4357,6 +4839,44 @@ def _ns_to_num(t_ns):
     return _MPL_EPOCH + np.asarray(t_ns, dtype=np.float64) / 86_400e9
 
 
+def _chart_title(names: list[str], window_label: str = "",
+                 width: int = 82, max_lines: int = 3) -> str:
+    """The heading of the chart: every channel written out, wrapped as needed.
+
+    A long list used to collapse to "6 PVs", which told nobody which six. The
+    names go in the heading now, over up to `max_lines` lines; only a list too
+    long even for those is cut short, and then it says how many were left out
+    (the legend beside the curves names them anyway).
+    """
+    tail = f"  ({window_label})" if window_label else ""
+    for keep in range(len(names), 0, -1):
+        text = ", ".join(names[:keep])
+        if keep < len(names):
+            text += f", + {len(names) - keep} more"
+        lines = textwrap.wrap(text + tail, width=width,
+                              break_long_words=False)
+        if len(lines) <= max_lines:
+            return "\n".join(lines)
+    return f"{len(names)} PVs{tail}"
+
+
+def _text_band_frac(ax, txt):
+    """Which slice of the plot's height (0…1) a text box takes up.
+
+    Used to keep the legend out of the red notes' way. Needs a renderer, which
+    is why the chart's figure gets its canvas the moment it is made; None comes
+    back when there is no text, or no renderer to measure with."""
+    if txt is None:
+        return None
+    try:
+        renderer = ax.figure.canvas.get_renderer()
+        bb = txt.get_window_extent(renderer).transformed(
+            ax.transAxes.inverted())
+        return float(bb.y0), float(bb.y1)
+    except Exception:
+        return None
+
+
 def _fetch_chart_data(series: list[ChartSeries], start_ns: int, end_ns: int,
                       timeout: float, **kw):
     """Read every PV of the chart. Returns (list of SeriesData, FetchReport).
@@ -4385,6 +4905,43 @@ CHART_GRID  = "#cccccc"
 # average lines are drawn. /plot all is a documented command.
 CHART_MAX_BANDS = 3
 
+# How sharp the picture sent to the chat is. 8 x 4 inches, so this is the whole
+# resolution: 600 dpi is 4800 x 2400 px. It is read on a phone and pinched into,
+# and at the old 110 dpi (880 x 440) the thin band edges and the axis text broke
+# up as soon as anybody looked closely at a spike.
+#
+# Only the pixel count changes — every size in the figure is in points, so the
+# layout and the text keep the same proportions at any dpi.
+#
+# Measured (testing/bench_chart_dpi.py, 16 Sep 2026, a 90-day curve):
+#     dpi    pixels        PNG      drawing   canvas
+#     110     880 x 440     44 kB    0.06 s     1 MB
+#     220    1760 x 880     95 kB    0.08 s     6 MB
+#     600    4800 x 2400   299 kB    0.25 s    44 MB
+#    1200    9600 x 4800   720 kB    0.83 s   176 MB
+# 600 is the default because it is already past what any screen shows; it can be
+# changed in Settings ("Picture resolution (dpi)") and for one picture at a time
+# with the `; 300dpi` option on /plot.
+#
+# The curve's point count (chart_history.DEFAULT_BINS, 900) is deliberately NOT
+# raised with it: 900 points across 4800 px makes a one-off excursion a ~5 px
+# step that can be seen, where one point per pixel would make it a hairline.
+CHART_DPI = 600
+
+
+def _chart_dpi(dpi: int = 0) -> int:
+    """The resolution to draw at: what was asked for, else the default.
+
+    Clamped rather than trusted — the number can come from a chat command or
+    from a hand-edited settings file, and a figure of 0 or 20000 dpi is either a
+    matplotlib error or a minute of drawing.
+    """
+    try:
+        val = int(dpi) or CHART_DPI
+    except (TypeError, ValueError):
+        val = CHART_DPI
+    return max(bot_commands.DPI_MIN, min(bot_commands.DPI_MAX, val))
+
 
 def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
                      timeout: float, window_label: str = "",
@@ -4396,6 +4953,7 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
                      n_bins: int = chart_history.DEFAULT_BINS,
                      budget: int = chart_history.DEFAULT_BUDGET,
                      detail: bool = False,
+                     dpi: int = 0,
                      progress_fn=None,
                      plan_fn=None,
                      log_fn=None) -> bytes | None:
@@ -4450,7 +5008,8 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
     if not fetched:
         return None
 
-    fig = Figure(figsize=(8, 4), dpi=110)
+    fig = Figure(figsize=(8, 4), dpi=_chart_dpi(dpi))
+    FigureCanvasAgg(fig)       # a renderer from the start: text gets measured
     fig.patch.set_facecolor(CHART_PAPER)
     ax = fig.add_subplot(111)
     ax.set_facecolor(CHART_PAPER)
@@ -4500,10 +5059,8 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
                 ax.axhline(val, linestyle=ls, linewidth=lw, alpha=0.7,
                            color=ALARM_COLOR if ls == "-." else WARN_COLOR)
 
-    names = ", ".join(d.request.display_name for d in fetched)
-    if len(names) > 70:
-        names = f"{len(fetched)} PVs"
-    title = f"{names}  ({window_label})" if window_label else names
+    title = _chart_title([d.request.display_name for d in fetched],
+                         window_label)
     if condensed:
         title += ("\nline = average, band = lowest…highest" if bands
                   else f"\nline = average (band left out: {len(fetched)} curves)")
@@ -4513,11 +5070,6 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
     ax.tick_params(colors=CHART_TICK, labelcolor=CHART_TICK)
     for spine in ax.spines.values():
         spine.set_color(CHART_EDGE)
-    if not single:
-        leg = ax.legend(loc="best", fontsize=8, facecolor=CHART_PAPER,
-                        edgecolor=CHART_EDGE)
-        for t in leg.get_texts():
-            t.set_color(CHART_INK)
     if yaxis:
         ax.set_ylim(yaxis[0], yaxis[1])
     ax.grid(True, alpha=0.6, color=CHART_GRID)
@@ -4526,41 +5078,82 @@ def render_chart_png(series: list[ChartSeries], start_ns: int, end_ns: int,
     # reads the x axis to find out.
     newest_ns = max((d.newest_ns for d in fetched), default=0)
     lag_s = (end_ns - newest_ns) / 1e9 if newest_ns else 0.0
+    note_txt = banner_txt = None
     if stale_after_s > 0 and newest_ns and lag_s > stale_after_s:
         note = (f"NOT CURRENT - newest data "
                 f"{api.ns_to_prague(newest_ns).strftime('%d.%m. %H:%M')}, "
                 f"{fmt_duration(lag_s)} before the end of the window")
         # No emoji: the bundled font has no glyph for one and it would render
         # as an empty box.
-        ax.text(0.99, 0.02, note, transform=ax.transAxes, ha="right",
-                va="bottom", fontsize=8, color=ALARM_COLOR,
-                bbox=dict(boxstyle="round,pad=0.3", facecolor=CHART_PAPER,
-                          edgecolor=ALARM_COLOR, alpha=0.85))
+        note_txt = ax.text(0.99, 0.02, note, transform=ax.transAxes,
+                           ha="right", va="bottom", fontsize=8,
+                           color=ALARM_COLOR,
+                           bbox=dict(boxstyle="round,pad=0.3",
+                                     facecolor=CHART_PAPER,
+                                     edgecolor=ALARM_COLOR, alpha=0.85))
         if out_info is not None:
             out_info["note"] = note
     banner = (out_info or {}).get("banner", "")
     if banner:
-        ax.text(0.01, 0.98, banner, transform=ax.transAxes, ha="left",
-                va="top", fontsize=8, color=ALARM_COLOR,
-                bbox=dict(boxstyle="round,pad=0.3", facecolor=CHART_PAPER,
-                          edgecolor=ALARM_COLOR, alpha=0.85))
+        banner_txt = ax.text(0.01, 0.98, banner, transform=ax.transAxes,
+                             ha="left", va="top", fontsize=8,
+                             color=ALARM_COLOR,
+                             bbox=dict(boxstyle="round,pad=0.3",
+                                       facecolor=CHART_PAPER,
+                                       edgecolor=ALARM_COLOR, alpha=0.85))
+    # The legend goes in last, and only into the strip the red notes have left
+    # free. matplotlib's own "best" placement looks at the curves alone, so on
+    # a chart whose readings sit in one corner it lands squarely on top of the
+    # "NOT CURRENT" line.
+    if not single:
+        lo, hi = 0.0, 1.0
+        band = _text_band_frac(ax, note_txt)
+        if band:
+            lo = max(lo, min(0.5, band[1] + 0.02))
+        band = _text_band_frac(ax, banner_txt)
+        if band:
+            hi = min(hi, max(0.5, band[0] - 0.02))
+        leg = ax.legend(loc="best", fontsize=8, facecolor=CHART_PAPER,
+                        edgecolor=CHART_EDGE,
+                        bbox_to_anchor=(0.0, lo, 1.0, hi - lo),
+                        bbox_transform=ax.transAxes)
+        for t in leg.get_texts():
+            t.set_color(CHART_INK)
     if out_info is not None:
         out_info["newest_ns"] = newest_ns
         out_info["stale_s"] = lag_s
     ax.xaxis_date(api.TZ_PRAGUE)
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M", tz=api.TZ_PRAGUE))
-    fig.autofmt_xdate()
+    # Horizontal labels, like the live graph in the window. This used to be
+    # fig.autofmt_xdate(), which tilts every label 30° — matplotlib's way of
+    # making long labels fit. Room is made instead of tilting: fewer ticks, and
+    # the date above the time rather than beside it.
+    loc = mdates.AutoDateLocator(tz=api.TZ_PRAGUE, maxticks=8)
+    ax.xaxis.set_major_locator(loc)
+    ax.get_xlim()          # settle the view interval so the ticks can be read
+    # A window of days lands every tick on midnight, and five "00:00" under a
+    # month-long graph say nothing — then the date alone is the label.
+    midnight_only = all(
+        mdates.num2date(t, tz=api.TZ_PRAGUE).replace(tzinfo=None)
+        == mdates.num2date(t, tz=api.TZ_PRAGUE).replace(
+            tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
+        for t in loc()) if len(loc()) else False
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(
+        "%m-%d" if midnight_only else "%m-%d\n%H:%M", tz=api.TZ_PRAGUE))
+    for lbl in ax.get_xticklabels():
+        lbl.set_rotation(0)
+        lbl.set_ha("center")
     fig.tight_layout()
 
     buf = BytesIO()
-    FigureCanvasAgg(fig).print_png(buf)
+    fig.canvas.print_png(buf)
     return buf.getvalue()
 
 
 def render_pv_png(pv_name: str, display_name: str, hours: float,
                   thr: Thresholds, timeout: float,
                   vmin=None, vmax=None,
-                  stale_after_s: float = 0.0) -> bytes | None:
+                  stale_after_s: float = 0.0,
+                  dpi: int = 0) -> bytes | None:
     """Fetch the last `hours` h from CPVA and render a value+threshold PNG.
 
     This window always ends now, so the plot is marked when its newest point is
@@ -4571,7 +5164,7 @@ def render_pv_png(pv_name: str, display_name: str, hours: float,
     return render_chart_png(
         [ChartSeries(pv_name, display_name, thr, vmin, vmax)],
         start, end, timeout, window_label=f"last {hours:g} h",
-        stale_after_s=stale_after_s)
+        stale_after_s=stale_after_s, dpi=dpi)
 
 
 class _AxisRangeDialog(QDialog):
@@ -4766,6 +5359,14 @@ class GraphPanel(QWidget):
         # Per-plotted-series snap cache for the cursor value box, rebuilt every
         # redraw: [(times_num_np, values_np, color, display_name), ...].
         self._snap_series: list = []
+        # Reduced curve per PV, keyed on the history's version counter:
+        # {pv_name: (version, x_datenums, values)}. redraw() runs for reasons
+        # that have nothing to do with the data — a grid toggle, a resize, the
+        # legend moving — and refresh_data() falls back to it whenever the
+        # picture's shape changed, which asks for every curve again in the
+        # same pass. Deliberately NOT cleared by redraw(): that is the case it
+        # is for. A new reading bumps the version and the entry is ignored.
+        self._series_cache: dict = {}
         self._readout_texts: list = []   # cursor box: time header + one line/PV
         self._units = ""
         self._blit_bg = None
@@ -5221,11 +5822,17 @@ class GraphPanel(QWidget):
         idx = self.combo.findText(cur)
         self.combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo.blockSignals(False)
+        # The PV list just changed, so drop reduced curves for PVs that are no
+        # longer there. Everything else keeps its entry: the cache is keyed on
+        # the history's version and is meant to survive redraws.
+        live = {pv.name for pv in self._win.pvs}
+        for gone in [n for n in self._series_cache if n not in live]:
+            del self._series_cache[gone]
 
     def _plot_one(self, pv: PVConfig, color, with_thresholds: bool, ax=None):
         ax = ax if ax is not None else self.ax
         xs, ys = self._series(pv)
-        if not xs:
+        if xs.size == 0:
             return
         lines = ax.plot(xs, ys, drawstyle="steps-post", color=color,
                         linestyle=self._unit_linestyle(self._pv_units(pv)),
@@ -5235,9 +5842,7 @@ class GraphPanel(QWidget):
         # Cache the plotted (thinned) series so the cursor value box can snap to
         # each PV's value at the hovered time — reuses the exact drawn data and
         # its curve colour for both the single-PV and All-PVs views.
-        self._snap_series.append(
-            (np.asarray(mdates.date2num(xs), dtype=float),
-             np.asarray(ys, dtype=float), color, pv.display_name))
+        self._snap_series.append((xs, ys, color, pv.display_name))
         if with_thresholds:
             for val, ls, lw in ((pv.warn_low, "--", 1.0), (pv.warn_high, "--", 1.0),
                                 (pv.alarm_low, "-.", 1.6), (pv.alarm_high, "-.", 1.6)):
@@ -5246,19 +5851,30 @@ class GraphPanel(QWidget):
                                linewidth=lw, alpha=0.6)
 
     def _series(self, pv: PVConfig):
-        """The PV's plottable history as (times, values); ([], []) if empty."""
+        """The PV's plottable history as (x_datenums, values) arrays.
+
+        Reduced with _envelope, not by keeping every n-th reading: the history
+        now holds every archived reading, and even thinning would throw the
+        short excursions away again at the last moment. See the note above
+        _SampleHistory for the dips that went missing that way.
+
+        x comes back as matplotlib date numbers straight from the nanoseconds.
+        Building a datetime per point was the most expensive thing the graph
+        did — 3000 of them per curve on every poll.
+        """
         rt = self._win.runtime.get(pv.name)
         if not rt or not rt.history:
-            return [], []
-        pts = list(rt.history)
-        if len(pts) > MAX_GRAPH_POINTS:
-            # Thin evenly across the whole history (a plain tail-cut would
-            # silently shorten the graph's time span); keep the newest point.
-            step = len(pts) / MAX_GRAPH_POINTS
-            last = pts[-1]
-            pts = [pts[int(i * step)] for i in range(MAX_GRAPH_POINTS)]
-            pts[-1] = last
-        return [api.ns_to_prague(t) for t, _ in pts], [v for _, v in pts]
+            return _EMPTY_V, _EMPTY_V
+        ver = getattr(rt.history, "version", None)
+        if ver is not None:
+            hit = self._series_cache.get(pv.name)
+            if hit is not None and hit[0] == ver:
+                return hit[1], hit[2]
+        t, v = _envelope(*_history_arrays(rt.history), MAX_GRAPH_POINTS)
+        x = _ns_to_num(t)
+        if ver is not None:
+            self._series_cache[pv.name] = (ver, x, v)
+        return x, v
 
     def _pv_units(self, pv: PVConfig) -> str:
         rt = self._win.runtime.get(pv.name)
@@ -5392,6 +6008,11 @@ class GraphPanel(QWidget):
             labels += l
         self._legend = self._draw_legend(handles, labels)
         self.ax.grid(self._grid_on, alpha=0.3)
+        # _series hands over plain floats now, so matplotlib no longer infers
+        # a date axis from the data and would label the ticks as bare numbers.
+        # _ns_to_num is anchored on the same epoch date2num uses, so saying so
+        # explicitly gives exactly the ticks the datetimes used to.
+        self.ax.xaxis_date(api.TZ_PRAGUE)
         self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=api.TZ_PRAGUE))
 
         self._apply_limits(win_min)
@@ -5509,13 +6130,12 @@ class GraphPanel(QWidget):
         by_name = {p.name: p for p in self._win.pvs}
         for name, label, color, line in self._curve_rows:
             pv = by_name.get(name)
-            xs, ys = self._series(pv) if pv is not None else ([], [])
-            if not xs:
+            xs, ys = self._series(pv) if pv is not None else (_EMPTY_V, _EMPTY_V)
+            if xs.size == 0:
                 self.redraw()      # curve lost its data: shape changed after all
                 return
             line.set_data(xs, ys)
-            snap.append((np.asarray(mdates.date2num(xs), dtype=float),
-                         np.asarray(ys, dtype=float), color, label))
+            snap.append((xs, ys, color, label))
         # The cursor value box reads this cache, and its text artists are keyed
         # by position in it — same curves in the same order, so they still fit.
         self._snap_series = snap
@@ -5679,7 +6299,7 @@ class _AlertWorker(QRunnable):
     def __init__(self, sig: _AlertSignals, hub: NotificationHub,
                  payload: AlertPayload, thr: Thresholds, hours: float,
                  timeout: float, tag: str, vmin=None, vmax=None,
-                 stale_after_s: float = 0.0):
+                 stale_after_s: float = 0.0, dpi: int = 0):
         super().__init__()
         self._sig = sig
         self._hub = hub
@@ -5691,6 +6311,7 @@ class _AlertWorker(QRunnable):
         self._vmin = vmin
         self._vmax = vmax
         self._stale_after_s = stale_after_s
+        self._dpi = dpi
 
     def run(self):
         png = None
@@ -5698,7 +6319,8 @@ class _AlertWorker(QRunnable):
             try:
                 png = render_pv_png(self._payload.pv_name, self._payload.display_name,
                                     self._hours, self._thr, self._timeout,
-                                    self._vmin, self._vmax, self._stale_after_s)
+                                    self._vmin, self._vmax, self._stale_after_s,
+                                    dpi=self._dpi)
             except Exception:  # noqa: BLE001 - alert must still go out text-only
                 png = None
         errors = self._hub.dispatch(self._payload, png)
@@ -5741,7 +6363,7 @@ class _ChartWorker(QRunnable):
                  body_md: str, yaxis=None, stale_after_s: float = 0.0,
                  token: "_CancelToken" = None, detail: bool = False,
                  max_workers: int = 10, budget: int = 600, n_bins: int = 900,
-                 log_fn=None):
+                 dpi: int = 0, log_fn=None):
         super().__init__()
         self._sig = sig
         self._token = token
@@ -5759,6 +6381,7 @@ class _ChartWorker(QRunnable):
         self._max_workers = max_workers
         self._budget = budget
         self._n_bins = n_bins
+        self._dpi = dpi
         self._log_fn = log_fn
         self._last_progress = 0.0
         self._progress_sent = 0
@@ -5812,6 +6435,7 @@ class _ChartWorker(QRunnable):
                                    self._token, detail=self._detail,
                                    max_workers=self._max_workers,
                                    budget=self._budget, n_bins=self._n_bins,
+                                   dpi=self._dpi,
                                    progress_fn=self._progress,
                                    plan_fn=self._plan,
                                    log_fn=self._log_fn)
@@ -5909,6 +6533,47 @@ class _TextReplyWorker(QRunnable):
 
     def run(self):
         self._webex.post_text(self._markdown)
+
+
+# ---------------------------------------------------------------------------
+# /change — an open question and the one step back
+#
+# Every other command is one self-contained line; this is the only one that
+# prints a numbered list and then waits for an answer. The state that makes
+# that possible is kept deliberately small: no timer, no thread, nothing on
+# disk. A question is forgotten when it is answered, when /cancel drops it,
+# when a later /change replaces it, and when it goes stale. Deliberately NOT
+# when the same person types something else — looking the value up with
+# /status before answering is the normal thing to do.
+# ---------------------------------------------------------------------------
+
+# How long a printed listing stays answerable. Long enough to walk to the
+# machine and look at it, short enough that a number typed into the room
+# tomorrow cannot land on a limit.
+CHANGE_SESSION_TTL_S = 900
+
+
+@dataclass
+class _ChangeSession:
+    """A /change listing that has been printed and not yet answered."""
+    pv_name: str
+    rows: list          # bot_commands.LimitRow, exactly as they were numbered
+    asked_ns: int
+
+    def stale(self, now_ns: int) -> bool:
+        return (now_ns - self.asked_ns) > CHANGE_SESSION_TTL_S * 1_000_000_000
+
+
+@dataclass
+class _ChangeUndo:
+    """What the last /change replaced, so /undo can put it back."""
+    pv_name: str
+    display_name: str
+    # (prof_index or None, attr, old value) — the value BEFORE the change.
+    before: list
+    what: str           # the same wording the change itself was announced with
+    email: str
+    at_ns: int
 
 
 # ---------------------------------------------------------------------------
@@ -6033,6 +6698,8 @@ class MonitorWidget(QWidget):
         self._poll_inflight = False
         self._poll_started_ns = 0   # when the in-flight pass was dispatched
         self._poll_zombies = 0      # passes written off by the watchdog
+        self._gap_logged: set = set()   # PVs whose graph gap was already said
+        self._history_warned = False    # the 'history is large' line, said once
         # Oldest archive timestamp the graph backfill has already fetched (0 =
         # nothing fetched yet). Launch only covers the visible graph window;
         # anything older is fetched on request, and this marks where that
@@ -6102,6 +6769,12 @@ class MonitorWidget(QWidget):
         # what sent a person off to re-paste a sign-in that was working.
         self._menu_last_decisive: Optional[bool] = None
         self._menu_timer: Optional[QTimer] = None
+        # /change — the only command that asks a question and waits. One open
+        # question per sender (keyed by e-mail), so two people can be changing
+        # different PVs at once and a bare number can only ever answer the
+        # question its own sender asked.
+        self._change_pending: dict = {}
+        self._change_undo: Optional[_ChangeUndo] = None
 
         self.hub = NotificationHub.from_settings(self.settings)
         self.evaluator = AlertEvaluator(self._eval_config())
@@ -6140,14 +6813,56 @@ class MonitorWidget(QWidget):
             stable_seconds=float(s.get("stable_seconds", 120)),
         )
 
-    def _history_maxlen(self) -> int:
-        return max(10, int(self.settings["history_minutes"] * 60 /
-                           max(1, self.settings["poll_interval_s"])) + 5)
+    def _history_span_ns(self) -> int:
+        """How far back the graph keeps readings, from the 'History kept' setting.
+
+        This is the bound that matters. The old one was a sample count derived
+        from the poll interval, which only made sense while the graph held one
+        averaged point per poll; now that every archived reading is kept, the
+        count depends on how fast each PV happens to be written and only the
+        clock is the same for all of them.
+        """
+        return int(float(self.settings["history_minutes"]) * 60e9)
+
+    def _history_cap(self) -> int:
+        """Per-PV sample ceiling: the memory backstop behind the time bound.
+
+        Only bites for a PV written far faster than anything measured here
+        (HISTORY_ASSUMED_MAX_HZ is 5 Hz against a fastest-measured 1.9 Hz), and
+        then it shortens that one PV's history rather than letting it grow
+        without limit.
+        """
+        return min(HISTORY_HARD_CAP,
+                   max(4096, int(float(self.settings["history_minutes"]) * 60
+                                 * HISTORY_ASSUMED_MAX_HZ)))
+
+    def _new_history(self) -> "_SampleHistory":
+        return _SampleHistory(self._history_span_ns(), self._history_cap())
+
+    def _warn_if_history_large(self) -> None:
+        """Say it once when the kept readings stop being a rounding error.
+
+        Not a failure — 12 h of the PVs monitored today is ~32 MB — but this
+        app has run a PC out of memory before, so the number belongs where
+        somebody will see it rather than only in a developer's head.
+        """
+        if self._history_warned:
+            return
+        total = self._history_bytes()
+        if total >= HISTORY_TOTAL_WARN_BYTES:
+            self._history_warned = True
+            self._log(f"Graph history now holds {total / 1e6:.0f} MB of "
+                      f"readings. Lower 'History kept (min)' in Settings if "
+                      f"that is more than you need.")
+
+    def _history_bytes(self) -> int:
+        """What every PV's kept readings add up to, for the memory heartbeat."""
+        return sum(getattr(rt.history, "nbytes", 0)
+                   for rt in self.runtime.values())
 
     def _init_runtime(self):
-        ml = self._history_maxlen()
         for pv in self.pvs:
-            self.runtime[pv.name] = PVRuntime(history=deque(maxlen=ml))
+            self.runtime[pv.name] = PVRuntime(history=self._new_history())
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -6353,7 +7068,14 @@ class MonitorWidget(QWidget):
             return
         since = self._mem_start.proc_commit if self._mem_start else None
         up = fmt_duration((api.now_ns() - self._mem_start_ns) / 1e9)
-        self._log(f"{memstats.long_line(snap, since)} Running for {up}.")
+        # Name the graph history's share separately. It is the one part that
+        # grows with how long the program has been open, so in the series of
+        # these lines it is what tells "settling in" from "climbing".
+        kept = sum(len(rt.history) for rt in self.runtime.values())
+        hist = (f" Graph history {self._history_bytes() / 1e6:.0f} MB "
+                f"({kept:,} readings).")
+        self._log(f"{memstats.long_line(snap, since)} Running for {up}.{hist}")
+        self._warn_if_history_large()
         if snap.sys_commit_pct >= MEM_WARN_PCT:
             now = api.now_ns()
             if now - self._mem_warned_ns >= MEM_WARN_REPEAT_NS:
@@ -6715,13 +7437,12 @@ class MonitorWidget(QWidget):
         if dlg.exec() == QDialog.Accepted:
             existing = {p.name for p in self.pvs}
             added = 0
-            ml = self._history_maxlen()
             for name in dlg.selected:
                 if name in existing:
                     continue
                 pv = PVConfig(name=name)        # disabled until learned/set
                 self.pvs.append(pv)
-                self.runtime[pv.name] = PVRuntime(history=deque(maxlen=ml))
+                self.runtime[pv.name] = PVRuntime(history=self._new_history())
                 added += 1
             if added:
                 self._recluster()
@@ -7041,10 +7762,9 @@ class MonitorWidget(QWidget):
         if dlg.exec() == QDialog.Accepted:
             self.hub = NotificationHub.from_settings(self.settings)
             self.evaluator = AlertEvaluator(self._eval_config())
-            ml = self._history_maxlen()
+            span, cap = self._history_span_ns(), self._history_cap()
             for rt in self.runtime.values():
-                if rt.history.maxlen != ml:
-                    rt.history = deque(rt.history, maxlen=ml)
+                rt.history = _history_retune(rt.history, span, cap)
             self.timer.setInterval(int(self.settings["poll_interval_s"] * 1000))
             # A widened graph window asks for data further back than launch
             # fetched, so top the history up now.
@@ -7207,15 +7927,11 @@ class MonitorWidget(QWidget):
         """
         self._run_backfill(float(self.settings["graph_window_minutes"]),
                            "Fetching archive history for the graph window…")
-        # The "value unchanged" check needs frozen_after_minutes of history to
-        # ever fire, which is normally more than the visible window. Fetch that
-        # remainder as a follow-up instead of widening the first pass, so the
-        # graph appears immediately and the check is armed a few seconds later.
+        # Nothing needs history beyond the visible window any more: the
+        # "not updating" check only looks at the newest sample's timestamp.
+        # (It used to fetch frozen_after_minutes of extra history to arm the
+        # value-unchanged half of the check, which is gone.)
         self._backfill_followup_min = 0.0
-        if self.settings.get("frozen_check_enabled", True)                 and any(pv.frozen_check for pv in self.pvs):
-            need = float(self.settings.get("frozen_after_minutes", 120))
-            if need > float(self.settings["graph_window_minutes"]):
-                self._backfill_followup_min = need
 
     def extend_backfill(self, minutes: Optional[float] = None):
         """Fetch archive data older than what the graph already holds.
@@ -7276,39 +7992,31 @@ class MonitorWidget(QWidget):
         self._backfill_start_ns = min(start, self._backfill_start_ns or start)
         QThreadPool.globalInstance().start(_BackfillWorker(
             sig, names, start, end, float(self.settings["http_timeout_s"]),
-            ranges, self._history_maxlen(),
+            ranges, self._history_cap(),
             int(self.settings.get("poll_max_workers", 24))))
         self._log(message)
 
     def _on_backfill(self, results: dict):
         self._backfill_inflight = False
         filled = 0
-        for name, pts in results.items():
+        for name, pairs in results.items():
             rt = self.runtime.get(name)
-            if rt is None or not pts:
+            if rt is None or pairs is None:
                 continue
-            # Only add points older than what live polling has produced, so
-            # re-starting monitoring never duplicates samples.
-            oldest_live = rt.history[0][0] if rt.history else None
-            older = [p for p in pts
-                     if oldest_live is None or p[0] < oldest_live]
-            if not older:
+            t, v = pairs
+            if not len(t):
                 continue
-            # Thin the combined series evenly to what the buffer holds. Handing
-            # an over-long list to deque(maxlen=...) would keep only its tail,
-            # i.e. silently drop exactly the older data just fetched.
-            merged = older + list(rt.history)
-            ml = rt.history.maxlen
-            if ml and len(merged) > ml:
-                step = len(merged) / ml
-                newest = merged[-1]
-                merged = [merged[int(i * step)] for i in range(ml)]
-                merged[-1] = newest
-            rt.history = deque(merged, maxlen=ml)
-            filled += 1
+            # Everything older than what live polling already holds goes in
+            # front of it. The buffer drops the overlap, keeps the order, and
+            # if the two together overrun the cap it is this older block that
+            # gets reduced — never the live tail.
+            if rt.history.prepend_samples(t, v):
+                filled += 1
         if filled:
-            self._log(f"Backfilled graph history for {filled} PV(s).")
+            self._log(f"Backfilled graph history for {filled} PV(s) "
+                      f"({self._history_bytes() / 1e6:.0f} MB of readings held).")
             self.graph.redraw()
+        self._warn_if_history_large()
         # Arm the frozen check right after the graph is up (see
         # _backfill_history). Deferred by a tick so this pass is fully settled.
         if self._backfill_followup_min:
@@ -7357,6 +8065,11 @@ class MonitorWidget(QWidget):
         # available this pass to switch state-dependent thresholds.
         names += [g for g in sorted(self._gate_pv_names()) if g not in monitored]
         ranges = {pv.name: self._valid_range(pv) for pv in self.pvs}
+        # Where each PV's graph history currently ends, so a pass that follows
+        # a skipped one can reach back and close the gap instead of leaving a
+        # hole nothing will ever fill (see POLL_GAP_MAX_WINDOWS).
+        newest = {n: getattr(rt.history, "newest_ns", 0)
+                  for n, rt in self.runtime.items()}
         self._poll_gen += 1
         gen = self._poll_gen
         self._poll_inflight = True
@@ -7373,12 +8086,44 @@ class MonitorWidget(QWidget):
         sig.done.connect(lambda res, g=gen: self._poll_done(res, g))
         self._poll_sig = sig   # stale after the delete; only kept as a handle
         QThreadPool.globalInstance().start(
-            _PollWorker(sig, names, dict(self.settings), ranges))
+            _PollWorker(sig, names, dict(self.settings), ranges, newest))
 
     def _poll_done(self, results: dict, gen: int):
         self._poll_inflight = False
         if gen == self._poll_gen:      # stale results (stop/restart) are dropped
             self._on_poll(results)
+
+    def _store_readings(self, pv: PVConfig, rt: PVRuntime, pairs, val, now: int):
+        """Put this pass's archive readings into the PV's graph history.
+
+        Everything the archiver returned in range, not the average: a dip that
+        lasts one reading is exactly what the average hides. The overlap
+        between consecutive passes is dropped inside the buffer.
+
+        A PV that answered with no usable timestamps still gets its one
+        averaged point, so a channel the archiver reports oddly keeps a curve
+        instead of a blank graph.
+        """
+        t, v = pairs if pairs is not None else (_EMPTY_T, _EMPTY_V)
+        if t.size == 0:
+            if val is not None:
+                rt.history.append((rt.last_update_ns, val))
+            return
+        before = getattr(rt.history, "newest_ns", 0)
+        rt.history.append_samples(t, v)
+        # A pass is skipped when the previous one is still fetching, and the
+        # fetch only reaches back POLL_GAP_MAX_WINDOWS. Past that the readings
+        # are gone for good, so say so once rather than leaving an unexplained
+        # hole in the curve.
+        if before:
+            gap_s = (int(t[0]) - before) / 1e9
+            limit = 2.0 * float(self.settings["sample_window_s"])
+            if gap_s > limit and pv.name not in self._gap_logged:
+                self._gap_logged.add(pv.name)
+                self._log(f"Graph gap on {pv.display_name}: "
+                          f"{fmt_duration(gap_s)} with no readings kept — a "
+                          f"poll pass was skipped. Use 'Load older data from "
+                          f"archive' to fill it in.")
 
     def _on_poll(self, results: dict):
         now = api.now_ns()
@@ -7396,7 +8141,7 @@ class MonitorWidget(QWidget):
             res = results.get(pv.name)
             if res is None:
                 continue
-            val, units, last_ts, err, rejected, raw_val = res
+            val, units, last_ts, err, rejected, raw_val, raw_pts = res
             rt = self.runtime[pv.name]
             prev_rej = rt.rejected_count
             rt.current_value = val
@@ -7411,8 +8156,9 @@ class MonitorWidget(QWidget):
                 self._log(f"{pv.display_name}: {err} — treating as sensor error.")
             elif prev_rej and not rejected:
                 self._log(f"{pv.display_name}: readings back within valid range.")
-            if val is not None:
-                rt.history.append((rt.last_update_ns, val))
+            # Every reading the archiver returned goes to the graph, not the
+            # one averaged number the thresholds use. `val` above is untouched.
+            self._store_readings(pv, rt, raw_pts, val, now)
             # Before any threshold work: decide whether this reading is still
             # live at all, so an alert raised below can say if it is not.
             self._update_frozen(pv, rt, now)
@@ -7467,48 +8213,40 @@ class MonitorWidget(QWidget):
                    300.0)
 
     def _update_frozen(self, pv: PVConfig, rt: PVRuntime, now: int) -> None:
-        """Refresh this PV's 'not updating' verdict from its own history.
+        """Refresh this PV's 'not updating' verdict: is a NEW reading arriving?
 
-        Two ways a PV can keep answering while its reading is dead:
+        The one thing that counts is the timestamp of the newest sample. While
+        new samples keep landing, the PV is updating and the value on screen is
+        live — whatever number it carries.
 
-          * the value never changes — the archiver serves the same number over
-            and over (a stuck IOC, a dead sensor);
-          * the newest sample itself stops advancing — the archiver replies, but
-            with data that is minutes to days old.
+        A repeating number used to be taken as a second symptom ("a dead sensor
+        repeats the last digit exactly"), and it was wrong: measured on
+        L3-UTIL-CHL03-001 (DA1 Chiller) on 13 Sep 2026, a sample arrives every
+        ~0.7 s, the sensor reports whole tenths of a degree, and a regulated
+        chiller stays on one tenth for 40–125 min. That produced "PV NOT
+        UPDATING — value unchanged for 2 h" on a perfectly healthy chiller,
+        followed by a "value is changing again" recovery once it drifted a
+        tenth. A steady value is now simply a steady value.
 
-        Either one means what the table shows is not live. A PV with no reading
-        at all this pass is NOT frozen: that is the ordinary 'no data' state,
-        which the State column already reports.
+        A PV with no reading at all this pass is NOT flagged here: that is the
+        ordinary 'no data' state, which the State column already reports.
         """
         def _clear():
             rt.frozen = False
             rt.frozen_reason = ""
-            rt.frozen_since_ns = 0
-            rt.frozen_span_s = 0.0
-            rt.frozen_bounded = False
 
         if not self._frozen_check_on(pv) or rt.current_value is None:
             _clear()
             return
 
-        after_s = float(self.settings.get("frozen_after_minutes", 120)) * 60.0
-        info = detect_frozen(
-            rt.history, now, after_s,
-            min_points=int(self.settings.get("frozen_min_points", 5)))
-        rt.frozen_since_ns = info.since_ns
-        rt.frozen_span_s = info.span_s
-        rt.frozen_bounded = info.bounded
-
-        reasons = []
-        if info.frozen:
-            span = fmt_duration(info.span_s)
-            reasons.append(f"value unchanged for {span}"
-                           + ("" if info.bounded else " (all data kept here)"))
         age_s = (now - rt.data_ts_ns) / 1e9 if rt.data_ts_ns else 0.0
         if age_s > self._sample_age_limit_s():
-            reasons.append(f"newest archive sample is {fmt_duration(age_s)} old")
-        rt.frozen = bool(reasons)
-        rt.frozen_reason = ", ".join(reasons)
+            rt.frozen = True
+            rt.frozen_reason = (f"no new reading for {fmt_duration(age_s)} — "
+                                f"newest archive sample is from "
+                                f"{api.ns_to_prague(rt.data_ts_ns).strftime('%H:%M:%S')}")
+        else:
+            _clear()
 
     def _check_frozen_alerts(self):
         """Send one alert when a PV stops updating and one when it moves again.
@@ -7543,7 +8281,7 @@ class MonitorWidget(QWidget):
         value = rt.current_value if rt.current_value is not None else 0.0
         units = (rt.current_units or pv.units) or ""
         if level == AlertLevel.OK:
-            reason = "Value is changing again — the PV is updating."
+            reason = "New readings are arriving again — the PV is updating."
             prev = AlertLevel.WARNING
         else:
             shown = f"{_fmt(value)} {units}".strip()
@@ -7744,7 +8482,9 @@ class MonitorWidget(QWidget):
         def _is_conn_failure(res) -> bool:
             if res is None:
                 return True
-            val, _units, _ts, err, rejected, _raw = res
+            # A slice, not a full unpack: this cares about three fields, so
+            # the next time the poll result grows a member it stays correct.
+            val, _units, _ts, err, rejected = res[:5]
             return val is None and rejected == 0 and bool(err)
 
         all_failed = all(_is_conn_failure(results.get(pv.name)) for pv in self.pvs)
@@ -7794,10 +8534,14 @@ class MonitorWidget(QWidget):
                 or rt.alert.level == AlertLevel.OK:
             return 1.0, False
 
+        # Hand over only the stretch classify_trend would keep anyway. It
+        # filters by lookback itself, so the verdict is the same; without this
+        # it would walk the whole 12 h of raw readings on every poll of every
+        # alarming PV.
+        lookback_s = float(s.get("trend_lookback_minutes", 10.0)) * 60.0
         trend = classify_trend(
-            rt.history, now,
-            float(s.get("trend_lookback_minutes", 10.0)) * 60.0,
-            5, float(s.get("trend_flat_frac", 0.02)))
+            _history_since(rt.history, now - int(lookback_s * 1e9)), now,
+            lookback_s, 5, float(s.get("trend_flat_frac", 0.02)))
         if trend == Trend.FLAT:
             return 1.0, False
 
@@ -7870,7 +8614,8 @@ class MonitorWidget(QWidget):
         self._alert_sig = sig
         QThreadPool.globalInstance().start(
             _AlertWorker(sig, self.hub, payload, thr, hours, timeout, tag,
-                         vmin, vmax, self._sample_age_limit_s()))
+                         vmin, vmax, self._sample_age_limit_s(),
+                         dpi=int(self.settings.get("chart_dpi", CHART_DPI))))
         return True
 
     def _on_alert_result(self, result):
@@ -8525,23 +9270,56 @@ class MonitorWidget(QWidget):
             if self.hub.webex.is_own_message(it.get("id")):
                 continue
             text = (it.get("text") or "").strip()
+            # The sender is settled before the message is: a line with no slash
+            # may still be an answer to a question WE asked this person, and
+            # who may command the bot is the same rule either way.
+            email = (it.get("personEmail") or "").lower()
             if "/" in text:
                 if not text.startswith("/"):
                     text = text[text.index("/"):]   # strip a leading @mention
             else:
+                bare = self._strip_mention(text)
+                low = bare.lower()
                 # Be forgiving: a bare "help"/"?"/"commands" (no slash) is
                 # treated as /help. Anything else without a slash is ignored
                 # so the bot stays quiet during normal conversation.
-                low = text.lower()
                 if low in ("help", "?", "commands") or low.endswith(" help"):
-                    text = "/help"
+                    # "plot help" asks about /plot; "please help" does not, so
+                    # only a real topic is carried over.
+                    asked = low[:-5].strip() if low.endswith(" help") else ""
+                    topic = bot_commands.help_topic(asked)
+                    text = f"/help {topic}" if topic else "/help"
+                elif self._is_change_answer(bare, email):
+                    if allow and email not in allow:
+                        self._reply(f"⛔ Sorry, {email} is not allowed to "
+                                    f"command me.")
+                        continue
+                    self._answer_change(bare, email)
+                    continue
                 else:
                     continue
-            email = (it.get("personEmail") or "").lower()
             if allow and email not in allow:
                 self._reply(f"⛔ Sorry, {email} is not allowed to command me.")
                 continue
             self._handle_command(text, email)
+
+    def _strip_mention(self, text: str) -> str:
+        """Drop a leading mention of us from a line that holds no slash.
+
+        Webex delivers the tag as plain text ("Diagnostics 6 15"), and every
+        other path finds the command by slicing at the first `/`. An answer to
+        a /change listing has no slash to slice at, and in a room with other
+        people it MUST carry the tag or it never arrives at all.
+        """
+        out = (text or "").strip()
+        name = (getattr(self.hub.webex, "bot_name", "") or "").strip()
+        for cand in ([name] if name else []) + ["Diagnostics", "Diagnostic"]:
+            for form in (f"@{cand}", cand):
+                if form and out.lower().startswith(form.lower()):
+                    rest = out[len(form):]
+                    if not rest or rest[:1] in (" ", ",", ":", "\t"):
+                        return rest.lstrip(" ,:\t")
+        return out
 
     def _reply(self, markdown: str):
         first = markdown.splitlines()[0] if markdown else ""
@@ -8550,31 +9328,60 @@ class MonitorWidget(QWidget):
             QThreadPool.globalInstance().start(
                 _TextReplyWorker(self.hub.webex, markdown))
 
-    def _find_pv(self, query: str):
-        """Return (pv, '') on a unique match, else (None, reason)."""
+    def _find_pvs(self, query: str) -> list:
+        """Every PV matching `query`, best first (empty list when none do).
+
+        An exact name wins on its own; otherwise the family-wide PV search rules
+        apply — words are tokens, AND-matched anywhere in the name, ranked.
+        """
         q = query.strip().lower()
         if not q:
-            return None, "missing PV name"
+            return []
         exact = [p for p in self.pvs
                  if p.display_name.lower() == q or p.name.lower() == q]
         if exact:
-            return exact[0], ""
-        matches = [p for p in self.pvs
-                   if q in p.display_name.lower() or q in p.name.lower()]
+            return exact[:1]
+        return bot_commands.search_pvs(self.pvs, q)
+
+    def _find_pv(self, query: str):
+        """Return (pv, '') on a unique match, else (None, reason).
+
+        For the commands that really can only take one PV — the live graph.
+        """
+        if not query.strip():
+            return None, "missing PV name"
+        matches = self._find_pvs(query)
         if len(matches) == 1:
             return matches[0], ""
         if not matches:
             return None, f"no PV matches '{query}'"
         names = ", ".join(p.display_name for p in matches[:8])
-        return None, f"'{query}' is ambiguous: {names}"
+        more = f" (+{len(matches) - 8} more)" if len(matches) > 8 else ""
+        return None, f"'{query}' matches several PVs: {names}{more}"
 
-    def _resolve_pvs(self, items: list[str]):
+    def _resolve_pvs(self, items: list[str], expand: bool = True):
         """Resolve a comma-separated item list to PVs, keeping the order and
-        dropping duplicates. Returns (pvs, errors); 'all' means every PV."""
+        dropping duplicates. Returns (pvs, errors); 'all' means every PV.
+
+        With `expand` (the default) a fragment that hits several PVs brings all
+        of them in — typing `plfe` is how somebody asks for the PLFE group, and
+        answering "ambiguous" to that was just an obstacle. Only a fragment that
+        hits NOTHING is an error.
+        """
         if len(items) == 1 and items[0].strip().lower() == "all":
             return list(self.pvs), []
         pvs, errors, seen = [], [], set()
         for it in items:
+            if expand:
+                matches = self._find_pvs(it)
+                if not matches:
+                    errors.append(f"no PV matches '{it}'"
+                                  if it.strip() else "missing PV name")
+                for pv in matches:
+                    if pv.name not in seen:
+                        seen.add(pv.name)
+                        pvs.append(pv)
+                continue
             pv, err = self._find_pv(it)
             if pv is None:
                 errors.append(err)
@@ -8590,19 +9397,22 @@ class MonitorWidget(QWidget):
         self._log(f"Webex cmd from {email}: {text}")
         try:
             if cmd in ("/help", "/?"):
-                self._reply(self._cmd_help())
+                # "/help plot" is a question about one command, not a request
+                # for the whole cheat sheet again.
+                self._reply(self._cmd_help_topic(pc.args) if pc.args.strip()
+                            else self._cmd_help())
             elif cmd == "/list":
-                if not self.pvs:
-                    self._reply("No PVs configured.")
-                else:
-                    self._reply("**PVs:**\n" + "\n".join(
-                        f"- {p.display_name}" for p in self.pvs))
+                self._reply(self._cmd_list(pc.items))
             elif cmd == "/status":
                 self._reply(self._cmd_status(pc.items))
             elif cmd == "/alarms":
-                self._reply(self._cmd_alarms())
+                self._reply(self._cmd_alarms(pc.items))
             elif cmd in ("/cancel", "/abort", "/nevermind"):
-                self._cmd_cancel()
+                self._cmd_cancel(email)
+            elif cmd in ("/change", "/limit", "/limits"):
+                self._cmd_change(pc, email)
+            elif cmd == "/undo":
+                self._cmd_undo(email)
             elif cmd == "/start":
                 self.toggle_monitoring(True)
                 self._reply("▶ Monitoring started.")
@@ -8750,6 +9560,9 @@ class MonitorWidget(QWidget):
             body += f"- **Y range:** {opts.yaxis[0]:g} … {opts.yaxis[1]:g}\n"
         if opts.detail:
             body += "- **Detail:** every single reading\n"
+        if opts.dpi:
+            body += (f"- **Resolution:** {opts.dpi} dpi "
+                     f"({8 * opts.dpi} × {4 * opts.dpi} px)\n")
         for w in opts.warnings:
             body += f"- ⚠ {w}\n"
         body += "\n".join(self._status_line(pv) for pv in pvs)
@@ -8774,6 +9587,7 @@ class MonitorWidget(QWidget):
             max_workers=int(self.settings.get("plot_max_workers", 10)),
             budget=int(self.settings.get("plot_request_budget", 600)),
             n_bins=int(self.settings.get("plot_bins", 900)),
+            dpi=opts.dpi or int(self.settings.get("chart_dpi", CHART_DPI)),
             log_fn=self._log))
         hint = "" if opts.time is None or opts.time.hours <= 24 else \
             " Send `/cancel` if you asked for the wrong window."
@@ -8791,16 +9605,331 @@ class MonitorWidget(QWidget):
                 stopped.append(token.label)
         return stopped
 
-    def _cmd_cancel(self):
+    def _cmd_cancel(self, email: str = ""):
         stopped = self._cancel_jobs()
+        # An unanswered /change listing is also something somebody may want to
+        # take back — and leaving it open means the next bare number in the
+        # room moves a limit.
+        dropped = self._change_pending.pop((email or "").lower(), None)
+        if dropped is not None:
+            self._log(f"Webex: /change question for {email} dropped.")
         if not stopped:
-            self._reply("Nothing is running — there is nothing to cancel.")
+            self._reply("Dropped the limits question — nothing changed."
+                        if dropped is not None else
+                        "Nothing is running — there is nothing to cancel.")
             return
         names = "; ".join(stopped)
         self._log(f"Webex: plot cancelled ({names}).")
+        tail = " The limits question is dropped too." if dropped else ""
         self._reply(f"🛑 Cancelled: {names}. "
                     f"Requests already sent still have to come back, so it can "
-                    f"take a few seconds — but nothing will be sent.")
+                    f"take a few seconds — but nothing will be sent.{tail}")
+
+    # -- /change ------------------------------------------------------------
+
+    def _is_change_answer(self, text: str, email: str) -> bool:
+        """True when `text` reads as a reply to a listing this person asked for.
+
+        Both halves matter: there has to be a live question from THIS sender,
+        and the line has to parse. That is what keeps ordinary conversation in
+        the room — and a number typed by somebody who never asked — out of the
+        limits.
+        """
+        sess = self._change_pending.get((email or "").lower())
+        if sess is None or sess.stale(api.now_ns()):
+            return False
+        return bot_commands.looks_like_answer(text, sess.rows)
+
+    def _answer_change(self, text: str, email: str):
+        """A reply to the listing, however it arrived — bare, or as /change."""
+        key = (email or "").lower()
+        sess = self._change_pending.get(key)
+        now = api.now_ns()
+        if sess is None:
+            self._reply("⚠ I have not asked you anything. `/change <pv>` "
+                        "prints a PV's limits with a number against each.")
+            return
+        if sess.stale(now):
+            del self._change_pending[key]
+            self._reply(f"⚠ That limits list is more than "
+                        f"{CHANGE_SESSION_TTL_S // 60} minutes old, so I have "
+                        f"forgotten it — nothing changed. Send `/change "
+                        f"{sess.pv_name}` again.")
+            return
+        pv = next((p for p in self.pvs if p.name == sess.pv_name), None)
+        if pv is None:
+            del self._change_pending[key]
+            self._reply(f"⚠ {sess.pv_name} is not configured any more — "
+                        f"nothing changed.")
+            return
+        try:
+            pairs = bot_commands.parse_change_answer(text, sess.rows)
+        except bot_commands.CommandError as e:
+            self._reply(f"⚠ {e}")
+            return
+        self._apply_limit_changes(pv, pairs, email)
+
+    def _cmd_change(self, pc, email: str):
+        """`/change <pv>` prints the listing; `/change 6 15` answers it."""
+        key = (email or "").lower()
+        raw = pc.args.strip()
+        if not raw:
+            sess = self._change_pending.get(key)
+            if sess is not None and not sess.stale(api.now_ns()):
+                pv = next((p for p in self.pvs if p.name == sess.pv_name), None)
+                if pv is not None:
+                    self._reply(self._change_listing(pv, sess.rows))
+                    return
+            self._reply(
+                "**`/change <pv>`** — move a warning or alarm limit.\n"
+                "I print the PV's limits with a number against each one, and "
+                "you answer `6 15`. `/list` has the PV names; `/help change` "
+                "has the rest.")
+            return
+        # An answer typed as a command — "/change 6 15" — is how the follow-up
+        # is sent in a room, because a bare line there never reaches me.
+        if self._is_change_answer(raw, email):
+            self._answer_change(raw, email)
+            return
+        # "/change DA1; warn high 25" — the house separator, so a PV name with
+        # spaces in it can never be mistaken for part of the answer.
+        if pc.options:
+            pv, err = self._find_pv(pc.first)
+            if pv is None:
+                self._reply(f"⚠ {err}")
+                return
+            self._change_in_one_line(pv, ", ".join(pc.options), email)
+            return
+        # "/change DA1 warn high 25" — no separator. The PV name is the longest
+        # leading part that names exactly one PV; whatever is left has to read
+        # as an answer, or this was simply a PV name and the listing is what
+        # was wanted.
+        words = raw.split()
+        for cut in range(len(words) - 1, 0, -1):
+            hits = self._find_pvs(" ".join(words[:cut]))
+            if len(hits) != 1:
+                continue
+            tail = " ".join(words[cut:])
+            if bot_commands.looks_like_answer(tail,
+                                              bot_commands.limit_rows(hits[0])):
+                self._change_in_one_line(hits[0], tail, email)
+                return
+        pv, err = self._find_pv(pc.first)
+        if pv is None:
+            # A fragment fitting several PVs lists them, the way /graph does:
+            # there is one list of limits to number, so this really is a
+            # one-PV command.
+            tail = (" — one PV at a time, so name one of them."
+                    if "several" in err else "")
+            self._reply(f"⚠ {err}{tail}")
+            return
+        rows = bot_commands.limit_rows(pv)
+        self._change_pending[key] = _ChangeSession(pv.name, rows, api.now_ns())
+        self._reply(self._change_listing(pv, rows))
+
+    def _change_in_one_line(self, pv: PVConfig, answer: str, email: str):
+        """`/change <pv> <answer>` — the whole thing without the listing."""
+        try:
+            pairs = bot_commands.parse_change_answer(
+                answer, bot_commands.limit_rows(pv))
+        except bot_commands.CommandError as e:
+            self._reply(f"⚠ {e} `/change {pv.display_name}` prints the list.")
+            return
+        self._apply_limit_changes(pv, pairs, email)
+
+    def _change_listing(self, pv: PVConfig, rows: list) -> str:
+        """The numbered limits of one PV, with the rule in force marked."""
+        rt = self.runtime.get(pv.name)
+        units = (rt.current_units if rt and rt.current_units else pv.units) or ""
+        head = f"**{pv.display_name}** — `{pv.name}`"
+        if units:
+            head += f", {units}"
+        live = self._limits_label(pv, self._match_profile(pv))
+        if rt and rt.current_value is not None:
+            head += f"\nValue now **{_fmt(rt.current_value)}** — *{live}* in force"
+        else:
+            head += f"\nNo reading right now — *{live}* in force"
+        out = [head, ""]
+        scope = None
+        for r in rows:
+            if r.scope != scope:
+                scope = r.scope
+                mark = "  ← in force now" if scope == live else ""
+                out.append(f"**{scope}**{mark}")
+            shown = "not set" if r.value is None else _fmt(r.value)
+            out.append(f"`{r.n}` {r.label} **{shown}**")
+        who = bot_commands.bot_tag(getattr(self.hub.webex, "bot_name", ""))
+        # The worked example is built out of THIS PV's own rows, so it always
+        # names a number that exists — a PV with no rules stops at 4 — and
+        # pasting it back unchanged moves nothing.
+        ex = [r for r in rows if r.scope == live and r.field.endswith("_high")]
+        ex = ex or rows
+        n1, v1 = ex[0].n, ("15" if ex[0].value is None else _fmt(ex[0].value))
+        n2 = ex[-1].n
+        out += [
+            "",
+            f"Answer `{who} {n1} {v1}` — the limit's number, then what it "
+            f"should be. In a room the tag is what gets it to me; "
+            f"`{who} /change {n1} {v1}` is the same thing. Several at once: "
+            f"`{n1} {v1}, {n2} …`. Names work too: `warn high {v1}`.",
+            f"`/cancel` drops the question; I forget it after "
+            f"{CHANGE_SESSION_TTL_S // 60} min.",
+        ]
+        return "\n".join(out)
+
+    @staticmethod
+    def _limit_get(pv: PVConfig, prof_index, attr):
+        if prof_index is None:
+            return getattr(pv, attr, None)
+        return (pv.profiles[prof_index] or {}).get(attr)
+
+    @staticmethod
+    def _limit_set(pv: PVConfig, prof_index, attr, value):
+        """Write one bound straight onto the PV.
+
+        Deliberately not via ThresholdsEditor.apply_to, which rebuilds the whole
+        profile list out of table cells — here only the one number moves.
+        """
+        if prof_index is None:
+            setattr(pv, attr, value)
+        else:
+            pv.profiles[prof_index][attr] = value
+
+    def _limit_scope_values(self, pv: PVConfig, prof_index) -> dict:
+        return {attr: self._limit_get(pv, prof_index, attr)
+                for attr, _ in bot_commands.LIMIT_FIELDS}
+
+    def _apply_limit_changes(self, pv: PVConfig, pairs: list, email: str):
+        """Validate, write, save and say what happened."""
+        # Try the whole answer on a copy of the affected scopes first: a line
+        # that moves two bounds at once has to be judged as a whole, and a
+        # refusal must leave nothing written.
+        wanted: dict = {}
+        for row, value in pairs:
+            wanted.setdefault(row.prof_index,
+                              self._limit_scope_values(pv, row.prof_index))
+            wanted[row.prof_index][row.field] = value
+        for prof_index, values in wanted.items():
+            problem = bot_commands.check_limit_order(values)
+            if problem:
+                scope = next(r.scope for r, _ in pairs
+                             if r.prof_index == prof_index)
+                self._reply(f"⚠ {scope}: {problem} Nothing changed.")
+                return
+        before, lines, notes = [], [], []
+        rt = self.runtime.get(pv.name)
+        now_val = rt.current_value if rt else None
+        for row, value in pairs:
+            old = self._limit_get(pv, row.prof_index, row.field)
+            before.append((row.prof_index, row.field, old))
+            self._limit_set(pv, row.prof_index, row.field, value)
+            shown_old = "not set" if old is None else _fmt(old)
+            shown_new = "cleared" if value is None else _fmt(value)
+            lines.append(f"**{row.scope}** {row.label}: "
+                         f"{shown_old} → **{shown_new}**")
+            notes += self._limit_warnings(pv, row, value, now_val)
+        self.model.refresh_all()
+        self.persist()
+        what = "; ".join(lines)
+        self._log(f"Webex /change from {email}: {pv.display_name} — {what}")
+        self._change_pending.pop((email or "").lower(), None)
+        self._change_undo = _ChangeUndo(pv.name, pv.display_name, before,
+                                        what, email, api.now_ns())
+        self._reply(self._change_done(pv, lines, notes,
+                                      "`/undo` puts it back."))
+
+    def _limit_warnings(self, pv: PVConfig, row, value, now_val) -> list:
+        """Things worth saying out loud about a number that was accepted.
+
+        None of these refuse the change — the operator may well mean it — but a
+        limit that can never fire, or one the value is already the wrong side
+        of, is exactly the shape of a typo.
+        """
+        out = []
+        if value is None:
+            out.append(f"**{row.scope}** {row.label} is now unset — that side "
+                       f"raises nothing at all.")
+            return out
+        lo, hi = pv.valid_min, pv.valid_max
+        if (lo is not None and value < lo) or (hi is not None and value > hi):
+            out.append(f"{_fmt(value)} is outside this PV's valid range "
+                       f"({'–' if lo is None else _fmt(lo)} to "
+                       f"{'–' if hi is None else _fmt(hi)}), so a reading can "
+                       f"never get there.")
+        if now_val is not None:
+            high_side = row.field.endswith("_high")
+            if high_side and now_val > value:
+                out.append(f"The value is {_fmt(now_val)} right now, already "
+                           f"above the new {row.label}.")
+            elif not high_side and now_val < value:
+                out.append(f"The value is {_fmt(now_val)} right now, already "
+                           f"below the new {row.label}.")
+        return out
+
+    def _change_done(self, pv: PVConfig, lines: list, notes: list,
+                     tail: str) -> str:
+        """The confirmation, including when it bites and where it was saved."""
+        try:
+            poll_s = int(float(self.settings.get("poll_interval_s", 30)))
+        except (TypeError, ValueError):
+            poll_s = 30
+        try:
+            grace_min = float(self.settings.get("rule_change_grace_minutes",
+                                                20.0))
+        except (TypeError, ValueError):
+            grace_min = 20.0
+        out = [f"✅ **{pv.display_name}**"]
+        out += [f"- {ln}" for ln in lines]
+        if notes:
+            out += ["", "⚠ " + " ".join(notes)]
+        when = f"Takes effect at the next reading (within {poll_s} s)"
+        if grace_min > 0:
+            when += (f"; alerting for this PV is then held for "
+                     f"{grace_min:g} min while the value follows")
+        out += ["", when + f". {tail}"]
+        if not self.shared_ok:
+            out.append("⚠ The shared PV list could not be reached, so this "
+                       "change is saved on this PC only.")
+        return "\n".join(out)
+
+    def _cmd_undo(self, email: str):
+        """One step back from the last /change."""
+        u = self._change_undo
+        if u is None:
+            self._reply("Nothing to undo — I have not changed a limit since "
+                        "the program started.")
+            return
+        pv = next((p for p in self.pvs if p.name == u.pv_name), None)
+        if pv is None:
+            self._change_undo = None
+            self._reply(f"⚠ {u.display_name} is not configured any more — "
+                        f"nothing to put back.")
+            return
+        lines = []
+        for prof_index, attr, old in u.before:
+            if prof_index is not None and prof_index >= len(pv.profiles):
+                continue        # the rule has been deleted in the window since
+            now_v = self._limit_get(pv, prof_index, attr)
+            self._limit_set(pv, prof_index, attr, old)
+            scope = ("Global" if prof_index is None
+                     else bot_commands.profile_label(pv.profiles[prof_index],
+                                                      prof_index))
+            label = dict(bot_commands.LIMIT_FIELDS)[attr]
+            lines.append(f"**{scope}** {label}: "
+                         f"{'cleared' if now_v is None else _fmt(now_v)} → "
+                         f"**{'not set' if old is None else _fmt(old)}**")
+        if not lines:
+            self._change_undo = None
+            self._reply("⚠ The rules that change touched are gone — nothing "
+                        "to put back.")
+            return
+        self.model.refresh_all()
+        self.persist()
+        self._change_undo = None
+        self._log(f"Webex /undo from {email}: {pv.display_name} — "
+                  f"{'; '.join(lines)}")
+        self._reply(self._change_done(
+            pv, lines, [], "That was the only step back I keep."))
 
     def _on_chart_result(self, result):
         token, errors, had_png, cancelled = result
@@ -8815,7 +9944,42 @@ class MonitorWidget(QWidget):
             self._log("Chart sent." if had_png
                       else "Chart sent (no data in that window — text only).")
 
+    def _cmd_help_topic(self, topic: str) -> str:
+        """The long help for one command — the answer to `/help plot`.
+
+        The cheat sheet has to stay skimmable on a phone, so the syntax, the
+        worked examples and above all the traps of one command live here
+        instead. The canteen is the exception: its own long help already exists
+        in okbase_menu, and is handed over rather than written twice.
+        """
+        asked = topic.strip().lstrip("/").split(";")[0].strip()
+        if bot_commands.help_topic(asked) == "" \
+                and asked.split()[0].lower() in ("food", "menu", "lunch"):
+            return okbase_menu.FOOD_HELP
+        # Tagging is not a command, so its page cannot be a constant: it has to
+        # carry the bot's real name to be worth anything.
+        if bot_commands.is_mention_topic(asked):
+            return bot_commands.mention_help_full(
+                getattr(self.hub.webex, "bot_name", ""))
+        body = bot_commands.command_help(asked)
+        if body:
+            return body
+        topics = ", ".join(f"`{t}`" for t in bot_commands.help_topics())
+        return (f"I have no separate page for '{asked}'. Try `/help <command>` "
+                f"with one of: {topics}, `food`, `mention`.\n\nOr `/help` on "
+                f"its own for the whole list of commands.")
+
     def _cmd_help(self) -> str:
+        """The cheat sheet: one line per command, and nothing else.
+
+        This used to run to several screens — the whole catalogue of time
+        windows, six lines on /plot alone, and forty on ordering lunch — which
+        is no use to somebody standing at the machine with a phone. So each
+        command gets ONE line: what it takes, and the single condition that
+        would otherwise trip them up. Everything else moved to the `/help
+        <command>` pages, which is what those pages are for; the lunch-ordering
+        section lives on `/help food`, under okbase_menu.FOOD_HELP.
+        """
         # The mention rule goes first, and with the bot's real name in it when the
         # listener has already asked Webex for it.
         return (
@@ -8825,48 +9989,35 @@ class MonitorWidget(QWidget):
             + bot_commands.SYNTAX_HELP + "\n"
             "\n"
             "**Commands**\n"
-            "- `/status [pv, pv]` — values + state, all PVs or just those. "
-            "Every reply says when the values were last read; if I have stopped "
-            f"reading, each line says `{NOT_REFRESHED_LABEL}` instead of `ok` "
-            "and a warning goes above the list.\n"
-            "- `/alarms` — only PVs currently in warning/alarm, plus any that "
-            "stopped updating\n"
-            "- `/list` — the configured PVs\n"
-            "- `/plot <pv, pv, …>[; window][; y lo-hi][; detail]` — send one "
-            "graph with a curve per PV, e.g. "
-            "`/plot Chiller 1, Chiller 2; yesterday 7-18` or "
-            "`/plot Chiller 1; 1.1. 9:00 - 1.9. 12:00`. "
-            "`/plot all` takes every PV; a single PV also gets its limit "
-            "lines. Over a long window the curve is the average of each point "
-            "with a shaded band from its lowest to its highest reading, so a "
-            "short peak still shows; `; detail` reads every single reading "
-            "instead, which is slow over months.\n"
-            "- `/cancel` — drop a plot that is still being fetched, so a long "
-            "window asked for by mistake does not have to be waited out "
-            "(`/abort` does the same)\n"
-            "- `/start` — alerting on (PVs are read and plotted either way)\n"
-            "- `/stop [hours]` — alerting off; with hours, auto-resume later "
-            "(e.g. `/stop 10`). This is about alerting, not about a running "
-            "plot — that one is `/cancel`.\n"
-            "- `/enable <pv, pv>` `/disable <pv, pv>` — alerting per PV\n"
-            "- `/datawatchdog on|off` — the 'no data at all' alert "
-            "(no argument: show current state)\n"
-            "- `/graph <pv|all>` — what the app window itself shows\n"
-            "- `/window <minutes>` — time window of that live graph\n"
-            "- `/yaxis <lo-hi>|auto` — Y range of that live graph\n"
-            "- `/run` — start the app when it is closed (answered by the "
-            "always-on listener; if the app is already open it says so)\n"
-            "- `/food` — the canteen menu: today until 14:30, the next serving "
-            "day after that; `/food today`, `/food week`, `/food tomorrow`, "
-            "`/food friday`, `/food 27.8.`, `/food refresh`. Read from OKbase "
-            "once a day, and answered even when the app is closed.\n"
+            "- `/status [pv]` — value and state; no PV means all of them, and "
+            f"`{NOT_REFRESHED_LABEL}` in place of `ok` means I stopped reading\n"
+            "- `/alarms [pv]` — only what is in warning or alarm right now\n"
+            "- `/list [pv]` — the configured PVs\n"
+            "- `/plot <pv, …>[; window][; y lo-hi]` — one picture, a curve per "
+            "PV; a long window takes minutes\n"
+            "- `/cancel` — drop a plot that is still being fetched, or an "
+            "unanswered limits question (`/abort` does the same)\n"
+            "- `/change <pv>` — move a warning or alarm limit; one PV at a "
+            "time, and I ask which limit\n"
+            "- `/undo` — put the last limit change back\n"
+            "- `/start`, `/stop [hours]` — alerting on and off; PVs are read "
+            "and plotted either way\n"
+            "- `/enable <pv>`, `/disable <pv>` — alerting for one PV or a "
+            "whole group\n"
+            "- `/datawatchdog on|off` — the 'no data at all' alert; no "
+            "argument shows the state\n"
+            "- `/graph <pv|all>`, `/window <minutes>`, `/yaxis <lo-hi>|auto` — "
+            "the live graph in the app's own window, not a picture in the "
+            "chat; `/graph` takes a single PV\n"
+            "- `/run` — start the app when it is closed\n"
+            "- `/food [today|tomorrow|week|friday|27.8.]` — the canteen menu, "
+            "answered even when the app is closed; ordering lunch is "
+            "`/help food`\n"
             "\n"
-            # A section of its own, and last, because it is the only thing here
-            # that WRITES to somebody's HR portal — and because the ordering
-            # words got typed wrong twice while they were one bullet among
-            # twenty. Kept in okbase_menu so `/help` and `/food help` cannot
-            # drift apart.
-            + okbase_menu.ORDER_HELP)
+            "**`/help <command>`** is the long version — the examples and what "
+            "to watch out for. Pages: "
+            + ", ".join(f"`{t}`" for t in bot_commands.help_topics())
+            + ", `food`, `mention`.")
 
     def _status_line(self, p: PVConfig) -> str:
         rt = self.runtime.get(p.name)
@@ -8904,17 +10055,43 @@ class MonitorWidget(QWidget):
             state = "no data"
         return f"- **{p.display_name}**: {val} {units} [{state}]"
 
+    def _cmd_list(self, items: Optional[list[str]] = None) -> str:
+        """The configured PVs, or just those matching what was typed after
+        `/list` — `/list plfe` answers with the PLFE ones."""
+        if not self.pvs:
+            return "No PVs configured."
+        if not items or (len(items) == 1 and items[0].strip().lower() == "all"):
+            return "**PVs:**\n" + "\n".join(
+                f"- {p.display_name}" for p in self.pvs)
+        pvs, errors = self._resolve_pvs(items)
+        if not pvs:
+            return (f"⚠ {'; '.join(errors)}. Send `/list` for the whole list.")
+        what = ", ".join(i.strip() for i in items)
+        head = f"**PVs matching '{what}' ({len(pvs)} of {len(self.pvs)}):**"
+        out = head + "\n" + "\n".join(f"- {p.display_name}" for p in pvs)
+        if errors:
+            out += "\n\n_⚠ " + "; ".join(errors) + "._"
+        return out
+
     def _cmd_status(self, items: Optional[list[str]] = None) -> str:
         if not self.pvs:
             return "No PVs configured."
-        pvs = self.pvs
+        pvs, errors = self.pvs, []
         if items:
             pvs, errors = self._resolve_pvs(items)
-            if errors:
-                return "⚠ " + "; ".join(errors)
+            if not pvs:
+                return "⚠ " + "; ".join(errors or ["missing PV name"])
         mon = "MONITORING" if self._monitoring else "stopped (reading only)"
-        out = (f"**Status ({mon}):**\n"
+        what = ""
+        if items and len(pvs) != len(self.pvs):
+            # Say what was matched: a fragment can bring in a whole group, and
+            # a list of four lines with no caption looks like the whole list.
+            what = (f" — {', '.join(i.strip() for i in items)}: "
+                    f"{len(pvs)} of {len(self.pvs)} PVs")
+        out = (f"**Status ({mon}){what}:**\n"
                + "\n".join(self._status_line(p) for p in pvs))
+        if errors:
+            out += "\n\n_⚠ " + "; ".join(errors) + "._"
         # The warning goes ABOVE the values, not below them: read on a phone,
         # the first line is the only one that is certain to be read, and if the
         # numbers are out of date that is the thing to know before reading them.
@@ -8983,9 +10160,18 @@ class MonitorWidget(QWidget):
         late = f" — {NOT_REFRESHED_LABEL} ⚠" if self._refresh_fault() else ""
         return f"Values read at {when} ({age} ago){late}"
 
-    def _cmd_alarms(self) -> str:
+    def _cmd_alarms(self, items: Optional[list[str]] = None) -> str:
+        pool, errors = self.pvs, []
+        if items and not (len(items) == 1
+                          and items[0].strip().lower() == "all"):
+            pool, errors = self._resolve_pvs(items)
+            if not pool:
+                return "⚠ " + "; ".join(errors or ["missing PV name"])
+        scope = ""
+        if len(pool) != len(self.pvs):
+            scope = f" (of {', '.join(i.strip() for i in items)})"
         lines, frozen = [], []
-        for p in self.pvs:
+        for p in pool:
             if not p.enabled:
                 continue
             rt = self.runtime.get(p.name)
@@ -9017,9 +10203,10 @@ class MonitorWidget(QWidget):
                          f"[{level.label.lower()}{held}]")
         out = []
         if lines:
-            out.append("**Current alarms:**\n" + "\n".join(lines))
+            out.append(f"**Current alarms{scope}:**\n" + "\n".join(lines))
         if frozen:
-            out.append(f"**⚠ Reading is not live:**\n" + "\n".join(frozen))
+            out.append(f"**⚠ Reading is not live{scope}:**\n"
+                       + "\n".join(frozen))
         note = self._refresh_note_short()
         if not out:
             # "No alarms" is a claim about the present. While the values are
@@ -9028,8 +10215,15 @@ class MonitorWidget(QWidget):
                 return (f"{note}\n"
                         f"_I cannot tell whether anything is in alarm right "
                         f"now; nothing was in alarm at the last reading._")
-            return f"✅ No PVs currently in warning/alarm.\n\n_{self._freshness_footer()}_"
-        return self._freshness_header() + "\n\n".join(out)
+            if not any(p.enabled for p in pool):
+                # Otherwise "no alarms" would be a verdict on PVs that are not
+                # being judged at all.
+                return (f"ℹ️ Alerting is off for every PV{scope}, so there is "
+                        f"nothing to report. `/status` shows their values.")
+            return (f"✅ No PVs{scope} currently in warning/alarm.\n\n"
+                    f"_{self._freshness_footer()}_")
+        tail = ("\n\n_⚠ " + "; ".join(errors) + "._") if errors else ""
+        return self._freshness_header() + "\n\n".join(out) + tail
 
     # --- simulate ------------------------------------------------------
     def simulate_alert(self):

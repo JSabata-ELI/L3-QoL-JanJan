@@ -2,614 +2,701 @@
 Created by Jan Moucka, ELI Laser
 
 Bugs / suggestions: jan.moucka@eli-laser.eu
-Verified against source: 2026-09-02  (a.py, 3718 lines)
 -----------------------------------------------------------------
 Short version: ReadMe Announcer.txt  ("ReadMe" button)
-Code map:      STRUCTURE.md
 -----------------------------------------------------------------
-
 
 =================================================================
 1. WHAT THE PROGRAM DOES
 =================================================================
 
-1.1 CONDITIONS
+  You keep a list of things that have to stay true. The program checks
+  the whole list twice a second and the moment one of them stops being
+  true it raises the alarm, saying in your own words what needs doing.
 
-    A condition is one thing that has to stay true while the program
-    is watching. You keep a list of them; all of them are checked
-    twice a second, and the first one that stops being true raises
-    the alarm and says what needs doing.
+  There is one list and two kinds of thing on it.
 
-    Three kinds, one per tab:
 
-      Screen areas  a rectangle of a screen still looks the way it
-                    did when its reference picture was taken
-      Values        a machine value stays under its limit, and — if
-                    you attach one — a screen area still matches its
-                    picture as well
-      Halls         the beam is going where you said it is going
+1.1 A VALUE
 
-    Each one has a name and a sentence of your own — that sentence is
-    what appears when it fires, so it can say "check the L3BT
-    alignment in HP" rather than "change detected".
+  An archived number that has to stay inside its limits. Four limits,
+  and any of them can be left empty:
 
-    The tabs only sort the list. Everything in it is watched at once,
-    whichever tab happens to be open, and the first thing to go wrong
-    raises the alarm.
+    Lo Lo   below this it FIRES
+    Lo      below this it only warns
+    Hi      above this it only warns
+    Hi Hi   above this it FIRES
 
-    The screen check does not understand what it is looking at, and
-    that is the whole point: it works on a camera window, a
-    control-system screen, a warning lamp, a number, a graph, a web
-    page — anything that is drawn on a screen.
+  An empty box means that limit is switched off. It does NOT mean
+  zero. A zero limit on an energy would fire the moment the laser
+  runs, so empty has to mean "don't check".
 
-1.2 THE QUICK RECTANGLE
+  A value can also watch the DIFFERENCE between two channels — a
+  chiller's temperature minus its setpoint, for instance. The second
+  channel is held forward, which matters: a setpoint is written once a
+  week, so a ten-second window of it is empty almost always, and
+  without holding it forward the deviation would be unreadable exactly
+  when the chiller was behaving.
 
-    "Set reference" on the Screen areas tab draws one rectangle
-    without giving it a name, exactly as the program has always
-    worked. It is watched alongside the conditions and it is not
-    remembered as a condition. Use it for a one-off, and a condition
-    for anything you want to keep.
 
-1.3 THE MACHINE VALUE BADGES
+1.2 A SCREEN AREA
 
-    Eight values from the machine, read twice a second, each shown
-    as a coloured badge only when it is outside its limits. Nothing
-    to configure and nothing to draw.
+  A rectangle of a screen that has to keep looking like its reference
+  picture. The program keeps the reference, takes a new picture twice a
+  second, and compares them. If the average difference is bigger than
+  the sensitivity number you set, that counts as a change.
 
-    IMPORTANT: this half only runs while the program is watching.
-    Pressing Start turns it on; stopping turns it off and the badges
-    disappear with it.
+  It does not understand what it is looking at. It only knows the
+  picture is no longer the same one. That is exactly what makes it work
+  on anything at all.
+
+
+1.3 SHOWS ONLY, OR RAISES THE ALARM
+
+  Every row carries that switch.
+
+    shows only         the row goes red in the table, and a badge with
+                       your sentence appears next to the circle.
+                       Nothing flashes and nothing beeps.
+    raises the alarm    all of that, plus the flashing window and the
+                       sound.
+
+  The fourteen machine values the program starts with are set to
+  "shows only", because that is what they have always done. Anything
+  you add yourself defaults to raising the alarm.
+
+
+1.4 PRESETS — SETS OF ALARMS TO WORK IN
+
+  A preset is a named set of alarms. Pick one in the drop-down at the
+  top of the window and it is the only set you see: the Watch, Values
+  and Areas lists hold nothing else, and nothing else is watched
+  either. So you can set up a night shift without the commissioning
+  alarms in the way, and switch between them with one click.
+
+  All alarms       everything there is — the normal view
+  Unassigned       everything that is in no preset. The program makes
+                   this one itself; you cannot rename or delete it.
+
+  An alarm may be in several presets at once. Nothing is ever lost by
+  making your first preset: what you do not put in one stays under
+  Unassigned, and there it is still listed and still watched whenever
+  Unassigned or All alarms is chosen.
+
+  How to put an alarm in a preset:
+
+    · press "Manage presets" at the top to make, rename or forget a
+      set. Forgetting a set keeps its alarms — they become Unassigned.
+    · in an alarm's own editor, tick the sets it belongs to under
+      Presets.
+    · or pick the rows in the Values or Areas list, RIGHT-CLICK them
+      and choose "Assign to a preset" — every row you picked is
+      changed, and the menu says how many it is about.
+
+  Add an alarm while a preset is chosen and it joins that preset, or
+  it would vanish the moment you saved it.
+
+  Each alarm fires on its own. Being in the same preset as another
+  alarm does not make one wait for the other. (The old "Group" column
+  did exactly that; it is gone, and any group names you had are now
+  presets with the same names.)
 
 
 =================================================================
-2. SETTING UP
+2. THE FOUR TABS
 =================================================================
 
-2.1 A SCREEN AREA CONDITION
+2.1 WATCH
 
-  1. "Add screen area" in the Conditions panel.
-  2. NAME, and the sentence to show when it fires.
-  3. MONITOR, then "Draw area". The chosen screen dims under a
-     see-through overlay; drag out the rectangle and let go. Esc
-     cancels without changing anything.
+  One table, one row per watched thing:
 
-     The overlay is deliberately built from two windows: a dim one
-     over the screen, and a solid red frame for the border. A border
-     drawn on the see-through window would be see-through too, and
-     invisible against a bright display.
+    On               tick it to watch it
+    Name             what you called it
+    What it watches  the channel, or the monitor and the size of the
+                     rectangle
+    Reading now      the number, or how far the picture has drifted
+    State            in range / warning / FIRED / not refreshed /
+                     no reading / off
 
-  4. The reference picture is taken as soon as you let go, and shown
-     in the dialog. "Take reference" takes it again — use it if the
-     screen was mid-change at that moment.
-  5. FIRES ON A CHANGE OVER — the sensitivity, section 5.
-  6. Save, and tick the condition in the On column.
+  The table is in three blocks, each under its own grey heading line
+  that says how many are in it:
 
-  "Identify" at the top flashes a big number on each screen for three
-  seconds, so you do not have to guess which one Windows calls number
-  2.
+    Watched · in range        ticked, and holding
+    Watched · not in range    ticked, and something is wrong with it
+    Not watched               not ticked at all
 
-2.2 A VALUE CONDITION
+  A block with nothing in it is left out. Inside a block the order is
+  the one you arranged on the Values and Areas tabs, and a row only
+  ever moves when it changes block — a table that shuffles twice a
+  second moves the row out from under your pointer just as you click
+  it. When a row does move, your place in the list and the row you had
+  clicked are kept.
 
-  1. "Add value". The back-reflection energy (L3-PM03-023:Energy) is
-     filled in for you; any other PV name can be typed instead.
-  2. "Read now" reads that value for the last minute and shows what
-     it is doing now and its highest and lowest — pick the limits
-     from that, rather than guessing.
-  3. WARN OVER   past this, an orange badge appears and nothing else
-                 happens.
-     TRIP OVER   past this, the alarm goes off.
-     Leaving a box empty switches that level off. Empty is not zero:
-     a limit of zero on an energy would fire the moment the laser
-     runs.
-  4. UNIT is only used in the text of the badge.
-  5. ALSO REQUIRE A SCREEN AREA — see 2.3.
+  The bar above the table still names the worst thing outright.
 
-  A value condition needs no rectangle: with only value conditions in
-  the list, Start works and nothing has to be drawn.
+  A row that is fine has no colour at all. Only a verdict worth
+  looking at is coloured, so the one thing that is wrong stands out
+  instead of being lost in a wall of green.
 
-2.3 A VALUE WITH A SCREEN AREA ATTACHED
+  Double-click any row to open it for editing on its own tab.
 
-  Tick "Also require a screen area" at the bottom of a value
-  condition and the same Draw area / Take reference controls appear
-  as on a screen condition, with their own monitor and their own
-  sensitivity.
+  The message log is underneath, on a splitter you can drag. Every
+  failure arrives there as a sentence with an explanation, never as a
+  raw error. "Reading report" writes out how many reads have been
+  made, how many failed and how many had to be written off.
 
-  From then on the condition has two halves and BOTH have to hold:
 
-    the value stays under its trip limit, AND
-    the picture still matches its reference
+2.2 VALUES
 
-  Either half going wrong raises the alarm, and the message says
-  which of the two it was. The picture is compared twice a second on
-  this computer; the value comes from the archiver a second or two
-  later. So they are checked on their own clocks, not together, which
-  is why the alarm names the half that failed.
+  The whole list of numbers, in this order:
 
-  Untick the box and the area is thrown away, picture and all.
+    On · Name · Say when it fires · Lo Lo · Lo · Hi · Hi Hi · Unit ·
+    Channel · Fires · How read
 
-  The arrow button under the list re-takes the picture of whichever
-  area the selected condition owns — its own if it is a screen
-  condition, the attached one if it is a value.
+  CLICK A LIMIT AND TYPE. That is the whole of changing a limit — the
+  yellow-tinted cells are the ones you can type into. The name, the
+  unit and the sentence can be typed in place as well.
 
-2.4 A HALL CHECK
+  Which presets a row belongs to is NOT a column — the drop-down at
+  the top decides which rows are on the list at all. See 1.4.
 
-  You say where you are shooting; the program tells you the moment
-  the machine disagrees. Section 9 has the detail.
+  Add value opens the editor:
 
-  1. "Add hall check" on the Halls tab.
-  2. SHOOTING INTO — E2, E3, E4, E5 ELI-LUIS or E5 ELI-MAIA, or
-     "don't check".
-  3. PSS STATE — "internal only" or "into the experiment", or
-     "don't check".
-  4. SWITCHYARD MAY MOVE FOR — how many seconds the switchyard is
-     allowed to be on its way before that counts as wrong. 60 by
-     default.
-  5. "Read now", at the top of the tab, says what the machine is
-     doing this minute. Set the condition against that, not against
-     what you assume.
+    Name and the sentence you want to read when it fires
+    Channel        type it, or press Find
+    Find           searches the archiver's own list of every channel
+                   it holds — nearly ten thousand names. Type a few
+                   words from the name in any order; each word has to
+                   appear somewhere, nothing has to be at the start
+                   and nothing has to touch. "chl temp" finds
+                   L3-UTIL-CHL03-001:Temp. It tells you how many it
+                   is showing out of how many matched.
+    Read now       reads it from the archiver and says what it holds,
+                   so you can check the name is right before you save
+    the difference between two channels — the chiller case
+    the four limits and the unit
+    How it is read:
+      worst in the window          one shot over the limit is the
+                                   whole event, so nothing is
+                                   averaged away. This is the default
+                                   for anything you add.
+      average of the newest few    steadier. A single chiller sample
+                                   crosses its limit constantly; the
+                                   average does not. This is what the
+                                   fourteen machine values use.
+      newest value, however old    for a channel written only when it
+                                   changes — a setpoint, a state, a
+                                   valve. It looks back an hour, then
+                                   six, then a day, then a week, then
+                                   a month, and stops at the first
+                                   window that has anything in it.
+    When it stops holding — shows only, or raises the alarm
+    Presets        the sets this alarm belongs to. Tick none and it
+                   belongs to Unassigned. "New preset" makes one
+                   without leaving the editor.
 
-  Leaving both dropdowns on "don't check" means the condition can
-  never fire, and it says so when you press Start.
+  Duplicate is the quick way to add a second, similar channel.
 
-2.5 THE LIST ITSELF
+  REMOVE is a button above the table and an entry on the rows' own
+  right-click menu; either way it takes every row you have picked off
+  the list for good. Pick as many as you like with Ctrl-click or
+  Shift-click — the button stays live for one row or twenty, and the
+  menu says how many it is about ("Remove these 3"). It names them
+  all before it does anything.
 
-  On            click the box to switch a condition on or off; it is
-                saved at once
-  Add / Edit    Edit, or a double-click, opens the same dialog again
-  Delete        removes it, after asking
-  arrow (↺)     re-takes the reference picture of the selected
-                condition — for when what you watch has changed for a
-                good reason and the new state should count as normal.
-                On the Halls tab there is no arrow: there is no
-                picture to take.
+  RIGHT-CLICK A ROW for the rest: Edit, Duplicate and "Assign to a
+  preset". Assigning is only on the menu, because it is about the rows
+  you have already picked rather than about the tab.
 
-  Each tab shows only its own kind, but they are one list underneath.
-  Everything ticked is watched, whichever tab is open.
+  "Restore the standard values" puts back any of the fourteen machine
+  values that are missing — matched on the channel, so a row you have
+  renamed is not added twice.
 
-  The list, the reference pictures and the limits all live in the
-  settings file next to the program, so they come back next time.
+  EVERY COLUMN is as wide as the widest thing in it, heading included,
+  and every one of them can still be dragged wider or narrower by its
+  divider. A width you set yourself is then left alone.
 
-  The rectangle is remembered as a position on the desktop, so a
-  condition belongs to the computer it was made on and to that
-  computer's monitor arrangement. Move the monitors around and the
-  area has to be drawn again.
 
-  PREVIEW: hover "Preview region" for a thumbnail of what is inside
-  the quick rectangle right now, up to 640 by 400. Click to pin it
-  open.
+2.3 AREAS
+
+  The rectangles, in this order: On, Name, Sensitivity, Say when it
+  fires, Fires, Rectangle, Reference. What the area IS comes first
+  and where it is comes last, and no column is wider than what is in
+  it — so if the last two do not fit the window, the scrollbar
+  underneath reaches them. The monitor number is written into the
+  Rectangle cell, with the size and the corner.
+
+  Sensitivity can be typed straight into the table. Presets work here
+  exactly as they do on the Values tab — see 1.4.
+
+  RIGHT-CLICK A ROW for Edit, "Take the picture again", "Assign to a
+  preset" and Remove. The last two are no longer buttons above the
+  table; they are about the rows you have picked, so they are on the
+  rows, and with several picked the menu says how many.
+
+  Add area:
+    1. Give it a name and the sentence you want to see.
+    2. Press "Draw the area". Both windows get out of the way, then
+       every screen dims. Drag out the rectangle and let go — the
+       size in real pixels is shown above it as you drag. Esc
+       cancels.
+       You do not have to pick a monitor first: drag on whichever
+       screen the thing is on.
+    3. The reference picture is taken straight away, with the
+       program's own windows still hidden, and shown underneath.
+    4. Save, and tick it On.
+
+  "Take the picture again" photographs the SAME rectangle once more
+  and keeps that as the reference. Use it when the screen has
+  legitimately changed and you want the new look to count as normal.
+  It does not ask you to draw anything again.
+
+  A picture of a screen that has not changed is identical to the one
+  it replaced, so there would be nothing at all to see. That is why
+  the line under the preview says "reference picture taken at" and
+  the time — that line, and the difference dropping to nearly zero,
+  are the proof it happened. The same line is in the editor, under
+  its own picture.
+
+  THE PREVIEW on the right shows the selected area as it is now, its
+  reference below it, and the live difference next to the sensitivity.
+  Both pictures have a black edge drawn round them: the rectangle is
+  usually smaller than the box it is shown in, and without the edge
+  there is no telling a white screen apart from the white box behind
+  it.
+
+  SAVED RECTANGLES are the presets from earlier versions, and they
+  still hold the same rectangles. Save keeps the selected area's
+  rectangle under a name; Load puts a saved rectangle into the
+  selected area and takes a fresh reference picture; Delete forgets
+  the saved rectangle and leaves the watched areas alone.
+
+
+2.4 ALARM
+
+  The flash:
+    What flashes    fill the window with the colour, or one shape
+                    painted in the colour
+    Colour          the colour picker
+    Colours         the picked colour · a different colour every
+                    blink · blue to red across the width, drifting ·
+                    rings running out of the centre, never dark
+    Blink           how long each half of a blink lasts. Zero means
+                    do not blink at all.
+    For             how long it flashes. Zero means until somebody
+                    clicks it or presses Esc, which is the usual
+                    answer: an alarm nobody saw did not work.
+    Shape           which picture, from the images folder next to the
+                    program. The preview shows it as it will really
+                    flash — the shape, filled with the colour.
+
+  The sound:
+    the on/off switch, which sound, the beep's pitch and length, the
+    Bluetooth run-up, and which speaker it comes out of.
+
+    THE SOUND STARTS SWITCHED OFF. A new installation flashes and
+    says nothing until you tick it on here.
+
+    THE SPEAKER MATTERS. Windows keeps a separate output per program,
+    so a program parked on the built-in speaker stays there even after
+    a Bluetooth one has been made the default — which is exactly how a
+    lab can hear every system sound and nothing from this one. Naming
+    the speaker here settles it. The list is re-read every time you
+    open it, because a Bluetooth speaker only appears once it has
+    connected.
+
+    THE BLUETOOTH RUN-UP is silence played in front of the sound. A
+    Bluetooth link only carries audio once it has opened, which takes
+    a moment when nothing has been played for a while. Without the
+    run-up the whole beep lands in that gap and nobody hears it. 800
+    milliseconds is the default.
+
+    "Test the sound" plays it now and says what happened. If it could
+    not be played it says so, rather than leaving you to wonder.
+
+  Where it appears:
+    "Place the alarm window" shows the alarm as a framed rectangle
+    with grips on its corners and edges, which you can drag and size.
+    It is only faintly tinted and the picture shows through it, so
+    whatever is already on the monitor stays visible underneath and
+    you can line the alarm up on it exactly — park it over a picture
+    on a screen and that picture is what appears to blink.
+
+    Drag the MIDDLE of the rectangle to move it; drag one of the
+    eight grips on its edge to size it, and the pointer changes over
+    a grip to say so. It cannot be made smaller than a grip or two,
+    because a rectangle with no edge left is a rectangle you cannot
+    get hold of again. "Fit to the picture" makes the window exactly
+    the picture's own size so it is not stretched. "Keep this place"
+    saves it; Cancel, or Esc on the rectangle itself, leaves it where
+    it was.
+
+    The little box that asks is deliberately NOT one of those windows
+    that blocks everything else. It cannot be: while it blocked, the
+    rectangle it is asking about could not be dragged at all, which
+    is the bug that was reported on 18.9.2026.
+
+    "Place the circle" shows the circle now, wherever it last sat,
+    so you can drag it to where you want it while the program is
+    watching. Keep this place saves it. You can also just drag it
+    while it is watching — either way it is remembered. While it is
+    being placed, letting go of it does NOT stop watching.
+
+    "Put the circle back in the corner" forgets where it was dragged
+    to, and it goes back to the top right of the main screen. It is
+    about the preset you are on and no other.
+
+    BOTH places belong to the preset. The line at the top of "Where
+    it appears" says which preset you are setting and where its two
+    things sit, and switching preset in the header switches the
+    places with it — one set of alarms can flash on the left screen
+    and another on the right. A preset you have never placed simply
+    follows the last place you used anywhere, so nothing moves the
+    first time you start this version.
+
+    "Use these places for every preset that has none" hands the
+    current circle and alarm places to every preset still unplaced,
+    "All alarms" and "Unassigned" included. A preset you placed
+    yourself — or put back in the corner on purpose — is left as it
+    is. The button greys out when every preset has its own places,
+    and its tooltip names the ones still waiting.
+
+    The sentences appear beside the circle and never on top of it,
+    nor on top of the exclamation mark: to its right if there is
+    room, otherwise to its left, otherwise underneath. Only the worst
+    five get a badge of their own; if more than that are out of range
+    the last badge says how many more.
 
 
 =================================================================
 3. THE CIRCLE
 =================================================================
 
-The coloured circle is the entire state of the program in one
-glance:
-
-  grey     nothing to watch yet
-  orange   ready, not watching
+  grey     nothing is switched on — there is nothing to watch
+  orange   something is switched on, but not watching
   green    watching
-  red      something fired and the alarm is up
+  red      something fired
 
-Nothing else needs to be read to know where you are.
+  Click it to start or stop. It is the same as the button beside it.
+
+  While it is watching, the window disappears and ONLY the circle is
+  on screen, floating above everything. The space around it is not
+  part of the window at all, so clicks go straight through to whatever
+  is behind — it cannot get in the way of real work. Drag it to move
+  it; where you leave it is remembered.
+
+  Any sentence worth reading appears as a badge beside it: red for
+  something that fired, amber for a warning. ONLY readings that are
+  out of range get a sentence. A reading that did not arrive at all
+  never does — see the exclamation mark below.
+
+  A RED EXCLAMATION MARK, next to the circle, no background and no
+  words: the readings have not been arriving for over five minutes.
+  The archiver is down, the network is gone, or the channel itself is
+  dead. It is the only thing said about that on screen; which channel
+  and what the archiver answered is in the message log on the Watch
+  tab. It goes away by itself the moment a reading comes back.
+
+  Five minutes, not five seconds, on purpose: a missed read or a bad
+  minute at the archiver is normal and interrupts nobody. Five minutes
+  of it means the alarm cannot see what it is watching.
 
 
 =================================================================
 4. WHEN SOMETHING FIRES
 =================================================================
 
-  - The alarm window flashes, in one of two modes (section 6).
-  - A sound plays, if sound is switched on.
-  - The sentence belonging to that condition appears as a red badge
-    on the overlay and as a line in the message log, so it can still
-    be read after the flashing is gone.
-  - Watching stops by itself. That is deliberate: whatever changed
-    has now changed, and re-alarming every half second would be
-    useless.
-  - Click the flashing area, or press Esc, to dismiss the alarm.
-    The control panel comes back and the circle goes orange, ready
-    to start again.
+  1. The flash appears where you placed it and the sound plays.
+  2. Your sentence appears as a red badge beside the circle, and the
+     circle goes red.
+  3. WATCHING STOPS. Nothing can re-alarm every half second.
+  4. The circle and the badge STAY while the flash is up — that badge
+     is the only place your own words can be read at that moment, so
+     the window does not come back over the top of it.
+  5. Click the flash, or press Esc, or click the circle. The flash
+     goes away and the window comes back.
+  6. Press Reset, then Start watching.
 
-Two things never raise the alarm:
+  If the thing is still wrong when you start again, it fires straight
+  away. That is the truth, not a fault.
 
-  - A value that could not be read at all. The reason goes into the
-    message log in plain words instead; a missing reading is not a
-    good reading, and it is not a bad one either.
-  - A condition that cannot fire: a screen area with no reference
-    picture, or a value with no trip limit. Pressing Start writes a
-    line in the log for each of those, so a condition cannot sit
-    there ticked and silently do nothing.
-
-One case is worth knowing about: if the screen resolution or the
-display scaling changes while watching, the new picture no longer has
-the same size as the reference and the two cannot be compared. That
-counts as the condition failing, and the badge says both sizes. The
-alternative — quietly reporting that everything is fine — is the one
-wrong answer.
-
-In "Image only" mode the clickable area is the image itself, and it
-stays clickable through the dark half of the blink. (This is why the
-window is never made fully transparent between blinks — a window at
-zero opacity stops receiving clicks, so the alarm would become
-impossible to dismiss at the wrong moment.)
+  In "one shape" mode only the shape itself takes clicks — everything
+  around it is see-through and click-through. Esc always works, so
+  there is no way to end up with a flash you cannot dismiss.
 
 
 =================================================================
-5. THE THRESHOLD, AND HOW TO CHOOSE IT
+5. THE SENSITIVITY, AND HOW TO CHOOSE IT
 =================================================================
 
-The comparison is the average difference per pixel, on a scale where
-0 means identical and 255 means black against white. The threshold
-is that average, and it defaults to 2. Each screen condition has its
-own — a noisy camera picture and a line of text need different
-numbers — and the one in Settings belongs to the quick rectangle.
+  It is the average difference between the two pictures, on a scale of
+  0 to 255, averaged over every pixel and every colour channel. Lower
+  is more sensitive. The default is 2.
 
-What that means in practice:
+  What counts as difference: camera noise, anti-aliased text moving by
+  a pixel, the mouse pointer crossing the rectangle, a clock digit
+  changing. All of it.
 
-  - A large rectangle with one small thing changing in it produces a
-    small average. Watch a tight rectangle around the thing you care
-    about, not the whole window.
-  - A live camera image with noise in it produces a constant small
-    average even when nothing happened. Raise the threshold until it
-    stops triggering, or watch a quieter part of the screen.
-  - Anti-aliased text and a moving mouse cursor both count as
-    changes. Keep the cursor out of the rectangle.
+  The important consequence is about SIZE, not about the number: a
+  small change inside a big rectangle averages away to almost nothing.
+  A number changing inside a whole camera window might move the
+  average by 0.3. The same number in a rectangle drawn tightly around
+  it moves it by 30. So the answer is almost always a tighter
+  rectangle rather than a lower number.
 
-Range 0.5 to 50. Lower is more sensitive.
+  Use the preview on the Areas tab: it shows the live difference next
+  to the sensitivity, so you can watch what normal looks like before
+  you decide.
 
-
-=================================================================
-6. THE ALARM APPEARANCE
-=================================================================
-
-There are two windows: the control panel and the alarm window. They
-are separate on purpose, so the alarm can sit exactly on top of
-whatever you need to see it against while the control panel lives
-somewhere out of the way.
-
-FLASH MODE
-  Background color   the whole alarm window blinks in the chosen
-                     colour
-  Image only         only the chosen image blinks, filled with the
-                     chosen colour; everything around it stays
-                     see-through, and the dark half of the blink
-                     shows nothing at all
-
-FLASH COLOUR       click to pick it
-FLASH DURATION     0 to 60 seconds, 3 by default
-BLINK SPEED        fixed, about three blinks a second
-
-IMAGE              which file from the images folder is used
-
-SOUND
-  Play sound on change   on or off
-  Freq / Duration        the built-in beep, in hertz and
-                         milliseconds
-  Sound file             a .wav from the sounds folder instead of
-                         the beep
-
-The images and sounds folders sit next to the program. Without the
-images folder the alarm can only flash a plain colour, because the
-picture is read from disk at the moment it is needed. Both folders
-are listed in the build settings so that every build carries them —
-a deployment that loses them has to be redone.
+  If the area fires the moment you start watching, the usual cause is
+  that the screen resolution or its scaling changed after the
+  reference was taken. The program says so outright, with both sizes:
+  "area is now 246x122 px, reference 369x183". Take the picture again.
 
 
 =================================================================
-7. REGION PRESETS AND WINDOW POSITIONS
+6. HOW THE VALUES ARE READ
 =================================================================
 
-A preset stores the QUICK rectangle under a name, so a routine you do
-every week does not have to be drawn again. Conditions keep their own
-rectangles and need no preset.
+  From the archiver, over the network — not from the machine directly.
+  The archiver publishes about a second late, so a value is a second
+  or two behind the machine. This program raises a person, not a
+  hardware interlock.
 
-  Load          use the selected preset
-  Save region   store the current rectangle under a name
-  Delete        remove it
+  The readings are taken WHETHER OR NOT it is watching: twice a second
+  while watching, every two seconds while not. That is why the tables
+  are never blank, and why you can set a limit by watching the value
+  move.
 
-Window positions are remembered too, and they are recorded by
-dragging rather than typed:
+  All the channels of one pass are read side by side, and the pass has
+  a time limit of its own. One channel that will not answer therefore
+  costs that channel and not the whole pass — it is reported as "not
+  read in time" and the others come back as normal.
 
-  Set control window   drag the control panel where you want it,
-                       then confirm
-  Set image window     the same for the alarm window. This is how
-                       you line the alarm image up with whatever is
-                       behind it.
+  An empty answer and a failed read are DIFFERENT THINGS and the
+  program never confuses them:
 
-A position can be global (used for everything) or stored inside a
-preset (used only for that one). A window returns to exactly the spot
-it was recorded at, so the alarm image stays lined up with what is
-behind it, however many times the position is saved and loaded again.
+    "nothing archived in the window"   the archiver was reached and
+                                       answered; it holds nothing for
+                                       that window. Often it simply
+                                       means the channel name is not
+                                       one the archiver writes.
+    a failure                          it could not be asked, or it
+                                       refused. The log says which,
+                                       in words, with what to try.
 
-No window can end up where you cannot see it. Before any window is
-shown — the panel, the alarm, the settings, a preview, a tooltip — its
-position is checked against the screens that are actually connected
-and, if part of the window would fall outside one, it is moved just
-enough to be completely visible. It stays on the screen it was meant
-for; only a remembered monitor that is gone sends it to another one.
+  Either way the row goes GREY and never green. Reporting that
+  everything is fine on the strength of a reading that was never taken
+  is the one answer that must never happen.
 
-Everything is kept in one settings file next to the program: the
-saved rectangles, the window positions, the limits and the flash
-settings.
+  "Not refreshed" means something else again: the last GOOD reading is
+  now more than fifteen seconds old, so the number on screen is stale.
+  It does not mean the value stopped changing — the archiver only
+  writes when a value changes, so a chiller holding its setpoint
+  perfectly publishes nothing for minutes, and that is a healthy
+  chiller.
 
-
-=================================================================
-8. THE MACHINE VALUES IN DETAIL
-=================================================================
-
-8.1 WHAT IS READ
-
-    Helium volume       the helium pressure, in PSI
-    Alpha voltage       the seeder voltage, in V
-    Chiller DA1..DA4    how far the chiller is from its setpoint, °C
-    Helium Chiller      the same
-    Utility chiller     the same
-
-    The six chiller rows are the difference between the measured
-    temperature and the setpoint, not the temperature itself. A
-    chiller that is asked for 12 and delivers 12.5 shows 0.5.
-
-8.2 HOW THEY ARE READ
-
-    Not live from the machine, but from the archiver, over the
-    network. Each reading asks for that value's samples over the
-    last minute and averages the most recent twenty-five of them.
-
-    Averaging is what makes the badges usable. A single sample of a
-    chiller deviation crosses a 0.3 limit constantly; the average
-    over twenty-five samples only crosses it when something is
-    genuinely off. The cost is that the badge reacts over seconds,
-    not instantly — which is the right trade for these values.
-
-    The reading happens on a background thread, so a slow or
-    unreachable archiver cannot freeze the window. A value that
-    cannot be read shows no badge, and the reason is written into
-    the message log in plain words rather than as a technical error
-    — hover a line in the log for the explanation.
-
-8.3 THE COLOURS
-
-    orange   past the first limit  (the Lo or Hi value)
-    red      past the second limit (the Lolo or HiHi value)
-    purple   the chiller's ACTUAL temperature is outside the range it
-             is allowed to run in at all
-
-    Purple outranks both of the others, and it shows the real
-    temperature instead of the deviation. The reason it exists: a
-    chiller can hold its setpoint perfectly and still be at
-    completely the wrong temperature, because somebody set the
-    setpoint wrong. The deviation check cannot see that; the
-    absolute check can.
-
-    The allowed ranges are 7 to 17.5 °C for DA1 to DA4 and the
-    Helium chiller, and 18 to 22 °C for the Utility chiller. They
-    are fixed in the program, not editable.
-
-    The arrow at the end of the badge says which way the value went.
-
-8.4 THE LIMITS
-
-    Settings -> PV Limits, one row per value and four numbers each:
-
-      Lolo / Lo   the low limits  (red / orange)
-      Hi / HiHi   the high limits (orange / red)
-
-    They save themselves the moment you change them. The defaults
-    are:
-
-      Helium volume    orange below 46 or above 57
-                       red below 45.5 or above 60
-      Alpha voltage    orange below 1.2 or above 1.9
-                       red below 1.1 or above 2.2
-      every chiller    orange beyond ±0.3, red beyond ±0.6
-
-8.5 THE LAYOUT
-
-    Only the badges that are actually alerting are shown, and they
-    vary in width, so they are laid out by hand and wrapped onto
-    another line when they run out of room. The result is that none
-    of them is ever cut off, however many are up at once. The badges
-    belonging to conditions are laid out in the same row.
-
-8.6 HOW A VALUE CONDITION IS JUDGED
-
-    Not on an average, unlike the eight badges above: on the HIGHEST
-    sample of the last ten seconds. One shot over the limit is the
-    whole event — an average over a minute of shots would hide
-    exactly the thing you asked to be told about.
-
-    The archiver only writes a sample when the value changes, so a
-    value that jumped over the limit and then sat perfectly still
-    produces nothing recent at all. In that case the newest sample of
-    the last minute is used, because that is the value the machine is
-    still holding. Only when there is nothing at all is no judgement
-    made.
-
-    Two consequences worth knowing:
-
-      - The reading comes from the archiver, which publishes about a
-        second late, so the alarm is a second or two behind the
-        machine. This is not a program to protect hardware with; it
-        is a program that tells a person to go and look.
-      - A spike that has already passed can still fire, if it is
-        inside the last ten seconds. That is the intended behaviour:
-        you want to be told that it happened.
+  If a whole pass never comes back at all, the program says so, writes
+  it off, and starts a new one. It never sits showing the last good
+  numbers as though they were current.
 
 
 =================================================================
-9. WHERE THE BEAM GOES
+7. WHERE THE SETTINGS LIVE
 =================================================================
 
-9.1 THE TWO VALUES
+  presets.json, in the program's own folder. Everything is in there:
+  the watched things, the limits, the saved rectangles, the flash and
+  sound settings, where the alarm and the circle sit — and the
+  reference pictures, as text.
 
-    Beam fate      L3BT-MSS:Beam_fate
+  The reference pictures are stored ON PURPOSE rather than re-taken at
+  every start. A picture taken fresh at start-up would quietly accept a
+  screen that is ALREADY in the bad state as normal, which is the one
+  way this program could fail silently. A reference bigger than about a
+  megabyte is refused with a message instead — watch a smaller area.
 
-                     0   switchyard moving
-                     1   E2
-                     2   E3
-                     3   E4
-                     4   E5 ELI-LUIS
-                     5   E5 ELI-MAIA
+  It is written a second after your last change, safely: to a
+  temporary file that is then renamed, so a crash mid-write cannot
+  cost you every rectangle you ever set up.
 
-    PSS state      L3-PSS:STATE_EXH_EXTERNAL_HIGH_P
-
-                     0   shooting fully internally
-                     1   shooting into the experiment
-
-    The line at the top of the Halls tab shows both of them by name,
-    each with the time it last changed, and it keeps itself up to
-    date while watching runs.
-
-9.2 HOW THEY ARE READ
-
-    From the archiver, like everything else the program reads — but
-    with one difference that matters. These two are written only when
-    they change, and they change hours apart, so asking for the last
-    minute would come back empty nearly always. The program therefore
-    asks for the last hour, then the last day, then the last week,
-    then the last month, and takes the newest sample it finds.
-
-    They are also read far less often than everything else — once
-    every two seconds — because reading a value that changes twice a
-    day five hundred times a minute buys nothing.
-
-9.3 WHAT COUNTS AS WRONG
-
-    Whichever of the two halves you set has to match. A half left on
-    "don't check" is not judged at all.
-
-    The switchyard on its way (beam fate 0) is not treated as a
-    destination. While it is moving the badge is orange and nothing
-    else happens — it only becomes an alarm once it has been moving
-    for longer than the number of seconds set in the condition.
-
-    The clock used for that is the archiver's own timestamp of the
-    sample, not this computer's clock, which runs ahead of the
-    facility's.
-
-9.4 WHAT IS NOT READABLE YET
-
-    THE BEAM FATE IS NOT BEING ARCHIVED. There is no L3BT-MSS channel
-    in the archiver at all, and reading the control system directly
-    is not possible from these computers. So today a hall check set on
-    the beam fate can never fire.
-
-    It does not go quiet about it: the read-out says "cannot be read",
-    the condition's badge turns orange and says which value is
-    missing, and nothing is ever reported as fine on the strength of
-    a reading that was never made. The PSS half works now and can be
-    used on its own.
-
-    When the beam fate does become readable, nothing in the program
-    has to change.
+  Everything from earlier versions came through this rewrite: the
+  saved rectangles, the window positions, the flash and sound
+  settings, and any limits you had typed into the old PV Limits table
+  — those became the limits of the fourteen machine values, and your
+  typed number wins over the built-in default.
 
 
 =================================================================
-10. THE OVERLAY MODE
+8. WHAT CHANGED IN THIS VERSION
 =================================================================
 
-While watching, the control panel becomes a small borderless
-see-through overlay. Only the circle and the badges stay visible;
-the rest of it lets clicks straight through to whatever is
-underneath.
+  The program was rewritten. It looks and behaves like Image Tools and
+  CSS Logger now, and it is one list instead of four different
+  mechanisms.
 
-This is what makes the program usable in practice — it can sit on
-top of the screen you are actually working with, without covering it
-and without being in the way of the mouse.
+  GONE:
+    - The Halls tab and the whole "where the beam goes" check. Its
+      main channel, L3BT-MSS:Beam_fate, is not archived at all, so
+      that half could never fire.
+    - The nameless "quick rectangle". Every rectangle is a named row
+      now.
+    - The screen area hidden inside a value condition. It is a row of
+      its own, called "<the value's name> · area". Nothing changed
+      about how it behaves: either half going wrong fired the alarm
+      before, and either row does now.
+    - The purple chiller badge. Each chiller is two rows instead: one
+      for holding its setpoint, one for the temperature being right.
+      One row, one thing measured.
+
+  NEW:
+    - Four limits per value instead of two, and both ends of the
+      range.
+    - The channel search, so a PV can be found by a few words rather
+      than typed from memory.
+    - Presets: named sets of alarms, so only the set you are working
+      in is listed and watched. They took the place of the old
+      "Group" column, which made two alarms wait for each other.
+    - Limits typed straight into the table.
+    - The live preview beside the areas.
+    - A red exclamation mark beside the circle when the readings have
+      not arrived for over five minutes — and, in exchange, NOT ONE
+      WORD beside the circle about a read that failed. The panel over
+      your work used to fill up with "not read yet" and "could not be
+      read", which is noise. Asked for on 21.9.2026.
+    - Remove is a button on the Values and Areas tabs again, as well
+      as on the right-click menu. It was menu-only and looked as
+      though it did nothing. While a menu was still open, the "are
+      you sure" box underneath it could not be answered — the work
+      is now done after the menu has gone.
+    - Readings that keep coming when it is not watching.
+    - "Not refreshed", so old numbers cannot pass for current ones.
+
+  FIXED, after it crashed three times in two minutes on 17.9.2026
+  while an area was being drawn:
+
+    - Drawing an area now actually saves it. It never did. The
+      editor has to get out of the way while you drag the rectangle
+      out, or the program photographs its own window — and getting
+      out of the way was quietly cancelling the whole editor. You
+      drew the rectangle, you pressed Save, and it was thrown away.
+      That is why there were fourteen values saved and not one area.
+    - Pressing "Draw the area" twice in a row can no longer take the
+      program down. The button switches itself off while you are
+      drawing.
+    - Each abandoned attempt used to leave a hidden copy of the
+      editor running, with its timers still going. Measured over 250
+      attempts: 312 of them still alive and a gigabyte of memory
+      gone. Now nothing is left behind.
+    - Closing the editor while the screens are dark now works. It
+      used to leave the picker running with nobody to report back
+      to, and after that "Draw the area" did nothing at all.
+    - There is always a way out of the dimmed screens: Esc, a single
+      click anywhere, or two minutes of waiting.
+    - Watching an area is much cheaper. Photographing one small
+      rectangle costs the same as photographing every screen — 269 ms
+      and 30 MB a time, measured — and it used to do that once per
+      area, twice a second, plus a third time for the preview in the
+      window. Now it is one photograph per round, and the preview
+      has its own slower clock.
+    - The program writes down what happened to it when it dies. See
+      section 9.
+    - Closing the window really ends the program. It used to leave
+      an invisible copy running, holding the settings file, so the
+      next start made a second one.
+    - "alarm_geometry" and "hud_position" no longer show up in the
+      saved-rectangles list on the Areas tab. Loading one fed the
+      alarm's position in as a rectangle, and deleting one forgot
+      where the alarm appears.
+    - "Playing…" under "Test the sound" now clears itself. The
+      message from the sound was never being delivered.
+    - Much less work while it is just sitting there watching. The
+      table was being rewritten twice a second even with the window
+      hidden, the badges next to the circle were being restyled
+      twice a second to say the same thing, and a channel that
+      cannot be read was writing two lines a second into the log
+      for ever. All three now do nothing when nothing has changed.
+    - A sound on a speaker that stops answering can no longer
+      corrupt the program's memory.
+    - A stuck reading can no longer take the other half with it.
+      The numbers and the pictures have a thread each now, so one
+      of them hanging leaves the other working.
+    - Remove takes everything you picked. Ctrl-click or Shift-click
+      as many rows as you like, right-click them and choose Remove
+      once; it names them before it does anything. Before, picking
+      more than one row greyed out every button, which looked like
+      the program had lost the selection.
+
+  KNOWN, and left as it is on purpose:
+
+    - Clicking the alarm dismisses it only where the picture is
+      actually drawn. The window has the shape of the picture, so a
+      click in a see-through part goes to whatever is behind it.
+      Esc always works. Say if you would rather the whole rectangle
+      took the click.
 
 
 =================================================================
-11. WHEN SOMETHING GOES WRONG
+9. IF SOMETHING LOOKS WRONG
 =================================================================
 
-  It alarms constantly
-      The rectangle contains something that is always moving: a live
-      camera, a clock, a cursor, a blinking caret. Move the
-      rectangle or raise the threshold.
+  Nothing is being read at all
+    Look at the log. "Archiver unreachable" means this PC cannot get
+    to it — the network or the VPN. Every failure in the log carries an
+    explanation of what it means and what to try.
 
-  It never alarms
-      Either the change is too small relative to the rectangle
-      (shrink the rectangle around the thing that matters), or the
-      threshold is too high, or watching was stopped by a previous
-      alarm and never restarted — check the circle.
+  One value says "nothing archived in the window"
+    The channel name is probably not one the archiver writes. Open the
+    row, press Find, and search for it by a few words.
 
-  A condition is ticked but nothing ever happens
-      Press Start and read the message log. A screen area with no
-      reference picture and a value with no trip limit both say so
-      there, and both are silent by design.
+  A channel name is refused outright
+    The archiver answers a name it does not know with a refusal, not
+    with an empty answer, and the log says "Channel name refused".
+    Check the spelling.
 
-  Start does nothing at all
-      There is nothing to watch: no quick rectangle and no condition
-      switched on. The status line says so.
+  An area fires as soon as watching starts
+    Either the screen really did change, or its resolution or scaling
+    changed after the reference was taken. The message says which,
+    with both sizes. Take the picture again.
 
-  A screen condition fires the moment watching starts
-      The screens have been rearranged or the display scaling
-      changed, so the area is not where the reference was taken. The
-      badge says both sizes when that is the cause. Draw the area
-      again.
+  An area never fires
+    Check it has a reference picture — the Reference column says NO
+    PICTURE in red when it has not. Without one there is nothing to
+    compare against, and the program says so when watching starts.
 
-  A value condition will not stop firing
-      The value is still over the limit, or it went over inside the
-      last ten seconds. Check with "Read now" in the condition,
-      which shows what it has actually been doing.
+  No sound
+    Press "Test the sound" on the Alarm tab. It says what happened.
+    If the lab is silent but the PC is not, the speaker is the thing
+    to change: name it under "Play it on". If a Bluetooth speaker
+    swallows the start of the sound, raise the Bluetooth run-up.
 
-  The reference picture is refused as too big
-      The picture is kept inside the settings file, so it has to stay
-      small. Draw the box that changes, not a whole screen.
+  The alarm flashes somewhere useless
+    "Place the alarm window" on the Alarm tab.
 
-  The alarm flashes but I hear nothing
-      Sound is switched off, or the chosen .wav is missing from the
-      sounds folder. The built-in beep always works.
+  The circle is in the way
+    Drag it. Or "Put the circle back in the corner". The space around
+    it is click-through, so it should not be able to get in the way of
+    a click.
 
-  The alarm window shows no picture
-      The images folder is missing next to the program, or the
-      chosen file is not in it. The alarm still works, as a plain
-      colour.
+  It flashed and I cannot make it stop
+    Esc. Always.
 
-  I cannot dismiss the alarm
-      Click the image itself in "Image only" mode, not the empty
-      space around it. Esc always works.
+  The program disappeared
+    It writes a record of its own death now:
 
-  No badges at all
-      Either every value is in range, which is the normal case, or
-      watching is not running — the values are only read while it
-      is. If the message log fills with read failures instead, the
-      archiver is not reachable from this computer.
+      C:\Users\<you>\AppData\Local\Announcer\announcer_crash.log
 
-  A hall check is ticked but nothing ever happens
-      Either both dropdowns are on "don't check" — the log says so
-      when you press Start — or it is set on the beam fate, which is
-      not archived yet (section 9.4). The read-out at the top of the
-      tab tells you which.
+    Send that file with the report. It holds the start of every run,
+    Qt's own complaints, and — if the program was killed outright
+    rather than closing — the exact place in the code it died. Before
+    this, a crash left nothing behind anywhere except in Windows'
+    event log, which says only "access violation" and nothing about
+    where.
 
-  A hall check fires the moment I start
-      That is the point: the machine is not where you said it was.
-      Press "Read now" to see what it actually says and set the
-      condition against that.
+    The file is kept to about 2 MB; the previous one is beside it as
+    announcer_crash.log.1.
 
-  A hall check keeps going orange while the beam is being switched
-      The switchyard is on the move. Raise "Switchyard may move for"
-      until it covers how long the move really takes.
-
-  A value condition with an area fires and I do not know which half
-      The message says it: "screen area changed" for the picture,
-      "... is over ..." for the value.
-
-  A badge is purple but the deviation is tiny
-      That is exactly the case purple is for: the chiller is holding
-      a setpoint that is itself wrong. Check the setpoint, not the
-      chiller.
-
-  A remembered window position puts the window somewhere odd
-      The monitor it was recorded on is disconnected or was
-      rearranged, so the window was moved to a screen that exists.
-      Re-record the position with "Set control window" / "Set image
-      window".
-
-  A window sits a little away from where it was recorded
-      It should not any more. If the panel or the alarm window is
-      short of where you left it, or drifts a bit further every time
-      the position is saved and loaded, the version in use is older
-      than August 2026 — take the current one.
-
------------------------------------------------------------------
+  The screens went dark and there is no window anywhere
+    That is the area picker, not a crash. Press Esc, or click once
+    anywhere, and everything comes back. If you do nothing it gives
+    up by itself after two minutes.

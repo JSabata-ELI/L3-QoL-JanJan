@@ -39,11 +39,21 @@ def check_alias(m):
     check("nothing else has an alias — an alias is a promise, not a guess",
           cpva.channel_aliases("HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy") == ())
 
-    day = "2026-09-01"          # AFTER the rename: the date rule says the L3 name
-    check("the date rule still names the L3 channel for a recent day",
-          cpva.channel_for_day(new, day) == new)
-    check("and the HAPLS one for a day before the rename",
-          cpva.channel_for_day(new, "2026-08-01") == old)
+    day = "2026-09-01"
+    # The operator's rule, 23.09.2026: SBW4 is looked for under the HAPLS name
+    # FIRST and under the L3 one only when that holds nothing. The date the
+    # channel was "renamed" decides nothing any more — the two names take turns
+    # with the configuration, and the HAPLS one is what the machine has been
+    # writing (it holds 31.08.–22.09., the L3 name a single stray value).
+    check("SBW4 is read under the HAPLS name first, whatever the day",
+          cpva.read_order(new) == (old, new)
+          and cpva.read_order(old) == (old, new), str(cpva.read_order(new)))
+    check("and that is the name a day is asked for",
+          cpva.channel_for_day(new, day) == old
+          and cpva.channel_for_day(new, "2026-08-01") == old)
+    check("a channel with one name is asked under it, once",
+          cpva.read_order("HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy")
+          == ("HAPLS-ENER_IN_PTM1_LT7_DIAG2:Energy",))
 
     # The archiver: only the OLD name holds this day. Under the date rule alone the
     # day reads back as empty — which is what made a search find nothing.
@@ -71,18 +81,21 @@ def check_alias(m):
               res.status == "ok", res.status)
         check("the name that answered is carried out, so it can be SAID",
               res.src_channel == old, res.src_channel)
-        check("both names were tried, the one asked for first",
-              asked == [new, old], str(asked))
+        check("the HAPLS name answered it, in ONE request",
+              asked == [old], str(asked))
 
-        # A channel that answers costs nothing extra — the second request only
-        # ever happens on an empty day.
+        # The other way round: the day only the L3 name holds. Two requests, and
+        # the answer is the same — the order is a cost rule, never a filter.
         asked.clear()
-        stored[new] = [(t0 + 1, 1.0)]
+        stored[new] = stored.pop(old)
         cpva._day_cache.clear()
         res = cpva.get_day(new, day)
-        check("a name that answers is not asked twice", asked == [new], str(asked))
-        check("and its own samples are what comes back",
-              len(res.samples) == 1, f"{len(res.samples)} sample(s)")
+        check("a day only the L3 name holds falls back to it",
+              asked == [old, new], str(asked))
+        check("and its samples are what comes back",
+              len(res.samples) == 5 and res.src_channel == new,
+              f"{len(res.samples)} sample(s) from {res.src_channel}")
+        stored[old] = stored.pop(new)          # back to the HAPLS-only day
     finally:
         cpva.fetch_values_ex, cpva.fetch_values = orig
         cpva._day_cache.clear()
@@ -173,8 +186,16 @@ def check_alias(m):
         stored.pop(new, None)
         got.clear()
         out = m._cpva_fetch_samples(new, t0, t1)
+        check("a region read asks the HAPLS name first as well",
+              len(out) == 5 and got == [old], f"{len(out)}, {got}")
+
+        # …and falls back to the L3 name when the HAPLS one has nothing.
+        stored[new] = stored.pop(old)
+        got.clear()
+        out = m._cpva_fetch_samples(new, t0, t1)
         check("a region read of an empty name falls back too",
-              len(out) == 5 and got == [new, old], f"{len(out)}, {got}")
+              len(out) == 5 and got == [old, new], f"{len(out)}, {got}")
+        stored[old] = stored.pop(new)
     finally:
         cpva.fetch_samples = orig_s
 

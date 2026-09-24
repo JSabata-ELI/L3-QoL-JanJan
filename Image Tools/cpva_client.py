@@ -67,9 +67,9 @@ CHANNEL_MAP: dict[str, str] = {
     "pcm2":      "L3-PM03-025:Energy",
     "pcm4":      "HAPLS-ENER_IN_PCM4_LT5_DIAG2:Energy",
     "pap1":      "HAPLS-ENER_IN_PAP1_LT7_DIAG2:Energy",
-    # Renamed 2026-08-14: SBW4 is archived under L3-SBW4-PM311:Energy. The old
-    # HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy still holds the historical samples, so
-    # dates before the rename read "n/a" under this name.
+    # SBW4 has TWO archived names and they take turns; this is the canonical one
+    # (what labels and tooltips say). Which one is READ first is read_order's
+    # business — the HAPLS-era name, which is what the machine has been writing.
     "sbw4":      "L3-SBW4-PM311:Energy",
     "Back_Ref":  "L3-PM03-023:Energy",
     "waveplate": "L3-PFWP6-MTR03-1:RawPos",
@@ -145,6 +145,7 @@ STATS: "dict[str, float]" = {
     "takeovers": 0,         # abandoned single-flight records (see get_day)
     "range_splits": 0,      # oversize ranges re-fetched in halves (fetch_samples_split)
     "alias_hits": 0,        # empty days answered by the channel's other name (SBW4)
+    "samples_after_window": 0,  # carry-over values stamped after the asked window
 }
 _stats_lock = threading.Lock()
 
@@ -537,8 +538,9 @@ def best_shot_ns(start_ns: int, end_ns: int, *, channel: str = SHOT_CHANNEL,
     """Timestamp (ns) of the highest-energy sample in the window, or None
     (on failure or when no sample has value > 0)."""
     try:
-        samples = fetch_values(channel, start_ns, end_ns, timeout=timeout,
-                               try_value_suffix=False)
+        samples = _drop_after(
+            fetch_values(channel, start_ns, end_ns, timeout=timeout,
+                         try_value_suffix=False), end_ns)
     except CpvaError:
         return None
     best_t: int | None = None
@@ -582,27 +584,29 @@ def today_key() -> str:
     return datetime.now(TZ_PRAGUE).strftime("%Y-%m-%d")
 
 
-# SBW4 was re-archived under a new name on this Prague day. Every sample from
-# before it is still under the old name and under NOTHING else, so a query that
-# spans the rename has to change name half way — otherwise the older days come
-# back empty and read as "the laser never fired", which is not what happened.
+# The Prague day SBW4 was first archived under the L3 name. Kept only as a note
+# of when the second name appeared: it decides NOTHING any more, because the two
+# names take turns with the laser configuration rather than with the calendar
+# (see read_order / channel_for_day).
 SBW4_RENAME_DATE_KEY = "2026-08-14"
 SBW4_CHANNEL_LEGACY = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
 
 
 def channel_for_day(channel: str, date_key: str) -> str:
-    """The name `channel` was archived under on the given Prague day.
+    """The name to ask FIRST for this measurement on the given Prague day.
 
-    Only SBW4 has ever moved; every other channel is returned unchanged. Date keys
-    are 'YYYY-MM-DD', so a plain string comparison orders them correctly.
+    Only SBW4 has two names; every other channel is returned unchanged. The date
+    (`SBW4_RENAME_DATE_KEY`) no longer decides anything — the two names take turns
+    with the laser configuration, not with the calendar, and the HAPLS-era name is
+    the one that has been carrying the measurement: measured 23.09.2026 it holds
+    every day from 31.08. to 22.09. (4 000 – 110 000 samples each) while the L3
+    name answers most of them with a single stray value. So SBW4 is READ UNDER THE
+    HAPLS NAME FIRST and under the L3 name only when that finds nothing, which is
+    also one request instead of two on nearly every day.
 
-    This is a GUESS, not a fact: the two SBW4 names take turns depending on which
-    laser configuration is running, so the date rule alone reads a day back as
-    empty whenever the other name is the one being written. `channel_aliases`
-    below is what makes that recoverable."""
-    if channel == SBW4_CHANNEL and date_key < SBW4_RENAME_DATE_KEY:
-        return SBW4_CHANNEL_LEGACY
-    return channel
+    Which name a day is actually served from is never assumed: `read_order` below
+    is the whole rule, and `DayResult.src_channel` reports what answered."""
+    return read_order(channel)[0]
 
 
 # Names that mean the SAME measurement. SBW4 is the only one: the HAPLS-era name
@@ -621,6 +625,31 @@ def channel_aliases(channel: str) -> "tuple[str, ...]":
     Kept deliberately small: an alias list is a promise that the two names are the
     same physical measurement, and only SBW4 has ever been renamed."""
     return _CHANNEL_ALIASES.get(channel, ())
+
+
+# Which of SBW4's two names is asked FIRST, whichever of them the caller named.
+# The operator's rule: SBW4 is looked for under the HAPLS name, and only when
+# that finds nothing under the L3 one. It is also what the archive says — see
+# channel_for_day.
+_READ_FIRST: "dict[str, str]" = {
+    SBW4_CHANNEL:        SBW4_CHANNEL_LEGACY,
+    SBW4_CHANNEL_LEGACY: SBW4_CHANNEL_LEGACY,
+}
+
+
+def read_order(channel: str) -> "tuple[str, ...]":
+    """Every name this measurement may be archived under, in the order to ask.
+
+    One name for everything except SBW4. The order is a cost rule only: whichever
+    name answers, the samples are the same measurement, and the second name is
+    asked ONLY when the first holds nothing for the window — so a wrong guess
+    costs one extra request, never a wrong or a missing answer."""
+    alts = channel_aliases(channel)
+    if not alts:
+        return (channel,)
+    first = _READ_FIRST.get(channel, channel)
+    rest = [n for n in (channel,) + alts if n != first]
+    return (first, *rest)
 
 
 # ── shared day cache ──────────────────────────────────────────────────────────
@@ -653,6 +682,12 @@ class _Entry(NamedTuple):
     # tail query must use it; querying the bare name for an alias-only channel
     # returns nothing, so the day would never grow. Defaulted/last for compat.
     src_channel: str = ""
+    # The slice of the day these samples actually came from, (start_ns, end_ns).
+    # Empty = the whole day, which is what every caller that asks for no span
+    # gets and what every older entry was. A caller asking for more than this
+    # entry holds must NOT be served from it — that would be missing data
+    # reported as "nothing archived". See `_covers`.
+    span: "tuple[int, int]" = ()
 
 
 _DAY_CACHE_MAX = 64
@@ -663,11 +698,14 @@ _day_cache_lock = threading.Lock()
 class _InFlight:
     """Single-flight record: waiters take the fetcher's result directly, so a
     FAILED fetch is not retried once per waiter (serial stampede on outage)."""
-    __slots__ = ("event", "result")
+    __slots__ = ("event", "result", "span")
 
     def __init__(self):
         self.event = threading.Event()
         self.result: "DayResult | None" = None
+        # The slice of the day this fetch is reading; () = all of it. A waiter
+        # that needs more than this must not take the answer (see get_day).
+        self.span: "tuple[int, int]" = ()
 
 
 # Single-flight: (channel, date_key) → in-progress fetch record.
@@ -694,6 +732,54 @@ def _entry_result(ent: "_Entry", status: str, age: float) -> DayResult:
     return DayResult(ent.samples, status, age, ent.ts_list, ent.src_channel)
 
 
+def _clamp_span(span_ns, day_start: int, day_end: int) -> "tuple[int, int]":
+    """The piece of `date_key`'s day a caller asked for, never outside the day.
+    No span (the normal case) is the whole day."""
+    if not span_ns:
+        return day_start, day_end
+    s, e = int(span_ns[0]), int(span_ns[1])
+    s = max(day_start, min(s, day_end))
+    e = max(s, min(e, day_end))
+    return s, e
+
+
+def _drop_after(samples: "list[tuple[int, float]]", end_ns: int
+                ) -> "list[tuple[int, float]]":
+    """Samples stamped AFTER the window that was asked for, removed.
+
+    The archiver answers a window it holds nothing for with a single carry-over
+    sample — and that sample may carry a timestamp from AFTER the window.
+    Measured 23.09.2026: `L3-SBW4-PM311:Energy` asked for 01.09. answers with one
+    value stamped 22.09. 21:24. Kept, it makes an empty day look like a day with
+    data (so the channel's other name is never tried) and puts a value three weeks
+    in the future into a day's curve. The sample from BEFORE the window is left
+    alone: that one is the real held-forward value."""
+    if not samples or samples[-1][0] <= end_ns:
+        return samples
+    cut = bisect_right([s[0] for s in samples], end_ns)
+    if cut < len(samples):
+        _stat_bump("samples_after_window")
+    return samples[:cut]
+
+
+def _has_inside(samples: "list[tuple[int, float]]", start_ns: int) -> bool:
+    """Does this answer hold a sample the window itself, not just the carry-over
+    value archived before it? A name that answers only with carry-over holds
+    nothing for these hours — see _drop_after."""
+    return bool(samples) and samples[-1][0] >= start_ns
+
+
+def _covers(ent: "_Entry", day_start: int, day_end: int,
+            want: "tuple[int, int]") -> bool:
+    """Does this cached entry hold everything the caller is asking for?
+
+    An entry fetched for 07:00–21:00 answers any question inside those hours and
+    NOTHING else: served to a caller who wanted the whole day it would report the
+    night as empty, which is a lie about the archive, not a cache miss."""
+    have = ent.span or (day_start, day_end)
+    return have[0] <= want[0] and have[1] >= want[1]
+
+
 def _merge_tail(old: "list[tuple[int, float]]", old_ts: "list[int]",
                 tail: "list[tuple[int, float]]") -> "list[tuple[int, float]]":
     """Append newly archived samples from an overlapping tail query, skipping the
@@ -715,7 +801,8 @@ def _merge_tail(old: "list[tuple[int, float]]", old_ts: "list[int]",
 
 def get_day(channel: str, date_key: str, *,
             today_ttl: float = 3.0,
-            timeout: float = DEFAULT_TIMEOUT) -> DayResult:
+            timeout: float = DEFAULT_TIMEOUT,
+            span_ns: "tuple[int, int] | None" = None) -> DayResult:
     """Samples for one Prague day, cached.
 
     Status semantics:
@@ -729,14 +816,26 @@ def get_day(channel: str, date_key: str, *,
     Past days are immutable → cached without TTL. Today honours today_ttl and is
     refreshed with an INCREMENTAL tail query (only the time after the newest
     cached sample), not by re-downloading the whole day.
+
+    `span_ns` asks for ONE SLICE of the day instead of all of it — the hours the
+    caller is actually going to look at. A search over 07:00–21:00 was reading
+    00:00–24:00 and throwing ten hours away: ten hours the archiver had to
+    serialize, which is also what pushes a busy channel over the response-size
+    limit and costs it a split. The slice is remembered with the samples
+    (`_Entry.span`), and a caller asking for more than a cached entry holds
+    refetches rather than being told the night was empty.
     """
     key = (channel, date_key)
     is_today = (date_key == today_key())
     waited_s = 0.0
+    day_start, day_end = day_bounds_ns(date_key)
+    want = _clamp_span(span_ns, day_start, day_end)
 
     while True:
         with _day_cache_lock:
             ent = _day_cache.get(key)
+            if ent is not None and not _covers(ent, day_start, day_end, want):
+                ent = None          # holds less than is being asked for — refetch
             if ent is not None:
                 _day_cache.move_to_end(key)
                 age = time.monotonic() - ent.fetched_mono
@@ -754,6 +853,7 @@ def get_day(channel: str, date_key: str, *,
             fl = _inflight.get(key)
             if fl is None:
                 fl = _InFlight()
+                fl.span = want
                 _inflight[key] = fl
                 break              # this thread fetches
         # Another thread is fetching this key — take ITS result (even "error")
@@ -762,7 +862,13 @@ def get_day(channel: str, date_key: str, *,
                       max(0.1, _INFLIGHT_MAX_WAIT_S - waited_s))
         fl.event.wait(round_s)
         if fl.result is not None:
-            return fl.result
+            # …but only when that fetch is reading at least as much of the day as
+            # this caller needs. Taking a narrower fetch's answer would hand back
+            # a slice of the day as if it were the whole of it.
+            fl_span = fl.span or (day_start, day_end)
+            if fl_span[0] <= want[0] and fl_span[1] >= want[1]:
+                return fl.result
+            continue               # its record is gone by now — fetch it ourselves
         # Fetcher still running (wait timed out) or died without a result — loop
         # back to re-check the cache / in-flight state. Past the patience bound the
         # record is treated as dead and dropped, so THIS thread becomes the fetcher
@@ -776,7 +882,7 @@ def get_day(channel: str, date_key: str, *,
             waited_s = 0.0
 
     try:
-        day_start, day_end = day_bounds_ns(date_key)
+        win_start, win_end = want
         if ent is not None and ent.samples:
             # Incremental refresh of today: ask only for what we cannot have yet,
             # and ask the name that produced the samples we already hold (see
@@ -784,49 +890,65 @@ def get_day(channel: str, date_key: str, *,
             # NORMAL answer here and must not cost a second request every time.
             src = ent.src_channel or channel
             tail = fetch_values(src,
-                                max(day_start, ent.ts_list[-1] - TAIL_OVERLAP_NS),
-                                day_end, timeout=timeout, try_value_suffix=False)
-            samples = _merge_tail(ent.samples, ent.ts_list, tail)
+                                max(win_start, ent.ts_list[-1] - TAIL_OVERLAP_NS),
+                                win_end, timeout=timeout, try_value_suffix=False)
+            samples = _merge_tail(ent.samples, ent.ts_list,
+                                  _drop_after(tail, win_end))
         else:
+            # Every name this measurement is archived under, in the order the
+            # operator asked for: SBW4 is looked for under the HAPLS-era name
+            # first and under the L3 one only when that holds nothing (see
+            # read_order). Everything else is a single name, asked once.
+            #
+            # "Holds nothing" means no sample INSIDE the window, not an empty
+            # answer: measured 23.09.2026, the L3 SBW4 name answers every day of
+            # the first three weeks of September with one single carry-over
+            # value — stamped 22.09., weeks after the day asked for. Counted as
+            # data it stopped the other name (which holds all 4 000–110 000
+            # samples of each of those days) from ever being asked, and the Shot
+            # Finder reported "no samples inside the chosen hours" for every day
+            # but today.
+            #
+            # A name that FAILS is not the end of the story either: a name the
+            # archiver does not know for this day answers HTTP 400, and treating
+            # that as an outage is what made SBW4 report "the archiver did not
+            # answer". The first failure is KEPT and re-raised only if no name
+            # delivers anything — a day cached as "empty" after a failed query
+            # would be a lie, and both names failing IS an outage.
+            names = read_order(channel)
             first_failure: "CpvaError | None" = None
-            try:
-                samples, src = fetch_values_ex(channel, day_start, day_end,
-                                               timeout=max(timeout, FULL_DAY_TIMEOUT))
-            except CpvaBusyError:
-                raise                  # our own pool — says nothing about the name
-            except CpvaError as exc:
-                # The name asked for FAILED. That is not the end of the story when
-                # the measurement has another archived name: a name the archiver
-                # does not know for this day answers 400, and treating that as an
-                # outage is what made SBW4 report "the archiver did not answer" on
-                # days its other name holds every sample. The failure is KEPT and
-                # re-raised below unless the other name actually delivers — a day
-                # cached as "empty" after a failed query would be a lie.
-                if not channel_aliases(channel):
-                    raise
-                first_failure = exc
-                samples, src = [], channel
-            # Nothing under the name asked for → try the other name the SAME
-            # measurement is archived under (SBW4's HAPLS-era and L3 names take
-            # turns). Only ever a SECOND request, and only on a day that came back
-            # empty, so a channel with data pays nothing for this. The name that
-            # answered is remembered as `src_channel`, so today's incremental tail
-            # keeps asking the name that works.
-            if not samples:
-                for alt in channel_aliases(channel):
-                    try:
-                        alt_s, alt_src = fetch_values_ex(
-                            alt, day_start, day_end,
-                            timeout=max(timeout, FULL_DAY_TIMEOUT))
-                    except CpvaError:
-                        continue
-                    if alt_s:
-                        samples, src = alt_s, alt_src
+            # With nothing found the day is reported under the name the caller
+            # asked for: "read under its other name" is a note about DATA, and
+            # printing it over an empty day would say something that did not
+            # happen.
+            samples, src = [], channel
+            for _i, name in enumerate(names):
+                try:
+                    got, got_src = fetch_values_ex(
+                        name, win_start, win_end,
+                        timeout=max(timeout, FULL_DAY_TIMEOUT))
+                except CpvaBusyError:
+                    raise              # our own pool — says nothing about the name
+                except CpvaError as exc:
+                    if first_failure is None:
+                        first_failure = exc
+                    continue
+                got = _drop_after(got, win_end)
+                if _has_inside(got, win_start):
+                    samples, src = got, got_src
+                    if _i:
                         _stat_bump("alias_hits")
-                        first_failure = None
-                        break
-                if first_failure is not None:
-                    raise first_failure
+                    break
+                if got and not samples:
+                    # Carry-over only: the value held over from before these
+                    # hours. Real, and worth keeping for a step channel — but the
+                    # other name is still asked, since it may hold the hours
+                    # themselves.
+                    samples, src = got, got_src
+            if samples:
+                first_failure = None   # something answered; that is not an outage
+            if first_failure is not None:
+                raise first_failure
     except CpvaBusyError:
         # Our own pool was full — nothing was learned about this channel or day, so
         # do NOT arm _error_until. Blacking the key out for ERROR_BACKOFF_S on a
@@ -861,11 +983,13 @@ def get_day(channel: str, date_key: str, *,
     # wait on, so no line between the two may sit outside a handler.
     try:
         ts_list = [s[0] for s in samples]
-        partial = int(time.time() * 1e9) <= day_end     # the day had not ended yet
+        partial = int(time.time() * 1e9) <= win_end     # the window had not ended yet
         with _day_cache_lock:
             _error_until.pop(key, None)
+            # The span is stored with the samples: the next caller can tell whether
+            # this entry answers its question or only part of it.
             _day_cache[key] = ent = _Entry(samples, ts_list, time.monotonic(),
-                                           partial, src)
+                                           partial, src, want)
             _day_cache.move_to_end(key)
             while len(_day_cache) > _DAY_CACHE_MAX:
                 _day_cache.popitem(last=False)
@@ -897,10 +1021,31 @@ def _finish_inflight(key, fl: "_InFlight", result: "DayResult") -> None:
 # as an archiver error. Half the pool is the cap.
 _WARM_MAX_WORKERS = max(1, _POOL_SIZE // 2)
 
+# What a warm-up the operator is WAITING for may take instead (Shot Finder's
+# Load data / Load images). It is the job in front of them, not a background
+# chore, so it gets more of the pool — but never all of it: two slots stay free
+# for the Image Slider's live panel, which must not start reporting its own
+# queueing as an archiver outage.
+FOREGROUND_WARM_WORKERS = max(1, _POOL_SIZE - 2)
+
+
+def days_per_warm_wave(n_channels: int, *, reserve: int = 8) -> int:
+    """How many days may be warmed at once before the cache starts throwing the
+    beginning of the warm-up away.
+
+    The cache holds `_DAY_CACHE_MAX` channel-days. A search over a month with
+    three PVs warms ninety of them, so by the time the first day was worked on
+    it had already been evicted — and was fetched a SECOND time. Warming in
+    waves of this size keeps everything that has been paid for. `reserve` leaves
+    room for the days another tab is holding at the same time."""
+    n = max(1, int(n_channels))
+    return max(1, (_DAY_CACHE_MAX - max(0, int(reserve))) // n)
+
 
 def warm_days(channels: "Iterable[str]", date_keys: "Iterable[str]",
               *, today_ttl: float = 3.0, timeout: float = DEFAULT_TIMEOUT,
-              on_done=None) -> None:
+              on_done=None, span_for_day=None, max_workers: "int | None" = None
+              ) -> None:
     """Pre-load the day cache for channels × date_keys in parallel (bounded by
     _WARM_MAX_WORKERS). Fetch failures are counted and swallowed — this is
     best-effort warm-up and per-item calls will surface/retry them — but only
@@ -909,20 +1054,29 @@ def warm_days(channels: "Iterable[str]", date_keys: "Iterable[str]",
     on_done(channel, date_key, done, total) is called as each channel-day lands, from
     a worker thread. It is what lets a caller show how far a warm-up of a hundred
     channel-days has got: without it the whole block is one silent wait, which is how
-    a search of one day came to look like a program that had stopped."""
+    a search of one day came to look like a program that had stopped.
+
+    `span_for_day(date_key) -> (start_ns, end_ns) | None` reads only the hours that
+    day was picked for (see get_day's `span_ns`).
+
+    `max_workers` overrides the background cap. The default stays half the pool, so
+    a warm-up running behind somebody's back can never take every connection; a
+    warm-up the operator started by pressing a button may ask for more."""
     jobs = [(ch, dk) for ch in dict.fromkeys(channels) for dk in dict.fromkeys(date_keys)]
     if not jobs:
         return
 
     def _one(j):
         try:
-            get_day(j[0], j[1], today_ttl=today_ttl, timeout=timeout)
+            span = span_for_day(j[1]) if span_for_day is not None else None
+            get_day(j[0], j[1], today_ttl=today_ttl, timeout=timeout, span_ns=span)
         except CpvaError:
             _stat_bump("warm_failures")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     total = len(jobs)
-    with ThreadPoolExecutor(max_workers=min(_WARM_MAX_WORKERS, total)) as ex:
+    cap = _WARM_MAX_WORKERS if max_workers is None else max(1, int(max_workers))
+    with ThreadPoolExecutor(max_workers=min(cap, total)) as ex:
         futs = {ex.submit(_one, j): j for j in jobs}
         done = 0
         for fut in as_completed(futs):
@@ -936,13 +1090,20 @@ def warm_days(channels: "Iterable[str]", date_keys: "Iterable[str]",
                     pass
 
 
-def peek_day(channel: str, date_key: str) -> "DayResult | None":
+def peek_day(channel: str, date_key: str,
+             span_ns: "tuple[int, int] | None" = None) -> "DayResult | None":
     """Cached samples for one day WITHOUT touching the network. None = cache miss.
-    Today's TTL is ignored (the point is to never block a UI thread)."""
+    Today's TTL is ignored (the point is to never block a UI thread).
+
+    An entry that holds only part of the day (see get_day's `span_ns`) is a MISS
+    for anyone wanting more than it covers — half a day served as a whole one
+    would read as "nothing was archived" outside the slice."""
     key = (channel, date_key)
+    day_start, day_end = day_bounds_ns(date_key)
+    want = _clamp_span(span_ns, day_start, day_end)
     with _day_cache_lock:
         ent = _day_cache.get(key)
-        if ent is None:
+        if ent is None or not _covers(ent, day_start, day_end, want):
             return None
         _day_cache.move_to_end(key)
         return _entry_result(ent, "ok" if ent.samples else "empty",
@@ -1479,10 +1640,14 @@ def _value_before_day(channel: str, date_key: str, *,
     found: "tuple[float, int] | None" = None
     try:
         for d in lookback_days:
-            samples = fetch_values(channel, end_ns - d * DAY_NS, end_ns,
-                                   timeout=timeout, try_value_suffix=False)
+            # _drop_after, because the query end is NOT a guarantee: a window the
+            # archiver holds nothing for is answered with a carry-over value that
+            # may be stamped later than the window itself.
+            samples = _drop_after(
+                fetch_values(channel, end_ns - d * DAY_NS, end_ns,
+                             timeout=timeout, try_value_suffix=False), end_ns)
             if samples:
-                t_ns, val = samples[-1]   # query end is end_ns → all samples ≤ end_ns
+                t_ns, val = samples[-1]
                 found = (val, t_ns)
                 break
         if found is None and not channel.endswith(".value"):
@@ -1493,9 +1658,9 @@ def _value_before_day(channel: str, date_key: str, *,
             # time). One extra request, only in the already-failing case.
             widest = max(lookback_days) if lookback_days else 0
             if widest:
-                alias = parse_samples(fetch_samples(
+                alias = _drop_after(parse_samples(fetch_samples(
                     channel + ".value", end_ns - widest * DAY_NS, end_ns,
-                    timeout=timeout))
+                    timeout=timeout)), end_ns)
                 if alias:
                     t_ns, val = alias[-1]
                     found = (val, t_ns)

@@ -76,6 +76,24 @@ SIGN_IN_TIMEOUT_S = 300.0
 PORT_TIMEOUT_S = 30.0
 POLL_S = 1.0
 
+# Judging a sign-on cookie that was in the profile BEFORE this window opened.
+#
+# `CHECK_TIMEOUT_S` is short on purpose: this runs while a window is sitting on
+# screen, and the portal's own default of 20 s per request would leave it there
+# for a minute looking broken.
+#
+# `UNDECIDED_GRACE_S` is how long an undecided answer is waited out before the
+# old cookie is handed back anyway. Waiting matters: the window is one second
+# old when the first look happens, its page has not loaded, and every question
+# asked from inside it comes back "don't know" — which is what used to be read
+# as "signed in" and produced a blank window, gone in a blink, followed by "the
+# saved OKbase session has expired". Waiting for ever is wrong too: when
+# NOTHING can decide, the portal itself is not answering, and that is not a
+# reason to make somebody sign in again.
+CHECK_TIMEOUT_S = 8.0
+CHECK_EVERY_S = 3.0
+UNDECIDED_GRACE_S = 15.0
+
 EDGE_PATHS = (
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
@@ -630,6 +648,63 @@ def session_alive(port: int, base: str = "") -> str:
     return UNKNOWN
 
 
+def cookie_state(line: str, base: str = "",
+                 timeout: float = CHECK_TIMEOUT_S) -> str:
+    """ALIVE / DEAD / UNKNOWN for a Cookie line, asked from HERE.
+
+    The decisive question, and the reason it is not asked from inside the page:
+
+    * a fetch made from the window only means something while the window is ON
+      the portal. One second after the window opens it is on a blank page or on
+      Microsoft's, where the browser refuses that request before it ever leaves
+      the PC — and a refusal reads exactly like a portal that said nothing.
+    * the page asks one address; `okbase_menu` asks that address and then, if it
+      is refused, uses the single sign-on cookie to get a NEW session
+      (REVIVE_PATHS). A session id that has timed out on a sign-on that is
+      perfectly alive therefore looks dead from the page and is fine in fact.
+
+    So this asks the same way the canteen menu itself will: same cookies, same
+    revive attempt, same verdict. UNKNOWN means the portal could not be reached
+    — never that the sign-in is gone.
+    """
+    if not (line or "").strip():
+        return DEAD
+    session = None
+    try:
+        session, err = om.session_from_cookie(line, base or om.BASE_DEFAULT,
+                                              timeout)
+    except Exception:  # noqa: BLE001 - not knowing is a full answer here
+        return UNKNOWN
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if session is not None:
+        return ALIVE
+    if om.is_expired(err):
+        return DEAD
+    return UNKNOWN
+
+
+def inherited_state(line: str, base: str, port: int, host: str,
+                    where: str) -> str:
+    """The verdict on a sign-on cookie that predates this window.
+
+    Asked of the portal directly first, and only then — if the portal could not
+    be reached from here and the window happens to be sitting on the portal
+    itself — from inside the window, which may have a route this program has
+    not (a proxy the browser is configured for).
+    """
+    state = cookie_state(line, base)
+    if state != UNKNOWN:
+        return state
+    if host and host.lower() in (where or "").lower():
+        return session_alive(port, base)
+    return UNKNOWN
+
+
 # --------------------------------------------------------------------------- #
 # The whole job
 # --------------------------------------------------------------------------- #
@@ -701,7 +776,9 @@ def renew(host: str = "", page: str = MENU_PAGE,
     A sign-on cookie left over in the profile is checked against the portal
     before it is handed back, and thrown out if the portal has forgotten it.
     Microsoft's cookies are kept, so that second sign-in usually needs no clicks
-    either.
+    either. Until that check has actually ANSWERED, the window stays open: an
+    old cookie handed back on a "don't know" is the fault that made this button
+    a blank window that vanished and an "expired sign-in" message behind it.
     """
     def say(text: str) -> None:
         if progress is not None:
@@ -751,6 +828,8 @@ def renew(host: str = "", page: str = MENU_PAGE,
         refused: set[str] = set()   # sign-on cookies the portal has disowned
         inherited: set[str] | None = None   # what was in the profile beforehand
         swept = False          # the profile has been cleared out once already
+        undecided_since = 0.0  # since when nothing could judge the old cookie
+        asked_at = 0.0         # when the portal was last put the question
         while time.monotonic() < deadline:
             cookies, err = all_cookies(ws)
             if err:
@@ -774,21 +853,38 @@ def renew(host: str = "", page: str = MENU_PAGE,
                 # races the portal's own redirect, and losing that race would
                 # throw away the very sign-in the person just completed.
                 inherited = set(sso)
-            if jar and not (sso & refused):
-                # A jar still carrying a disowned sign-on cookie is not kept as
-                # the fallback either: it is exactly the thing that would be
-                # handed back at the end as "usable until the portal's timeout".
+            if jar and not sso:
+                # The fallback, and only for what it says it is: a session with
+                # no sign-on cookie behind it. A jar that HAS one is either
+                # handed back below or has been disowned by the portal, and
+                # neither belongs here — a disowned one turning up at the end
+                # as "usable until the portal's timeout" is the very thing this
+                # walk exists to stop.
                 best = jar
-            if sso and not (sso & refused):
+            # Where the window is. Read before the cookie is judged, because
+            # whether a question asked from inside it can mean anything depends
+            # on the page it is on.
+            where = page_url(ws)
+
+            ready = bool(sso) and not (sso & refused)
+            if ready and (sso & inherited):
                 # The cookie being THERE is not the sign-in working. The window
                 # keeps its own profile, so yesterday's sign-on cookie is still
                 # sitting in it the next morning; handing that back said "signed
                 # in" and the very next check said "expired — sign in again",
                 # with no way for the operator to get out of the loop. So the
-                # portal is asked, from inside the window, before an inherited
-                # cookie is called a sign-in. UNKNOWN is accepted as a yes: only
-                # a refusal is acted on.
-                if (sso & inherited) and session_alive(port, base_rest) == DEAD:
+                # portal is asked before an inherited cookie is called a
+                # sign-in — and an answer of "don't know" is NOT a yes, which is
+                # the whole of the 2026-09-16 fault: a one-second-old window has
+                # not loaded its page yet, nothing could answer, the old cookie
+                # was handed back on the strength of that, and the window shut
+                # before the person had seen anything in it.
+                verdict = UNKNOWN
+                if time.monotonic() - asked_at >= CHECK_EVERY_S:
+                    asked_at = time.monotonic()
+                    verdict = inherited_state(cookie_line(jar), base_rest,
+                                              port, host, where)
+                if verdict == DEAD:
                     refused.update(sso)
                     say("the saved sign-in is no longer valid — signing in afresh…")
                     if not swept:
@@ -798,16 +894,27 @@ def renew(host: str = "", page: str = MENU_PAGE,
                     # session; the pages will come round again for the new one.
                     pushed = picked = told = ""
                     best = {}
+                    undecided_since = 0.0
                     navigate(port, sso_start_url(page))
                     bring_to_front(port)
                     time.sleep(POLL_S)
                     continue
+                if verdict != ALIVE:
+                    # Undecided. Keep the window open and keep walking it — but
+                    # do not sit here for ever either: when nothing at all can
+                    # decide, it is the portal that is not answering, and that
+                    # is no reason to put a person through a fresh sign-in.
+                    if not undecided_since:
+                        undecided_since = time.monotonic()
+                        say("checking the saved sign-in with OKbase…")
+                    ready = (time.monotonic() - undecided_since
+                             >= UNDECIDED_GRACE_S)
+            if ready:
                 say("signed in — closing the window.")
                 return cookie_line(jar), ""
 
             # Walk the two pages a program is able to walk. Each is done once
             # per landing, so a page that ignores it is not hammered.
-            where = page_url(ws)
             if where and where != told:
                 # Every OTHER page names itself too. Those two are the only ones
                 # this can walk past; on anything else the window is simply

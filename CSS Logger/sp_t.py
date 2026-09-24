@@ -12,8 +12,16 @@ Archive workflow:
      shot measured inside each region is drawn as its own curve.
 
 Live workflow:
-  1. Switch to Live -> click "Start Live".
-  2. The bottom graph shows the newest shot plus the average of the last N spectra.
+  1. Click "Live mode" (top left, red while off, green while it runs), or tick
+     "Live mode" in the calendar.
+  2. It reads the picked time window — its From time, moved onto today — and the
+     bottom graph shows the newest shot plus the average of the last N spectra.
+     The shot filter sifts the whole window before N is applied.
+  3. Click it again and that stretch is loaded into the search graph, ready to
+     select in.
+
+There is no Archive button: the calendar decides. A day picked in the past with
+Live off IS the archive.
 
 Standalone:   python sp_t.py
 Integration:  class SpectraWidget, method cancel_scan()
@@ -35,10 +43,10 @@ except ImportError:
     _PRAGUE = None
 
 from PySide6.QtCore import (Qt, QObject, QTimer, Signal,
-                            QRect, QPoint, QEvent)
+                            QRect, QPoint, QEvent, QLocale)
 from PySide6.QtGui import (QAction, QColor, QCursor, QIcon, QPalette,
                            QShortcut, QKeySequence, QGuiApplication,
-                           QPainter, QPen)
+                           QPainter, QPen, QDoubleValidator, QFontMetrics)
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSpinBox, QCheckBox, QGroupBox, QScrollArea, QSizePolicy, QButtonGroup,
@@ -135,9 +143,12 @@ def _import_daypicker():
 
 
 daypicker = _import_daypicker()
-PickSeg        = daypicker.PickSeg
-seg_bounds_ns  = daypicker.seg_bounds_ns
-DayTimePicker  = daypicker.DayTimePicker
+PickSeg          = daypicker.PickSeg
+seg_bounds_ns    = daypicker.seg_bounds_ns
+seg_fields       = daypicker.seg_fields
+last_hour_window = daypicker.last_hour_window
+TZ_PRAGUE_DP     = daypicker.TZ_PRAGUE
+DayTimePicker    = daypicker.DayTimePicker
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 PV_ENERGY = "HAPLS-ENER_IN_SBW4_LT5_DIAG2:Energy"
@@ -181,6 +192,10 @@ def _spec_pvs_config_path() -> str:
     base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ELI_Spectra")
     return os.path.join(base, "spec_pvs.json")
 
+def _shot_filter_config_path() -> str:
+    base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ELI_Spectra")
+    return os.path.join(base, "shot_filter.json")
+
 def _strip_xy_suffix(ch: str) -> str:
     """Return the base PV name by stripping a trailing _X or _Y suffix."""
     for suffix in ("_X", "_Y"):
@@ -210,9 +225,14 @@ def _save_search_presets(presets: list):
 
 SIDEBAR_W       = 340          # fixed width of the left control panel
 LIVE_INTERVAL_S = 3            # poll period in live mode
-LIVE_BUF_MAX    = 2000         # max spectra kept in the rolling buffer
 DEFAULT_LIVE_N  = 100          # default "average last N" value
-LIVE_HISTORY_S  = 600          # on Start Live, preload this many seconds of recent shots
+# Rolling buffer cap. Live preloads the WHOLE window picked in the calendar, so
+# this has to hold a lab day: MEASURED 2026-09-23, the SPIDER writes ~460
+# shots/h, i.e. ~6400 for 07:00-21:00. The old 2000 silently dropped the
+# morning, which is exactly the "the filter found nothing" report this cap
+# caused. 20000 x 2048 float64 is ~330 MB worst case, and the >2 h question in
+# _confirm_live_preload is what keeps the user from walking into that blind.
+LIVE_BUF_MAX    = 20000
 MAX_INDIVIDUAL_LINES = 400     # cap when overlaying a region's individual spectra
 
 # "Every spectrum" display: draw each measured shot instead of one averaged curve.
@@ -593,6 +613,49 @@ def _shade(hex_color: str, factor: float) -> str:
 # Purple, the same accent the Image Slider gives its "Image / Display" section.
 _SET_ACCENT = "#7a4fc0"
 
+# The shot filter's own colours. Teal, so the block cannot be mistaken for the
+# purple drawing settings, the grey/green/blue numbered step cards or any
+# region colour; and one red, worn by the header while the filter is keeping
+# nothing — a folded-away block has nothing else to shout with.
+_FILTER_ACCENT = "#00695C"
+_FILTER_ALARM  = "#B71C1C"
+
+# The roof over the three numbered steps. Blue grey, because it has to be
+# telling apart from everything it sits next to or wraps: the purple drawing
+# settings, the teal shot filter, and the grey / green / blue of the step cards
+# inside it (_STEP_COLORS). Its body is that colour washed out to near white
+# (_shade 1.93), so the pale cards stay readable on top of it.
+_LOAD_ACCENT = "#455A64"
+_FILTER_EDIT_OK = (
+    "QLineEdit { font-size: 11px; padding: 2px 4px; color: #111; "
+    "background: #ffffff; border: 1px solid #b4b4b4; border-radius: 3px; }"
+    "QLineEdit:focus { border: 1px solid #00695C; }"
+)
+# A QDoubleValidator still accepts an intermediate "-" or "1e", so a box can hold
+# text that is not a number. It says so instead of behaving as if it were empty.
+_FILTER_EDIT_BAD = (
+    "QLineEdit { font-size: 11px; padding: 2px 4px; color: #B71C1C; "
+    "background: #ffffff; border: 2px solid #B71C1C; border-radius: 3px; }"
+)
+
+
+def _parse_num(text) -> "float | None":
+    """A typed number, or None for blank and for anything not yet a number.
+
+    Accepts a decimal comma as well as a point — the keyboard on this PC is
+    Czech, and 24700,5 is what gets typed. Same tolerance as _parse_number_list.
+    """
+    if text is None:
+        return None
+    s = str(text).strip().replace(",", ".")
+    if not s:
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v if np.isfinite(v) else None
+
 def _sub_label(text: str) -> QLabel:
     """Small caption for one block inside the settings group."""
     lbl = QLabel(text.upper())
@@ -608,6 +671,7 @@ class _SettingsGroup(QWidget):
                  expanded: bool = True, parent=None):
         super().__init__(parent)
         self._title = title
+        self._accent = accent
         self._expanded = bool(expanded)
 
         outer = QVBoxLayout(self)
@@ -620,6 +684,23 @@ class _SettingsGroup(QWidget):
         self._header.setCursor(Qt.CursorShape.PointingHandCursor)
         self._header.setSizePolicy(QSizePolicy.Policy.Expanding,
                                    QSizePolicy.Policy.Fixed)
+        self._header.setToolTip("Click to fold this block away or open it again.")
+        self._header.clicked.connect(self._on_clicked)
+        outer.addWidget(self._header)
+
+        self.body = QWidget()
+        self.body.setObjectName("setBody")
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(8, 5, 7, 7)
+        self.body_layout.setSpacing(4)
+        outer.addWidget(self.body)
+
+        self._paint_accent()
+        self.body.setVisible(self._expanded)
+        self._paint_header()
+
+    def _paint_accent(self):
+        accent = self._accent
         self._header.setStyleSheet(
             "QToolButton { text-align: left; border: none; padding: 6px 9px;"
             " margin-top: 6px; font-weight: 700; font-size: 11px;"
@@ -628,12 +709,6 @@ class _SettingsGroup(QWidget):
             f" background: {accent}; }}"
             f"QToolButton:hover {{ background: {_shade(accent, 0.85)}; }}"
         )
-        self._header.setToolTip("Click to fold this block away or open it again.")
-        self._header.clicked.connect(self._on_clicked)
-        outer.addWidget(self._header)
-
-        self.body = QWidget()
-        self.body.setObjectName("setBody")
         # A near-white tint (1.93): anything stronger and the black control text
         # stops being comfortably legible. Scoped to the object name so the
         # controls inside keep their own white / transparent backgrounds, and the
@@ -646,12 +721,20 @@ class _SettingsGroup(QWidget):
             " border-bottom-left-radius: 4px; border-bottom-right-radius: 4px; }"
             "#setBody QLabel { background: transparent; border: none; color: #111; }"
         )
-        self.body_layout = QVBoxLayout(self.body)
-        self.body_layout.setContentsMargins(8, 5, 7, 7)
-        self.body_layout.setSpacing(4)
-        outer.addWidget(self.body)
 
-        self.body.setVisible(self._expanded)
+    def set_accent(self, accent: str):
+        """Repaint the block in a different colour — the shot filter turns its
+        header red when it is keeping nothing, which is the loudest thing a
+        folded-away block can say."""
+        if accent == self._accent:
+            return
+        self._accent = accent
+        self._paint_accent()
+
+    def set_title(self, title: str):
+        """Rewrite the header text. The header is visible while the body is
+        folded, so it is where a block's result belongs."""
+        self._title = title
         self._paint_header()
 
     def _paint_header(self):
@@ -681,17 +764,6 @@ _BTN_DANGER = (
     "padding:7px 10px; border-radius:4px; }"
     "QPushButton:hover { background:#7F0000; }"
 )
-# Archive / Live: the chosen one is a filled blue button with white text, the
-# other dark ink on light grey. Written out because the app-wide stylesheet
-# repaints every button and the style's own "checked" look never shows through.
-_BTN_MODE = (
-    "QPushButton { background:#f0f0f0; color:#111; font-weight:600; "
-    "padding:6px 10px; border:1px solid #b4b4b4; border-radius:4px; }"
-    "QPushButton:hover:!checked { background:#dde8ff; }"
-    "QPushButton:checked { background:#1565C0; color:#ffffff; font-weight:700; "
-    "border:1px solid #0D47A1; }"
-)
-
 _TB_STYLE = (
     "QToolBar { background: white; border: none; } "
     "QToolButton { background: transparent; color: black; } "
@@ -772,6 +844,10 @@ _FETCH_WORKERS = 8
 # Above this many one-hour requests the load is worth a word of warning first
 # (hours × PVs). A normal day of a dozen PVs is well under it.
 _FETCH_WARN_REQUESTS = 400
+# Live preloads the whole picked window in one go, and spectra are 2048 floats
+# each. Above this many hours the user is asked first — see
+# _confirm_live_preload. Two hours is about 900 shots, which is still quick.
+_LIVE_PRELOAD_WARN_H = 2
 
 # The shortest drag on the search graph that counts as selecting a spectrum
 # rather than a click. The axis is in seconds of archive time.
@@ -988,6 +1064,67 @@ def _fetch_scalars(channel: str, start_ns: int, end_ns: int) -> list[tuple[int, 
     return result
 
 
+# ── The shot filter's two rules ───────────────────────────────────────────────
+# Slack added to the user's "±" field, as a fraction of the value asked for.
+# MEASURED on three days of archive (scratchpad probe, 2026-09-23): GDD
+# (L3-SPFE-AOD03-002:Order2_RB) is stored exactly — 24700.0, 24800.0 — but TOD
+# (Order3_RB) holds -97999.99999999999 and -94000.00000000001 where -98000 and
+# -94000 were set. A bare "==" would therefore silently throw away every shot
+# taken at those two TOD settings, which is the worst possible failure for a
+# filter: it looks like the shots were never measured.
+_FILTER_REL_EPS = 1e-6
+
+
+def _hold_forward(series: "list[tuple[int, float]]",
+                  ts_arr: "np.ndarray") -> np.ndarray:
+    """The value of a slowly-changing scalar AT each shot time.
+
+    The last sample at or before the shot; NaN when the channel had not recorded
+    anything yet. NOT an interpolation and not a window average: these are set
+    points, and between two writes the value simply IS the earlier one.
+
+    This is the normal case, not a corner: the dispersion PVs record about 35
+    samples in three days (FOD once), so a ten-minute region usually contains no
+    sample of its own and every value comes from the archiver's "last sample
+    before the window" freebie, which _fetch_scalars deliberately keeps.
+    """
+    ts_arr = np.asarray(ts_arr, dtype=np.int64)
+    if ts_arr.size == 0:
+        return np.empty(0, dtype=float)
+    if not series:
+        return np.full(ts_arr.shape, np.nan)
+    ordered = sorted(series, key=lambda s: s[0])
+    times = np.fromiter((int(t) for t, _ in ordered), dtype=np.int64,
+                        count=len(ordered))
+    vals  = np.fromiter((float(v) for _, v in ordered), dtype=float,
+                        count=len(ordered))
+    # side="right": a sample written at exactly the shot's own timestamp counts
+    # as already in force — the question being asked is "what did the archiver
+    # hold as of this instant".
+    pos = np.searchsorted(times, ts_arr, side="right") - 1
+    out = np.where(pos >= 0, vals[np.clip(pos, 0, None)], np.nan)
+    return np.asarray(out, dtype=float)
+
+
+def _match_value(vals: "np.ndarray", target: float, tol: float) -> np.ndarray:
+    """Which of `vals` count as equal to `target` within the user's ± field.
+
+    NaN never matches. A shot whose filter PV has no archived value cannot be
+    shown to satisfy a condition, so it is rejected — and the panel says which
+    channel did it, instead of leaving an empty graph to be read as "nothing was
+    measured".
+    """
+    vals = np.asarray(vals, dtype=float)
+    if vals.size == 0:
+        return np.empty(0, dtype=bool)
+    target = float(target)
+    # The max(1, |target|) floor matters at target 0, where a purely relative
+    # epsilon would come out as zero slack and reject an archived 1e-17.
+    slack = abs(float(tol)) + _FILTER_REL_EPS * max(1.0, abs(target))
+    with np.errstate(invalid="ignore"):
+        return np.isfinite(vals) & (np.abs(vals - target) <= slack)
+
+
 def _trimmed_mean(stack: np.ndarray, frac: float = 0.1) -> np.ndarray:
     """Mean after dropping the lowest and highest `frac` of values per column."""
     n = stack.shape[0]
@@ -1070,16 +1207,64 @@ def _x_unit_kind(unit: str) -> tuple[str, str]:
 
 
 def _guess_x_unit(*pv_names: str) -> str:
-    """Default unit of the X AXIS of a spectrum channel, from its name. Only the
-    SPIDER time domain differs from the nanometres the tab was built for — note
-    this is the axis, so TimeDomain_Phase is also fs (its phase is the Y value)
-    while SpecDomain_Phase is nm. Editable in the panel when a name lies."""
+    """Default unit of the X AXIS of a spectrum channel, read from its name.
+
+    The name is all there is. MEASURED 2026-09-24: the archiver does answer with
+    a metaData block, but its `units` field is the empty string on EVERY channel
+    — the SPIDER waveforms and a plain …:Energy scalar alike. So the EGU route
+    that main.py uses for scalar units returns nothing here; do not re-try it.
+
+    The whole catalogue is small enough to name. Of 9744 archived channels only
+    five are _X axes, plus two standalone spectra:
+
+        SpecDomain_Int_X / _Y      594.08 … 1295.1     nm
+        SpecDomain_Phase_X / _Y    594.08 … 1295.1     nm
+        TimeDomain_Int_X / _Y     -3749.1 … -1.83      fs
+        TimeDomain_FL_X / _Y      -3749.1 … -1.83      fs
+        TimeDomain_Phase_X / _Y   -3749.1 … -1.83      fs
+        FundY, SHGY  (no _X, the axis is built by hand)   nm
+
+    Note this is the AXIS, so TimeDomain_Phase is fs as well (its phase is the Y
+    value) while SpecDomain_Phase is nm. Everything a grating spectrometer
+    produces is in nanometres, which is why an unrecognised name still ends up
+    there. Editable in the panel when a name lies."""
     blob = " ".join(n or "" for n in pv_names).lower()
     if "timedomain" in blob or "time_domain" in blob:
         return "fs"
     if "thz" in blob:
         return "THz"
+    # Said out loud rather than left to the fall-through, so the wavelength
+    # families are as findable as the femtosecond one.
+    for word in ("specdomain", "spec_domain", "wavelength", "spectrum",
+                 "spectral", "fund", "shg"):
+        if word in blob:
+            return "nm"
     return "nm"
+
+
+def _x_unit_impossible(x, unit: str) -> str:
+    """Why the numbers on the axis cannot be in `unit` — '' when they can.
+
+    One rule, and it is physics rather than a hunch: a WAVELENGTH cannot be zero
+    or negative. That is exactly the case this panel got wrong — a SPIDER time
+    axis running -3749 … -1.8 fs was labelled "Wavelength [nm]" for weeks
+    because a hand-typed unit had outlived the channel it was typed for.
+
+    Nothing is guessed from the size or the span of the numbers: a rule that
+    merely looks plausible would let the panel contradict a correct unit, which
+    is worse than the mislabelling it is meant to catch."""
+    if x is None:
+        return ""
+    quantity, _ = _x_unit_kind(unit)
+    if quantity != "Wavelength":
+        return ""
+    arr = np.asarray(x, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0 or float(np.min(arr)) > 0.0:
+        return ""
+    return (f"X axis: the unit is set to {unit}, but the measured axis runs "
+            f"from {float(np.min(arr)):.4g} — a wavelength cannot be negative. "
+            f"Check the Unit box in step 3.")
 
 
 def _fwhm(x: np.ndarray, y: np.ndarray) -> "float | None":
@@ -1224,31 +1409,70 @@ def _load_x_csv(path: str) -> "np.ndarray | None":
     return _reconstruct_wavelength_axis(np.asarray(vals, dtype=float))
 
 
-def _compute_stats(arrs: list[np.ndarray]) -> dict | None:
-    """Combine a list of waveforms (keeping only the most common length).
+STAT_KEYS = ("mean", "median", "trimmed", "sigma", "std", "p10", "p90")
 
-    Computes every averaging method up front so the user can switch the method
-    afterwards without re-fetching the data.
+
+def _stats_from_stack(stack: np.ndarray, keys=None) -> dict:
+    """Every averaging method of one already-stacked set of waveforms.
+
+    `keys` limits which of them are actually computed; the rest come back None.
+    That exists for the shot filter, which recomputes the averages from the rows
+    that matched on every keystroke and only ever needs the curve currently on
+    the graph.
+
+    MEASURED, testing/probe_filter_cost.py, on the worst real region seen so far
+    (9007 shots x 2048 points = 148 MB): the whole set takes 9.6 s, of which the
+    median (2.0 s), the trimmed mean (1.5 s) and the two percentiles (3.7 s) are
+    the bulk, while the mean and the standard deviation together are 0.26 s. At
+    4096 points it is 24 s. Computing all seven on every keystroke is therefore
+    not an option, and computing them lazily is not an optimisation but the
+    difference between a usable control and a frozen window.
+    """
+    want = None if keys is None else set(keys)
+
+    def _on(k):
+        return want is None or k in want
+
+    return {
+        "mean":    stack.mean(axis=0)               if _on("mean")    else None,
+        "median":  np.median(stack, axis=0)         if _on("median")  else None,
+        "trimmed": _trimmed_mean(stack, 0.1)        if _on("trimmed") else None,
+        "sigma":   _sigma_clipped_mean(stack, 3.0)  if _on("sigma")   else None,
+        "std":     stack.std(axis=0)                if _on("std")     else None,
+        "p10":     np.percentile(stack, 10, axis=0) if _on("p10")     else None,
+        "p90":     np.percentile(stack, 90, axis=0) if _on("p90")     else None,
+        "stack":   stack,          # individual spectra (feature: show all spectra)
+        "n":       int(stack.shape[0]),
+    }
+
+
+def _modal_length(arrs: list) -> "int | None":
+    """The waveform length most of these arrays have, or None for an empty list.
+
+    The one definition of "the length this set of shots is about". Whoever keeps
+    a per-shot list beside the stack (timestamps, a filter PV's values) has to
+    drop exactly the same rows, or row i of the two stops being the same shot.
     """
     if not arrs:
         return None
     lens = [len(a) for a in arrs]
-    common = max(set(lens), key=lens.count)
+    return max(set(lens), key=lens.count)
+
+
+def _compute_stats(arrs: list[np.ndarray], keys=None) -> dict | None:
+    """Combine a list of waveforms (keeping only the most common length).
+
+    Computes every averaging method up front so the user can switch the method
+    afterwards without re-fetching the data — unless `keys` narrows it, see
+    _stats_from_stack.
+    """
+    common = _modal_length(arrs)
+    if common is None:
+        return None
     arrs = [a for a in arrs if len(a) == common]
     if not arrs:
         return None
-    stack = np.vstack(arrs)
-    return {
-        "mean":    stack.mean(axis=0),
-        "median":  np.median(stack, axis=0),
-        "trimmed": _trimmed_mean(stack, 0.1),
-        "sigma":   _sigma_clipped_mean(stack, 3.0),
-        "std":     stack.std(axis=0),
-        "p10":     np.percentile(stack, 10, axis=0),
-        "p90":     np.percentile(stack, 90, axis=0),
-        "stack":   stack,          # individual spectra (feature: show all spectra)
-        "n":       len(arrs),
-    }
+    return _stats_from_stack(np.vstack(arrs), keys)
 
 
 # user-facing dropdown label -> stat key
@@ -1297,6 +1521,48 @@ def _fmt_window(w: "tuple[int, int]") -> str:
     """'2026-08-25 08:00-12:00' — one picked window, for labels and status text."""
     a, b = _ns_to_dt(w[0]), _ns_to_dt(w[1])
     return f"{a.strftime('%Y-%m-%d %H:%M')}-{b.strftime('%H:%M')}"
+
+
+def _live_span_ns(segments, windows, now: "datetime | None" = None
+                  ) -> "tuple[int, int]":
+    """[start_ns, now_ns] — the stretch Live preloads, from the picked window.
+
+    Daypicker rule 7, the Image Slider's rule: the From of the picked window is
+    kept and only the DATE moves to today. "To" is thrown away, because live has
+    not happened yet — the window stays open and keeps taking new shots.
+
+    Nothing picked yet, or a From that is still in the future (07:00 picked, but
+    it is 06:20), falls back to the last whole hour. Live used to preload a flat
+    ten minutes, which is why a filter set on a morning value found nothing: the
+    morning had never been read.
+
+    Kept at module level, with `now` injectable, so the rule can be tested
+    without building a widget — see testing/test_live_window.py.
+    """
+    now = now or datetime.now(TZ_PRAGUE_DP)
+    today = now.date()
+    hf = mf = None
+    if segments:
+        # The segment for today if it is in the pick, otherwise the last day
+        # picked — that is the one whose hours the user set most recently.
+        chosen = None
+        for s in segments:
+            if seg_fields(s)[0] == today:
+                chosen = s
+                break
+        chosen = chosen if chosen is not None else segments[-1]
+        _d, hf, mf, _ht, _mt = seg_fields(chosen)
+    elif windows:
+        a = _ns_to_dt(windows[-1][0])
+        hf, mf = a.hour, a.minute
+    if hf is None:
+        hf, mf, _ht, _mt = last_hour_window(now)
+    start_ns, _end = seg_bounds_ns(PickSeg(today, int(hf), int(mf), 23, 59))
+    now_ns = int(now.timestamp() * 1e9)
+    if start_ns >= now_ns:
+        hf, mf, _ht, _mt = last_hour_window(now)
+        start_ns, _end = seg_bounds_ns(PickSeg(today, int(hf), int(mf), 23, 59))
+    return start_ns, now_ns
 
 
 # ── _TimeMap ──────────────────────────────────────────────────────────────────
@@ -2530,9 +2796,9 @@ class SpectraWidget(QWidget):
         self._live_timer        = QTimer(self)
         self._live_timer.setSingleShot(True)
         self._live_timer.timeout.connect(self._live_tick)
-        self._blink_timer       = QTimer(self)
-        self._blink_timer.timeout.connect(self._blink_tick)
-        self._blink_on          = False
+        # Live rewrote the window to the stretch it is streaming; that stretch
+        # still has to be read from the archive when live is switched off again.
+        self._archive_reload_pending = False
         self._busy              = False
         self._cancel            = threading.Event()
         self._loading           = False   # a day load is in flight
@@ -2545,6 +2811,37 @@ class SpectraWidget(QWidget):
         self._live_slice_n      = 0       # shots handed to it (see _on_live_y)
         self._analysis_gen      = 0       # bumped when in-flight results go stale
         self._reanalyze_pending = False   # re-run queued behind an obsolete run
+        # ── The shot filter ───────────────────────────────────────────────
+        # Conditions on a scalar PV's value at each shot's own time. Several of
+        # them, AND-ed, each with its own on/off tick so it can stay configured
+        # while switched off. See _apply_shot_filter().
+        self._filter_on:        bool                     = False
+        self._filter_conds:     list[dict]               = []
+        self._load_shot_filter()          # fills the two above
+        self._filter_rows:      list[dict]               = []   # widget refs per row
+        self._filter_busy       = False   # a per-shot value top-up is in flight
+        self._filter_pending    = False   # another apply queued behind it
+        self._filter_fetch_err: dict                     = {}   # (rid, ch) -> message
+        # A live poll of each filter channel, {channel: [(ts_ns, value)]}. Live
+        # shots are filtered against this, held forward exactly as the archive
+        # ones are.
+        self._live_scalars:     dict                     = {}
+        # Set by _live_shots on every call: raw shots in the window, how many of
+        # them match the filter, how many the graph uses after "last N", and how
+        # many raw shots arrived after the last matching one.
+        self._live_seen_n       = 0
+        self._live_matched_n    = 0
+        self._live_kept_n       = 0
+        self._live_newer_dropped = 0
+        self._live_arming:      list                     = []   # channels not polled yet
+        # Set when the filter has pinned the colour-by PV to one value, so the
+        # rainbow would paint every spectrum the same — see _compute_region_colors.
+        self._color_pinned:     tuple | None             = None
+        # Editing the value box must not recompute a 9000-shot average on every
+        # keystroke — see _schedule_filter() and probe_filter_cost.py.
+        self._filter_timer      = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self._apply_filter_and_redraw)
         self._cax_bot:          object | None            = None   # permanent colour-bar slot
         self._colorbar_bot:     object | None            = None
         self._colorbar_info:    dict   | None            = None
@@ -2597,19 +2894,25 @@ class SpectraWidget(QWidget):
         lay.setContentsMargins(2, 4, 2, 4)
         lay.setSpacing(6)
 
-        # ── Top status block (live indicator + selected day + messages) ──
+        # ── Top row: the Live switch and Stop ──────────────────────────
+        # The old "○ Idle / ⟳ Working… / ● LIVE" pill is gone. It blinked, it
+        # could not be clicked, and it said what the status line under it and the
+        # progress bar already say. Its place is taken by the Live switch itself,
+        # painted exactly like Image Slider's: green while it runs, red while it
+        # does not.
+        self._btn_live = QPushButton("⇢ Live mode")
+        self._btn_live.setCheckable(True)
+        self._btn_live.setToolTip(
+            "Stream the newest spectra as they are measured.\n\n"
+            "Switching it on reads the window set in Load day and time — its "
+            "From time, moved onto today — and then keeps taking every new "
+            "shot. Nothing picked yet means the last whole hour. Switching it "
+            "off leaves that stretch loaded in the search graph.\n"
+            "The button is green while it runs and red while it does not."
+        )
         row_state = QHBoxLayout()
         row_state.setSpacing(4)
-        self._lbl_live_ind = QLabel()
-        self._lbl_live_ind.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_live_ind.setToolTip(
-            "What this tab is doing right now:\n"
-            "○ Idle — nothing running\n"
-            "⟳ Working… — loading a day or analysing spectra "
-            "(the progress bar by Analyze shows how far)\n"
-            "● LIVE — streaming new shots"
-        )
-        row_state.addWidget(self._lbl_live_ind, stretch=1)
+        row_state.addWidget(self._btn_live, stretch=1)
         self._btn_stop = QPushButton("⏹  Stop")
         self._btn_stop.setToolTip(
             "Stop whatever is running: live streaming, a day load or an analysis "
@@ -2620,10 +2923,111 @@ class SpectraWidget(QWidget):
         row_state.addWidget(self._btn_stop)
         lay.addLayout(row_state)
 
+        # ── The action row: Analyze · Export ───────────────────────────
+        self._btn_analyze = QPushButton("✓  Analyze")
+        self._btn_analyze.setEnabled(False)
+        self._btn_analyze.setStyleSheet(_BTN_SUCCESS)
+        self._btn_analyze.setToolTip(
+            "Fetch and average the spectra in every not-yet-analyzed selection, then plot them."
+        )
+        self._btn_export = QPushButton("\U0001F4BE  Export")
+        self._btn_export.setEnabled(False)
+        # Same height as Analyze beside it — an unstyled button is 4 px shorter.
+        self._btn_export.setStyleSheet(
+            "QPushButton { background:#f0f0f0; color:#111; font-weight:700; "
+            "padding:7px 10px; border:1px solid #b4b4b4; border-radius:4px; }"
+            "QPushButton:hover { background:#e0f2f1; }"
+            "QPushButton:disabled { background:#ececec; color:#999; "
+            "border:1px solid #d5d5d5; }"
+        )
+        self._btn_export.setToolTip(
+            "Export the analyzed spectra to a CSV (details + curves) and/or save the plot image."
+        )
+
+        # ── Average last N — rides in the same row, only while Live runs ───
+        # It used to be a "Live" group box far down the panel, between the shot
+        # filter and the drawing settings. It is not a drawing setting and it is
+        # not a filter: it says how much of the live stream is on the graph, so
+        # it belongs with the buttons that act on the data.
+        #
+        # The row is measured, not guessed. On this PC (Segoe UI 9 pt, display
+        # at 150 %) the four controls want 86 + 83 + 80 + 59 px plus 3 gaps of
+        # 4 px = 320 px, and the sidebar's inside is 336 px — so the full
+        # caption fits with room to spare and Analyze keeps its stretch.
+        self._g_live = QWidget()
+        live_l = QHBoxLayout(self._g_live)
+        live_l.setContentsMargins(0, 0, 0, 0)
+        live_l.setSpacing(4)
+        lbl_live_n = QLabel("Average last N:")
+        # Own colour: the sidebar is light and an unstyled label inherits the
+        # dark theme's white text, which would be invisible here.
+        lbl_live_n.setStyleSheet(
+            "color: #111; background: transparent; border: none;")
+        live_l.addWidget(lbl_live_n)
+        self._sb_live_n = QSpinBox()
+        self._sb_live_n.setRange(1, LIVE_BUF_MAX)
+        self._sb_live_n.setValue(DEFAULT_LIVE_N)
+        _live_n_tip = (
+            "How many of the most-recent live spectra to average together "
+            "(the newest shot is always drawn on top in red). The same N "
+            "decides how many faint blue single shots are drawn, so it is what "
+            "is on the graph at all, not just the black curve.\n\n"
+            "Start Live reads the WHOLE window set in Load day and time — its "
+            "From time, moved onto today — and then adds one poll every "
+            f"{LIVE_INTERVAL_S} s. Nothing picked yet means the last whole "
+            "hour.\n"
+            f"At most {MAX_INDIVIDUAL_LINES} of the shots are drawn as faint "
+            "individual traces; all of them are averaged.\n\n"
+            "The shot filter runs FIRST, over the whole window, and N then "
+            "takes the last N of the shots that matched. So a condition set on "
+            "a morning value finds the morning shots, and the status line says "
+            "how many of the window matched."
+        )
+        # On the caption too — the box is small and the words beside it are
+        # what the eye lands on.
+        lbl_live_n.setToolTip(_live_n_tip)
+        self._sb_live_n.setToolTip(_live_n_tip)
+        live_l.addWidget(self._sb_live_n)
+        self._g_live.setVisible(False)
+
+        row_act = QHBoxLayout()
+        row_act.setSpacing(4)
+        row_act.addWidget(self._btn_analyze, stretch=1)
+        row_act.addWidget(self._btn_export)
+        row_act.addWidget(self._g_live)
+        lay.addLayout(row_act)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._progress.setFormat("Analyzing  %v / %m  (%p%)")
+        self._progress.setTextVisible(True)
+        self._progress.setVisible(False)
+        self._progress.setStyleSheet(
+            "QProgressBar { border: 1px solid #b0b0b0; border-radius: 4px; "
+            "text-align: center; height: 20px; font-size: 11px; font-weight: 700; "
+            "background: #ffffff; color: #111; }"
+            "QProgressBar::chunk { background: #2E7D32; border-radius: 3px; }"
+        )
+        lay.addWidget(self._progress)
+
         self._lbl_status = QLabel("Ready.")
         self._lbl_status.setWordWrap(True)
         self._lbl_status.setStyleSheet("color: #555; font-size: 10px;")
         lay.addWidget(self._lbl_status)
+
+        # ══ Loading data — the three numbered steps, under one roof ════
+        # Picking a day, picking what to search on and picking the measured
+        # channel are one job: getting data onto the screen. They were three
+        # loose cards taking up most of the panel even after the data was in.
+        # One foldable group (the same header the shot filter and the drawing
+        # settings wear) names that job and folds all three away when the
+        # reading starts. It opens expanded, because on a fresh start there is
+        # nothing loaded yet and the steps ARE what to do next.
+        self._g_loading = _SettingsGroup("Loading data", accent=_LOAD_ACCENT,
+                                         expanded=True)
+        load_l = self._g_loading.body_layout
+        lay.addWidget(self._g_loading)
 
         # ══ Step 1 — the day and the time window ═══════════════════════
         card1, b1 = _step_card(1, "DAY & TIME")
@@ -2643,7 +3047,7 @@ class SpectraWidget(QWidget):
             "Each day gets its own From/To time; only the chosen hours are loaded."
         )
         b1.addWidget(self._btn_pick_day)
-        lay.addWidget(card1)
+        load_l.addWidget(card1)
 
         # ══ Step 2 — the search signal and the list it comes from ══════
         # One card on purpose: the answer on top, the list you change it in below.
@@ -2766,7 +3170,7 @@ class SpectraWidget(QWidget):
         row_pv.addWidget(self._btn_add_pv)
         row_pv.addWidget(self._btn_rem_pv)
         b2.addLayout(row_pv)
-        lay.addWidget(card2)
+        load_l.addWidget(card2)
 
         # ══ Step 3 — which spectrum is measured ════════════════════════
         card3, b3 = _step_card(3, "SPECTRUM  —  what I measure")
@@ -2821,70 +3225,23 @@ class SpectraWidget(QWidget):
         self._edit_x_unit.setToolTip(
             "Unit of the horizontal axis of the spectrum graph — nm for a "
             "spectrometer, fs for the SPIDER time domain. It sets the axis title, "
-            "the readout, the Peak / FWHM labels and the exported column names.")
+            "the readout, the Peak / FWHM labels and the exported column names."
+            "\n\nIt fills itself in from the name of the measured channel, and "
+            "follows it when the channel is changed. Type over it only when a "
+            "name lies: what you type is then remembered for THAT channel alone. "
+            "Emptying the box, or typing the unit it already shows, hands it "
+            "back to the automatic setting.")
         self._edit_x_unit.editingFinished.connect(self._on_x_unit_edited)
         row_un.addWidget(self._edit_x_unit)
         row_un.addStretch(1)
         b3.addLayout(row_un)
-        lay.addWidget(card3)
+        load_l.addWidget(card3)
 
-        # ── Mode ───────────────────────────────────────────────────────
-        # Built here, put on the panel further down: the order on screen is
-        # day → search by → spectrum → selected spectra → mode → analyze.
-        g_mode = self._g_mode = QGroupBox("Mode")
-        g_mode.setStyleSheet(_GROUP_STYLE)
-        row_m = QHBoxLayout(g_mode)
-        self._btn_archive   = QPushButton("Archive")
-        self._btn_live_mode = QPushButton("Live")
-        self._btn_archive.setToolTip("Browse past data: load a day and select spectra from the archive.")
-        self._btn_live_mode.setToolTip("Stream the latest spectra in real time and average the last N shots.")
-        self._btn_archive.setCheckable(True)
-        self._btn_live_mode.setCheckable(True)
-        self._btn_archive.setChecked(True)
-        # The app-wide stylesheet gives every button its own border and background,
-        # which wipes out the style's "pressed in" look — both mode buttons then
-        # looked identical and nothing on the panel said which mode was on. The
-        # chosen one is now a filled blue button with white text.
-        for _b in (self._btn_archive, self._btn_live_mode):
-            _b.setStyleSheet(_BTN_MODE)
-        self._mode_grp = QButtonGroup(self)
-        self._mode_grp.setExclusive(True)
-        self._mode_grp.addButton(self._btn_archive)
-        self._mode_grp.addButton(self._btn_live_mode)
-        row_m.addWidget(self._btn_archive)
-        row_m.addWidget(self._btn_live_mode)
-
-        # ── Live controls ──────────────────────────────────────────────
-        self._g_live = QGroupBox("Live")
-        self._g_live.setStyleSheet(_GROUP_STYLE)
-        live_l = QVBoxLayout(self._g_live)
-        row_n = QHBoxLayout()
-        row_n.addWidget(QLabel("Average last N:"))
-        self._sb_live_n = QSpinBox()
-        self._sb_live_n.setRange(1, LIVE_BUF_MAX)
-        self._sb_live_n.setValue(DEFAULT_LIVE_N)
-        self._sb_live_n.setToolTip(
-            "How many of the most-recent live spectra to average together "
-            "(the newest shot is always drawn on top in red).\n\n"
-            f"Start Live begins with the last {LIVE_HISTORY_S // 60} minutes of "
-            f"shots and then adds one poll every {LIVE_INTERVAL_S} s, so right "
-            "after starting there are usually fewer than this in the buffer — the "
-            "status line says how many are actually being averaged.\n"
-            f"Every shot in the buffer is averaged, but at most "
-            f"{MAX_INDIVIDUAL_LINES} of them are drawn as faint individual traces."
-        )
-        row_n.addWidget(self._sb_live_n)
-        live_l.addLayout(row_n)
-        self._btn_live_start = QPushButton("▶  Start Live")
-        self._btn_live_start.setStyleSheet(_BTN_SUCCESS)
-        self._btn_live_start.setToolTip(
-            "Start/stop streaming live spectra. The bottom graph shows the newest shot "
-            "plus the average of the last N spectra."
-        )
-        live_l.addWidget(self._btn_live_start)
-        # (the blinking "live is running" indicator lives in the top status block)
-        self._g_live.setVisible(False)
-
+        # (There is no "Archive" button any more: the calendar decides. A day
+        #  picked in the past and Live off IS archive; switching Live on keeps
+        #  the picked From time, moves it onto today and streams from there,
+        #  exactly as in Image Slider. The Live button itself is the "it is
+        #  running" light, and "Average last N" rides beside Analyze/Export.)
         # (region selection list lives in the collapsible block, not here)
 
         # ══ Settings — everything that only changes how it is DRAWN ════
@@ -3063,56 +3420,27 @@ class SpectraWidget(QWidget):
         set_l.addWidget(g_cmp)
 
         # ══ The panel, in the order it is used ═════════════════════════
-        # The three numbered steps are already on it. What follows is the list of
-        # what was picked, then how it is read (mode), then Analyze, then the two
-        # buttons that end the job — and the drawing settings last of all.
+        # Loading data (the three numbered steps) is already on it. What follows
+        # is the list of what was picked, then the filter that decides which
+        # shots count — and the drawing settings last of all. The buttons that
+        # do the work (Live, Stop, Analyze, Export) sit at the very top, where
+        # they are reachable whatever is folded away below.
 
         # ── Selected spectra (the list itself) ─────────────────────────
-        lay.addWidget(self._make_region_panel(), stretch=1)
+        lay.addWidget(self._make_region_panel())
 
-        # ── Mode (+ the live controls that belong to it) ───────────────
-        lay.addWidget(self._g_mode)
-        lay.addWidget(self._g_live)
-
-        # ── Analyze + its progress bar ─────────────────────────────────
-        self._btn_analyze = QPushButton("✓  Analyze")
-        self._btn_analyze.setEnabled(False)
-        self._btn_analyze.setStyleSheet(_BTN_SUCCESS)
-        self._btn_analyze.setToolTip(
-            "Fetch and average the spectra in every not-yet-analyzed selection, then plot them."
-        )
-        lay.addWidget(self._btn_analyze)
-
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 1)
-        self._progress.setValue(0)
-        self._progress.setFormat("Analyzing  %v / %m  (%p%)")
-        self._progress.setTextVisible(True)
-        self._progress.setVisible(False)
-        self._progress.setStyleSheet(
-            "QProgressBar { border: 1px solid #b0b0b0; border-radius: 4px; "
-            "text-align: center; height: 20px; font-size: 11px; font-weight: 700; "
-            "background: #ffffff; color: #111; }"
-            "QProgressBar::chunk { background: #2E7D32; border-radius: 3px; }"
-        )
-        lay.addWidget(self._progress)
-
-        # ── Clear all + Export ─────────────────────────────────────────
-        self._btn_clear_regs = QPushButton("Clear all")
-        self._btn_clear_regs.setToolTip("Remove all selected spectra from the list.")
-        self._btn_export = QPushButton("\U0001F4BE  Export results")
-        self._btn_export.setEnabled(False)
-        self._btn_export.setToolTip(
-            "Export the analyzed spectra to a CSV (details + curves) and/or save the plot image."
-        )
-        row_end = QHBoxLayout()
-        row_end.setSpacing(6)
-        row_end.addWidget(self._btn_clear_regs)
-        row_end.addWidget(self._btn_export, stretch=1)
-        lay.addLayout(row_end)
+        # ── Shot filter ────────────────────────────────────────────────
+        # Not a display setting: it changes what n IS, what is averaged, the
+        # metrics and the export. It sits directly under the list of selections
+        # whose counts it rewrites.
+        lay.addWidget(self._make_filter_panel())
 
         # ── Display settings, last ─────────────────────────────────────
         lay.addWidget(self._g_settings)
+
+        # Nothing below the settings, so the blocks pack to the top instead of
+        # being stretched apart by the scroll area's leftover height.
+        lay.addStretch(1)
 
         return sb
 
@@ -3779,17 +4107,25 @@ class SpectraWidget(QWidget):
         lbl = QLabel("Selected spectra")
         lbl.setStyleSheet("font-weight: 700; font-size: 13px;")
         head.addWidget(lbl, stretch=1)
-        self._btn_expand_all = QPushButton("⤢ Expand all")
-        self._btn_expand_all.setToolTip("Expand all spectra to show their details (or collapse them all)")
-        self._btn_expand_all.setStyleSheet(
+        _small_btn = (
             "QPushButton { font-size: 11px; padding: 2px 6px; border: 1px solid #c8c8c8; "
-            "border-radius: 3px; background: #f4f4f4; }"
+            "border-radius: 3px; background: #f4f4f4; color: #111; }"
             "QPushButton:hover { background: #e8f0fe; }"
             "QPushButton:disabled { color: #aaa; }"
         )
+        self._btn_expand_all = QPushButton("⤢ Expand all")
+        self._btn_expand_all.setToolTip("Expand all spectra to show their details (or collapse them all)")
+        self._btn_expand_all.setStyleSheet(_small_btn)
         self._btn_expand_all.clicked.connect(self._toggle_all_expanded)
         self._btn_expand_all.setEnabled(False)
         head.addWidget(self._btn_expand_all)
+        # "Clear all" empties THIS list (it never touched the graph), so it
+        # belongs on this heading and not in the row of actions at the top.
+        self._btn_clear_regs = QPushButton("✕ Clear all")
+        self._btn_clear_regs.setToolTip("Remove all selected spectra from this list.")
+        self._btn_clear_regs.setStyleSheet(_small_btn)
+        self._btn_clear_regs.setEnabled(False)
+        head.addWidget(self._btn_clear_regs)
         v.addLayout(head)
 
         # The region list is a plain framed container (NOT its own scroll area):
@@ -3807,11 +4143,441 @@ class SpectraWidget(QWidget):
         self._regions_lay.setContentsMargins(0, 0, 0, 0)
         self._regions_lay.setSpacing(0)
         self._regions_lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+        # The box is exactly as tall as the rows in it: Fixed, not Maximum. It
+        # used to be the one stretching widget on the sidebar, so an empty list
+        # still claimed every spare pixel and the block looked enormous with
+        # nothing in it. Maximum was worse than Preferred here — the layout is
+        # then free to hand it LESS than its rows need and the last rows are cut
+        # in half.
+        self._regions_w.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                      QSizePolicy.Policy.Fixed)
         v.addWidget(self._regions_w)
-        # Analyze, the progress bar, Clear all and Export are NOT part of this
-        # panel any more — they are built by _make_sidebar and sit below Mode, so
-        # the panel reads list → mode → analyze → finish.
+        # Analyze, Export and the progress bar are NOT part of this panel — they
+        # are the action row at the top of the sidebar, beside Live.
         return col
+
+    # ── The shot filter's panel ───────────────────────────────────────────────
+    # One row per condition: a tick box, the PV, "= value ± tolerance", and a
+    # remove button. Everything that has to be read off the block — how many
+    # shots matched, what the filter PV reads at the picked shot, a channel that
+    # never recorded — is written into the readout lines rather than into static
+    # captions, so the block carries no text that is the same in every state.
+    def _make_filter_panel(self) -> QWidget:
+        self._g_filter = _SettingsGroup("Shot filter", accent=_FILTER_ACCENT,
+                                        expanded=False)
+        lay = self._g_filter.body_layout
+
+        self._chk_filter = QCheckBox("Filter shots by PV value")
+        self._chk_filter.setChecked(self._filter_on)
+        self._chk_filter.setStyleSheet(_CHK_STYLE)
+        self._chk_filter.setToolTip(
+            "Keep only the shots whose PV values match the conditions below.\n\n"
+            "The value is read at each shot's own time — the last value the "
+            "archiver holds at or before it, which is how a set point that is "
+            "written once a day still has a value for every shot.\n\n"
+            "Everything follows: the average is rebuilt from the matching shots "
+            "only, and so are the metrics, the legend counts, the shot bar and "
+            "the exported CSV."
+        )
+        lay.addWidget(self._chk_filter)
+
+        self._lbl_filter_count = QLabel("")
+        self._lbl_filter_count.setWordWrap(True)
+        lay.addWidget(self._lbl_filter_count)
+
+        # The rows live in their own container so adding or removing one does not
+        # rebuild the master switch and the readout above it.
+        self._filter_rows_w = QWidget()
+        self._filter_rows_lay = QVBoxLayout(self._filter_rows_w)
+        self._filter_rows_lay.setContentsMargins(0, 0, 0, 0)
+        self._filter_rows_lay.setSpacing(3)
+        lay.addWidget(self._filter_rows_w)
+
+        self._btn_filter_add = QPushButton("+  Add condition…")
+        self._btn_filter_add.setStyleSheet(
+            "QPushButton { font-size: 11px; padding: 3px 8px; color: #111; "
+            "border: 1px solid #b4b4b4; border-radius: 3px; background: #f4f4f4; }"
+            "QPushButton:hover { background: #e0f2f1; }"
+        )
+        self._btn_filter_add.setToolTip("Pick another PV to filter the shots by.")
+        self._btn_filter_add.clicked.connect(self._filter_add_condition)
+        lay.addWidget(self._btn_filter_add)
+
+        self._rebuild_filter_rows()
+        self._update_filter_readout()
+        return self._g_filter
+
+    def _filter_num_width(self, sample: str) -> int:
+        """Width for a numeric box, measured from the widest value it must show.
+
+        Never a hand-picked number: the panel is 340 px wide and a guessed width
+        is how a box ends up clipping '-98000' to '-9800'."""
+        fm = QFontMetrics(self.font())
+        return fm.horizontalAdvance(sample) + 14
+
+    def _make_filter_row(self, i: int, c: dict) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(3)
+
+        chk = QCheckBox("")
+        chk.setChecked(bool(c.get("on")))
+        chk.setStyleSheet(_CHK_STYLE)
+        chk.setToolTip("Use this condition. Unticked it stays here, set up and "
+                       "doing nothing.")
+        chk.toggled.connect(lambda on, k=i: self._on_filter_row_toggled(k, on))
+        row.addWidget(chk)
+
+        btn_pv = QPushButton(c.get("label") or c["channel"].split(":")[-1])
+        btn_pv.setToolTip(f"{c['channel']}\nClick to filter by a different PV.")
+        btn_pv.setMinimumWidth(0)          # never guess a width in a 340 px panel
+        btn_pv.setStyleSheet(
+            "QPushButton { font-size: 11px; font-weight: 600; text-align: left; "
+            "padding: 2px 6px; color: #111; background: #f0f0f0; "
+            "border: 1px solid #b4b4b4; border-radius: 3px; }"
+            "QPushButton:hover { background: #e0f2f1; }"
+        )
+        btn_pv.clicked.connect(lambda _=False, k=i: self._filter_pick_pv(k))
+        row.addWidget(btn_pv, stretch=1)
+
+        e_val = self._make_filter_edit(
+            c.get("value"), "value", self._filter_num_width("-99999.99"),
+            "The value to match. Leave it empty and the condition does nothing.")
+        e_val.textEdited.connect(lambda t, k=i: self._on_filter_num_edited(k, "value", t))
+        row.addWidget(e_val)
+
+        pm = QLabel("±")
+        pm.setStyleSheet("font-weight: 700; color: #111;")
+        row.addWidget(pm)
+
+        e_tol = self._make_filter_edit(
+            c.get("tol"), "0", self._filter_num_width("9999.99"),
+            "How far from the value still counts. 0 means exactly this value.\n\n"
+            "Even at 0 a hair of slack is allowed: the archive stores TOD as "
+            "-97999.99999999999 where -98000 was set, and a strict comparison "
+            "would throw away every shot taken at that setting.")
+        e_tol.textEdited.connect(lambda t, k=i: self._on_filter_num_edited(k, "tol", t))
+        row.addWidget(e_tol)
+
+        btn_del = QPushButton("✕")
+        btn_del.setFixedWidth(22)
+        btn_del.setToolTip("Remove this condition.")
+        btn_del.setStyleSheet(
+            "QPushButton { font-size: 12px; font-weight: 700; padding: 1px; "
+            "color: #B71C1C; background: #f4f4f4; border: 1px solid #b4b4b4; "
+            "border-radius: 3px; }"
+            "QPushButton:hover { color: #ffffff; background: #B71C1C; }"
+        )
+        btn_del.clicked.connect(lambda _=False, k=i: self._filter_remove_condition(k))
+        row.addWidget(btn_del)
+        v.addLayout(row)
+
+        note = QLabel("")
+        note.setWordWrap(True)
+        note.setContentsMargins(21, 0, 0, 0)
+        note.setStyleSheet("font-size: 10px; color: #333;")
+        note.setVisible(False)
+        v.addWidget(note)
+
+        self._filter_rows.append({"chk": chk, "pv": btn_pv, "val": e_val,
+                                  "tol": e_tol, "note": note})
+        return box
+
+    def _make_filter_edit(self, value, placeholder: str, width: int,
+                          tip: str) -> QLineEdit:
+        """One numeric box of a condition row.
+
+        A line edit and not a spin box, for four measured reasons: there is no
+        sane range to set when the channel can be any PV in the archiver (GDD
+        24700, TOD -98000, FOD past a million); a fixed number of decimals would
+        silently round a small tolerance to zero; an empty box has to mean "not
+        set yet" and a spin box can never be empty; and stepping 24700 by one is
+        of no use to anybody.
+        """
+        e = QLineEdit("" if value is None else self._fmt_full(value))
+        e.setPlaceholderText(placeholder)
+        e.setFixedWidth(width)
+        e.setToolTip(tip)
+        val = QDoubleValidator()
+        val.setNotation(QDoubleValidator.Notation.StandardNotation)
+        val.setDecimals(6)
+        # The C locale on purpose: on a Czech Windows the validator would demand a
+        # decimal comma and refuse "24700.5".
+        val.setLocale(QLocale.c())
+        e.setValidator(val)
+        e.setStyleSheet(_FILTER_EDIT_OK)
+        return e
+
+    def _rebuild_filter_rows(self):
+        self._filter_rows = []
+        while self._filter_rows_lay.count():
+            item = self._filter_rows_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if not self._filter_conds:
+            empty = QLabel("No conditions — add one below.")
+            empty.setStyleSheet("font-size: 11px; color: #555;")
+            self._filter_rows_lay.addWidget(empty)
+            return
+        for i, c in enumerate(self._filter_conds):
+            self._filter_rows_lay.addWidget(self._make_filter_row(i, c))
+
+    def _on_filter_row_toggled(self, i: int, on: bool):
+        if 0 <= i < len(self._filter_conds):
+            self._filter_conds[i]["on"] = bool(on)
+        self._schedule_filter(0)
+
+    def _on_filter_num_edited(self, i: int, key: str, text: str):
+        """Type a value or a tolerance.
+
+        The box says so when what is in it is not a number — a validator still
+        lets a lone '-' or '1e' through, and treating that as an empty box would
+        quietly switch the condition off under the user's hands.
+        """
+        if not (0 <= i < len(self._filter_conds)):
+            return
+        refs = self._filter_rows[i] if i < len(self._filter_rows) else None
+        v = _parse_num(text)
+        bad = bool(str(text).strip()) and v is None
+        if refs is not None:
+            refs["val" if key == "value" else "tol"].setStyleSheet(
+                _FILTER_EDIT_BAD if bad else _FILTER_EDIT_OK)
+        if bad:
+            return
+        self._filter_conds[i][key] = v if key == "value" else (v or 0.0)
+        self._schedule_filter(300)
+
+    def _filter_pick_pv(self, i: int):
+        """Change the PV a condition is set on."""
+        if not (0 <= i < len(self._filter_conds)):
+            return
+        dlg = PvSearchDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        added = dlg.added_pvs()
+        if not added:
+            return
+        lbl, ch = added[0]              # one row, one PV — take the first pick
+        c = self._filter_conds[i]
+        if ch != c["channel"]:
+            c["label"], c["channel"] = lbl, ch
+        self._rebuild_filter_rows()
+        self._schedule_filter(0)
+
+    def _filter_add_condition(self):
+        dlg = PvSearchDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        have = {c["channel"] for c in self._filter_conds}
+        for lbl, ch in dlg.added_pvs():
+            if ch in have:
+                continue
+            have.add(ch)
+            self._filter_conds.append({"label": lbl, "channel": ch,
+                                       "value": None, "tol": 0.0, "on": True})
+        self._rebuild_filter_rows()
+        self._schedule_filter(0)
+
+    def _filter_remove_condition(self, i: int):
+        if 0 <= i < len(self._filter_conds):
+            self._filter_conds.pop(i)
+        self._rebuild_filter_rows()
+        self._schedule_filter(0)
+
+    def _on_filter_master_toggled(self, on: bool):
+        self._filter_on = bool(on)
+        self._schedule_filter(0)
+
+    def _schedule_filter(self, delay_ms: int = 0):
+        """Re-apply the filter, coalescing a burst of edits into one pass.
+
+        Recomputing a region's averages is tens to hundreds of milliseconds even
+        with only the keys the graph needs, so every keystroke in the value box
+        must not start one.
+        """
+        self._filter_timer.start(max(0, int(delay_ms)))
+
+    def _apply_filter_and_redraw(self):
+        self._save_shot_filter()
+        self._ensure_filter_values()      # may start a background top-up
+        self._apply_shot_filter()
+        self._update_region_counts()
+        self._redraw_spectra()
+        self._update_filter_readout()
+        line = self._filter_status_line()
+        if line:
+            self._set_status(line)
+
+    def _filter_status_line(self) -> str:
+        conds = self._active_conditions()
+        if not conds:
+            return ""
+        if self._filter_busy:
+            return "Shot filter: reading the archive…"
+        kept, total = self._filter_counts()
+        if total == 0:
+            return f"Shot filter set ({self._filter_summary(', ')}) — nothing analyzed yet."
+        head = f"Shot filter: {kept} of {total} shots match"
+        if kept == 0:
+            head = f"Shot filter: nothing matches ({kept} of {total} shots)"
+        line = f"{head} ({self._filter_summary(', ')})."
+        pinned = getattr(self, "_color_pinned", None)
+        if pinned:
+            line += (f"  Colour by {pinned[0]} is pinned at "
+                     f"{self._fmt_full(pinned[1])} by the filter — using "
+                     f"selection order instead.")
+        return line
+
+    def _update_filter_readout(self):
+        """The count, the per-condition notes, and the folded header.
+
+        The header is the one part that stays visible when the block is folded
+        away, so the result is written into it: OFF, "37 of 892", or a red
+        "0 of 892" that cannot be missed.
+        """
+        g = getattr(self, "_g_filter", None)
+        if g is None:
+            return
+        conds = self._active_conditions()
+        kept, total = self._filter_counts()
+        lbl = self._lbl_filter_count
+        if not conds:
+            n_set = sum(1 for c in self._filter_conds if c.get("on"))
+            if self._filter_on and n_set:
+                lbl.setText("No value typed yet — the conditions do nothing.")
+                title = "Shot filter — no value"
+            elif self._filter_on:
+                # The default state: armed, nothing ticked, so nothing is thrown
+                # away. Saying "off" here would contradict the ticked master box.
+                lbl.setText("No condition — every measured shot is used.")
+                title = "Shot filter — no condition"
+            else:
+                lbl.setText("Off — every measured shot is used.")
+                title = "Shot filter — off"
+            lbl.setStyleSheet("font-size: 11px; color: #555;")
+            g.set_title(title)
+            g.set_accent(_FILTER_ACCENT)
+        elif self._filter_busy:
+            lbl.setText("Reading the archive for the new condition…")
+            lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #0D47A1;")
+            g.set_title("Shot filter — reading")
+            g.set_accent(_FILTER_ACCENT)
+        elif total == 0:
+            lbl.setText("Nothing analyzed yet.")
+            lbl.setStyleSheet("font-size: 11px; color: #555;")
+            g.set_title("Shot filter — armed")
+            g.set_accent(_FILTER_ACCENT)
+        elif kept == 0:
+            lbl.setText(f"Nothing matches — 0 of {total} shots.")
+            lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #B71C1C; "
+                              "background: #ffebee; padding: 2px 4px;")
+            g.set_title(f"Shot filter — 0 of {total}")
+            g.set_accent(_FILTER_ALARM)
+        else:
+            lbl.setText(f"{kept} of {total} shots match.")
+            lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #1B5E20;")
+            g.set_title(f"Shot filter — {kept} of {total}")
+            g.set_accent(_FILTER_ACCENT)
+        self._update_filter_row_notes()
+
+    def _update_filter_row_notes(self):
+        """Per-condition line: how many shots it alone keeps, what the PV reads
+        at the shot the bar is on, or why it rejected everything."""
+        for i, c in enumerate(self._filter_conds):
+            if i >= len(self._filter_rows):
+                break
+            note = self._filter_rows[i]["note"]
+            text, style = self._filter_row_note(c)
+            note.setText(text)
+            note.setStyleSheet(style)
+            note.setVisible(bool(text))
+
+    def _filter_row_note(self, c: dict) -> "tuple[str, str]":
+        grey = "font-size: 10px; color: #555;"
+        dark = "font-size: 10px; color: #333;"
+        red  = "font-size: 10px; font-weight: 700; color: #B71C1C;"
+        ch = c["channel"]
+        if not c.get("on"):
+            return "", grey
+        if c.get("value") is None:
+            return "no value set — this condition is doing nothing", grey
+        pend = [r for r in self._regions
+                if r.get("analyzed") and ch in self._filter_missing_channels(r)]
+        if pend or (self._live and ch in (self._live_arming or [])):
+            return f"fetching {ch}…", grey
+        # A channel that never recorded before a selection rejects every shot in
+        # it, and that must not look like "the shots were not measured".
+        for r in self._regions:
+            if not r.get("analyzed") or r.get("stack_all") is None:
+                continue
+            vals = (r.get("shot_vals") or {}).get(ch)
+            if vals is None or len(vals) == 0:
+                continue
+            if not np.any(np.isfinite(vals)):
+                series = (r.get("scalar_series") or {}).get(ch) or []
+                when = (f" (first sample {_fmt_date(min(t for t, _ in series))} "
+                        f"{_fmt_hms(min(t for t, _ in series))})" if series else "")
+                return (f"{ch} has no archived value at or before "
+                        f"{self._region_label(self._regions.index(r))}{when}"), red
+        kept = self._cond_kept_count(c)
+        bits = []
+        if kept is not None:
+            bits.append(f"n={kept}")
+        now = self._cond_value_at_picked_shot(c)
+        if now is not None:
+            bits.append(f"now {self._fmt_full(now)}")
+        return (" · ".join(bits), dark) if bits else ("", grey)
+
+    def _cond_kept_count(self, c: dict) -> "int | None":
+        """How many shots THIS condition alone keeps, across every selection."""
+        if c.get("value") is None:
+            return None
+        total = 0
+        seen = False
+        for r in self._regions:
+            vals = (r.get("shot_vals") or {}).get(c["channel"])
+            if vals is None:
+                continue
+            seen = True
+            total += int(_match_value(vals, c["value"], c.get("tol") or 0.0).sum())
+        if self._live and self._live_buf and self._live_scalars.get(c["channel"]):
+            buf = list(self._live_buf)
+            ts = np.fromiter((int(t) for t, _ in buf), dtype=np.int64, count=len(buf))
+            vals = _hold_forward(self._live_scalars[c["channel"]], ts)
+            total += int(_match_value(vals, c["value"], c.get("tol") or 0.0).sum())
+            seen = True
+        return total if seen else None
+
+    def _cond_value_at_picked_shot(self, c: dict) -> "float | None":
+        """What the condition's PV reads at the shot the shot bar is standing on.
+
+        The cheapest possible check that the hold-forward, the channel and the
+        unit are all the ones the user thinks they are."""
+        # _single_current returns a (None, None, None) triple when the bar has
+        # nothing to stand on — truthy, so it has to be unpacked and checked.
+        r, k, _it = self._single_current()
+        if r is None or k is None:
+            return None
+        vals = (r.get("shot_vals") or {}).get(c["channel"])
+        if vals is None:
+            return None
+        ts_all = np.asarray(r.get("stack_ts_all") or [], dtype=np.int64)
+        ts = (r.get("stack_ts") or [])
+        if k >= len(ts) or ts_all.size == 0:
+            return None
+        # searchsorted, not list.index(): this runs on every step of the shot
+        # bar, which is a blit path with a 20 ms budget, and stack_ts_all can
+        # hold nine thousand entries.
+        j = int(np.searchsorted(ts_all, int(ts[k])))
+        if j >= ts_all.size or int(ts_all[j]) != int(ts[k]) or j >= len(vals):
+            return None
+        v = float(vals[j])
+        return v if np.isfinite(v) else None
 
     def _make_graphs(self) -> QWidget:
         # vertical splitter [SBW4 energy (top) | spectra (bottom)]
@@ -3951,15 +4717,15 @@ class SpectraWidget(QWidget):
             pass
 
     def _update_top_visibility(self):
-        """Energy graph shows only in archive mode and when the user wants it;
+        """Search graph shows only while Live is off and the user wants it;
         otherwise the spectra graph fills the whole area.
 
         Restores the ratio the user last dragged. It used to reset to a hard-coded
-        440/320 here, which threw that ratio away on every Archive/Live click and on
+        440/320 here, which threw that ratio away on every Live click and on
         every "Show search graph" tick — the graph appeared to resize by itself."""
         if getattr(self, "_splitter", None) is None:
             return                      # called while the panel is still being built
-        show = self._btn_archive.isChecked() and self._chk_show_energy.isChecked()
+        show = (not self._live) and self._chk_show_energy.isChecked()
         self._top_container.setVisible(show)
         if show:
             self._splitter.setSizes(self._wanted_split())
@@ -3990,9 +4756,7 @@ class SpectraWidget(QWidget):
     def _connect_signals(self):
         self._btn_pick_day.clicked.connect(self._pick_day)
         self._btn_stop.clicked.connect(self.cancel_scan)
-        self._btn_archive.clicked.connect(lambda: self._set_live_mode(False))
-        self._btn_live_mode.clicked.connect(lambda: self._set_live_mode(True))
-        self._btn_live_start.clicked.connect(self._toggle_live)
+        self._btn_live.clicked.connect(self._on_live_clicked)
         self._btn_analyze.clicked.connect(self._run_analysis)
         self._btn_clear_regs.clicked.connect(self._clear_regions)
         self._btn_export.clicked.connect(self._export)
@@ -4022,6 +4786,7 @@ class SpectraWidget(QWidget):
         self._edit_pv_search.textEdited.connect(self._on_inline_search)
         self._lst_pv_search.itemClicked.connect(self._on_inline_result_clicked)
         self._cmb_color.currentIndexChanged.connect(self._on_color_mode_changed)
+        self._chk_filter.toggled.connect(self._on_filter_master_toggled)
         self._splitter.splitterMoved.connect(self._on_splitter_moved)
         self._tb_top.subplot_params_changed.connect(self._save_layout)
         self._tb_bot.subplot_params_changed.connect(self._save_layout)
@@ -4108,6 +4873,59 @@ class SpectraWidget(QWidget):
         return (f"{head}\nThe spectra cover {span[0]:.0f} … {span[1]:.0f}"
                 + (f" {unit}" if unit else "")
                 + " — widen From/To, or tick Auto-fit and analyze again.")
+
+    def _n_of_text(self, r: dict) -> str:
+        """The shot count for a legend entry — "37 of 892" while the filter bites."""
+        n = int(r.get("n") or 0)
+        if r.get("filter_mask") is None:
+            return str(n)
+        return f"{n} of {int(r.get('n_all') or 0)}"
+
+    def _filter_title_suffix(self) -> str:
+        """What the graph's title adds while the filter is on. Nothing when off."""
+        if not self._active_conditions():
+            return ""
+        kept, total = self._filter_counts()
+        if total == 0:
+            return ""
+        return f"  ·  shot filter {kept} of {total}"
+
+    def _filter_keeps_nothing_msg(self) -> str:
+        """The placeholder text when the filter is why the graph is empty.
+
+        Empty when the filter is not the reason — the caller then falls back to
+        the range / "analyze something" messages.
+        """
+        conds = self._active_conditions()
+        if not conds:
+            return ""
+        kept, total = self._filter_counts()
+        if total == 0 or kept > 0:
+            return ""
+        lines = [f"Shot filter kept 0 of {total} shots",
+                 self._filter_summary(" · ")]
+        # A channel that never recorded before a selection rejects all of it, and
+        # that is a different problem from a value nobody ever set.
+        for c in conds:
+            ch = c["channel"]
+            for r in self._regions:
+                if not r.get("analyzed") or r.get("stack_all") is None:
+                    continue
+                vals = (r.get("shot_vals") or {}).get(ch)
+                if vals is None or len(vals) == 0:
+                    continue
+                if not np.any(np.isfinite(vals)):
+                    series = (r.get("scalar_series") or {}).get(ch) or []
+                    when = ""
+                    if series:
+                        t0 = min(t for t, _ in series)
+                        when = f" (first sample {_fmt_date(t0)} {_fmt_hms(t0)})"
+                    lines.append(
+                        f"{ch} has no archived value at or before "
+                        f"{self._region_label(self._regions.index(r))}{when}")
+                    break
+        lines.append("Widen ±, untick a condition, or switch the filter off.")
+        return "\n".join(lines)
 
     def _fit_bot_ylim(self, ax):
         """Scale the spectra graph to the curves that are on it, plus 5 % air."""
@@ -4277,20 +5095,85 @@ class SpectraWidget(QWidget):
             if a.text() in ("Pan", "Zoom"):
                 a.toggled.connect(_on_pan_zoom_toggled)
 
-    # ── Mode ──────────────────────────────────────────────────────────────────
-    def _set_live_mode(self, live: bool):
-        self._g_live.setVisible(live)
-        if not live:
+    # ── Live / archive ────────────────────────────────────────────────────────
+    # There is no mode switch to set any more. Archive is simply "Live is off":
+    # the calendar says which hours are on screen. Turning Live on keeps the
+    # FROM time of the picked window and only moves it onto today, the way Image
+    # Slider does it (daypicker rule 7) — so "Live" means "that window, and keep
+    # going", not "the last ten minutes".
+    def _on_live_clicked(self):
+        if self._btn_live.isChecked():
+            self._enter_live()
+        else:
             self._stop_live()
-            # back to archive: redraw the loaded day, if any
-            if self._energy_data:
-                self._draw_energy()
-                self._install_span()
-            else:
-                self._draw_top_empty()
-        # In live mode the search graph is irrelevant; in archive it follows the
-        # "Show search graph" checkbox.
+
+    def _enter_live(self):
+        start_ns, now_ns = _live_span_ns(self._segments, self._windows)
+        if not self._confirm_live_preload(start_ns, now_ns):
+            self._btn_live.setChecked(False)
+            self._refresh_pill()
+            return
+        self._windows  = [(start_ns, now_ns)]
+        # NOT cleared: the calendar must reopen on the window live is actually
+        # streaming, and _windows and _segments must not be able to disagree.
+        a = _ns_to_dt(start_ns)
+        self._segments = [PickSeg(a.date(), a.hour, a.minute, 23, 59)]
+        self._tmap     = _TimeMap(self._windows)
+        self._lbl_day.setText(self._day_summary())
+        self._lbl_day.setToolTip(self._window_tooltip())
+        # The window is not fetched into the search graph while live runs — the
+        # graph is hidden anyway. It is read once Live is switched off, so the
+        # graph the user comes back to is the stretch that was just streamed.
+        self._archive_reload_pending = True
+        self._btn_live.setChecked(True)
+        self._g_live.setVisible(True)
+        # _start_live FIRST: _update_top_visibility asks whether live is running,
+        # and called before the flag is set it would leave the search graph on
+        # screen for the whole session.
+        self._start_live(start_ns)
         self._update_top_visibility()
+
+    def _confirm_live_preload(self, start_ns: int, end_ns: int) -> bool:
+        """Warn before a live preload that will take a while — never refuse it.
+
+        Spectra are 2048 floats each and the whole window is read in one go, so
+        a full lab day is thousands of them. Same shape as
+        _confirm_request_volume: it only asks.
+        """
+        hours = (end_ns - start_ns) / 3.6e12
+        if hours <= _LIVE_PRELOAD_WARN_H:
+            return True
+        n_chunks = int(-(-(end_ns - start_ns) // _CHUNK_NS))
+        n_req = n_chunks * (1 + len(self._filter_channels()))
+        ans = QMessageBox.question(
+            self, "This will take a while",
+            f"Live will read {hours:.1f} h of spectra "
+            f"({_fmt_hms(start_ns)} → now), about {n_req} archive requests.\n\n"
+            "It will work, but it can take a minute or two. Stop ends live at "
+            "any point.\n\nLoad it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        return ans == QMessageBox.StandardButton.Yes
+
+    def _leave_live(self):
+        """Back to archive: fetch the hour Live was standing on, or redraw the
+        day that was loaded before."""
+        self._btn_live.setChecked(False)
+        self._g_live.setVisible(False)
+        self._update_top_visibility()
+        # Never start a fetch on the way out of a Stop or of another job: Stop
+        # would be undone (_load_day_energy clears the cancel flag) and two loads
+        # would run at once. The flag stays set, so the hour is read the next
+        # time live is left cleanly.
+        can_load = not (self._cancel.is_set() or self._busy or self._loading)
+        if self._archive_reload_pending and self._windows and can_load:
+            self._archive_reload_pending = False
+            self._load_day_energy()
+        elif self._energy_data:
+            self._draw_energy()
+            self._install_span()
+        else:
+            self._draw_top_empty()
         self._redraw_spectra()
 
     # ── Search-PV list (pick / add / remove / persist) ─────────────────────────
@@ -4325,6 +5208,399 @@ class SpectraWidget(QWidget):
                            for lbl, ch in self._search_pvs], f, indent=2)
         except Exception:
             pass
+
+    # ── Shot filter: the saved conditions ─────────────────────────────────────
+    def _load_shot_filter(self):
+        """Read shot_filter.json into _filter_on / _filter_conds.
+
+        A condition is {label, channel, value, tol, on}. `value` is None until
+        something is typed — blank means "not configured yet", which must never
+        be read as "match 0.0"; that is also why the boxes are line edits and not
+        spin boxes, which cannot be empty.
+
+        The master switch defaults to ON with no condition ticked, which filters
+        nothing: typing a value is then the only step, instead of typing it and
+        wondering why the graph did not change. An explicit `false` in the file
+        is still honoured — the user's own switch always wins.
+        """
+        conds, on = [], True
+        try:
+            with open(_shot_filter_config_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            on = bool(data.get("enabled", True))
+            for d in data.get("conditions") or []:
+                ch = str(d.get("channel") or "").strip()
+                if not ch:
+                    continue
+                val = d.get("value")
+                conds.append({
+                    "label":   str(d.get("label") or ch.split(":")[-1]),
+                    "channel": ch,
+                    "value":   None if val is None else float(val),
+                    "tol":     float(d.get("tol") or 0.0),
+                    "on":      bool(d.get("on")),
+                })
+        except Exception:
+            pass
+        if not conds:
+            # First run: the three dispersion orders, ready to be filled in.
+            # None of them ticked, so the armed filter keeps every shot.
+            conds = [{"label": lbl, "channel": ch, "value": None, "tol": 0.0,
+                      "on": False} for lbl, ch in ORDER_PVS]
+        self._filter_conds = conds
+        self._filter_on    = on
+
+    def _save_shot_filter(self):
+        try:
+            p = _shot_filter_config_path()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump({"enabled": bool(self._filter_on),
+                           "conditions": self._filter_conds}, f, indent=2)
+        except Exception:
+            pass
+
+    # ── Shot filter: which shots count ────────────────────────────────────────
+    def _active_conditions(self) -> "list[dict]":
+        """The conditions that really filter anything right now.
+
+        Three things have to be true: the master switch is on, the row's own tick
+        box is on, and a value has been typed. A blank value is a row waiting to
+        be filled in, never a request to match zero.
+        """
+        if not self._filter_on:
+            return []
+        return [c for c in self._filter_conds
+                if c.get("on") and c.get("value") is not None and c.get("channel")]
+
+    def _filter_channels(self) -> "list[str]":
+        """The channels the active conditions need, each once, in row order."""
+        out, seen = [], set()
+        for c in self._active_conditions():
+            ch = c["channel"]
+            if ch not in seen:
+                seen.add(ch)
+                out.append(ch)
+        return out
+
+    def _cond_text(self, c: dict) -> str:
+        """One condition as the user set it — 'GDD = 24700 ± 5'."""
+        val = self._fmt_full(c.get("value"))
+        if not c.get("tol"):
+            return f"{c.get('label') or c['channel']} = {val}"
+        return f"{c.get('label') or c['channel']} = {val} ± {self._fmt_full(c['tol'])}"
+
+    def _filter_summary(self, sep: str = " · ") -> str:
+        """Every active condition on one line, for a message or a CSV note."""
+        return sep.join(self._cond_text(c) for c in self._active_conditions())
+
+    def _filter_missing_channels(self, r: dict) -> "list[str]":
+        """Filter channels this region has no per-shot values for yet."""
+        have = r.get("shot_vals") or {}
+        n = int(r.get("n_all") or 0)
+        return [ch for ch in self._filter_channels()
+                if have.get(ch) is None or len(have[ch]) != n]
+
+    def _region_filter_mask(self, r: dict) -> "np.ndarray | None":
+        """Which of the region's shots the filter keeps — or None for all of them.
+
+        None is not a detail, it is the fast path: _apply_shot_filter then puts
+        back the averages the analysis already computed instead of recomputing
+        anything, so switching the filter off returns the very same numbers, bit
+        for bit. It costs nothing and it is what makes the filter safe to leave
+        wired into a tab that worked without it.
+        """
+        conds = self._active_conditions()
+        n = int(r.get("n_all") or 0)
+        if not conds or n == 0:
+            return None
+        ts = np.asarray(r.get("stack_ts_all") or [], dtype=np.int64)
+        if ts.size != n:
+            return None          # nothing to line the per-shot values up against
+        by_ch = r.get("shot_vals") or {}
+        mask, applied = np.ones(n, dtype=bool), False
+        for c in conds:
+            vals = by_ch.get(c["channel"])
+            if vals is None or len(vals) != n:
+                # Still being fetched (_ensure_filter_values). A condition whose
+                # values are in flight lets everything through — rejecting during
+                # an HTTP round trip would flash an empty graph.
+                continue
+            mask &= _match_value(vals, c["value"], c["tol"])
+            applied = True
+        if not applied or bool(mask.all()):
+            return None
+        return mask
+
+    def _stat_keys_needed(self) -> set:
+        """The averages the graph is actually showing right now.
+
+        _apply_shot_filter computes only these. All seven of them on a 9000-shot
+        region is 9.6 s (probe_filter_cost.py), which would freeze the window on
+        every keystroke in the value box; the mean and the standard deviation
+        together are 0.26 s.
+        """
+        keys = {"mean", "std"}                 # metrics + the ±1σ band
+        try:
+            keys.add(self._curve_method())
+        except Exception:
+            pass
+        chk = getattr(self, "_chk_std", None)
+        if chk is not None and chk.isChecked() and self._band_kind() == "pct":
+            keys |= {"p10", "p90"}
+        return keys
+
+    def _shot_stat(self, r: dict, channel: str, idx) -> "tuple[float | None, int]":
+        """(mean, count) of one scalar over the matching shots only."""
+        vals = (r.get("shot_vals") or {}).get(channel)
+        if vals is None:
+            return None, 0
+        sel = np.asarray(vals, dtype=float)[idx]
+        sel = sel[np.isfinite(sel)]
+        if sel.size == 0:
+            return None, 0
+        return float(sel.mean()), int(sel.size)
+
+    def _restore_region_unfiltered(self, r: dict):
+        """Put the analysis's own results back — the filter-off path."""
+        r["stack"]      = r.get("stack_all")
+        r["stack_ts"]   = list(r.get("stack_ts_all") or [])
+        r["n"]          = int(r.get("n_all") or 0)
+        r.update(r.get("stats_all") or {})
+        r["stats_keys"] = set(STAT_KEYS)
+        r["orders"]     = dict(r.get("orders_all") or {})
+        r["energy_avg"] = r.get("energy_avg_all")
+        r["energy_n"]   = int(r.get("energy_n_all") or 0)
+
+    def _apply_shot_filter(self):
+        """Rewrite every analyzed region to the shots that match the conditions.
+
+        The filtered values go into the SAME keys the rest of the tab already
+        reads — stack, stack_ts, n, mean, median, orders, energy_avg — with the
+        untouched originals parked in the *_all keys beside them. So the graph,
+        the metrics, the legend, the shot bar, the region details and the CSV all
+        follow the filter without any of the twenty places that read those keys
+        having to know it exists, and none of them can drift away from the
+        picture the way the CSV's X column once did.
+        """
+        keys = self._stat_keys_needed()
+        for r in self._regions:
+            if not r.get("analyzed"):
+                continue
+            if r.get("stack_all") is None:
+                # No spectra in this selection at all. The window means of the
+                # energy and the orders are still worth showing — they are how
+                # the details block says what the laser was set to while nothing
+                # was measured.
+                self._restore_region_unfiltered(r)
+                r["filter_mask"] = None
+                continue
+            mask = self._region_filter_mask(r)
+            r["filter_mask"] = mask
+            if mask is None:
+                self._restore_region_unfiltered(r)
+                continue
+            idx = np.flatnonzero(mask)
+            ts_all = np.asarray(r.get("stack_ts_all") or [], dtype=np.int64)
+            r["stack_ts"] = [int(t) for t in ts_all[idx]]
+            if idx.size == 0:
+                for k in STAT_KEYS:
+                    r[k] = None
+                r["stack"], r["n"] = None, 0
+                r["stats_keys"] = set(STAT_KEYS)
+                r["orders"] = {lbl: None for lbl, _ in ORDER_PVS}
+                r["energy_avg"], r["energy_n"] = None, 0
+                r["_metrics"] = None
+                continue
+            r.update(_stats_from_stack(r["stack_all"][idx], keys))
+            r["stats_keys"] = set(keys)
+            # The dispersion and energy numbers become averages over the matching
+            # shots. Left as window means they would report the average of two
+            # settings beside a spectrum built from only one of them.
+            orders = {}
+            for lbl, ch in ORDER_PVS:
+                orders[lbl] = self._shot_stat(r, ch, idx)[0]
+            r["orders"] = orders
+            r["energy_avg"], r["energy_n"] = self._shot_stat(r, PV_ENERGY, idx)
+
+    def _ensure_stats_for_display(self):
+        """Fill in an average the display now wants but the filter pass skipped.
+
+        _apply_shot_filter computes only the curve that was on the graph, so
+        switching Show to Median or ticking the percentile band has to ask for
+        the missing one here rather than find None and draw nothing.
+        """
+        need = self._stat_keys_needed()
+        for r in self._regions:
+            if not r.get("analyzed") or not r.get("n"):
+                continue
+            stack = r.get("stack")
+            if stack is None:
+                continue
+            missing = {k for k in need if r.get(k) is None}
+            if not missing:
+                continue
+            st = _stats_from_stack(stack, missing)
+            for k in missing:
+                r[k] = st[k]
+            r["stats_keys"] = set(r.get("stats_keys") or set()) | missing
+
+    def _filter_counts(self) -> "tuple[int, int]":
+        """(kept, total) shots — archive regions plus the live buffer."""
+        kept = total = 0
+        for r in self._regions:
+            if not r.get("analyzed"):
+                continue
+            total += int(r.get("n_all") or 0)
+            kept  += int(r.get("n") or 0)
+        if self._live and self._live_buf:
+            # "X of Y shots match" is about the WINDOW, not about "last N": the
+            # user wants to know how much of what was loaded carries the value
+            # he asked for. N only decides how many of those end up on the
+            # graph, and the status line says that separately.
+            self._live_shots(self._sb_live_n.value())
+            kept  += int(self._live_matched_n or 0)
+            total += int(self._live_seen_n or 0)
+        return kept, total
+
+    def _filter_bites(self) -> bool:
+        """True when the filter is actually throwing shots away."""
+        if not self._active_conditions():
+            return False
+        kept, total = self._filter_counts()
+        return total > 0 and kept < total
+
+    def _live_shots(self, n_last: "int | None" = None) -> list:
+        """The buffered live shots the filter keeps, oldest first.
+
+        THE FILTER RUNS FIRST, over the whole buffer, and `n_last` then takes
+        the last N of what matched. It used to be the other way round — N off
+        the raw buffer, filter afterwards — which was harmless while live only
+        held ten minutes, but is the whole bug once live preloads a window: with
+        GDD stepped at noon, "the last 200 shots" were all of the new setting,
+        so a filter set on the morning value reported nothing matching although
+        the morning was sitting in the buffer.
+
+        The three counters this sets are read by the status line and by
+        _filter_counts: `_live_seen_n` = raw shots in the window,
+        `_live_matched_n` = how many of them match, `_live_kept_n` = how many
+        the graph actually uses after N.
+        """
+        buf = list(self._live_buf)
+        self._live_seen_n = len(buf)
+        self._live_matched_n = len(buf)
+        self._live_kept_n = len(buf)
+        self._live_newer_dropped = 0
+        self._live_arming = []
+        conds = self._active_conditions()
+
+        def _tail(shots: list) -> list:
+            out = shots[-int(n_last):] if n_last else shots
+            self._live_kept_n = len(out)
+            return out
+
+        if not conds or not buf:
+            return _tail(buf)
+        self._live_arming = sorted({c["channel"] for c in conds
+                                    if not self._live_scalars.get(c["channel"])})
+        if self._live_arming:
+            # A channel that has not reported yet cannot reject anything —
+            # otherwise every Start Live begins with a flash of "nothing matched"
+            # before the first poll lands.
+            return _tail(buf)
+        ts = np.fromiter((int(t) for t, _ in buf), dtype=np.int64, count=len(buf))
+        mask = np.ones(len(buf), dtype=bool)
+        for c in conds:
+            vals = _hold_forward(self._live_scalars.get(c["channel"]) or [], ts)
+            mask &= _match_value(vals, c["value"], c["tol"])
+        keep = [s for s, m in zip(buf, mask) if m]
+        self._live_matched_n = len(keep)
+        if keep:
+            # How many RAW shots came in after the last matching one — that is
+            # what the red curve's label reports, so it counts against the whole
+            # buffer and not against the N-trimmed tail.
+            last = int(np.flatnonzero(mask)[-1])
+            self._live_newer_dropped = len(buf) - 1 - last
+        return _tail(keep)
+
+    # ── Shot filter: fetching a channel added after Analyze ───────────────────
+    def _ensure_filter_values(self) -> bool:
+        """Fetch the per-shot values the filter needs and does not have yet.
+
+        A condition set on GDD, TOD, FOD or the SBW4 energy never gets here — the
+        analysis fetches those anyway. This is for a channel picked afterwards.
+        Returns True when a fetch was started, i.e. the filter is still pending.
+        """
+        if self._filter_busy:
+            self._filter_pending = True
+            return True
+        pairs = []
+        for r in self._regions:
+            if not r.get("analyzed") or r.get("stack_all") is None:
+                continue
+            for ch in self._filter_missing_channels(r):
+                if self._filter_fetch_err.get((r["id"], ch)):
+                    continue        # already tried and failed; do not spin on it
+                pairs.append((r["id"], int(r["t_start"]), int(r["t_end"]), ch))
+        if not pairs:
+            return False
+
+        self._filter_busy = True
+        gen = self._analysis_gen
+        chs = sorted({ch for _, _, _, ch in pairs})
+        self._set_status("Shot filter: reading " + ", ".join(chs) + "…")
+        self._progress.setRange(0, len(pairs))
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+
+        sig = _Sig(self)
+        sig.done.connect(self._on_filter_values)
+        sig.progress_n.connect(self._on_analysis_progress)
+
+        def _work():
+            out = []
+            try:
+                for i, (rid, t0, t1, ch) in enumerate(pairs):
+                    series = _fetch_scalars(ch, t0, t1)
+                    out.append((rid, ch, series, _last_fetch_error.get(ch)))
+                    sig.progress_n.emit(i + 1, len(pairs))
+            finally:
+                # Always emit: the slot is the only place _filter_busy is cleared,
+                # and a guard nothing ever clears wedges the filter for good.
+                sig.done.emit((out, gen))
+
+        _bg(_work)
+        return True
+
+    def _on_filter_values(self, payload):
+        out, gen = payload
+        self._filter_busy = False
+        self._progress.setVisible(False)
+        if gen != self._analysis_gen:
+            # The spectrum channel changed while this was in flight, so these
+            # values belong to shot times that no longer exist.
+            self._start_pending_filter()
+            return
+        for rid, ch, series, err in out:
+            r = self._find_region(rid)
+            if r is None or r.get("stack_all") is None:
+                continue
+            r.setdefault("scalar_series", {})[ch] = series
+            ts = np.asarray(r.get("stack_ts_all") or [], dtype=np.int64)
+            r.setdefault("shot_vals", {})[ch] = _hold_forward(series, ts)
+            if err:
+                self._filter_fetch_err[(rid, ch)] = err
+        self._apply_shot_filter()
+        self._update_region_counts()
+        self._redraw_spectra()
+        self._update_filter_readout()
+        self._start_pending_filter()
+
+    def _start_pending_filter(self):
+        if not self._filter_pending:
+            return
+        self._filter_pending = False
+        self._apply_filter_and_redraw()
 
     def _load_spec_y(self) -> str:
         """Load the saved spectrum Y (intensity) channel. Supports both the new
@@ -4383,18 +5659,41 @@ class SpectraWidget(QWidget):
         return src
 
     # ── Unit of the X axis ────────────────────────────────────────────────────
+    # A hand-typed unit belongs to the channel it was typed for, and to no other.
+    # It used to be saved on its own, so it outlived its channel: the panel spent
+    # weeks calling a SPIDER femtosecond axis "Wavelength [nm]" because a stale
+    # "nm" sat in %APPDATA%\ELI_Spectra\spec_pvs.json and _x_unit() returned it
+    # before the name was ever consulted. The unit is therefore stored WITH its
+    # channel (unit_for), and a saved unit whose channel does not match — which
+    # includes every file written by an older build — is ignored, so the guess
+    # takes over by itself on the next start.
+    def _x_unit_source(self) -> str:
+        """The channel a unit would belong to: the axis PV actually in use."""
+        cfg = self._x_axis_cfg or {"mode": "native"}
+        if cfg.get("mode") in ("pv", "linear"):
+            return str(cfg.get("source_pv") or "")
+        return str(self._spec_base_pv or "")
+
     def _x_unit(self) -> str:
-        """Unit of the spectrum graph's horizontal axis: what the user typed, or
-        a guess from the channel name."""
+        """Unit of the spectrum graph's horizontal axis: what the user typed for
+        THIS channel, or a guess from the channel name."""
         cfg = self._x_axis_cfg or {"mode": "native"}
         u = cfg.get("unit")
-        if isinstance(u, str) and u.strip():
+        if (isinstance(u, str) and u.strip()
+                and str(cfg.get("unit_for") or "") == self._x_unit_source()):
             return u.strip()
         if cfg.get("mode") == "index":
             return ""
         src = (cfg.get("source_pv") if cfg.get("mode") in ("pv", "linear")
                else self._spec_x_pv)
         return _guess_x_unit(src, self._spec_base_pv)
+
+    def _x_unit_is_manual(self) -> bool:
+        """True while the unit on screen was typed by hand for this channel."""
+        cfg = self._x_axis_cfg or {}
+        u = cfg.get("unit")
+        return bool(isinstance(u, str) and u.strip()
+                    and str(cfg.get("unit_for") or "") == self._x_unit_source())
 
     def _x_names(self) -> tuple:
         """(quantity, unit, symbol) behind every axis label the panel prints —
@@ -4419,15 +5718,33 @@ class SpectraWidget(QWidget):
         return f"{v:.{decimals}f} {unit}".strip()
 
     def _on_x_unit_edited(self):
-        """The unit changes labels only — no data is refetched or recomputed."""
+        """The unit changes labels only — no data is refetched or recomputed.
+
+        editingFinished also fires when the box merely loses focus, so clicking
+        through it used to freeze whatever it happened to show in as a permanent
+        manual override — that is how "nm" ended up pinned to a time-domain
+        channel. Typing the unit the channel already guesses therefore means
+        "leave it automatic": the override is dropped, not written."""
         new = self._edit_x_unit.text().strip()
         cfg = dict(self._x_axis_cfg or {"mode": "native"})
-        if new == (cfg.get("unit") or "").strip():
-            return
-        cfg["unit"] = new
+        was = self._x_unit()
+        src = (cfg.get("source_pv") if cfg.get("mode") in ("pv", "linear")
+               else self._spec_x_pv)
+        guess = "" if cfg.get("mode") == "index" else _guess_x_unit(
+            src, self._spec_base_pv)
+        if not new or new == guess:
+            cfg.pop("unit", None)
+            cfg.pop("unit_for", None)
+        else:
+            cfg["unit"] = new
+            cfg["unit_for"] = self._x_unit_source()
         self._x_axis_cfg = cfg
-        self._save_spec_base()
         self._edit_x_unit.setText(self._x_unit())
+        # Saved even when the label does not move, so that a dropped override is
+        # really gone from the file and cannot come back on the next start.
+        self._save_spec_base()
+        if self._x_unit() == was:
+            return                      # nothing on screen changes
         self._sync_x_unit_labels()
         self._rebuild_regions_ui()
         self._redraw_spectra()
@@ -4452,6 +5769,24 @@ class SpectraWidget(QWidget):
                 return (f"X axis: the archive stored only {nx} of the {n} axis "
                         f"points — the rest was continued at the same spacing.")
         return ""
+
+    def _x_unit_note(self) -> str:
+        """A word when the measured axis cannot be in the unit on the label.
+
+        Only a hand-typed unit can get here — the guessed one comes from the
+        channel name and is right for every channel that exists. The panel says
+        so and leaves the label alone: relabelling a graph behind the operator's
+        back would hide the very mistake he has to correct."""
+        if not self._x_unit_is_manual():
+            return ""
+        unit = self._x_unit()
+        for r in self._regions:
+            if not r.get("analyzed"):
+                continue
+            msg = _x_unit_impossible(r.get("x"), unit)
+            if msg:
+                return msg
+        return _x_unit_impossible(self._x_data, unit)
 
     def _sync_x_unit_labels(self):
         """Repaint the labels that carry the unit outside the graph itself."""
@@ -4538,9 +5873,16 @@ class SpectraWidget(QWidget):
     # region still counted as analyzed — so the only way out was Clear all and
     # reselecting every span by hand. Now the selections stay and the results are
     # recomputed for them.
+    # Everything a fetch put on a region. The shot filter's caches are in here on
+    # purpose: shot_vals and stack_ts_all are keyed to the OLD channel's shot
+    # times, and a new channel's shots fall at different instants — filtering the
+    # new curves against the old times would silently keep the wrong ones.
     _RESULT_KEYS = ("x", "mean", "median", "trimmed", "sigma", "std", "p10", "p90",
                     "stack", "stack_ts", "orders", "energy_avg", "energy_n", "n",
-                    "_metrics")
+                    "_metrics", "fetch_error",
+                    "stack_all", "stack_ts_all", "n_all", "stats_all", "stats_keys",
+                    "orders_all", "energy_avg_all", "energy_n_all",
+                    "scalar_series", "shot_vals", "filter_mask")
 
     def _reanalyze_all(self, why: str):
         """Drop stale results but KEEP the selections, then re-run the analysis."""
@@ -5082,22 +6424,32 @@ class SpectraWidget(QWidget):
     def _pick_day(self):
         """Open the shared day/time picker (daypicker.py — the same calendar as
         Image Tools). It returns one time window per picked day, each with its own
-        hours; only those windows are fetched and drawn."""
+        hours; only those windows are fetched and drawn.
+
+        The Live tick is the Image Slider's own: ticking it keeps the From/To
+        that were typed, moves the day to today and hands the window to live
+        mode instead of to the archive load.
+        """
         init_date = _ns_to_dt(self._windows[0][0]).date() if self._windows else None
         dlg = DayTimePicker(parent=self, init_date=init_date,
                             init_segments=list(self._segments) or None,
-                            allow_live=False,     # Spectra has its own Live button
+                            allow_live=True,
                             title="Select day(s) and time window")
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        online  = dlg.is_online_mode()
         windows = [w for w in dlg.selected_windows() if w[1] > w[0]]
         if not windows:
             return
-        if not self._confirm_request_volume(windows):
+        # Only the archive load is measured in hours × PVs. The live branch has
+        # its own question, on the window it is really going to read.
+        if not online and not self._confirm_request_volume(windows):
             return
-        # switch UI back to archive mode
-        self._btn_archive.setChecked(True)
-        self._set_live_mode(False)
+        # Picking days IS leaving live mode — the calendar decides what is on
+        # screen. The window live was standing on is dropped, not re-fetched.
+        self._archive_reload_pending = False
+        if not online:
+            self._stop_live()
         self._segments = list(dlg.all_segments())
         self._windows  = windows
         # Keep already-selected spectra across day changes — they carry absolute
@@ -5105,7 +6457,16 @@ class SpectraWidget(QWidget):
         # A zoom remembered in axis coordinates would stand for a different
         # instant now, but _load_day_energy ends in _draw_energy(), which resets
         # the view anyway — so there is nothing to clear here.
-        self._load_day_energy()
+        if online:
+            # _enter_live re-reads _segments and rewrites _windows to "that From,
+            # on today, open end", so the pick set just above is what it starts
+            # from. Already live? Restart on the new window.
+            if self._live:
+                self._live = False
+                self._live_timer.stop()
+            self._enter_live()
+        else:
+            self._load_day_energy()
 
     def _confirm_request_volume(self, windows: "list[tuple[int, int]]") -> bool:
         """Warn before a load that will take minutes — but never refuse it.
@@ -5697,7 +7058,8 @@ class SpectraWidget(QWidget):
         v.addWidget(details)
 
         self._row_widgets[rid] = {"name": btn_name, "eye": btn_eye, "details": details,
-                                  "metrics": getattr(details, "_metric_label", None)}
+                                  "metrics": getattr(details, "_metric_label", None),
+                                  "count": getattr(details, "_count_label", None)}
         self._apply_visibility_style(rid, r["visible"])
         return box
 
@@ -5728,19 +7090,42 @@ class SpectraWidget(QWidget):
             lay.addWidget(note)
             return w
 
-        add(f"<b># of spectra:</b> {r.get('n', 0)}")
+        # The shot count is its own label, kept in _row_widgets: the filter
+        # rewrites it on every edit and rebuilding the whole row each time would
+        # throw away the list's scroll position.
+        count_lbl = QLabel(self._region_count_html(r))
+        count_lbl.setWordWrap(True)
+        lay.addWidget(count_lbl)
+        w._count_label = count_lbl
+        filtered = r.get("filter_mask") is not None
+        if filtered and int(r.get("n") or 0) == 0:
+            why = QLabel("No shot in this selection matches the filter.")
+            why.setWordWrap(True)
+            why.setStyleSheet("color: #B71C1C; font-weight: 700; border: none;")
+            lay.addWidget(why)
+
+        # While the filter bites, these are averages over the matching shots and
+        # not over the whole window — the label has to say which, or a GDD of
+        # 24700 beside a window that also held 24800 reads as the wrong number.
+        over = "matching shots" if filtered else None
         ea = r.get("energy_avg")
         if ea is not None:
+            n_e = r.get("energy_n", 0)
             add(f"<b>SBW4 Output energy:</b> {ea:.3f} J  "
-                f"<span style='color:#888'>(avg of {r.get('energy_n', 0)})</span>")
+                f"<span style='color:#888'>(avg of {n_e}"
+                + (f" {over}" if over else "") + ")</span>")
         else:
             add("<b>SBW4 Output energy:</b> n/a")
 
         orders = r.get("orders") or {}
         for label, _ in ORDER_PVS:
             val = orders.get(label)
-            add(f"<b>{label}:</b> {round(val)}"
-                if val is not None else f"<b>{label}:</b> n/a")
+            if val is None:
+                add(f"<b>{label}:</b> n/a")
+            else:
+                add(f"<b>{label}:</b> {round(val)}"
+                    + (f"  <span style='color:#888'>(over the {over})</span>"
+                       if over else ""))
 
         # Spectral metrics (peak λ / centroid / FWHM / RMS bandwidth / area).
         # Filled in / refreshed by _update_metric_labels() after each redraw,
@@ -5764,6 +7149,28 @@ class SpectraWidget(QWidget):
             )
             lay.addWidget(chk)
         return w
+
+    def _region_count_html(self, r: dict) -> str:
+        """The "# of spectra" line, which the shot filter rewrites."""
+        n = int(r.get("n") or 0)
+        if r.get("filter_mask") is None:
+            return f"<b># of spectra:</b> {n}"
+        total = int(r.get("n_all") or 0)
+        colour = "#B71C1C" if n == 0 else "#333"
+        return (f"<b># of spectra:</b> <span style='color:{colour}'>{n}</span>"
+                f" <span style='color:#888'>of {total} (shot filter)</span>")
+
+    def _update_region_counts(self):
+        """Rewrite just the shot counts after a filter change.
+
+        Not _rebuild_regions_ui(): that destroys and recreates every row, which
+        resets the list's scroll position — once per keystroke while the value is
+        being typed."""
+        for r in self._regions:
+            refs = self._row_widgets.get(r["id"]) or {}
+            lbl = refs.get("count")
+            if lbl is not None and r.get("analyzed"):
+                lbl.setText(self._region_count_html(r))
 
     def _apply_visibility_style(self, rid: int, visible: bool):
         refs = self._row_widgets.get(rid)
@@ -5848,14 +7255,17 @@ class SpectraWidget(QWidget):
     def _clear_regions(self):
         self._regions.clear()
         self._region_seq = 0
+        self._filter_fetch_err.clear()
         self._rebuild_regions_ui()
         self._update_action_buttons()
         self._refresh_energy_view()
         self._draw_bot_empty()
+        self._update_filter_readout()
 
     def _update_action_buttons(self):
         self._btn_analyze.setEnabled(any(not r["analyzed"] for r in self._regions))
         self._btn_export.setEnabled(any(r["analyzed"] for r in self._regions))
+        self._btn_clear_regs.setEnabled(bool(self._regions))
         self._update_expand_all_btn()
         # Curves appearing (or the last one being removed) changes which graph
         # deserves the room — see _wanted_split().
@@ -5897,6 +7307,13 @@ class SpectraWidget(QWidget):
 
         x_cached  = self._x_data
         spec_y_ch = self._spec_y_pv
+        # Every scalar whose value is wanted per shot. The energy and the three
+        # dispersion orders were fetched here anyway; the filter's own channels
+        # ride along so that no condition is left "pending" right after Analyze.
+        scalar_chs = [PV_ENERGY] + [ch for _, ch in ORDER_PVS]
+        for ch in self._filter_channels():
+            if ch not in scalar_chs:
+                scalar_chs.append(ch)
         # Stamp this run. If the spectrum source changes while it is in flight the
         # stamp no longer matches and its results are thrown away instead of being
         # written into selections that now belong to a different channel.
@@ -5921,27 +7338,54 @@ class SpectraWidget(QWidget):
                     f"{_fmt_hms(r['t_start'])}–{_fmt_hms(r['t_end'])}…"
                 )
                 wfs = _fetch_waveforms(spec_y_ch, r["t_start"], r["t_end"])
+                # THE WINDOW IS THE WINDOW. Whatever is asked for, the archiver
+                # answers with one sample BEFORE the start and one AT OR AFTER
+                # the end — measured on the real archive: a five-minute window
+                # holding 60 shots came back with 62, and a window holding none
+                # came back with two shots from five hours away. Unclipped, a
+                # marked stretch was averaged together with a shot from either
+                # side of it, its count was wrong by two, and the shot bar could
+                # stand on a shot outside the region it names. Ends are
+                # exclusive, the same convention daypicker.seg_bounds_ns uses.
+                t0, t1 = int(r["t_start"]), int(r["t_end"])
+                wfs = [(t, a) for t, a in wfs if t0 <= t < t1]
                 fetch_err = _last_fetch_error.get(spec_y_ch)
                 st = _compute_stats([a for _, a in wfs])
 
-                # extra per-region scalars: output energy + dispersion orders
-                energy_vals = [v for _, v in _fetch_scalars(
-                    PV_ENERGY, r["t_start"], r["t_end"])]
+                # Extra per-region scalars: output energy, the dispersion orders,
+                # and whatever the shot filter is set on. Kept as the raw series
+                # too, not only as a mean — the filter needs the value at each
+                # shot's own time, and a message needs to be able to say when a
+                # silent channel last recorded.
+                series = {}
+                for ch in scalar_chs:
+                    series[ch] = _fetch_scalars(ch, r["t_start"], r["t_end"])
+                # The raw series is KEPT as it came, freebie and all: the value
+                # in force before the window is the one held forward onto the
+                # first shots, and dropping it would leave a quiet set point
+                # looking like "no data". The window averages below are a
+                # different question and must not reach past the end.
+                energy_vals = [v for t, v in series.get(PV_ENERGY, [])
+                               if t0 <= t < t1]
                 orders = {}
                 for label, pv in ORDER_PVS:
-                    vals = [v for _, v in _fetch_scalars(pv, r["t_start"], r["t_end"])]
+                    vals = [v for t, v in series.get(pv, []) if t < t1]
                     orders[label] = float(np.mean(vals)) if vals else None
 
                 res = {
-                    "id": r["id"], "x": x_data, "orders": orders,
-                    "energy_avg": float(np.mean(energy_vals)) if energy_vals else None,
-                    "energy_n": len(energy_vals),
+                    "id": r["id"], "x": x_data,
+                    "orders_all": orders,
+                    "energy_avg_all": float(np.mean(energy_vals)) if energy_vals else None,
+                    "energy_n_all": len(energy_vals),
+                    "scalar_series": series,
                     "fetch_error": fetch_err,
                 }
                 if st is None:
                     res.update({"mean": None, "median": None, "trimmed": None,
                                 "sigma": None, "std": None, "stack": None,
-                                "stack_ts": [], "n": 0})
+                                "stack_ts": [], "n": 0,
+                                "stack_all": None, "stack_ts_all": [], "n_all": 0,
+                                "stats_all": {}, "shot_vals": {}})
                 else:
                     res.update(st)
                     # _compute_stats keeps only the most common waveform length —
@@ -5950,6 +7394,16 @@ class SpectraWidget(QWidget):
                     # each curve by its time in the CSV).
                     common = st["stack"].shape[1]
                     res["stack_ts"] = [t for t, a in wfs if len(a) == common]
+                    # The unfiltered truth, parked beside it. The shot filter
+                    # rewrites stack / stack_ts / n / the averages in place; these
+                    # are what it filters FROM and restores when switched off.
+                    res["stack_all"]    = st["stack"]
+                    res["stack_ts_all"] = list(res["stack_ts"])
+                    res["n_all"]        = st["n"]
+                    res["stats_all"]    = {k: st[k] for k in STAT_KEYS}
+                    ts_arr = np.asarray(res["stack_ts_all"], dtype=np.int64)
+                    res["shot_vals"] = {ch: _hold_forward(s, ts_arr)
+                                        for ch, s in series.items()}
                 results.append(res)
                 sig.progress_n.emit(i + 1, len(snap))
 
@@ -5978,15 +7432,25 @@ class SpectraWidget(QWidget):
                 continue
             r.update(res)
             r["analyzed"] = True
+        # Before anything counts the shots: the filter decides what n IS, and the
+        # analysis only ever wrote the unfiltered numbers.
+        self._apply_shot_filter()
         self._finish_analysis_ui()
         if self._cancel.is_set():
             self._rebuild_regions_ui()
             self._redraw_spectra()
             self._set_status(f"Analysis cancelled ({len(results)} region(s) done).")
             return
-        n_total = sum(res["n"] for res in results)
+        n_total = sum(int(r.get("n") or 0) for r in self._regions if r["id"] in by_id)
+        # An empty selection has two quite different causes, and they must not
+        # share one sentence: nothing was measured there, or the shot filter threw
+        # everything away. Blaming the archive for the filter is the wrong culprit.
         empties = [self._region_label(i) for i, r in enumerate(self._regions)
-                   if r["id"] in by_id and r.get("n", 0) == 0]
+                   if r["id"] in by_id and r.get("n", 0) == 0
+                   and int(r.get("n_all") or 0) == 0]
+        filtered_out = [self._region_label(i) for i, r in enumerate(self._regions)
+                        if r["id"] in by_id and r.get("n", 0) == 0
+                        and int(r.get("n_all") or 0) > 0]
         msg = f"Analysis done. {n_total} spectra total."
         if empties:
             msg += f"  No spectra in: {', '.join(empties)}."
@@ -5995,7 +7459,13 @@ class SpectraWidget(QWidget):
             errs = {res["fetch_error"] for res in results if res.get("fetch_error")}
             if errs:
                 msg += "  " + "   ".join(sorted(errs))
-        note = self._x_fit_note()
+        if filtered_out:
+            msg += (f"  The shot filter kept nothing in: {', '.join(filtered_out)}"
+                    f" ({self._filter_summary(', ')}).")
+        elif self._filter_bites():
+            kept, tot = self._filter_counts()
+            msg += f"  Shot filter kept {kept} of {tot} shots."
+        note = "  ".join(n for n in (self._x_fit_note(), self._x_unit_note()) if n)
         if note:
             msg += "  " + note
         # Also in the channel's own tooltip: the status line is overwritten by the
@@ -6008,6 +7478,7 @@ class SpectraWidget(QWidget):
             self._auto_fit_range()      # snap range to the data span (signals blocked)
         self._rebuild_regions_ui()      # populate details (energy, orders, n)
         self._redraw_spectra()
+        self._update_filter_readout()   # the block's count is now about real shots
 
     def _on_analysis_error(self, err: str):
         self._finish_analysis_ui()
@@ -6300,21 +7771,34 @@ class SpectraWidget(QWidget):
         """Refresh the bar, keeping the user on the same shot.
 
         Called at the end of every bottom-graph redraw. The position is matched
-        back by (region, stack row) and NOT by its number: hiding a region or
-        changing the display renumbers the list, and a plain clamp would quietly
-        move the user onto a different spectrum."""
+        back by (region, measurement time) and NOT by its number: hiding a
+        region, changing the display or moving the shot filter renumbers the
+        list, and a plain clamp would quietly move the user onto a different
+        spectrum.
+
+        The time, not the stack row. The row index is only a position inside the
+        stack, and the shot filter rewrites that stack — the same physical shot
+        comes back as a different row, so a (region, row) match would land on its
+        neighbour every time the filter moved. The row is still the fallback for
+        a shot whose timestamp is unknown, which cannot be identified any other
+        way."""
         old = getattr(self, "_single_items_cache", [])
         pos_old = getattr(self, "_single_pos", 0)
-        prev = ((old[pos_old]["rid"], old[pos_old]["k"])
-                if 0 <= pos_old < len(old) else None)
+        prev = old[pos_old] if 0 <= pos_old < len(old) else None
+        prev_key = None
+        if prev is not None:
+            prev_key = ((prev["rid"], "t", int(prev.get("ts") or 0))
+                        if prev.get("ts") else (prev["rid"], "k", prev["k"]))
 
         items = self._single_items()
         self._single_items_cache = items
         n = len(items)
         pos = 0
-        if prev is not None and n:
+        if prev_key is not None and n:
             for j, it in enumerate(items):
-                if (it["rid"], it["k"]) == prev:
+                key = ((it["rid"], "t", int(it.get("ts") or 0))
+                       if it.get("ts") else (it["rid"], "k", it["k"]))
+                if key == prev_key:
                     pos = j
                     break
             else:
@@ -6361,10 +7845,17 @@ class SpectraWidget(QWidget):
             return
         pos = min(getattr(self, "_single_pos", 0), len(items) - 1)
         it = items[pos]
+        # "· filtered" so a bar reading "37 of 37" is not mistaken for the whole
+        # day: the bar walks the matching shots only.
+        tail = "   ·   filtered" if self._filter_bites() else ""
         self._lbl_single.setText(
             f"{pos + 1} of {len(items)}   ·   {self._single_when(it)}"
-            f"   ·   {it['label']}"
+            f"   ·   {it['label']}{tail}"
         )
+        # Each condition's line shows what its PV reads at THIS shot, so stepping
+        # the bar is how a wrong channel or a wrong unit gets caught.
+        if self._active_conditions():
+            self._update_filter_row_notes()
 
     @staticmethod
     def _single_when(it) -> str:
@@ -6766,6 +8257,17 @@ class SpectraWidget(QWidget):
             return default
         vals = [float(r["orders"][order_label]) for r in vis]
         vmin, vmax = min(vals), max(vals)
+        self._color_pinned = None
+        if vmax == vmin and len(vis) > 1:
+            # Every region has the SAME value, so a rainbow over a zero-wide
+            # range paints them all one blue and several spectra read as one.
+            # Fall back to the selection-order palette. A shot filter set on the
+            # very PV the colours come from is the usual way to get here, and
+            # then it is worth saying so — recorded rather than announced,
+            # because this runs inside a draw.
+            if self._filter_bites():
+                self._color_pinned = (order_label, vmin)
+            return default
         span = (vmax - vmin) or 1.0
         try:
             cmap = matplotlib.colormaps["rainbow"]
@@ -6898,8 +8400,8 @@ class SpectraWidget(QWidget):
         if not self._live_buf:
             return
         n_avg = self._sb_live_n.value()
-        arrs  = [a for _, a in list(self._live_buf)[-n_avg:]]
-        st = _compute_stats(arrs)
+        arrs  = [a for _, a in self._live_shots(n_avg)]
+        st = _compute_stats(arrs, self._stat_keys_needed())
         if st is None:
             return
         curve = st[self._curve_method()]
@@ -6936,6 +8438,9 @@ class SpectraWidget(QWidget):
                 QApplication.restoreOverrideCursor()
 
     def _redraw_spectra_now(self):
+        # The filter only computes the average that was on the graph, so a new
+        # Show / band setting has to be filled in before anything is read.
+        self._ensure_stats_for_display()
         norm       = self._norm_mode()
         single     = self._is_single()
         band_on    = self._chk_std.isChecked() and not single
@@ -6976,12 +8481,15 @@ class SpectraWidget(QWidget):
             r["_metrics"] = _spectral_metrics(xp_m, yp_m)
             col = color_for.get(r["id"], r["color"])
             m_short = _METHOD_SHORT.get(method, method)
-            label = f"{self._region_label(i)} · {m_short} (n={r.get('n', 0)})"
+            # The count in the legend is the one number read straight off the
+            # picture, so it carries the filter: "n=37 of 892", not a bare 37.
+            n_txt = self._n_of_text(r)
+            label = f"{self._region_label(i)} · {m_short} (n={n_txt})"
             if order_label is not None:
                 v = (r.get("orders") or {}).get(order_label)
                 if v is not None:
                     label = (f"{self._region_label(i)}  {order_label}="
-                             f"{round(float(v))} · {m_short}")
+                             f"{round(float(v))} · {m_short} (n={n_txt})")
             if single:
                 # every shot in the region, no averaged curve at all
                 stack = r.get("stack")
@@ -6989,6 +8497,8 @@ class SpectraWidget(QWidget):
                 n_drawn = len(idx)
                 count = (f"{total} spectra" if n_drawn >= total
                          else f"{n_drawn} of {total} spectra drawn")
+                if r.get("filter_mask") is not None:
+                    count += f" · {total} of {int(r.get('n_all') or 0)} matched"
                 head = self._region_label(i)
                 if order_label is not None:
                     v = (r.get("orders") or {}).get(order_label)
@@ -7017,9 +8527,12 @@ class SpectraWidget(QWidget):
         # live: only the last N shots (newest red, older faint blue, average black)
         if self._live and self._live_buf:
             n_avg  = self._sb_live_n.value()
-            buf = list(self._live_buf)[-n_avg:]
-            self._plot_live_spectra(ax, buf, norm)
-            st = _compute_stats([a for _, a in buf])
+            # N first, then the filter: "average last N" counts the shots as they
+            # arrived, which keeps the averaging window as fresh with the filter
+            # on as it is without it.
+            buf = self._live_shots(n_avg)
+            self._plot_live_spectra(ax, buf, norm, self._live_newer_dropped)
+            st = _compute_stats([a for _, a in buf], self._stat_keys_needed())
             # _compute_stats keeps only the most common waveform length, so the
             # average can silently rest on fewer shots than were handed to it.
             # Record both counts and let the status line own up to the difference.
@@ -7032,10 +8545,16 @@ class SpectraWidget(QWidget):
                     band_lo, band_hi = st.get("p10"), st.get("p90")
                 elif band_on:
                     std_arg = st["std"]
+                # With the filter biting, the legend has to say what the average
+                # rests on AND how much of the window matched — "n=200" alone
+                # would read as "that is all there was".
+                n_live = (f"{st['n']} of {self._live_matched_n} matching"
+                          if self._live_matched_n < self._live_seen_n
+                          else str(st["n"]))
                 self._plot_spectrum(ax, self._x_data, st[curve_m], std_arg,
-                                    "#000000", f"Live {curve_m} (n={st['n']})",
+                                    "#000000", f"Live {curve_m} (n={n_live})",
                                     norm, band_lo, band_hi, lw=2.4, smooth_win=smooth_win)
-            any_drawn = True
+            any_drawn = bool(buf) or any_drawn
 
         # comparison curve (difference / ratio of two analyzed regions)
         if self._chk_compare.isChecked():
@@ -7054,10 +8573,11 @@ class SpectraWidget(QWidget):
                 if single_total:
                     head += (f" ({single_total} measured)" if single_shown >= single_total
                              else f" ({single_shown} of {single_total} drawn)")
-                ax.set_title(head)
+                ax.set_title(head + self._filter_title_suffix())
             else:
                 ax.set_title(("Live spectra — " if self._live else "Averaged spectra — ")
-                             + self._cmb_method.currentText())
+                             + self._cmb_method.currentText()
+                             + self._filter_title_suffix())
             ax.set_xlim(x_min, x_max)
             ax.grid(True, alpha=0.25)
             ax.legend(fontsize=9)
@@ -7089,12 +8609,17 @@ class SpectraWidget(QWidget):
             if self._measured_y_range(ax) is None:
                 self._draw_bot_empty(self._range_misses_data_msg())
         else:
-            # Nothing was drawn. With spectra in hand that means the same thing:
-            # the range does not cover them (a bundle drops out here, one point
-            # earlier than an averaged curve does).
-            self._draw_bot_empty(self._range_misses_data_msg()
-                                 if self._drawn_x_span() is not None else
-                                 "Analyze a spectrum in the search graph")
+            # Nothing was drawn, and there are three quite different reasons.
+            # The filter is checked FIRST: shots exist and it threw them all away,
+            # so blaming the wavelength range (or the archive) would name the
+            # wrong culprit and send the user hunting in the wrong place.
+            filt_msg = self._filter_keeps_nothing_msg()
+            if filt_msg:
+                self._draw_bot_empty(filt_msg)
+            else:
+                self._draw_bot_empty(self._range_misses_data_msg()
+                                     if self._drawn_x_span() is not None else
+                                     "Analyze a spectrum in the search graph")
 
         self._bot_redrawing = False
         if self._bot_user_xlim is not None:
@@ -7140,8 +8665,14 @@ class SpectraWidget(QWidget):
             ax.plot(xa, ca - cb, color="#000000", lw=1.8, ls="--", label="A − B")
         return True
 
-    def _plot_live_spectra(self, ax, buf, norm):
-        """Older shots faint light-blue; the newest measured spectrum solid red."""
+    def _plot_live_spectra(self, ax, buf, norm, n_newer_dropped: int = 0):
+        """Older shots faint light-blue; the newest measured spectrum solid red.
+
+        With the filter on, the red curve is the newest shot that MATCHES, and
+        its label says how many newer ones were thrown away. Painting a rejected
+        shot red would defeat the filter, and dropping it without a word makes a
+        running laser look dead.
+        """
         arrs = [a for _, a in buf]
         if not arrs:
             return
@@ -7165,36 +8696,41 @@ class SpectraWidget(QWidget):
 
         newest = arrs[-1]
         if len(newest) == len(x):
+            when = _fmt_hms(int(buf[-1][0])) if buf[-1][0] else ""
+            if n_newer_dropped:
+                label = (f"Newest matching shot {when} "
+                         f"({n_newer_dropped} newer filtered out)")
+            else:
+                label = "Newest live shot"
             ax.plot(xp, _y(newest), color="#D32F2F", lw=2.7, alpha=1.0,
-                    zorder=3, label="Newest live shot")
+                    zorder=3, label=label)
 
     # ── Live mode ─────────────────────────────────────────────────────────────
-    def _toggle_live(self):
-        if self._live:
-            self._stop_live()
-        else:
-            self._start_live()
-
-    def _start_live(self):
+    # The switch is _on_live_clicked → _enter_live / _stop_live; these two do the
+    # streaming itself.
+    def _start_live(self, start_ns: "int | None" = None):
         self._live = True
         self._live_buf = deque(maxlen=LIVE_BUF_MAX)
-        self._btn_live_start.setText("⏹  Stop Live")
-        self._btn_live_start.setStyleSheet(_BTN_DANGER)
-        self._blink_on = False     # _blink_tick flips it → starts bright
-        self._blink_timer.start(600)
-        self._blink_tick()
-        self._update_stop_button()
+        # The filter's own series starts empty too. No lookback is needed: the
+        # first tick asks from _live_start_ns, and that request comes back with
+        # the last sample before it — the value held forward onto the oldest
+        # preloaded shot.
+        self._live_scalars = {}
+        self._live_arming = self._filter_channels()
+        self._btn_live.setChecked(True)
+        self._refresh_pill()
 
-        # Preload a short window of recent history so there is something to average
-        # immediately, then keep polling forward. (No "start time" to fiddle with —
-        # the only control is "average last N".)
-        now_ns = int(datetime.now(timezone.utc).timestamp() * 1e9)
-        self._live_start_ns = now_ns - int(LIVE_HISTORY_S * 1e9)
+        # Preload the WHOLE picked window, then keep polling forward. The first
+        # tick asks for everything from _live_start_ns in one go, which
+        # _cpva_fetch_chunked splits into hourly pieces across its workers.
+        if start_ns is None:
+            start_ns, _now = _live_span_ns(self._segments, self._windows)
+        self._live_start_ns = int(start_ns)
         self._live_last_ns  = self._live_start_ns
         self._live_autofit_done = False
 
         self._set_status(
-            f"Live started — preloading last {LIVE_HISTORY_S // 60} min of shots…"
+            f"Live started — preloading {_fmt_hms(self._live_start_ns)} → now…"
         )
 
         # Resolve the (possibly custom) wavelength axis BEFORE polling Y, otherwise the
@@ -7220,52 +8756,43 @@ class SpectraWidget(QWidget):
             self._live_tick()
 
     def _stop_live(self):
+        """Stop streaming and go back to the archive view.
+
+        Every route out of live mode lands here — the Live button, a changed
+        spectrum PV, Stop, the suite closing — so the switch, the search graph
+        and the loaded hour are always put back together."""
         if not self._live:
+            self._btn_live.setChecked(False)
+            self._refresh_pill()
             return
         self._live = False
         self._live_timer.stop()
-        self._blink_timer.stop()
-        self._refresh_pill()
-        self._btn_live_start.setText("▶  Start Live")
-        self._btn_live_start.setStyleSheet(_BTN_SUCCESS)
         self._set_status("Live stopped.")
-
-    def _set_pill(self, text: str, fg: str, bg: str = "transparent",
-                  border: str = "#ddd"):
-        """Paint the state pill. Every state goes through here, so the outline and
-        the text size can no longer differ between them — the old code wrote a
-        bordered 13 px style at build time and a border-less 12 px one on stop, so
-        the pill lost its outline the first time Live was stopped."""
-        self._lbl_live_ind.setText(text)
-        self._lbl_live_ind.setStyleSheet(
-            f"font-weight: 700; font-size: 13px; color: {fg}; "
-            f"background: {bg}; border: 1px solid {border}; "
-            "border-radius: 4px; padding: 4px;"
-        )
+        self._leave_live()
+        self._refresh_pill()
 
     def _refresh_pill(self):
-        """Show what the tab is actually doing right now.
+        """Repaint the Live switch — the one place that says whether shots are
+        streaming. Steady colours, no blinking: green while it runs, red while it
+        does not. Same paint job as Image Slider's Live mode button, so the two
+        programs look the same.
 
-        The pill used to track live mode only, so it read "idle" while an Analyze
-        was fetching half a day of spectra."""
+        (It kept its old name because a dozen call sites, on every load and every
+        analysis, ask for exactly this refresh.)"""
+        b = self._btn_live
         if self._live:
-            return                      # _blink_tick owns the pill while live runs
-        if self._busy or self._loading:
-            self._set_pill("⟳  Working…", "#0D47A1", "#e8f0fe", "#c3d7f5")
+            base = "background: #d9f2d9; color: #14532d; border: 1px solid #7cb87c;"
         else:
-            self._set_pill("○  Idle", "#999")
+            base = "background: #f9dedb; color: #7f1d1d; border: 1px solid #d9a7a1;"
+        # Same padding as Stop beside it (_BTN_DANGER), or the two buttons on
+        # one row come out 26 px and 30 px tall and the row looks broken.
+        b.setStyleSheet(
+            "QPushButton { %s border-radius: 4px; padding: 7px 10px; "
+            "font-weight: 700; }" % base)
         self._update_stop_button()
 
     def _update_stop_button(self):
         self._btn_stop.setEnabled(bool(self._live or self._busy or self._loading))
-
-    def _blink_tick(self):
-        """Toggle the 'live is running' indicator so the user sees it is alive."""
-        self._blink_on = not self._blink_on
-        if self._blink_on:
-            self._set_pill("●  LIVE", "#2E7D32", "#e3f4e4", "#bfe0c0")
-        else:
-            self._set_pill("●  LIVE", "#bfe0c0", "transparent", "#e3f4e4")
 
     def _live_tick(self):
         if not self._live:
@@ -7278,26 +8805,76 @@ class SpectraWidget(QWidget):
         sig_y.done.connect(self._on_live_y)
         sig_y.error.connect(self._on_live_y_error)
         spec_y_ch = self._spec_y_pv
+        # Whatever the shot filter is set on, read on the same 3-second window.
+        # One request each, and each brings the archiver's last sample before the
+        # window — so a set point that is written once a week still reports its
+        # current value on every tick, with no state to keep.
+        filt_chs = self._filter_channels()
 
         def _work():
             try:
                 wfs = _fetch_waveforms(spec_y_ch, start_ns, now_ns)
-                sig_y.done.emit((now_ns, wfs))
+                scalars = {ch: _fetch_scalars(ch, start_ns, now_ns)
+                           for ch in filt_chs}
+                sig_y.done.emit((now_ns, wfs, scalars))
             except Exception as ex:
                 sig_y.error.emit(str(ex))
 
         _bg(_work)
 
+    def _absorb_live_scalars(self, scalars: dict) -> bool:
+        """Merge a tick's filter-PV samples into the rolling series.
+
+        Returns True when something new arrived — a late GDD write can change the
+        verdict on shots that are already buffered, and without a redraw on that
+        the graph would keep showing the old answer.
+        """
+        changed = False
+        oldest = min((t for t, _ in self._live_buf), default=None)
+        for ch, series in (scalars or {}).items():
+            kept = self._live_scalars.setdefault(ch, [])
+            known = {t for t, _ in kept}
+            for t, v in series:
+                if int(t) not in known:
+                    kept.append((int(t), float(v)))
+                    known.add(int(t))
+                    changed = True
+            kept.sort(key=lambda s: s[0])
+            # Trim, but always keep the one sample before the oldest buffered
+            # shot: that is the value held forward onto it.
+            if oldest is not None:
+                before = [s for s in kept if s[0] <= oldest]
+                after  = [s for s in kept if s[0] > oldest]
+                self._live_scalars[ch] = (before[-1:] + after) if before else after
+        return changed
+
     def _on_live_y(self, payload):
-        now_ns, wfs = payload
+        now_ns, wfs, scalars = payload
+        # ONE ENTRY PER SHOT. Every request also returns the sample before its
+        # start and the first one at or after its end, so consecutive 3-second
+        # polls overlap. MEASURED by replaying six real ticks: 16 entries for 6
+        # shots — every shot was in the buffer two or three times, so "average
+        # last 100" was really averaging some 37 shots with different weights,
+        # and the red "newest" curve was often not the newest.
+        known = {int(t) for t, _ in self._live_buf}
+        added = 0
         for t, arr in wfs:
-            self._live_buf.append((t, arr))
+            if int(t) in known:
+                continue
+            known.add(int(t))
+            self._live_buf.append((int(t), arr))
+            added += 1
         self._live_last_ns = now_ns
+        scal_new = self._absorb_live_scalars(scalars)
         # Redrawing the whole figure (ax.clear + re-plot up to MAX_INDIVIDUAL_LINES
         # traces + a full draw_idle) is expensive, and most ticks bring no new
         # shots — the poll just advances the clock. Skip the redraw on those ticks
         # so the GUI stays smooth; only rebuild when new spectra actually arrived.
-        if wfs:
+        # ...or when a filter PV changed: a value written a moment ago can flip
+        # the verdict on shots that are already in the buffer. `added`, not
+        # `wfs`: a tick whose every shot was already buffered has changed
+        # nothing and must not pay for a redraw.
+        if added or scal_new:
             # Once, on the first real live data: fit From/To to this X axis so a custom
             # wavelength axis outside the default 700–900 nm is not masked to nothing.
             if (not self._live_autofit_done and self._live_buf
@@ -7305,15 +8882,30 @@ class SpectraWidget(QWidget):
                 self._auto_fit_live_range()
                 self._live_autofit_done = True
             self._redraw_spectra()
+            self._update_filter_readout()
         want  = self._sb_live_n.value()
         have  = len(self._live_buf)
-        n_avg = min(want, have)
-        msg = f"Live: averaging last {n_avg} of {have} buffered (N={want})"
+        conds = self._active_conditions()
+        if conds:
+            # The filter has already sifted the whole window, so the honest
+            # sentence is "last N of the matching ones", with the window total
+            # beside it — otherwise a big window and a sharp filter look like a
+            # buffer that never fills.
+            self._live_shots(want)        # refresh the counters for this line
+            n_avg = self._live_kept_n
+            msg = (f"Live: averaging last {n_avg} of {self._live_matched_n} "
+                   f"matching (N={want}), {self._live_seen_n} shots in window")
+        else:
+            n_avg = min(want, have)
+            msg = f"Live: averaging last {n_avg} of {have} buffered (N={want})"
         if n_avg < want:
             msg += " — filling up"
         used = self._live_used_n
         if used is not None and 0 <= used < self._live_slice_n:
             msg += f", {self._live_slice_n - used} skipped (different length)"
+        if conds and self._live_arming:
+            msg += (", shot filter arming (waiting for "
+                    + ", ".join(self._live_arming) + ")")
         self._set_status(f"{msg}  ({_fmt_hms(now_ns)})")
         if self._live:
             self._live_timer.start(LIVE_INTERVAL_S * 1000)
@@ -7337,19 +8929,24 @@ class SpectraWidget(QWidget):
         return s or "0"
 
     def _live_export_spectra(self) -> list:
-        """Live shots currently shown/averaged: the last N from the buffer."""
+        """Live shots currently shown/averaged: the last N from the buffer, minus
+        whatever the shot filter rejects — the file has to hold what the picture
+        holds."""
         if not self._live or not self._live_buf:
             return []
-        n = self._sb_live_n.value()
-        return list(self._live_buf)[-n:]
+        return self._live_shots(self._sb_live_n.value())
 
     def _export(self):
         analyzed = [(i, r) for i, r in enumerate(self._regions)
                     if r.get("analyzed") and r.get("n", 0) > 0]
         live = self._live_export_spectra()
         if not analyzed and not live:
+            # Naming Analyze here would be the wrong culprit when there ARE
+            # analyzed spectra and the filter is what emptied them.
+            msg = self._filter_keeps_nothing_msg()
             QMessageBox.information(
-                self, "Export", "Nothing to export — analyze a spectrum or start live first."
+                self, "Export",
+                msg or "Nothing to export — analyze a spectrum or start live first."
             )
             return
 
@@ -7442,6 +9039,12 @@ class SpectraWidget(QWidget):
         x_name = ("sample_number" if samples else
                   f"{x_quantity.lower()}_{x_unit}" if x_unit else x_quantity.lower())
         order_labels = [lbl for lbl, _ in ORDER_PVS]
+        # A filter set on a channel that is not already a column gets one, so the
+        # file says what the shots it holds were actually taken at.
+        order_chs = {ch for _, ch in ORDER_PVS} | {PV_ENERGY}
+        extra_conds = [c for c in self._active_conditions()
+                       if c["channel"] not in order_chs]
+        extra_cols = [f"{c['label']} [filter]" for c in extra_conds]
         # live shots whose length matches the export axis
         live_ok = [(t, np.asarray(a, dtype=float)) for t, a in live if len(a) == nx]
         live_skipped = len(live) - len(live_ok)
@@ -7486,6 +9089,18 @@ class SpectraWidget(QWidget):
                 fit_note = self._x_fit_note()
                 if fit_note:
                     w.writerow([f"# NOTE: {fit_note}"])
+            # A unit the numbers contradict travels with the file: the column
+            # headers below are built from it, so the reader has to know.
+            unit_note = self._x_unit_note()
+            if unit_note:
+                w.writerow([f"# NOTE: {unit_note}"])
+            if self._active_conditions():
+                kept = sum(int(r.get("n") or 0) for _, r in regs)
+                tot  = sum(int(r.get("n_all") or 0) for _, r in regs)
+                w.writerow([f"# NOTE: shot filter active — "
+                            f"{self._filter_summary('; ')}. Only matching shots "
+                            f"are in this file ({kept} of {tot} across all "
+                            f"spectra)."])
             wide_lbl = "RMS width" if x_sym != "λ" else "RMS bandwidth"
             metric_cols = (["Peak sample", "Peak intensity", "Centroid [sample]",
                             "FWHM [samples]", "RMS width [samples]", "Area"]
@@ -7496,7 +9111,8 @@ class SpectraWidget(QWidget):
             metric_keys = ["peak_wl", "peak_int", "centroid", "fwhm", "rms_bw", "area"]
             w.writerow(["# Spectrum details"])
             w.writerow(["Spectrum", "Date", "Start", "End", "# of spectra",
-                        "Method", "SBW4 Output energy [J]"] + order_labels + metric_cols)
+                        "Method", "SBW4 Output energy [J]"]
+                       + order_labels + extra_cols + metric_cols)
             for i, r in regs:
                 d0, d1 = _fmt_date(r["t_start"]), _fmt_date(r["t_end"])
                 date_str = d0 if d0 == d1 else f"{d0}…{d1}"
@@ -7512,6 +9128,14 @@ class SpectraWidget(QWidget):
                         # The file is fuller than the picture; say so, or the two
                         # look like they disagree.
                         meth_txt += f", graph drew {drawn}"
+                if r.get("filter_mask") is not None:
+                    meth_txt += (f", {int(r.get('n') or 0)} of "
+                                 f"{int(r.get('n_all') or 0)} matched the shot filter")
+                mask = r.get("filter_mask")
+                idx = (np.flatnonzero(mask) if mask is not None
+                       else np.arange(int(r.get("n_all") or 0)))
+                extra_vals = [self._shot_stat(r, c["channel"], idx)[0]
+                              for c in extra_conds]
                 w.writerow([
                     self._region_label(i), date_str,
                     _fmt_hms(r["t_start"]), _fmt_hms(r["t_end"]),
@@ -7519,6 +9143,7 @@ class SpectraWidget(QWidget):
                     self._fmt_full(ea) if ea is not None else "",
                 ] + [self._fmt_full(orders.get(lbl)) if orders.get(lbl) is not None
                      else "" for lbl in order_labels]
+                  + [self._fmt_full(v) if v is not None else "" for v in extra_vals]
                   + [self._fmt_full(m.get(k)) if m.get(k) is not None else ""
                      for k in metric_keys])
             if live_ok:
@@ -7528,10 +9153,14 @@ class SpectraWidget(QWidget):
                 live_txt = "individual"
                 if live_skipped:
                     live_txt += f", {live_skipped} skipped (different length)"
+                if self._live_matched_n < self._live_seen_n:
+                    live_txt += (f", shot filter matched {self._live_matched_n} of "
+                                 f"{self._live_seen_n} in the window")
                 w.writerow([f"Live shots (last {len(live_ok)})", date_str,
                             _fmt_hms(t0), _fmt_hms(t1),
                             len(live_ok), live_txt, "",
-                            *[""] * len(order_labels), *[""] * len(metric_cols)])
+                            *[""] * len(order_labels), *[""] * len(extra_cols),
+                            *[""] * len(metric_cols)])
 
             w.writerow([])   # blank separator line
 

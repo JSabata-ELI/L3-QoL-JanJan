@@ -75,6 +75,17 @@ RAW_START_CHUNK_NS = 4 * CHUNK_SIZE_NS      # raw mode's optimistic first try
 MIN_CHUNK_COUNT    = 16                     # smallest useful decimation target
 FETCH_MAX_REQUESTS = 20_000                 # hard budget for one fetch call
 
+# Checking a server-thinned series against the archive itself (see
+# _decimated_is_suspect). The archiver's decimation levels are not complete for
+# every channel: a rarely-written one can come back as a long run of identical
+# interpolated points, or simply stop days before the period does.
+VERIFY_DENSE_PER_HOUR = 500     # samples in the probe hour above which the
+                                # channel is dense and its thinned series kept
+VERIFY_EDGE_FRACTION  = 0.05    # a thinned series must reach this close to both
+                                # ends of the period, or it is treated as short
+VERIFY_MAX_SAMPLES    = 400_000 # a re-read bigger than this is dropped again:
+                                # the thinned series is the lesser evil
+
 # Rows within this many milliseconds of each other are merged into one.
 SAMPLE_HOLD_MIN_GAP_MS = 137
 MASTER_RAMP_PV = "L3-PFWP6-MTR03-1:RawPos"
@@ -326,6 +337,51 @@ def _looks_decimated(samples: list, requested: int):
     return None
 
 
+def _decimated_is_suspect(samples: list, start_ns: int, end_ns: int):
+    """Does this server-thinned series describe the level rather than the data?
+
+    Returns ``(True, reason)`` when the series must not be trusted. Measured on
+    the real archiver 2026-09-21 over 10.-12.9.2026, both silent:
+
+      * ``L3-PCM3Y-MTR03-73:RawPos`` answered ``count=2000`` with 630 identical
+        points that stop 61.5 h before the period does, hiding the thirteen
+        positions the motor really went through at 10:30. Asked raw, the same
+        request returns those eighteen samples.
+      * ``HAPLS-SPEC_CENT_PD1M1_LT7_DIAG1:SpectralCentroid`` answered with 4321
+        identical points over a period holding not one archived sample, which
+        the Logger then drew as a solid three-day line.
+
+    Both give themselves away in the same two ways: nothing in the series ever
+    changes, or the series does not reach the ends of the period. A decimated
+    point carries ``minimum``/``maximum`` for its bin, so a bin that really saw
+    a change says so even when its mean happens to repeat.
+    """
+    span = end_ns - start_ns
+    if span <= 0 or not samples:
+        return False, ""
+    times = [int(s["time"]) for s in samples if s.get("time") is not None]
+    if not times:
+        return False, ""
+    edge = max(int(span * VERIFY_EDGE_FRACTION), int(MIN_CHUNK_NS))
+    if times[-1] < end_ns - edge:
+        return True, (f"thinned series stops {(end_ns - times[-1])/3.6e12:.1f} h "
+                      f"before the period ends")
+    if times[0] > start_ns + edge:
+        return True, (f"thinned series starts {(times[0] - start_ns)/3.6e12:.1f} h "
+                      f"after the period begins")
+    seen = set()
+    for s in samples:
+        lo, hi = s.get("minimum"), s.get("maximum")
+        if lo is not None and hi is not None and lo != hi:
+            return False, ""          # a bin really saw a change — trust it
+        v = s.get("value")
+        if isinstance(v, (int, float)):
+            seen.add(float(v))
+            if len(seen) > 1:
+                return False, ""
+    return True, "thinned series never changes"
+
+
 def _coalesce_ranges(ranges: list) -> list:
     """Sort and merge touching/overlapping (start, end) pairs."""
     out = []
@@ -396,6 +452,9 @@ class FetchReport(NamedTuple):
     decimated:   object        # True / False / None (unknown)
     span_ns:     int
     elapsed_s:   float
+    rechecked:   tuple = ()    # channels whose thinned series was thrown away
+                               # and read again as archived (see
+                               # _decimated_is_suspect)
 
 
 def cpva_fetch_samples_chunked(channel: str, start_ns: int, end_ns: int,
@@ -436,6 +495,118 @@ def _empty_report(gaps, boundaries, span_ns) -> FetchReport:
     return FetchReport(gaps, boundaries, 0, 0, False, False, None, span_ns, 0.0)
 
 
+def _probe_density(channel: str, start_ns: int, end_ns: int, timeout: float,
+                   cancel_fn=None) -> int:
+    """Raw samples the channel has in the newest hour of the period.
+
+    One request. It decides whether a suspect thinned series is worth replacing:
+    a densely archived channel HAS a working decimation level (measured: the
+    energies and the chiller temperatures all track their raw data), and
+    re-reading one of those raw is exactly the cost the thinning exists to
+    avoid. A channel writing a handful of samples a day is free to read raw.
+    """
+    if _is_cancelled(cancel_fn):
+        return -1
+    a = max(start_ns, end_ns - CHUNK_SIZE_NS)
+    try:
+        return len(cpva_fetch_samples(channel, a, end_ns, timeout, None))
+    except Exception:
+        return -1                      # unknown — let the caller re-read
+
+
+def _channels_to_read_raw(channels, start_ns, end_ns, timeout,
+                          cancel_fn=None, max_workers: int = 8) -> dict:
+    """Which of these channels are too sparse to be worth thinning.
+
+    Returns ``{channel: samples in the probe hour}`` for the sparse ones, plus
+    ``"_requests"`` — how many requests this cost. A channel is judged on the
+    newest hour of the period; if that hour is empty the middle hour decides,
+    so a meter that simply happened to be off at the end is not mistaken for a
+    setting. Two requests per channel at the very worst, run in parallel.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    spent = [0]
+
+    def _judge(ch):
+        n = _probe_density(ch, start_ns, end_ns, timeout, cancel_fn)
+        spent[0] += 1
+        if n == 0 and end_ns - start_ns > 3 * CHUNK_SIZE_NS:
+            mid = start_ns + (end_ns - start_ns) // 2
+            n = _probe_density(ch, mid, min(end_ns, mid + CHUNK_SIZE_NS),
+                               timeout, cancel_fn)
+            spent[0] += 1
+        return n
+
+    if _is_cancelled(cancel_fn) or not channels:
+        return {"_requests": 0}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(channels))) as ex:
+        counts = dict(zip(channels, ex.map(_judge, channels)))
+    out = {ch: n for ch, n in counts.items()
+           if 0 <= n < VERIFY_DENSE_PER_HOUR}
+    out["_requests"] = spent[0]
+    return out
+
+
+def _recheck_decimated(suspects, out, gaps, boundaries, start_ns, end_ns,
+                       timeout, cancel_fn=None, log_fn=None, max_workers=8):
+    """Replace every untrustworthy thinned series with the real samples.
+
+    ``suspects`` is ``[(channel, reason), …]`` from :func:`_decimated_is_suspect`.
+    Sparse channels are re-read raw over the whole period; dense ones keep what
+    the server gave. Mutates ``out``, ``gaps`` and ``boundaries`` in place and
+    returns ``(rechecked, extra_requests)``.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _note(text):
+        if log_fn:
+            try:
+                log_fn(text)
+            except Exception:
+                pass
+
+    extra = 0
+    names = [ch for ch, _why in suspects]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(names))) as ex:
+        density = dict(zip(names, ex.map(
+            lambda ch: _probe_density(ch, start_ns, end_ns, timeout, cancel_fn),
+            names)))
+    extra += len(names)
+
+    redo = [ch for ch in names if density.get(ch, -1) < VERIFY_DENSE_PER_HOUR]
+    for ch in names:
+        if ch not in redo:
+            _note(f"{shorten_pv_name(ch)}: the archiver's thinned series looks "
+                  f"flat, but the channel is written {density[ch]}× an hour — "
+                  f"kept as it is")
+    if not redo or _is_cancelled(cancel_fn):
+        return [], extra
+
+    raw_out, raw_err, raw_rep = cpva_fetch_many_adaptive(
+        redo, start_ns, end_ns, count=None, timeout=timeout,
+        cancel_fn=cancel_fn, preflight=False, verify=False)
+    extra += raw_rep.requests
+
+    why_of = dict(suspects)
+    done = []
+    for ch in redo:
+        got = raw_out.get(ch, [])
+        if raw_err.get(ch) and not got:
+            continue                   # the raw read failed — keep what we had
+        if len(got) > VERIFY_MAX_SAMPLES:
+            _note(f"{shorten_pv_name(ch)}: {why_of[ch]}, but reading it in full "
+                  f"is {len(got)} samples — the thinned series was kept")
+            continue
+        out[ch] = got
+        gaps[ch] = list(raw_rep.gaps.get(ch) or [])
+        boundaries[ch] = list(raw_rep.boundaries.get(ch) or [])
+        done.append(ch)
+        _note(f"{shorten_pv_name(ch)}: {why_of[ch]} — re-read as archived, "
+              f"{len(got)} sample(s)")
+    return done, extra
+
+
 def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                              count: int | None = None,
                              timeout: float | None = None,
@@ -447,7 +618,8 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                              start_chunk_ns: int | None = None,
                              min_chunk_ns: int = MIN_CHUNK_NS,
                              max_requests: int = FETCH_MAX_REQUESTS,
-                             preflight: bool = True):
+                             preflight: bool = True,
+                             verify: bool = True):
     """Read several channels over [start_ns, end_ns), whatever its length.
 
     Asks for as much time per request as the archiver will actually serve, and
@@ -476,6 +648,11 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
 
     ``chunk_fn(channel, samples)`` is called as each request lands, for callers
     that want to paint partial results. ``log_fn(text)`` gets one-line notes.
+
+    ``verify`` (only meaningful with ``count``) checks each thinned series
+    against the archive and reads the channel again, as archived, when the
+    server's decimation level turns out to be flat or to stop early — see
+    :func:`_decimated_is_suspect`. Turn it off only inside that re-read.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -657,48 +834,13 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
             if pend == 0:
                 finished.set()
 
-    # ── the plan: newest first, channels interleaved ───────────────────────
-    if start_chunk_ns is None:
-        want = min(span_total, MAX_CHUNK_NS if count else RAW_START_CHUNK_NS)
-    else:
-        want = int(start_chunk_ns)
-    want = max(min_chunk_ns, int(want))
-
-    # Each channel opens with ONE small request at the newest end. It is what
-    # puts something on screen straight away: the first big request over a long
-    # period is often refused, and the caller would otherwise watch an empty
-    # graph through the whole search for a span the archiver will serve.
-    probe_span = min(span_total, max(min_chunk_ns, CHUNK_SIZE_NS))
-    use_probe = span_total > 2 * probe_span
-
-    per_ch = {}
-    for ch in channels:
-        lst, b = [], end_ns
-        if use_probe:
-            a = b - probe_span
-            lst.append((ch, a, b, True))
-            b = a
-        while b > start_ns:
-            a = max(start_ns, b - want)
-            lst.append((ch, a, b, False))
-            b = a
-        per_ch[ch] = lst
-    plan = [t for grp in itertools.zip_longest(*per_ch.values())
-            for t in grp if t is not None]
-
-    # Count the whole plan up front, so the reported total only ever grows when
-    # a request genuinely splits into more work.
-    with lock:
-        state["total"] = len(plan)
-    if progress_fn:
-        emitted[1] = len(plan)
-        progress_fn(0, len(plan))
-
     # ── pre-flight: is the archiver there at all? ──────────────────────────
     # A big first request is allowed up to 120 s, so without this a dead
     # archiver would look like a two-minute hang. One minute of the newest end
     # at the short timeout answers that in 10 s. Skipped for short windows,
-    # which are cheap enough to fail on their own.
+    # which are cheap enough to fail on their own. It runs BEFORE the density
+    # pass below, so a dead archiver is still answered in one timeout instead
+    # of one per channel.
     if preflight and span_total > 4 * CHUNK_SIZE_NS:
         probe_a = max(start_ns, end_ns - MIN_CHUNK_NS)
         dead = None
@@ -727,6 +869,72 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                     FetchReport(gaps, boundaries, 1, 0, False, False, None,
                                 span_total, time.monotonic() - t0))
 
+    # ── who gets thinned, and who is read exactly as archived ──────────────
+    # Thinning is for a channel the archiver writes thousands of times an hour;
+    # for a motor position or a setting it is not a saving, it is damage. The
+    # server hands back one point per minute whatever the target, so a stepping
+    # channel arrives as minute-MEANS: the waveplate's 1049 real positions over
+    # three days came back as 90 averages that the motor never stood on. One
+    # cheap request per channel tells the two apart before anything else is
+    # asked for, and a channel found to be sparse is read raw throughout —
+    # which costs almost nothing, because sparse is exactly what it is.
+    per_ch_count = {ch: count for ch in channels}
+    sparse_raw: set = set()
+    if count and verify and span_total > 4 * CHUNK_SIZE_NS:
+        sparse = _channels_to_read_raw(channels, start_ns, end_ns,
+                                       base_timeout, cancel_fn, max_workers)
+        with lock:
+            state["requests"] += sparse.pop("_requests", 0)
+        for ch in sparse:
+            per_ch_count[ch] = None
+            # It is sparse — that is the whole point — so ask for the widest
+            # span in one go instead of raw mode's cautious four hours, which
+            # over a year would be 2190 requests for a channel holding a dozen
+            # samples. The oracle still halves anything the archiver refuses.
+            sparse_raw.add(ch)
+        if sparse:
+            _note(f"read as archived, not thinned (too few samples to thin): "
+                  f"{', '.join(shorten_pv_name(c) for c in sparse)}")
+
+    # ── the plan: newest first, channels interleaved ───────────────────────
+    def _want_for(ch) -> int:
+        if start_chunk_ns is not None:
+            return max(min_chunk_ns, int(start_chunk_ns))
+        wide = per_ch_count[ch] or ch in sparse_raw
+        w = min(span_total, MAX_CHUNK_NS if wide else RAW_START_CHUNK_NS)
+        return max(min_chunk_ns, int(w))
+
+    # Each channel opens with ONE small request at the newest end. It is what
+    # puts something on screen straight away: the first big request over a long
+    # period is often refused, and the caller would otherwise watch an empty
+    # graph through the whole search for a span the archiver will serve.
+    probe_span = min(span_total, max(min_chunk_ns, CHUNK_SIZE_NS))
+    use_probe = span_total > 2 * probe_span
+
+    per_ch = {}
+    for ch in channels:
+        want = _want_for(ch)
+        lst, b = [], end_ns
+        if use_probe:
+            a = b - probe_span
+            lst.append((ch, a, b, True))
+            b = a
+        while b > start_ns:
+            a = max(start_ns, b - want)
+            lst.append((ch, a, b, False))
+            b = a
+        per_ch[ch] = lst
+    plan = [t for grp in itertools.zip_longest(*per_ch.values())
+            for t in grp if t is not None]
+
+    # Count the whole plan up front, so the reported total only ever grows when
+    # a request genuinely splits into more work.
+    with lock:
+        state["total"] = len(plan)
+    if progress_fn:
+        emitted[1] = len(plan)
+        progress_fn(0, len(plan))
+
     workers = max(1, min(max_workers, len(plan)))
     ex = ThreadPoolExecutor(max_workers=workers)
     try:
@@ -738,7 +946,7 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
                     state["done"] += 1
                     gaps[ch].append((a, b))
                 continue
-            _submit(ch, a, b, _share(count, b - a, span_total),
+            _submit(ch, a, b, _share(per_ch_count[ch], b - a, span_total),
                     planned=True, probe=is_probe)
         # Retire the planner only after everything is queued: without this seed
         # the first task can finish before the second is submitted, "pending"
@@ -774,6 +982,50 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
             clean.append(s)
         out[ch] = clean
 
+    # ── a channel judged sparse that turned out not to be ──────────────────
+    # Two quiet probe hours can still belong to a fast meter that ran for one
+    # day of the period. Holding (and drawing) a million samples is worse than
+    # the thinned series, so take that after all — one request, and only in
+    # this rare case.
+    over = [ch for ch in sparse_raw
+            if len(out[ch]) > VERIFY_MAX_SAMPLES and not gaps[ch]]
+    if over and not _is_cancelled(cancel_fn):
+        thin_out, _thin_err, thin_rep = cpva_fetch_many_adaptive(
+            over, start_ns, end_ns, count=count, timeout=base_timeout,
+            cancel_fn=cancel_fn, preflight=False, verify=False)
+        with lock:
+            state["requests"] += thin_rep.requests
+        for ch in over:
+            if not thin_out.get(ch):
+                continue
+            _note(f"{shorten_pv_name(ch)}: reading it as archived is "
+                  f"{len(out[ch])} samples — thinned after all")
+            out[ch] = thin_out[ch]
+            sparse_raw.discard(ch)
+            boundaries[ch] = list(thin_rep.boundaries.get(ch) or [])
+
+    # ── the thinned series is checked against the archive itself ───────────
+    # The server's decimation levels are not built for every channel, and a
+    # missing one is answered with a flat run of interpolated points rather
+    # than with nothing — which the Logger then drew as a solid line across
+    # days. Only channels that look wrong are checked, and only the sparse ones
+    # are read again, so a normal load costs nothing extra.
+    rechecked: list = []
+    if count and verify and state["decimated"] and not state["cancelled"]:
+        suspects = []
+        for ch in channels:
+            if gaps[ch] or not out[ch] or not per_ch_count[ch]:
+                continue          # incomplete, empty, or already read raw
+            bad, why = _decimated_is_suspect(out[ch], start_ns, end_ns)
+            if bad:
+                suspects.append((ch, why))
+        if suspects and not _is_cancelled(cancel_fn):
+            rechecked, extra_req = _recheck_decimated(
+                suspects, out, gaps, boundaries, start_ns, end_ns,
+                base_timeout, cancel_fn, log_fn, max_workers)
+            with lock:
+                state["requests"] += extra_req
+
     for ch in channels:
         g = _coalesce_ranges(gaps[ch])
         gaps[ch] = g
@@ -790,7 +1042,8 @@ def cpva_fetch_many_adaptive(channels: list[str], start_ns: int, end_ns: int,
 
     report = FetchReport(gaps, boundaries, state["requests"], state["splits"],
                          state["cancelled"], state["over_budget"],
-                         state["decimated"], span_total, time.monotonic() - t0)
+                         state["decimated"], span_total, time.monotonic() - t0,
+                         tuple(rechecked))
     if state["over_budget"]:
         _note(f"stopped after {max_requests} requests — the period is too long "
               f"to read in full at this level of detail")
@@ -864,7 +1117,18 @@ def _last_before_in_range(channel: str, lo: int, hi: int,
                 or _last_before_in_range(channel, lo, mid, timeout, cancel_fn))
     if not raw:
         return None
-    return max(raw, key=lambda s: (s.get("time") or 0))
+    # The archiver brackets the range on BOTH sides: the reply carries the
+    # sample just before `lo` and the one just after `hi`. Taking the newest of
+    # the whole reply therefore hands back a value from the future — measured
+    # 2026-09-21 on HAPLS-SPEC_CENT_PD1M1_LT7_DIAG1:SpectralCentroid, where the
+    # value "before" 10.9. came back stamped 19.9. and was then held flat across
+    # the whole window. Only samples genuinely older than `hi` may answer.
+    # A sample older than `lo` is kept: it still is the newest one before `hi`,
+    # and accepting it saves the caller the deeper look-back rings.
+    older = [s for s in raw if (s.get("time") or 0) < hi]
+    if not older:
+        return None
+    return max(older, key=lambda s: (s.get("time") or 0))
 
 
 def cpva_fetch_last_before(channel: str, before_ns: int,

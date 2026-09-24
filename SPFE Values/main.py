@@ -35,46 +35,33 @@ def _icon_file() -> Path | None:
 
 
 def _icon_app_id() -> str | None:
-    """A taskbar identity derived from the icon's bytes and this build's name.
+    """A taskbar identity that is new on every launch.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it, so an id once seen without a usable icon keeps drawing the blank
-    window placeholder for good. Hashing the icon alone is not enough --
-    measured 2026-09-03 on four programs that did exactly that -- because such
-    an id only changes when the picture is redrawn. The running build's own
-    file name, which carries the version, goes in as well, so every rebuild
-    runs under an id Windows has never seen.
+    it, so every *stable* id tried here eventually picked up a bad cache entry
+    and then drew the blank window placeholder for good: a fixed string, a hash
+    of the icon, and a hash tagged with the build's file name each broke within
+    days. Setting no id at all was no better -- Windows then keys the button on
+    the exe path and caches the picture there instead (Diagnostic v1.3.1,
+    measured 2026-09-17: the window icon, the exe's own icon resource and the
+    shell's own file icon all correct, the taskbar button blank).
 
-    Returns None when there is no icon to give: the caller then sets no id at
-    all rather than burning the plain prefix on a run with no picture.
+    An id Windows has never seen has no cache entry, so the button falls back
+    to the window icon, which every program here sets itself -- measured on a
+    fresh id on 2026-09-04 and again on 2026-09-17. A random suffix per launch
+    makes every run a first-time id, which is why this is the one form that
+    cannot go stale. Nothing here needs a stable identity: no program registers
+    a shortcut, pins itself or sends Windows toasts. The one cost is pinning a
+    *running* taskbar button -- that pin would carry this run's id and would
+    not start the program again, so pin the exe instead.
+
+    Returns None when there is no icon at all; the caller then sets no id and
+    the button keeps taking the exe's own picture.
     """
-    # A frozen build gets no taskbar identity at all, deliberately.
-    # Windows caches the taskbar picture per AppUserModelID and never re-reads
-    # it, so one bad cache entry breaks that build for good; tagging the id
-    # with the build's file name only postponed it (Diagnostic v1.1.3's id
-    # drew the blank placeholder within a day of the build). Measured
-    # 2026-09-04 with three otherwise identical windows: the app's own id ->
-    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
-    # from the exe's own resource, which the builder always embeds (verified
-    # on a purpose-built PyInstaller exe). With no id Windows keys the button
-    # on the exe itself, so there is no per-id cache left to go stale. An id
-    # is still worth having when running from source, where the process is
-    # python.exe and would otherwise wear the Python icon.
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
+    if _icon_file() is None:
         return None
-    icon = _icon_file()
-    if icon is None:
-        return None
-    try:
-        data = icon.read_bytes()
-    except OSError:
-        return None
-    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
-                             else (sys.argv[0] or __file__))
-    digest = hashlib.md5(data + b"\x00"
-                         + build.encode("utf-8", "replace")).hexdigest()[:8]
-    return f"{_APP_ID_PREFIX}.{digest}"
+    import uuid
+    return f"{_APP_ID_PREFIX}.{uuid.uuid4().hex[:12]}"
 
 
 class SPFEValuesWindow(QMainWindow):

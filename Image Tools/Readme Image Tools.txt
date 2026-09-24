@@ -20,8 +20,15 @@ WHAT IT IS
       Workshop       look at one image properly: measure it, mark
                      it, export it
 
-  The tabs hand images to each other. Anything you find in the first
-  three can be sent to Workshop with one button.
+  The tabs hand images to each other. Each of the first three has a
+  row of "send this on" buttons for the other tabs — Image Finder,
+  Image Slider and Workshop, minus the tab you are already in.
+
+  What crosses over to the Image Finder is the MOMENT, not the file:
+  it picks the day itself, looks the frames up itself, and puts that
+  one instant side by side for every camera it was given. So you can
+  send a shot the Shot Finder found, or the moment the Image Slider
+  is parked on — even one you scrubbed to between two pictures.
 
   "One Moment" is gone: it is part of the Image Finder now. Picking a
   moment out of a graph and seeing every camera at that moment is
@@ -144,7 +151,8 @@ THE FOUR TABS
     the selected camera's own picture is still being read.
 
     The ◀ ▶ arrows move one image per click; hold one down and it
-    speeds up to five images a second. With several cameras, the
+    speeds up — two images a second, then three, four, five, eight
+    after five seconds and ten after eight. With several cameras, the
     master camera is the one the others follow — move any other
     camera's slider and it stays on the moment you left it.
 
@@ -251,6 +259,16 @@ THE FOUR TABS
     the cameras, where each one sits AND how big each one is set to
     be, so it comes back exactly as you left it.
 
+    MARKS ON THE PICTURE. Switch on Draw for a cross, a circle or a
+    box and draw as many of them as you need — every click adds
+    another one. Click a mark to pick it out and press Delete to take
+    it away; Ctrl+click makes a new mark on top of one that is already
+    there instead of picking that one up. You only ever click the
+    shape you have switched on, so the others are never in the way.
+    With several cameras marked, every mark lands on all of them at
+    the same place in each picture, and Delete takes it off all of
+    them.
+
     PCW3_NF shows the permanent reference square that is set on the
     camera itself. The camera screen draws it, but it is not part of
     the stored picture, so the program draws it back on. Right-click
@@ -263,15 +281,27 @@ THE FOUR TABS
     Give a value and a tolerance — an energy, a waveplate angle —
     and it finds every shot in a date range that matches, across
     several conditions at once. The results can be opened, previewed
-    or sent to Workshop.
+    or sent on to the Image Finder, the Image Slider or Workshop.
+    "Act on" says what the three send buttons and Save work with:
+    the day rows in the table, or the one shot picked in the day
+    detail.
 
     Two buttons say what is searched: "Time window" for the days and
     hours and "Cameras" for the cameras. Both pickers are the ones
     the Image Slider uses — one calendar with the times to the
     minute, and the camera list with its saved sets — so the days
     need not follow one another, and a set of cameras saved in one
-    tab is offered in the other. The times open on 07:00 to 20:00,
+    tab is offered in the other. The times open on 07:00 to 21:00,
     the shift rather than the whole calendar day.
+
+    Then two buttons: "Load data" reads only the numbers and says
+    how many shots fall inside the band - no pictures, so it is
+    quick even over a month - and "Load images" fetches the picture
+    of every day as well. Pressing "Load data" first costs nothing:
+    "Load images" then only looks for the pictures, the rows already
+    on screen stay where they are, and the "Image" column beside the
+    date fills in - a green tick where the picture is there, a red
+    cross where it is not, a grey dash where nobody has looked yet.
 
     Double-click a day in the results and a window opens with every
     matching shot of that day, and a graph beside it showing the
@@ -287,11 +317,12 @@ THE FOUR TABS
     carries, and it fills in by itself as the window opens. Double-
     click a row to open the folder with that frame selected.
 
-    While a search runs, the bar under "Load data" says how far it
-    has got and the line under it what is being read right now, so
+    While a search runs, the bar under the two buttons says how far
+    it has got and the line under it what is being read right now, so
     one slow day no longer looks like a program that has stopped.
-    How long is left appears once it has been measured on the days
-    already done, not guessed from the start.
+    How long is left is measured - the archiver read and the picture
+    hunt are timed separately and added up - and each search
+    remembers the two speeds for the next one.
     Changing the picked days shows the same bar while the cameras of
     those days are being looked up.
 

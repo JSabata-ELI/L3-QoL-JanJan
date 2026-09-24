@@ -2,8 +2,9 @@
 
 What is pinned here, and why each of them was wrong before:
 
-  * **The time window opens on the shift**, 07:00-20:00. It used to open on the whole
-    calendar day, so every search read hours in which nothing is ever shot.
+  * **The time window opens on the shift**, 07:00-21:00 (the house default, see
+    daypicker.DEFAULT_FROM_HOUR). It used to open on the whole calendar day, so every
+    search read hours in which nothing is ever shot.
   * **The day's curve holds its value.** A PV is what the archive last wrote until
     something new is written, so the line is flat and then steps (`steps-post`, the
     same as the PV Search window). Sloping from one sample to the next draws values
@@ -120,11 +121,11 @@ app.processEvents()
 
 # ── 1. the default time window ────────────────────────────────────────────────
 print("\nTime window")
-check("opens on the shift, not the calendar day", w._tw_times == (7, 0, 20, 0),
+check("opens on the shift, not the calendar day", w._tw_times == (7, 0, 21, 0),
       f"got {w._tw_times}")
 wins = w._tw_windows
 span_h = (wins[0][1] - wins[0][0]) / 3.6e12 if wins else 0
-check("13 hours wide", abs(span_h - 13.0) < 1e-6, f"got {span_h:.3f} h")
+check("14 hours wide", abs(span_h - 14.0) < 1e-6, f"got {span_h:.3f} h")
 check("one window for the one picked day", len(wins) == 1, f"got {len(wins)}")
 
 # ── open the day ──────────────────────────────────────────────────────────────
@@ -238,6 +239,118 @@ dots = [ln for ln in w._day_ax.get_lines() if ln.get_label() == "in range"]
 check("the shots in range are still dots, not a line", bool(dots) and
       dots[0].get_linestyle() in ("None", "none", ""),
       f"got {dots[0].get_linestyle()!r}" if dots else "no dots")
+
+# ── 5b. the time labels stand upright ─────────────────────────────────────────
+print("\nThe time labels")
+rots = sorted({round(t.get_rotation()) for t in w._day_ax.get_xticklabels()})
+check("upright, never at an angle", rots in ([0], []), f"got {rots}")
+w._day_canvas.resize(900, 300)
+w._retick_day_xaxis()
+wide = len(w._day_ax.get_xticks())
+w._day_canvas.resize(320, 300)
+w._retick_day_xaxis()
+narrow = len(w._day_ax.get_xticks())
+check("fewer labels when the curve is dragged narrow, not overlapping ones",
+      narrow < wide, f"{wide} labels at 900 px, {narrow} at 320 px")
+check("the axes fill the pane instead of sitting in a white frame",
+      w._day_fig.get_layout_engine() is not None,
+      f"layout engine {type(w._day_fig.get_layout_engine()).__name__}")
+
+# ── 5c. the slider under the curve ────────────────────────────────────────────
+print("\nThe shot slider")
+sl = w._day_slider
+check("one step per listed shot", (sl.minimum(), sl.maximum()) == (0, N_ROWS - 1),
+      f"got {sl.minimum()}..{sl.maximum()}")
+check("the wheel walks the shots without a click first",
+      bool(sl.property("wheelAlways")))
+moved = []
+for want in (3, 7, 0, N_ROWS - 1):
+    sl.setValue(want)
+    app.processEvents()
+    moved.append(tbl.currentRow())
+check("moving it picks that shot in the list", moved == [3, 7, 0, N_ROWS - 1],
+      f"got {moved}")
+back = []
+for want in (5, 2):
+    tbl.selectRow(want)
+    app.processEvents()
+    back.append(sl.value())
+check("and a row picked in the list moves the handle", back == [5, 2],
+      f"got {back}")
+w._select_day_shot_by_ns(int(rr[8]["_ns"]))
+app.processEvents()
+check("a click on the curve moves both", (tbl.currentRow(), sl.value()) == (8, 8),
+      f"got row {tbl.currentRow()}, handle {sl.value()}")
+
+# ── 5d. a frame is read once, then it is in memory ────────────────────────────
+print("\nFrames kept in memory")
+RENDERED: "list[str]" = []
+
+
+def fake_render(path, *a, **k):
+    from PySide6.QtGui import QImage
+    RENDERED.append(str(path))
+    img = QImage(8, 8, QImage.Format.Format_Grayscale8)
+    img.fill(0)
+    return img, "note", {"contrast": 0}
+
+
+real_loader = w._load_and_show_preview
+w._load_and_show_preview = sf_t.ShotFinderWidget._load_and_show_preview.__get__(w)
+w._render_preview_frame = fake_render
+w._preview_cache.clear()
+path3 = str(frame_path(int(rr[3]["_ns"]) + 5_000_000))
+args = ("", False, None, 0, 0)
+w._load_and_show_preview(Path(path3), "", w._preview_gen, *args)
+first = len(RENDERED)
+w._load_and_show_preview(Path(path3), "", w._preview_gen, *args)
+check("the same frame is read off the share once", len(RENDERED) == first == 1,
+      f"read {len(RENDERED)} time(s)")
+check("and it is handed back with its own scale note",
+      w._preview_cache.get(w._preview_key(path3, args))[1] == "note")
+w._load_and_show_preview(Path(path3), "", w._preview_gen, "Iron", False, None, 0, 0)
+check("a changed display setting is a different frame, not a stale one",
+      len(RENDERED) == 2, f"read {len(RENDERED)} time(s)")
+
+# Reading ahead: only rows whose frame is already named, and while the handle is
+# being dragged only the ones AHEAD of it.
+w._start_day_prefill(w._day_dr, w._day_fill_gen)   # names every frame again
+wait_for_fill(N_ROWS)
+tbl.selectRow(4)
+
+
+def settle():
+    """Let every read already under way finish, so what follows is measured on its
+    own — the naming of the column queues reads of its own as the names land."""
+    for _ in range(40):
+        app.processEvents()
+        w._preview_pool.waitForDone(3000)
+    w._day_prefetch_timer.stop()
+
+
+settle()
+RENDERED.clear()
+w._preview_cache.clear()
+w._day_scrubbing = True
+w._day_step_dir = 1
+w._run_preview_prefetch()
+w._preview_pool.waitForDone(3000)
+ahead = sorted({NS_TO_ROW.get(int(sf_t._ts_from_stem(Path(p)) or 0) - 5_000_000, -1)
+                for p in RENDERED})
+check("while dragging, the shots ahead of the handle are read first",
+      len(ahead) >= 4 and min(ahead) > 4, f"read rows {ahead}")
+settle()
+RENDERED.clear()
+w._preview_cache.clear()
+w._day_scrubbing = False
+w._run_preview_prefetch()
+w._preview_pool.waitForDone(3000)
+both = sorted({NS_TO_ROW.get(int(sf_t._ts_from_stem(Path(p)) or 0) - 5_000_000, -1)
+               for p in RENDERED})
+check("standing still, the shots on both sides are read",
+      bool([r for r in both if r < 4]) and bool([r for r in both if r > 4]),
+      f"read rows {both}")
+w._load_and_show_preview = real_loader
 
 # ── 6. the time left is only said when it is known ────────────────────────────
 print("\nThe time estimate")

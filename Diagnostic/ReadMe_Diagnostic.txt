@@ -77,10 +77,9 @@ DIFFERENT LIMITS FOR DIFFERENT OPERATION
                         could physically produce. Shown differently
                         from missing data, because it means the
                         sensor is wrong rather than absent.
-    not updating        the archive keeps answering with fresh
-                        timestamps and a plausible number, but the
-                        number never moves. A dead sensor or a stuck
-                        system. This one is worth understanding —
+    not updating        the archive answers, but has no newer
+                        reading to give — the number on screen is
+                        hours old. This one is worth understanding —
                         see below.
     not refreshed       this program itself stopped reading. Nothing
                         on screen is wrong, it is simply old — see
@@ -89,21 +88,27 @@ DIFFERENT LIMITS FOR DIFFERENT OPERATION
 
 "NOT UPDATING"
 
-  The quietest way a value can fail: it still arrives, it still
-  looks reasonable, and it is days old. Nothing else notices, because
-  it sits inside its limits and looks like a beautifully steady
-  reading.
+  The quietest way a value can fail: it still looks reasonable, it
+  still sits inside its limits, and it is hours old. Nothing else
+  notices.
 
-  So each reading is also asked whether it is still alive: has the
-  value been exactly the same for longer than two hours, and has the
-  newest stored sample stopped advancing. Exactly the same, on
-  purpose — a working sensor's noise always moves the last digit;
-  only a stuck one repeats it.
+  So each reading is also asked one question: is a NEW reading
+  arriving? The answer is the timestamp of the newest stored sample.
+  While new samples keep landing, the value is live — whatever
+  number it carries.
 
-  Such a value is shown as "not updating" on a dark teal background,
-  and that outranks warning and alarm, because a limit verdict on a
-  dead reading means nothing. Values that genuinely hold still —
-  switch positions, setpoints, enable flags — can be excused
+  A number that simply does not move is NOT a fault. The check used
+  to treat it as one, and it was wrong: the chillers are regulated so
+  well that they report the very same tenth of a degree for two hours
+  at a time, with a fresh reading every second, and the program was
+  announcing a healthy chiller as "not updating" and then announcing
+  its "recovery" once the tenth drifted. That half of the check is
+  gone.
+
+  A value that really is not being refreshed is shown as "not
+  updating" on a dark teal background, and that outranks warning and
+  alarm, because a limit verdict on an old reading means nothing.
+  PVs that are archived only now and then on purpose can be excused
   individually.
 
 
@@ -160,13 +165,25 @@ THE GRAPH
   without reading colours. If you prefer a legend inside the plot,
   the right-click menu offers one, and the two are alternatives.
 
+  IT DRAWS EVERY READING THE ARCHIVE HAS, not one point per reading
+  pass. That matters for values that jump and come straight back: the
+  Utility Chiller drops to 10 C for well under a second, and the graph
+  used to draw 19.2 C at that moment, because 19.2 is the average of
+  the readings around it. The graph now shows the 10.
+  The limits still work on the average, exactly as before, so a dip
+  that short is something you see on the graph - it does not send a
+  message. That is on purpose: a value that is back to normal within
+  seven minutes has never been worth waking anybody for.
+
 
 THE WEBEX BOT
 
   In the room set up for it, the bot answers one-line commands:
   the state of everything, only what is alarming, the configured
   list, and a graph of any values over any period. It can also arm
-  and disarm alerting, per value or as a whole.
+  and disarm alerting, per value or as a whole, and MOVE A WARNING
+  OR ALARM LIMIT - so a chiller sitting a tenth of a degree outside
+  its band overnight no longer means walking to the PC.
 
   ONE THING NOBODY GUESSES: in a room with more than two people,
   Webex shows a bot only the messages that @mention it. A command
@@ -178,7 +195,38 @@ THE WEBEX BOT
       @Diagnostics /plot Chiller 1; 1.1. 9:00 - 1.9. 12:00
 
   In a one-to-one chat with the bot the tag is not needed. Type
-  /help in the room for the whole list.
+  /help in the room for the whole list, and
+
+      @Diagnostics /help plot
+
+  for one command in full - examples, and what to watch out for.
+  There is such a page for status, alarms, list, plot, time, change,
+  undo, graph, stop, enable, cancel, window, yaxis, datawatchdog,
+  run, food and mention.
+
+  The list itself is deliberately one line per command - what it
+  takes, and the one thing that catches people out. Everything
+  longer than that, including the whole of ordering lunch, sits on
+  those pages, because /help is read on a phone at the machine.
+
+  CHANGING A LIMIT goes like a conversation:
+
+      @Diagnostics /change DA1
+
+  answers with that value's limits, numbered - the ordinary four,
+  then four more for each rule the value has (one per shot rate, for
+  instance), with the rule in force right now marked and the current
+  reading above them. Then:
+
+      @Diagnostics 6 15
+
+  sets limit 6 to fifteen. "limit 6 hodnota 15" and "warn high 25"
+  say the same thing, "6 15, 7 17" moves two at once, and the whole
+  thing fits on one line as /change DA1 warn high 25. In a room the
+  answer has to carry the tag as well, or Webex never delivers it;
+  /change 6 15 is the form that always gets through. The program
+  refuses a number that would cross another limit - which the window
+  on the PC does not - and /undo puts the last change back.
 
   A GRAPH OVER MONTHS is drawn as the average of each point on the
   picture with a shaded band from the lowest to the highest reading
@@ -189,6 +237,24 @@ THE WEBEX BOT
   evenly spread part of the period instead and stamps the picture
   SAMPLED - 24 % of the window read, so a gap is never passed off as
   a calm stretch. Add "; detail" to read every single reading.
+
+  Be warned that the band is real but tiny: on a chiller over 90 days
+  each point covers 2.4 hours, in which the temperature moves about
+  0.4 degrees, so the band is 1 % of the picture's height. It shows
+  where it matters - the lone vertical spikes on such a graph are the
+  band's edges, not the average. And SAMPLED only appears past 600
+  requests to the archive: one PV over 90 days is read whole, four
+  chillers over 90 days are sampled to 83 %.
+
+  HOW SHARP THE PICTURE IS is set in Settings, "Picture resolution
+  (dpi)" - 600 by default, which is 4800 x 2400 points and about
+  300 kB. One graph can be asked for differently:
+
+      @Diagnostics /plot Chiller 1; 12h; 1200dpi
+
+  Anything from 50 to 1200 works, and the reply says which was used.
+  Only the number of points changes; the writing and the lines keep
+  the same proportions.
 
   IT WILL NOT TAKE THE COMPUTER DOWN ANY MORE. On 2.9.2026 a graph
   over 180 days filled the whole memory of the machine and the

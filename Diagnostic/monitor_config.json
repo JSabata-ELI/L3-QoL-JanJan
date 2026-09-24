@@ -23,8 +23,6 @@
     "data_watchdog_enabled": true,
     "data_watchdog_fail_polls": 2,
     "frozen_check_enabled": true,
-    "frozen_after_minutes": 120,
-    "frozen_min_points": 5,
     "frozen_alert_enabled": true,
     "learn_days_default": 7,
     "warn_k_default": 3.0,
@@ -40,10 +38,13 @@
     "plot_max_workers": 10,
     "plot_request_budget": 600,
     "plot_bins": 900,
+    "chart_dpi": 600,
     "shared_pv_list_enabled": true,
     "shared_pv_list_path": "",
     "shared_pv_list_timeout_s": 3.0,
     "_shared_pv_root_cache": "\\\\hapls-share.cs.eli-beams.eu\\scratch\\Software",
+    "frozen_after_minutes": 120,
+    "frozen_min_points": 5,
     "hysteresis_frac": 0.05
   },
   "pvs": [
@@ -134,10 +135,10 @@
               0.2
             ]
           ],
-          "warn_low": 14.6,
-          "warn_high": 15.2,
-          "alarm_low": 14.3,
-          "alarm_high": 15.5
+          "warn_low": 14.4,
+          "warn_high": 15.0,
+          "alarm_low": 14.1,
+          "alarm_high": 15.3
         },
         {
           "label": "3,3 Hz",

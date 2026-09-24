@@ -146,16 +146,17 @@ def _fetch(channels, span, limits, count=2000, **kw):
 def test_a_servable_period_costs_one_request():
     """No hunting when the archiver simply serves the period.
 
-    Two requests per signal, not one: the first is the small opening request at
-    the newest end, which is what puts something on screen immediately. What
-    must not happen is any SPLITTING.
+    Three requests per signal, not one: the density probe that decides whether
+    thinning the signal is worth it at all, then the small opening request at
+    the newest end, which is what puts something on screen immediately, then
+    the rest of the period. What must not happen is any SPLITTING.
     """
     fake = _Fake({"A": 60 * DAY, "B": 60 * DAY}).install()
     res, err, rep, _p, _s, _e = _fetch(["A", "B"], 2 * DAY, fake.limits)
     check("no request is ever refused, so nothing is split",
           rep.splits == 0 and not err, f"{rep.splits} splits, err={list(err)}")
-    check("one opening request plus one for the rest, per signal",
-          rep.requests == 4, f"{rep.requests} requests")
+    check("density probe, opening request and the rest, per signal",
+          rep.requests == 6, f"{rep.requests} requests")
     check("both signals have data", all(res[c] for c in ("A", "B")))
 
 
@@ -192,8 +193,11 @@ def test_night_hours_are_read():
 def test_a_slow_signal_is_not_dragged_down():
     fake = _Fake({"SLOW": 60 * DAY, "FAST": HOUR}).install()
     res, err, rep, _p, _s, _e = _fetch(["SLOW", "FAST"], 2 * DAY, fake.limits)
-    check("the slow signal is never split (opening request + the rest)",
-          fake.count_for("SLOW") == 2, f"{fake.count_for('SLOW')} requests")
+    # Three, not two: the density probe that decides whether this channel is
+    # worth thinning at all costs one request per signal (see
+    # test_thinned_series_is_checked.py).
+    check("the slow signal is never split (density probe + opening + the rest)",
+          fake.count_for("SLOW") == 3, f"{fake.count_for('SLOW')} requests")
     check("the fast signal is still read in full", not rep.gaps["FAST"],
           str(rep.gaps["FAST"][:2]))
     check("the fast signal did not need a request per minute",
