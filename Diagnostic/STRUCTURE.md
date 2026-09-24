@@ -1,16 +1,17 @@
 # Diagnostic — STRUCTURE
 
-> Verified against source: 2026-09-11 · `monitor_tab.py` 9090 L · `okbase_menu.py` 2948 L ·
-> `alerting.py` 1178 L · `chart_history.py` 888 L · `edge_cdp.py` 885 L ·
-> `remote_launcher.py` 765 L · `cpva_api.py` 585 L · `bot_commands.py` 481 L ·
+> Verified against source: 2026-09-16 · `monitor_tab.py` 9132 L · `okbase_menu.py` 2948 L ·
+> `alerting.py` 1117 L · `edge_cdp.py` 992 L · `chart_history.py` 888 L ·
+> `remote_launcher.py` 765 L · `cpva_api.py` 585 L · `bot_commands.py` 567 L ·
 > `main.py` 485 L · `shared_pvs.py` 364 L · `okbase_capture.py` 248 L ·
 > `notify_provision.py` 238 L · `memstats.py` 187 L ·
 > `operation_history_logic.py` 128 L · `secrets_util.py` 70 L ·
 > tests: `test_okbase_menu.py` 895 L · `testing/test_okbase_orders.py` 790 L ·
-> `test_monitor_frozen.py` 640 L · `test_alerting.py` 565 L ·
+> `test_monitor_frozen.py` 639 L · `test_alerting.py` 490 L ·
 > `test_edge_cdp.py` 340 L · `test_rule_change_grace.py` 332 L ·
-> `test_bot_commands.py` 243 L · `testing/test_stale_sso_cookie.py` 225 L ·
-> `testing/` 14 test files + `bench_long_plot.py`
+> `test_bot_commands.py` 243 L · `testing/test_stale_sso_cookie.py` 241 L ·
+> `testing/test_signin_undecided.py` 196 L ·
+> `testing/` 16 test files + `bench_long_plot.py`
 
 PySide6 app: live PV monitoring and alerting off the CPVA archive, with a two-way
 Webex bot. The **PV Monitor** tab is the program in practice.
@@ -26,7 +27,7 @@ Shared infrastructure — paths, the build/deploy chain, where settings live:
 |--------|------|
 | `main.py` | Entry point, window, splash, tabs, the run-status/lock files. **pandas and matplotlib are imported lazily** (`operation_history_logic` inside `HistoryTab._run`, `monitor_tab` inside `main()` after the splash) — on a cold file cache those imports cost tens of seconds, and this way the splash paints first. |
 | `monitor_tab.py` | The whole PV Monitor: table, graph, threshold/condition editing, Settings, share publishing, alert dispatch, Webex commands. |
-| `alerting.py` | Alert state machine + the three notification channels; the Qt-free series checks (`classify_trend`, `detect_frozen`); the run-status file. |
+| `alerting.py` | Alert state machine + the three notification channels; the Qt-free series check `classify_trend`; the run-status file. |
 | `cpva_api.py` | Thin CPVA REST client, and `get_app_dir()` — every path in the program resolves through it. Also the shared request scheduler (`cpva_run_chunks`), the halve-on-refusal fetch (`cpva_fetch_samples_piecewise`, which hands each piece over rather than collecting it) and the 32 MB ceiling on a single answer. **No numpy in here**: `remote_launcher.py` imports `get_app_dir` from it and is built as its own always-on exe. |
 | `chart_history.py` | Reading a long stretch of archive for a plot: measure how densely a channel is written, size the requests to match, condense every answer into per-point min/max/average as it arrives, and put into words what could not be read. Qt-free and matplotlib-free so it can be tested alone. See below. |
 | `shared_pvs.py` | The PV list + shared settings on the scratch share. |
@@ -59,13 +60,14 @@ CPVA archive (REST, https://10.78.0.57:8443)
   │  cpva_api.cpva_fetch_samples()
   ▼
 monitor_tab._PollWorker       every poll_interval_s, poll_max_workers at a time
-       _BackfillWorker        fills the graph history at launch
+       _BackfillWorker        fills the graph history from the archive
        _LearnWorker           derives thresholds from N days of archive
   ▼
-PVRuntime.samples ──► PVTableModel ──► GraphPanel
+PVRuntime.history ──► PVTableModel ──► GraphPanel
+   (_SampleHistory: every archived reading, in numpy arrays)
   ├─ _check_limits_change        holds alerting after the rule in force changes
   ├─ alerting.AlertEvaluator     thresholds + debounce/settle + re-notify
-  ├─ alerting.detect_frozen      "not updating"  (this PV's reading is dead)
+  ├─ _update_frozen              "not updating"  (no newer reading for this PV)
   ├─ _check_refresh_health       "not refreshed" (this program stopped reading;
   │                              marks at once, notifies only if it lasts)
   ▼
@@ -139,8 +141,6 @@ every checkbox click and an SMB write costs tens to hundreds of ms.
 | `_raw_severity(value, thr)` | the bare verdict — **no hysteresis**, deliberately |
 | `AlertEvaluator` | debounce count, settle minutes, re-notify cooldown, recovery notices, and the trend-paced reminders |
 | `classify_trend(samples, now_ns, lookback_s, …)` | which way the value is heading → reminders speed up or slow down |
-| `detect_frozen(samples, now_ns, frozen_after_s, …)` → `FrozenInfo` | the "not updating" verdict |
-| `_same_value(a, b, rel_tol, abs_tol)` | near-exact comparison — a working sensor's noise always moves the last digit; only a stuck one repeats it |
 | `describe_reason`, `fmt_value`, `fmt_duration` | message text |
 | `build_messagecard`, `build_textcard` | the Teams MessageCard payloads |
 | `TeamsClient`, `EmailNotifier`, `WebexNotifier`, `NotificationHub` | the channels and the fan-out |
@@ -149,29 +149,28 @@ every checkbox click and an SMB write costs tens to hundreds of ms.
 
 `WebexNotifier` both sends (text and PNG) and listens for commands.
 
-### "Not updating" — two independent checks
+### "Not updating" — is a new reading arriving?
 
-- **The value never changes.** `detect_frozen` walks back through the kept history
-  while the value is still *exactly* the same and measures the run. Longer than
-  `frozen_after_minutes` (120) counts, and the run must be carried by at least
-  `frozen_min_points` (5) samples, so two readings hours apart are never mistaken for
-  a stuck sensor.
-- **The newest archived sample stops advancing.** The limit is derived from the poll
-  pacing (two sample windows or three poll intervals, whichever is longer, never
-  under 5 minutes), so it needs no setting of its own.
+`_update_frozen` asks one thing: how old is the newest archived sample for this PV?
+Older than the limit (two sample windows or three poll intervals, whichever is
+longer, never under 5 minutes — derived from the poll pacing, so it needs no setting
+of its own) and the PV counts as not updating.
 
-The history behind the first check is the graph's, which `_BackfillWorker` pre-fills
-from the archive at launch: the visible window (`graph_window_minutes`) first so the
-graph draws in ~2 s, then a follow-up pass up to `frozen_after_minutes` to arm this
-check, so a freeze that started over the weekend is still visible within a poll or
-two of opening the app. Older data is fetched only on request (`extend_backfill`) —
-the archiver caps a request at 1 h, so a wide pre-fill costs one request per hour
-per PV.
+**A steady value is not a fault.** A second check used to sit here: a PV serving
+*exactly* the same number for longer than `frozen_after_minutes` (2 h) was taken for
+a stuck sensor, since "a working sensor's noise always moves the last digit".
+Measured on `L3-UTIL-CHL03-001:Temp` (DA1 Chiller, 13 Sep 2026): a sample every
+~0.7 s, whole tenths of a degree, one tenth held for 40–125 min — so a healthy
+chiller was announced as `PV NOT UPDATING — value unchanged for 2 h 0 min` and
+"recovered" a couple of hours later, all night long. Removed on 16 Sep 2026 with
+`alerting.detect_frozen`, the `frozen_after_minutes` / `frozen_min_points` settings
+and the extra history pre-fill that armed it. `test_monitor_frozen.py` now asserts
+the opposite (`test_a_steady_value_is_not_reported`).
 
-`not updating` **outranks** ok/warn/alarm in the table (dark teal), and is shown even
-for PVs with **On** unchecked. A threshold alert raised on a frozen PV carries the
-warning in its reason. Per-PV opt-out: `frozen_check` in **Edit PV**, for values that
-genuinely hold still (switch positions, setpoints, enable flags).
+The graph's history is therefore pre-filled to the visible window only
+(`graph_window_minutes`), which is why the graph draws in ~2 s; nothing needs more
+than that any more. Older data is fetched only on request (`extend_backfill`) — the
+archiver caps a request at 1 h, so a wide pre-fill costs one request per hour per PV.
 
 ### Conditional limits and the rule-change hold
 
@@ -250,7 +249,8 @@ stale too. It honours the same `frozen_check` opt-out.
 | Class | Role |
 |-------|------|
 | `PVConfig` | one configured PV: name, display name, thresholds, conditional rule profiles, valid range, group, `frozen_check`, on/off |
-| `PVRuntime` | its live state: kept `samples`, last value, alert state, frozen info, and the rule-change hold (`limits_key`, `grace_until_ns`, `in_grace()`) |
+| `PVRuntime` | its live state: kept readings (`history`, a `_SampleHistory`), last value, alert state, frozen info, and the rule-change hold (`limits_key`, `grace_until_ns`, `in_grace()`) |
+| `_SampleHistory` | one PV's archived readings as two numpy arrays. Deque-compatible on the surface (`append`, `len`, `[0]`, iteration) so the tests that hand in a plain `deque` keep working; `arrays()` gives the graph a no-copy view. Bounded by time (`history_minutes`) and by a per-PV count (`HISTORY_ASSUMED_MAX_HZ`, `HISTORY_HARD_CAP`) |
 | `PVTableModel(QAbstractTableModel)` | the table. `_alarm_status_text` / `_alarm_status_tooltip` / `_frozen_tooltip` produce the State cell, including the `⏸`-prefixed dark-red form used while alerting is disarmed |
 | `PVListChoice` / `load_shared_pv_list(settings, local_pvs)` | share vs local mirror, and whether publishing is allowed |
 
@@ -259,11 +259,11 @@ stale too. It honours the same `frozen_check` opt-out.
 | Worker | Role |
 |--------|------|
 | `_PollWorker` | one poll pass: up to `poll_max_workers` PVs concurrently. The archiver call is I/O-bound HTTP, so a pass costs ~`ceil(N / workers) × per-request time`; too few workers make a pass overrun the interval, which skips ticks and makes the table lag |
-| `_BackfillWorker` | fills the graph history at launch (`history_minutes`) |
+| `_BackfillWorker` | fills the graph history from the archive: `graph_window_minutes` at launch, up to `history_minutes` on "Load older data". Streams through `cpva_api.cpva_run_chunks`, reducing each answer with `_envelope` in the thread that received it and under `chart_history._MemoryGuard` — see *Every reading, not one per poll* |
 | `_LearnWorker` + `compute_baseline(v, warn_k, alarm_k)` | derive thresholds from `learn_days_default` days of archive; `_BatchLearnController` drives it for many PVs |
 | `_ChannelsWorker` | the archiver's channel list for the PV browser |
 | `_AlertWorker` | dispatch, off the UI thread |
-| `_ChartWorker` + `render_chart_png` / `render_pv_png` / `_fetch_chart_data` | the PNG a chat `/plot` returns. The archiver half lives in `chart_history.py`; `_fetch_chart_data` is the seam the tests replace |
+| `_ChartWorker` + `render_chart_png` / `render_pv_png` / `_fetch_chart_data` | the PNG a chat `/plot` returns — 8 × 4 in at the `chart_dpi` setting (Settings → "Picture resolution (dpi)", default `CHART_DPI` = 600, so 4800 × 2400 px, ~300 kB, 0.25 s to draw; it was 110 until 16 Sep 2026 and broke up as soon as anybody zoomed in on a phone). One picture at a time overrides it with `/plot …; 300dpi`. `_chart_dpi(dpi)` resolves and **clamps** the figure — it arrives from a chat command or a hand-edited settings file, and 0 or 20000 dpi must never reach matplotlib. `testing/bench_chart_dpi.py` has the measured cost of every dpi from 110 to 1200; `testing/test_plot_dpi.py` checks the option, the resulting pixel size and the clamping. X labels are **horizontal**, date over time, at most 8 ticks (`AutoDateLocator(maxticks=8)`) — `fig.autofmt_xdate()` used to tilt them 30°, and the time line is dropped when every tick lands on midnight. The archiver half lives in `chart_history.py`; `_fetch_chart_data` is the seam the tests replace (`testing/shot_chart_axis.py` renders the axis at five window lengths from canned readings) |
 | `_CancelToken` | the switch behind `/cancel`. Set on the UI thread, read in the worker and inside `cpva_fetch_samples_chunked(cancel_fn=…)`, so the chunks not yet fetched are skipped. `MonitorWidget._chart_jobs` holds the tokens of the plots still running; a cancelled worker dispatches **nothing**, and `render_chart_png` sets `out_info["cancelled"]` so "no data in that window" and "you took it back" stay different answers |
 | `_MeIdWorker`, `_CmdPollWorker`, `_TextReplyWorker` | the Webex bot loop |
 | `_SharedWriteSignals` / `_shared_write_job` | the debounced share publish |
@@ -298,6 +298,76 @@ the wheel must not change a control the pointer merely hovers over.
 The side list exists because matplotlib re-picks a "best" legend corner on every
 redraw — the legend visibly jumped from corner to corner while data came in.
 
+### Every reading, not one per poll
+
+Until 23 Sep 2026 the graph held **one number per poll**: the mean of the last
+`avg_last_n` readings. An operator reported the Utility Chiller dropping to 10 °C in
+CS Studio while Diagnostic drew 19.2 °C at the same minute. Both were right about
+their own data:
+
+- `L3-UTIL-CHL03-006:Temp` is written ~1.09×/s and took **five** values all that
+  morning — 10.0, 19.9, 20.0, 20.1, 29.9. There is no 19.2 in the archive.
+- It dropped to 10.0 three times, for **one reading** each: 09:09:51, 11:47:18 and
+  11:54:20 (that last one twice in the same second).
+- 24 twenties and one ten over 25 is 19.6; 23 twenties and two tens over 25 is 19.2.
+  Replaying the poll over the real archive reproduced the drawn curve exactly:
+  19.544, 19.560, 19.200.
+
+So the number on screen was an artefact of the averaging, and no setting could have
+recovered the dip — it had already been averaged away before the graph saw it.
+
+Three things had to change together, because any one alone still loses the dip:
+
+1. **The poll keeps what it fetches.** `_avg_recent_numeric` already downloaded the
+   whole `sample_window_s` and threw all but `avg_last_n` readings away; it now also
+   returns the in-range `(times, values)`. No extra network traffic — the readings
+   were always being paid for.
+2. **The history can hold them.** `_SampleHistory` (two numpy arrays) replaced the
+   `deque` of tuples: ~16 bytes a reading instead of ~120, i.e. ~32 MB rather than
+   ~235 MB for twelve hours of the PVs monitored today.
+3. **The drawing keeps the extremes.** `_envelope` splits the series into equal-count
+   columns and emits each column's minimum and maximum in the order they happened,
+   rather than keeping every n-th reading. At 1 Hz over 12 h a column is ~55 readings
+   wide, so even thinning kept one of 55 and the dips fell in the other 54. A
+   one-reading dip is its column's minimum by definition, so it cannot be lost.
+
+Rendering the real 23 Sep data through both paths is the proof, and both pictures are
+kept: the envelope draws all three dips at 10.0, the old stride thinning draws a flat
+band whose minimum is 18.8.
+
+```
+python testing/capture_chiller_dips.py      re-capture the fixture from the archive
+                                            (already committed; needs the network)
+python testing/shot_graph_spike.py          graph_spike_envelope.png  — the dips
+python testing/shot_graph_spike.py --stride graph_spike_stride.png    — the control
+```
+
+Both runs assert before they save — the drawn minimum, the cursor readout at the dip's
+timestamp, the last x value, and that the tick labels still read as wall-clock times.
+That last one is the guard worth keeping: `_series` hands matplotlib plain floats now,
+so without `ax.xaxis_date(...)` the ticks would silently come out as bare numbers on an
+otherwise perfectly plausible picture.
+
+**Alerting was deliberately not touched.** The thresholds still see the same
+`avg_last_n` average, on the same rhythm, with the same settle / stability / cooldown /
+grace windows. A sub-second dip is therefore visible on the graph and still sends no
+message — the 7-minute settle window is there precisely so transients do not wake
+anybody, and the operator chose to keep it.
+
+Two consequences worth knowing:
+
+- `classify_trend` is fed from `history`, so it now sees raw readings rather than
+  per-poll averages. It re-averages inside its own overlapping windows and only scales
+  the re-notify reminder rhythm — no state machine, no debounce, no settle. It is
+  handed `_history_since(...)` rather than the whole buffer, or it would walk 12 h of
+  readings on every poll of every alarming PV.
+- A skipped poll pass used to cost one graph point; with raw readings it would cost a
+  hole nothing ever fills. The next pass therefore reaches back to the last stored
+  reading, capped at `POLL_GAP_MAX_WINDOWS`. The widened stretch reaches the graph
+  only: `avg_from_ns` keeps the average, `n_rejected`, `last_ts` and `last_raw` on the
+  configured window, because `n_rejected` feeds the error string and the bad-data flag
+  and widening it silently would have changed alerting.
+
 ### Reading vs monitoring
 
 Polling is independent of **Start monitoring**. PVs are read from launch, so the
@@ -324,8 +394,12 @@ Windows can no longer start anything, with free RAM still showing in Task Manage
   half-hourly log line could not have caught it: `MEM_WARN_PCT` watches the **PC's**
   percentage, and 24 GB inside one process was still only ~75 % of the limit.
 - **Bounded**: `LogWidget.MAX_LINES` (20 000) caps the Log tab, which otherwise grew
-  for as long as the window stayed open. `PVRuntime.history` was already a bounded
-  `deque` (`_history_maxlen`).
+  for as long as the window stayed open. `PVRuntime.history` is bounded twice — by
+  time (`history_minutes`) and by a per-PV sample cap — and `_log_memory` prints what
+  it actually comes to every half hour, with a one-off warning above
+  `HISTORY_TOTAL_WARN_BYTES` (256 MB). Measured 23 Sep 2026: the 31 monitored PVs are
+  written 45.4 readings/s between them, so 12 h is ~2.0 M readings — **~32 MB** as
+  two numpy arrays, against ~235 MB had they stayed Python tuples in a deque.
 - **Fixed leak**: every worker dispatch makes a `_*Signals` object parented to the
   widget, and a parented `QObject` is only destroyed with its parent — so all of them
   stayed alive. Measured at **~3 KB each**, i.e. ~0.5 GB of commit per week at a 10 s
@@ -346,8 +420,12 @@ Two structural separators, and only two, because a PV name may contain spaces:
 | `parse_command(text)` → `ParsedCommand` | verb, items, options. Raises `CommandError` with a human message |
 | `parse_time_spec(spec, now_ns, tz)` → `TimeRange` | `12h` / `90m` / `2d` / bare hours, `7-18`, `22-6` (crosses midnight), `today`, `yesterday`, `yesterday 7-18`, `15.8. 7-18`, `2026-08-15`, **and a range between two points: `1.1. 9:00 - 1.9. 12:00`, `1.1. - 1.9.`, `yesterday 21:00 - now`**. A window running past now is cut off and the reply says `(so far)`; a bare `15.8.` means the most recent 15 August |
 | `parse_yaxis_spec(spec)` | `y 15-35` / `y auto` |
-| `parse_plot_options(options, now_ns, …)` → `PlotOptions` | the `/plot` option list, including `detail` |
-| `mention_help(bot_name)` | the tag reminder at the top of `/help` |
+| `parse_plot_options(options, now_ns, …)` → `PlotOptions` | the `/plot` option list, including `detail` and `dpi` |
+| `parse_dpi_spec(spec)` → `int | None` | `300dpi` / `300 dpi` / `dpi 300`, range `DPI_MIN…DPI_MAX` (50–1200). Tried **before** the time parser: a bare number there is a window in hours, so `300dpi` must not reach it |
+| `split_query` / `tokens_in_order` / `rank_pv_match` / `search_pvs(pvs, q)` | PV name matching — tokens, AND, ranked; a fragment is a filter, not an error (see below) |
+| `LIMIT_FIELDS` / `limit_rows(pv)` / `parse_limit_field` / `parse_change_answer` / `looks_like_answer` / `check_limit_order` | the `/change` listing and its answers — see below |
+| `bot_tag(bot_name)` / `mention_help(bot_name)` / `mention_help_full(bot_name)` | the two-sentence tag reminder at the top of `/help`, and the `/help mention` page. Built rather than constant, because they have to carry the bot's real name |
+| `COMMAND_HELP` + `help_topic(name)` / `command_help(name)` / `help_topics()` / `is_mention_topic(name)` | the long help for one command, behind `/help plot`. Aliases (`dpi`, `alerts`, `abort`, `y`, `watchdog`, `limits`, `times`, …) map onto the fifteen pages; `/food` and `mention` are deliberately absent from the dict, the first so `okbase_menu.FOOD_HELP` stays the single copy, the second because its page needs the bot name. `monitor_tab._cmd_help_topic` is the seam that hands both over and answers an unknown topic with the list |
 
 ### The two-endpoint range
 
@@ -375,11 +453,79 @@ Three rules worth knowing:
 Refused: a range that ends before it starts (never silently rolled forward a day the way
 a clock window is), one entirely in the future, and anything over three years.
 
-PV names are matched loosely — any unique part of the display name or the PV name,
-case-insensitive; an ambiguous or unknown name is reported and nothing is sent.
+### PV name matching — a fragment is a filter
+
+`split_query` / `tokens_in_order` / `rank_pv_match` / `search_pvs` are the house PV
+search rules (the Image Slider's `cpva_client` is the reference, copied here because
+Diagnostic does not import it): words separated by spaces, commas or `*` are tokens,
+AND-matched anywhere in the display name or the PV name, ranked exact → field →
+prefix → inside-field → anywhere, with the typed word order breaking ties.
+
+`monitor_tab._find_pvs` wraps it (an exact name still wins alone) and
+`_resolve_pvs(items, expand=True)` turns each comma-separated item into **every** PV
+it matches, order kept, duplicates dropped. So `/list plfe`, `/status plfe` and
+`/alarms plfe` answer about the whole PLFE group and say how many of the configured
+PVs that is; before 16 Sep 2026 `/list` ignored its argument and answered with all
+31 PVs, and `/status plfe` answered `'plfe' is ambiguous`. Only a fragment matching
+**nothing** is an error. `_find_pv` (single) is kept for `/graph`, which can show one
+PV or all of them, and it lists the candidates when it is handed a group.
 
 The mention Webex writes into the text is stripped in `monitor_tab._on_commands`
-before parsing.
+before parsing — by slicing at the first `/` for a command, and by
+`_strip_mention` for a `/change` answer, which has no slash to slice at.
+
+### /help is one line per command
+
+The cheat sheet is read on a phone standing at the machine, so `_cmd_help` gives each
+command **one line**: what it takes, and the single condition that would otherwise
+catch somebody out. It had grown to several screens twice — the full catalogue of time
+windows, six lines on `/plot`, and forty on ordering lunch — and both times the fix was
+the same: move it to the `/help <command>` page that already exists for it. The time
+windows are now `/help time` (`_HELP_TIME`), tagging is `/help mention`, and ordering
+lunch is `okbase_menu.ORDER_HELP` reached through `/help food`, which `FOOD_HELP`
+already ends with. `testing/test_help_topics.py` holds the ceiling as a test
+(`HELP_MAX_CHARS`) and fails if `pin:` reappears in the cheat sheet.
+
+### Changing a limit from the chat — /change and /undo
+
+`/change` is the only command that asks a question and waits, and the only one that
+writes a monitoring rule.
+
+- **The listing.** `limit_rows(pv)` numbers the Global four (`alarm_low`, `warn_low`,
+  `warn_high`, `alarm_high`, in number-line order, the same order the Thresholds editor
+  shows its columns in) and then four per entry of `pv.profiles`. So a chiller with a
+  rule per shot rate has twelve. `monitor_tab._change_listing` renders them, marking the
+  one in force with `_match_profile` / `_limits_label` and printing the current value
+  above, so a wrong number is visible before it is typed.
+- **The session.** `MonitorWidget._change_pending` maps sender e-mail → `_ChangeSession`
+  (PV name, the rows **as printed**, when). The rows are kept rather than recomputed so
+  an edit made in the window meanwhile cannot silently retarget a number. No timer, no
+  thread, nothing on disk; it expires after `CHANGE_SESSION_TTL_S` (15 min), is dropped
+  by `/cancel` and replaced by the next `/change`. Deliberately **not** dropped by other
+  commands — looking the value up with `/status` before answering is normal.
+- **The mention trap.** A bare `6 15` in a room never reaches the bot at all, so the
+  listing spells the tag out and offers `/change 6 15`, which is an ordinary command and
+  always arrives. `_on_commands` resolves the sender and the allowlist **before** it
+  decides what a slash-less line is, then asks `_is_change_answer`; that needs both a
+  live question from that sender and a line `parse_change_answer` accepts, which is what
+  keeps ordinary conversation out of the limits.
+- **Validation the window does not do.** `check_limit_order` refuses a value that would
+  put the four bounds out of order, judging the whole answer at once so a two-bound line
+  is legal together or not at all; nothing is written on a refusal. A bound outside
+  `valid_min…valid_max`, one the value is already the wrong side of, and a cleared bound
+  are said out loud but applied — the operator may well mean them.
+- **Writing.** `_limit_set` puts the one number straight onto the `PVConfig` or the
+  profile dict, deliberately **not** through `ThresholdsEditor.apply_to`, which rebuilds
+  the whole profile list out of table cells. Then `model.refresh_all()` and `persist()`,
+  like `/enable`. Everything runs on the GUI thread, so there is nothing to lock.
+- **Alerting.** Nothing touches `PVRuntime`: `_check_limits_change` keys the grace on the
+  four numbers, so a chat edit gets the same 20-minute hold a rule switch does, and an
+  alarm nobody was told about is cleared, for free.
+- **`/undo`** keeps one step in `_change_undo` (in memory, gone on restart) and puts the
+  previous numbers back through the same path.
+
+Not answered by `remote_launcher.py`: the standalone listener never reads the PV list,
+so `/change` only works while the app is open.
 
 ---
 
@@ -401,7 +547,7 @@ channels over 180 days**. The same question now takes about four.
 | `plan_span_for(probe, …)` | the same, but from a `RateProbe`, so **"measured zero" and "could not measure" are told apart**. A quiet channel that answered still gets whole-day requests; a channel nothing could be learned about gets the 1 h span that is safe for anything |
 | `_MemoryGuard` | asked before every request whether the read may go on: the caller's own cancel switch, plus this program's committed memory against `MEM_OWN_CEILING_BYTES` (4 GB) and the PC's against `MEM_PC_CEILING_PCT` (92 %). Latches — a read abandoned for memory never resumes — and sets `report.stopped_low_memory`, which `describe_fetch` turns into words |
 | `plan_tasks(…)` | full coverage when it fits the request budget (600), everything when `detail` is set, otherwise one span-long stretch out of each of ~300 evenly spread buckets. The stretch touching the end of the window is always asked for **first** — the freshness stamp reads the newest reading, and a channel that is perfectly up to date must not be stamped `NOT CURRENT` because its last request happened to be scheduled last |
-| `_BinReducer` | folds each answer into ~900 points (one per pixel) — count, sum, min, max, and the summed reading time — **in the thread that received it**, then drops it. A 60 000-reading answer is ~20 MB of dictionaries; collecting them all first is what runs the machine out of memory. `numpy` throughout: 98 000 readings condense in 0.03 s |
+| `_BinReducer` | folds each answer into ~900 points along the curve (kept at 900 when the picture went to 220 dpi) — count, sum, min, max, and the summed reading time — **in the thread that received it**, then drops it. A 60 000-reading answer is ~20 MB of dictionaries; collecting them all first is what runs the machine out of memory. `numpy` throughout: 98 000 readings condense in 0.03 s |
 | `describe_fetch(…)` | the words for the chat reply and the stamp for the picture |
 
 ### The 24 GB plot, and the three limits that came out of it
@@ -687,6 +833,70 @@ So presence is no longer read as liveness:
 
 `testing/test_stale_sso_cookie.py` holds all of it offline — no browser, no
 network.
+
+#### "Don't know" is not "yes" — the blank window (2026-09-16)
+
+The fix above was right about *what* to ask and wrong about *where* to ask it,
+and the wrong half produced a worse symptom than the bug it replaced: the button
+put up a window with **nothing in it**, the window vanished in a blink, and
+behind it came *"Could not read the menu: the saved OKbase session has expired —
+sign in again"*. Every press, with Edge open and with Edge closed.
+
+The chain, end to end:
+
+1. the profile still holds yesterday's `_shibsession_…`, so the first cookie
+   look — one second after the window opens — finds a sign-on cookie;
+2. it is put to `session_alive`, which asks **from inside the window**. At one
+   second old that window is on `about:blank`: the browser refuses a request to
+   the portal from a blank page before it ever leaves the PC;
+3. a refusal reads as `error:TypeError`, which is `unknown`, and `unknown` was
+   **taken as a yes**;
+4. so yesterday's cookie was handed back as a completed sign-in and the window
+   was closed — before it had painted anything, which is the "blank window";
+5. the menu read that follows did the real thing, the portal refused, and the
+   operator got "expired — sign in again" from the very button that exists to
+   fix that. No number of presses could get out of it, because every press
+   repeated step 2 at the same one second.
+
+Three changes, all in `edge_cdp.py`:
+
+- **`cookie_state(line)` asks the portal from HERE**, through
+  `okbase_menu.session_from_cookie` — same cookies, same revive attempt, same
+  verdict the canteen menu itself will reach minutes later. It does not depend
+  on what page the window is on, and it fixes a second flaw of the in-page
+  check: the page asks one address, while `okbase_menu` uses the sign-on cookie
+  to mint a NEW session when the session id has merely timed out
+  (`REVIVE_PATHS`). A good sign-on with a stale session id looked *dead* from
+  the page, which cost a Microsoft prompt for nothing.
+- **`unknown` no longer means yes.** While nothing can decide, the window stays
+  open and the walk carries on (`inherited_state`, `CHECK_EVERY_S`). The
+  operator sees "checking the saved sign-in with OKbase…" instead of a window
+  that flashes past. `session_alive` is kept as the second opinion and is asked
+  **only while the tab is actually on the portal**, where the question means
+  something — the browser may have a route this program has not.
+- **`UNDECIDED_GRACE_S` (15 s) bounds that wait.** When nothing at all can
+  decide, it is the *portal* that is not answering, and that is no reason to put
+  a person through a fresh prompt — so the old cookie is handed back, and the
+  read that follows says "the portal did not answer", which the Settings dialog
+  already reports as a verdict on nothing. `CHECK_TIMEOUT_S` is 8 s rather than
+  the portal's usual 20: this runs with a window on screen.
+
+`testing/test_signin_undecided.py` holds the whole story offline, including the
+one line that matters most — an undecided check must not close the window.
+
+Measured against the live portal on 2026-09-16, and worth knowing before anyone
+optimises the inherited-cookie path again: **the profile never keeps the sign-on
+cookie the walk mints.** Three runs in a row all started from the *same*
+long-dead cookie (fingerprinted, never printed) and each ended with a different
+fresh one — `_shibsession_…` is a session cookie and the browser is killed with
+`Browser.close`, so it is never written out, while the stale one from whichever
+day it was persisted survives every `forget_site`. So in practice every press
+pays the ~1.5 s check, says "the saved sign-in is no longer valid", and does a
+real sign-in — which is silent and takes about five seconds, because Microsoft's
+cookies ARE kept. End to end on the same day: window to menu on screen, five
+days read, no clicks. The inherited-cookie path is therefore nearly dead code on
+this PC; it is kept because it costs one cheap question and it is the thing that
+made the two earlier faults, so it must stay correct.
 
 ### Two kinds of failure, and why they must never share a message
 
@@ -1221,7 +1431,7 @@ silently decrypts to an empty string and alerting stops working with no error.
 ## Tests (offline, no network)
 
 ```
-python test_alerting.py         the alerting layer incl. detect_frozen
+python test_alerting.py         the alerting layer
 python test_monitor_frozen.py   the two "not live" checks as the tab uses them:
                                 "not updating" (verdict, one-shot notification,
                                 table rendering) and the refresh watchdog
@@ -1232,7 +1442,74 @@ python -m pytest test_rule_change_grace.py
                                 it opens, what it does to a half-built alert
                                 state, what the table and the bot say meanwhile,
                                 and the 31.08. chiller evening as a regression
+python -m pytest testing/test_history_buffer.py
+                                `_SampleHistory`: the 60 s/30 s overlap dropped,
+                                an out-of-order batch sorted, both bounds (time
+                                and the per-PV cap) cutting the OLDEST, `arrays()`
+                                returning views rather than copies, growth by
+                                doubling, and `prepend_samples` reducing the older
+                                block while the live tail is untouched. Also that
+                                a plain `deque` — including the newest-first shape
+                                two fixtures use — still works
+python -m pytest testing/test_history_envelope.py
+                                `_envelope` over `fixture_chiller_dips.json`
+                                (seven real hours of the Utility Chiller): all
+                                three one-reading dips to 10 °C survive, the times
+                                stay ordered, the series ends on the newest
+                                reading. The last test is the control — the same
+                                data through the thinning this replaced, showing
+                                the dips are simply absent
+python -m pytest testing/test_poll_raw_samples.py
+                                the poll's two halves: the average handed to the
+                                thresholds is bit-for-bit what it always was
+                                (including the 19.2 the operator saw), while every
+                                in-range reading now also reaches the graph. Plus
+                                the widened window after a skipped pass, which may
+                                change nothing the thresholds see
+python -m pytest testing/test_backfill_memory.py
+                                `_BackfillWorker` over 12 h × 31 PVs (~2.5 M
+                                readings) through a stand-in archiver: every
+                                answer weak-referenced and proved released, the
+                                per-PV cap held, a dip surviving, and the three
+                                awkward asks — a refused plan, a tripped memory
+                                guard and one unreadable PV — each reporting back
+                                instead of wedging the caller's in-flight flag
 python test_bot_commands.py     the chat command grammar
+python testing/test_help_topics.py
+                                `/help plot`: that EVERY command has a page (a
+                                new command without one fails here), that the
+                                /plot page still carries its traps, that the
+                                words people type reach the right page, and that
+                                an unknown topic answers with the list. Also
+                                that the cheat sheet itself stays under its
+                                length ceiling, keeps one line per command, and
+                                never grows the lunch-ordering section back
+python testing/test_change_limits.py
+                                moving a limit from the chat: the numbered
+                                listing (Global then every rule, the one in
+                                force marked), every spelling of an answer
+                                ("6 15", "limit 6 hodnota 15", "warn high 25",
+                                "3,3 Hz warn high 14.6" - the comma in the rule
+                                name must not split the line), that ordinary
+                                conversation is never taken for an answer, the
+                                order check the window's own editor lacks,
+                                two people changing different PVs at once, the
+                                question going stale, /undo, and that the change
+                                opens the same alerting hold a rule switch does
+python testing/test_plot_dpi.py
+                                the `; 300dpi` option, that a bare number there
+                                is still a window in hours, the PNG really
+                                coming out at that pixel size, and 0 / 20000 dpi
+                                being clamped before matplotlib sees them
+python testing/test_pv_filter.py
+                                asking about a GROUP of PVs: the matcher
+                                (tokens, AND, any order, the PV name counts
+                                too) and the replies — /list plfe is the four
+                                PLFE pressures and says "4 of 9", /status plfe
+                                is no longer an "ambiguous" complaint, /alarms
+                                plfe is scoped to that group and says so when
+                                alerting is off for all of it, and /graph still
+                                insists on one PV
 python test_okbase_menu.py      the canteen menu, pinned against a live
                                 capture: the real payload and its three
                                 traps, splitting the two languages out of
@@ -1298,6 +1575,17 @@ python -m pytest testing/test_stale_sso_cookie.py
                                 nothing, a cookie minted during the walk is not
                                 second-guessed, and Microsoft's cookies survive
                                 the clear-out
+python -m pytest testing/test_signin_undecided.py
+                                that a check which has not ANSWERED yet is
+                                never read as a sign-in (the blank window that
+                                closed itself and left "the session has
+                                expired" behind it): the portal is asked from
+                                here through okbase_menu, so the revive counts
+                                and the window's page does not matter; a late
+                                answer is still used; the page is asked only
+                                while it is on the portal; and a portal nothing
+                                can reach hands the old cookie back rather than
+                                demanding a new prompt
 python testing/test_cancel_plot.py
                                 /cancel: the chunks still queued are never
                                 fetched, a cancelled fetch answers with

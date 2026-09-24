@@ -24,6 +24,14 @@ What is checked here:
       nm for a spectrometer — and drives the axis title, the readout, the
       Peak/FWHM labels and the exported column names,
     * typing a unit overrides the guess and survives a save/load,
+    * a typed unit belongs to ONE channel: it is stored with the channel it was
+      typed for, it is ignored on any other, and a unit saved by an older build
+      (which recorded no channel) is ignored altogether — that stale "nm" is
+      what made the panel call a femtosecond axis "Wavelength [nm]",
+    * merely clicking through the Unit box writes no override, so the displayed
+      unit cannot freeze itself in,
+    * a wavelength unit on an axis running through zero is called out in the
+      status line and in the CSV, without the label being silently rewritten,
     * with no axis at all nothing claims a unit.
 
 Renders testing/_out/x_axis_truncated.png so the axis can be looked at.
@@ -270,8 +278,10 @@ def test_units(w):
     QApplication.processEvents()
     _ok(w._x_unit() == "ps", "a typed unit overrides the guess", w._x_unit())
     _ok(w._x_title() == "Time [ps]", "and reaches the axis title", w._x_title())
-    _ok("range [ps]" in w._g_xrange.title(),
-        "and the From/To group title", w._g_xrange.title())
+    # The From/To caption is no longer a QGroupBox title but the _sub_label
+    # _lbl_xrange, which upper-cases what it is given.
+    _ok("RANGE [PS]" in w._lbl_xrange.text(),
+        "and the From/To caption", w._lbl_xrange.text())
     _ok(w._x_axis_cfg.get("unit") == "ps",
         "it is stored in the axis config, so it is saved with the PV")
 
@@ -279,6 +289,98 @@ def test_units(w):
     w._on_x_unit_edited()
     QApplication.processEvents()
     _ok(w._x_unit() == "fs", "clearing it goes back to the guess", w._x_unit())
+
+
+def test_unit_follows_the_channel(w):
+    """A typed unit belongs to ONE channel and may not outlive it.
+
+    This is the bug reported on 2026-09-24: %APPDATA%\\ELI_Spectra\\spec_pvs.json
+    held {"base": "…TimeDomain_Int", "x_axis": {"mode": "native", "unit": "nm"}}
+    and the graph called a femtosecond axis "Wavelength [nm]" for weeks."""
+    print("\ntest_unit_follows_the_channel")
+
+    # Exactly the file that was on the machine: a wavelength unit saved with no
+    # record of the channel it was typed for.
+    w._x_axis_cfg = {"mode": "native", "unit": "nm"}
+    _ok(w._x_unit() == "fs",
+        "a unit saved by an older build does not outlive its channel",
+        w._x_unit())
+    _ok(w._x_title() == "Time [fs]", "the graph names the right quantity",
+        w._x_title())
+    _ok(not w._x_unit_is_manual(), "and it counts as automatic, not typed")
+
+    # The same unit, stamped with THIS channel, is the operator's word and wins.
+    w._x_axis_cfg = {"mode": "native", "unit": "nm",
+                     "unit_for": "L3-SBDP-SPIDER:TimeDomain_Int"}
+    _ok(w._x_unit() == "nm", "a unit typed for this channel is honoured",
+        w._x_unit())
+    _ok(w._x_unit_is_manual(), "and it knows it was typed")
+
+    # …but it does not follow the operator onto the next channel.
+    w._spec_base_pv = "L3-SBDP-SPIDER:SpecDomain_Int"
+    w._spec_x_pv = w._spec_base_pv + "_X"
+    _ok(w._x_unit() == "nm", "SpecDomain is nm in its own right", w._x_unit())
+    w._spec_base_pv = "L3-SBDP-SPIDER:TimeDomain_FL"
+    w._spec_x_pv = w._spec_base_pv + "_X"
+    _ok(w._x_unit() == "fs",
+        "another time-domain channel does not inherit the typed nm",
+        w._x_unit())
+
+    # Focus-out must not freeze the shown unit in. editingFinished fires on
+    # every focus change, and this is how the stale "nm" was written.
+    w._spec_base_pv = "L3-SBDP-SPIDER:TimeDomain_Int"
+    w._spec_x_pv = w._spec_base_pv + "_X"
+    w._x_axis_cfg = {"mode": "native"}
+    w._edit_x_unit.setText(w._x_unit())          # "fs", as the box shows it
+    w._on_x_unit_edited()                        # as if the box lost focus
+    QApplication.processEvents()
+    _ok("unit" not in w._x_axis_cfg,
+        "clicking through the box writes no override", str(w._x_axis_cfg))
+    _ok(w._x_unit() == "fs", "and the unit is still the guessed one",
+        w._x_unit())
+
+    # A real override still saves, and now carries its channel with it.
+    w._edit_x_unit.setText("ps")
+    w._on_x_unit_edited()
+    QApplication.processEvents()
+    _ok(w._x_axis_cfg.get("unit") == "ps"
+        and w._x_axis_cfg.get("unit_for") == "L3-SBDP-SPIDER:TimeDomain_Int",
+        "a typed unit is stored together with its channel", str(w._x_axis_cfg))
+    w._edit_x_unit.setText("")
+    w._on_x_unit_edited()
+    QApplication.processEvents()
+
+
+def test_unit_the_numbers_contradict(w):
+    """A wavelength cannot be negative, and the panel says so."""
+    print("\ntest_unit_the_numbers_contradict")
+    spider_x = sp_t._fit_x_axis(_stored_x(), N_FULL)
+    grating_x = np.linspace(594.08, 1295.1, 2048)
+
+    _ok(sp_t._x_unit_impossible(spider_x, "nm") != "",
+        "a -3749 … +3745 axis cannot be in nanometres")
+    _ok(sp_t._x_unit_impossible(grating_x, "nm") == "",
+        "a 594 … 1295 axis can, and is left alone")
+    _ok(sp_t._x_unit_impossible(spider_x, "fs") == "",
+        "the same axis in fs is fine — only wavelengths are checked")
+    _ok(sp_t._x_unit_impossible(None, "nm") == "",
+        "no axis, no complaint")
+
+    # Through the panel: only a HAND-TYPED unit can be contradicted, because the
+    # guessed one comes from the channel name and is right by construction.
+    w._x_data = spider_x
+    w._regions = []
+    w._x_axis_cfg = {"mode": "native"}
+    _ok(w._x_unit_note() == "", "the automatic unit is never second-guessed")
+    w._x_axis_cfg = {"mode": "native", "unit": "nm",
+                     "unit_for": "L3-SBDP-SPIDER:TimeDomain_Int"}
+    note = w._x_unit_note()
+    _ok(note != "" and "cannot be negative" in note,
+        "a typed nm on a femtosecond axis is called out", note)
+    _ok(w._x_title() == "Wavelength [nm]",
+        "and the label is NOT changed behind the operator's back",
+        w._x_title())
+    w._x_axis_cfg = {"mode": "native"}
 
 
 def test_no_axis_at_all(w):
@@ -306,6 +408,8 @@ def main():
     test_panel_uses_it(w)
     test_csv(w, os.path.join(OUT, "x_axis_truncated.csv"))
     test_units(w)
+    test_unit_follows_the_channel(w)
+    test_unit_the_numbers_contradict(w)
     test_no_axis_at_all(w)
     print("\nFAILURES PRESENT" if _failed else "\nall good")
     return 1 if _failed else 0

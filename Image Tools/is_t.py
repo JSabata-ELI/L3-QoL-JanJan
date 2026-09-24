@@ -236,14 +236,22 @@ PROXY_HOLD_MAX   = 25       # consecutive holds tolerated for an in-flight displ
                             # _inflight key can never park the preview forever
 PROXY_REFINE_MS  = 200      # settle time before the full-quality re-render
 PROXY_TOPUP_MS   = 2000     # debounce for extending the preview after a refresh
-HOLD_STEP_RATES  = (2, 3, 4, 5)   # frames per second while a frame arrow is HELD DOWN, one
-                            # rung per whole second held (see _hold_step_tick). The press always
+HOLD_STEP_RAMP   = ((0.0, 2), (1.0, 3), (2.0, 4), (3.0, 5), (5.0, 8), (8.0, 10))
+                            # (seconds held, frames per second) while a frame arrow is HELD
+                            # DOWN — the rung in force is the LAST entry whose time has
+                            # passed (see _hold_rate / _hold_step_tick). The press always
                             # moves exactly one frame, so a plain click is unchanged and the
                             # first repeat only arrives 1/2 s later — that half second is
                             # what separates a click from a hold, with no separate delay to
-                            # tune. Capped at 5/s on purpose: every step is a share read per
-                            # camera (130-160 ms each, see _proxy_try_paint_cam), so a faster
-                            # ramp would only queue reads the user has already scrolled past.
+                            # tune. One rung a second up to 5/s, then it opens up: 8/s after
+                            # two more seconds of holding and 10/s three seconds after that,
+                            # for crossing a long stretch of the day. The fast rungs are
+                            # deliberately at the END of a long hold: every step is a share
+                            # read per camera (130-160 ms each, see _proxy_try_paint_cam), so
+                            # 10/s outruns the reads and only the frames that arrive in time
+                            # are painted — which is what "hold it down to get there" wants,
+                            # and is not what the first second of a hold should do.
+HOLD_STEP_RATES  = tuple(r for _, r in HOLD_STEP_RAMP)   # the rungs alone, for the tests
 HQ_SETTLE_MS     = 500      # stillness required before multi-cam TILES are re-rendered at
                             # native resolution. A second, slower tier on top of
                             # PROXY_REFINE_MS rather than a re-tune of it: the 200 ms refine
@@ -318,6 +326,34 @@ import json
 import threading
 
 CPVA_HTTP_TIMEOUT = 8.0
+
+
+#  The scroll bars. The plain ones are a pale grey sliver on a pale grey panel —
+#  there is nothing to see and little to grab. This one, the same as Workshop's,
+#  has a track that is visibly a track, a handle dark enough to read against it at
+#  a glance, and no end arrows, which are two more tiny targets nobody uses.
+_SCROLLBAR_QSS = (
+    "QScrollBar:vertical { background: #d8dce2; width: 16px; margin: 0px;"
+    " border: none; }"
+    "QScrollBar::handle:vertical { background: #6c7580; min-height: 28px;"
+    " border-radius: 4px; margin: 2px; }"
+    "QScrollBar::handle:vertical:hover { background: #4a5566; }"
+    "QScrollBar::handle:vertical:pressed { background: #2f3a49; }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px;"
+    " background: none; border: none; }"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+    " { background: none; }"
+    "QScrollBar:horizontal { background: #d8dce2; height: 16px; margin: 0px;"
+    " border: none; }"
+    "QScrollBar::handle:horizontal { background: #6c7580; min-width: 28px;"
+    " border-radius: 4px; margin: 2px; }"
+    "QScrollBar::handle:horizontal:hover { background: #4a5566; }"
+    "QScrollBar::handle:horizontal:pressed { background: #2f3a49; }"
+    "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal"
+    " { width: 0px; background: none; border: none; }"
+    "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal"
+    " { background: none; }"
+)
 
 
 def _import_cpva_client():
@@ -1021,6 +1057,11 @@ def pv_eval_derived(names: "list[str]", raw: dict, statuses: dict) -> dict:
                 s = sts.get(src, "ok")
                 if s == "stale":
                     worst = "stale"
+                elif s == "far" and worst in ("ok", "approx"):
+                    # One source read from another moment makes the whole formula a
+                    # reading from another moment. Ranked above "approx" (an uncertain
+                    # pairing) and below "stale" (a value from an older FETCH).
+                    worst = "far"
                 elif s == "approx" and worst == "ok":
                     worst = "approx"
             if not ok:
@@ -1083,14 +1124,25 @@ PV_FETCH_MAX_WORKERS = 4
 # interval is coalesced into one trailing catch-up, so a single shot after a quiet
 # stretch is still answered immediately and only a continuous stream is paced.
 #
-# 0.5 s, not the shot period: at 3.3 Hz the archiver's ~1 s publication delay means
-# the newest frame has no values yet however fast we ask, so a per-shot refresh only
-# bought three round-trips a second — for every energy channel, for as long as the
-# laser runs — and never produced a fresher number than this does. The operator's own
-# bound was "once a second is fine". The panel still cannot fall behind: the fetch is
-# single-flight with a dirty flag (_pv_trigger_fetch_now / _pv_on_result), so requests
-# coalesce instead of queueing, and the newest frame is always the one asked about.
-PV_REFRESH_MIN_INTERVAL_S = 0.5
+# 0.25 s. It was 0.5 s, on the reasoning that the archiver was a second late anyway so
+# asking sooner could not produce a fresher number. That reasoning expired: the
+# archiver now publishes within ~0.1 s (see the measurement further down), and the
+# gate had become the single biggest item in the delay between a picture and its
+# numbers — measured with testing/bench_pv_latency.py at the real publication lag:
+#
+#     0.5 s gate   picture -> number  p50 351 ms
+#     0.25 s gate  picture -> number  p50 234 ms   same 2.7 requests per shot
+#
+# The request count per shot is unchanged at an ordinary cadence because the gate only
+# bites when triggers arrive faster than it; what does cost more is a 3.3 Hz live run,
+# where the panel goes from ~4 to ~8 fetches a second (bench_pv_live_multi.py prints
+# both). That is the trade, and it is deliberate: the operator's complaint was that the
+# number arrives after the picture.
+#
+# The panel still cannot fall behind: the fetch is single-flight with a dirty flag
+# (_pv_trigger_fetch_now / _pv_on_result), so requests coalesce instead of queueing,
+# and the newest frame is always the one asked about.
+PV_REFRESH_MIN_INTERVAL_S = 0.25
 
 # How far the displayed values may lag the displayed frame before the panel admits
 # it (grey text, "⟳" on the overlay). A refresh cannot be instant — the archiver
@@ -1116,12 +1168,55 @@ PV_PENDING_GRACE_NS = 1_000_000_000
 _PV_WINDOW_NS: int = 300_000_000          # 0.3 s
 _PV_PREFER: str = "nearest"               # NOT "before" — see cpva.lookup_near
 
-# ── the archiver publishes LATE, and that is why the panel trailed the picture ──
-# A sample becomes READABLE through the CPVA API about a second after it was taken.
-# Measured 2026-08-14 (95 samples on PTM1, polled 4×/s, every observation stamped with
-# the SERVER's own clock via the HTTP Date header): p50 ≈ 0.9 s, and the spread runs
-# from roughly 0.2 s to 2.5 s. An image, by contrast, is on the share within ~0.02 s of
-# its own timestamp (file mtime - filename ts, last frames of C03-014-PFM4NF).
+# ── when the channel is archived MORE SLOWLY than the camera stores frames ─────
+# The window above assumes a reading per shot. Measured 16.09.2026 on a real run
+# (C03-013-PFM1NF, 15:26-15:33): 1200 frames at 3.3 Hz, but PTM1/SBW4/Back_Ref were
+# archived once every 5.0 s — so 93 % of the stored frames had no reading of their own
+# and the panel said "n/a", while the nearest reading sat 2 s away and was the only
+# candidate for kilometres. PTM1's own rate over that day ran from 1.15/s overnight to
+# 0.01/s at midday, so this is not a one-off either.
+#
+# So: when nothing is inside the strict window, the nearest reading IS shown — always
+# labelled with how far off it is (" (+2.5 s)"), never as this frame's own number.
+#
+# How far is "near" is measured off THE CHANNEL'S OWN samples around this frame (half
+# its median gap), never from a constant. The day the energies arrive at 3.3 Hz like
+# the frames do, half their median gap is 0.15 s — smaller than the strict window — and
+# this rule switches itself off with no edit. That is the whole reason it measures.
+#
+# The cap is what keeps a quiet stretch from being dressed up as data: past it (the
+# laser stopped, the channel stopped archiving) there is no reading to show and the
+# panel says "n/a" with the reason in the tooltip.
+PV_NEAR_MAX_GAP_S = 60.0
+# How many samples on each side of the frame the cadence is measured over. Local, not
+# per day: the rate changes by two orders of magnitude between night and midday, and a
+# day-wide median would describe neither.
+_PV_CADENCE_SPAN = 25
+
+# ── how late the archiver is, and how late WE are ─────────────────────────────
+# RE-MEASURED 17.09.2026 (testing/probe_publish_delay.py, polling 10×/s, the clock
+# offset taken from the server's own HTTP Date header at the moment it ticks):
+#
+#     PTM1 energy          12 samples   publication delay p50 -0.10 s
+#     chiller temperature  34 samples   publication delay p50 -0.15 s
+#
+# i.e. a sample is readable through the API as soon as it is stamped — the delay is
+# below the ±0.2 s this method can resolve. The ~0.9 s measured on 2026-08-14 no
+# longer holds, and every constant that was tuned around "the archiver is a second
+# late" was therefore tuned around something that is no longer true.
+#
+# What is left is OUR OWN delay, measured end to end by testing/bench_pv_latency.py
+# with the publication lag set to the value above:
+#
+#     picture -> number   p50 351 ms   with the old 0.5 s refresh gate
+#     picture -> number   p50 234 ms   with the 0.25 s gate below
+#
+# The number now lands about a fifth of a second after the picture it belongs to, at
+# the same request count per shot (2.7) for an ordinary 5 s cadence. An image, for
+# comparison, is on the share within ~0.02 s of its own timestamp (file mtime -
+# filename ts, last frames of C03-014-PFM4NF), and the live poll then takes up to
+# ONLINE_POLL_MIN_INTERVAL_S to notice it plus a share read to paint it — so the
+# PICTURE is now the slower half of the pair, not the number.
 #
 # That asymmetry is the whole bug. The panel fires its fetch on the LEADING edge of a
 # frame change, i.e. a few ms after the image lands, and asks for a ±0.3 s window
@@ -1140,22 +1235,24 @@ _PV_PREFER: str = "nearest"               # NOT "before" — see cpva.lookup_nea
 # What this module now does: an unpublished value is reported as "pending" rather than
 # "n/a", the panel keeps re-asking until it lands (usually the first retry), and a held
 # number says how far back it comes from instead of a quiet " (old)".
-PV_ARCHIVER_RETRY_MS_MIN = 400
+# 120 ms, not the old 400: the sample is now readable within ~0.1 s of the shot, so a
+# 400 ms first retry spent three tenths of a second waiting for something that was
+# already there. It costs nothing at an ordinary cadence — the retry only runs while a
+# value is genuinely outstanding, and at 5 s between shots that is one or two extra
+# tail queries of ~8 ms each.
+PV_ARCHIVER_RETRY_MS_MIN = 120
 PV_ARCHIVER_RETRY_MS_MAX = 2000
 # For this long after a frame starts waiting, the retry keeps asking at the MINIMUM
-# interval instead of doubling. The publication delay is ~1 s and the ladder used to
-# double straight through it: measured with testing/bench_pv_latency.py, the sample
-# became readable 80 ms after the 400 ms retry and the next rung was 800 ms further on,
-# so the number appeared ~730 ms after the archiver had it — on every single shot, at
-# every cadence an operator watches one shot at a time.
+# interval instead of doubling. The ladder used to double straight through the
+# publication delay: measured with testing/bench_pv_latency.py, the sample became
+# readable 80 ms after the 400 ms retry and the next rung was 800 ms further on, so the
+# number appeared ~730 ms after the archiver had it — on every single shot, at every
+# cadence an operator watches one shot at a time.
 #
 # Inside the window where the answer is genuinely expected, asking again at a steady
-# 400 ms is the whole point of waiting; the doubling belongs after it, where the question
-# has stopped being "is it published yet" and become "is anything ever coming". The
-# interval is deliberately still PV_ARCHIVER_RETRY_MS_MIN and not shorter: 400 ms keeps
-# the panel's whole fetch rate inside the pacing the refresh gate was built to hold
-# (bench_pv_live_multi.py measures exactly that), and a shorter one bought ~300 ms at the
-# price of two thirds more requests on a shared archiver.
+# short interval is the whole point of waiting; the doubling belongs after it, where the
+# question has stopped being "is it published yet" and become "is anything ever
+# coming".
 PV_ARCHIVER_FINE_WAIT_S = 2.5
 # Above ~1 shot/s the frame on screen is ALWAYS younger than the publication delay, so
 # waiting for its own values would leave the panel on "wait" for a whole run. Instead the
@@ -1219,9 +1316,87 @@ _CAM_FAULT_SHORT = {
 }
 
 
+def _pv_own_window_ns(ts_list: "list[int] | None", ts_ns: int) -> int:
+    """How far a reading may sit from THIS frame and still be THIS frame's own, in ns.
+
+    Half the distance to the nearer neighbouring frame OF THE SAME CAMERA — the rule
+    "a reading belongs to the frame it is nearest to", which is the only definition
+    that cannot hand one reading to two frames. Floored at _PV_WINDOW_NS and capped at
+    PV_NEAR_MAX_GAP_S.
+
+    Why it is measured against the FRAMES and not against a constant: every camera is
+    triggered by the shot but stamps its file with its own small, constant lead or lag,
+    and the fixed ±0.3 s cut straight through the middle of that spread. Measured
+    16.09.2026, 15:00-16:00, all cameras storing one frame every 5.00 s against
+    PTM1 (testing/probe_cam_frame_offset.py):
+
+        PCM4NF   reading -0.164 s from the frame, spread 0.12 s → paired  92 %
+        PCM2NF   reading -0.366 s from the frame, spread 0.11 s → paired   5 %
+        PCW3NF   reading -0.512 s from the frame, spread 0.18 s → paired   0 %
+        PTM9NF   reading -0.393 s from the frame, spread 0.32 s → paired  20 %
+
+    Same shots, same channel, same cadence: the only difference is where the camera's
+    own timestamp falls, and a hard 0.3 s made three of those four cameras look like
+    "the archiver has no data". At 5 s between frames the claim window becomes 2.5 s,
+    which takes all of them, and the neighbouring shot is still 5 s away — unreachable.
+    On a free-running camera at 3.3 Hz it comes out at 0.15 s, below the floor, so
+    nothing is widened and a neighbour's reading can never be claimed. It needs no
+    per-camera calibration and no list to maintain, which is the point.
+    """
+    if not ts_list:
+        return _PV_WINDOW_NS
+    i = bisect.bisect_left(ts_list, int(ts_ns))
+    near = [abs(ts_list[j] - int(ts_ns)) for j in (i - 1, i, i + 1)
+            if 0 <= j < len(ts_list) and ts_list[j] != int(ts_ns)]
+    cap = int(PV_NEAR_MAX_GAP_S * 1e9)
+    if not near:
+        # A single frame says nothing about the camera's rate, and a wide claim
+        # invented from no evidence is exactly what this function exists to avoid.
+        # The nearest reading is still shown by the fallback below — labelled.
+        return _PV_WINDOW_NS
+    return max(_PV_WINDOW_NS, min(min(near) // 2, cap))
+
+
+def _pv_wide_window_ns(channel: str, ts_ns: int) -> int:
+    """How far from this frame a reading of `channel` may still be the only candidate,
+    in ns. 0 when the strict window is already the right answer.
+
+    Half the channel's own median sample gap around ts_ns, capped at
+    PV_NEAR_MAX_GAP_S. Cache only — the strict lookup that just ran has the day in
+    hand, so this costs a bisect and no network. Returns 0 when the day is not cached
+    or holds too few samples to measure a cadence: a guess here would be a number
+    invented about a channel nobody has measured.
+    """
+    try:
+        res = cpva.peek_day(channel, cpva.date_key_for_ns(ts_ns))
+    except Exception:
+        return 0
+    if res is None or len(res.ts_list or ()) < 4:
+        return 0
+    ts_list = res.ts_list
+    i = bisect.bisect_left(ts_list, int(ts_ns))
+    win = ts_list[max(0, i - _PV_CADENCE_SPAN):i + _PV_CADENCE_SPAN]
+    if len(win) < 4:
+        return 0
+    gaps = sorted(b - a for a, b in zip(win, win[1:]))
+    median_gap = gaps[len(gaps) // 2]
+    half = int(median_gap // 2)
+    if half <= _PV_WINDOW_NS:
+        # The channel is archived at least as densely as the frames — the strict
+        # window is the honest one and a wider one would pair a neighbouring shot.
+        return 0
+    return min(half, int(PV_NEAR_MAX_GAP_S * 1e9))
+
+
 def _pv_last_known_ex(channel: str, ts_ns: int,
-                      fresh: bool = False) -> "tuple[float | None, str]":
-    """Return (value for ts_ns, fetch status) using the shared lookup.
+                      fresh: bool = False, own_window_ns: "int | None" = None
+                      ) -> "tuple[float | None, str, int | None]":
+    """Return (value for ts_ns, fetch status, timestamp of the sample used).
+
+    `own_window_ns` is how far a reading may be and still be THIS frame's own — see
+    _pv_own_window_ns, which derives it from the camera's own frame spacing. The
+    caller passes it because only the caller knows which camera's timeline the frame
+    belongs to. Left out, the strict ±_PV_WINDOW_NS applies, as before.
 
     `fresh` skips today's cache TTL, so the archiver is really asked. Only the wait
     ladder sets it (see _pv_retry_fetch_now): that fetch exists BECAUSE a sample is
@@ -1242,26 +1417,77 @@ def _pv_last_known_ex(channel: str, ts_ns: int,
     (see the measured lag above). How long to keep asking is the CALLER's decision —
     it is the one that knows how long it has been waiting, and elapsed time here would
     have to come from the local clock, which is 25 s off the archiver's.
+    "far" → nothing inside the strict window, and the nearest reading of a channel
+    archived more slowly than the frames is returned instead (see _pv_wide_window_ns).
+    It is a real reading of a real moment, it is simply not this frame's, so the caller
+    must print the offset next to it.
+
+    The third element is the timestamp of the sample the value came from — None when
+    there is no value. It is what lets the panel say HOW far off the reading is
+    without guessing, and it is archiver-clock against archiver-clock, so the
+    workstation's 25 s skew cannot touch it.
     """
-    res = cpva.lookup_near(channel, int(ts_ns), window_ns=_PV_WINDOW_NS,
+    own = max(_PV_WINDOW_NS, int(own_window_ns or 0))
+    res = cpva.lookup_near(channel, int(ts_ns), window_ns=own,
                            prefer=_PV_PREFER,
                            pending_if_uncovered=True,
                            today_ttl=0.0 if fresh else _PV_TODAY_CACHE_TTL,
                            timeout=CPVA_HTTP_TIMEOUT)
+    is_step = cpva.is_step_channel(channel)
     if res.status == "pending":
-        return None, "pending"
+        return None, "pending", None
     if res.status in ("stale", "error"):
-        return res.value, res.status
+        return res.value, res.status, (None if is_step else res.ts_ns)
+    if res.value is None and res.status == "not_found" and not is_step:
+        # Nothing per-shot to be had. If this channel is simply archived more slowly
+        # than the camera stores frames, the nearest reading is the only candidate
+        # there is — show it, and let the caller label the offset.
+        wide = _pv_wide_window_ns(channel, ts_ns)
+        if wide > own:
+            near = cpva.lookup_near(channel, int(ts_ns), window_ns=wide,
+                                    prefer=_PV_PREFER,
+                                    pending_if_uncovered=False,
+                                    today_ttl=0.0 if fresh else _PV_TODAY_CACHE_TTL,
+                                    timeout=CPVA_HTTP_TIMEOUT)
+            if near.value is not None:
+                return near.value, "far", near.ts_ns
+        return None, "not_found", None
+    # A SETTING reports no sample timestamp at all. Its value between two changes is
+    # not an old reading of anything — it is what the machine was set to for this
+    # frame, and labelling the waveplate "(-40 min)" would say the opposite. Only
+    # measurements, which really are per-shot, carry the gap.
+    samp_ts = None if is_step else res.ts_ns
     # A quantized channel (the waveplate) caught mid-move: the value IS on the grid
     # now, but it is the nearest legal position rather than one the motor reported
     # holding, so it gets the same "~" as an uncertain energy pairing.
     if res.value is not None and not res.exact:
-        return res.value, "approx"
-    if (res.value is not None and res.ts_ns is not None
-            and not cpva.is_step_channel(channel)
-            and abs(res.ts_ns - int(ts_ns)) > cpva.PV_EXACT_MATCH_NS):
-        return res.value, "approx"
-    return res.value, "ok"
+        return res.value, "approx", samp_ts
+    if (res.value is not None and res.ts_ns is not None and not is_step
+            and abs(res.ts_ns - int(ts_ns)) > own):
+        return res.value, "approx", samp_ts
+    return res.value, "ok", samp_ts
+
+
+def pv_offset_label(sample_ts_ns: "int | None", frame_ts_ns: "int | None",
+                    own_window_ns: "int | None" = None) -> str:
+    """" (+2.5 s)" when the reading is not this frame's own, "" when it is.
+
+    ONE formatter for the table, the overlay and the burn-in. They drifted apart once
+    already, and a saved image that omits a flag the screen showed is a wrong record,
+    not a cosmetic difference. Signed, because on a channel archived every few seconds
+    the nearest reading is as often after the frame as before it.
+
+    What counts as "this frame's own" is `own_window_ns` — the same claim window the
+    value was looked up with (_pv_own_window_ns). It has to be the same number, or a
+    camera whose frames are stamped 0.4 s off the shot would have every one of its
+    perfectly good readings labelled as if it belonged to a different picture."""
+    if sample_ts_ns is None or frame_ts_ns is None:
+        return ""
+    delta = int(sample_ts_ns) - int(frame_ts_ns)
+    if abs(delta) <= max(cpva.PV_EXACT_MATCH_NS, int(own_window_ns or 0)):
+        return ""
+    off = delta / 1e9
+    return f" ({off:+.1f} s)" if abs(off) < 10.0 else f" ({off:+.0f} s)"
 
 
 def _pv_decorate(txt: str, status: str) -> str:
@@ -1298,27 +1524,41 @@ def _format_pv_value(channel: str, val: float, name: str = "") -> str:
     return f"{val:.{dec}f}"
 
 
-def pv_text_for_ts(ts_ns: "int | None", enabled_names: "list[str]") -> str:
+def pv_text_for_ts(ts_ns: "int | None", enabled_names: "list[str]",
+                   frame_ts_list: "list[int] | None" = None) -> str:
     """Build the PV burn-in string from the archiver values at a SPECIFIC image
     timestamp — so every saved frame gets the values that were actually present at
     its own moment, not a single live snapshot. Same format/units as the overlay.
 
     Derived PVs are computed here too, from the sources read for THIS timestamp —
-    a formula's sources are fetched even when they are not themselves listed."""
+    a formula's sources are fetched even when they are not themselves listed.
+
+    `frame_ts_list` is that camera's frame timeline. It decides how far a reading may
+    be and still be this frame's own (_pv_own_window_ns) — the SAME window the panel
+    used on screen, so the burned-in line and the screen cannot disagree about which
+    picture a number belongs to."""
     if ts_ns is None or not enabled_names:
         return ""
     raw: dict = {}
     sts: dict = {}
+    # The archived moment each number came from, so a reading that belongs to another
+    # instant is burned in WITH its offset. Without this the saved picture would carry
+    # a bare number that the screen had labelled — see pv_offset_label.
+    samp: dict = {}
+    own = _pv_own_window_ns(frame_ts_list, ts_ns)
     for base in pv_source_names(enabled_names):
         channel = pv_channel_for(base)
         if not channel:
             continue
         try:
-            val, status = _pv_last_known_ex(channel, ts_ns)
+            val, status, src_ts = _pv_last_known_ex(channel, ts_ns,
+                                                    own_window_ns=own)
         except Exception:
-            val, status = None, "error"
+            val, status, src_ts = None, "error", None
         if val is not None:
             val *= PV_SCALE.get(base, 1.0)
+            if src_ts is not None:
+                samp[base] = int(src_ts)
         raw[base], sts[base] = val, status
     derived = pv_eval_derived(enabled_names, raw, sts)
     parts: list[str] = []
@@ -1341,7 +1581,15 @@ def pv_text_for_ts(ts_ns: "int | None", enabled_names: "list[str]") -> str:
             parts.append(f"{pv_label_for(name)}: {token}")
             continue
         txt = _pv_decorate(pv_format_value(name, val), status)
-        parts.append(f"{pv_label_for(name)}: {txt} {pv_units_for(name)}".strip())
+        # A formula is only as current as its farthest source; a plain PV speaks for
+        # itself. Either way the offset goes AFTER the unit, exactly as on screen.
+        srcs = [samp[s] for s in
+                ((pv_derived_def(name) or {}).get("bindings") or {}).values()
+                if s in samp] or ([samp[name]] if name in samp else [])
+        off = (pv_offset_label(max(srcs, key=lambda t: abs(t - ts_ns)), ts_ns, own)
+               if srcs else "")
+        parts.append(
+            f"{pv_label_for(name)}: {txt} {pv_units_for(name)}".strip() + off)
     return "  |  ".join(parts)
 
 
@@ -1863,6 +2111,17 @@ def container_root_for_year(year: int) -> Path:
 _REF_STATUS_STYLE = "font-size: 10px; color: #666; padding: 1px 0;"
 _REF_WARN_STYLE   = "font-size: 10px; font-weight: 700; color: #b36b00; padding: 1px 0;"
 
+# The difference line under the picture: measured (green) and still only an estimate,
+# because the frame has so far only been decoded smaller than it will end up (amber).
+# Both are dark ink on the panel's light grey — see _apply_bc's neighbours in the house
+# style. The word "not final" travels with the colour; colour alone is never the signal.
+_DIFF_TEXT_STYLE      = "font-size: 10px; color: #1b5e20; padding: 1px 0;"
+_DIFF_TEXT_PROV_STYLE = "font-size: 10px; color: #8a6d00; padding: 1px 0;"
+# Same two inside a per-camera block, which carries no padding of its own: the blocks
+# are stacked in a height-capped column and 2 px per camera adds up.
+_DIFF_BLOCK_STYLE      = "font-size: 10px; color: #1b5e20; padding: 0;"
+_DIFF_BLOCK_PROV_STYLE = "font-size: 10px; color: #8a6d00; padding: 0;"
+
 _CHECKBOX_STYLE = """
 QCheckBox { spacing: 6px; padding: 2px 4px; font-weight: 600; color: #111; background: transparent; }
 QCheckBox::indicator { width: 18px; height: 18px; border: 2px solid #4a4a4a;
@@ -1876,6 +2135,20 @@ QCheckBox:disabled { color: #9a9a9a; }
 QCheckBox::indicator:disabled { border: 2px solid #c9c9c9; background: #f0f0f0; }
 QCheckBox::indicator:checked:disabled { border: 2px solid #a9c6ee; background: #a9c6ee; }
 """
+
+# The "send this on to another tab" buttons. They sit two or three to a row in a
+# 275 px panel, so they are smaller than a normal button — and every colour is
+# spelled out, both states: a button left to the style comes out pale on pale and
+# a disabled one unreadable. The same block is in if_t.py and sf_t.py; each tab
+# also runs on its own, so it is copied rather than imported (the same reason
+# _import_img_scale is).
+_SEND_BTN_QSS = (
+    "QPushButton { font-size: 10px; padding: 3px 4px; background: #eaeaea; "
+    "color: #111111; border: 1px solid #b4b4b4; border-radius: 3px; }"
+    "QPushButton:hover:!disabled { background: #d8e8ff; border: 1px solid #2d7dff; }"
+    "QPushButton:pressed:!disabled { background: #c3dbff; }"
+    "QPushButton:disabled { background: #ededed; color: #8d8d8d; "
+    "border: 1px solid #d4d4d4; }")
 
 # ── Contrast / Brightness / Gamma rows (IMAGE / DISPLAY) ─────────────────────
 # The three names are shortened to Con / Bri / Gam so a numeric readout of the value
@@ -2863,8 +3136,14 @@ def _autostretch_gray(img: QImage, p_low: float = 0.5, p_high: float = 99.5,
 
 
 def _apply_bc(img: QImage, contrast: int = 0, offset: int = 0,
-              auto: int = img_scale.AUTO_NONE, out: dict | None = None) -> QImage:
-    """The Contrast / Brightness pair on an image that is ALREADY 8-bit.
+              auto: int = img_scale.AUTO_NONE, out: dict | None = None,
+              gamma: "int | float | None" = None) -> QImage:
+    """The Gamma / Contrast / Brightness trio on an image that is ALREADY 8-bit.
+
+    Same order as img_scale.render_u8 does it on 16-bit data: gamma bends the scale,
+    then the contrast gain, then the brightness offset. `gamma` is in slider units
+    (or the AUTO sentinel) and None means "leave it alone", which is what every caller
+    outside the subtraction path wants.
 
     Contrast is a multiplicative gain pivoted on the frame's own BLACK LEVEL, not on
     mid-grey. Mid-grey was unusable here: an absolute-scale frame sits around code 29,
@@ -2873,6 +3152,10 @@ def _apply_bc(img: QImage, contrast: int = 0, offset: int = 0,
     level means contrast only spreads the signal ABOVE the background, which is what the
     control is for and what makes small moves small.
 
+    The pivot and the Auto window are measured AFTER the gamma bend, exactly as
+    render_u8 measures them through its own curve — otherwise the black level the gain
+    pivots on describes a picture that is no longer on screen.
+
     `auto` is img_scale's AUTO_* mask and means the same here as everywhere else: each
     ticked box fills in the value of ITS OWN control from this frame's percentile window
     (img_scale.auto_bc_pair). This path serves the sources that have no full-precision
@@ -2880,16 +3163,37 @@ def _apply_bc(img: QImage, contrast: int = 0, offset: int = 0,
     goes through img_scale.render_u8 instead, which does the same arithmetic before the
     rounding to 8 bits.
 
-    `out`, when given, receives {"contrast", "offset"} for the ticked boxes, so the
-    greyed-out sliders can be parked on what Auto actually applied."""
+    `out`, when given, receives {"gamma", "contrast", "offset"} for what was actually
+    applied, so the greyed-out controls can be parked on it."""
     if img.isNull():
         return img
-    if not contrast and not offset and not auto:
+    g = None
+    if gamma is not None:
+        # Resolved here rather than by the caller: Auto gamma needs the pixels, and on
+        # this path the pixels are the 8-bit difference, not the 16-bit frame.
+        g = (None if img_scale.is_auto_gamma(gamma)
+             else img_scale.gamma_from_slider(gamma))
+    # g is None here either because no gamma was asked for, or because Auto has to see
+    # the pixels first — only the first of those two means "nothing to bend".
+    bend = gamma is not None and (g is None or g != img_scale.GAMMA_NEUTRAL)
+    if not contrast and not offset and not auto and not bend:
+        if out is not None and g is not None:
+            out["gamma"] = g
         return img
     w, h = img.width(), img.height()
     if w <= 0 or h <= 0:
         return img
     arr, stat, is_gray = _img_planes(img)
+    if gamma is not None:
+        if g is None:                       # Auto: off this frame's own median
+            g = img_scale.auto_gamma(stat, 255.0)
+        if out is not None:
+            out["gamma"] = g
+        if g != img_scale.GAMMA_NEUTRAL:
+            arr = np.power(np.clip(arr * (1.0 / 255.0), 0.0, 1.0),
+                           float(g), dtype=np.float32) * 255.0
+            stat = arr if is_gray else (0.114 * arr[:, :, 0] + 0.587 * arr[:, :, 1]
+                                        + 0.299 * arr[:, :, 2])
     s = _stat_sample(stat)
     pivot = float(np.percentile(s, _BLACK_PCT))
     contrast, offset = img_scale.auto_bc_pair(
@@ -2915,6 +3219,13 @@ def _apply_bc(img: QImage, contrast: int = 0, offset: int = 0,
 # so the existing three-argument constructions keep working.
 _RenderBC = namedtuple("_RenderBC", "offset contrast auto gamma",
                        defaults=(img_scale.GAMMA_SLIDER_NEUTRAL,))
+
+# What one render has to know about the subtraction reference — see Viewer._ref_render.
+# `arr` the reference at this decode size, `subtract` whether the PICTURE is replaced by
+# the difference (the checkbox) or the reference is only measured against, `thr`/`off`
+# the two spinboxes, `key_parts` the three fields it adds to the pixmap key, and `mkey`
+# the key the resulting NUMBERS are published under.
+_RefRender = namedtuple("_RefRender", "arr subtract thr off key_parts mkey")
 _RENDER_BC_NONE = _RenderBC(0, 0, 0)
 
 
@@ -3010,21 +3321,24 @@ def _diff_hist(vals: np.ndarray) -> list:
     return _diff_hist_from_counts(_diff_counts256(vals))
 
 
-def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int = 0,
-                          sub_offset: int = 0, stats_out: dict | None = None) -> QImage:
-    """|current − reference| as a Grayscale8 QImage.
-
-    ±1 is always zeroed (integer round-trip noise), then `sub_threshold` cuts
-    small differences. `stats_out` receives the TRUE difference statistics —
-    measured before `sub_offset` is added, so the numbers stay physical.
-    `sub_offset` lifts every remaining non-zero pixel by that intensity, which
-    makes 1–2 count differences visible at the cost of absolute readability.
-    """
+def _gray_plane(img: QImage) -> np.ndarray:
+    """One 8-bit grey plane out of a QImage, as float32."""
+    if img.format() != QImage.Format.Format_Grayscale8:
+        img = img.convertToFormat(QImage.Format.Format_Grayscale8)
     ptr = img.bits()
     if hasattr(ptr, "setsize"):
         ptr.setsize(img.sizeInBytes())
-    arr_cur = np.frombuffer(ptr, dtype=np.uint8).reshape(
+    return np.frombuffer(ptr, dtype=np.uint8).reshape(
         img.height(), img.bytesPerLine())[:, :img.width()].copy().astype(np.float32)
+
+
+def _reference_diff(arr_cur: np.ndarray, ref_image: np.ndarray,
+                    sub_threshold: int = 0) -> np.ndarray:
+    """|current − reference| as float32, ±1 zeroed and the threshold applied.
+
+    ±1 always goes (integer round-trip noise), then `sub_threshold` cuts small
+    differences. Both arrays are 8-bit codes on the camera's absolute scale, rendered
+    LINEAR — see load_image_scaled's subtraction branch."""
     if ref_image.shape != arr_cur.shape:
         from PIL import Image as PilImage
         ref_pil = PilImage.fromarray(ref_image.astype(np.uint8))
@@ -3033,41 +3347,64 @@ def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int
             PilImage.Resampling.NEAREST)
         ref_arr = np.asarray(ref_pil, dtype=np.float32)
     else:
-        ref_arr = ref_image.copy()
+        ref_arr = ref_image
     diff = np.abs(arr_cur - ref_arr)
     diff[diff <= 1] = 0
     if sub_threshold > 1:
         diff[diff < sub_threshold] = 0
-    nz = diff > 0
-    n_nz = int(nz.sum())
+    return diff
+
+
+def _diff_stats_from(diff: np.ndarray) -> dict:
+    """The numbers the INFO panel reports, off a finished difference array.
+
+    What the operator actually reads: how many pixels are ABOVE THE BACKGROUND of this
+    frame, what share of the frame that is, how strong the difference is on average, how
+    bright the brightest and the faintest counted pixel are, and — the number a bare
+    count never gave — how many pixels differ by AT LEAST each of _DIFF_LEVELS. The
+    background is the frame's own floor (min over EVERY pixel, so nearly always 0 on a
+    diff), not a constant, because a frame whose floor has been lifted must not report
+    its whole area as "lit". "min" is the darkest pixel that still counts as a
+    difference: with the diff threshold at 0 it is the noise floor the sensor leaves
+    behind, and with a threshold set it reads that threshold back — which is exactly how
+    to confirm the threshold is doing what the spinbox says.
+
+    Taken BEFORE `sub_offset` is added, so the numbers stay physical."""
+    bg = float(diff.min())
+    above = diff > bg
+    n_above = int(above.sum())
+    vals = diff[above]
+    total = int(diff.size)
+    counts = _diff_counts256(vals)
+    return {
+        "count": int((diff > 0).sum()),
+        "bg":    bg,
+        "above": n_above,
+        "total": total,
+        "pct":   (100.0 * n_above / total) if total else 0.0,
+        "mean":  float(vals.mean()) if vals.size else 0.0,
+        "min":   float(vals.min()) if vals.size else 0.0,
+        "max":   float(diff.max()),
+        "levels": _diff_levels_from_counts(counts),
+        "hist":  _diff_hist_from_counts(counts),
+    }
+
+
+def _apply_reference_diff(img: QImage, ref_image: np.ndarray, sub_threshold: int = 0,
+                          sub_offset: int = 0, stats_out: dict | None = None) -> QImage:
+    """|current − reference| as a Grayscale8 QImage.
+
+    `stats_out` receives the TRUE difference statistics — measured before `sub_offset`
+    is added. `sub_offset` lifts every remaining non-zero pixel by that intensity, which
+    makes 1–2 count differences visible at the cost of absolute readability.
+    """
+    diff = _reference_diff(_gray_plane(img), ref_image, sub_threshold)
     if stats_out is not None:
-        # What the operator actually reads: how many pixels are ABOVE THE BACKGROUND of
-        # this frame, what share of the frame that is, how strong the difference is on
-        # average, how bright the brightest pixel is, and — the number a bare count
-        # never gave — how many pixels differ by AT LEAST each of _DIFF_LEVELS. The
-        # background is the frame's own floor (min over EVERY pixel, so nearly always 0
-        # on a diff), not a constant, because a frame whose floor has been lifted must
-        # not report its whole area as "lit". The darkest lit pixel is not reported: it
-        # is just the diff threshold read back.
-        bg = float(diff.min())
-        above = diff > bg
-        n_above = int(above.sum())
-        vals = diff[above]
-        total = int(diff.size)
-        counts = _diff_counts256(vals)
-        stats_out.update({
-            "count": n_nz,
-            "bg":    bg,
-            "above": n_above,
-            "total": total,
-            "pct":   (100.0 * n_above / total) if total else 0.0,
-            "mean":  float(vals.mean()) if vals.size else 0.0,
-            "max":   float(diff.max()),
-            "levels": _diff_levels_from_counts(counts),
-            "hist":  _diff_hist_from_counts(counts),
-        })
-    if sub_offset and n_nz:
-        diff[nz] += float(sub_offset)
+        stats_out.update(_diff_stats_from(diff))
+    if sub_offset:
+        nz = diff > 0
+        if nz.any():
+            diff[nz] += float(sub_offset)
     diff = np.clip(diff, 0, 255).astype(np.uint8)
     out = QImage(diff.tobytes(), img.width(), img.height(),
                  img.width(), QImage.Format.Format_Grayscale8)
@@ -3098,6 +3435,14 @@ class _DiffHistogram(QWidget):
     _SCALE_FG = "#8a8a8a"
     _PEAK     = "#c62828"
     _MEAN     = "#1565c0"
+    _MIN      = "#6a1b9a"
+    # The same picture while it is still only an ESTIMATE — drawn from a frame that was
+    # decoded smaller than it will end up. Grey bars and a grey border, plus the word
+    # written on it: colour alone may not be the only signal.
+    _BAR_PROV      = "#9e9e9e"
+    _BAR_TOP_PROV  = "#757575"
+    _BORDER_PROV   = "#b08d57"
+    _PROV_FG       = "#8a6d00"
 
     # Candidate tick sets, densest first. The densest one whose labels do not touch
     # is the one drawn, so a 265 px panel gets 0/32/…/255 and a 120 px tile-sized one
@@ -3115,7 +3460,9 @@ class _DiffHistogram(QWidget):
         self._hist: list = []
         self._peak: float = 0.0
         self._mean: float = 0.0
+        self._vmin: float = 0.0
         self._caption: str = ""
+        self._provisional = False
         self._compact = bool(compact)
         self.setFixedHeight(self._bars_h() + self._H_AXIS)
         self.setToolTip(
@@ -3123,10 +3470,18 @@ class _DiffHistogram(QWidget):
             "to right.\nOnly the pixels above the background are counted — the "
             "background alone is nearly the\nwhole frame and would flatten every "
             "other bar.\nBar heights are on a square-root scale, so a handful of very "
-            "bright pixels is still visible.\nThe grey number top-left is how many "
-            "pixels the tallest bar stands for.\nThe red line marks the brightest "
-            "pixel; the blue number is the average difference of the counted "
-            "pixels.")
+            "bright pixels is still visible.\nThe grey number top-left (top) is how "
+            "many pixels the tallest bar stands for.\nThe numbers on the right are the "
+            "difference itself, on the same 0–255 scale:\n  max (red) the brightest "
+            "differing pixel, also marked by the red line,\n  mean (blue) the average "
+            "of every counted pixel,\n  min (purple) the faintest pixel still counted "
+            "— the noise floor, or the diff\n  threshold read back when one is set.\n"
+            "A narrow histogram drops min first, then mean, rather than printing them "
+            "on top\nof each other.\n"
+            "Grey bars with 'not final' on them mean the frame has so far only been "
+            "decoded\nsmaller than it will end up: shrinking averages neighbouring "
+            "pixels, so those\nnumbers are an estimate. They turn green the moment the "
+            "full-size render lands.")
         self.setVisible(False)
 
     def _bars_h(self) -> int:
@@ -3141,16 +3496,30 @@ class _DiffHistogram(QWidget):
         self.update()
 
     def set_data(self, hist: "list | None", peak: float = 0.0, mean: float = 0.0,
-                 caption: str = ""):
-        """Show one histogram, or hide the widget when there is nothing to draw."""
+                 vmin: float = 0.0, caption: str = "", provisional: bool = False):
+        """Show one histogram, or hide the widget when there is nothing to draw.
+
+        `provisional` says these numbers came from a frame decoded smaller than the one
+        that will end up on screen, so they are an estimate — drawn grey and labelled."""
         self._hist = list(hist or [])
         self._peak = float(peak or 0.0)
         self._mean = float(mean or 0.0)
+        self._vmin = float(vmin or 0.0)
         self._caption = caption or ""
+        self.set_provisional(provisional)
         has = any(self._hist)
         self.setVisible(has)
         if has:
             self.update()
+
+    def set_provisional(self, provisional: bool):
+        """Mark (or unmark) the SAME numbers as an estimate, without re-feeding them —
+        what a display that keeps the last numbers because none arrived has to do."""
+        provisional = bool(provisional)
+        if provisional == getattr(self, "_provisional", None):
+            return
+        self._provisional = provisional
+        self.update()
 
     def _pick_ticks(self, w: int, fm) -> tuple:
         """The densest tick set whose labels still have 4 px of air between them."""
@@ -3194,16 +3563,19 @@ class _DiffHistogram(QWidget):
             gx = 1 + int((w - 3) * t / 255.0)
             p.drawLine(gx, 1, gx, bars_h - 2)
 
-        p.setPen(QPen(QColor(self._BORDER), 1))
+        prov = self._provisional
+        p.setPen(QPen(QColor(self._BORDER_PROV if prov else self._BORDER), 1))
         p.drawRect(0, 0, w - 1, bars_h - 1)
 
         n = len(self._hist)
         top_count = max(self._hist) if n else 0
         if n and top_count > 0:
+            bar     = self._BAR_PROV     if prov else self._BAR
+            bar_top = self._BAR_TOP_PROV if prov else self._BAR_TOP
             top = math.sqrt(top_count)
             bw = (w - 2) / n
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(QColor(self._BAR)))
+            p.setBrush(QBrush(QColor(bar)))
             for i, c in enumerate(self._hist):
                 if c <= 0:
                     continue
@@ -3211,45 +3583,55 @@ class _DiffHistogram(QWidget):
                 x0 = 1 + int(i * bw)
                 x1 = 1 + int((i + 1) * bw)
                 p.fillRect(QRect(x0, bars_h - 1 - bh, max(1, x1 - x0), bh),
-                           QColor(self._BAR if bh > 2 else self._BAR_TOP))
-            # Where the brightest pixel sits, on the same 0–255 axis as the bars.
+                           QColor(bar if bh > 2 else bar_top))
+            # Where the brightest and the faintest counted pixel sit, on the same 0–255
+            # axis as the bars.
             if self._peak > 0:
                 xp = 1 + int((w - 3) * min(255.0, self._peak) / 255.0)
                 p.setPen(QPen(QColor(self._PEAK), 1))
                 p.drawLine(xp, 1, xp, bars_h - 2)
-            # The bar scale and the peak value, written INSIDE the picture. Both sit
-            # on a white pad: they are printed over the bars, and grey-on-dark-green
-            # would be exactly the unreadable text this house style forbids.
-            scale_txt = f"max {top_count:,}".replace(",", " ")
-            peak_txt = f"peak {self._peak:.0f}" if self._peak > 0 else ""
+            if self._vmin > 0:
+                xm = 1 + int((w - 3) * min(255.0, self._vmin) / 255.0)
+                p.setPen(QPen(QColor(self._MIN), 1, Qt.PenStyle.DotLine))
+                p.drawLine(xm, 1, xm, bars_h - 2)
+            # The numbers, written INSIDE the picture: how many pixels the tallest bar
+            # stands for on the left, and the difference itself — brightest, average,
+            # faintest — on the right. Each sits on a white pad: they are printed over
+            # the bars, and grey-on-dark-green would be exactly the unreadable text this
+            # house style forbids. "top" is deliberately not called "max" any more —
+            # two different numbers were both labelled max, one a pixel count and one
+            # an intensity.
+            scale_txt = f"top {top_count:,}".replace(",", " ")
             sw = fm.horizontalAdvance(scale_txt)
             p.fillRect(QRect(2, 1, sw + 4, 11), QColor(255, 255, 255, 215))
             p.setPen(QPen(QColor(self._SCALE_FG), 1))
             p.drawText(QRect(4, 1, sw, 11),
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                        scale_txt)
-            if peak_txt:
-                pw = fm.horizontalAdvance(peak_txt)
-                p.fillRect(QRect(w - 4 - pw - 2, 1, pw + 4, 11),
-                           QColor(255, 255, 255, 215))
-                p.setPen(QPen(QColor(self._PEAK), 1))
-                p.drawText(QRect(w - 4 - pw, 1, pw, 11),
+            # Right to left, most important first, and each one DROPPED rather than
+            # overlapped once it would run into the scale on the other end: a 275 px
+            # panel shows all three, a tile-sized histogram keeps max alone.
+            right = w - 4
+            left_stop = 2 + sw + 4 + 6
+            # "not final" goes FIRST, so a histogram too narrow for three numbers drops
+            # the numbers and keeps the warning rather than the other way round.
+            for txt, col in (
+                    ("not final" if prov else "", self._PROV_FG),
+                    (f"max {self._peak:.0f}" if self._peak > 0 else "", self._PEAK),
+                    (f"mean {self._mean:.1f}" if self._mean > 0 else "", self._MEAN),
+                    (f"min {self._vmin:.0f}" if self._vmin > 0 else "", self._MIN)):
+                if not txt:
+                    continue
+                tw2 = fm.horizontalAdvance(txt)
+                x = right - tw2
+                if x - 2 <= left_stop:
+                    break
+                p.fillRect(QRect(x - 2, 1, tw2 + 4, 11), QColor(255, 255, 255, 215))
+                p.setPen(QPen(QColor(col), 1))
+                p.drawText(QRect(x, 1, tw2, 11),
                            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                           peak_txt)
-                # The average difference, immediately LEFT of the peak — drawn only
-                # when it fits beside the scale on the other end, so a narrow tile
-                # loses the mean instead of printing it over "max".
-                if self._mean > 0:
-                    mean_txt = f"mean {self._mean:.1f}"
-                    mw = fm.horizontalAdvance(mean_txt)
-                    mx = w - 4 - pw - 2 - 6 - mw
-                    if mx - 2 > 2 + sw + 4 + 6:
-                        p.fillRect(QRect(mx - 2, 1, mw + 4, 11),
-                                   QColor(255, 255, 255, 215))
-                        p.setPen(QPen(QColor(self._MEAN), 1))
-                        p.drawText(QRect(mx, 1, mw, 11),
-                                   Qt.AlignmentFlag.AlignRight
-                                   | Qt.AlignmentFlag.AlignVCenter, mean_txt)
+                           txt)
+                right = x - 8
 
         # Tick marks + numbers under the bars.
         p.setPen(QPen(QColor(self._AXIS_FG), 1))
@@ -3286,17 +3668,29 @@ class _DiffCamBlock(QWidget):
         lay.setSpacing(0)
         self.lbl = QLabel("")
         self.lbl.setWordWrap(True)
-        self.lbl.setStyleSheet("font-size: 10px; color: #1b5e20; padding: 0;")
+        self.lbl.setStyleSheet(_DIFF_BLOCK_STYLE)
         lay.addWidget(self.lbl)
         self.hist = _DiffHistogram(compact=compact)
         lay.addWidget(self.hist)
 
     def set_block(self, text: str, hist: "list | None", peak: float,
-                  mean: float = 0.0):
+                  mean: float = 0.0, vmin: float = 0.0,
+                  provisional: bool = False):
+        self.lbl.setStyleSheet(_DIFF_BLOCK_PROV_STYLE if provisional
+                               else _DIFF_BLOCK_STYLE)
         self.lbl.setText(text or "")
         self.lbl.setVisible(bool(text))
-        self.hist.set_data(hist, peak, mean)
+        self.hist.set_data(hist, peak, mean, vmin, provisional=provisional)
         self.setVisible(bool(text) or self.hist.isVisible())
+
+    def mark_provisional(self):
+        """Say the numbers already on this block are no longer known to describe what is
+        on screen, without touching the numbers themselves."""
+        self.lbl.setStyleSheet(_DIFF_BLOCK_PROV_STYLE)
+        txt = self.lbl.text()
+        if txt and not txt.endswith(" …"):
+            self.lbl.setText(txt + " …")
+        self.hist.set_provisional(True)
 
 
 # ---------------- FAST IMAGE LOAD ----------------
@@ -3445,7 +3839,19 @@ def _frame_scale(path: Path, r) -> "tuple[float, str | None, int | None]":
     return full_scale, cam, frame_bits
 
 
-def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: int = 0, brightness_offset: int = 0, ref_image: np.ndarray | None = None, sub_threshold: int = 0, contrast: int = 0, auto_bright: int = 0, sub_offset: int = 0, stats_out: dict | None = None, gamma: int = img_scale.GAMMA_SLIDER_NEUTRAL) -> QImage:
+def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: int = 0, brightness_offset: int = 0, ref_image: np.ndarray | None = None, sub_threshold: int = 0, contrast: int = 0, auto_bright: int = 0, sub_offset: int = 0, stats_out: dict | None = None, gamma: int = img_scale.GAMMA_SLIDER_NEUTRAL, subtract: bool = True) -> QImage:
+    """Decode and render one frame.
+
+    `ref_image` is the subtraction reference. `subtract` decides what is DONE with it:
+
+      True  — the picture returned IS the difference (Subtraction on).
+      False — the picture returned is the ordinary rendering and the reference is only
+              MEASURED against (`stats_out`). That is what keeps the difference numbers
+              and the histogram alive while Subtraction is switched off, off the one
+              decode, with no second read of the share.
+
+    Either way the difference itself is taken on the LINEAR absolute-scale rendering of
+    both frames, so the numbers do not depend on a single display control."""
     r, _buf, _ba = _open_reader(path)
     sz = r.size()
     if sz.isValid():
@@ -3498,20 +3904,35 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
     # Effective Contrast / Brightness / Gamma of this render, published for the sliders.
     auto_out: dict = {}
 
+    # What is DONE with the reference: replace the picture with the difference, or only
+    # measure against it. See the docstring.
+    doing_diff = ref_image is not None and bool(subtract)
+    measuring  = ref_image is not None and not subtract
+    # The LINEAR absolute-scale rendering of this frame — what BOTH of those work on, so
+    # the numbers cannot depend on how the picture happens to be displayed. Built only
+    # when there is a reference; None for an 8-bit source, which has no absolute scale of
+    # its own and is compared as it comes.
+    lin8 = None
+
     if img.format() in (QImage.Format.Format_Grayscale16, QImage.Format.Format_RGB16):
         ptr = img.bits()
         if hasattr(ptr, "setsize"):
             ptr.setsize(img.sizeInBytes())
         arr16 = np.frombuffer(ptr, dtype=np.uint16).reshape(img.height(), img.bytesPerLine() // 2)[:, :img.width()].copy()
-        if is_cyclic and ref_image is None:
+        if ref_image is not None:
+            lin8 = _norm16_to8_full_scale(arr16, img_scale.GAMMA_NEUTRAL, full_scale)
+        if is_cyclic and not doing_diff:
             # Straight from the 16-bit values, skipping the 8-bit step entirely. Going
             # through 8 bits first would quantise the frame to 257 stored units against
             # NI's 1024-unit band, so a pixel within a quarter-band of an edge could come
             # out the wrong colour — on a palette whose whole purpose is that the colour
             # IS the value. The LUT in GRADIENTS is the same rule at 8-bit resolution and
             # only serves the subtraction path below, which has no 16-bit data left.
+            if measuring and stats_out is not None:
+                stats_out.update(_diff_stats_from(_reference_diff(
+                    lin8.astype(np.float32), ref_image, sub_threshold)))
             return _rgb_to_qimage(_ni_binary_rgb(arr16, full_scale))
-        if ref_image is None:
+        if not doing_diff:
             # The whole display pipeline on the FULL-PRECISION data: absolute scale bent
             # by gamma, then the contrast gain, then the brightness offset, rounded to 8
             # bits once at the end. Doing the pair here rather than on the 8-bit result
@@ -3526,28 +3947,51 @@ def load_image_scaled(path: Path, max_side: int, brighten: bool, gradient_id: in
             did_bc = True
         else:
             # Subtraction: the difference is taken on the plain absolute-scale rendering
-            # of both frames, and the pair is applied to the difference further down.
-            g = (img_scale.auto_gamma(arr16.astype(np.float32), full_scale)
-                 if img_scale.is_auto_gamma(gamma) else img_scale.gamma_from_slider(gamma))
-            auto_out["gamma"] = g
-            arr8 = _norm16_to8_full_scale(arr16, g, full_scale)
+            # of both frames — LINEAR, gamma 1.00, whatever the gamma control says.
+            #
+            # Gamma used to be applied HERE, to the current frame only: the reference is
+            # decoded by _load_raw_arr, which never bends it (see its call to
+            # load_image_scaled). So |current − reference| compared two differently bent
+            # curves, and with Auto gamma the curve came from each frame's own median —
+            # a different scale on every frame. The reported maximum then jumped around
+            # for reasons that had nothing to do with the pictures.
+            #
+            # Gamma, contrast and brightness are all display adjustments of the finished
+            # DIFFERENCE and are applied together further down (_apply_bc), which is also
+            # what keeps the numbers in the INFO panel physical.
+            arr8 = lin8
         img = QImage(arr8.tobytes(), img.width(), img.height(), img.width(), QImage.Format.Format_Grayscale8)
     elif is_default:
         # Keep the original colours; subtraction is the one operation that needs mono.
-        if ref_image is not None and img.format() != QImage.Format.Format_Grayscale8:
+        # Measuring does not: it reads a grey plane of its own and leaves the picture be.
+        if doing_diff and img.format() != QImage.Format.Format_Grayscale8:
             img = img.convertToFormat(QImage.Format.Format_Grayscale8)
     else:
         img = img.convertToFormat(QImage.Format.Format_Grayscale8)
 
-    if ref_image is not None:
+    if doing_diff:
         img = _apply_reference_diff(img, ref_image, sub_threshold, sub_offset, stats_out)
+    elif measuring and stats_out is not None:
+        # Subtraction is OFF: the picture stays what it is and only the numbers are
+        # taken. Off `lin8` where there is one — `img` has been through gamma, contrast
+        # and brightness by now and would give a different answer every time a slider
+        # moved.
+        cur = lin8.astype(np.float32) if lin8 is not None else _gray_plane(img)
+        stats_out.update(_diff_stats_from(
+            _reference_diff(cur, ref_image, sub_threshold)))
 
     # Everything that had no 16-bit pixels to work from: a subtraction difference, and
     # any source that was already 8-bit. Same arithmetic as render_u8 above, one step
     # later — see _apply_bc.
+    #
+    # Gamma is handed over only on the subtraction path. An 8-bit SOURCE file has no
+    # absolute scale to bend (it is already somebody else's rendering), and that is the
+    # behaviour it has always had; a difference does, because both sides of it were just
+    # rendered here on the camera's own absolute scale.
     if not did_bc:
         img = _apply_bc(img, contrast=contrast, offset=brightness_offset,
-                        auto=auto_mask, out=auto_out)
+                        auto=auto_mask, out=auto_out,
+                        gamma=gamma if doing_diff else None)
 
     _auto_bc_put(path, auto_out)
 
@@ -4008,7 +4452,7 @@ class LoaderSignals(QObject):
     loaded = Signal(int, int, int, int, int, int, object, QImage, object)
 
 class LoadTask(QRunnable):
-    def __init__(self, gen, req_id, idx, path, max_side, brighten, gradient_id, signals, bc=_RENDER_BC_NONE, ref_image=None, sub_threshold=0, sub_offset=0, key=None):
+    def __init__(self, gen, req_id, idx, path, max_side, brighten, gradient_id, signals, bc=_RENDER_BC_NONE, ref_image=None, sub_threshold=0, sub_offset=0, key=None, subtract=True, stats_key=None):
         super().__init__()
         self.gen = gen; self.req_id = req_id; self.idx = idx
         self.path = path; self.max_side = max_side; self.brighten = brighten
@@ -4016,6 +4460,11 @@ class LoadTask(QRunnable):
         self.ref_image = ref_image; self.sub_threshold = sub_threshold
         self.sub_offset = sub_offset
         self.key = key
+        # `subtract` False = measure the reference, keep the ordinary picture (the
+        # Subtraction checkbox is off but a reference is set). `stats_key` is where the
+        # numbers go: its OWN key, not the pixmap's — see Viewer._measure_key.
+        self.subtract = bool(subtract)
+        self.stats_key = stats_key if stats_key is not None else key
         self.signals = signals
 
     def run(self):
@@ -4026,16 +4475,23 @@ class LoadTask(QRunnable):
         # e.g. a fast multi-cam camera getting caught mid-write over the network share
         # more often than a slow one. Always emit, using a null QImage on failure, so
         # _on_cam_loaded / _on_loaded release their busy flags and retry the next frame.
-        # Difference statistics are collected only for subtraction renders and
-        # published under the SAME cache key the pixmap is stored under, so the UI
-        # can label a frame whether it came from this load or from the pixmap cache.
+        # Difference statistics are collected whenever there is a REFERENCE — with
+        # Subtraction on they describe the picture, with it off they still say how far
+        # this frame is from the reference — and published under their own key, so the
+        # UI can label a frame whether it came from this load or from the pixmap cache.
         stats = {} if self.ref_image is not None else None
         try:
-            img = load_image_scaled(self.path, self.max_side, bool(self.brighten), self.gradient_id, self.bc.offset, self.ref_image, self.sub_threshold, self.bc.contrast, self.bc.auto, self.sub_offset, stats, self.bc.gamma)
+            img = load_image_scaled(self.path, self.max_side, bool(self.brighten), self.gradient_id, self.bc.offset, self.ref_image, self.sub_threshold, self.bc.contrast, self.bc.auto, self.sub_offset, stats, self.bc.gamma, self.subtract)
         except Exception:
             img = QImage()
-        if stats and self.key is not None and not img.isNull():
-            _diff_stats_put(self.key, stats)
+        if stats and self.stats_key is not None and not img.isNull():
+            # The size this difference was measured at. Shrinking a frame averages
+            # neighbouring pixels, so the same pair of frames yields a LOWER maximum and a
+            # different pixel count at every decode size — and one frame is drawn small
+            # first and full-size a moment later. The INFO panel uses this to keep
+            # approximate numbers from passing for measured ones (see _update_diff_stats).
+            stats["side"] = int(self.max_side)
+            _diff_stats_put(self.stats_key, stats)
         try:
             self.signals.loaded.emit(self.gen, self.req_id, self.idx, self.max_side, self.brighten, self.gradient_id, self.bc, img, self.key)
         except RuntimeError:
@@ -4139,6 +4595,233 @@ class RefreshScanTask(QRunnable):
         items.sort(key=lambda it: it.ts_ns)
         self.signals.finished.emit(self.gen, items)
 
+# ---------------- OVERLAY MARKS (cross / circle / square) ----------------
+# The marks the operator draws on a picture. A camera may carry SEVERAL of each kind:
+# a click adds one, clicking one and pressing Delete takes it away. Geometry is kept in
+# fractions of the image rect, which is what lets one click put the same mark on every
+# selected camera whatever each sensor's size is.
+#
+# Geometry is a plain tuple, never a QPointF and never a mutable record. The marks are
+# copied between cameras, into the session store and into a worker thread, and a shared
+# mutable element would let one dragged handle move marks on seven other cameras.
+#
+#   cross   (x, y)
+#   circle  (cx, cy, rx, ry)        radii as fractions of width / height
+#   square  (left, top, right, bottom)
+#
+# Everything that DRAWS them goes through draw_marks: the screen, the single save, the
+# multi-camera save and the batch save used to carry four copies of the same drawing
+# code, so every change to the shapes had to be made four times or one exported picture
+# quietly disagreed with the screen.
+MARK_KINDS = ("cross", "circle", "square")
+
+# Selection is shown with a black casing under the mark's own colour and white dashes
+# over it. No single colour can be seen on both a blown-out beam core and a black field,
+# so the decoration carries its own contrast and nothing is left to the theme.
+_SEL_CASE  = QColor(0, 0, 0, 210)
+_SEL_DASH  = QColor(255, 255, 255, 235)
+_HANDLE_FILL   = QColor(255, 255, 255, 240)
+_HANDLE_BORDER = QColor(0, 0, 0, 220)
+
+# A click with no drag in circle / square mode still has to make something, so it makes
+# one this big — small enough not to hide the picture, big enough to grab.
+_NEW_MARK_FRAC = 0.05
+
+
+def new_marks() -> dict:
+    """An empty set of marks for one camera. A fresh list per kind — one shared list
+    would put every cross into the circles as well."""
+    return {k: [] for k in MARK_KINDS}
+
+
+def copy_marks(marks) -> dict:
+    """A detached copy. The session store, the other cameras and the batch-save worker
+    each keep marks of their own; sharing the lists would let a later edit change what
+    was already saved."""
+    marks = marks or {}
+    return {k: list(marks.get(k) or ()) for k in MARK_KINDS}
+
+
+def visible_marks(iv) -> dict:
+    """The marks that should actually be drawn: the kinds whose tick box is on."""
+    return {k: (list(iv.marks.get(k) or ()) if getattr(iv, f"show_{k}", False) else [])
+            for k in MARK_KINDS}
+
+
+def has_any_mark(marks) -> bool:
+    """Is anything actually drawn?
+
+    This decides whether a save writes the extra annotated file, so it counts MARKS. The
+    save paths used to ask only whether a tick box was on, which was survivable while a
+    ticked Cross box drew a cross in the middle of the picture by itself; now that it
+    draws nothing, the loose test would write an annotated copy identical to the
+    original, plus a second copy of the original beside it."""
+    marks = marks or {}
+    return any(marks.get(k) for k in MARK_KINDS)
+
+
+def mark_handles(rect, kind: str, geom) -> dict:
+    """Grab points for ONE mark, in the pixels of `rect`."""
+    x0, y0 = rect.left(), rect.top()
+    w, h = rect.width(), rect.height()
+    if kind == "cross":
+        gx, gy = geom
+        return {"move": QPointF(x0 + gx * w, y0 + gy * h)}
+    if kind == "circle":
+        cx, cy, rx, ry = geom
+        px, py = x0 + cx * w, y0 + cy * h
+        dx, dy = rx * w, ry * h
+        return {"move": QPointF(px, py),
+                "n": QPointF(px, py - dy), "s": QPointF(px, py + dy),
+                "e": QPointF(px + dx, py), "w": QPointF(px - dx, py)}
+    ln, tn, rn, bn = geom
+    sx, sy = x0 + ln * w, y0 + tn * h
+    ex, ey = x0 + rn * w, y0 + bn * h
+    mx, my = (sx + ex) / 2.0, (sy + ey) / 2.0
+    return {"move": QPointF(mx, my),
+            "nw": QPointF(sx, sy), "ne": QPointF(ex, sy),
+            "sw": QPointF(sx, ey), "se": QPointF(ex, ey),
+            "n": QPointF(mx, sy), "s": QPointF(mx, ey),
+            "w": QPointF(sx, my), "e": QPointF(ex, my)}
+
+
+def mark_hit(rect, kind: str, geom, pos, cross_size: int = 18, thick: int = 2) -> bool:
+    """Did the click land ON this mark?
+
+    The test is proximity to the OUTLINE (or to the centre, for a cross), never "inside
+    the shape": a click anywhere inside a big circle counting as a hit would make it
+    impossible to draw a second mark inside the first one."""
+    x0, y0 = rect.left(), rect.top()
+    w, h = rect.width(), rect.height()
+    px, py = pos.x(), pos.y()
+    if kind == "cross":
+        gx, gy = geom
+        cx, cy = x0 + gx * w, y0 + gy * h
+        r = max(8.0, float(cross_size))
+        return abs(px - cx) <= r and abs(py - cy) <= r
+    tol = float(thick) + 5.0
+    if kind == "circle":
+        gcx, gcy, grx, gry = geom
+        cx, cy = x0 + gcx * w, y0 + gcy * h
+        rx, ry = max(1.0, grx * w), max(1.0, gry * h)
+        d = math.hypot((px - cx) / rx, (py - cy) / ry)
+        return abs(d - 1.0) * min(rx, ry) <= tol
+    ln, tn, rn, bn = geom
+    sx, sy = x0 + ln * w, y0 + tn * h
+    ex, ey = x0 + rn * w, y0 + bn * h
+    inside_x = (sx - tol) <= px <= (ex + tol)
+    inside_y = (sy - tol) <= py <= (ey + tol)
+    on_v = abs(px - sx) <= tol or abs(px - ex) <= tol
+    on_h = abs(py - sy) <= tol or abs(py - ey) <= tol
+    return (inside_x and inside_y) and (on_v or on_h)
+
+
+def _stroke_mark(p, rect, kind: str, geom, pen: QPen, cross_size: int = 18):
+    """The bare shape, with the pen already set up by the caller."""
+    x0, y0 = rect.left(), rect.top()
+    w, h = rect.width(), rect.height()
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    if kind == "cross":
+        gx, gy = geom
+        cx, cy = x0 + int(gx * w), y0 + int(gy * h)
+        sz = max(2, int(cross_size))
+        p.drawLine(cx - sz, cy, cx + sz, cy)
+        p.drawLine(cx, cy - sz, cx, cy + sz)
+    elif kind == "circle":
+        gcx, gcy, grx, gry = geom
+        cx, cy = x0 + int(gcx * w), y0 + int(gcy * h)
+        rx, ry = max(1, int(grx * w)), max(1, int(gry * h))
+        p.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
+    else:
+        ln, tn, rn, bn = geom
+        p.drawRect(x0 + int(ln * w), y0 + int(tn * h),
+                   int((rn - ln) * w), int((bn - tn) * h))
+
+
+def _mark_pen(colour: QColor, width: int, dashed: bool = False) -> QPen:
+    pen = QPen(colour)
+    pen.setWidth(max(1, int(width)))
+    if dashed:
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setDashPattern([4, 4])
+    return pen
+
+
+def draw_marks(p, rect, marks, style, *, pen_min_w: int = 0,
+               draw_mode: str = "", selected=None, handle_radius: int = 0):
+    """Draw every mark of every kind into `rect`.
+
+    ONE routine for the screen and for every saved picture, so a saved copy is what was
+    on screen. `rect` is the image rect on the widget, or QRect(0, 0, w, h) when burning
+    the marks into the picture itself. `style` carries the colours, thicknesses and the
+    cross size. `pen_min_w` is the floor a saved picture puts under the pen so a 2 px
+    line does not vanish on a 4000 px frame. `selected` is (kind, index) — the mark the
+    operator has picked; it is screen-only, so every save path passes None. Handles are
+    drawn only when `handle_radius` is set, and only on the selected mark: with eight
+    circles armed, handles on all of them would be forty blobs over the picture."""
+    marks = marks or {}
+    csize = int(style.get("cross_size", 18) or 18)
+    for kind in MARK_KINDS:
+        lst = marks.get(kind) or ()
+        if not lst:
+            continue
+        colour = style.get(f"{kind}_color") or QColor(255, 255, 255, 230)
+        thick = max(int(style.get(f"{kind}_thick", 2) or 2), int(pen_min_w))
+        for i, geom in enumerate(lst):
+            is_sel = (selected == (kind, i))
+            if is_sel:
+                _stroke_mark(p, rect, kind, geom,
+                             _mark_pen(_SEL_CASE, thick + 4), csize)
+            _stroke_mark(p, rect, kind, geom,
+                         _mark_pen(colour, thick + (1 if is_sel else 0)), csize)
+            if not is_sel:
+                continue
+            if kind == "cross":
+                # A cross's arms are a few pixels long: white dashes down the middle of
+                # them would leave nothing of the colour that says which kind of mark it
+                # is, and there is nothing to hang grab points on. Its selection is a
+                # dashed box around it instead — which is also the area that answers to
+                # a click, so what is drawn is what is clickable.
+                hs = csize + 4
+                c = mark_handles(rect, kind, geom)["move"]
+                box = QRect(int(c.x()) - hs, int(c.y()) - hs, hs * 2, hs * 2)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(_mark_pen(_SEL_CASE, 3))
+                p.drawRect(box)
+                p.setPen(_mark_pen(_SEL_DASH, 1, dashed=True))
+                p.drawRect(box)
+                continue
+            # White dashes along the outline, then the grab points that resize it.
+            _stroke_mark(p, rect, kind, geom,
+                         _mark_pen(_SEL_DASH, 1, dashed=True), csize)
+            if handle_radius > 0 and draw_mode == kind:
+                r = int(handle_radius)
+                p.setPen(QPen(_HANDLE_BORDER, 1))
+                p.setBrush(_HANDLE_FILL)
+                for pt in mark_handles(rect, kind, geom).values():
+                    p.drawEllipse(int(pt.x()) - r, int(pt.y()) - r, r * 2, r * 2)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+
+
+def mark_style_of_view(iv) -> dict:
+    """Screen style — the per-camera appearance fields."""
+    return {"cross_color": iv.cross_color, "cross_thick": iv.cross_thickness,
+            "cross_size": iv.cross_size,
+            "circle_color": iv.circle_color, "circle_thick": iv.circle_thick,
+            "square_color": iv.square_color, "square_thick": iv.square_thick}
+
+
+def overlay_params_from_view(iv, style: dict) -> dict:
+    """What a save path needs to reproduce the screen: the marks and the look.
+
+    The marks are COPIED — this dict is handed to SaveRangeTask, which runs on a worker
+    thread while the operator can go on drawing, and a shared list would let a mark
+    appear or vanish halfway through a batch."""
+    p = dict(style)
+    p["marks"] = copy_marks(visible_marks(iv))
+    return p
+
 # ---------------- BACKGROUND SAVE ----------------
 class SaveRangeSignals(QObject):
     progress = Signal(int, int, str)
@@ -4159,6 +4842,10 @@ class SaveRangeTask(QRunnable):
         # own, and its sources are resolved through the module-level definitions
         # (see pv_source_channels / pv_text_for_ts).
         self.pv_names: list = list(pv_names or [])
+        # This batch's own frame timeline, for the pairing window (_pv_own_window_ns).
+        # Built once: the saved frames and the panel must pair identically.
+        self._pv_frame_ts: list = sorted(
+            int(i.ts_ns) for i in (self.items or []) if getattr(i, "ts_ns", None))
         self.pv_units: dict = pv_units or {}
         self.signals = SaveRangeSignals()
 
@@ -4171,34 +4858,9 @@ class SaveRangeTask(QRunnable):
         w, h = pix.width(), pix.height()
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if p.get('show_cross') and p.get('cross_pos_norm') is not None:
-            cn = p['cross_pos_norm']
-            cx = int(cn.x() * w); cy = int(cn.y() * h)
-            sz = p.get('cross_size', 18)
-            pen = QPen(p.get('cross_color', QColor(0, 255, 0)))
-            pen.setWidth(max(p.get('cross_thick', 2), w // 500))
-            painter.setPen(pen)
-            painter.drawLine(cx - sz, cy, cx + sz, cy)
-            painter.drawLine(cx, cy - sz, cx, cy + sz)
-        if p.get('show_circle') and p.get('circle_center_norm') is not None:
-            cn = p['circle_center_norm']
-            cx = int(cn.x() * w); cy = int(cn.y() * h)
-            if p.get('circle_rx_norm') is not None:
-                rx = int(p['circle_rx_norm'] * w); ry = int(p['circle_ry_norm'] * h)
-            else:
-                r = int(p.get('circle_r_norm', 0.1) * min(w, h)); rx = ry = r
-            pen = QPen(p.get('circle_color', QColor(255, 255, 0)))
-            pen.setWidth(max(p.get('circle_thick', 2), w // 500))
-            painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
-        if p.get('show_square') and p.get('square_rect_norm') is not None:
-            ln, tn, rn, bn = p['square_rect_norm']
-            sx = int(ln * w); sy = int(tn * h)
-            sw = int((rn - ln) * w); sh = int((bn - tn) * h)
-            pen = QPen(p.get('square_color', QColor(0, 200, 255)))
-            pen.setWidth(max(p.get('square_thick', 2), w // 500))
-            painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(sx, sy, sw, sh)
+        # The same routine the screen uses, so a saved copy is what was on screen.
+        draw_marks(painter, QRect(0, 0, w, h), p.get('marks'), p,
+                   pen_min_w=w // 500)
         painter.end()
         return pix
 
@@ -4249,11 +4911,7 @@ class SaveRangeTask(QRunnable):
         p = self.overlay_params or {}
         # A drawn shape (cross/circle/square) is the only thing that counts as a real
         # "modification" — palette, brightness and the PV bar are just views/annotations.
-        has_shapes = bool(
-            (p.get('show_cross')  and p.get('cross_pos_norm')   is not None) or
-            (p.get('show_circle') and p.get('circle_center_norm') is not None) or
-            (p.get('show_square') and p.get('square_rect_norm') is not None)
-        )
+        has_shapes = has_any_mark(p.get('marks'))
         # `brighten` used to count too, but the Default palette now ignores every
         # enhancement (see load_image_scaled), so on Default the rendered view is
         # byte-for-byte the original picture and copying the file is the better save.
@@ -4265,7 +4923,8 @@ class SaveRangeTask(QRunnable):
             # Per-image PV text: archiver values at each image's OWN timestamp
             # (day-level cache → ~1 HTTP request per channel per day).
             if self.pv_names:
-                pv_text = (pv_text_for_ts(it.ts_ns, list(self.pv_names))
+                pv_text = (pv_text_for_ts(it.ts_ns, list(self.pv_names),
+                                          self._pv_frame_ts)
                            or (self.overlay_params or {}).get('pv_text', ''))
             else:
                 pv_text = (self.overlay_params or {}).get('pv_text', '')
@@ -6777,6 +7436,25 @@ def save_ref_rect_config(cam_name: str, cfg: "CamRefRectConfig"):
     _save_cam_ref_rects(data)
 
 
+def save_ref_rect_show(cam_name: str, show: bool):
+    """Remember ONLY the on/off switch, right when it is clicked.
+
+    The switch is not part of what Cancel takes back: once the rectangle has been
+    switched off it stays off — through Cancel, through the window's X, and through
+    every later session — until the same tick box switches it on again. The position
+    and the line style still wait for OK, so Cancel undoes those."""
+    key = _ref_rect_key(cam_name)
+    if not key:
+        return
+    data = _load_cam_ref_rects()
+    d = data.get(key)
+    if not isinstance(d, dict):
+        d = _asdict(CamRefRectConfig())
+    d["show"] = bool(show)
+    data[key] = d
+    _save_cam_ref_rects(data)
+
+
 def _draw_outlined_text(p, rect, align_flags, text, font, fill_color, outline_px: int):
     """Draw text centred in rect; if outline_px > 0 draws a black stroke behind the fill."""
     if not text:
@@ -7369,7 +8047,7 @@ class CamRefRectDialog(QDialog):
         btn_row.addStretch()
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(self._on_accept)
-        btns.rejected.connect(self._on_reject)
+        btns.rejected.connect(self.reject)
         btn_row.addWidget(btns)
         lay.addLayout(btn_row)
 
@@ -7427,10 +8105,16 @@ class CamRefRectDialog(QDialog):
 
     def _on_show_toggled(self, state: int):
         self._cfg.show = bool(state)
+        # Written straight away: only this tick box may switch the rectangle on, so
+        # leaving the window any other way must not bring it back (save_ref_rect_show).
+        self._orig_cfg.show = self._cfg.show
+        save_ref_rect_show(self._cam_name, self._cfg.show)
         self._live_update()
 
     def _reset_all(self):
+        keep_show = self._cfg.show      # the default is ON; the switch keeps its state
         self._cfg = CamRefRectConfig()
+        self._cfg.show = keep_show
         for fld, sb in self._edge_sb.items():
             sb.blockSignals(True)
             sb.setValue(getattr(self._cfg, fld) * 100.0)
@@ -7449,12 +8133,14 @@ class CamRefRectDialog(QDialog):
             self._img_view.update()
         self.accept()
 
-    def _on_reject(self):
+    def reject(self):
+        # An override, not a slot: the window's X closes through reject() as well, and
+        # that way out used to leave the live preview hanging on the picture.
         if self._img_view is not None:
             self._img_view._ref_rect_override = None
             self._img_view.ref_rect_cfg = self._orig_cfg
             self._img_view.update()
-        self.reject()
+        super().reject()
 
     def save_config(self):
         save_ref_rect_config(self._cam_name, self._cfg)
@@ -10043,10 +10729,15 @@ class ImageView(QWidget):
         self._scaled: QPixmap | None = None
         self.bg_color: QColor = QColor("#f3f3f3")  # overrideable per-instance
 
+        # Several marks of each kind may sit on this camera (see MARK_KINDS): the tick
+        # boxes say which kinds are shown, `marks` holds the geometry, `_sel` is the one
+        # the operator clicked — the one Delete takes away.
+        self.marks: dict = new_marks()
+        self._sel: "tuple[str, int] | None" = None
+
         self.show_cross  = False
         self.cross_size  = 18
         self.cross_thickness = 2
-        self.cross_pos_norm: QPointF | None = None
         self._draw_mode: str = ""
         self.energy_text: str = ""
         self.timestamp_text: str = ""   # shown as large white overlay in top-left
@@ -10056,13 +10747,11 @@ class ImageView(QWidget):
         self.cam_label_font_px: int = 12  # controlled by Label size spinbox
 
         self.show_circle = False
-        self.circle_center_norm: QPointF | None = None
-        self.circle_r_norm: float | None = None
-        self.circle_rx_norm: float | None = None  # normalizováno přes šířku obrazu
-        self.circle_ry_norm: float | None = None  # normalizováno přes výšku obrazu
         # draw state
         self._drag_start: QPointF | None = None
-        self._drag_handle: str = ""   # "" | "move" | "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se"
+        self._drag_handle: str = ""   # "" | "new" | "move" | "n" | "s" | "e" | "w" | "nw" | "ne" | "sw" | "se"
+        self._drag_idx: int = -1      # which mark of the armed kind is being dragged
+        self._drag_pending_new = False  # a "new" drag that has not moved far enough yet
 
         self.cross_color     = QColor(0, 255, 0, 220)
         self.circle_color    = QColor(255, 255, 0, 230)
@@ -10071,8 +10760,6 @@ class ImageView(QWidget):
         self.square_thick    = 2
 
         self.show_square = False
-        # stored as (left_norm, top_norm, right_norm, bottom_norm) — all in [0,1]
-        self.square_rect_norm: tuple[float, float, float, float] | None = None
 
         # Top-N SC pixel markers: list of (nx, ny) normalized coords, or None
         self.sc_topn_points_norm: "list[tuple[float,float]] | None" = None
@@ -10210,7 +10897,77 @@ class ImageView(QWidget):
     def set_draw_mode(self, mode: str):
         self._draw_mode = mode
         self.setCursor(Qt.CursorShape.CrossCursor if mode else Qt.CursorShape.ArrowCursor)
+        # Arming a mode picks up the mark added last, so a camera carrying one shape
+        # behaves exactly as it always has: its handles are there to grab straight away,
+        # with no click to select it first.
+        lst = self.marks.get(mode) or ()
+        self._sel = (mode, len(lst) - 1) if lst else None
         self.update()
+
+    # ── marks ────────────────────────────────────────────────────────────────
+    def add_mark(self, kind: str, geom) -> int:
+        """Put one more mark on this camera and return its index."""
+        self.marks.setdefault(kind, []).append(tuple(geom))
+        return len(self.marks[kind]) - 1
+
+    def set_marks(self, kind: str, geoms):
+        """Replace every mark of one kind (the mirror onto another camera, and Clear)."""
+        self.marks[kind] = [tuple(g) for g in (geoms or ())]
+        if self._sel is not None and self._sel[0] == kind:
+            self._sel = None
+
+    def clear_marks(self):
+        self.marks = new_marks()
+        self._sel = None
+
+    def selected_geom(self):
+        """Geometry of the selected mark, or None."""
+        if self._sel is None:
+            return None
+        kind, i = self._sel
+        lst = self.marks.get(kind) or ()
+        return lst[i] if 0 <= i < len(lst) else None
+
+    def _hit_mark(self, kind: str, pos, ir) -> "int | None":
+        """Index of the mark under `pos`, searched from the top down — the mark added
+        last is drawn last, so it is the one the operator sees up there."""
+        lst = self.marks.get(kind) or ()
+        thick = {"circle": self.circle_thick, "square": self.square_thick}.get(kind, 2)
+        for i in range(len(lst) - 1, -1, -1):
+            if mark_hit(ir, kind, lst[i], pos, cross_size=self.cross_size, thick=thick):
+                return i
+        return None
+
+    def focusOutEvent(self, event):
+        # The selection belongs to the view that has the keyboard, and Delete only ever
+        # reaches that one. Left lit on a tile the operator has walked away from, the
+        # highlight would promise something the key no longer does.
+        if self._sel is not None:
+            self._sel = None
+            self.update()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        """Delete takes away the mark that is picked out on the picture.
+
+        Everything else is handed straight on: the Viewer owns the arrow keys, F11 and
+        Escape, and this widget takes the keyboard the moment a picture is clicked, so
+        swallowing a key here would stop the arrows stepping through the frames."""
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) \
+                and self._draw_mode and self._sel is not None \
+                and self._sel[0] == self._draw_mode:
+            kind, i = self._sel
+            lst = self.marks.get(kind) or []
+            if 0 <= i < len(lst):
+                del lst[i]
+                self._sel = (kind, len(lst) - 1) if lst else None
+                self.update()
+                # The same signal a drag sends: the other selected cameras are handed
+                # the whole (now shorter) list, so the mark goes from all of them.
+                self.overlay_edited.emit(kind)
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def _img_rect(self) -> QRect | None:
         self._ensure_scaled()
@@ -10229,37 +10986,13 @@ class ImageView(QWidget):
     def _handle_radius(self) -> int:
         return 7
 
-    def _circle_handles(self, ir: QRect) -> dict:
-        """Vrátí handlery pro ellipsu: střed + 4 okraje."""
-        if self.circle_center_norm is None: return {}
-        cx = ir.left() + int(self.circle_center_norm.x() * ir.width())
-        cy = ir.top()  + int(self.circle_center_norm.y() * ir.height())
-        rx = int((self.circle_rx_norm or 0) * ir.width())
-        ry = int((self.circle_ry_norm or 0) * ir.height())
-        return {
-            "move": QPointF(cx, cy),
-            "n":    QPointF(cx, cy - ry),
-            "s":    QPointF(cx, cy + ry),
-            "e":    QPointF(cx + rx, cy),
-            "w":    QPointF(cx - rx, cy),
-        }
-
-    def _square_handles(self, ir: QRect) -> dict:
-        """Vrátí handlery pro obdélník: střed + 4 rohy + 4 hrany."""
-        if self.square_rect_norm is None: return {}
-        ln, tn, rn, bn = self.square_rect_norm
-        sx = ir.left() + int(ln * ir.width())
-        sy = ir.top()  + int(tn * ir.height())
-        ex = ir.left() + int(rn * ir.width())
-        ey = ir.top()  + int(bn * ir.height())
-        mx, my = (sx + ex) // 2, (sy + ey) // 2
-        return {
-            "move": QPointF(mx, my),
-            "nw": QPointF(sx, sy), "ne": QPointF(ex, sy),
-            "sw": QPointF(sx, ey), "se": QPointF(ex, ey),
-            "n":  QPointF(mx, sy), "s":  QPointF(mx, ey),
-            "w":  QPointF(sx, my), "e":  QPointF(ex, my),
-        }
+    def _sel_handles(self, ir: QRect) -> dict:
+        """Grab points of the SELECTED mark — the only one that shows any, so the only
+        one that answers to them."""
+        g = self.selected_geom()
+        if g is None:
+            return {}
+        return mark_handles(ir, self._sel[0], g)
 
     def _hit_handle(self, pos: QPointF, handles: dict) -> str:
         r = self._handle_radius() + 3
@@ -10268,12 +11001,19 @@ class ImageView(QWidget):
                 return name
         return ""
 
-    def _set_cross_at(self, pos, ir):
-        """Put the cross at widget position `pos` inside image rect `ir`."""
-        self.cross_pos_norm = QPointF(
-            max(0.0, min(1.0, (pos.x() - ir.left()) / ir.width())),
-            max(0.0, min(1.0, (pos.y() - ir.top())  / ir.height()))
-        )
+    @staticmethod
+    def _norm_in(pos, ir) -> tuple:
+        return (max(0.0, min(1.0, (pos.x() - ir.left()) / ir.width())),
+                max(0.0, min(1.0, (pos.y() - ir.top())  / ir.height())))
+
+    def _place_cross_at(self, pos, ir, *, new: bool):
+        """Put a cross at widget position `pos`. `new` adds one, otherwise the selected
+        cross is moved there."""
+        g = self._norm_in(pos, ir)
+        if new or self._sel is None or self._sel[0] != "cross":
+            self._sel = ("cross", self.add_mark("cross", g))
+        else:
+            self.marks["cross"][self._sel[1]] = g
         self.update()
         self.overlay_edited.emit("cross")
 
@@ -10295,48 +11035,47 @@ class ImageView(QWidget):
             super().mousePressEvent(event); return
         pos = event.position()
 
-        if self._draw_mode == "cross":
-            # Press puts the cross under the cursor and keeps it there until release:
-            # a click alone places it, holding on drags it. Clicking anywhere else is
-            # the same gesture, so it simply moves — there is only ever one cross.
-            self._drag_handle = "cross"
-            self._drag_start = pos
-            self._set_cross_at(pos, ir)
-            return
+        mode = self._draw_mode
+        if mode not in MARK_KINDS:
+            super().mousePressEvent(event); return
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        self._drag_pending_new = False
 
-        if self._draw_mode == "circle" and self.circle_center_norm is not None \
-                and self.circle_rx_norm is not None:
-            hit = self._hit_handle(pos, self._circle_handles(ir))
+        # Ctrl means "make a new one here anyway" — without it, landing on a mark picks
+        # that mark up instead, which is what makes Delete able to name one of several.
+        if not ctrl:
+            # The selected mark shows its grab points, so those come first.
+            hit = self._hit_handle(pos, self._sel_handles(ir)) \
+                if (self._sel is not None and self._sel[0] == mode) else ""
             if hit:
                 self._drag_handle = hit
+                self._drag_idx = self._sel[1]
                 self._drag_start = pos
                 return
-            # klik mimo handlery = začít kreslit nový
-            self._drag_handle = "new"
-            self._drag_start = pos
-            return
-
-        if self._draw_mode == "circle":
-            self._drag_handle = "new"
-            self._drag_start = pos
-            return
-
-        if self._draw_mode == "square" and self.square_rect_norm is not None:
-            hit = self._hit_handle(pos, self._square_handles(ir))
-            if hit:
-                self._drag_handle = hit
+            i = self._hit_mark(mode, pos, ir)
+            if i is not None:
+                self._sel = (mode, i)
+                self._drag_handle = "move"
+                self._drag_idx = i
                 self._drag_start = pos
+                self.update()
                 return
-            self._drag_handle = "new"
+
+        if mode == "cross":
+            self._drag_handle = "move"
             self._drag_start = pos
+            self._place_cross_at(pos, ir, new=True)
+            self._drag_idx = self._sel[1]
             return
 
-        if self._draw_mode == "square":
-            self._drag_handle = "new"
-            self._drag_start = pos
-            return
+        # Circle / square: the mark is created on the first real movement, so the drag
+        # can define its size. A press that never moves makes one of its own on release.
+        self._drag_handle = "new"
+        self._drag_idx = -1
+        self._drag_start = pos
+        self._drag_pending_new = True
 
-        super().mousePressEvent(event)
+    _DRAG_PX = 4
 
     def mouseMoveEvent(self, event):
         if self._rb_start is not None:
@@ -10354,9 +11093,10 @@ class ImageView(QWidget):
         shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
 
         # kurzor podle handleru
-        if self._draw_mode in ("circle", "square") and not self._drag_handle:
-            handles = self._circle_handles(ir) if self._draw_mode == "circle" else self._square_handles(ir)
-            hit = self._hit_handle(pos, handles)
+        mode = self._draw_mode
+        if mode in MARK_KINDS and not self._drag_handle:
+            hit = self._hit_handle(pos, self._sel_handles(ir)) \
+                if (self._sel is not None and self._sel[0] == mode) else ""
             if hit == "move":
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
             elif hit in ("n", "s"):
@@ -10367,23 +11107,45 @@ class ImageView(QWidget):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
             elif hit in ("ne", "sw"):
                 self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif self._hit_mark(mode, pos, ir) is not None:
+                # Over a mark that is not the selected one: clicking picks it up.
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
             else:
                 self.setCursor(Qt.CursorShape.CrossCursor)
 
         if not (event.buttons() & Qt.MouseButton.LeftButton): return
         if self._drag_start is None: return
+        if mode not in MARK_KINDS: return
 
         def clamp_norm(v): return max(0.0, min(1.0, v))
         def to_norm(px, py):
             return clamp_norm((px - ir.left()) / ir.width()), clamp_norm((py - ir.top()) / ir.height())
 
         # ── CROSS ───────────────────────────────────────────────────────
-        if self._draw_mode == "cross" and self._drag_handle == "cross":
-            self._set_cross_at(pos, ir)
+        if mode == "cross":
+            if self._drag_handle:
+                self._place_cross_at(pos, ir, new=False)
+            return
+
+        # A circle or a square is born on the first real movement, so the drag itself
+        # can give it a size. Below that the press is a click and is dealt with on
+        # release.
+        if self._drag_handle == "new" and self._drag_pending_new:
+            if abs(pos.x() - self._drag_start.x()) < self._DRAG_PX and \
+               abs(pos.y() - self._drag_start.y()) < self._DRAG_PX:
+                return
+            self._drag_idx = self.add_mark(mode, (0.0, 0.0, 0.0, 0.0))
+            self._sel = (mode, self._drag_idx)
+            self._drag_pending_new = False
+
+        lst = self.marks.get(mode) or []
+        i = self._drag_idx
+        if not (0 <= i < len(lst)):
             return
 
         # ── CIRCLE ──────────────────────────────────────────────────────
-        if self._draw_mode == "circle":
+        if mode == "circle":
+            cx, cy, rx_n, ry_n = lst[i]
             if self._drag_handle == "new":
                 # tažení = střed je start, poloměr = vzdálenost
                 x0, y0 = self._drag_start.x(), self._drag_start.y()
@@ -10394,38 +11156,32 @@ class ImageView(QWidget):
                     rx_n, ry_n = r, r
                 else:
                     rx_n, ry_n = abs(dx), abs(dy)
-                self.circle_center_norm = QPointF(*to_norm(x0, y0))
-                self.circle_rx_norm = rx_n
-                self.circle_ry_norm = ry_n
-                self.circle_r_norm  = max(rx_n, ry_n)
+                cx, cy = to_norm(x0, y0)
 
             elif self._drag_handle == "move":
                 dx = (pos.x() - self._drag_start.x()) / ir.width()
                 dy = (pos.y() - self._drag_start.y()) / ir.height()
                 self._drag_start = pos
-                cx = clamp_norm(self.circle_center_norm.x() + dx)
-                cy = clamp_norm(self.circle_center_norm.y() + dy)
-                self.circle_center_norm = QPointF(cx, cy)
+                cx = clamp_norm(cx + dx)
+                cy = clamp_norm(cy + dy)
 
             elif self._drag_handle in ("e", "w"):
-                cx_px = ir.left() + self.circle_center_norm.x() * ir.width()
+                cx_px = ir.left() + cx * ir.width()
                 rx_n = abs(pos.x() - cx_px) / ir.width()
-                if shift: self.circle_ry_norm = rx_n
-                self.circle_rx_norm = rx_n
-                self.circle_r_norm  = max(self.circle_rx_norm, self.circle_ry_norm)
+                if shift: ry_n = rx_n
 
             elif self._drag_handle in ("n", "s"):
-                cy_px = ir.top() + self.circle_center_norm.y() * ir.height()
+                cy_px = ir.top() + cy * ir.height()
                 ry_n = abs(pos.y() - cy_px) / ir.height()
-                if shift: self.circle_rx_norm = ry_n
-                self.circle_ry_norm = ry_n
-                self.circle_r_norm  = max(self.circle_rx_norm, self.circle_ry_norm)
+                if shift: rx_n = ry_n
 
+            lst[i] = (cx, cy, rx_n, ry_n)
             self.update()
             self.overlay_edited.emit("circle")
 
         # ── SQUARE ──────────────────────────────────────────────────────
-        elif self._draw_mode == "square":
+        else:
+            ln, tn, rn, bn = lst[i]
             if self._drag_handle == "new":
                 # Střed je drag_start, roztahuje se symetricky na obě strany
                 cx0, cy0 = to_norm(self._drag_start.x(), self._drag_start.y())
@@ -10435,23 +11191,18 @@ class ImageView(QWidget):
                 if shift:
                     side = max(dx, dy)
                     dx, dy = side, side
-                self.square_rect_norm = (
-                    max(0.0, cx0 - dx), max(0.0, cy0 - dy),
-                    min(1.0, cx0 + dx), min(1.0, cy0 + dy)
-                )
+                ln, tn = max(0.0, cx0 - dx), max(0.0, cy0 - dy)
+                rn, bn = min(1.0, cx0 + dx), min(1.0, cy0 + dy)
 
             elif self._drag_handle == "move":
                 dx = (pos.x() - self._drag_start.x()) / ir.width()
                 dy = (pos.y() - self._drag_start.y()) / ir.height()
                 self._drag_start = pos
-                ln, tn, rn, bn = self.square_rect_norm
                 w_ = rn - ln; h_ = bn - tn
                 ln = clamp_norm(ln + dx); tn = clamp_norm(tn + dy)
-                self.square_rect_norm = (ln, tn,
-                    clamp_norm(ln + w_), clamp_norm(tn + h_))
+                rn, bn = clamp_norm(ln + w_), clamp_norm(tn + h_)
 
             else:
-                ln, tn, rn, bn = self.square_rect_norm
                 h = self._drag_handle
                 nx, ny = to_norm(pos.x(), pos.y())
                 if "w" in h: ln = min(nx, rn - 0.01)
@@ -10464,11 +11215,10 @@ class ImageView(QWidget):
                     elif h in ("nw",): side = max(rn - ln, bn - tn); ln = rn - side; tn = bn - side
                     elif h in ("ne",): side = max(rn - ln, bn - tn); rn = ln + side; tn = bn - side
                     elif h in ("sw",): side = max(rn - ln, bn - tn); ln = rn - side; bn = tn + side
-                self.square_rect_norm = (
-                    clamp_norm(ln), clamp_norm(tn),
-                    clamp_norm(rn), clamp_norm(bn)
-                )
+                ln, tn = clamp_norm(ln), clamp_norm(tn)
+                rn, bn = clamp_norm(rn), clamp_norm(bn)
 
+            lst[i] = (ln, tn, rn, bn)
             self.update()
             self.overlay_edited.emit("square")
 
@@ -10519,9 +11269,26 @@ class ImageView(QWidget):
 
             self.update()
             return
+        # A press that never moved is a click, and a click has to leave a mark — the
+        # rule is the same for all three shapes. A circle or a square gets a small
+        # default size, because a click on its own cannot say how big it should be.
+        if self._drag_pending_new and self._draw_mode in ("circle", "square") \
+                and self._drag_start is not None:
+            ir = self._img_rect()
+            if ir is not None and ir.width() > 0 and ir.height() > 0:
+                cx, cy = self._norm_in(self._drag_start, ir)
+                r = _NEW_MARK_FRAC
+                geom = ((cx, cy, r, r) if self._draw_mode == "circle"
+                        else (max(0.0, cx - r), max(0.0, cy - r),
+                              min(1.0, cx + r), min(1.0, cy + r)))
+                self._sel = (self._draw_mode, self.add_mark(self._draw_mode, geom))
+                self.update()
+                self.overlay_edited.emit(self._draw_mode)
+        self._drag_pending_new = False
         self._rb_start = None
         self._rb_current = None
         self._drag_handle = ""
+        self._drag_idx = -1
         self._drag_start = None
         super().mouseReleaseEvent(event)
 
@@ -10564,56 +11331,12 @@ class ImageView(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(img_rect)
 
-        if self.show_cross:
-            if self.cross_pos_norm is not None:
-                cx = img_rect.left() + int(self.cross_pos_norm.x() * img_rect.width())
-                cy = img_rect.top()  + int(self.cross_pos_norm.y() * img_rect.height())
-            else:
-                cx = img_rect.center().x(); cy = img_rect.center().y()
-            pen = QPen(self.cross_color); pen.setWidth(self.cross_thickness); p.setPen(pen)
-            p.drawLine(cx - self.cross_size, cy, cx + self.cross_size, cy)
-            p.drawLine(cx, cy - self.cross_size, cx, cy + self.cross_size)
+        # The marks — the same routine every saved picture goes through, so what is
+        # exported is what is here. Only the selection highlight is screen-only.
+        draw_marks(p, img_rect, visible_marks(self), mark_style_of_view(self),
+                   draw_mode=self._draw_mode, selected=self._sel,
+                   handle_radius=self._handle_radius())
 
-        if self.show_circle and self.circle_center_norm is not None:
-            nx, ny = self.circle_center_norm.x(), self.circle_center_norm.y()
-            cx = img_rect.left() + int(nx * img_rect.width())
-            cy = img_rect.top()  + int(ny * img_rect.height())
-            # použij rx/ry pokud jsou k dispozici (přesné), jinak fallback na r
-            if self.circle_rx_norm is not None and self.circle_ry_norm is not None:
-                rx = int(self.circle_rx_norm * img_rect.width())
-                ry = int(self.circle_ry_norm * img_rect.height())
-            else:
-                rx = ry = int(self.circle_r_norm * min(img_rect.width(), img_rect.height()))
-            pen = QPen(self.circle_color); pen.setWidth(self.circle_thick); p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
-            if self._draw_mode == "circle":
-                for pt in self._circle_handles(img_rect).values():
-                    p.setPen(QPen(self.circle_color))
-                    p.setBrush(QColor(self.circle_color.red(), self.circle_color.green(),
-                                      self.circle_color.blue(), 120))
-                    p.drawEllipse(int(pt.x()) - self._handle_radius(),
-                                  int(pt.y()) - self._handle_radius(),
-                                  self._handle_radius()*2, self._handle_radius()*2)
-
-        if self.show_square and self.square_rect_norm is not None:
-            # square_rect_norm = (left_norm, top_norm, right_norm, bottom_norm)
-            ln, tn, rn, bn = self.square_rect_norm
-            sx = img_rect.left() + int(ln * img_rect.width())
-            sy = img_rect.top()  + int(tn * img_rect.height())
-            sw = int((rn - ln) * img_rect.width())
-            sh = int((bn - tn) * img_rect.height())
-            pen = QPen(self.square_color); pen.setWidth(self.square_thick); p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(sx, sy, sw, sh)
-            if self._draw_mode == "square":
-                for pt in self._square_handles(img_rect).values():
-                    p.setPen(QPen(self.square_color))
-                    p.setBrush(QColor(self.square_color.red(), self.square_color.green(),
-                                      self.square_color.blue(), 120))
-                    p.drawEllipse(int(pt.x()) - self._handle_radius(),
-                                  int(pt.y()) - self._handle_radius(),
-                                  self._handle_radius()*2, self._handle_radius()*2)
         if self.energy_text and not self._pix.isNull():
             # No local import of QFont/QFontMetrics here: both are module-level
             # already, and importing them INSIDE this branch made them local to the
@@ -10922,10 +11645,7 @@ class ImageView(QWidget):
 
         if r < min(w,h)*CIRCLE_R_MIN_FRAC or r > min(w,h)*CIRCLE_R_MAX_FRAC: return False
         r *= 1.04  # soft edge kompenzace — hrana je měkká, fit leží těsně uvnitř
-        self.circle_center_norm = QPointF(cx / w, cy / h)
-        self.circle_r_norm  = r / min(w, h)
-        self.circle_rx_norm = r / w
-        self.circle_ry_norm = r / h
+        self._sel = ("circle", self.add_mark("circle", (cx / w, cy / h, r / w, r / h)))
         return True
 
     def _calibrate_circle_hard(self) -> bool:
@@ -11003,10 +11723,7 @@ class ImageView(QWidget):
         if edge_r < r_min or edge_r > r_max: return False
 
         r = float(edge_r)
-        self.circle_center_norm = QPointF(cx0 / w, cy0 / h)
-        self.circle_r_norm  = r / min(w, h)
-        self.circle_rx_norm = r / w
-        self.circle_ry_norm = r / h
+        self._sel = ("circle", self.add_mark("circle", (cx0 / w, cy0 / h, r / w, r / h)))
         return True
     
     def calibrate_cross_from_pixmap(self) -> bool:
@@ -11048,7 +11765,7 @@ class ImageView(QWidget):
         cx = float((arr * xs).sum() / total)
         cy = float((arr * ys).sum() / total)
 
-        self.cross_pos_norm = QPointF(cx / w, cy / h)
+        self._sel = ("cross", self.add_mark("cross", (cx / w, cy / h)))
         return True
 
     # ------------------------------------------------------------------ square
@@ -11161,7 +11878,8 @@ class ImageView(QWidget):
         if (right_n - left_n) > 0.99 or (bottom_n - top_n) > 0.99:
             return False
 
-        self.square_rect_norm = (left_n, top_n, right_n, bottom_n)
+        self._sel = ("square",
+                     self.add_mark("square", (left_n, top_n, right_n, bottom_n)))
         return True
 
 # ---------------- MULTI CAMERA GRID ----------------
@@ -11984,31 +12702,22 @@ class MultiCameraGrid(QWidget):
         self._overlay_store: dict[str, dict] = {}  # cam_name → overlay state
         self._layout_config = None  # CamLayoutConfig or None
 
+    # The tiles are destroyed and built again on every change of the camera set and on
+    # every scan, so whatever is not in these two goes for good. The lists are COPIED
+    # both ways: a shared list would make the store follow every later edit, and
+    # "restore" would then hand back whatever happened afterwards.
     @staticmethod
     def _save_iv_overlay(iv: "ImageView") -> dict:
-        return {
-            "show_cross":          iv.show_cross,
-            "cross_pos_norm":      iv.cross_pos_norm,
-            "show_circle":         iv.show_circle,
-            "circle_center_norm":  iv.circle_center_norm,
-            "circle_r_norm":       iv.circle_r_norm,
-            "circle_rx_norm":      iv.circle_rx_norm,
-            "circle_ry_norm":      iv.circle_ry_norm,
-            "show_square":         iv.show_square,
-            "square_rect_norm":    iv.square_rect_norm,
-        }
+        state = {f"show_{k}": getattr(iv, f"show_{k}", False) for k in MARK_KINDS}
+        state["marks"] = copy_marks(iv.marks)
+        return state
 
     @staticmethod
     def _restore_iv_overlay(iv: "ImageView", state: dict):
-        iv.show_cross         = state.get("show_cross", False)
-        iv.cross_pos_norm     = state.get("cross_pos_norm")
-        iv.show_circle        = state.get("show_circle", False)
-        iv.circle_center_norm = state.get("circle_center_norm")
-        iv.circle_r_norm      = state.get("circle_r_norm")
-        iv.circle_rx_norm     = state.get("circle_rx_norm")
-        iv.circle_ry_norm     = state.get("circle_ry_norm")
-        iv.show_square        = state.get("show_square", False)
-        iv.square_rect_norm   = state.get("square_rect_norm")
+        for k in MARK_KINDS:
+            setattr(iv, f"show_{k}", state.get(f"show_{k}", False))
+        iv.marks = copy_marks(state.get("marks"))
+        iv._sel = None
 
     def setup_cameras(self, cam_names: list[str], layout_config=None):
         """Vytvoří/překreslí kamery podle seznamu jmen."""
@@ -14913,14 +15622,38 @@ class PvValueTable(QTableWidget):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMaximumHeight(120)
         self.setStyleSheet("font-size: 11px;")
+        self._apply_height(0)
         self._names: "list[str]" = []
         self.cellClicked.connect(self._on_cell_clicked)
         # The value column's tooltips EXPLAIN a state ("belongs to an earlier shot",
         # "not published yet"), and Qt takes its own tooltips away after ~10 s. They
         # are therefore shown by hand from eventFilter — see _show_long_tip.
         self.viewport().installEventFilter(self)
+
+    def _apply_height(self, rows: int):
+        """Pin the table to the exact height of the rows it holds — BOTH sides.
+
+        A maximum alone is not enough. A QTableWidget is Expanding with a
+        minimumSizeHint of roughly two rows, so in the 275 px panel it is the one
+        widget a layout that is short of room can steal height from. Collapsing
+        another section is exactly that case: the panel's content then fits its
+        viewport, the scrollbar disappears, and the shortfall is taken out of THIS
+        widget — the reported "collapse Timeline & Range and the PV list drops to two
+        rows nobody can read past" (16.09.2026, measured in
+        testing/probe_pv_table_squeeze.py: 106 px with the section open, 82 px with it
+        shut).
+
+        A fixed height cannot be squeezed, so the room has to come from the panel's own
+        scrollbar instead, which is what it is a scroll area for. Measured off the
+        widget (header sizeHint + frame) rather than a guessed constant, so another
+        style or DPI still shows every row.
+        """
+        head = (self.horizontalHeader().sizeHint().height()
+                if not self.horizontalHeader().isHidden() else 0)
+        h = int(head + max(int(rows), 1) * self.ROW_H + 2 * self.frameWidth())
+        self.setMinimumHeight(h)
+        self.setMaximumHeight(h)
 
     def _on_cell_clicked(self, row: int, col: int):
         if col == 0 and 0 <= row < len(self._names):
@@ -14948,7 +15681,7 @@ class PvValueTable(QTableWidget):
         alarm = alarm or set()
         self._names = list(names)
         self.setRowCount(len(self._names))
-        self.setMaximumHeight(self.ROW_H * max(len(self._names), 1) + 26)
+        self._apply_height(len(self._names))
         for i, name in enumerate(self._names):
             shown = name not in hidden
             # Two different glyphs, not one glyph in two colours: on this table the
@@ -15952,6 +16685,17 @@ class Viewer(QWidget):
         self._ref_image: np.ndarray | None = None  # reference frame pro subtraction (full-res, jen pro status/existence)
         self._ref_path: "Path | None" = None        # cesta k reference snímku (re-decode na displej. rozlišení)
         self._ref_scaled: dict = {}                 # max_side -> np.ndarray reference zmenšená stejným pipeline jako aktuální snímek
+        # (frame key, stats) of the last difference measured on a FULL-SIZE render, so a
+        # smaller render of that same frame cannot replace its numbers with an estimate.
+        self._diff_last_final: "tuple | None" = None
+        # Auto contrast / brightness / gamma frozen for the current subtraction run, so
+        # every difference frame is adjusted identically — see _sub_hold_on.
+        self._sub_auto_hold: "dict | None" = None
+        self._cam_sub_hold: dict = {}       # cam_i -> the same, per tile
+        # (Diff threshold, Offset) as they last stood. _on_subtract_changed serves the
+        # checkbox AND the two spinboxes, and only the spinboxes change what the
+        # difference IS — see there.
+        self._sub_params_last: "tuple | None" = None
         self._sf_energy_map: dict[str, str] = {}  # filename -> energie ze Shot Finderu
         self._saved_timestamps: list[tuple[int, str]] = []  # (ts_ns, label)
 
@@ -15970,7 +16714,8 @@ class Viewer(QWidget):
         self._cam_ref_images: list        = []        # list of np.ndarray | None, per-camera subtraction reference (full-res, jen status)
         self._cam_ref_paths:  list        = []        # list of Path | None, cesta k reference snímku per-camera
         self._cam_ref_scaled: list        = []        # list of dict (max_side -> np.ndarray), reference zmenšená per-camera
-        self._cam_diff_stats: dict        = {}        # cam_i -> last difference stats (for the info line)
+        self._cam_diff_stats: dict        = {}        # cam_i -> (frame key, last difference stats)
+        self._cam_diff_final: dict        = {}        # cam_i -> (frame key, stats measured FULL-SIZE)
 
         # ── Online mode state ────────────────────────────────────────────────
         self._dir_watch_sigs:  "_DirWatchSignals | None" = None
@@ -16116,6 +16861,11 @@ class Viewer(QWidget):
         # is the operator-visible half of the archiver-lag fix: "12.95 J (-28 s)"
         # cannot be mistaken for this shot's reading the way "12.95 J (old)" was.
         self._pv_last_good_ts: dict[str, int] = {}
+        # The ARCHIVED MOMENT behind each number on display, per PV. Not the same thing
+        # as the frame above: a channel archived every few seconds answers a fetch for
+        # THIS frame with a reading from four seconds ago, and only this timestamp can
+        # say so. It is what the "(+2.5 s)" label is computed from.
+        self._pv_sample_ts: dict[str, int] = {}
         self._pv_no_sample: set = set()
         # PVs whose value for the fetched frame is not "missing" but NOT PUBLISHED YET
         # (see _pv_arm_wait_retry). Drives the "wait" badge and the retry timer — while
@@ -16454,7 +17204,8 @@ class Viewer(QWidget):
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        left_scroll.setStyleSheet("QScrollArea { background: transparent; } QScrollBar:vertical { width: 8px; }")
+        left_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; }" + _SCROLLBAR_QSS)
 
         left = QWidget()
         left.setMinimumWidth(255)
@@ -16560,14 +17311,27 @@ class Viewer(QWidget):
         row_follow = QHBoxLayout()
         row_follow.addWidget(self._btn_auto_follow)
         s_src.body_layout.addLayout(row_follow)
-        # Sending the frame on to Workshop is a "where does this image go next" step,
-        # not a save-to-disk option, so it lives with the source pickers rather than
-        # among the Save switches.
+        # Sending the frame on to another tab is a "where does this image go next"
+        # step, not a save-to-disk option, so it lives with the source pickers
+        # rather than among the Save switches. Both destinations share one row.
+        send_row = QHBoxLayout(); send_row.setSpacing(4)
+        self.btn_send_finder = QPushButton("➤ Image Finder")
+        self.btn_send_finder.setEnabled(False)
+        self.btn_send_finder.setStyleSheet(_SEND_BTN_QSS)
+        self.btn_send_finder.setToolTip(
+            "Send the moment on screen to the Image Finder tab, with the cameras "
+            "loaded here — that is where the same instant is put side by side, "
+            "camera by camera and day by day.")
+        self.btn_send_finder.clicked.connect(self._send_to_image_finder)
+        send_row.addWidget(self.btn_send_finder, 1)
+
         self.btn_send_workshop = QPushButton("➤ Workshop")
         self.btn_send_workshop.setEnabled(False)
+        self.btn_send_workshop.setStyleSheet(_SEND_BTN_QSS)
         self.btn_send_workshop.setToolTip("Send current image to Workshop tab for editing")
         self.btn_send_workshop.clicked.connect(self._send_to_workshop)
-        s_src.body_layout.addWidget(self.btn_send_workshop)
+        send_row.addWidget(self.btn_send_workshop, 1)
+        s_src.body_layout.addLayout(send_row)
 
         # ══════════════════ Section: TIMELINE & RANGE ═════════════
         # Hold-to-repeat for the two frame arrows (see _hold_step_begin). Wired to
@@ -16873,19 +17637,30 @@ class Viewer(QWidget):
         row_grad.addWidget(QLabel("Palette:"))
         row_grad.addWidget(self.gradient_cb, 1)
         s_disp.body_layout.addLayout(row_grad)
-        row_sub = QHBoxLayout()
         self.cb_subtract = QCheckBox("Subtraction")
         self.cb_subtract.setStyleSheet(_CHECKBOX_STYLE)
         self.cb_subtract.setToolTip("Show absolute difference from reference frame")
         self.cb_subtract.stateChanged.connect(self._on_subtract_changed)
-        row_sub.addWidget(self.cb_subtract)
+        s_disp.body_layout.addWidget(self.cb_subtract)
+        # The two reference buttons share a row of their own, half the column each.
+        # Squeezed onto the checkbox's line the pair did not fit the 275 px panel and
+        # "Remove ref" came out elided. Same shape as the Reset zoom / Reset layout pair
+        # further down.
         self.btn_set_ref = QPushButton("Set ref")
-        self.btn_set_ref.setFixedWidth(65)
         self.btn_set_ref.setEnabled(False)
         self.btn_set_ref.setToolTip("Set current frame as subtraction reference")
         self.btn_set_ref.clicked.connect(self._set_reference_frame)
-        row_sub.addWidget(self.btn_set_ref)
-        row_sub.addStretch(1)
+        self.btn_remove_ref = QPushButton("Remove ref")
+        self.btn_remove_ref.setEnabled(False)
+        self.btn_remove_ref.setToolTip(
+            "Take the subtraction reference away again.\n"
+            "With several cameras it clears the ones that are selected, the same way\n"
+            "'Set ref' sets them. Subtraction itself stays as you left it.")
+        self.btn_remove_ref.clicked.connect(self._remove_reference_frame)
+        row_sub = QHBoxLayout()
+        row_sub.setSpacing(4)
+        row_sub.addWidget(self.btn_set_ref, 1)
+        row_sub.addWidget(self.btn_remove_ref, 1)
         s_disp.body_layout.addLayout(row_sub)
         self.cb_preload_preview = QCheckBox("Preload preview")
         self.cb_preload_preview.setStyleSheet(_CHECKBOX_STYLE)
@@ -16979,9 +17754,20 @@ class Viewer(QWidget):
         self.btn_draw_cross  = QPushButton("✚ Draw")
         self.btn_draw_circle = QPushButton("◯ Draw")
         self.btn_draw_square = QPushButton("◻ Draw")
-        self.btn_draw_cross.setToolTip("Click on image to place cross")
-        self.btn_draw_circle.setToolTip("Drag to draw ellipse, Shift = circle")
-        self.btn_draw_square.setToolTip("Drag to draw rectangle, Shift = square")
+        # There is no list of the marks anywhere, so these three lines are the only
+        # place the rules are written down.
+        self.btn_draw_cross.setToolTip(
+            "Click the image to add a cross — every click adds another.\n"
+            "Click a cross to pick it out, then Delete to take it away.\n"
+            "Ctrl+click adds a new one on top of an existing one.")
+        self.btn_draw_circle.setToolTip(
+            "Drag to draw an ellipse, Shift = circle. Every drag adds another.\n"
+            "Click one to pick it out, then Delete to take it away.\n"
+            "Ctrl+drag adds a new one on top of an existing one.")
+        self.btn_draw_square.setToolTip(
+            "Drag to draw a rectangle, Shift = square. Every drag adds another.\n"
+            "Click one to pick it out, then Delete to take it away.\n"
+            "Ctrl+drag adds a new one on top of an existing one.")
         self.btn_draw_circle.clicked.connect(lambda: self._toggle_draw_mode("circle"))
         self.btn_draw_square.clicked.connect(lambda: self._toggle_draw_mode("square"))
         self.btn_draw_cross.clicked.connect(lambda: self._toggle_draw_mode("cross"))
@@ -17022,7 +17808,9 @@ class Viewer(QWidget):
         btn_overlay_settings.clicked.connect(self._open_overlay_settings)
         overlay_settings_row.addWidget(btn_overlay_settings, 1)
         btn_remove_all_overlays = QPushButton("✕ Remove selected")
-        btn_remove_all_overlays.setToolTip("Remove all overlays from selected camera(s)")
+        btn_remove_all_overlays.setToolTip(
+            "Take every mark off the selected cameras — all of them when none is "
+            "selected.\nTo remove one mark, click it and press Delete.")
         btn_remove_all_overlays.clicked.connect(self._remove_all_overlays)
         overlay_settings_row.addWidget(btn_remove_all_overlays, 1)
         s_ovl.body_layout.addLayout(overlay_settings_row)
@@ -17425,7 +18213,7 @@ class Viewer(QWidget):
         self._diff_hist_box.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._diff_hist_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._diff_hist_box.setStyleSheet(
-            "QScrollArea { background: transparent; } QScrollBar:vertical { width: 8px; }")
+            "QScrollArea { background: transparent; }" + _SCROLLBAR_QSS)
         self._diff_hist_box.setVisible(False)
         # lbl_date and lbl_selected_range are COMPATIBILITY SHIMS. The date of the frame
         # on screen and the picked windows are now one two-column table (_range_table);
@@ -17822,21 +18610,16 @@ class Viewer(QWidget):
         self.btn_draw_square.setStyleSheet(on if m == "square" else "")
 
     def _remove_all_overlays(self):
-        def _clear_iv(iv):
-            iv.show_cross  = False; iv.cross_pos_norm  = None
-            iv.show_circle = False; iv.circle_center_norm = None
-            iv.circle_r_norm = None; iv.circle_rx_norm = None; iv.circle_ry_norm = None
-            iv.show_square = False; iv.square_rect_norm = None
+        # The same cameras every other overlay control acts on — the selected ones, or
+        # all of them when none is selected. This used to clear only cameras that were
+        # actually selected, so with nothing selected the one bulk-clear there is did
+        # nothing at all.
+        for iv in self._overlay_targets():
+            for k in MARK_KINDS:
+                setattr(iv, f"show_{k}", False)
+            iv.clear_marks()
             iv.set_draw_mode("")
             iv.update()
-
-        if self._is_multi_cam():
-            for idx in self._multi_grid.selected_cam_indices():
-                iv = self._multi_grid.get_img_view(idx)
-                if iv is not None:
-                    _clear_iv(iv)
-        else:
-            _clear_iv(self.img_view)
 
         self.cb_cross.setChecked(False)
         self.cb_circle.setChecked(False)
@@ -17927,6 +18710,24 @@ class Viewer(QWidget):
             self._overlay_square_thick = square_thick_sb.value()
             self._apply_overlay_settings(all_cams=cb_all_cams.isChecked())
 
+    def _overlay_style(self) -> dict:
+        """The look every SAVED picture uses. The panel's own settings, not a tile's:
+        the saves have always drawn with these, and reading a tile instead would make
+        an exported picture disagree with the settings window."""
+        return {"cross_color": self._overlay_cross_color,
+                "cross_thick": self._overlay_cross_thick,
+                "cross_size":  self._overlay_cross_size,
+                "circle_color": self._overlay_circle_color,
+                "circle_thick": self._overlay_circle_thick,
+                "square_color": self._overlay_square_color,
+                "square_thick": self._overlay_square_thick}
+
+    def _burn_marks(self, painter, pix, iv):
+        """Burn this camera's marks into a picture at its own resolution."""
+        w, h = pix.width(), pix.height()
+        draw_marks(painter, QRect(0, 0, w, h), visible_marks(iv),
+                   self._overlay_style(), pen_min_w=w // 500)
+
     def _apply_overlay_settings(self, all_cams: bool = False):
         def _apply_to_iv(iv):
             iv.cross_size      = self._overlay_cross_size
@@ -17976,6 +18777,7 @@ class Viewer(QWidget):
         self._pv_frame_ts = None
         self._pv_last_good = {}
         self._pv_last_good_ts = {}
+        self._pv_sample_ts = {}
         self._pv_no_sample = set()
         self._pv_awaiting = set()
         # The limits may have just changed under the alarm. An "over" flag left from the
@@ -18052,6 +18854,22 @@ class Viewer(QWidget):
             return text, True, (
                 "Reading the archiver right now — this number is still the "
                 "previous frame's. It is replaced as soon as the answer arrives.")
+        off = self._pv_sample_offset_s(name)
+        if off is not None:
+            # The number is a real archived reading, just not of this frame. Say which
+            # moment it is from and why there is nothing closer — this is the ordinary
+            # case on a channel archived more slowly than the camera stores frames, and
+            # before this it was reported as "n/a", i.e. as nothing at all.
+            samp = self._pv_sample_ts.get(name)
+            when = fmt_hhmmss_ms_from_ns(samp) if samp else "?"
+            return self._pv_display_text(name), True, (
+                f"Read at {when}, {abs(off):.1f} s "
+                f"{'after' if off > 0 else 'before'} this frame — the nearest reading "
+                "there is. This PV is archived less often than the camera stores "
+                "frames, so most frames have no reading of their own."
+                f"\nAnything closer than {self._pv_claim_window_ns() / 1e9:.1f} s — "
+                "half the gap to this camera's neighbouring frame — is shown without "
+                "a label, as this frame's own value.")
         if self._pv_is_held(name):
             note = self._pv_source_frame_note(name)
             return text, True, (
@@ -18060,7 +18878,66 @@ class Viewer(QWidget):
                  "instead." + note) if note else
                 "Older shot: no reading was archived near this frame, so the last "
                 "value this PV reported is shown.")
+        if text.startswith(cpva.PV_TEXT_NOT_FOUND):
+            # "n/a" used to be the one state with NOTHING to click on: no tooltip, no
+            # number, no reason. It reads as a fault, and the operator's report is
+            # exactly that ("no data yet, and then n/a"). It is almost never a fault —
+            # these channels are archived on their own scan, far more slowly than the
+            # camera stores frames (measured 16.09.2026, 15:26-15:33: 1200 frames,
+            # 51 PTM1 samples, one every ~5 s), so most frames simply have no reading
+            # of their own and the nearest one belongs to another shot.
+            return text, True, self._pv_no_sample_reason(name)
         return text, False, ""
+
+    def _pv_no_sample_reason(self, name: str) -> str:
+        """Why this PV reads "n/a" on this frame, in one tooltip.
+
+        Names the nearest archived reading and how far away it is, because that is the
+        difference between "this channel is dead" and "this channel is archived every
+        few seconds while the camera stores three frames a second". Cache only — no
+        network from the GUI thread — so it says less rather than blocking when the day
+        is not cached yet."""
+        win_s = self._pv_claim_window_ns() / 1e9
+        base = (f"No reading of this PV was archived within ±{win_s:.1f} s of this "
+                f"frame — half the gap to this camera's neighbouring frame — so it "
+                "has no value of its own.")
+        near = self._pv_nearest_archived(name)
+        if near is None:
+            return base + ("\nThe archiver stores this channel on its own scan, which "
+                           "can be far slower than the camera stores frames.")
+        gap, ts_ns = near
+        return (base + f"\nThe nearest one is {gap:.1f} s away, at "
+                f"{fmt_hhmmss_ms_from_ns(ts_ns)} — that belongs to another shot, so it "
+                "is not shown as this frame's number.\nStep to a frame nearer that "
+                "moment to read it.")
+
+    def _pv_nearest_archived(self, name: str) -> "tuple[float, int] | None":
+        """(seconds, timestamp) of the archiver's nearest sample to the displayed frame,
+        ignoring the pairing window. Cache only, so it is free and safe on the GUI
+        thread; None when the day is not cached, the PV is derived, or the day is empty.
+
+        Deliberately unbounded in time: the point is to report the gap, however big,
+        not to find a value that may be used. Nothing here ever reaches the display as
+        a number."""
+        channel = pv_channel_for(name)
+        cur = self._pv_current_ts()
+        if not channel or cur is None:
+            return None
+        best: "tuple[float, int] | None" = None
+        key = cpva.date_key_for_ns(cur)
+        for date_key in (key, cpva.prev_date_key(key), cpva.next_date_key(key)):
+            res = cpva.peek_day(channel, date_key)
+            if res is None or not res.samples:
+                continue
+            got = cpva.nearest_sample_ex(res.samples, cur,
+                                         window_ns=24 * 3600 * 1_000_000_000,
+                                         prefer=_PV_PREFER, ts_list=res.ts_list)
+            if got is None:
+                continue
+            gap = abs(got[0] - cur) / 1e9
+            if best is None or gap < best[0]:
+                best = (gap, got[0])
+        return best
 
     def _pv_trigger_fetch(self):
         """Rate-limited entry with a LEADING edge: the first frame change fires the
@@ -18309,14 +19186,21 @@ class Viewer(QWidget):
         # Read into a LOCAL before the worker starts: _pv_retry_fetch_now clears the
         # attribute as soon as this method returns, and the closure below runs later.
         fresh = bool(getattr(self, "_pv_fetch_fresh", False))
+        # How far a reading may be and still belong to THIS frame, from the spacing of
+        # this camera's own frames. Worked out here, on the GUI thread, where the
+        # timeline is: the worker must not read the frame lists while a scan edits them.
+        own_window = _pv_own_window_ns(self._pv_frame_ts_list(), ts_ns)
 
         def _fetch_one(name):
-            """(name, display text, value, status) — the number is returned as well
-            as its text because the formulas are computed from it."""
+            """(name, display text, value, status, sample timestamp) — the number is
+            returned as well as its text because the formulas are computed from it,
+            and the sample's own timestamp because a reading that is not this frame's
+            has to be labelled with the gap (see _pv_sample_offset_s)."""
             channel = pv_channel_for(name)
             if not channel:
-                return name, cpva.PV_TEXT_NOT_FOUND, None, "missing"
-            val, status = _pv_last_known_ex(channel, ts_ns, fresh=fresh)
+                return name, cpva.PV_TEXT_NOT_FOUND, None, "missing", None
+            val, status, samp = _pv_last_known_ex(channel, ts_ns, fresh=fresh,
+                                                  own_window_ns=own_window)
             if val is None:
                 # "ERR"  = fetch failed (not cached → next trigger retries);
                 # "wait" = the archiver has not published this frame yet (about a
@@ -18324,9 +19208,10 @@ class Viewer(QWidget):
                 # "n/a"  = genuinely no sample near this timestamp.
                 return name, (cpva.PV_TEXT_ERROR if status == "error"
                               else cpva.PV_TEXT_PENDING if status == "pending"
-                              else cpva.PV_TEXT_NOT_FOUND), None, status
+                              else cpva.PV_TEXT_NOT_FOUND), None, status, None
             val *= PV_SCALE.get(name, 1.0)
-            return name, _pv_decorate(pv_format_value(name, val), status), val, status
+            return (name, _pv_decorate(pv_format_value(name, val), status), val,
+                    status, samp)
 
         def _fetch():
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18339,14 +19224,20 @@ class Viewer(QWidget):
             # a label. Only names that were asked for, and only when a real reading
             # came back — a held or errored value must not be measured against a limit.
             nums: dict = {}
+            # Which archived moment each number came from, so a reading that is not
+            # this frame's own can be printed with its offset instead of passing for
+            # one. Only the names that got a real value appear here.
+            samp: dict = {}
             try:
                 with ThreadPoolExecutor(
                         max_workers=min(len(sources), PV_FETCH_MAX_WORKERS)) as ex:
                     futs = {ex.submit(_fetch_one, n): n for n in sources}
                     for fut in as_completed(futs):
                         try:
-                            name, txt, val, status = fut.result()
+                            name, txt, val, status, src_ts = fut.result()
                             raw[name], sts[name] = val, status
+                            if src_ts is not None and val is not None:
+                                samp[name] = int(src_ts)
                             if name in names:
                                 results[name] = txt
                                 if val is not None and status in ("ok", "approx"):
@@ -18365,6 +19256,14 @@ class Viewer(QWidget):
                         results[nm] = _pv_decorate(pv_format_value(nm, val), status)
                         if status in ("ok", "approx"):
                             nums[nm] = val
+                        # A formula is only as current as its FARTHEST source: the
+                        # offset printed next to it has to be the worst of the ones
+                        # it was computed from, never the best.
+                        srcs = [samp[s] for s in
+                                ((pv_derived_def(nm) or {}).get("bindings") or {}
+                                 ).values() if s in samp]
+                        if srcs:
+                            samp[nm] = max(srcs, key=lambda t: abs(t - ts_ns))
             finally:
                 # ALWAYS emit — _pv_on_result must clear the in-flight flag,
                 # otherwise one crashed fetch would freeze the overlay forever.
@@ -18372,7 +19271,7 @@ class Viewer(QWidget):
                 # producer and one consumer, and a second signal for the numbers could
                 # arrive out of step with the text they belong to.
                 try:
-                    self._pv_signals.result.emit(gen, (results, nums))
+                    self._pv_signals.result.emit(gen, (results, nums, samp))
                 except RuntimeError:
                     # The window was closed while this fetch was running, so the signal
                     # object is gone. Same guard LoadTask.run has: there is nothing left
@@ -18404,10 +19303,12 @@ class Viewer(QWidget):
         # payload is (text, numbers) — see the emit in _pv_trigger_fetch_now. Unpacked
         # tolerantly so a plain dict (an older in-flight fetch across a reload) still
         # applies its values instead of raising on the GUI thread.
-        if isinstance(payload, tuple) and len(payload) == 2:
-            results, nums = payload
+        if isinstance(payload, tuple) and len(payload) == 3:
+            results, nums, samp = payload
+        elif isinstance(payload, tuple) and len(payload) == 2:
+            results, nums, samp = payload[0], payload[1], {}
         else:
-            results, nums = payload, {}
+            results, nums, samp = payload, {}, {}
         # A fetch the watchdog already wrote off (PV_FETCH_WATCHDOG_S) may still come
         # back minutes later. Ignore it completely: a newer fetch owns the panel by
         # now, and clearing the in-flight flag or applying these numbers would put
@@ -18423,6 +19324,14 @@ class Viewer(QWidget):
             # Remember WHICH frame these numbers describe, so the panel can admit
             # it when the displayed frame has moved on since.
             self._pv_values_ts = getattr(self, "_pv_fetch_ts", None)
+            # And WHICH ARCHIVED MOMENT each number came from. Kept per PV, because
+            # the channels are archived at their own rates: one can have this frame's
+            # own reading while the next one's newest is seconds old. A name that got
+            # no value this time keeps its previous entry, which belongs with the held
+            # value that is still on display for it.
+            if not hasattr(self, "_pv_sample_ts"):
+                self._pv_sample_ts = {}
+            self._pv_sample_ts.update({k: int(v) for k, v in (samp or {}).items()})
             self._pv_values.update(self._pv_apply_last_good(results))
             # Before the table and the overlay are rebuilt: the alarm decides which
             # rows are painted red, so it has to be settled first or every trip would
@@ -18688,6 +19597,38 @@ class Viewer(QWidget):
         gap = (cur - src) / 1e9
         return gap if gap > 0.0 else None
 
+    def _pv_sample_offset_s(self, name: str) -> "float | None":
+        """SIGNED seconds between the frame on screen and the archived moment the
+        number shown for `name` actually comes from (+ = the reading is later).
+
+        None when the reading IS this frame's own — inside the claim window this
+        camera's frame spacing allows (_pv_claim_window_ns) — or when the moment is
+        unknown. Both timestamps come from the archiver/camera side, never from this
+        workstation's clock, which runs ~25 s ahead.
+
+        This is the honest version of the "(-2.5 s)" label: the older one measured to
+        the FRAME the fetch was aimed at, which says nothing on a channel archived
+        every few seconds — the frame can be this one while the reading is from four
+        seconds ago."""
+        samp = getattr(self, "_pv_sample_ts", {}).get(name)
+        cur = self._pv_current_ts()
+        if samp is None or cur is None:
+            return None
+        if abs(samp - cur) <= self._pv_claim_window_ns():
+            return None
+        return (samp - cur) / 1e9
+
+    def _pv_claim_window_ns(self) -> int:
+        """The claim window for the frame on screen: how far a reading may be and
+        still be shown as this frame's own value. One place, because the fetch, the
+        label and the tooltip must all use the SAME number — a value looked up inside
+        a 2.5 s claim and then labelled against 0.3 s would contradict itself."""
+        cur = self._pv_current_ts()
+        if cur is None:
+            return _PV_WINDOW_NS
+        return max(cpva.PV_EXACT_MATCH_NS,
+                   _pv_own_window_ns(self._pv_frame_ts_list(), cur))
+
     def _pv_is_held(self, name: str) -> bool:
         """True when the number shown for `name` is not this frame's own reading.
 
@@ -18700,6 +19641,8 @@ class Viewer(QWidget):
         The frame-gap test is what keeps the retargeted case honest: those numbers are a
         real reading, so nothing else here would have flagged them, and an unflagged older
         shot sitting next to the current picture is the whole bug this panel had."""
+        if self._pv_sample_offset_s(name) is not None:
+            return True
         if self._pv_held_age_s(name) is not None:
             return True
         if name in getattr(self, "_pv_no_sample", ()):
@@ -18731,8 +19674,15 @@ class Viewer(QWidget):
             # exactly like this frame's reading, which is how a whole shot's worth of
             # offset went unnoticed. "(-28 s)" names it in the operator's own units —
             # the gap to the shot the number actually belongs to.
+            # The gap to the READING itself, through the shared formatter, so the
+            # table, the overlay badge and the burn-in cannot word it differently.
+            samp_lbl = pv_offset_label(getattr(self, "_pv_sample_ts", {}).get(name),
+                                       self._pv_current_ts(),
+                                       self._pv_claim_window_ns())
             age = self._pv_held_age_s(name)
-            if age is None:
+            if samp_lbl:
+                val += samp_lbl
+            elif age is None:
                 val += cpva.PV_TEXT_STALE_SUFFIX
             else:
                 # One decimal below 10 s: at 3.3 Hz the gap to the last published shot is
@@ -19302,6 +20252,12 @@ class Viewer(QWidget):
         rec = d[cam_i] if (d and 0 <= cam_i < len(d)) else self._disp_snapshot()
         if self._is_view_only_palette(rec["gid"]):
             return {"gid": rec["gid"], "brighten": 0, "bc": _RENDER_BC_NONE}
+        # A subtraction run's held Auto values, put in on the way OUT: the record keeps
+        # the user's own settings (see _disp_snapshot), the render gets the frozen ones.
+        hold = (self._cam_sub_hold.get(cam_i) if self._sub_hold_on() else None)
+        if hold:
+            br, bc = self._apply_sub_hold(rec["brighten"], rec["bc"], hold)
+            return dict(rec, brighten=br, bc=bc)
         return rec
 
     def _disp_targets(self) -> list[int]:
@@ -19545,16 +20501,7 @@ class Viewer(QWidget):
         # Update draw mode checkboxes/buttons to reflect selected camera's state
         iv = self._multi_grid.selected_img_view()
         if iv is not None:
-            self.cb_cross.blockSignals(True)
-            self.cb_circle.blockSignals(True)
-            self.cb_square.blockSignals(True)
-            self.cb_cross.setChecked(iv.show_cross)
-            self.cb_circle.setChecked(iv.show_circle)
-            self.cb_square.setChecked(iv.show_square)
-            self.cb_cross.blockSignals(False)
-            self.cb_circle.blockSignals(False)
-            self.cb_square.blockSignals(False)
-            self._refresh_draw_btns()
+            self._sync_overlay_checkboxes_from_iv(iv)
 
         # Nothing is WRITTEN to a tile here, and that is the whole point of _cam_disp: a
         # tile keeps whatever it was last given, so selecting it never drags the panel's
@@ -20061,14 +21008,10 @@ class Viewer(QWidget):
         brighten    = _d["brighten"]
         bc          = _d["bc"]
         gradient_id = _d["gid"]
-        subtract    = self.cb_subtract.isChecked()
-        ref = self._cam_ref_arr_for(cam_idx, max_side) if subtract else None
-        sub_thr, sub_off = self._sub_params(ref)
-
         cache = self._cam_caches[cam_idx]
         ck    = self._cam_ck(cam_idx, cam_idx_f)
-        key   = (ck, max_side, brighten, gradient_id, bc,
-                 id(ref) if ref is not None else None, sub_thr, sub_off)
+        rr    = self._cam_ref_render_for(cam_idx, ck, max_side)
+        key   = (ck, max_side, brighten, gradient_id, bc) + rr.key_parts
         # From here on this is the ONLY render allowed to reach tile cam_idx.
         self._cam_set_shown_key(cam_idx, key)
         # Recorded BEFORE any paint: this is what the slider is asking for, and every
@@ -20086,9 +21029,9 @@ class Viewer(QWidget):
             # info panel with an N-line string, so per camera per mouse-move it was one of
             # the most expensive things on the drag path.
             if defer_labels:
-                self._collect_cam_diff_stats(cam_idx, key)
+                self._collect_cam_diff_stats(cam_idx, rr.mkey)
             else:
-                self._update_cam_diff_stats(cam_idx, key)
+                self._update_cam_diff_stats(cam_idx, rr.mkey)
             self._cam_want[cam_idx] = None   # we're current; drop any stale pending load
             return
 
@@ -20113,7 +21056,7 @@ class Viewer(QWidget):
         # the offset AFTER a trim that may have landed in between, and the pixmap
         # would be cached under a key naming a different frame.
         self._cam_want[cam_idx] = (cam_idx_f, it.path, max_side, brighten,
-                                   gradient_id, ref, sub_thr, bc, sub_off, ck)
+                                   gradient_id, rr, bc, ck)
         self._start_cam_load(cam_idx)
         # This tile now wants a frame it has not got — colour its label accordingly
         # without waiting for the dot tick (see _display_multicam_index). The nav tick does
@@ -20161,17 +21104,16 @@ class Viewer(QWidget):
         rid = self._cam_req_seq
         self._cam_inflight_at[cam_idx][rid] = time.monotonic()
         try:
-            cam_idx_f, path, max_side, brighten, gradient_id, ref, sub_thr, bc, sub_off, ck = want
+            cam_idx_f, path, max_side, brighten, gradient_id, rr, bc, ck = want
             sig  = self._cam_signals[cam_idx]
-            key = (ck, max_side, brighten, gradient_id, bc,
-                   id(ref) if ref is not None else None,
-                   sub_thr if ref is not None else 0, sub_off if ref is not None else 0)
+            key = (ck, max_side, brighten, gradient_id, bc) + rr.key_parts
             # req_id carries the in-flight slot id so _on_cam_loaded can release exactly
             # the load that finished — it used to be a literal 0 and unused.
             self._cam_pool.start(LoadTask(
                 self._gen, rid, cam_idx_f,
                 path, max_side, brighten, gradient_id,
-                sig, bc, ref, sub_thr, sub_off, key=key))
+                sig, bc, rr.arr, rr.thr, rr.off, key=key,
+                subtract=rr.subtract, stats_key=rr.mkey))
         except Exception:
             # Never leave the slot occupied if the launch itself failed — _on_cam_loaded
             # would never fire to release it, and the camera would slowly run out of depth
@@ -20792,6 +21734,9 @@ class Viewer(QWidget):
         self._cam_ref_paths    = [None] * n
         self._cam_ref_scaled   = [dict() for _ in range(n)]
         self._cam_diff_stats   = {}
+        self._cam_diff_final   = {}
+        self._diff_last_final  = None
+        self._clear_sub_auto_hold()
         # References belong to the previous camera set — with Subtraction still on,
         # tell the user the reference is gone instead of silently rendering plain frames.
         self._refresh_ref_warning()
@@ -22555,6 +23500,7 @@ class Viewer(QWidget):
         self.btn_save.setEnabled(True)
         self.btn_save_range.setEnabled(True)
         self.btn_send_workshop.setEnabled(True)
+        self.btn_send_finder.setEnabled(True)
         self.btn_play.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_prev.setEnabled(True)
@@ -22565,7 +23511,7 @@ class Viewer(QWidget):
         self.btn_clear_marks.setEnabled(True)
         self._btn_auto_follow.setEnabled(True)
         self._refresh_live_btn_style()
-        self.btn_set_ref.setEnabled(True)
+        self.btn_set_ref.setEnabled(True); self._update_ref_buttons()
         self.btn_pointing.setEnabled(True)
         self.btn_pointing_live.setEnabled(True)
         self.btn_cal_circle.setEnabled(True)
@@ -23116,6 +24062,9 @@ class Viewer(QWidget):
         self._ref_path = None
         self._ref_scaled = {}
         self._cam_diff_stats = {}
+        self._cam_diff_final = {}
+        self._diff_last_final = None
+        self._clear_sub_auto_hold()
         if hasattr(self, "lbl_ref_status"):
             self.lbl_ref_status.setText("")
         if hasattr(self, "lbl_diff_stats"):
@@ -23168,7 +24117,8 @@ class Viewer(QWidget):
                 self.btn_play, self.btn_stop, self.btn_prev, self.btn_next, self.btn_set_a,
                 self.btn_set_b, self.btn_clear_marks, self.btn_cal_circle, self.btn_cal_square,
                 self.btn_cal_cross, self.btn_pointing, self.btn_save_ts, self.btn_goto_ts,
-                self.btn_prev_ts, self.btn_next_ts, self.btn_set_ref]:
+                self.btn_prev_ts, self.btn_next_ts, self.btn_set_ref,
+                self.btn_remove_ref]:
             w.setEnabled(False)
         self.mark_a_ns = None; self.mark_b_ns = None; self.tickbar.set_marks(None, None)
         self.prog.setVisible(False); self.lbl_scan_progress.setText(""); self.btn_cancel_scan.setVisible(False)
@@ -23209,6 +24159,7 @@ class Viewer(QWidget):
         self.btn_clear_marks.setEnabled(True)
         self.btn_refresh.setEnabled(False)
         self.btn_send_workshop.setEnabled(True)
+        self.btn_send_finder.setEnabled(True)
         self.btn_save_ts.setEnabled(True)
         if self._saved_timestamps:
             self._ts_nav_set_enabled(True)
@@ -23414,24 +24365,17 @@ class Viewer(QWidget):
 
     @staticmethod
     def _copy_overlay_shape(src: "ImageView", dst: "ImageView", shape: str):
-        """Copy ONE overlay's geometry from src to dst. Everything is normalized to
-        the image rect, so the mark lands on the same spot of a differently sized
-        sensor."""
-        if shape == "cross":
-            dst.cross_pos_norm = QPointF(src.cross_pos_norm) \
-                if src.cross_pos_norm is not None else None
-            dst.show_cross = src.show_cross
-        elif shape == "circle":
-            dst.circle_center_norm = QPointF(src.circle_center_norm) \
-                if src.circle_center_norm is not None else None
-            dst.circle_r_norm  = src.circle_r_norm
-            dst.circle_rx_norm = src.circle_rx_norm
-            dst.circle_ry_norm = src.circle_ry_norm
-            dst.show_circle = src.show_circle
-        elif shape == "square":
-            dst.square_rect_norm = tuple(src.square_rect_norm) \
-                if src.square_rect_norm is not None else None
-            dst.show_square = src.show_square
+        """Copy ONE kind of mark from src to dst — the WHOLE list of it.
+
+        Everything is normalized to the image rect, so the marks land on the same spots
+        of a differently sized sensor. The whole list travels, not one mark, because
+        that is what makes adding, moving and deleting all reach the other cameras
+        through the one signal there is; the price is that a camera which had marks of
+        its own gets the drawn-on camera's set instead."""
+        if shape not in MARK_KINDS:
+            return
+        dst.set_marks(shape, src.marks.get(shape))
+        setattr(dst, f"show_{shape}", getattr(src, f"show_{shape}", False))
 
     def _on_overlay_edited(self, cam_idx: int, shape: str):
         """A tile's overlay was dragged → put the same mark, at the same normalized
@@ -23496,7 +24440,12 @@ class Viewer(QWidget):
     def _calibrate_shape(self, shape: str):
         """Run the auto-detection for one shape on EVERY camera the overlay controls
         are aimed at. Each camera is calibrated on its own frame — one click, one
-        result per camera — and the cameras that failed are reported together."""
+        result per camera — and the cameras that failed are reported together.
+
+        The result is ADDED: marks already on the camera stay where they are, so Cal
+        can be used to put one more measured mark beside marks placed by hand. The
+        detectors append nothing when they fail, so a failed Cal leaves no empty mark
+        behind."""
         titles = {"circle": "Circle calibration", "cross": "Cross calibration",
                   "square": "Square calibration"}
         title = titles[shape]
@@ -23578,37 +24527,150 @@ class Viewer(QWidget):
             f"≥ {t}: {Viewer._fmt_px(n)} px" for t, n in lv)
 
     @staticmethod
-    def _fmt_diff_stats(st: dict, compact: bool = False) -> str:
+    def _fmt_diff_stats(st: dict, compact: bool = False,
+                        provisional: bool = False) -> str:
         """ONE number: how many pixels differ from the reference.
 
         That is the whole line by the operator's request. Everything else the run
-        produces — the peak, the average, the per-level counts — is drawn inside the
-        histogram right below it, where it costs no extra row in the 275 px panel.
-        The background level is printed only when it is NOT 0."""
+        produces — the brightest, the average and the faintest difference, and the
+        per-level counts — is drawn inside the histogram right below it (the counts in
+        its tooltip), where it costs no extra row in the 275 px panel.
+        The background level is printed only when it is NOT 0.
+
+        `provisional` appends "…" — the number has not been measured on the full-size
+        render yet, and the line goes amber to match (see _update_diff_stats)."""
         n = int(st.get("above", st.get("count", 0)) or 0)
         bg = float(st.get("bg", 0.0) or 0.0)
         bg_txt = "" if bg <= 0 else f" (bg {bg:.0f})"
+        tail = " …" if provisional else ""
         if n <= 0:
-            return "0 px differ" if compact else f"Diff: no pixels above background{bg_txt}"
+            return ("0 px differ" + tail if compact
+                    else f"Diff: no pixels above background{bg_txt}{tail}")
         px = Viewer._fmt_px(n)
         if compact:
-            return f"{px} px"
-        return f"Diff: {px} px differ{bg_txt}"
+            return f"{px} px{tail}"
+        return f"Diff: {px} px differ{bg_txt}{tail}"
+
+    # ── measured numbers vs. an estimate ─────────────────────────────────────
+    # The same frame is drawn twice: first at whatever smaller size the pass in flight
+    # asked for, then at full size. Shrinking a picture averages neighbouring pixels, so
+    # the difference measured off the small one has a LOWER maximum and a different pixel
+    # count — the reported maximum jumped twice for one frame and neither jump meant
+    # anything.
+    #
+    # So the full-size numbers are remembered PER FRAME and win whenever they exist for
+    # the frame on screen, however that frame is being drawn at this instant. Only while
+    # a frame has never been rendered full-size are its estimated numbers shown, and then
+    # they are marked — amber, with "…" on the line and "not final" on the histogram.
+    # Numbers are never carried over from a DIFFERENT frame: every remembered set is
+    # stored under its own frame key and thrown away with it.
+    #
+    # Statistics from before the "side" field existed carry none and are taken at face
+    # value, which is the behaviour they had.
+
+    @staticmethod
+    def _stats_are_final(st: "dict | None") -> bool:
+        return bool(st) and int(st.get("side", FULL_RES_SIDE)) == FULL_RES_SIDE
+
+    @staticmethod
+    def _frame_of_key(key):
+        """The frame a render key belongs to, without its size or display settings."""
+        try:
+            return key[0]
+        except Exception:
+            return key
+
+    def _ref_render(self, ck, ref) -> "_RefRender":
+        """Everything one render has to know about the reference.
+
+        ONE place decides it, because every render path has to agree: **with a reference
+        set the frame is always MEASURED against it**, and the Subtraction checkbox only
+        decides whether the picture is replaced by the difference as well. That is what
+        keeps the numbers and the histogram alive — and in the same place, so nothing
+        under the cursor moves — while Subtraction is off.
+
+        `key_parts` are the three fields the reference contributes to the PIXMAP key.
+        They are neutral while Subtraction is off, because the picture is then the
+        ordinary render and must share the cache entry it would have had with no
+        reference at all.
+
+        `mkey` is where the NUMBERS go — a key of their own. What the difference is
+        depends on the frame, the reference and the two spinboxes and on nothing else:
+        since gamma, contrast and brightness moved to the far side of the subtraction, no
+        display control can change a figure. So the numbers survive a palette change, a
+        slider move, and the Subtraction checkbox itself. The frame comes FIRST in it, so
+        `_frame_of_key` reads a measure key exactly as it reads a pixmap key."""
+        if ref is None:
+            return _RefRender(None, True, 0, 0, (None, 0, 0), None)
+        sub_thr, sub_off = self._sub_params(ref)
+        subtract = bool(self.cb_subtract.isChecked())
+        return _RefRender(
+            ref, subtract, sub_thr, sub_off,
+            (id(ref), sub_thr, sub_off) if subtract else (None, 0, 0),
+            (ck, "m", id(ref), sub_thr, sub_off))
+
+    def _ref_render_for(self, ck, side) -> "_RefRender":
+        """`_ref_render` with the single-camera reference decoded at `side`."""
+        return self._ref_render(
+            ck, self._ref_arr_for(side) if self._has_reference() else None)
+
+    def _cam_ref_render_for(self, cam_i: int, ck, side) -> "_RefRender":
+        """The same for one tile."""
+        return self._ref_render(ck, self._cam_ref_arr_for(cam_i, side))
+
+    def _pick_diff_stats(self, st: "dict | None", frame, remembered
+                         ) -> "tuple[dict | None, bool]":
+        """(statistics to show, are they only an estimate).
+
+        `remembered` is the (frame, statistics) pair last measured full-size for this
+        view — used only when it belongs to the very frame being asked about."""
+        if self._stats_are_final(st):
+            return st, False
+        if remembered is not None and remembered[0] == frame:
+            return remembered[1], False
+        return st, st is not None
 
     def _update_diff_stats(self, key):
-        """Refresh the single-cam difference-statistics line for the frame rendered
-        under `key`. Called from every path that shows a frame, so cache hits are
-        labelled too."""
-        if not self.cb_subtract.isChecked() or self._ref_path is None:
+        """Refresh the single-cam difference line and histogram for the frame measured
+        under `key` (a MEASURE key — see _ref_render). Called from every path that shows
+        a frame, so cache hits are labelled too.
+
+        **Gated on the REFERENCE, not on the Subtraction checkbox.** With a reference set
+        every frame is measured against it whether or not the difference is the picture
+        on screen, so switching Subtraction off leaves the numbers and the histogram
+        where they are, still following the frames. Reported 23.09.2026: they used to
+        vanish the instant the box was unticked, and since the INFO panel sits ABOVE the
+        settings column the whole column — the checkbox included — jumped ~110 px up
+        under the cursor, which made clicking on and off to compare impossible."""
+        if self._ref_path is None or key is None:
             self.lbl_diff_stats.setText("")
+            self._diff_last_final = None
             self._set_diff_hist(None)
             return
+        frame = self._frame_of_key(key)
         st = _diff_stats_get(key)
+        remembered = getattr(self, "_diff_last_final", None)
+        st, provisional = self._pick_diff_stats(st, frame, remembered)
         if st is None:
-            return   # stats evicted / not a diff render — keep the last numbers
-        self.lbl_diff_stats.setText(self._fmt_diff_stats(st))
+            # Stats evicted and nothing measured for this frame. The old numbers stay on
+            # screen — but they stop claiming to describe what is on it. Both signals,
+            # not just the colour: a mark that is only a shade is not a mark.
+            self.lbl_diff_stats.setStyleSheet(_DIFF_TEXT_PROV_STYLE)
+            old = self.lbl_diff_stats.text()
+            if old and not old.endswith(" …"):
+                self.lbl_diff_stats.setText(old + " …")
+            for b in self._diff_hist_blocks:
+                if b.isVisible():
+                    b.mark_provisional()
+            return
+        if not provisional:
+            self._diff_last_final = (frame, st)
+        self.lbl_diff_stats.setStyleSheet(_DIFF_TEXT_PROV_STYLE if provisional
+                                          else _DIFF_TEXT_STYLE)
+        self.lbl_diff_stats.setText(
+            self._fmt_diff_stats(st, provisional=provisional))
         self.lbl_diff_stats.setToolTip(self._fmt_diff_levels(st))
-        self._set_diff_hist(st)
+        self._set_diff_hist(st, provisional=provisional)
 
     # How tall the per-camera histogram column may grow before it starts scrolling.
     # The INFO panel is anchored above the settings column and does not scroll, so
@@ -23616,8 +24678,9 @@ class Viewer(QWidget):
     _DIFF_BOX_MAX_H = 210
 
     def _show_diff_blocks(self, items: list):
-        """Render one block per camera: `items` is [(text, stats_dict), …], already in
-        display order. An empty list hides the whole box.
+        """Render one block per camera: `items` is [(text, stats_dict), …] or
+        [(text, stats_dict, provisional), …], already in display order. An empty list
+        hides the whole box.
 
         The blocks are pooled, not rebuilt: a subtraction run re-renders this on every
         displayed frame, and creating widgets at 3 Hz is what a scrub tick cannot
@@ -23625,7 +24688,8 @@ class Viewer(QWidget):
         box = getattr(self, "_diff_hist_box", None)
         if box is None:
             return
-        items = [(t, s) for t, s in items if s]
+        items = [(it[0], it[1], bool(it[2]) if len(it) > 2 else False)
+                 for it in items if it[1]]
         if not items:
             for b in self._diff_hist_blocks:
                 b.setVisible(False)
@@ -23636,11 +24700,12 @@ class Viewer(QWidget):
             b = _DiffCamBlock(compact=compact)
             self._diff_hist_lay.addWidget(b)
             self._diff_hist_blocks.append(b)
-        for i, (text, st) in enumerate(items):
+        for i, (text, st, prov) in enumerate(items):
             b = self._diff_hist_blocks[i]
             b.hist.set_compact(compact)
             b.set_block(text, st.get("hist"), float(st.get("max", 0.0) or 0.0),
-                        float(st.get("mean", 0.0) or 0.0))
+                        float(st.get("mean", 0.0) or 0.0),
+                        float(st.get("min", 0.0) or 0.0), provisional=prov)
             # The per-level counts are no longer written on the line — they are one
             # hover away instead of four columns of numbers per camera.
             b.lbl.setToolTip(self._fmt_diff_levels(st))
@@ -23664,7 +24729,8 @@ class Viewer(QWidget):
         if box.height() != want or box.minimumHeight() != want:
             box.setFixedHeight(want)
 
-    def _set_diff_hist(self, st: "dict | None", caption: str = ""):
+    def _set_diff_hist(self, st: "dict | None", caption: str = "",
+                       provisional: bool = False):
         """Feed the histogram column with a SINGLE camera, or clear it. Guarded by
         hasattr: the stats line is written from paths that run while the INFO panel is
         still being built."""
@@ -23672,7 +24738,7 @@ class Viewer(QWidget):
             return
         # The single-camera view prints its numbers in lbl_diff_stats above, so the
         # block carries the picture alone unless a camera name was handed in.
-        self._show_diff_blocks([(caption, st)] if st else [])
+        self._show_diff_blocks([(caption, st, provisional)] if st else [])
 
     def _collect_cam_diff_stats(self, cam_i: int, key):
         """Record one tile's diff statistics WITHOUT rebuilding the label.
@@ -23680,17 +24746,31 @@ class Viewer(QWidget):
         Formatting the label is O(cameras) and every setText forces a relayout of the
         info panel, so doing it per camera inside the display loop made one 33 ms scrub
         tick cost O(cameras²) formats and N relayouts — on the Subtraction path, which
-        has no preview to fall back on either."""
-        if not self.cb_subtract.isChecked():
+        has no preview to fall back on either.
+
+        Gated on the REFERENCE, not the checkbox — see _update_diff_stats."""
+        if not self._has_reference() or key is None:
             self._cam_diff_stats = {}
+            self._cam_diff_final = {}
             return
         st = _diff_stats_get(key)
-        if st is not None:
-            self._cam_diff_stats[cam_i] = st
+        # Same rule as the single camera: a full-size render is what the tile's numbers
+        # are; anything smaller only stands in until one arrives (see _pick_diff_stats).
+        # Remembered against the FRAME, so the next frame never inherits them.
+        #
+        # `st` is None when the entry has been evicted (the store is bounded and a
+        # many-camera run fills it). Recorded AS None against the frame, never skipped:
+        # skipping left the previous frame's numbers sitting under this frame's tile
+        # with nothing to say they belonged to another one.
+        if self._stats_are_final(st):
+            self._cam_diff_final[cam_i] = (self._frame_of_key(key), st)
+        self._cam_diff_stats[cam_i] = (self._frame_of_key(key), st)
 
     def _flush_cam_diff_stats(self):
-        """Write the collected statistics to the info line — once per display pass."""
-        if not self.cb_subtract.isChecked():
+        """Write the collected statistics to the info line — once per display pass.
+
+        Gated on the REFERENCE, not the checkbox — see _update_diff_stats."""
+        if not self._has_reference():
             self.lbl_diff_stats.setText("")
             self._set_diff_hist(None)
             return
@@ -23704,8 +24784,13 @@ class Viewer(QWidget):
             if c >= len(self._cam_ref_paths) or self._cam_ref_paths[c] is None:
                 continue
             name = _strip_cam_name(self._cam_names[c]) if c < len(self._cam_names) else f"cam {c}"
-            items.append((f"{name}: {self._fmt_diff_stats(self._cam_diff_stats[c], compact=True)}",
-                          self._cam_diff_stats[c]))
+            frame, latest = self._cam_diff_stats[c]
+            st, prov = self._pick_diff_stats(latest, frame,
+                                             self._cam_diff_final.get(c))
+            if st is None:
+                continue
+            items.append((f"{name}: {self._fmt_diff_stats(st, compact=True, provisional=prov)}",
+                          st, prov))
         self.lbl_diff_stats.setText("")
         self._show_diff_blocks(items)
 
@@ -23778,17 +24863,132 @@ class Viewer(QWidget):
         _bc_value_set_auto(self.lbl_gamma_val, self.cb_gamma_auto.isChecked(),
                            _TT_GAMMA)
 
+    # ── Auto is measured ONCE per subtraction run ────────────────────────────
+    # Auto contrast, Auto brightness and Auto gamma each read their value off the frame
+    # in front of them. On a normal frame that is the point. On a DIFFERENCE frame it
+    # means every frame comes out a different brightness — the picture "amplifies
+    # something" while the numbers beside it say nothing changed, and two frames can no
+    # longer be compared by eye at all.
+    #
+    # So on the subtraction path Auto still runs after the difference, exactly where it
+    # was, but it runs ONCE: the values it lands on for the first difference frame are
+    # held and applied unchanged to every later frame. They go into the render parameters
+    # themselves, so they are part of the pixmap cache key and a held render can never be
+    # confused with a per-frame one.
+    #
+    # The hold is dropped wherever the difference itself changes meaning — Subtraction
+    # switched on, a reference set or removed, the Diff threshold or Offset moved, an
+    # Auto box toggled, a new scan — and Auto then measures the new run's first frame.
+
+    def _sub_hold_on(self) -> bool:
+        """True while a held Auto applies: Subtraction on, with a reference to subtract."""
+        return bool(self.cb_subtract.isChecked() and self._has_reference())
+
+    def _clear_sub_auto_hold(self):
+        """Let Auto measure again on the next difference frame."""
+        self._sub_auto_hold = None
+        self._cam_sub_hold = {}
+
+    @staticmethod
+    def _sub_hold_from_render(path, auto_c: bool, auto_b: bool,
+                              auto_g: bool) -> "dict | None":
+        """The Auto values the render of `path` landed on, or None when they are not all
+        in yet. All or nothing: half a held setting would leave the other half measuring
+        itself on every frame, which is the very thing being stopped."""
+        if not (auto_c or auto_b or auto_g):
+            return None
+        vals = _auto_bc_get(path)
+        if not vals:
+            return None
+        out = {}
+        if auto_c and vals.get("contrast") is not None:
+            out["contrast"] = int(vals["contrast"])
+        if auto_b and vals.get("offset") is not None:
+            out["offset"] = int(vals["offset"])
+        if auto_g and vals.get("gamma") is not None:
+            out["gamma"] = int(img_scale.slider_from_gamma(float(vals["gamma"])))
+        want = int(auto_c) + int(auto_b) + int(auto_g)
+        return out if len(out) == want else None
+
+    @staticmethod
+    def _diff_worth_measuring(key) -> bool:
+        """True when the difference rendered under `key` actually has something in it.
+
+        The first frame shown after Set ref is the REFERENCE ITSELF — its difference is
+        identically zero, and Auto measuring a black frame lands on "do nothing" and
+        would freeze that for the whole run, leaving every later frame unadjusted. So a
+        run waits for a frame that differs before it freezes anything."""
+        st = _diff_stats_get(key)
+        return bool(st) and int(st.get("above", 0) or 0) > 0
+
+    def _capture_sub_auto_hold(self, path, key):
+        """Freeze the single-camera Auto values off the difference render of `path`, if a
+        subtraction run is on and nothing has been frozen for it yet."""
+        if self._sub_auto_hold is not None or not self._sub_hold_on():
+            return
+        if self._is_view_only_palette() or not self._diff_worth_measuring(key):
+            return
+        self._sub_auto_hold = self._sub_hold_from_render(
+            path, self.cb_bright.isChecked(), self.cb_bright_auto.isChecked(),
+            self.cb_gamma_auto.isChecked())
+
+    def _capture_cam_sub_auto_hold(self, cam_i: int, path, key):
+        """Same, for one tile — off ITS OWN Auto boxes, which need not match the panel's
+        (see _cam_disp)."""
+        if not self._sub_hold_on() or self._cam_sub_hold.get(cam_i) is not None:
+            return
+        if not self._diff_worth_measuring(key):
+            return
+        d = getattr(self, "_cam_disp", None)
+        rec = d[cam_i] if (d and 0 <= cam_i < len(d)) else None
+        if rec is None or self._is_view_only_palette(rec["gid"]):
+            return
+        ui = rec.get("ui") or {}
+        hold = self._sub_hold_from_render(
+            path, bool(ui.get("auto_c")), bool(ui.get("auto_b")),
+            bool(ui.get("auto_g")))
+        if hold:
+            self._cam_sub_hold[cam_i] = hold
+
+    @staticmethod
+    def _apply_sub_hold(brighten: int, bc: _RenderBC,
+                        hold: "dict | None") -> "tuple[int, _RenderBC]":
+        """Replace whatever Auto would measure per frame with the held values."""
+        if not hold:
+            return brighten, bc
+        contrast = int(hold.get("contrast", bc.contrast))
+        offset   = int(hold.get("offset", bc.offset))
+        gamma    = int(hold.get("gamma", bc.gamma))
+        # Both Auto flags go off: the numbers are now ordinary slider values, which is
+        # exactly what they mean — Auto contrast IS the Contrast slider set for you.
+        return (0 if "contrast" in hold else brighten), \
+               _RenderBC(offset, contrast, 0 if "offset" in hold else bc.auto, gamma)
+
+    def _render_brighten(self) -> int:
+        """The Auto-contrast flag as the RENDER must see it — 0 once a subtraction run
+        has frozen the gain it stands for (see _apply_sub_hold)."""
+        hold = self._sub_hold()
+        if hold and "contrast" in hold:
+            return 0
+        return 1 if self.cb_bright.isChecked() else 0
+
+    def _sub_hold(self) -> "dict | None":
+        return self._sub_auto_hold if self._sub_hold_on() else None
+
     def _bc(self) -> _RenderBC:
         """Brightness/contrast/gamma exactly as the controls stand right now."""
         return self._bc_for(self.gradient_cb.currentIndex())
 
     def _bc_for(self, gid: int) -> _RenderBC:
-        """As _bc_raw, but dropped to nothing on a palette that ignores it.
+        """As _bc_raw, but dropped to nothing on a palette that ignores it, and with a
+        subtraction run's held Auto values already in place.
         `gid` is the palette the frame will be drawn with — each tile may be on a
         different one (see _cam_disp)."""
         if self._is_view_only_palette(gid):
             return _RENDER_BC_NONE
-        return self._bc_raw()
+        return self._apply_sub_hold(
+            1 if self.cb_bright.isChecked() else 0,
+            self._bc_raw(), self._sub_hold())[1]
 
     def _bc_raw(self) -> _RenderBC:
         """Brightness/contrast/gamma render params, honoring the 'Auto checkbox overrides
@@ -23797,7 +24997,12 @@ class Viewer(QWidget):
         sends the sentinel so the render resolves it per frame.
 
         The three rows are independent — each Auto box speaks only for its own row (see
-        img_scale.render_u8)."""
+        img_scale.render_u8).
+
+        RAW on purpose: a subtraction run's held Auto values are put in at READ time
+        (_bc_for, _cam_disp_get), never here — this is also what _disp_snapshot stores
+        per tile, and a tile must remember the user's settings, not one run's
+        measurement."""
         contrast = 0 if self.cb_bright.isChecked() else int(self.contrast_slider.value())
         gamma = (img_scale.GAMMA_SLIDER_AUTO if self.cb_gamma_auto.isChecked()
                  else int(self.gamma_slider.value()))
@@ -23898,6 +25103,10 @@ class Viewer(QWidget):
             self.contrast_slider.setValue(int(self._contrast_manual))
             self.contrast_slider.blockSignals(False)
         self._sync_bc_value_labels()
+        # A subtraction run's frozen Auto values were measured with the boxes as they
+        # were; with one of them flipped they describe something else. Let it measure the
+        # next difference frame again (see _sub_hold_on).
+        self._clear_sub_auto_hold()
         self._bc_row_touched("contrast")
         self._on_brightness_changed()
 
@@ -23947,6 +25156,7 @@ class Viewer(QWidget):
             self.gamma_slider.setValue(int(self._gamma_manual))
             self.gamma_slider.blockSignals(False)
             self._set_gamma_label(int(self._gamma_manual))
+        self._clear_sub_auto_hold()     # see _on_contrast_auto_changed
         self._bc_row_touched("gamma")
         self._on_brightness_changed()
 
@@ -23962,6 +25172,7 @@ class Viewer(QWidget):
             self.brightness_slider.setValue(int(self._brightness_manual))
             self.brightness_slider.blockSignals(False)
         self._sync_bc_value_labels()
+        self._clear_sub_auto_hold()     # see _on_contrast_auto_changed
         self._bc_row_touched("bright")
         self._on_brightness_changed()
 
@@ -24075,6 +25286,11 @@ class Viewer(QWidget):
                     self._cam_ref_images[cam_i] = True
                     self._cam_ref_paths[cam_i]  = it.path
                     self._cam_ref_scaled[cam_i] = {}   # re-decode at display size, drop stale sizes
+                    # A new reference is a new subtraction run: Auto measures its first
+                    # frame again, and the old numbers are gone with the old difference.
+                    self._cam_sub_hold.pop(cam_i, None)
+                    self._cam_diff_stats.pop(cam_i, None)
+                    self._cam_diff_final.pop(cam_i, None)
                     ts_str = fmt_prague_full_from_ns(it.ts_ns)
                     self._multi_grid.set_cam_ref_status(cam_i, f"Ref: {ts_str}")
                     self._cam_caches[cam_i] = PixCache(self._cam_cache_size(len(self._cam_caches)))
@@ -24084,6 +25300,7 @@ class Viewer(QWidget):
                     pass
             if set_names:
                 self._set_ref_status(f"Ref: {', '.join(set_names)}")
+                self._update_ref_buttons()
             else:
                 QMessageBox.information(
                     self, "Set reference",
@@ -24107,8 +25324,13 @@ class Viewer(QWidget):
         it = self.items[self.current_idx]
         self._ref_path = it.path
         self._ref_scaled = {}   # re-decode at display size, drop stale sizes
+        # A new reference is a new subtraction run: Auto measures its first frame again,
+        # and the numbers on the panel belong to the difference that has just gone.
+        self._sub_auto_hold = None
+        self._diff_last_final = None
         ts_str = fmt_prague_full_from_ns(it.ts_ns)
         self._set_ref_status(f"Ref: {ts_str}")
+        self._update_ref_buttons()
         # Badge on the image itself — the 1-camera layout is the multi-camera layout
         # with one camera, so it gets the same green "Ref: <timestamp>" strip the
         # tiles get via set_cam_ref_status (only the info-panel text was set here).
@@ -24123,11 +25345,92 @@ class Viewer(QWidget):
                 self.current_idx, self.items[self.current_idx].ts_ns,
                 update_slider=True)
 
+    def _remove_reference_frame(self):
+        """Take the subtraction reference away — the other half of Set ref.
+
+        Same scope rule as setting one: with several cameras it clears the ones selected
+        at the moment of the click, and offers to cover all of them when nothing is
+        selected. Subtraction itself is left exactly as the user set it; with the
+        reference gone the INFO panel says so (_refresh_ref_warning)."""
+        if self._is_multi_cam():
+            have = [i for i, p in enumerate(self._cam_ref_paths) if p is not None]
+            if not have:
+                return
+            selected = [i for i in self._multi_grid.selected_cam_indices() if i in have]
+            if not selected:
+                if len(have) > 1:
+                    reply = QMessageBox.question(
+                        self, "Remove reference",
+                        "No cameras selected — remove the reference from ALL cameras?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                selected = have
+            for cam_i in selected:
+                self._cam_ref_images[cam_i] = None
+                self._cam_ref_paths[cam_i] = None
+                self._cam_ref_scaled[cam_i] = {}
+                self._cam_sub_hold.pop(cam_i, None)
+                self._cam_diff_stats.pop(cam_i, None)
+                self._cam_diff_final.pop(cam_i, None)
+                # An empty text takes the green badge off the tile (set_cam_ref_status).
+                self._multi_grid.set_cam_ref_status(cam_i, "")
+                if cam_i < len(self._cam_caches):
+                    self._cam_caches[cam_i] = PixCache(
+                        self._cam_cache_size(len(self._cam_caches)))
+            names = [_strip_cam_name(self._cam_names[i])
+                     for i in selected if i < len(self._cam_names)]
+            self._set_ref_status(f"Ref removed: {', '.join(names)}" if names else "")
+            self._flush_cam_diff_stats()
+            self._refresh_ref_warning()
+            self._update_ref_buttons()
+            # Same wedge guard as Set ref: a camera whose in-flight slots were never
+            # freed would set _cam_want and never relaunch, leaving a blank tile.
+            self._reset_cam_pipeline()
+            self._redraw_all_cams_in_place()
+            return
+
+        if self._ref_path is None:
+            return
+        self._ref_path = None
+        self._ref_scaled = {}
+        self._ref_image = None
+        self._sub_auto_hold = None
+        self._diff_last_final = None
+        self.img_view.set_cam_ref_text("")
+        self.lbl_diff_stats.setText("")
+        self._set_diff_hist(None)
+        self._set_ref_status("")
+        self.cache = PixCache(CACHE_SIZE)
+        self._inflight.clear(); self._want_display_req.clear()
+        # Drop any pending display gate so a load still in flight from the reference
+        # that has just gone cannot strand the pipeline (frozen slider / arrows).
+        self._display_load_key = None; self._deferred_display = None
+        self._refresh_ref_warning()
+        self._update_ref_buttons()
+        if self.current_idx is not None and self.items:
+            self._display_exact_index(
+                self.current_idx, self.items[self.current_idx].ts_ns,
+                update_slider=True)
+
     def _has_reference(self) -> bool:
         """True when at least one subtraction reference is set for the current mode."""
         if self._is_multi_cam():
             return any(p is not None for p in getattr(self, "_cam_ref_paths", []))
         return getattr(self, "_ref_path", None) is not None
+
+    def _update_ref_buttons(self):
+        """Remove ref is live only while there is a reference to remove. Set ref's own
+        enabling belongs to the bulk lists that grey the panel out between scans, so it
+        is only ever narrowed here, never widened."""
+        btn = getattr(self, "btn_remove_ref", None)
+        if btn is None:
+            return
+        btn.setEnabled(bool(self._has_reference())
+                       and getattr(self, "btn_set_ref", None) is not None
+                       and self.btn_set_ref.isEnabled())
 
     def _set_ref_status(self, text: str):
         """Reference line in the INFO panel, in its normal (grey) style."""
@@ -24146,6 +25449,7 @@ class Viewer(QWidget):
             self._set_diff_hist(None)
         elif not self._has_reference():
             self._set_ref_status("")
+        self._update_ref_buttons()
 
     def _on_subtract_changed(self):
         """Subtraction on/off, Diff threshold or Offset changed.
@@ -24157,6 +25461,20 @@ class Viewer(QWidget):
         typing an Offset — and threw away the frames needed to step back to the
         previous value. Keeping them makes a value you have already used instant.
         """
+        # Only the two SPINBOXES change what the difference is. The checkbox merely
+        # decides whether that difference is the picture — the numbers and the histogram
+        # go on describing the same thing either way, and throwing them away here is
+        # exactly the flicker that made clicking Subtraction on and off to compare
+        # impossible (see _update_diff_stats). The Auto hold survives too: it belongs to
+        # this reference and this threshold, and is simply not applied while the box is
+        # off (_sub_hold_on).
+        params = (int(self.sub_threshold_sb.value()), int(self.sub_offset_sb.value()))
+        if params != getattr(self, "_sub_params_last", None):
+            self._sub_params_last = params
+            self._clear_sub_auto_hold()
+            self._diff_last_final = None
+            self._cam_diff_final = {}
+            self._cam_diff_stats = {}
         self._refresh_ref_warning()
         # The preview layer is unusable while Subtraction is on, so _proxy_enabled now
         # depends on this checkbox: pause the sweep when it goes on, resume when off.
@@ -24296,12 +25614,21 @@ class Viewer(QWidget):
         traded away while it cannot be perceived. Live mode never comes here — it decodes
         arriving frames at native resolution."""
         base = self._cam_tile_base_side(n_cams)
+        # Subtraction renders NATIVE unless the user is actually moving. The numbers in
+        # the INFO panel are measured off whatever size was decoded, and a shrunken frame
+        # averages neighbouring pixels — so a tile-sized render and the native one that
+        # follows it report two different maxima for one frame. Reading it native in the
+        # first place is what stops that, and standing on one frame is exactly where the
+        # extra pixels are affordable.
+        if self.cb_subtract.isChecked() and not self._navigating():
+            return HQ_SIDE
         if not self._navigating():
             return base
-        # With Subtraction on there is no preview to fall back on, so every position is a
-        # real read + decode + subtract — and max_side is part of both the pixmap key and
-        # the reference key, so changing it mid-drag guarantees a cache miss AND a
-        # re-decoded reference at the new size. Keep one size for the whole gesture.
+        # While moving there is no preview to fall back on with Subtraction on, so every
+        # position is a real read + decode + subtract — and max_side is part of both the
+        # pixmap key and the reference key, so changing it mid-drag guarantees a cache
+        # miss AND a re-decoded reference at the new size. Keep one size for the whole
+        # gesture; the settle tier brings the tile up to native when the user stops.
         if self.cb_subtract.isChecked():
             return base
         ips = self._last_motion_ips
@@ -24396,7 +25723,15 @@ class Viewer(QWidget):
         # at only a few Hz, so one full-res decode per frame doesn't hurt responsiveness —
         # scrubbing and playback above keep the fast downscaled path, and _prefetch_idle
         # stays on _scrub_side.
-        if self._online_mode:
+        #
+        # A REFERENCE joins it for the same reason the tiles do (see _cam_tile_side): the
+        # difference numbers are measured off whatever size was decoded, so a shrunken
+        # first render and the native one behind it report two different maxima for one
+        # frame. The rule is the reference rather than the Subtraction checkbox, because
+        # a frame is measured against the reference whether or not the difference is what
+        # is on screen. Standing still is where the extra pixels are affordable; the two
+        # branches above keep the small render while the user is actually moving.
+        if self._online_mode or self._has_reference():
             return FULL_RES_SIDE
         return self._scrub_side
 
@@ -25137,14 +26472,20 @@ class Viewer(QWidget):
             self._diag_miss += 1
             return False
         ts_ns, arr = got
-        pm = self._proxy_render(0, ts_ns, arr,
-                                1 if self.cb_bright.isChecked() else 0,
+        pm = self._proxy_render(0, ts_ns, arr, self._render_brighten(),
                                 self._bc(), self.gradient_cb.currentIndex())
         if pm is None:
             self._diag_miss += 1
             return False
         self.img_view.set_pixmap(pm)
         self._diag_prev += 1
+        # A preview paint measures nothing — it repaints a frame held in RAM and never
+        # goes near the reference. With a reference set the numbers beside the picture
+        # must therefore say they are no longer known to describe it, and go back to
+        # being measured when the settle pass renders the frame for real.
+        if self._has_reference():
+            self._update_diff_stats(self._ref_render_for(
+                self._ck(idx), self._current_decode_side()).mkey)
         # Say which frame this actually is. _set_info_for already wrote the readouts from
         # the REQUESTED index (it runs before every call to this method), and the preview
         # is sampled, so without this single-cam quietly claimed a moment it was not
@@ -25264,7 +26605,6 @@ class Viewer(QWidget):
         if grid is None:
             return
         n_cams      = min(len(cam_items_all), len(getattr(self, "_cam_want", [])))
-        subtract    = self.cb_subtract.isChecked()
         for cam_i in range(n_cams):
             cam_items = cam_items_all[cam_i]
             if not cam_items:
@@ -25283,13 +26623,9 @@ class Viewer(QWidget):
             brighten = d["brighten"]
             bc       = d["bc"]
             gradient_id = d["gid"]
-            ref      = self._cam_ref_arr_for(cam_i, HQ_SIDE) if subtract else None
-            sub_thr, sub_off = self._sub_params(ref)
             ck  = self._cam_ck(cam_i, idx)
-            key = (ck, HQ_SIDE, brighten, gradient_id, bc,
-                   id(ref) if ref is not None else None,
-                   sub_thr if ref is not None else 0,
-                   sub_off if ref is not None else 0)
+            rr  = self._cam_ref_render_for(cam_i, ck, HQ_SIDE)
+            key = (ck, HQ_SIDE, brighten, gradient_id, bc) + rr.key_parts
             shown = (self._cam_shown_key[cam_i]
                      if cam_i < len(getattr(self, "_cam_shown_key", [])) else None)
             if shown == key:
@@ -25301,7 +26637,7 @@ class Viewer(QWidget):
                 iv.set_pixmap(cached)
                 self._diag_hq += 1
                 self._cam_note_painted(cam_i, it.ts_ns)
-                self._update_cam_diff_stats(cam_i, key)
+                self._update_cam_diff_stats(cam_i, rr.mkey)
                 self._cam_want[cam_i] = None
                 continue
             # Claim the tile BEFORE launching: _on_cam_loaded rejects any arrival whose
@@ -25312,7 +26648,7 @@ class Viewer(QWidget):
             self._cam_set_shown_key(cam_i, key)
             self._cam_note_target(cam_i, it.ts_ns)
             self._cam_want[cam_i] = (idx, it.path, HQ_SIDE, brighten,
-                                     gradient_id, ref, sub_thr, bc, sub_off, ck)
+                                     gradient_id, rr, bc, ck)
             self._start_cam_load(cam_i)
 
     def _refine_current_frame(self):
@@ -25354,24 +26690,24 @@ class Viewer(QWidget):
         # ~22 MB QPixmap.fromImage on the GUI thread after EVERY slider release, which was
         # a visible hitch that v2.5.5 (no refine pass at all) did not have. Zoomed in the
         # user really is looking at individual pixels, so that case stays native.
-        # Subtraction stays native too: _update_diff_stats reports pixel counts, mean and
-        # max difference for whatever render is on screen, and downscaling averages pixels
-        # — so refining at 1600 would quietly change numbers people write down.
+        # A REFERENCE stays native too — not just Subtraction. The difference statistics
+        # are measured off whatever render this pass produces, and downscaling averages
+        # pixels, so refining at 1600 would quietly change numbers people write down.
+        # Since the numbers are now kept while Subtraction is OFF as well, the rule is
+        # "there is something to measure", not "the difference is the picture".
         zoomed = getattr(self.img_view, "_zoom_norm", None) is not None
-        side = FULL_RES_SIDE if (zoomed or self.cb_subtract.isChecked()) \
+        side = FULL_RES_SIDE if (zoomed or self._has_reference()) \
                else REFINE_MAX_SIDE
-        brighten    = 1 if self.cb_bright.isChecked() else 0
+        brighten    = self._render_brighten()
         gradient_id = self.gradient_cb.currentIndex()
         bc          = self._bc()
-        ref = self._ref_arr_for(side) if self.cb_subtract.isChecked() else None
-        sub_thr, sub_off = self._sub_params(ref)
-        key = (self._ck(idx), side, brighten, gradient_id, bc,
-               id(ref) if ref is not None else None, sub_thr, sub_off)
+        rr = self._ref_render_for(self._ck(idx), side)
+        key = (self._ck(idx), side, brighten, gradient_id, bc) + rr.key_parts
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self.img_view.set_pixmap(cached)
             self._diag_cach += 1
-            self._update_diff_stats(key)
+            self._update_diff_stats(rr.mkey)
             return
         self._display_req_id += 1
         self._want_display_req[key] = self._display_epoch
@@ -25601,6 +26937,9 @@ class Viewer(QWidget):
         self._ref_path = None
         self._ref_scaled = {}
         self._cam_diff_stats = {}
+        self._cam_diff_final = {}
+        self._diff_last_final = None
+        self._clear_sub_auto_hold()
         # Same reasoning for the PV values: they were fetched for a frame of the PREVIOUS
         # dataset. _pv_values_ts stayed set, so _pv_is_pending only greyed them out — and
         # a greyed number still reads as "this dataset's value" to an operator. Drop them
@@ -25616,6 +26955,7 @@ class Viewer(QWidget):
         # frame of the new one, which is the exact confusion this block prevents.
         self._pv_last_good = {}
         self._pv_last_good_ts = {}
+        self._pv_sample_ts = {}
         self._pv_no_sample = set()
         self._pv_awaiting = set()
         if hasattr(self, "_pv_table"):
@@ -25644,7 +26984,8 @@ class Viewer(QWidget):
                 self.btn_play, self.btn_stop, self.btn_prev, self.btn_next, self.btn_set_a,
                 self.btn_set_b, self.btn_clear_marks, self.btn_cal_circle, self.btn_cal_square,
                 self.btn_cal_cross, self.btn_pointing, self.btn_save_ts, self.btn_goto_ts,
-                self.btn_prev_ts, self.btn_next_ts, self.btn_set_ref]:
+                self.btn_prev_ts, self.btn_next_ts, self.btn_set_ref,
+                self.btn_remove_ref]:
             w.setEnabled(False)
         # Preserve marks across rescan — they are revalidated against the new axis at scan-done time
         # (do not clear mark_a_ns / mark_b_ns here)
@@ -25706,7 +27047,7 @@ class Viewer(QWidget):
         self._display_req_id += 1
         req_id = self._display_req_id
         max_side = self._current_decode_side()
-        brighten = 1 if self.cb_bright.isChecked() else 0
+        brighten = self._render_brighten()
         gradient_id = self.gradient_cb.currentIndex()
         bc = self._bc()
         key = (0, max_side, brighten, gradient_id, bc, None, 0, 0)
@@ -25813,12 +27154,13 @@ class Viewer(QWidget):
         self.btn_cal_square.setEnabled(True); self.btn_cal_cross.setEnabled(True)
         self.btn_refresh.setEnabled(True)
         self.btn_send_workshop.setEnabled(True)
+        self.btn_send_finder.setEnabled(True)
         self.btn_pointing.setEnabled(True)
         self.btn_pointing_live.setEnabled(True)
         self._sc_set_enabled(True)
         self._btn_auto_follow.setEnabled(True)
         self._refresh_live_btn_style()
-        self.btn_set_ref.setEnabled(True)
+        self.btn_set_ref.setEnabled(True); self._update_ref_buttons()
         self._update_range_ui(); self._sync_overlay_checkboxes_from_iv(self.img_view); self.img_view.update()
         pending_online = getattr(self, '_pending_online_mode', False)
         if pending_online and self.items:
@@ -25858,7 +27200,7 @@ class Viewer(QWidget):
             self.play_time_ns = start_ts; self.target_idx = start_idx
             self._display_exact_index(start_idx, start_ts, update_slider=False)
         self.btn_save_ts.setEnabled(True)
-        self.btn_set_ref.setEnabled(True)
+        self.btn_set_ref.setEnabled(True); self._update_ref_buttons()
         if self._saved_timestamps:
             self._ts_nav_set_enabled(True)
             self.lbl_ts_status.setText(
@@ -25897,21 +27239,25 @@ class Viewer(QWidget):
         idx = self.current_idx
         if not (0 <= idx < len(self.items)):
             return on_screen.copy() if on_screen is not None and not on_screen.isNull() else None
-        brighten = 1 if self.cb_bright.isChecked() else 0
-        ref = self._ref_arr_for(FULL_RES_SIDE) if self.cb_subtract.isChecked() else None
-        sub_thr, sub_off = self._sub_params(ref)
-        key = (self._ck(idx), FULL_RES_SIDE, brighten, self.gradient_cb.currentIndex(), self._bc(),
-               id(ref) if ref is not None else None, sub_thr, sub_off)
+        brighten = self._render_brighten()
+        rr = self._ref_render_for(self._ck(idx), FULL_RES_SIDE)
+        ref, sub_thr, sub_off = rr.arr, rr.thr, rr.off
+        key = (self._ck(idx), FULL_RES_SIDE, brighten,
+               self.gradient_cb.currentIndex(), self._bc()) + rr.key_parts
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             return cached.copy()
         bc = self._bc()
         try:
             # Same argument order LoadTask.run uses, so the export matches the render.
+            # GAMMA INCLUDED: it was left off, so a saved picture came out at gamma 1.00
+            # however the slider was set. It matters more since gamma moved to the far
+            # side of the subtraction, where it is the only thing separating a readable
+            # difference from a black one.
             img = load_image_scaled(
                 self.items[idx].path, FULL_RES_SIDE, bool(brighten),
                 self.gradient_cb.currentIndex(), bc.offset, ref, sub_thr,
-                bc.contrast, bc.auto, sub_off)
+                bc.contrast, bc.auto, sub_off, None, bc.gamma, rr.subtract)
             if img is not None and not img.isNull():
                 pm = QPixmap.fromImage(img)
                 if not pm.isNull():
@@ -25936,9 +27282,12 @@ class Viewer(QWidget):
                 for cam_i in range(n_cams):
                     self._cam_ref_arr_for(cam_i, side)
             return
-        # Both sizes _current_decode_side can return for a single-cam drag.
+        # Both sizes _current_decode_side can return for a single-cam drag, plus the
+        # native one it settles on when the drag ends — the refine pass and the idle
+        # prefetch both ask for that one within a few hundred ms of the release.
         self._ref_arr_for(self._drag_side)
         self._ref_arr_for(FAST_SCRUB_MAX_SIDE)
+        self._ref_arr_for(FULL_RES_SIDE)
 
     # ================================================================ SLIDER HANDLERS
     def _on_slider_pressed(self):
@@ -26021,19 +27370,17 @@ class Viewer(QWidget):
         self._pv_trigger_fetch()
 
         max_side = self._current_decode_side()
-        brighten = 1 if self.cb_bright.isChecked() else 0
+        brighten = self._render_brighten()
         gradient_id = self.gradient_cb.currentIndex()
-        subtract = self.cb_subtract.isChecked()
-        ref = self._ref_arr_for(max_side) if subtract else None
-        sub_thr, sub_off = self._sub_params(ref)
         bc = self._bc()
-        key = (self._ck(idx), max_side, brighten, gradient_id, bc, id(ref) if ref is not None else None, sub_thr, sub_off)
+        rr = self._ref_render_for(self._ck(idx), max_side)
+        key = (self._ck(idx), max_side, brighten, gradient_id, bc) + rr.key_parts
 
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self.img_view.set_pixmap(cached)
             self._diag_cach += 1
-            self._update_diff_stats(key)
+            self._update_diff_stats(rr.mkey)
             return
 
         # Live mode off: the whole window is preloaded at PROXY_MAX_SIDE, so repaint
@@ -26181,16 +27528,13 @@ class Viewer(QWidget):
     def _load_or_cache(self, idx, max_side, brighten, req_id=0):
         gradient_id = self.gradient_cb.currentIndex()
         bc = self._bc()
-        subtract = self.cb_subtract.isChecked()
-        ref = self._ref_arr_for(max_side) if subtract else None
-        sub_thr, sub_off = self._sub_params(ref)
-        ref_id = id(ref) if ref is not None else None
-        key = (self._ck(idx), max_side, brighten, gradient_id, bc, ref_id, sub_thr, sub_off)
+        rr = self._ref_render_for(self._ck(idx), max_side)
+        key = (self._ck(idx), max_side, brighten, gradient_id, bc) + rr.key_parts
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull(): return cached
         if key not in self._inflight:
             self._inflight.add(key)
-            self.load_pool.start(LoadTask(self._gen, req_id, idx, self.items[idx].path, max_side, brighten, gradient_id, self.load_signals, bc, ref, sub_thr, sub_off, key=key))
+            self.load_pool.start(LoadTask(self._gen, req_id, idx, self.items[idx].path, max_side, brighten, gradient_id, self.load_signals, bc, rr.arr, rr.thr, rr.off, key=key, subtract=rr.subtract, stats_key=rr.mkey))
         return None
 
     def _adaptive_index_step(self, target_idx):
@@ -26297,7 +27641,6 @@ class Viewer(QWidget):
         self._pv_trigger_fetch()
 
         t_ns = self.items[idx].ts_ns
-        subtract    = self.cb_subtract.isChecked()
         n_cams      = len(self._cam_items)
         # Invariant across the loop and across this tick. Reading it once also stops two
         # tiles from being cache-keyed at different sizes if the motion estimate moves
@@ -26328,15 +27671,11 @@ class Viewer(QWidget):
             if hasattr(self, '_cam_current_idx') and cam_i < len(self._cam_current_idx):
                 self._cam_current_idx[cam_i] = cam_idx
 
-            # Per-camera reference decoded at this display size (see _ref_arr_for)
-            ref = self._cam_ref_arr_for(cam_i, max_side) if subtract else None
-            ref_id = id(ref) if ref is not None else None
-            effective_sub_thr, effective_sub_off = self._sub_params(ref)
-
             cache = self._cam_caches[cam_i]
             ck = self._cam_ck(cam_i, cam_idx)
-            key = (ck, max_side, brighten, gradient_id, bc, ref_id,
-                   effective_sub_thr, effective_sub_off)
+            # Per-camera reference decoded at this display size (see _ref_arr_for)
+            rr = self._cam_ref_render_for(cam_i, ck, max_side)
+            key = (ck, max_side, brighten, gradient_id, bc) + rr.key_parts
             self._cam_set_shown_key(cam_i, key)
             self._cam_note_target(cam_i, it.ts_ns)
             cached = cache.get(key)
@@ -26346,7 +27685,8 @@ class Viewer(QWidget):
                     iv.set_pixmap(cached)
                     self._diag_cach += 1
                 self._cam_note_painted(cam_i, it.ts_ns)
-                self._collect_cam_diff_stats(cam_i, key)   # label flushed after the loop
+                # The MEASURE key, not the pixmap's — see _ref_render.
+                self._collect_cam_diff_stats(cam_i, rr.mkey)   # flushed after the loop
                 if cam_i < len(self._cam_want):
                     self._cam_want[cam_i] = None   # we're current; drop any stale pending load
                 continue
@@ -26379,8 +27719,7 @@ class Viewer(QWidget):
             # have one read outstanding, which is the ~7 frames/s ceiling.
             if cam_i < len(self._cam_want):
                 self._cam_want[cam_i] = (cam_idx, it.path, max_side, brighten,
-                                         gradient_id, ref, effective_sub_thr, bc,
-                                         effective_sub_off, ck)
+                                         gradient_id, rr, bc, ck)
                 self._start_cam_load(cam_i)
 
         # One label build for the whole pass, not one per camera (see
@@ -26429,11 +27768,9 @@ class Viewer(QWidget):
         # live UI state cached the pixmap under the wrong key whenever the per-camera
         # reference/subtraction changed mid-load.
         if key is None:
-            subtract = self.cb_subtract.isChecked()
-            ref = self._cam_ref_arr_for(cam_i, max_side) if subtract else None
-            ref_id = id(ref) if ref is not None else None
-            sub_thr, sub_off = self._sub_params(ref)
-            key = (self._cam_ck(cam_i, idx), max_side, brighten, gradient_id, bc, ref_id, sub_thr, sub_off)
+            ck = self._cam_ck(cam_i, idx)
+            key = ((ck, max_side, brighten, gradient_id, bc)
+                   + self._cam_ref_render_for(cam_i, ck, max_side).key_parts)
         pix = QPixmap.fromImage(img)
         if cam_i < len(self._cam_caches):
             self._cam_caches[cam_i].put(key, pix)
@@ -26472,7 +27809,8 @@ class Viewer(QWidget):
                 if (cam_i < len(self._cam_items)
                         and isinstance(_wi, int) and 0 <= _wi < len(self._cam_items[cam_i])):
                     self._cam_note_painted(cam_i, self._cam_items[cam_i][_wi].ts_ns)
-                self._update_cam_diff_stats(cam_i, want_key)
+                self._update_cam_diff_stats(
+                    cam_i, self._cam_ref_render_for(cam_i, want_key[0], max_side).mkey)
                 self._start_cam_load(cam_i)
                 return
             # The wanted render is neither cached nor pending (_cam_want was
@@ -26484,7 +27822,12 @@ class Viewer(QWidget):
                 self._redraw_cam_in_place(cam_i)
             return
 
-        self._update_cam_diff_stats(cam_i, key)
+        # Rebuilt rather than carried through the signal: the numbers depend only on
+        # the frame, the reference and the two spinboxes, so a render that finishes
+        # after a display setting changed still looks up the right set — and one that
+        # finishes after the REFERENCE changed misses, which is correct.
+        self._update_cam_diff_stats(
+            cam_i, self._cam_ref_render_for(cam_i, key[0], max_side).mkey)
         # Don't paint a frame that is already older than what the tile is showing —
         # avoids the view flashing backwards while it catches up to live.
         #
@@ -26564,6 +27907,13 @@ class Viewer(QWidget):
                 # Only for the frame actually asked for: the intermediate paints above are
                 # frames flying past, and letting them drive the sliders made the
                 # Brightness/Contrast controls jitter for the whole drag.
+                # The held Auto values of a subtraction run are per TILE, so every camera
+                # freezes its own off its own first difference frame — not just the
+                # master, whose job here is only to drive the shared sliders.
+                if is_wanted and idx < len(self._cam_items[cam_i]):
+                    self._capture_cam_sub_auto_hold(
+                        cam_i, self._cam_items[cam_i][idx].path,
+                        self._cam_ref_render_for(cam_i, key[0], max_side).mkey)
                 if is_wanted and cam_i == getattr(self, "_per_cam_master_idx", 0):
                     self._refresh_auto_bc_sliders(self._cam_items[cam_i][idx].path)
         # NOTE: the refresh dot is deliberately NOT bumped here. A finished image
@@ -26997,17 +28347,15 @@ class Viewer(QWidget):
             self._note_cam_fault_trip(i, state, tip, _reason)
 
     def _request_display_target(self, idx, axis_time_ns, update_slider):
-        max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0
+        max_side = self._current_decode_side(); brighten = self._render_brighten()
         gradient_id = self.gradient_cb.currentIndex()
-        subtract = self.cb_subtract.isChecked()
-        ref = self._ref_arr_for(max_side) if subtract else None
-        sub_thr, sub_off = self._sub_params(ref)
-        key = (self._ck(idx), max_side, brighten, gradient_id, self._bc(), id(ref) if ref is not None else None, sub_thr, sub_off)
+        rr = self._ref_render_for(self._ck(idx), max_side)
+        key = (self._ck(idx), max_side, brighten, gradient_id, self._bc()) + rr.key_parts
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self._display_req_id += 1; self.current_idx = idx
             self._paint_single(idx, cached)
-            self._update_diff_stats(key)
+            self._update_diff_stats(rr.mkey)
             self.btn_cal_circle.setEnabled(True); self.btn_cal_square.setEnabled(True); return
         if self._display_load_key is not None and self._display_load_key != key:
             self._deferred_display = (idx, axis_time_ns, update_slider); return
@@ -27030,29 +28378,33 @@ class Viewer(QWidget):
         self._set_info_for(idx, axis_time_ns); self._request_display_target(idx, axis_time_ns, update_slider)
 
     def _request_pixmap(self, idx, req_id):
-        max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0
+        max_side = self._current_decode_side(); brighten = self._render_brighten()
         gradient_id = self.gradient_cb.currentIndex()
-        subtract = self.cb_subtract.isChecked()
-        ref = self._ref_arr_for(max_side) if subtract else None
-        sub_thr, sub_off = self._sub_params(ref)
-        key = (self._ck(idx), max_side, brighten, gradient_id, self._bc(), id(ref) if ref is not None else None, sub_thr, sub_off)
+        rr = self._ref_render_for(self._ck(idx), max_side)
+        key = (self._ck(idx), max_side, brighten, gradient_id, self._bc()) + rr.key_parts
         self._want_display_req[key] = self._display_epoch
         pm = self._load_or_cache(idx, max_side, brighten, req_id)
         if pm is not None and self.target_idx == idx and req_id == self._display_req_id:
             self.current_idx = idx; self._paint_single(idx, pm)
-            self._update_diff_stats(key)
+            self._update_diff_stats(rr.mkey)
             self.btn_cal_circle.setEnabled(True); self.btn_cal_square.setEnabled(True)
 
     def _prefetch_idle(self, idx):
         if len(self._inflight) > 10: return
-        max_side = self._scrub_side; brighten = 1 if self.cb_bright.isChecked() else 0
+        # The size the DISPLAY will ask for, whenever that is not _scrub_side. With
+        # Subtraction on the view renders native (see _current_decode_side), so a
+        # neighbour read at _scrub_side lands under a key nothing will ever look up —
+        # a share read, a decode and a subtraction per frame, all thrown away.
+        max_side = (self._current_decode_side() if self.cb_subtract.isChecked()
+                    else self._scrub_side)
+        brighten = self._render_brighten()
         for j in range(idx - PREFETCH_RADIUS_IDLE, idx + PREFETCH_RADIUS_IDLE + 1):
             if j != idx and 0 <= j < len(self.items):
                 self._load_or_cache(j, max_side, brighten)
 
     def _prefetch_playish(self, idx):
         if self._last_motion_ips >= 120 or len(self._inflight) > 4: return
-        max_side = self._current_decode_side(); brighten = 1 if self.cb_bright.isChecked() else 0
+        max_side = self._current_decode_side(); brighten = self._render_brighten()
         ahead = 1 if self._last_motion_ips >= 40 else PREFETCH_AHEAD_PLAY
         for j in range(idx + 1, min(len(self.items), idx + 1 + ahead)):
             self._load_or_cache(j, max_side, brighten)
@@ -27064,10 +28416,8 @@ class Viewer(QWidget):
         # from the launch key on any mid-flight reference/subtract/gradient change, which
         # is what made the slider, arrows and subtraction toggle silently stop working.
         if key is None:
-            subtract = self.cb_subtract.isChecked()
-            ref = self._ref_arr_for(max_side) if subtract else None
-            sub_thr, sub_off = self._sub_params(ref)
-            key = (self._ck(idx), max_side, brighten, gradient_id, bc, id(ref) if ref is not None else None, sub_thr, sub_off)
+            key = ((self._ck(idx), max_side, brighten, gradient_id, bc)
+                   + self._ref_render_for(self._ck(idx), max_side).key_parts)
         self._inflight.discard(key)
         # A null image here is a file we know exists that could not be decoded (see the
         # matching split in _on_cam_loaded). The stale-generation case already returned
@@ -27113,8 +28463,10 @@ class Viewer(QWidget):
                 self.current_idx = idx
             self._paint_single(idx, pm)
             self._diag_load += 1
-            self._update_diff_stats(key)
+            mkey = self._ref_render_for(self._ck(idx), max_side).mkey
+            self._update_diff_stats(mkey)
             if idx < len(self.items):
+                self._capture_sub_auto_hold(self.items[idx].path, mkey)
                 self._refresh_auto_bc_sliders(self.items[idx].path)
             self.btn_cal_circle.setEnabled(True); self.btn_cal_square.setEnabled(True)
             # Pokud auto-follow, ujistíme se že slider je na správné pozici
@@ -27256,25 +28608,22 @@ class Viewer(QWidget):
         self.tickbar.set_cursor(self.play_time_ns)
 
         max_side = PLAY_MAX_SIDE_FAST
-        brighten = 1 if self.cb_bright.isChecked() else 0
+        brighten = self._render_brighten()
         gradient_id = self.gradient_cb.currentIndex()
-        subtract = self.cb_subtract.isChecked()
-        ref = self._ref_arr_for(max_side) if subtract else None
-        sub_thr, sub_off = self._sub_params(ref)
         bc = self._bc()
+        rr = self._ref_render_for(self._ck(new_idx), max_side)
         # _ck(new_idx), not the raw index: every other render-key site uses the absolute,
         # trim-proof frame number, and this one did not. Identical while _items_offset is 0,
         # but after any live-mode trim playback would read and write pixmaps under keys that
         # name a different frame than the rest of the app — losing every cross-path cache
         # hit and, worse, capable of showing a cached frame that is not the one asked for.
-        key = (self._ck(new_idx), max_side, brighten, gradient_id, bc,
-               id(ref) if ref is not None else None, sub_thr, sub_off)
+        key = (self._ck(new_idx), max_side, brighten, gradient_id, bc) + rr.key_parts
 
         cached = self.cache.get(key)
         if cached is not None and not cached.isNull():
             self.img_view.set_pixmap(cached)
             self._diag_cach += 1
-            self._update_diff_stats(key)
+            self._update_diff_stats(rr.mkey)
             return
 
         # Preloaded preview → playback runs at the timer's rate instead of the
@@ -27295,21 +28644,32 @@ class Viewer(QWidget):
     # ================================================================ STEP FRAME
     # ── holding a frame arrow down ───────────────────────────────────────────────
     # A press is always exactly one frame — the click behaviour nobody wanted changed.
-    # Keep the button down and the ramp in HOLD_STEP_RATES takes over: 2 images per second
-    # for the first second, then 3, then 4, then 5 for as long as it stays down.
+    # Keep the button down and the ramp in HOLD_STEP_RAMP takes over: 2 images per second
+    # for the first second, then 3, then 4, then 5 — and if it is still held, 8/s from the
+    # fifth second and 10/s from the eighth.
     #
-    # The rung is read from the CLOCK on every tick, not counted up — one rung per whole
-    # second held, which is the rule as it was asked for. Counting steps instead ("this
-    # rung owes 3 more frames") sounds equivalent and is not: a tick delayed by the GUI
-    # thread then pushes the whole ramp back, so a busy panel — the case the ramp exists
-    # for — crawled at 2/s for four seconds. Reading the clock means a stall costs the
-    # frames it swallowed and nothing more; the next tick is already at the rate the
-    # elapsed time calls for.
+    # The rung is read from the CLOCK on every tick, not counted up. Counting steps
+    # instead ("this rung owes 3 more frames") sounds equivalent and is not: a tick
+    # delayed by the GUI thread then pushes the whole ramp back, so a busy panel — the
+    # case the ramp exists for — crawled at 2/s for four seconds. Reading the clock means
+    # a stall costs the frames it swallowed and nothing more; the next tick is already at
+    # the rate the elapsed time calls for.
+    @staticmethod
+    def _hold_rate(held: float) -> int:
+        """Frames per second for a button that has been down `held` seconds."""
+        rate = HOLD_STEP_RAMP[0][1]
+        for at, r in HOLD_STEP_RAMP:
+            if held >= at:
+                rate = r
+            else:
+                break
+        return rate
+
     def _hold_step_begin(self, delta: int):
         self._hold_dir = delta
         self._hold_t0  = time.monotonic()
         self.step_frame(delta)
-        self._hold_timer.setInterval(int(1000 / HOLD_STEP_RATES[0]))
+        self._hold_timer.setInterval(int(1000 / self._hold_rate(0.0)))
         self._hold_timer.start()
 
     def _hold_step_end(self):
@@ -27325,8 +28685,7 @@ class Viewer(QWidget):
             return
         self.step_frame(self._hold_dir)
         held = time.monotonic() - self._hold_t0
-        rate = HOLD_STEP_RATES[min(int(held), len(HOLD_STEP_RATES) - 1)]
-        interval = int(1000 / rate)
+        interval = int(1000 / self._hold_rate(held))
         if interval != self._hold_timer.interval():
             self._hold_timer.setInterval(interval)
 
@@ -28598,6 +29957,7 @@ class Viewer(QWidget):
         self.btn_open.setEnabled(True); self.btn_date.setEnabled(True)
         self.btn_save.setEnabled(has and self.current_idx is not None)
         self.btn_send_workshop.setEnabled(has and self.current_idx is not None)
+        self.btn_send_finder.setEnabled(has and self.current_idx is not None)
         self.btn_play.setEnabled(has); self.btn_stop.setEnabled(False)
         self.btn_prev.setEnabled(has); self.btn_next.setEnabled(has)
         self.btn_set_a.setEnabled(has); self.btn_set_b.setEnabled(has)
@@ -28618,7 +29978,8 @@ class Viewer(QWidget):
         whole batch with _pv_prefetch_texts() before a GUI-thread render loop."""
         if not self.cb_save_overlay.isChecked():
             return ""
-        text = pv_text_for_ts(ts_ns, self._pv_visible_names())
+        text = pv_text_for_ts(ts_ns, self._pv_visible_names(),
+                              self._pv_frame_ts_list())
         return text or self._pv_text()
 
     def _pv_prefetch_texts(self, ts_values: "list[int]") -> "dict[int, str]":
@@ -28642,6 +30003,9 @@ class Viewer(QWidget):
         # frame inside the loop below.
         chans = pv_source_channels(names)
         uniq = sorted({int(t) for t in ts_values if t})
+        # The camera's own timeline, so a saved frame is paired exactly as the screen
+        # paired it (see _pv_own_window_ns). Read here, on the GUI thread.
+        frame_ts = list(self._pv_frame_ts_list())
         if not (chans and uniq):
             diag_note(f"PV bar: nothing to resolve (visible PVs={len(names)}, "
                       f"channels={len(chans)}, timestamps={len(uniq)}) — no bar")
@@ -28661,7 +30025,7 @@ class Viewer(QWidget):
                 failed.append(f"warm-up: {exc}")
             for t in uniq:
                 try:
-                    out[t] = pv_text_for_ts(t, names)
+                    out[t] = pv_text_for_ts(t, names, frame_ts)
                 except Exception as exc:
                     failed.append(f"{fmt_hhmmss_ms_from_ns(t)}: {exc}")
             done.set()
@@ -28769,27 +30133,10 @@ class Viewer(QWidget):
         self._show_copy_progress(total, f"Saving {total} frames around current…")
         iv = self.img_view
         has_overlay = (self.cb_save_overlay.isChecked()
-                       or iv.show_cross or iv.show_circle or iv.show_square)
+                       or has_any_mark(visible_marks(iv)))
         overlay_params = None
         if has_overlay:
-            overlay_params = {
-                'show_cross': iv.show_cross,
-                'cross_pos_norm': iv.cross_pos_norm,
-                'cross_size': self._overlay_cross_size,
-                'cross_color': self._overlay_cross_color,
-                'cross_thick': self._overlay_cross_thick,
-                'show_circle': iv.show_circle,
-                'circle_center_norm': iv.circle_center_norm,
-                'circle_rx_norm': iv.circle_rx_norm,
-                'circle_ry_norm': getattr(iv, 'circle_ry_norm', None),
-                'circle_r_norm': getattr(iv, 'circle_r_norm', 0.1),
-                'circle_color': self._overlay_circle_color,
-                'circle_thick': self._overlay_circle_thick,
-                'show_square': iv.show_square,
-                'square_rect_norm': iv.square_rect_norm,
-                'square_color': self._overlay_square_color,
-                'square_thick': self._overlay_square_thick,
-            }
+            overlay_params = overlay_params_from_view(iv, self._overlay_style())
         if overlay_params is not None:
             overlay_params['pv_text'] = self._pv_text()
         elif self._pv_text():
@@ -28841,43 +30188,7 @@ class Viewer(QWidget):
                 "No image displayed."); return
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = pix.width(), pix.height()
-
-        if self.img_view.show_cross:
-            if self.img_view.cross_pos_norm is not None:
-                cx = int(self.img_view.cross_pos_norm.x() * w)
-                cy = int(self.img_view.cross_pos_norm.y() * h)
-            else:
-                cx, cy = w // 2, h // 2
-            sz = self._overlay_cross_size
-            pen = QPen(self._overlay_cross_color); pen.setWidth(max(self._overlay_cross_thick, w // 500))
-            painter.setPen(pen)
-            sz = self._overlay_cross_size
-            painter.drawLine(cx - sz, cy, cx + sz, cy)
-            painter.drawLine(cx, cy - sz, cx, cy + sz)
-
-        if self.img_view.show_circle and self.img_view.circle_center_norm is not None:
-            cx = int(self.img_view.circle_center_norm.x() * w)
-            cy = int(self.img_view.circle_center_norm.y() * h)
-            if self.img_view.circle_rx_norm is not None:
-                rx = int(self.img_view.circle_rx_norm * w)
-                ry = int(self.img_view.circle_ry_norm * h)
-            else:
-                r = int(self.img_view.circle_r_norm * min(w, h))
-                rx = ry = r
-            pen = QPen(self._overlay_circle_color); pen.setWidth(max(self._overlay_circle_thick, w // 500))
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
-
-        if self.img_view.show_square and self.img_view.square_rect_norm is not None:
-            ln, tn, rn, bn = self.img_view.square_rect_norm
-            sx = int(ln * w); sy = int(tn * h)
-            sw = int((rn - ln) * w); sh = int((bn - tn) * h)
-            pen = QPen(self._overlay_square_color); pen.setWidth(max(self._overlay_square_thick, w // 500))
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(sx, sy, sw, sh)
+        self._burn_marks(painter, pix, self.img_view)
         painter.end()
 
         energy_text = self._sf_energy_map.get(it.path.name, "")
@@ -28921,7 +30232,7 @@ class Viewer(QWidget):
         pv_texts is the pre-resolved {ts_ns: bar text} map from _pv_prefetch_texts;
         pass it whenever this runs on the GUI thread so no archiver request can
         happen here."""
-        has_shapes = iv is not None and (iv.show_cross or iv.show_circle or iv.show_square)
+        has_shapes = iv is not None and has_any_mark(visible_marks(iv))
         # Default ignores brighten (see SaveRangeTask.run for the same change).
         is_recoloured = (gradient_id != GRADIENT_ID_DEFAULT)
         pv_text = (pv_texts.get(it.ts_ns, "") if pv_texts is not None
@@ -28958,35 +30269,7 @@ class Viewer(QWidget):
             pix = iv._pix.copy()
             painter = QPainter(pix)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            w, h = pix.width(), pix.height()
-            if iv.show_cross:
-                cx = int(iv.cross_pos_norm.x() * w) if iv.cross_pos_norm else w // 2
-                cy = int(iv.cross_pos_norm.y() * h) if iv.cross_pos_norm else h // 2
-                sz = self._overlay_cross_size
-                pen = QPen(self._overlay_cross_color)
-                pen.setWidth(max(self._overlay_cross_thick, w // 500))
-                painter.setPen(pen)
-                painter.drawLine(cx - sz, cy, cx + sz, cy)
-                painter.drawLine(cx, cy - sz, cx, cy + sz)
-            if iv.show_circle and iv.circle_center_norm is not None:
-                cx = int(iv.circle_center_norm.x() * w)
-                cy = int(iv.circle_center_norm.y() * h)
-                if iv.circle_rx_norm is not None:
-                    rx = int(iv.circle_rx_norm * w); ry = int(iv.circle_ry_norm * h)
-                else:
-                    r = int(iv.circle_r_norm * min(w, h)); rx = ry = r
-                pen = QPen(self._overlay_circle_color)
-                pen.setWidth(max(self._overlay_circle_thick, w // 500))
-                painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
-            if iv.show_square and iv.square_rect_norm is not None:
-                ln, tn, rn, bn = iv.square_rect_norm
-                sx = int(ln * w); sy = int(tn * h)
-                sw = int((rn - ln) * w); sh = int((bn - tn) * h)
-                pen = QPen(self._overlay_square_color)
-                pen.setWidth(max(self._overlay_square_thick, w // 500))
-                painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(sx, sy, sw, sh)
+            self._burn_marks(painter, pix, iv)
             painter.end()
             if not self._pv_save_append_bar(pix, dst, it.ts_ns, pv_text=pv_text):
                 return f"Could not save {dst.name}"
@@ -29045,6 +30328,43 @@ class Viewer(QWidget):
         msg += self._pv_bar_take_error()
         QMessageBox.information(self, "Saved", msg)
 
+    def _send_to_image_finder(self):
+        """The moment on screen, opened in the Image Finder.
+
+        The mirror image of the Finder's own "Send moment": this tab slides through
+        the shots around one instant, the Finder puts that one instant side by side
+        for every camera and every day. The cameras loaded here go with it, so the
+        wall opens on the same cameras rather than on whatever was picked there
+        last.
+
+        The MOMENT is what crosses over, not the file — the Finder looks the nearest
+        frame up itself, which is also what makes a moment scrubbed to between two
+        frames a valid thing to send.
+        """
+        title = "Send to Image Finder"
+        fi = getattr(self, "_finder_ref", None)
+        tabs = getattr(self, "_tab_widget", None)
+        if fi is None or tabs is None:
+            QMessageBox.information(self, title, "Image Finder not connected.")
+            return
+        ts = self._current_view_ts_ns()
+        if ts is None:
+            QMessageBox.information(self, title, "No image loaded.")
+            return
+        cams = [c for c in (self._cam_names or []) if c]
+        if not cams:
+            cams = [c for c in (self.last_pick_cam_names or []) if c]
+        try:
+            ok = fi.open_moments([int(ts)], cams)
+        except Exception as e:
+            QMessageBox.warning(self, title, f"Could not send the moment:\n{e}")
+            return
+        if not ok:
+            QMessageBox.information(self, title, "There is no moment to send.")
+            return
+        idx = getattr(self, "_finder_tab_idx", None)
+        tabs.setCurrentIndex(0 if idx is None else idx)
+
     def _send_to_workshop(self):
         """Send current frame (as numpy uint8 array) to Workshop tab."""
         wk = getattr(self, "_workshop_ref", None)
@@ -29097,8 +30417,7 @@ class Viewer(QWidget):
         gradient_id = self.gradient_cb.currentIndex()
         save_txt = self.cb_save_metadata_txt.isChecked()
         has_overlay = (self.cb_save_overlay.isChecked() or bool(self.img_view.energy_text)
-                       or self.img_view.show_cross or self.img_view.show_circle
-                       or self.img_view.show_square)
+                       or has_any_mark(visible_marks(self.img_view)))
         _energy_str = self._sf_energy_map.get(it.path.name, "")
         _extra_meta = {"Energy": _energy_str} if _energy_str else None
 
@@ -29164,32 +30483,7 @@ class Viewer(QWidget):
             if pix is not None and not pix.isNull():
                 painter = QPainter(pix)
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-                w, h = pix.width(), pix.height()
-                if self.img_view.show_cross:
-                    cx = int(self.img_view.cross_pos_norm.x() * w) if self.img_view.cross_pos_norm else w // 2
-                    cy = int(self.img_view.cross_pos_norm.y() * h) if self.img_view.cross_pos_norm else h // 2
-                    sz = self._overlay_cross_size
-                    pen = QPen(self._overlay_cross_color); pen.setWidth(max(self._overlay_cross_thick, w // 500))
-                    painter.setPen(pen)
-                    painter.drawLine(cx - sz, cy, cx + sz, cy)
-                    painter.drawLine(cx, cy - sz, cx, cy + sz)
-                if self.img_view.show_circle and self.img_view.circle_center_norm is not None:
-                    cx = int(self.img_view.circle_center_norm.x() * w)
-                    cy = int(self.img_view.circle_center_norm.y() * h)
-                    if self.img_view.circle_rx_norm is not None:
-                        rx = int(self.img_view.circle_rx_norm * w); ry = int(self.img_view.circle_ry_norm * h)
-                    else:
-                        r = int(self.img_view.circle_r_norm * min(w, h)); rx = ry = r
-                    pen = QPen(self._overlay_circle_color); pen.setWidth(max(self._overlay_circle_thick, w // 500))
-                    painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawEllipse(cx - rx, cy - ry, rx * 2, ry * 2)
-                if self.img_view.show_square and self.img_view.square_rect_norm is not None:
-                    ln, tn, rn, bn = self.img_view.square_rect_norm
-                    sx = int(ln * w); sy = int(tn * h)
-                    sw = int((rn - ln) * w); sh = int((bn - tn) * h)
-                    pen = QPen(self._overlay_square_color); pen.setWidth(max(self._overlay_square_thick, w // 500))
-                    painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
-                    painter.drawRect(sx, sy, sw, sh)
+                self._burn_marks(painter, pix, self.img_view)
                 painter.end()
                 self._pv_save_append_bar(pix, ann_dst, it.ts_ns,
                                          pv_text=_pv_ann_text, extra_text=_energy_str)
@@ -29323,27 +30617,10 @@ class Viewer(QWidget):
         self._show_copy_progress(total, "Saving range…")
         iv = self.img_view
         has_overlay = (self.cb_save_overlay.isChecked()
-                       or iv.show_cross or iv.show_circle or iv.show_square)
+                       or has_any_mark(visible_marks(iv)))
         overlay_params = None
         if has_overlay:
-            overlay_params = {
-                'show_cross': iv.show_cross,
-                'cross_pos_norm': iv.cross_pos_norm,
-                'cross_size': self._overlay_cross_size,
-                'cross_color': self._overlay_cross_color,
-                'cross_thick': self._overlay_cross_thick,
-                'show_circle': iv.show_circle,
-                'circle_center_norm': iv.circle_center_norm,
-                'circle_rx_norm': iv.circle_rx_norm,
-                'circle_ry_norm': getattr(iv, 'circle_ry_norm', None),
-                'circle_r_norm': getattr(iv, 'circle_r_norm', 0.1),
-                'circle_color': self._overlay_circle_color,
-                'circle_thick': self._overlay_circle_thick,
-                'show_square': iv.show_square,
-                'square_rect_norm': iv.square_rect_norm,
-                'square_color': self._overlay_square_color,
-                'square_thick': self._overlay_square_thick,
-            }
+            overlay_params = overlay_params_from_view(iv, self._overlay_style())
         if overlay_params is not None:
             overlay_params['pv_text'] = self._pv_text()
         elif self._pv_text():
@@ -29497,7 +30774,7 @@ if __name__ == "__main__":
     QComboBox   { padding: 3px 6px; }
     QProgressBar { background: #fff; }
     QToolTip { background: #ffffcc; color: #111; border: 1px solid #aaa; padding: 4px; }
-    """)
+    """ + _SCROLLBAR_QSS)
 
     w = Viewer()
     w.setWindowTitle("Image Slider")

@@ -3,9 +3,12 @@ import os
 import sys
 import re
 import json
+import queue
 import shutil
 import socket
 import threading
+from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import subprocess
 from pathlib import Path
@@ -290,8 +293,17 @@ NETWORK_ROOT = Path(r"\\users-L3.tier0.lcs.local\cpva-image-2026")
 RUN_FOLDER_FMT = "%Y-%m-%d__%H-%M-%S"
 TS_FMT = "%Y-%m-%d__%H-%M-%S"
 
+# Auto copy: how far back from a cycle's own moment a frame may be taken, and
+# how late a cycle may still be processed. Beyond this the archive can no longer
+# answer for that moment, so the cycle is dropped instead of guessed.
+AUTO_BACK_WINDOW_NS = 10_000_000_000   # 10 s
+AUTO_MIN_INTERVAL_S = 5
+
 DEFAULT_DEST = r"\\hapls-share.lcs.local\scratch"
-DEFAULT_DEST_CZOW = r"C:\Users\jan.moucka\Downloads\TEST"
+# Office/dev box: the lab scratch share is mapped to Z: here but has no such
+# mapping in the lab, so the two stations need different defaults. Built from
+# the real profile folder instead of a literal user name.
+DEFAULT_DEST_CZOW = str(Path.home() / "Downloads" / "test screenshot")
 
 CAM_CATEGORIES: dict[str, list[str]] = {
     "LT1": [
@@ -747,6 +759,43 @@ def take_screenshot_monitor_png(dst_path: Path, monitor_index: int | None):
     img.save(dst_path, "PNG")
 
 
+def take_screenshots_monitors_png(targets: list[tuple[Path, int | None]]) -> list[Path]:
+    """Save several screenshots from ONE grab of the whole desktop.
+
+    `ImageGrab.grab()` always captures every screen, so grabbing once per
+    selected monitor captured (and PNG-encoded) the same desktop several times —
+    seconds of a cycle spent on the same picture. One grab, one monitor
+    enumeration, then a crop per target.
+    """
+    if not targets:
+        return []
+    try:
+        from PIL import ImageGrab
+    except Exception as e:
+        raise RuntimeError("Pillow missing.\nInstall:\n\n  py -m pip install pillow\n") from e
+
+    full = ImageGrab.grab(all_screens=True)
+    rects = None
+    written: list[Path] = []
+    for dst_path, monitor_index in targets:
+        img = full
+        if monitor_index is not None:
+            if rects is None:
+                rects = list_monitors_rects()
+            if not rects:
+                raise RuntimeError("Failed to enumerate monitors.")
+            if monitor_index < 0 or monitor_index >= len(rects):
+                raise RuntimeError(f"Invalid monitor index {monitor_index+1}. Available: 1..{len(rects)}")
+            l, t, r, b = rects[monitor_index]
+            min_left = min(x[0] for x in rects)
+            min_top = min(x[1] for x in rects)
+            img = full.crop((l - min_left, t - min_top, r - min_left, b - min_top))
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(dst_path, "PNG")
+        written.append(dst_path)
+    return written
+
+
 # ---------------- Window capture ----------------
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -989,6 +1038,11 @@ def target_cpva_hour_dir(_day_root: Path) -> Path:
     now_utc = datetime.now(timezone.utc)
     return NETWORK_ROOT / str(now_utc.year) / str(now_utc.month) / str(now_utc.day) / str(now_utc.hour)
 
+def cpva_hour_dir_for_ns(ts_ns: int) -> Path:
+    """Hour folder that holds the frames of a given moment (folders are UTC)."""
+    d = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=timezone.utc)
+    return NETWORK_ROOT / str(d.year) / str(d.month) / str(d.day) / str(d.hour)
+
 """def target_cpva_hour_dir(_day_root: Path) -> Path:
     # TESTOVACÍ OVERRIDE — smaž pro produkci
     return NETWORK_ROOT / "2026" / "4" / "7" / "14" """
@@ -1037,8 +1091,10 @@ def _find_latest_existing_hour_dir(log) -> Path | None:
             return p
     return None
 
-def find_camera_folders_bulk(day_root: Path, cams: list[str], log) -> dict[str, Path]:
-    hour_dir = target_cpva_hour_dir(day_root)
+def find_camera_folders_bulk(day_root: Path, cams: list[str], log,
+                             hour_dir: Path | None = None) -> dict[str, Path]:
+    if hour_dir is None:
+        hour_dir = target_cpva_hour_dir(day_root)
     log(f"[CPVA] hour_dir = {hour_dir}")
 
     if not hour_dir.exists():
@@ -1077,6 +1133,34 @@ def find_camera_folders_bulk(day_root: Path, cams: list[str], log) -> dict[str, 
         log(f"[CPVA] bulk scan ERROR: {e}")
         return found
     
+def auto_tick_target_ns(t0_ns: int, n: int, interval_s: int) -> int:
+    """The moment cycle n belongs to. Cycles sit on a fixed grid from the start
+    of the run, so they are always exactly `interval_s` apart no matter how long
+    the copying of any one of them took."""
+    return t0_ns + n * interval_s * 1_000_000_000
+
+
+def auto_tick_delay_ms(t0_mono: float, n: int, interval_s: int, now_mono: float) -> int:
+    """Milliseconds until tick n is due — measured from the start of the run,
+    never 'one interval after the previous cycle finished'."""
+    due = t0_mono + n * interval_s
+    return max(0, int(round((due - now_mono) * 1000)))
+
+
+def auto_should_skip(age_ns: int | None, src: Path | None,
+                     prev_frame: Path | None) -> bool:
+    """Whether a camera is left out of a cycle.
+
+    A frame older than the backward window no longer belongs to this cycle's
+    moment. It is still kept when it is the very frame the previous cycle used —
+    a camera that is standing still has to keep showing up — but a *different*
+    old frame belongs to some other moment, so it is skipped.
+    """
+    if src is None or age_ns is None:
+        return True
+    return age_ns > AUTO_BACK_WINDOW_NS and src != prev_frame
+
+
 def fmt_span_ms(ms: float) -> str:
     """Human readable time span: ms below a second, then s / m s / h m s."""
     ms = abs(float(ms))
@@ -1092,61 +1176,97 @@ def fmt_span_ms(ms: float) -> str:
     return f"{int(total_s * 10) / 10:.1f}s"
 
 
-def find_image_near_click_fast(cam_dir: Path, t_click_ns: int, log=None,
-                                _cache: dict | None = None, _cache_time: dict | None = None,
-                                _cache_ttl: float = 5.0) -> Path | None:
+def scan_camera_dir(cam_dir: Path) -> list[tuple[int, str]]:
+    """Listing of one camera folder as (ts_ns, filename), sorted by timestamp."""
+    entries: list[tuple[int, str]] = []
+    with os.scandir(cam_dir) as it:
+        for entry in it:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            m = TS_IN_NAME_RE.search(entry.name)
+            if not m:
+                continue
+            entries.append((int(m.group(1)), entry.name))
+    entries.sort()
+    return entries
+
+
+def find_frame_at_or_before(cam_dir: Path, t_target_ns: int, log=None,
+                            _cache: dict | None = None, _cache_time: dict | None = None,
+                            _cache_ttl: float = 5.0,
+                            _cache_lock: "threading.Lock | None" = None,
+                            newest: bool = False
+                            ) -> tuple[Path | None, int | None]:
+    """Newest archived frame whose own timestamp is at or before `t_target_ns`.
+
+    A cycle asks for the picture that existed at its recorded moment, so a frame
+    from after that moment is never an answer — only the newest one at or before
+    it. Returns (path, age_ns), age = how far the frame sits behind the target;
+    (None, None) when the folder holds nothing that old.
+
+    `newest=True` ignores the target and takes whatever is newest in the folder
+    (the age is still reported against the target). That is what the manual Copy
+    and the first cycle of an auto run do: they have nothing to compare against
+    yet, and the first cycle is what measures how far the archive's clock runs
+    behind this computer's.
+
+    A cached listing whose newest entry is already older than the target cannot
+    answer the question (the frame we want may have been written after the scan),
+    so it is rescanned even while the TTL still holds.
+    """
     t0 = time.perf_counter()
     cam_key = str(cam_dir)
     now = time.time()
 
-    # Použij cache pokud je čerstvá
     entries: list[tuple[int, str]] | None = None
-    if (_cache is not None and cam_key in _cache and
-            _cache_time is not None and (now - _cache_time.get(cam_key, 0)) < _cache_ttl):
-        entries = _cache[cam_key]
-        if log:
-            log(f"[FAST] cache hit ({len(entries)} entries)")
-    
-    if entries is None:
-        # Načti adresář
-        entries = []
+    if _cache is not None and _cache_time is not None:
+        if _cache_lock is not None:
+            _cache_lock.acquire()
         try:
-            with os.scandir(cam_dir) as it:
-                for entry in it:
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    m = TS_IN_NAME_RE.search(entry.name)
-                    if not m:
-                        continue
-                    entries.append((int(m.group(1)), entry.name))
+            cached = _cache.get(cam_key)
+            fresh = (now - _cache_time.get(cam_key, 0)) < _cache_ttl
+            # Usable only if it is fresh AND already reaches past the target.
+            if cached and fresh and (newest or cached[-1][0] >= t_target_ns):
+                entries = cached
+        finally:
+            if _cache_lock is not None:
+                _cache_lock.release()
+
+    if entries is None:
+        try:
+            entries = scan_camera_dir(cam_dir)
         except Exception as e:
             if log:
-                log(f"[FAST] ERROR: {e}")
-            return None
-        
-        if _cache is not None:
-            _cache[cam_key] = entries
-        if _cache_time is not None:
-            _cache_time[cam_key] = now
-
-        dt_scan = time.perf_counter() - t0
-        if log:
-            log(f"[FAST] scanned {len(entries)} files in {dt_scan:.3f}s")
+                log(f"[PICK] {cam_dir.name}: listing failed: {e}")
+            return None, None
+        if _cache is not None and _cache_time is not None:
+            if _cache_lock is not None:
+                _cache_lock.acquire()
+            try:
+                _cache[cam_key] = entries
+                _cache_time[cam_key] = now
+            finally:
+                if _cache_lock is not None:
+                    _cache_lock.release()
 
     if not entries:
+        return None, None
+
+    idx = len(entries) - 1 if newest else bisect_right(entries, (t_target_ns, "￿")) - 1
+    if idx < 0:
         if log:
-            log("[FAST] no timestamped images found")
-        return None
+            oldest = datetime.fromtimestamp(entries[0][0] / 1_000_000_000).strftime("%H:%M:%S")
+            log(f"[PICK] {cam_dir.name}: nothing at or before target (oldest {oldest})")
+        return None, None
 
-    best = min(entries, key=lambda x: abs(x[0] - t_click_ns))
-    best_ts, best_name = best
-
-    dt = time.perf_counter() - t0
+    best_ts, best_name = entries[idx]
     if log:
-        log(f"[FAST] dt={dt:.3f}s delta={fmt_span_ms(abs(best_ts - t_click_ns)/1_000_000)}")
-        log(f"[FAST] best_name={best_name}")
-    return cam_dir / best_name
-    
+        log(f"[PICK] {cam_dir.name}: {best_name} "
+            f"(age {fmt_span_ms((t_target_ns - best_ts) / 1_000_000)}, "
+            f"lookup {time.perf_counter() - t0:.2f}s)")
+    return cam_dir / best_name, t_target_ns - best_ts
+
+
 # ---------------- README helpers ----------------
 def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -1280,7 +1400,11 @@ class PreviewWindow(tk.Toplevel):
     _CELL_PAD = 24      # px consumed per cell by padding + border
     _FILL_SLACK = 1.3   # how far a thumbnail may grow past the slider size to fill a row
 
-    _PALETTES = ["Grayscale", "Gradient", "Hot", "Viridis", "Plasma", "Inferno", "Jet", "Turbo"]
+    # "Original" keeps the picture in the colours it arrived in (a colour camera
+    # stays in colour); "Grayscale" deliberately drops them. Everything after
+    # that is a false-colour map over the grey values.
+    _PALETTES = ["Original", "Grayscale", "Gradient", "Hot", "Viridis", "Plasma",
+                 "Inferno", "Jet", "Turbo"]
 
     _LUTS: dict = {}  # lazy-built
 
@@ -1289,6 +1413,11 @@ class PreviewWindow(tk.Toplevel):
         self._save_all_annotated()
         if self._on_keep:
             self._on_keep()
+        if getattr(self, "_cycle_mode", False):
+            # The window is the live view of a running run — saving must not
+            # close it.
+            self._cycle_status_var.set("saved")
+            return
         self.destroy()
 
     def _save_all_annotated(self):
@@ -1302,38 +1431,16 @@ class PreviewWindow(tk.Toplevel):
                     import numpy as np
                     arr = np.array(overlay)
                     has_drawing = bool(arr[:, :, 3].max() > 0)
-                # Rebuild processed base at original resolution
+                # Rebuild processed base at original resolution — same single
+                # rendering path as the grid, so what was saved is what was seen.
                 from PIL import Image as PILImage
                 img = PILImage.open(path)
-                img_l = img.convert("I") if img.mode in ("I", "I;16") else img.convert("L")
-                import numpy as np
-                arr_raw = np.array(img_l)
-                if arr_raw.dtype != np.uint8:
-                    mn, mx = int(arr_raw.min()), int(arr_raw.max())
-                    if mx > mn:
-                        arr8 = ((arr_raw.astype(np.float32) - mn) / (mx - mn) * 255).astype(np.uint8)
-                    else:
-                        arr8 = np.zeros(arr_raw.shape, dtype=np.uint8)
-                else:
-                    arr8 = arr_raw
-                arr8, _ = self._apply_bc(arr8, state.get("auto", False),
-                                         state.get("contrast", 0),
-                                         state.get("auto_bright", False),
-                                         state.get("brightness", 0))
-                pal = state.get("palette", "Grayscale")
-                if pal != "Grayscale":
-                    if pal not in self._LUTS:
-                        self._build_lut(pal)
-                    lut = self._LUTS.get(pal)
-                    if lut is not None:
-                        base_img = PILImage.fromarray(lut[arr8], "RGB").convert("RGBA")
-                    else:
-                        base_img = PILImage.fromarray(arr8, "L").convert("RGBA")
-                else:
-                    base_img = PILImage.fromarray(arr8, "L").convert("RGBA")
+                base_rgb, _ = self._render_tuned(img, **self._settings_for(state))
+                base_img = base_rgb.convert("RGBA")
 
                 orig_w, orig_h = img.width, img.height
-                base_full = base_img.resize((orig_w, orig_h), PILImage.LANCZOS)
+                base_full = (base_img if base_img.size == (orig_w, orig_h)
+                             else base_img.resize((orig_w, orig_h), PILImage.LANCZOS))
 
                 if has_drawing:
                     ov_scaled = overlay.resize((orig_w, orig_h), PILImage.LANCZOS)
@@ -1358,8 +1465,10 @@ class PreviewWindow(tk.Toplevel):
                 print(f"[ANNOTATE] Failed {path.name}: {e}")
 
     def _do_delete(self):
+        cycle_mode = getattr(self, "_cycle_mode", False)
         if not self._paths:
-            self.destroy()
+            if not cycle_mode:
+                self.destroy()
             return
         import tkinter.messagebox as mb
         if not mb.askyesno("Delete", f"Delete {len(self._paths)} file(s)?", parent=self):
@@ -1371,6 +1480,23 @@ class PreviewWindow(tk.Toplevel):
                 pass
         if self._on_delete:
             self._on_delete()
+        if cycle_mode:
+            # Only the cycle on screen goes; the window and the rest of the run stay.
+            gone = self._shown_cycle
+            self._cycle_history = [e for e in self._cycle_history if e["cycle"] != gone]
+            self._paths = []
+            self._img_states.clear()
+            self._shown_cycle = None
+            self._refresh_cycle_box()
+            if self._cycle_history:
+                self.show_cycle(self._cycle_history[-1]["cycle"])
+            else:
+                self._grid_layout = None
+                self._redraw()
+            self._cycle_status_var.set(f"cycle {gone} deleted")
+            if self._on_cycle_change:
+                self._on_cycle_change(gone)
+            return
         self.destroy()
 
     def _do_try_again(self):
@@ -1420,22 +1546,34 @@ class PreviewWindow(tk.Toplevel):
             cls._LUTS[name] = None  # Grayscale = None
 
     def __init__(self, master, paths: list[Path],
-                 on_keep=None, on_delete=None, on_try_again=None):
+                 on_keep=None, on_delete=None, on_try_again=None,
+                 cycle_mode: bool = False, on_cycle_change=None):
         super().__init__(master)
         self.title("Preview — copied images")
-        self.geometry("900x700")
+        # Wide enough for the whole image toolbar — at 900 px the Palette box
+        # was cut off by the window edge.
+        self.geometry("1100x720")
         self.resizable(True, True)
 
         if not _PIL_OK:
             ttk.Label(self, text="Pillow not available.").pack(pady=20)
             return
 
+        # Cycle mode: this one window is the whole preview for an auto run — the
+        # cycle picker lives inside it and its content is swapped in place, so
+        # stepping between cycles never opens (or throws away) a window.
+        self._cycle_mode = cycle_mode
+        self._on_cycle_change = on_cycle_change
+        self._cycle_history: list[dict] = []
+        self._shown_cycle: int | None = None
+        self._caption_extra: dict[Path, str] = {}
         self._paths = list(paths)
         self._thumbs: list[ImageTk.PhotoImage] = []
         self._brightness = tk.IntVar(value=0)
         self._auto = tk.BooleanVar(value=False)
         self._contrast = tk.IntVar(value=0)
         self._auto_bright = tk.BooleanVar(value=False)
+        self._gamma = tk.DoubleVar(value=1.0)
         self._zoom = tk.DoubleVar(value=1.0)
         # Slider-equivalent values the auto modes computed for the last thumbnail
         # drawn with the global toolbar settings; _sync_auto_sliders parks the
@@ -1450,15 +1588,42 @@ class PreviewWindow(tk.Toplevel):
         #   "brightness": int, "auto": bool, "contrast": int, "auto_bright": bool}
         self._img_states: dict[Path, dict] = {}
 
+        # ── cycle bar (auto runs only) ────────────────────────────
+        if cycle_mode:
+            self.title("Auto copy — live preview")
+            self.geometry("1100x780")
+            cbar = ttk.Frame(self, padding=(8, 6))
+            cbar.pack(fill="x")
+            ttk.Label(cbar, text="Cycle:").pack(side="left")
+            self._cycle_var = tk.StringVar(value="")
+            self._cycle_cb = ttk.Combobox(cbar, textvariable=self._cycle_var,
+                                          state="readonly", width=18)
+            self._cycle_cb.pack(side="left", padx=(6, 0))
+            self._cycle_cb.bind("<<ComboboxSelected>>", self._on_cycle_picked)
+            ttk.Button(cbar, text="◀", width=3,
+                       command=lambda: self._step_cycle(-1)).pack(side="left", padx=(8, 0))
+            ttk.Button(cbar, text="▶", width=3,
+                       command=lambda: self._step_cycle(1)).pack(side="left", padx=(2, 0))
+            self._follow_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(cbar, text="Follow latest", variable=self._follow_var,
+                            command=self._on_follow_toggle).pack(side="left", padx=(12, 0))
+            self._cycle_status_var = tk.StringVar(value="")
+            ttk.Label(cbar, textvariable=self._cycle_status_var,
+                      foreground="#444444", font=("Segoe UI", 8)).pack(side="left", padx=(12, 0))
+            ttk.Separator(self, orient="horizontal").pack(fill="x")
+
         # ── action toolbar (Keep / Delete / Try Again) ────────────
         action_bar = ttk.Frame(self, padding=(6, 6))
         action_bar.pack(fill="x")
         ttk.Button(action_bar, text="✔ Save",
                    command=self._do_keep).pack(side="left", padx=(0, 6))
-        ttk.Button(action_bar, text="🗑 Delete",
+        ttk.Button(action_bar, text="🗑 Delete" if not cycle_mode else "🗑 Delete this cycle",
                    command=self._do_delete).pack(side="left", padx=(0, 6))
-        ttk.Button(action_bar, text="🔄 Delete and Try Again",
-                   command=self._do_try_again).pack(side="left")
+        if not cycle_mode:
+            # In cycle mode there is nothing sensible to retry: the cycle's moment
+            # has passed, so the old button only deleted the files.
+            ttk.Button(action_bar, text="🔄 Delete and Try Again",
+                       command=self._do_try_again).pack(side="left")
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", pady=(2, 0))
 
@@ -1468,34 +1633,44 @@ class PreviewWindow(tk.Toplevel):
 
         ttk.Label(bar, text="Contrast:").pack(side="left")
         self._contrast_scale = ttk.Scale(bar, from_=-127, to=127, orient="horizontal",
-                  variable=self._contrast, length=140,
+                  variable=self._contrast, length=120,
                   command=lambda _: self._redraw())
         self._contrast_scale.pack(side="left", padx=(4, 2))
         ttk.Button(bar, text="↺", width=3,
-                   command=lambda: (self._contrast.set(0), self._redraw())).pack(side="left", padx=(0, 2))
+                   command=self._reset_contrast).pack(side="left", padx=(0, 2))
         ttk.Checkbutton(bar, text="Auto", variable=self._auto,
                         command=self._on_auto_contrast_toggle).pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Brightness:").pack(side="left")
         self._bright_scale = ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
-                  variable=self._brightness, length=140,
+                  variable=self._brightness, length=120,
                   command=lambda _: self._redraw())
         self._bright_scale.pack(side="left", padx=(4, 2))
         ttk.Button(bar, text="↺", width=3,
-                   command=lambda: (self._brightness.set(0), self._redraw())).pack(side="left", padx=(0, 2))
+                   command=self._reset_brightness).pack(side="left", padx=(0, 2))
         ttk.Checkbutton(bar, text="Auto", variable=self._auto_bright,
                         command=self._on_auto_bright_toggle).pack(side="left", padx=(0, 12))
 
-        ttk.Label(bar, text="Zoom:").pack(side="left")
-        ttk.Scale(bar, from_=0.3, to=3.0, orient="horizontal",
+        ttk.Label(bar, text="Gamma:").pack(side="left")
+        ttk.Scale(bar, from_=0.2, to=3.0, orient="horizontal",
+                  variable=self._gamma, length=120,
+                  command=lambda _: self._redraw()).pack(side="left", padx=(4, 2))
+        ttk.Button(bar, text="↺", width=3,
+                   command=self._reset_gamma).pack(side="left")
+
+        # Second row: what the grid looks like rather than what the tones are.
+        bar2 = ttk.Frame(self, padding=(6, 4))
+        bar2.pack(fill="x")
+
+        ttk.Label(bar2, text="Zoom:").pack(side="left")
+        ttk.Scale(bar2, from_=0.3, to=3.0, orient="horizontal",
                   variable=self._zoom, length=120,
                   command=lambda _: self._relayout_if_needed()).pack(side="left", padx=(4, 12))
 
-        ttk.Label(bar, text="Palette:").pack(side="left")
-        self._palette = tk.StringVar(value="Grayscale")
-        ttk.Combobox(bar, textvariable=self._palette, values=self._PALETTES,
-                     state="readonly", width=10,
-                     postcommand=lambda: None).pack(side="left", padx=(4, 0))
+        ttk.Label(bar2, text="Palette:").pack(side="left")
+        self._palette = tk.StringVar(value="Original")
+        ttk.Combobox(bar2, textvariable=self._palette, values=self._PALETTES,
+                     state="readonly", width=10).pack(side="left", padx=(4, 0))
         self._palette.trace_add("write", lambda *_: self._redraw())
 
         # ── scrollable canvas ─────────────────────────────────────
@@ -1523,9 +1698,13 @@ class PreviewWindow(tk.Toplevel):
         def _on_mousewheel(event):
             self._canvas.yview_scroll(int(-event.delta / 120), "units")
 
+        # Bound on the window, not with bind_all: a Toplevel binding already
+        # receives its children's wheel events, while bind_all is global — every
+        # new instance stole it and a destroyed one left it pointing at a dead
+        # widget.
         self._canvas.bind("<MouseWheel>", _on_mousewheel)
         self._inner.bind("<MouseWheel>", _on_mousewheel)
-        self.bind_all("<MouseWheel>", _on_mousewheel)
+        self.bind("<MouseWheel>", _on_mousewheel)
 
         self._resize_after_id = None
         self._thumb_size = self._THUMB
@@ -1540,72 +1719,98 @@ class PreviewWindow(tk.Toplevel):
     #                together). "Auto" = percentile auto-levels stretch.
     #   BRIGHTNESS = additive offset (shifts every value up or down, gain
     #                untouched). "Auto" = shift so the top percentile hits 255.
+    #   GAMMA      = midtone curve (the ends stay put). Above 1 lifts the
+    #                midtones, below 1 deepens them.
+    # All three are built into ONE 256-entry tone curve by `_tone_lut`, which is
+    # what lets the same settings apply to a grayscale image and to each channel
+    # of a colour one.
     @staticmethod
     def _contrast_from_gain(gain: float) -> int:
-        """Inverse of the _manual_contrast gain curve: gain → slider value in
+        """Inverse of the Contrast gain curve: gain → slider value in
         [-127, 127]. Used to park the Contrast slider where auto contrast landed."""
         if gain <= 0:
             return 0
         c = 32893.0 * (gain - 1.0) / (259.0 + 127.0 * gain)
         return int(round(max(-127.0, min(127.0, c))))
 
-    @classmethod
-    def _autostretch(cls, arr):
-        """Percentile-based contrast stretch (auto-levels) — a gain, not a shift.
-        Returns (arr, equivalent_contrast_slider_value)."""
-        import numpy as np
-        lo, hi = np.percentile(arr, [0.1, 99.9])
-        if hi <= lo + 2:
-            return arr, 0
-        stretched = np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 255,
-                            0, 255).astype("uint8")
-        return stretched, cls._contrast_from_gain(255.0 / float(hi - lo))
-
     @staticmethod
-    def _manual_contrast(arr, contrast: int):
-        """Manual linear contrast around mid-gray. `contrast` in [-127, 127];
-        0 = unchanged. Same gain curve as the Image Tools Contrast slider."""
+    def _gamma_curve(lut, gamma: float):
+        """Midtone curve on an already-built LUT. Above 1 lifts the midtones,
+        below 1 deepens them; the black and white ends stay put."""
         import numpy as np
-        if contrast == 0:
-            return arr
-        c = float(contrast)
-        factor = (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
-        return np.clip(factor * (arr.astype(np.float32) - 128.0) + 128.0, 0, 255).astype("uint8")
-
-    @staticmethod
-    def _auto_brightness(arr, target: int = 255, p_high: float = 99.5):
-        """Auto-level brightness: shift so the p_high percentile reaches `target`.
-        Pure additive offset — preserves contrast. Matches Image Tools 'Auto brightness'.
-        Returns (arr, offset) so the Brightness slider can show the applied shift."""
-        import numpy as np
-        hi = float(np.percentile(arr, p_high))
-        offset = int(round(target - hi))
-        offset = max(-255, min(255, offset))
-        if offset == 0:
-            return arr, 0
-        return np.clip(arr.astype(np.int16) + offset, 0, 255).astype("uint8"), offset
+        if gamma is None or abs(float(gamma) - 1.0) < 1e-3:
+            return lut
+        g = max(0.05, float(gamma))
+        return 255.0 * np.power(np.clip(lut, 0, 255) / 255.0, 1.0 / g)
 
     @classmethod
-    def _apply_bc(cls, arr, auto_contrast: bool, contrast: int,
-                  auto_bright: bool, brightness: int):
-        """Shared brightness/contrast pipeline for every preview path.
+    def _tone_lut(cls, stats_arr, auto_contrast: bool, contrast: int,
+                  auto_bright: bool, brightness: int, gamma: float = 1.0):
+        """Build the 256-entry tone curve for the current settings.
+
+        A curve rather than a pixel-by-pixel transform, because the same curve
+        then applies to a grayscale image AND to each channel of a colour one —
+        which is what lets a colour camera keep its colours while its contrast,
+        brightness and gamma are adjusted. `stats_arr` is the 8-bit grey (or
+        luma) array the auto modes measure.
+
+        Order: contrast (gain) → gamma (midtones) → brightness (offset).
         Auto contrast overrides the manual Contrast slider; Auto brightness
         overrides the manual Brightness slider (same rule as Image Tools).
 
-        Returns (arr, applied) where applied = {"contrast": int, "brightness": int}
-        are the slider-equivalent values actually used — for the auto modes these
-        are the auto-computed positions, so the UI sliders can follow them."""
+        Returns (lut, applied) where applied = {"contrast", "brightness"} are the
+        slider-equivalent values actually used, so the UI sliders can follow the
+        auto modes.
+        """
         import numpy as np
         applied = {"contrast": int(contrast), "brightness": int(brightness)}
+        lut = np.arange(256, dtype=np.float32)
+
         if auto_contrast:
-            arr, applied["contrast"] = cls._autostretch(arr)
+            lo, hi = np.percentile(stats_arr, [0.1, 99.9])
+            if hi > lo + 2:
+                lut = (lut - float(lo)) / (float(hi) - float(lo)) * 255.0
+                applied["contrast"] = cls._contrast_from_gain(255.0 / float(hi - lo))
+            else:
+                applied["contrast"] = 0
         elif contrast:
-            arr = cls._manual_contrast(arr, contrast)
+            c = float(contrast)
+            factor = (259.0 * (c + 127.0)) / (127.0 * (259.0 - c))
+            lut = factor * (lut - 128.0) + 128.0
+
+        lut = cls._gamma_curve(lut, gamma)
+
         if auto_bright:
-            arr, applied["brightness"] = cls._auto_brightness(arr)
+            # Measured on the image as the curve so far leaves it.
+            so_far = np.clip(lut, 0, 255).astype(np.uint8)[stats_arr]
+            offset = int(round(255 - float(np.percentile(so_far, 99.5))))
+            offset = max(-255, min(255, offset))
+            lut = lut + offset
+            applied["brightness"] = offset
         elif brightness:
-            arr = np.clip(arr.astype(np.int16) + brightness, 0, 255).astype("uint8")
-        return arr, applied
+            lut = lut + float(brightness)
+
+        return np.clip(lut, 0, 255).astype(np.uint8), applied
+
+    @staticmethod
+    def _stats_gray(img):
+        """The 8-bit grey the auto modes measure, whatever the source mode is."""
+        import numpy as np
+        if img.mode in ("I", "I;16", "I;16B", "F"):
+            arr = np.array(img)
+            mn, mx = float(arr.min()), float(arr.max())
+            if mx > mn:
+                return ((arr - mn) / (mx - mn) * 255).astype(np.uint8)
+            return np.zeros(arr.shape, dtype=np.uint8)
+        return np.array(img.convert("L"))
+
+    @classmethod
+    def _apply_bc(cls, arr, auto_contrast: bool, contrast: int,
+                  auto_bright: bool, brightness: int, gamma: float = 1.0):
+        """Grayscale-only shorthand for `_tone_lut` (kept for tests)."""
+        lut, applied = cls._tone_lut(arr, auto_contrast, contrast,
+                                     auto_bright, brightness, gamma)
+        return lut[arr], applied
 
     def _on_auto_contrast_toggle(self):
         # Auto contrast overrides the manual Contrast slider → grey it out while on,
@@ -1617,6 +1822,24 @@ class PreviewWindow(tk.Toplevel):
         # Auto brightness overrides the manual Brightness slider → grey it out while on,
         # and let _redraw park it at the auto-computed position.
         self._bright_scale.configure(state="disabled" if self._auto_bright.get() else "normal")
+        self._redraw()
+
+    def _reset_contrast(self):
+        """↺ next to Contrast — back to untouched, Auto included. With Auto left
+        on, setting the slider to 0 would be undone by the next redraw."""
+        self._auto.set(False)
+        self._contrast_scale.configure(state="normal")
+        self._contrast.set(0)
+        self._redraw()
+
+    def _reset_brightness(self):
+        self._auto_bright.set(False)
+        self._bright_scale.configure(state="normal")
+        self._brightness.set(0)
+        self._redraw()
+
+    def _reset_gamma(self):
+        self._gamma.set(1.0)
         self._redraw()
 
     def _sync_auto_sliders(self):
@@ -1651,59 +1874,66 @@ class PreviewWindow(tk.Toplevel):
             # 1-bit / palette / I;16 sources reject the reducing filters
             return img.resize(box, Image.NEAREST)
 
+    def _settings_for(self, state: dict | None) -> dict:
+        """The viewing settings for one image: its own if it was edited in the
+        zoom window, otherwise the toolbar's."""
+        if state:
+            return {
+                "palette": state.get("palette", "Original"),
+                "auto_contrast": state.get("auto", False),
+                "contrast": state.get("contrast", 0),
+                "auto_bright": state.get("auto_bright", False),
+                "brightness": state.get("brightness", 0),
+                "gamma": state.get("gamma", 1.0),
+            }
+        return {
+            "palette": self._palette.get(),
+            "auto_contrast": self._auto.get(),
+            "contrast": self._contrast.get(),
+            "auto_bright": self._auto_bright.get(),
+            "brightness": self._brightness.get(),
+            "gamma": self._gamma.get(),
+        }
+
+    @classmethod
+    def _render_tuned(cls, img, palette: str, auto_contrast: bool, contrast: int,
+                      auto_bright: bool, brightness: int, gamma: float = 1.0):
+        """Apply the viewing settings to one image → (RGB image, applied).
+
+        The single path used by the grid, the hover popup, the zoom window and
+        Save, so all four agree. With the "Original" palette a colour picture
+        stays in its own colours — the tone curve is applied to each channel —
+        instead of being flattened to grey the moment a slider or Auto is
+        touched, which is what used to make Auto contrast look like a palette
+        change.
+        """
+        import numpy as np
+        stats = cls._stats_gray(img)
+        lut, applied = cls._tone_lut(stats, auto_contrast, contrast,
+                                     auto_bright, brightness, gamma)
+
+        if palette == "Original" and img.mode in ("RGB", "RGBA", "P", "LA"):
+            arr_rgb = np.array(img.convert("RGB"))
+            return Image.fromarray(lut[arr_rgb], "RGB"), applied
+
+        gray = lut[stats]
+        if palette not in ("Original", "Grayscale"):
+            if palette not in cls._LUTS:
+                cls._build_lut(palette)
+            cmap = cls._LUTS.get(palette)
+            if cmap is not None:
+                return Image.fromarray(cmap[gray], "RGB"), applied
+        return Image.fromarray(gray, "L").convert("RGB"), applied
+
     def _process(self, path: Path, size: int) -> ImageTk.PhotoImage | None:
         try:
-            import numpy as np
             state = self._img_states.get(path)
             img = self._fit_to_box(Image.open(path), size)
-
-            is_rgb_source = img.mode in ("RGB", "RGBA")
-            use_auto = state["auto"] if state else self._auto.get()
-            use_brightness = state["brightness"] if state else self._brightness.get()
-            use_contrast = state.get("contrast", 0) if state else self._contrast.get()
-            use_auto_bright = state.get("auto_bright", False) if state else self._auto_bright.get()
-            use_palette = state["palette"] if state else self._palette.get()
-
-            # RGB obrázky bez explicitní palety → zachovej barvy
-            if (is_rgb_source and use_palette == "Grayscale" and not use_auto
-                    and use_brightness == 0 and use_contrast == 0 and not use_auto_bright
-                    and not state):
-                base_rgb = img.convert("RGB")
-                if state and state.get("overlay") is not None:
-                    from PIL import Image as PILImage
-                    base_rgba = base_rgb.convert("RGBA")
-                    ov_thumb = state["overlay"].resize(base_rgba.size, PILImage.LANCZOS)
-                    composite = PILImage.alpha_composite(base_rgba, ov_thumb)
-                    return ImageTk.PhotoImage(composite.convert("RGB"))
-                return ImageTk.PhotoImage(base_rgb)
-
-            # Grayscale pipeline
-            img_l = img.convert("I") if img.mode in ("I", "I;16") else img.convert("L")
-            arr_raw = np.array(img_l)
-            if arr_raw.dtype != np.uint8:
-                mn, mx = int(arr_raw.min()), int(arr_raw.max())
-                if mx > mn:
-                    arr = ((arr_raw.astype(np.float32) - mn) / (mx - mn) * 255).astype(np.uint8)
-                else:
-                    arr = np.zeros(arr_raw.shape, dtype=np.uint8)
-            else:
-                arr = arr_raw
-            arr, applied = self._apply_bc(arr, use_auto, use_contrast,
-                                          use_auto_bright, use_brightness)
+            base_rgb, applied = self._render_tuned(img, **self._settings_for(state))
             if not state:
                 # This thumbnail used the global toolbar settings → remember where
                 # the auto modes landed so the sliders can be parked there.
                 self._last_auto_applied = applied
-            if use_palette != "Grayscale":
-                if use_palette not in self._LUTS:
-                    self._build_lut(use_palette)
-                lut = self._LUTS.get(use_palette)
-                if lut is not None:
-                    base_rgb = Image.fromarray(lut[arr], "RGB")
-                else:
-                    base_rgb = Image.fromarray(arr, "L").convert("RGB")
-            else:
-                base_rgb = Image.fromarray(arr, "L").convert("RGB")
 
             if state and state.get("overlay") is not None:
                 from PIL import Image as PILImage
@@ -1776,22 +2006,37 @@ class PreviewWindow(tk.Toplevel):
         ttk.Label(bar, text="Contrast:").pack(side="left")
         _contrast_zoom = tk.IntVar(value=existing_state.get("contrast", self._contrast.get()))
         _contrast_scale_z = ttk.Scale(bar, from_=-127, to=127, orient="horizontal",
-                  variable=_contrast_zoom, length=120)
+                  variable=_contrast_zoom, length=110)
         _contrast_scale_z.pack(side="left", padx=(4, 2))
+        ttk.Button(bar, text="↺", width=3,
+                   command=lambda: _reset_contrast_z()).pack(side="left", padx=(0, 2))
         _auto_zoom = tk.BooleanVar(value=existing_state.get("auto", self._auto.get()))
         ttk.Checkbutton(bar, text="Auto", variable=_auto_zoom).pack(side="left", padx=(0, 12))
 
         ttk.Label(bar, text="Brightness:").pack(side="left")
         _bright_zoom = tk.IntVar(value=existing_state.get("brightness", self._brightness.get()))
         _bright_scale_z = ttk.Scale(bar, from_=-255, to=255, orient="horizontal",
-                  variable=_bright_zoom, length=120)
+                  variable=_bright_zoom, length=110)
         _bright_scale_z.pack(side="left", padx=(4, 2))
+        ttk.Button(bar, text="↺", width=3,
+                   command=lambda: _reset_bright_z()).pack(side="left", padx=(0, 2))
         _auto_bright_zoom = tk.BooleanVar(value=existing_state.get("auto_bright", self._auto_bright.get()))
         ttk.Checkbutton(bar, text="Auto", variable=_auto_bright_zoom).pack(side="left", padx=(0, 12))
 
-        ttk.Label(bar, text="Palette:").pack(side="left")
+        ttk.Label(bar, text="Gamma:").pack(side="left")
+        _gamma_zoom = tk.DoubleVar(value=existing_state.get("gamma", self._gamma.get()))
+        ttk.Scale(bar, from_=0.2, to=3.0, orient="horizontal",
+                  variable=_gamma_zoom, length=110).pack(side="left", padx=(4, 2))
+        ttk.Button(bar, text="↺", width=3,
+                   command=lambda: _gamma_zoom.set(1.0)).pack(side="left")
+
+        # Second row: palette and the decisions, so nothing runs off the edge.
+        bar_b = ttk.Frame(win, padding=(6, 0))
+        bar_b.pack(fill="x")
+
+        ttk.Label(bar_b, text="Palette:").pack(side="left")
         _pal_zoom = tk.StringVar(value=existing_state.get("palette", self._palette.get()))
-        ttk.Combobox(bar, textvariable=_pal_zoom, values=self._PALETTES,
+        ttk.Combobox(bar_b, textvariable=_pal_zoom, values=self._PALETTES,
                      state="readonly", width=10).pack(side="left", padx=(4, 12))
 
         def _sync_auto_enable(*_):
@@ -1799,29 +2044,20 @@ class PreviewWindow(tk.Toplevel):
             _bright_scale_z.configure(state="disabled" if _auto_bright_zoom.get() else "normal")
         _sync_auto_enable()
 
-        # Apply / Revert přímo v toolbaru
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=(16, 8))
+        def _reset_contrast_z():
+            # Auto off as well — with Auto on, the next render parks the slider
+            # back where Auto wants it and the button looks dead.
+            _auto_zoom.set(False)
+            _contrast_zoom.set(0)
 
-        def _apply_changes():
-            self._img_states[path] = {
-                "overlay": _overlay_pil[0].copy() if _overlay_pil[0] is not None else None,
-                "palette": _pal_zoom.get(),
-                "brightness": _bright_zoom.get(),
-                "auto": _auto_zoom.get(),
-                "contrast": _contrast_zoom.get(),
-                "auto_bright": _auto_bright_zoom.get(),
-            }
-            win.destroy()
-            self._redraw()
-
-        def _revert_changes():
-            self._img_states.pop(path, None)
-            win.destroy()
-            self._redraw()
+        def _reset_bright_z():
+            _auto_bright_zoom.set(False)
+            _bright_zoom.set(0)
 
         _crop_mode = tk.BooleanVar(value=False)
-        ttk.Button(bar, text="✖ Clear crop",
+        ttk.Button(bar_b, text="✖ Clear crop",
                    command=lambda: _clear_crop()).pack(side="left", padx=(0, 8))
+        ttk.Separator(bar_b, orient="vertical").pack(side="left", fill="y", padx=(8, 8))
 
         def _apply_changes():
             self._img_states[path] = {
@@ -1831,6 +2067,7 @@ class PreviewWindow(tk.Toplevel):
                 "auto": _auto_zoom.get(),
                 "contrast": _contrast_zoom.get(),
                 "auto_bright": _auto_bright_zoom.get(),
+                "gamma": _gamma_zoom.get(),
                 "crop_rect": _crop_rect[0],
                 "zoom": _zoom.get(),
             }
@@ -1842,8 +2079,8 @@ class PreviewWindow(tk.Toplevel):
             win.destroy()
             self._redraw()
 
-        ttk.Button(bar, text="✔ Apply", command=_apply_changes).pack(side="left", padx=(0, 4))
-        ttk.Button(bar, text="↺ Revert", command=_revert_changes).pack(side="left")
+        ttk.Button(bar_b, text="✔ Apply", command=_apply_changes).pack(side="left", padx=(0, 4))
+        ttk.Button(bar_b, text="↺ Revert", command=_revert_changes).pack(side="left")
 
         ttk.Separator(win, orient="horizontal").pack(fill="x")
 
@@ -1925,7 +2162,6 @@ class PreviewWindow(tk.Toplevel):
             if _syncing[0]:
                 return  # slider write came from the auto-position sync, not the user
             try:
-                import numpy as np
                 from PIL import Image as PILImage
                 z = _zoom.get()
                 img = PILImage.open(path)
@@ -1933,49 +2169,23 @@ class PreviewWindow(tk.Toplevel):
                 h = max(1, int(img.height * z))
                 img_r = img.resize((w, h), PILImage.LANCZOS)
 
-                is_rgb = img_r.mode in ("RGB", "RGBA")
-                pal = _pal_zoom.get()
                 use_auto = _auto_zoom.get()
-                offset = _bright_zoom.get()
-                contrast = _contrast_zoom.get()
                 use_auto_bright = _auto_bright_zoom.get()
+                base_rgb, applied = self._render_tuned(
+                    img_r, _pal_zoom.get(), use_auto, _contrast_zoom.get(),
+                    use_auto_bright, _bright_zoom.get(), _gamma_zoom.get())
+                base_img = base_rgb.convert("RGBA")
 
-                if (is_rgb and pal == "Grayscale" and not use_auto and offset == 0
-                        and contrast == 0 and not use_auto_bright):
-                    base_img = img_r.convert("RGBA")
-                else:
-                    img_l = img_r.convert("I") if img_r.mode in ("I", "I;16") else img_r.convert("L")
-                    arr_raw = np.array(img_l)
-                    if arr_raw.dtype != np.uint8:
-                        mn, mx = int(arr_raw.min()), int(arr_raw.max())
-                        if mx > mn:
-                            arr = ((arr_raw.astype(np.float32)-mn)/(mx-mn)*255).astype(np.uint8)
-                        else:
-                            arr = np.zeros(arr_raw.shape, dtype=np.uint8)
-                    else:
-                        arr = arr_raw
-                    arr, applied = self._apply_bc(arr, use_auto, contrast,
-                                                  use_auto_bright, offset)
-                    # Park the disabled sliders where the auto modes landed.
-                    if use_auto or use_auto_bright:
-                        _syncing[0] = True
-                        try:
-                            if use_auto:
-                                _contrast_zoom.set(applied["contrast"])
-                            if use_auto_bright:
-                                _bright_zoom.set(applied["brightness"])
-                        finally:
-                            _syncing[0] = False
-                    if pal != "Grayscale":
-                        if pal not in self._LUTS:
-                            self._build_lut(pal)
-                        lut = self._LUTS.get(pal)
-                        if lut is not None:
-                            base_img = PILImage.fromarray(lut[arr], "RGB").convert("RGBA")
-                        else:
-                            base_img = PILImage.fromarray(arr, "L").convert("RGBA")
-                    else:
-                        base_img = PILImage.fromarray(arr, "L").convert("RGBA")
+                # Park the disabled sliders where the auto modes landed.
+                if use_auto or use_auto_bright:
+                    _syncing[0] = True
+                    try:
+                        if use_auto:
+                            _contrast_zoom.set(applied["contrast"])
+                        if use_auto_bright:
+                            _bright_zoom.set(applied["brightness"])
+                    finally:
+                        _syncing[0] = False
 
                 _base_pil[0] = base_img
                 _scale[0] = z
@@ -1998,6 +2208,7 @@ class PreviewWindow(tk.Toplevel):
         _auto_zoom.trace_add("write", _render)
         _contrast_zoom.trace_add("write", _render)
         _auto_bright_zoom.trace_add("write", _render)
+        _gamma_zoom.trace_add("write", _render)
         _auto_zoom.trace_add("write", _sync_auto_enable)
         _auto_bright_zoom.trace_add("write", _sync_auto_enable)
 
@@ -2341,7 +2552,6 @@ class PreviewWindow(tk.Toplevel):
         self._thumb_size = size
         self._grid_layout = (size, cols)
 
-        placed = 0
         # Full rows share the leftover pixels evenly; a grid narrower than the
         # window (fewer images than fit) stays left-packed instead of drifting apart.
         stretch = cols >= cols_fit
@@ -2352,38 +2562,139 @@ class PreviewWindow(tk.Toplevel):
                 weight=1 if (inside and stretch) else 0,
                 uniform="col" if inside else "")
         self._configured_cols = cols
-        cap_font = tkfont.Font(font=("Segoe UI", 7))
-        for i, path in enumerate(self._paths):
-            pm = self._process(path, size)
-            if pm is None:
-                continue
-            self._thumbs.append(pm)
-            r, c = divmod(placed, cols)
-            placed += 1
-
-            cell = ttk.Frame(self._inner, padding=4)
-            cell.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
-
-            lbl = tk.Label(cell, image=pm, cursor="hand2",
-                           relief="flat", bd=1)
-            lbl.pack(fill="both", expand=True)
-            lbl.bind("<Enter>", lambda e, p=path: self._on_hover_enter(p))
-            lbl.bind("<Leave>", lambda e, p=path: self._on_hover_leave(e))
-            lbl.bind("<Button-1>", lambda e, p=path: self._on_click(p))
-
-            # The caption must never be wider than the thumbnail: a wider cell
-            # would push the grid past the canvas width, and Tk answers that by
-            # squeezing the cells — which clips the image instead of scaling it.
-            caption = display_timestamp_only(path.name)
-            if cap_font.measure(caption) > size and " " in caption:
-                caption = caption.split(" ", 1)[1]  # tiny thumbnails: drop the date, keep the time
-            name = self._fit_caption(caption, cap_font, size)
-            name_lbl = ttk.Label(cell, text=name, font=cap_font,
-                                  foreground="gray", wraplength=size)
-            name_lbl.pack()
-            ToolTip(name_lbl, lambda p=path: p.name)  # full filename incl. timestamp on hover
+        placed = 0
+        for path in self._paths:
+            if self._make_cell(path, size, cols, placed):
+                placed += 1
+        self._placed_cells = placed
 
         self._sync_auto_sliders()
+
+    def _make_cell(self, path: Path, size: int, cols: int, index: int) -> bool:
+        """Render one thumbnail into the grid at `index`. False if unreadable."""
+        pm = self._process(path, size)
+        if pm is None:
+            return False
+        self._thumbs.append(pm)
+        r, c = divmod(index, cols)
+
+        cell = ttk.Frame(self._inner, padding=4)
+        cell.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+
+        lbl = tk.Label(cell, image=pm, cursor="hand2",
+                       relief="flat", bd=1)
+        lbl.pack(fill="both", expand=True)
+        lbl.bind("<Enter>", lambda e, p=path: self._on_hover_enter(p))
+        lbl.bind("<Leave>", lambda e, p=path: self._on_hover_leave(e))
+        lbl.bind("<Button-1>", lambda e, p=path: self._on_click(p))
+
+        # The caption must never be wider than the thumbnail: a wider cell
+        # would push the grid past the canvas width, and Tk answers that by
+        # squeezing the cells — which clips the image instead of scaling it.
+        cap_font = tkfont.Font(font=("Segoe UI", 7))
+        caption = display_timestamp_only(path.name)
+        extra = self._caption_extra.get(path, "")
+        if cap_font.measure(caption) > size and " " in caption:
+            caption = caption.split(" ", 1)[1]  # tiny thumbnails: drop the date, keep the time
+        if extra:
+            caption = f"{caption} {extra}"
+        name = self._fit_caption(caption, cap_font, size)
+        name_lbl = ttk.Label(cell, text=name, font=cap_font,
+                              foreground="gray", wraplength=size)
+        name_lbl.pack()
+        ToolTip(name_lbl, lambda p=path: p.name)  # full filename incl. timestamp on hover
+        return True
+
+    # ── live update (one persistent window) ───────────────────────
+    def append_path(self, path: Path):
+        """Add one just-copied file to the grid without rebuilding it.
+
+        This is the live path during an auto run: a full _redraw() would decode
+        every earlier image again for each new file, on the main thread, which is
+        exactly what used to delay the next cycle.
+        """
+        self._paths.append(path)
+        size, cols, _fit = self._compute_layout()
+        if (size, cols) != self._grid_layout:
+            self._grid_layout = None
+            self._redraw()   # the new file changed the layout — reflow everything
+            return
+        if self._make_cell(path, size, cols, getattr(self, "_placed_cells", len(self._paths) - 1)):
+            self._placed_cells = getattr(self, "_placed_cells", 0) + 1
+        self._sync_auto_sliders()
+
+    # ── cycle picker (auto runs) ──────────────────────────────────
+    def _cycle_label(self, entry: dict) -> str:
+        return f"Cycle {entry['cycle']}  ({entry['ts']})"
+
+    def _refresh_cycle_box(self):
+        if not getattr(self, "_cycle_mode", False):
+            return
+        self._cycle_cb["values"] = [self._cycle_label(e) for e in self._cycle_history]
+        shown = next((e for e in self._cycle_history if e["cycle"] == self._shown_cycle), None)
+        self._cycle_var.set(self._cycle_label(shown) if shown else "")
+
+    def set_cycle_history(self, history: list[dict]):
+        """Publish the run's cycle list; the user's own pick is left alone."""
+        if not getattr(self, "_cycle_mode", False):
+            return
+        self._cycle_history = list(history)
+        self._refresh_cycle_box()
+
+    @property
+    def following(self) -> bool:
+        return bool(getattr(self, "_cycle_mode", False) and self._follow_var.get())
+
+    @property
+    def shown_cycle(self) -> int | None:
+        return getattr(self, "_shown_cycle", None)
+
+    def set_cycle_status(self, text: str):
+        if getattr(self, "_cycle_mode", False):
+            self._cycle_status_var.set(text)
+
+    def show_cycle(self, cycle_num: int | None):
+        """Swap the grid to this cycle's files, in place."""
+        if not getattr(self, "_cycle_mode", False):
+            return
+        entry = next((e for e in self._cycle_history if e["cycle"] == cycle_num), None)
+        self._shown_cycle = cycle_num if entry else None
+        paths = list(entry["files"]) if entry else []
+        keep = set(paths)
+        self._img_states = {p: st for p, st in self._img_states.items() if p in keep}
+        self._caption_extra = {p: t for p, t in self._caption_extra.items() if p in keep}
+        self._paths = paths
+        self._grid_layout = None
+        self._refresh_cycle_box()
+        self._redraw()
+
+    def set_caption_extra(self, path: Path, text: str):
+        if hasattr(self, "_caption_extra"):
+            self._caption_extra[Path(path)] = text
+
+    def _on_cycle_picked(self, _evt=None):
+        idx = self._cycle_cb.current()
+        if idx < 0 or idx >= len(self._cycle_history):
+            return
+        # Picking a cycle by hand means "stay here" — stop jumping to the newest.
+        self._follow_var.set(False)
+        self.show_cycle(self._cycle_history[idx]["cycle"])
+
+    def _step_cycle(self, delta: int):
+        if not self._cycle_history:
+            return
+        nums = [e["cycle"] for e in self._cycle_history]
+        try:
+            idx = nums.index(self._shown_cycle)
+        except ValueError:
+            idx = len(nums) - 1
+        new_idx = max(0, min(idx + delta, len(nums) - 1))
+        self._follow_var.set(False)
+        self.show_cycle(nums[new_idx])
+
+    def _on_follow_toggle(self):
+        if self._follow_var.get() and self._cycle_history:
+            self.show_cycle(self._cycle_history[-1]["cycle"])
 
     # ── large preview popup ───────────────────────────────────────
     def _show_popup(self, path: Path):
@@ -2398,41 +2709,8 @@ class PreviewWindow(tk.Toplevel):
             popup_size = min(max(self._MIN_THUMB, self._thumb_size) * 3,
                              int(self.winfo_screenheight() * 0.8))
             img.thumbnail((popup_size, popup_size), Image.LANCZOS)
-
-            is_rgb_source = img.mode in ("RGB", "RGBA")
-            use_auto = state["auto"] if state else self._auto.get()
-            use_brightness = state["brightness"] if state else self._brightness.get()
-            use_contrast = state.get("contrast", 0) if state else self._contrast.get()
-            use_auto_bright = state.get("auto_bright", False) if state else self._auto_bright.get()
-            use_palette = state["palette"] if state else self._palette.get()
-
-            if (is_rgb_source and use_palette == "Grayscale" and not use_auto
-                    and use_brightness == 0 and use_contrast == 0 and not use_auto_bright
-                    and not state):
-                pm = ImageTk.PhotoImage(img.convert("RGB"))
-            else:
-                img_l = img.convert("I") if img.mode in ("I", "I;16") else img.convert("L")
-                arr_raw = np.array(img_l)
-                if arr_raw.dtype != np.uint8:
-                    mn, mx = arr_raw.min(), arr_raw.max()
-                    if mx > mn:
-                        arr = ((arr_raw.astype(np.float32) - mn) / (mx - mn) * 255).astype(np.uint8)
-                    else:
-                        arr = np.zeros_like(arr_raw, dtype=np.uint8)
-                else:
-                    arr = arr_raw
-                arr, _ = self._apply_bc(arr, use_auto, use_contrast,
-                                        use_auto_bright, use_brightness)
-                if use_palette != "Grayscale":
-                    if use_palette not in self._LUTS:
-                        self._build_lut(use_palette)
-                    lut = self._LUTS.get(use_palette)
-                    if lut is not None:
-                        pm = ImageTk.PhotoImage(Image.fromarray(lut[arr], "RGB"))
-                    else:
-                        pm = ImageTk.PhotoImage(Image.fromarray(arr, "L"))
-                else:
-                    pm = ImageTk.PhotoImage(Image.fromarray(arr, "L"))
+            base_rgb, _ = self._render_tuned(img, **self._settings_for(state))
+            pm = ImageTk.PhotoImage(base_rgb)
         except Exception:
             return
 
@@ -2456,57 +2734,34 @@ class PreviewWindow(tk.Toplevel):
 
 # ---------------- App ----------------
 def _icon_app_id(prefix, ico_path):
-    """Taskbar identity for `prefix`, tagged with the icon *and* this build.
+    """A taskbar identity that is new on every launch.
 
     Windows caches the taskbar picture per AppUserModelID and never re-reads
-    it: an id that was once seen without a usable icon keeps drawing the
-    generic placeholder for good, whatever icon the window later carries, and
-    clearing the shell icon cache would have to be repeated on every PC.
+    it, so every *stable* id tried here eventually picked up a bad cache entry
+    and then drew the blank window placeholder for good: a fixed string, a hash
+    of the icon, and a hash tagged with the build's file name each broke within
+    days. Setting no id at all was no better -- Windows then keys the button on
+    the exe path and caches the picture there instead (Diagnostic v1.3.1,
+    measured 2026-09-17: the window icon, the exe's own icon resource and the
+    shell's own file icon all correct, the taskbar button blank).
 
-    Hashing the icon's own bytes into the id was the first fix, but a
-    content-only id can be poisoned just as well, and then it never recovers
-    because it only changes when the picture is redrawn. Measured again on
-    2026-09-03: Calibrations, CSS Logger, Git Work and Image Tools all drew
-    the blank window placeholder on the taskbar while their title bars carried
-    the right icon, and Diagnostic -- the only one whose id also carried its
-    file name -- drew its icon. So the running build's own file name, which
-    carries the version, goes into the hash too: every rebuild runs under an
-    id Windows has never seen, so it cannot be serving a stale picture for it,
-    on this PC or any other.
+    An id Windows has never seen has no cache entry, so the button falls back
+    to the window icon, which every program here sets itself -- measured on a
+    fresh id on 2026-09-04 and again on 2026-09-17. A random suffix per launch
+    makes every run a first-time id, which is why this is the one form that
+    cannot go stale. Nothing here needs a stable identity: no program registers
+    a shortcut, pins itself or sends Windows toasts. The one cost is pinning a
+    *running* taskbar button -- that pin would carry this run's id and would
+    not start the program again, so pin the exe instead.
 
-    Returns None when the icon cannot be read; the caller then sets no id at
-    all rather than burning an id on a run that has no picture to give it.
-    The same helper sits in every program here.
+    Returns None when there is no icon at all; the caller then sets no id and
+    the button keeps taking the exe's own picture.
     """
-    # A frozen build gets no taskbar identity at all, deliberately.
-    # Windows caches the taskbar picture per AppUserModelID and never re-reads
-    # it, so one bad cache entry breaks that build for good; tagging the id
-    # with the build's file name only postponed it (Diagnostic v1.1.3's id
-    # drew the blank placeholder within a day of the build). Measured
-    # 2026-09-04 with three otherwise identical windows: the app's own id ->
-    # placeholder, a never-seen id -> the right icon, no id at all -> the icon
-    # from the exe's own resource, which the builder always embeds (verified
-    # on a purpose-built PyInstaller exe). With no id Windows keys the button
-    # on the exe itself, so there is no per-id cache left to go stale. An id
-    # is still worth having when running from source, where the process is
-    # python.exe and would otherwise wear the Python icon.
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
+    import os.path
+    if not ico_path or not os.path.exists(str(ico_path)):
         return None
-    if not ico_path:
-        return None
-    import hashlib
-    import os
-    import sys
-    try:
-        with open(ico_path, "rb") as fh:
-            data = fh.read()
-    except OSError:
-        return None
-    build = os.path.basename(sys.executable if getattr(sys, "frozen", False)
-                             else (sys.argv[0] or __file__))
-    tag = hashlib.sha1(data + b"\x00" + build.encode("utf-8", "replace"))
-    return f"{prefix}.{tag.hexdigest()[:12]}"
+    import uuid
+    return f"{prefix}.{uuid.uuid4().hex[:12]}"
 
 
 def set_app_icon(win, ico_path, app_id=None):
@@ -2578,7 +2833,6 @@ class App(tk.Tk):
         self._auto_copy_active = False
         self._auto_copy_after_id = None
         self._auto_copy_count = 0
-        self._auto_total_steps = 0   # celkový počet kroků přes všechny cykly (roste dynamicky)
         self._auto_copy_params: dict | None = None
 
         # Live mód
@@ -2586,8 +2840,21 @@ class App(tk.Tk):
         self._live_thread: threading.Thread | None = None
         self._live_collected_files: list[Path] = []   # soubory zachycené v live session
         self._live_lock = threading.Lock()
+        # Auto copy — the run's cycle list, the one live preview window, the
+        # queue of cycle moments still to be copied, and the frame each camera
+        # delivered last (the skip rule compares against it).
         self._auto_cycle_history: list[dict] = []
-        self._auto_preview_win = None
+        self._auto_preview: "PreviewWindow | None" = None
+        self._auto_tick_queue: "queue.Queue | None" = None
+        self._auto_drain_thread: threading.Thread | None = None
+        self._auto_ticks_done = False
+        self._auto_dropped = 0
+        self._auto_run_id = 0
+        self._auto_offset_ns: int | None = None
+        self._auto_t0_ns = 0
+        self._auto_t0_mono = 0.0
+        self._auto_last_frame: dict[str, Path] = {}
+        self._cam_folder_cache: tuple | None = None
         self._preview_enabled = tk.BooleanVar(value=True)
         self._notes_name_var = tk.StringVar(value="notes")
         self._label_settings: dict[str, dict] = {}
@@ -2622,14 +2889,7 @@ class App(tk.Tk):
         self._preset_mon_ref: dict[int, int] = {}
         self._preset_all_screens_ref: int = 0
         self._preset_cached_monitors: dict[str, list[int]] = {}  # preset_name → monitory zjištěné při _preset_add
-        self._custom_presets: dict[str, dict] = {}
-        _cp_path = self._custom_presets_path()
-        if _cp_path.exists():
-            try:
-                _raw = json.loads(_cp_path.read_text(encoding="utf-8"))
-                self._custom_presets = dict(_raw)
-            except Exception:
-                pass
+        self._presets: dict[str, dict] = self._load_presets()
 
         self.camera_vars: dict[str, tk.BooleanVar] = {}
         for _cat, cams in CAM_CATEGORIES.items():
@@ -3080,9 +3340,9 @@ class App(tk.Tk):
 
         self._presets_inner = ttk.Frame(presets_wrap)
         self._presets_inner.pack(anchor="w")
-        self._preset_names = list(PRESETS.keys()) + [k for k in self._custom_presets if k not in PRESETS]
+        self._preset_names = list(self._presets)
 
-        _all_presets_dict = {**PRESETS, **self._custom_presets}  # custom overrides built-in
+        _all_presets_dict = self._presets
         for name in self._preset_names:
             btn = ttk.Button(self._presets_inner, text=name, style="Preset.TButton",
                              command=lambda n=name: self.toggle_preset(n))
@@ -3124,13 +3384,12 @@ class App(tk.Tk):
         sel_cams_inner = ttk.Frame(sel_cams_box)
         sel_cams_inner.pack(fill="x")
 
-        sel_hsb = ttk.Scrollbar(sel_cams_inner, orient="horizontal")
-        sel_hsb.pack(side="bottom", fill="x")
+        self._sel_hsb = ttk.Scrollbar(sel_cams_inner, orient="horizontal")
 
-        self._sel_cams_canvas = tk.Canvas(sel_cams_inner, height=95, highlightthickness=0,
-                                           xscrollcommand=sel_hsb.set)
+        self._sel_cams_canvas = tk.Canvas(sel_cams_inner, height=20, highlightthickness=0,
+                                           xscrollcommand=self._sel_hsb.set)
         self._sel_cams_canvas.pack(fill="x", expand=True)
-        sel_hsb.config(command=self._sel_cams_canvas.xview)
+        self._sel_hsb.config(command=self._sel_cams_canvas.xview)
 
         self._sel_cams_frame = ttk.Frame(self._sel_cams_canvas)
         self._sel_cams_frame_id = self._sel_cams_canvas.create_window((0, 0), window=self._sel_cams_frame, anchor="nw")
@@ -3139,6 +3398,18 @@ class App(tk.Tk):
             self._sel_cams_canvas.configure(scrollregion=self._sel_cams_canvas.bbox("all"))
 
         self._sel_cams_frame.bind("<Configure>", _on_sel_cams_inner_configure)
+
+        self._sel_cams_last_w = 0
+
+        def _on_sel_cams_canvas_configure(evt):
+            # Re-layout only on a real width change (the refresh itself resizes
+            # the canvas height, which would otherwise loop forever).
+            if abs(evt.width - self._sel_cams_last_w) < 8:
+                return
+            self._sel_cams_last_w = evt.width
+            self._refresh_selected_cams_table()
+
+        self._sel_cams_canvas.bind("<Configure>", _on_sel_cams_canvas_configure)
 
         # LEFT: Progress bar (skrytý dokud nekopírujeme)
         prog_frame = ttk.Frame(left)
@@ -3384,7 +3655,7 @@ class App(tk.Tk):
             btn.configure(style="PresetOn.TButton" if n in self._active_presets else "Preset.TButton")
 
     def _preset_add(self, name: str):
-        data = self._custom_presets.get(name) or PRESETS.get(name, {})
+        data = self._presets.get(name, {})
         cams = list(data.get("cams", []))
         self._programmatic_cam_update = True
         try:
@@ -3407,7 +3678,7 @@ class App(tk.Tk):
         self._apply_monitor_effective()
 
     def _preset_remove(self, name: str):
-        data = self._custom_presets.get(name) or PRESETS.get(name, {})
+        data = self._presets.get(name, {})
         cams = list(data.get("cams", []))
         self._programmatic_cam_update = True
         try:
@@ -3444,15 +3715,55 @@ class App(tk.Tk):
         self._sync_sections_to_selected_cams()
         self._update_name_label()
 
-    def _custom_presets_path(self) -> Path:
+    def _presets_path(self) -> Path:
         if getattr(sys, "frozen", False):
             return Path(sys.executable).resolve().parent / "custom_presets.json"
         return Path(__file__).resolve().parent / "custom_presets.json"
 
-    def _save_custom_presets(self):
+    @staticmethod
+    def _factory_presets() -> dict[str, dict]:
+        """A private copy of the built-in presets (PRESETS shares its lists with CAM_CATEGORIES)."""
+        return {name: {"cams": list(data.get("cams") or []),
+                       "mons": list(data["mons"]) if data.get("mons") else None}
+                for name, data in PRESETS.items()}
+
+    def _load_presets(self) -> dict[str, dict]:
+        """Read the whole preset list from disk; seed it from the built-ins when there is none.
+
+        v2 file: {"version": 2, "presets": {name: {...}}} — the key order is the list order.
+        v1 file: a flat {name: {...}} of custom presets only; it is merged over the built-ins.
+        """
+        path = self._presets_path()
+        if not path.exists():
+            return self._factory_presets()
         try:
-            self._custom_presets_path().write_text(
-                json.dumps(self._custom_presets, ensure_ascii=False, indent=2), encoding="utf-8"
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return self._factory_presets()
+        if not isinstance(raw, dict):
+            return self._factory_presets()
+
+        if isinstance(raw.get("presets"), dict):          # v2
+            src = raw["presets"]
+            out: dict[str, dict] = {}
+            for name, data in src.items():
+                if isinstance(data, dict):
+                    out[name] = {"cams": list(data.get("cams") or []),
+                                 "mons": list(data["mons"]) if data.get("mons") else None}
+            return out or self._factory_presets()
+
+        out = self._factory_presets()                      # v1 → migrate
+        for name, data in raw.items():
+            if isinstance(data, dict):
+                out[name] = {"cams": list(data.get("cams") or []),
+                             "mons": list(data["mons"]) if data.get("mons") else None}
+        return out
+
+    def _save_presets(self):
+        try:
+            self._presets_path().write_text(
+                json.dumps({"version": 2, "presets": self._presets}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
         except Exception:
             pass
@@ -3461,8 +3772,8 @@ class App(tk.Tk):
         for btn in self.preset_buttons.values():
             btn.destroy()
         self.preset_buttons.clear()
-        self._preset_names = list(PRESETS.keys()) + [k for k in self._custom_presets if k not in PRESETS]
-        _all = {**PRESETS, **self._custom_presets}  # custom overrides built-in
+        self._preset_names = list(self._presets)
+        _all = self._presets
         for name in self._preset_names:
             btn = ttk.Button(self._presets_inner, text=name, style="Preset.TButton",
                              command=lambda n=name: self.toggle_preset(n))
@@ -3475,48 +3786,84 @@ class App(tk.Tk):
         self._place_presets_fn(6)
         self._refresh_preset_button_styles()
 
-    def _open_preset_manager(self):
+    def _open_preset_manager(self, offscreen: bool = False):
+        """Preset Manager: add, rename, remove, reorder (drag) the presets.
+
+        offscreen=True is for the tests — the window is built far outside the
+        desktop and does not grab the input, so nothing shows up on screen.
+        """
         dlg = tk.Toplevel(self)
         dlg.title("Preset Manager")
         dlg.resizable(True, True)
-        dlg.geometry("800x540")
-        dlg.grab_set()
+        dlg.geometry("820x560+-4000+-4000" if offscreen else "820x560")
+        if not offscreen:
+            dlg.grab_set()
 
-        all_cams = [cam for cams in CAM_CATEGORIES.values() for cam in cams]
+        # one entry per camera — a few of them sit in two sections
+        all_cams = list(dict.fromkeys(cam for cams in CAM_CATEGORIES.values() for cam in cams))
         cam_vars: dict[str, tk.BooleanVar] = {c: tk.BooleanVar(value=False) for c in all_cams}
-        _current_names: list[str] = []
-
-        def _all_names() -> list[str]:
-            return list(PRESETS.keys()) + [k for k in self._custom_presets if k not in PRESETS]
+        iid_name: dict[str, str] = {}           # tree row id → preset name
+        drag = {"iid": None, "active": False}
 
         def _effective_cams(name: str) -> set[str]:
-            data = self._custom_presets.get(name) or PRESETS.get(name, {})
-            return set(data.get("cams", []))
+            return set(self._presets.get(name, {}).get("cams", []))
 
-        # ── LEFT: Treeview preset list ──────────────────────────────────────
+        # ── LEFT: preset list ────────────────────────────────────────────────
         left = ttk.LabelFrame(dlg, text="Presets", padding=6)
         left.pack(side="left", fill="y", padx=(8, 4), pady=8)
+
+        # Rows tall enough for descenders (g, p, y) at any display scaling.
+        _row_font = tkfont.nametofont("TkDefaultFont")
+        _style = ttk.Style(dlg)
+        _style.configure("Presets.Treeview", font=_row_font,
+                         rowheight=_row_font.metrics("linespace") + 8)
 
         tree_frame = ttk.Frame(left)
         tree_frame.pack(fill="both", expand=True)
         tree_sb = ttk.Scrollbar(tree_frame, orient="vertical")
-        tree = ttk.Treeview(tree_frame, columns=("label",), show="headings",
+        tree = ttk.Treeview(tree_frame, columns=("label",), show="", height=14,
+                            style="Presets.Treeview",
                             selectmode="browse", yscrollcommand=tree_sb.set)
-        tree.heading("label", text="Preset")
         tree.column("label", width=175, anchor="w")
         tree_sb.config(command=tree.yview)
         tree_sb.pack(side="right", fill="y")
         tree.pack(side="left", fill="both", expand=True)
 
-        # ── RIGHT: name + camera grid ────────────────────────────────────────
+        list_btns = ttk.Frame(left)
+        list_btns.pack(fill="x", pady=(6, 0))
+        new_btn = ttk.Button(list_btns, text="New")
+        new_btn.pack(side="left")
+        remove_btn = ttk.Button(list_btns, text="Remove")
+        remove_btn.pack(side="left", padx=(6, 0))
+        remove_btn.state(["disabled"])
+
+        ttk.Label(left, text="Drag a row to reorder", foreground="#888",
+                  font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
+
+        # ── RIGHT: name, search, camera grid ─────────────────────────────────
         right = ttk.Frame(dlg)
         right.pack(side="left", fill="both", expand=True, padx=(4, 8), pady=8)
 
-        ttk.Label(right, text="Name:").pack(anchor="w")
+        name_row = ttk.Frame(right)
+        name_row.pack(fill="x")
+        ttk.Label(name_row, text="Name:").pack(side="left")
         name_var = tk.StringVar()
-        ttk.Entry(right, textvariable=name_var, width=30).pack(fill="x")
+        ttk.Entry(name_row, textvariable=name_var).pack(side="left", fill="x", expand=True, padx=(6, 6))
+        save_btn = ttk.Button(name_row, text="Save")
+        save_btn.pack(side="right")
 
-        ttk.Label(right, text="Cameras:").pack(anchor="w", pady=(8, 2))
+        search_row = ttk.Frame(right)
+        search_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(search_row, text="Search:").pack(side="left")
+        search_var = tk.StringVar()
+        ttk.Entry(search_row, textvariable=search_var).pack(side="left", fill="x", expand=True, padx=(6, 6))
+        ttk.Button(search_row, text="Clear", command=lambda: search_var.set("")).pack(side="right")
+
+        msg_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=msg_var, foreground="#b00000",
+                  font=("Segoe UI", 8)).pack(anchor="w")
+
+        ttk.Label(right, text="Cameras:").pack(anchor="w", pady=(4, 2))
 
         cam_area = ttk.Frame(right)
         cam_area.pack(fill="both", expand=True)
@@ -3529,14 +3876,32 @@ class App(tk.Tk):
         _cam_win = cam_canvas.create_window((0, 0), window=cam_inner, anchor="nw")
 
         CAM_COLS = 3
-        for i, cam in enumerate(all_cams):
-            r, c = divmod(i, CAM_COLS)
-            ttk.Checkbutton(cam_inner, text=cam, variable=cam_vars[cam]).grid(
-                row=r, column=c, sticky="w", padx=(4, 14), pady=1)
+        cam_boxes: dict[str, ttk.Checkbutton] = {
+            cam: ttk.Checkbutton(cam_inner, text=cam, variable=cam_vars[cam]) for cam in all_cams
+        }
 
         def _update_scroll_region(*_):
             cam_canvas.configure(scrollregion=cam_canvas.bbox("all"))
             cam_canvas.itemconfigure(_cam_win, width=cam_canvas.winfo_width())
+
+        def _matching_cams() -> list[str]:
+            """Every word of the query must appear in the name, in any order."""
+            words = search_var.get().strip().lower().split()
+            if not words:
+                return all_cams
+            return [c for c in all_cams if all(w in c.lower() for w in words)]
+
+        def _regrid_cams(*_):
+            for box in cam_boxes.values():
+                box.grid_forget()
+            for i, cam in enumerate(_matching_cams()):
+                r, c = divmod(i, CAM_COLS)
+                cam_boxes[cam].grid(row=r, column=c, sticky="w", padx=(4, 14), pady=1)
+            cam_canvas.yview_moveto(0)
+            _update_scroll_region()
+
+        _regrid_cams()
+        search_var.trace_add("write", _regrid_cams)
 
         cam_inner.bind("<Configure>", _update_scroll_region)
         cam_canvas.bind("<Configure>", _update_scroll_region)
@@ -3546,105 +3911,159 @@ class App(tk.Tk):
                        lambda e: cam_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
 
         # ── Callbacks ────────────────────────────────────────────────────────
-        del_text = tk.StringVar(value="Delete")
-        del_btn = None  # set after on_delete is defined
-
         def _refresh_tree(select_name: str | None = None):
-            nonlocal _current_names
-            _current_names = _all_names()
-            for iid in tree.get_children():
+            iid_name.clear()
+            for iid in tree.get_children(""):
                 tree.delete(iid)
-            for i, nm in enumerate(_current_names):
-                overridden = nm in self._custom_presets
-                is_builtin = nm in PRESETS
-                suffix = " *" if (is_builtin and overridden) else (" +" if not is_builtin else "")
-                tree.insert("", "end", iid=str(i), values=(nm + suffix,))
-            if select_name and select_name in _current_names:
-                iid = str(_current_names.index(select_name))
-                tree.selection_set(iid)
-                tree.see(iid)
+            for i, nm in enumerate(self._presets):
+                iid = f"I{i}"
+                iid_name[iid] = nm
+                tree.insert("", "end", iid=iid, values=(nm,))
+            if select_name:
+                for iid, nm in iid_name.items():
+                    if nm == select_name:
+                        tree.selection_set(iid)
+                        tree.see(iid)
+                        break
 
         def _selected_name() -> str | None:
             sel = tree.selection()
-            if not sel:
-                return None
-            idx = int(sel[0])
-            return _current_names[idx] if idx < len(_current_names) else None
+            return iid_name.get(sel[0]) if sel else None
 
         def _load(preset_name: str):
+            msg_var.set("")
             name_var.set(preset_name)
+            search_var.set("")
             for v in cam_vars.values():
                 v.set(False)
             for cam in _effective_cams(preset_name):
                 if cam in cam_vars:
                     cam_vars[cam].set(True)
-            if preset_name in PRESETS:
-                del_text.set("Reset to default")
-                if del_btn:
-                    del_btn.state(["!disabled"] if preset_name in self._custom_presets else ["disabled"])
-            else:
-                del_text.set("Delete")
-                if del_btn:
-                    del_btn.state(["!disabled"])
+            remove_btn.state(["!disabled"])
 
         def on_select():
+            if drag["active"]:
+                return
             nm = _selected_name()
             if nm:
                 _load(nm)
 
         def on_new():
+            msg_var.set("")
             tree.selection_set([])
             name_var.set("")
+            search_var.set("")
             for v in cam_vars.values():
                 v.set(False)
-            del_text.set("Delete")
-            if del_btn:
-                del_btn.state(["disabled"])
+            remove_btn.state(["disabled"])
 
         def on_save():
             n = name_var.get().strip()
             if not n:
+                msg_var.set("Type a name first.")
                 return
-            old_name = _selected_name()
-            if old_name and old_name not in PRESETS and old_name != n and old_name in self._custom_presets:
-                del self._custom_presets[old_name]
-                self._active_presets.discard(old_name)
-            self._custom_presets[n] = {"cams": [c for c, v in cam_vars.items() if v.get()], "mons": None}
-            self._save_custom_presets()
+            old = _selected_name()
+            if n in self._presets and n != old:
+                msg_var.set(f'A preset named "{n}" already exists.')
+                return
+            data = {"cams": [c for c in all_cams if cam_vars[c].get()],
+                    "mons": (self._presets.get(old) or {}).get("mons") if old else None}
+            if old and old != n:
+                # Rename: rebuild the list with the key swapped, so the row keeps its place.
+                self._presets = {(n if k == old else k): (data if k == old else v)
+                                 for k, v in self._presets.items()}
+                if old in self._active_presets:
+                    self._active_presets.discard(old)
+                    self._active_presets.add(n)
+                if old in self._preset_cached_monitors:
+                    self._preset_cached_monitors[n] = self._preset_cached_monitors.pop(old)
+            else:
+                self._presets[n] = data
+            self._save_presets()
             self._rebuild_preset_buttons()
             _refresh_tree(select_name=n)
             _load(n)
 
-        def on_delete():
+        def on_remove():
             nm = _selected_name()
-            if not nm or nm not in self._custom_presets:
+            if not nm:
                 return
-            self._active_presets.discard(nm)
-            del self._custom_presets[nm]
-            self._save_custom_presets()
+            if not messagebox.askyesno("Remove preset", f'Remove the preset "{nm}"?', parent=dlg):
+                return
+            if nm in self._active_presets:
+                self.toggle_preset(nm)      # switch it off first, so the monitor counts stay right
+            self._presets.pop(nm, None)
+            self._preset_cached_monitors.pop(nm, None)
+            self._save_presets()
             self._rebuild_preset_buttons()
-            if nm in PRESETS:
-                _refresh_tree(select_name=nm)
-                _load(nm)
+            _refresh_tree()
+            on_new()
+
+        def on_restore():
+            if not messagebox.askyesno(
+                    "Restore defaults",
+                    "Put the built-in presets back?\n\n"
+                    "Missing ones are added at the end, edited ones go back to their original "
+                    "cameras. Your own presets are left alone.", parent=dlg):
+                return
+            for nm, data in self._factory_presets().items():
+                self._presets[nm] = data
+            self._save_presets()
+            self._rebuild_preset_buttons()
+            keep = _selected_name()
+            _refresh_tree(select_name=keep)
+            if keep and keep in self._presets:
+                _load(keep)
             else:
-                _refresh_tree()
                 on_new()
+
+        # ── Drag to reorder ──────────────────────────────────────────────────
+        def on_drag_start(e):
+            drag["iid"] = tree.identify_row(e.y)
+            drag["active"] = False
+
+        def on_drag_motion(e):
+            src = drag["iid"]
+            if not src:
+                return
+            dst = tree.identify_row(e.y)
+            if dst and dst != src:
+                drag["active"] = True
+                tree.move(src, "", tree.index(dst))
+                tree.selection_set(src)
+                tree.configure(cursor="hand2")
+
+        def on_drag_drop(_e):
+            src, moved = drag["iid"], drag["active"]
+            drag["iid"], drag["active"] = None, False
+            tree.configure(cursor="")
+            if not (src and moved):
+                return
+            order = [iid_name[i] for i in tree.get_children("") if i in iid_name]
+            if order == list(self._presets):
+                return
+            self._presets = {nm: self._presets[nm] for nm in order}
+            self._save_presets()
+            self._rebuild_preset_buttons()
+            _refresh_tree(select_name=iid_name.get(src))
+
+        new_btn.configure(command=on_new)
+        remove_btn.configure(command=on_remove)
+        save_btn.configure(command=on_save)
 
         _refresh_tree()
         tree.bind("<<TreeviewSelect>>", lambda *_: on_select())
+        tree.bind("<ButtonPress-1>", on_drag_start, add="+")
+        tree.bind("<B1-Motion>", on_drag_motion, add="+")
+        tree.bind("<ButtonRelease-1>", on_drag_drop, add="+")
 
-        # ── Action buttons ───────────────────────────────────────────────────
+        # ── Bottom row ───────────────────────────────────────────────────────
         btn_row = ttk.Frame(right)
         btn_row.pack(fill="x", pady=(8, 0))
-        ttk.Button(btn_row, text="New", command=on_new).pack(side="left")
-        ttk.Button(btn_row, text="Save", command=on_save).pack(side="left", padx=(6, 0))
-        del_btn = ttk.Button(btn_row, textvariable=del_text, command=on_delete)
-        del_btn.pack(side="left", padx=(6, 0))
-        del_btn.state(["disabled"])
+        ttk.Button(btn_row, text="Restore defaults", command=on_restore).pack(side="left")
         ttk.Button(btn_row, text="Close", command=dlg.destroy).pack(side="right")
 
-        ttk.Label(right, text="* modified built-in   + custom", foreground="#888",
-                  font=("Segoe UI", 7)).pack(anchor="w", pady=(4, 0))
+        return dlg
 
     def _selected_cameras(self) -> list[str]:
         return [name for name, var in self.camera_vars.items() if var.get()]
@@ -3831,13 +4250,41 @@ class App(tk.Tk):
 
         cam_items = self._selected_cameras()
 
+        # One entry per label, including the two bold headings; the number of
+        # rows per column grows only if 5-row columns would not fit the width.
+        cells = len(mon_items) + (1 if mon_items else 0)
+        if cam_items:
+            if cells % 5:
+                cells += 5 - (cells % 5)   # heading always starts a fresh column
+            cells += len(cam_items) + 1
+
+        if not hasattr(self, "_sel_cams_fonts"):
+            self._sel_cams_fonts = (
+                tkfont.Font(family="Segoe UI", size=9),
+                tkfont.Font(family="Segoe UI", size=9, weight="bold"),
+            )
+        f_norm, f_bold = self._sel_cams_fonts
+        widest = max(
+            [f_bold.measure("Cameras:"), f_bold.measure("Monitors:")]
+            + [f_norm.measure(t) for t in (mon_items + cam_items)] or [60]
+        )
+        col_w = widest + 16
+
+        avail_w = self._sel_cams_canvas.winfo_width()
+        if avail_w < 50:
+            avail_w = max(self._sel_cams_canvas.winfo_reqwidth(), 600)
+        max_cols = max(1, avail_w // col_w)
+
         rows_per_col = 5
+        if cells and -(-cells // rows_per_col) > max_cols:
+            rows_per_col = -(-cells // max_cols)
+
         current_row = 0
         current_col = 0
 
         def _place(text, bold=False):
             nonlocal current_row, current_col
-            font = ("Segoe UI", 9, "bold") if bold else ("Segoe UI", 9)
+            font = f_bold if bold else f_norm
             ttk.Label(self._sel_cams_frame, text=text, font=font).grid(
                 row=current_row, column=current_col, sticky="w", padx=(0, 16), pady=0
             )
@@ -3860,7 +4307,20 @@ class App(tk.Tk):
             for c in cam_items:
                 _place(c)
 
+        self._sel_cams_frame.update_idletasks()
+        need_h = max(self._sel_cams_frame.winfo_reqheight(), 20)
+        self._sel_cams_canvas.configure(height=need_h)
+        self._sel_cams_canvas.update_idletasks()
         self._sel_cams_canvas.configure(scrollregion=self._sel_cams_canvas.bbox("all"))
+
+        # Horizontal scrollbar only when the columns really do not fit.
+        need_w = self._sel_cams_frame.winfo_reqwidth()
+        if need_w > self._sel_cams_canvas.winfo_width() + 2:
+            if not self._sel_hsb.winfo_ismapped():
+                self._sel_hsb.pack(side="bottom", fill="x")
+        elif self._sel_hsb.winfo_ismapped():
+            self._sel_hsb.pack_forget()
+            self._sel_cams_canvas.xview_moveto(0)
 
     def _ensure_output_path(self, dest: Path, run_ts: str, total_outputs: int) -> Path:
         if total_outputs <= 1:
@@ -4021,19 +4481,6 @@ class App(tk.Tk):
         h = min(120 + len(cams) * 34 + 80, 700)
         win.geometry(f"560x{h}")
 
-    def _open_preview_async(self, out_dir: Path):
-        def _collect():
-            try:
-                paths = []
-                for ext in ("*.png", "*.jpg", "*.tif", "*.tiff"):
-                    paths.extend(out_dir.glob(ext))
-                paths.sort(key=lambda p: p.name)
-                if paths:
-                    self.after(0, lambda pp=paths: PreviewWindow(self, pp))
-            except Exception:
-                pass
-        threading.Thread(target=_collect, daemon=True).start()
-
     def _open_preview_with_callbacks(self, out_dir: Path,
                                       monitors_local, all_screens_local,
                                       cams_local, source_mode,
@@ -4053,139 +4500,110 @@ class App(tk.Tk):
             on_try_again=_retry,
         ))
 
-    def _open_auto_preview(self, latest_entry: dict):
+    # ── one persistent preview window for a whole auto run ────────
+    def _auto_preview_window(self) -> "PreviewWindow | None":
+        """The single live preview window, created on first use."""
         if not self._preview_enabled.get():
-            return
-        if not self._auto_cycle_history:
-            return
-
-        # Pokud už je auto preview okno otevřené, jen ho aktualizuj
-        existing = getattr(self, "_auto_preview_win", None)
-        if existing is not None:
+            return None
+        win = self._auto_preview
+        if win is not None:
             try:
-                existing._refresh_cycles(self._auto_cycle_history, latest_entry["cycle"])
-                return
+                if win.winfo_exists():
+                    return win
+            except Exception:
+                pass
+            self._auto_preview = None
+        win = PreviewWindow(self, [], cycle_mode=True,
+                            on_cycle_change=self._forget_cycle)
+        self._auto_preview = win
+
+        def _on_close():
+            self._auto_preview = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        return win
+
+    def _forget_cycle(self, cycle: int):
+        """The preview deleted a cycle's files — drop it from the run as well,
+        or the next refresh would put the empty cycle back on the list."""
+        self._auto_cycle_history = [e for e in self._auto_cycle_history
+                                    if e["cycle"] != cycle]
+
+    def _close_auto_preview(self):
+        win = self._auto_preview
+        self._auto_preview = None
+        if win is not None:
+            try:
+                win.destroy()
             except Exception:
                 pass
 
-        win = tk.Toplevel(self)
-        win.title("Auto copy — cycle preview")
-        win.geometry("960x720")
-        win.resizable(True, True)
-        self._auto_preview_win = win
+    def _preview_begin_cycle(self, cycle: int, target_ns: int):
+        """Register a cycle before its files start arriving (main thread)."""
+        entry = {
+            "cycle": cycle,
+            "ts": datetime.fromtimestamp(target_ns / 1_000_000_000).strftime("%H:%M:%S"),
+            "target_ns": target_ns,
+            "files": [],
+        }
+        self._auto_cycle_history.append(entry)
+        win = self._auto_preview_window()
+        if win is None:
+            return
+        win.set_cycle_history(self._auto_cycle_history)
+        # The view is not moved yet: the previous cycle stays on screen until the
+        # first picture of this one actually lands, so there is no blank flash.
+        win.set_cycle_status(f"cycle {cycle} running…")
 
-        def _on_close():
-            self._auto_preview_win = None
-            win.destroy()
-        win.protocol("WM_DELETE_WINDOW", _on_close)
-
-        # ── top bar: výběr cyklu ──────────────────────────────────
-        top = ttk.Frame(win, padding=(8, 6))
-        top.pack(fill="x")
-
-        ttk.Label(top, text="Cycle:").pack(side="left")
-        cycle_var = tk.IntVar(value=latest_entry["cycle"])
-        cycle_cb = ttk.Combobox(top, textvariable=cycle_var, state="readonly", width=10)
-        cycle_cb.pack(side="left", padx=(6, 0))
-
-        ttk.Button(top, text="◀", width=3,
-                   command=lambda: _step(-1)).pack(side="left", padx=(8, 0))
-        ttk.Button(top, text="▶", width=3,
-                   command=lambda: _step(1)).pack(side="left", padx=(2, 0))
-
-        ts_var = tk.StringVar(value=latest_entry["ts"])
-        ttk.Label(top, textvariable=ts_var, foreground="gray",
-                  font=("Segoe UI", 8)).pack(side="left", padx=(12, 0))
-
-        ttk.Separator(win, orient="horizontal").pack(fill="x")
-
-        # ── preview frame ─────────────────────────────────────────
-        preview_frame = ttk.Frame(win)
-        preview_frame.pack(fill="both", expand=True)
-
-        _current_pw: list = [None]
-
-        def _load_cycle(cycle_num: int):
-            # Najdi entry pro daný cyklus
-            entry = next((e for e in self._auto_cycle_history if e["cycle"] == cycle_num), None)
-            if entry is None:
+    def _preview_add_file(self, cycle: int, path: Path, offset_ns: int | None = None):
+        """One file has landed — show it straight away (main thread)."""
+        entry = next((e for e in self._auto_cycle_history if e["cycle"] == cycle), None)
+        if entry is None:
+            return
+        entry["files"].append(path)
+        win = self._auto_preview
+        if win is None:
+            return
+        try:
+            if not win.winfo_exists():
+                self._auto_preview = None
                 return
-            ts_var.set(entry["ts"])
-            # Zruš předchozí PreviewWindow obsah
-            if _current_pw[0] is not None:
-                try:
-                    _current_pw[0].destroy()
-                except Exception:
-                    pass
-                _current_pw[0] = None
-            # Vytvoř nové PreviewWindow jako frame uvnitř win
-            paths = entry["files"]
-            if not paths:
-                return
+        except Exception:
+            self._auto_preview = None
+            return
+        if offset_ns:
+            win.set_caption_extra(path, f"(−{fmt_span_ms(offset_ns / 1_000_000)})")
+        shown = win.shown_cycle
+        if win.following and (shown is None or cycle > shown):
+            win.show_cycle(cycle)   # draws this file too — it is already in the entry
+            return
+        if shown == cycle:
+            win.append_path(path)
 
-            def _retry(files=paths):
-                pass  # retry nedává smysl pro historické cykly
+    def _preview_end_cycle(self, cycle: int, summary: str):
+        win = self._auto_preview
+        if win is None:
+            return
+        try:
+            if win.winfo_exists():
+                win.set_cycle_status(summary)
+        except Exception:
+            self._auto_preview = None
 
-            pw = PreviewWindow.__new__(PreviewWindow)
-            tk.Toplevel.__init__(pw, win)
-            pw.withdraw()  # schováme ho jako samostatné okno
-
-            # Místo toho zobrazíme obsah přímo — embedded preview
-            inner_win = tk.Toplevel(win)
-            inner_win.title(f"Cycle {cycle_num} — {entry['ts']}")
-            inner_win.geometry("920x640")
-            inner_win.transient(win)
-            _current_pw[0] = inner_win
-
-            # Jednodušší přístup: otevři standardní PreviewWindow
-            pw.destroy()
-            pwin = PreviewWindow(win, paths, on_keep=None, on_delete=None, on_try_again=_retry)
-            pwin.title(f"Cycle {cycle_num} — {entry['ts']}")
-            inner_win.destroy()
-            _current_pw[0] = pwin
-
-        def _refresh_cycles(history: list, select_cycle: int | None = None):
-            values = [f"Cycle {e['cycle']}  ({e['ts']})" for e in history]
-            cycle_cb["values"] = values
-            # Nastav výběr
-            target = select_cycle if select_cycle is not None else history[-1]["cycle"]
-            idx = next((i for i, e in enumerate(history) if e["cycle"] == target), len(history) - 1)
-            cycle_cb.current(idx)
-            cycle_var.set(history[idx]["cycle"])
-
-        def _on_cycle_selected(_evt=None):
-            idx = cycle_cb.current()
-            if idx < 0 or idx >= len(self._auto_cycle_history):
-                return
-            entry = self._auto_cycle_history[idx]
-            cycle_var.set(entry["cycle"])
-            _load_cycle(entry["cycle"])
-
-        def _step(delta: int):
-            idx = cycle_cb.current()
-            new_idx = max(0, min(idx + delta, len(self._auto_cycle_history) - 1))
-            cycle_cb.current(new_idx)
-            _on_cycle_selected()
-
-        cycle_cb.bind("<<ComboboxSelected>>", _on_cycle_selected)
-
-        # Přiřaď metodu pro refresh zvenku
-        win._refresh_cycles = _refresh_cycles
-
-        # Inicializace
-        _refresh_cycles(self._auto_cycle_history, latest_entry["cycle"])
-        _load_cycle(latest_entry["cycle"])
-
+    # ── auto copy: an exact time grid, recorded per cycle ─────────
     def _toggle_auto_copy(self):
         if self._auto_copy_active:
             self._stop_auto_copy()
         else:
             self._start_auto_copy()
 
+    def _auto_interval_s(self) -> int:
+        try:
+            return max(AUTO_MIN_INTERVAL_S, int(self._auto_interval_var.get()))
+        except Exception:
+            return AUTO_MIN_INTERVAL_S
+
     def _start_auto_copy(self):
-        if getattr(self, "_busy", False):
-            self.log("[AUTO] Cannot start: busy")
-            return
         monitors_local = self._selected_monitors()
         all_screens_local = bool(self.all_screens_var.get())
         cams_local = list(self._selected_cameras())
@@ -4193,23 +4611,81 @@ class App(tk.Tk):
         if not cams_local and monitors_local is None and not all_screens_local:
             messagebox.showwarning("Auto copy", "Select cameras or monitors.")
             return
+        if not self._get_dest():
+            return
+
+        self._close_auto_preview()
         self._auto_copy_active = True
         self._auto_copy_count = 0
-        self._auto_total_steps = 0
         self._auto_cycle_history = []
-        self._auto_preview_win = None
+        self._auto_last_frame = {}
+        self._auto_ticks_done = False
+        self._auto_dropped = 0
+        self._auto_offset_ns = None   # measured by the first cycle
+        self._auto_tick_queue = queue.Queue()
         self._auto_copy_params = {
             "monitors": monitors_local,
             "all_screens": all_screens_local,
             "cams": cams_local,
             "source": source_mode,
+            "custom_name": self.sanitize_folder_name(self.run_name_var.get()),
+            "total": self._planned_output_count(monitors_local, cams_local),
+            "dest": self._get_dest(),
         }
+        # Resolved once: the folder cannot change during a run, and creating it
+        # per cycle would put a share write on the main thread every tick.
+        self._auto_copy_params["out_dir"] = self._ensure_output_path(
+            self._auto_copy_params["dest"],
+            datetime.now().strftime(RUN_FOLDER_FMT),
+            self._auto_copy_params["total"])
+        # The grid every cycle is measured against: wall clock for the recorded
+        # target times, monotonic for the scheduling (a clock change must not
+        # move the ticks).
+        self._auto_t0_ns = time.time_ns()
+        self._auto_t0_mono = time.monotonic()
         self._auto_btn.configure(text="■ Stop auto")
-        self.log(f"[AUTO] Started — interval={self._auto_interval_var.get()}s  max_cycles={self._auto_cycles_var.get()}")
-        self._run_auto_cycle()
+        self.log(f"[AUTO] Started — every {self._auto_interval_s()}s, "
+                 f"max_cycles={self._auto_cycles_var.get()}")
+        # Each run gets its own number, so the previous run's worker cannot
+        # still be draining when Stop is followed straight away by Start.
+        self._auto_run_id += 1
+        self._auto_drain_thread = threading.Thread(
+            target=self._auto_drain_loop, args=(self._auto_run_id,), daemon=True)
+        self._auto_drain_thread.start()
+        if cams_local and source_mode == "cpva":
+            threading.Thread(target=self._prime_camera_cache,
+                             args=(list(cams_local),), daemon=True).start()
+        self._on_auto_tick(0)
+
+    def _prime_camera_cache(self, cams: list[str]):
+        """Read every selected camera folder once, before the first cycle.
+
+        The 3 s refresher only re-reads folders the cache already knows, so
+        without this the first cycle pays one cold share listing per camera —
+        which is what made cycle 1 take twice as long as the interval.
+        """
+        try:
+            folders = self._resolve_cam_folders(time.time_ns(), cams)
+            if not folders:
+                return
+            def _one(item):
+                cam, folder = item
+                try:
+                    entries = scan_camera_dir(folder)
+                except Exception:
+                    return
+                with self._cam_dir_cache_lock:
+                    self._cam_dir_cache[str(folder)] = entries
+                    self._cam_dir_cache_time[str(folder)] = time.time()
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(folders)))) as pool:
+                list(pool.map(_one, folders.items()))
+            self.log(f"[AUTO] Camera listings primed ({len(folders)}).")
+        except Exception as e:
+            self.log(f"[AUTO] Priming failed: {e}")
 
     def _stop_auto_copy(self):
         self._auto_copy_active = False
+        self._auto_ticks_done = True
         if self._auto_copy_after_id is not None:
             try:
                 self.after_cancel(self._auto_copy_after_id)
@@ -4218,32 +4694,178 @@ class App(tk.Tk):
             self._auto_copy_after_id = None
         self._auto_btn.configure(text="▶ Start auto")
         self._auto_status_var.set("")
+        self._progress_hide()
         self.log("[AUTO] Stopped.")
 
-    def _run_auto_cycle(self):
+    def _schedule_auto_tick(self, n: int):
+        """Fire tick n at t0 + n*interval — never 'interval after the last one',
+        so a slow cycle cannot stretch the ones after it."""
+        if not self._auto_copy_active:
+            return
+        delay_ms = auto_tick_delay_ms(self._auto_t0_mono, n,
+                                      self._auto_interval_s(), time.monotonic())
+        self._auto_copy_after_id = self.after(delay_ms, lambda k=n: self._on_auto_tick(k))
+
+    def _on_auto_tick(self, n: int):
         if not self._auto_copy_active or self._auto_copy_params is None:
             return
         max_cycles = self._auto_cycles_var.get()
-        self._auto_copy_count += 1
-        if max_cycles > 0 and self._auto_copy_count > max_cycles:
-            self.log(f"[AUTO] Finished after {max_cycles} cycles.")
-            self._stop_auto_copy()
+        if max_cycles > 0 and n >= max_cycles:
+            self._auto_ticks_done = True
+            self.log(f"[AUTO] All {max_cycles} cycles issued — finishing.")
             return
-        status = f"cycle {self._auto_copy_count}" + (f"/{max_cycles}" if max_cycles > 0 else "")
-        self._auto_status_var.set(status)
-        self.log(f"[AUTO] {status}")
-        self._schedule_next_auto_cycle()
+        cycle = n + 1
+        self._auto_copy_count = cycle
+        target_ns = auto_tick_target_ns(self._auto_t0_ns, n, self._auto_interval_s())
         p = self._auto_copy_params
-        self._run_copy_worker(
-            p["monitors"], p["all_screens"], p["cams"], p["source"],
-            _cycle_number=self._auto_copy_count,
-        )
 
-    def _schedule_next_auto_cycle(self):
-        if not self._auto_copy_active:
+        status = f"cycle {cycle}" + (f"/{max_cycles}" if max_cycles > 0 else "")
+        self._auto_status_var.set(status)
+        self._preview_begin_cycle(cycle, target_ns)
+
+        tick = {
+            "cycle": cycle,
+            "target_ns": target_ns,
+            "run_ts": datetime.fromtimestamp(target_ns / 1_000_000_000).strftime(RUN_FOLDER_FMT),
+            "out_dir": p["out_dir"],
+        }
+        # The screen can only be captured now, so it is captured at the tick
+        # itself — never when a lagging queue gets round to this cycle.
+        if p["monitors"] is not None or p["all_screens"]:
+            threading.Thread(target=self._grab_tick_screenshots,
+                             args=(tick,), daemon=True).start()
+        self._auto_tick_queue.put(tick)
+        self._schedule_auto_tick(n + 1)
+
+    def _grab_tick_screenshots(self, tick: dict):
+        p = self._auto_copy_params
+        if p is None:
             return
-        interval_ms = max(5, self._auto_interval_var.get()) * 1000
-        self._auto_copy_after_id = self.after(interval_ms, self._run_auto_cycle)
+        run_ts, out_dir = tick["run_ts"], tick["out_dir"]
+        custom_name, total = p["custom_name"], p["total"]
+        targets: list[tuple[Path, int | None]] = []
+        if p["monitors"] is None and p["all_screens"]:
+            fname = f"{custom_name}.png" if (total == 1 and custom_name) else f"{run_ts}_all.png"
+            targets.append((out_dir / fname, None))
+        elif p["monitors"] is not None:
+            for mi in p["monitors"]:
+                fname = (f"{custom_name}.png" if (total == 1 and custom_name)
+                         else f"{run_ts}_monitor{mi+1}.png")
+                targets.append((out_dir / fname, mi))
+        try:
+            written = take_screenshots_monitors_png(targets)
+        except Exception as e:
+            self.log(f"[AUTO] cycle {tick['cycle']}: screenshot failed: {e}")
+            return
+        for path in written:
+            self.after(0, lambda c=tick["cycle"], pth=path: self._preview_add_file(c, pth))
+
+    def _auto_drain_loop(self, run_id: int):
+        """One worker draining the tick queue in order.
+
+        A tick carries its own recorded moment, so a cycle that starts late still
+        copies the frames from its own time — the copying may lag, the pictures
+        may not.
+        """
+        q = self._auto_tick_queue
+        while self._auto_copy_active and self._auto_run_id == run_id:
+            try:
+                tick = q.get(timeout=0.25)
+            except queue.Empty:
+                if self._auto_ticks_done:
+                    self.after(0, self._stop_auto_copy)
+                    return
+                continue
+            if not self._auto_copy_active or self._auto_run_id != run_id:
+                return
+            try:
+                self._process_tick(tick)
+            except Exception as e:
+                self.log(f"[AUTO] cycle {tick.get('cycle')}: {e!r}")
+
+    def _process_tick(self, tick: dict):
+        p = self._auto_copy_params
+        if p is None:
+            return
+        cycle, target_ns = tick["cycle"], tick["target_ns"]
+        lag_ns = time.time_ns() - target_ns
+        behind = self._auto_tick_queue.qsize()
+
+        if lag_ns > AUTO_BACK_WINDOW_NS:
+            # Past the backward window the archive can no longer answer for this
+            # moment, so the cycle is dropped — out loud, never silently.
+            self._auto_dropped += 1
+            self.log(f"[AUTO] cycle {cycle} dropped — {fmt_span_ms(lag_ns / 1_000_000)} behind "
+                     f"({behind} waiting)")
+            self.after(0, lambda c=cycle: self._preview_end_cycle(c, f"cycle {c} dropped (too far behind)"))
+            return
+
+        if not p["cams"]:
+            self.after(0, lambda c=cycle: self._preview_end_cycle(c, f"cycle {c} done"))
+            return
+
+        # The first cycle simply takes the newest picture each camera has, and
+        # measures from it how far the archive's clock runs behind this computer's
+        # (this PC is seconds ahead of the facility, and CPVA publishes about a
+        # second late). Every later cycle asks for its own moment shifted by that
+        # offset — otherwise it asks the archive about a future it cannot answer
+        # for, and every camera looks half a minute "too old".
+        anchor = self._auto_offset_ns is None
+        offset = self._auto_offset_ns or 0
+        eff_target = target_ns - offset
+
+        t0 = time.perf_counter()
+        res = self._copy_cameras(
+            p["cams"], p["source"], eff_target, tick["out_dir"],
+            p["custom_name"], p["total"],
+            # On the anchor cycle the "age" is the clock offset, not something
+            # worth writing under a picture.
+            on_file=lambda pth, off, c=cycle, a=anchor: self.after(
+                0, lambda: self._preview_add_file(c, pth, None if a else off)),
+            cycle=cycle, newest=anchor,
+        )
+        self._last_out_dir = tick["out_dir"]
+        ages = [a for a in res["ages"].values() if a is not None]
+
+        if ages and (anchor or not res["copied"]):
+            # Anchor cycle, or a cycle where every camera fell outside the window
+            # while still delivering NEW frames — which can only mean the offset
+            # itself is wrong, so it is re-measured rather than left to skip
+            # everything for the rest of the run.
+            new_offset = offset + min(ages)
+            if anchor:
+                self.log(f"[AUTO] Archive clock runs {fmt_span_ms(min(ages) / 1_000_000)} "
+                         f"behind this PC — later cycles are corrected by that.")
+            else:
+                self.log(f"[AUTO] Nothing was in range — re-measuring the archive clock "
+                         f"({fmt_span_ms(offset / 1_000_000)} → "
+                         f"{fmt_span_ms(new_offset / 1_000_000)}).")
+            self._auto_offset_ns = new_offset
+
+        spread = ""
+        if ages:
+            rel = [a - min(ages) for a in ages] if anchor else ages
+            lo, hi = fmt_span_ms(min(rel) / 1_000_000), fmt_span_ms(max(rel) / 1_000_000)
+            spread = f"  spread {lo}" if lo == hi else f"  spread {lo}–{hi}"
+        line = (f"[AUTO] cycle {cycle} @ {tick['run_ts'][-8:]}  "
+                f"copied {len(res['copied'])}/{len(p['cams'])}{spread}  "
+                f"lag {fmt_span_ms(lag_ns / 1_000_000)}  took {time.perf_counter() - t0:.1f}s")
+        if behind:
+            line += f"  ({behind} cycles waiting)"
+        self.log(line)
+        if res["ages"]:
+            base = min(ages) if (anchor and ages) else 0
+            detail = "  ".join(
+                f"{cam} −{fmt_span_ms((age - base) / 1_000_000)}" if age is not None else f"{cam} −"
+                for cam, age in res["ages"].items())
+            self.log(f"       frames: {detail}")
+        for prob in res["problems"]:
+            self.log(f" [!] {prob}")
+        summary = f"cycle {cycle} — {len(res['copied'])}/{len(p['cams'])} cameras{spread}"
+        self.after(0, lambda c=cycle, s=summary: self._preview_end_cycle(c, s))
+        if behind:
+            self.after(0, lambda b=behind: self._auto_status_var.set(
+                f"cycle {self._auto_copy_count} · {b} waiting"))
 
     # ── Live mód ──────────────────────────────────────────────────
     def _toggle_live(self):
@@ -4388,6 +5010,190 @@ class App(tk.Tk):
             paths = sorted(files, key=lambda p: p.name)
             self.after(200, lambda pp=paths: PreviewWindow(self, pp))
 
+    # ── camera copying (shared by Copy and auto cycles) ───────────
+    def _resolve_cam_folders(self, target_ns: int, cams: list[str]) -> dict[str, Path]:
+        """Camera folder per camera for the moment `target_ns`, cached per hour.
+
+        The mapping only changes when the archive rolls over to a new hour
+        folder, so listing the whole hour once per cycle was pure waiting.
+        """
+        hour_dir = cpva_hour_dir_for_ns(target_ns)
+        key = (str(hour_dir), tuple(cams))
+        cached = getattr(self, "_cam_folder_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        found = find_camera_folders_bulk(today_day_root(), cams, self.log, hour_dir=hour_dir)
+        if not found:
+            # Just after the hour rolls over the new folder may not exist yet.
+            prev = cpva_hour_dir_for_ns(target_ns - 3_600_000_000_000)
+            found = find_camera_folders_bulk(today_day_root(), cams, self.log, hour_dir=prev)
+        if found:
+            self._cam_folder_cache = (key, found)
+        return found
+
+    def _copy_one_camera(self, cam: str, cam_folder: Path, target_ns: int,
+                         out_dir: Path, custom_name: str, total: int,
+                         prev_frame: Path | None, cycle: int | None,
+                         newest: bool = False) -> dict:
+        """Resolve and copy one camera's frame. Runs on a worker thread."""
+        out: dict = {"cam": cam, "dst": None, "age_ns": None,
+                     "problem": None, "src": None, "label_bump": False}
+        src, age_ns = find_frame_at_or_before(
+            cam_folder, target_ns, None,
+            _cache=self._cam_dir_cache,
+            _cache_time=self._cam_dir_cache_time,
+            _cache_ttl=self._cam_dir_cache_ttl,
+            _cache_lock=self._cam_dir_cache_lock,
+            newest=newest,
+        )
+        if src is None:
+            out["problem"] = f"{cam}: no frame at or before the requested moment."
+            return out
+        out["src"] = src
+        out["age_ns"] = age_ns
+
+        if cycle is not None and not newest and auto_should_skip(age_ns, src, prev_frame):
+            out["problem"] = (f"{cam}: skipped — newest frame is "
+                              f"{fmt_span_ms(age_ns / 1_000_000)} old.")
+            return out
+
+        try:
+            _m = TS_IN_NAME_RE.search(src.name)
+            if _m:
+                from zoneinfo import ZoneInfo
+                file_ts = datetime.fromtimestamp(
+                    int(_m.group(1)) / 1_000_000_000, tz=ZoneInfo("Europe/Prague")
+                ).strftime(TS_FMT)
+            else:
+                file_ts = datetime.fromtimestamp(safe_mtime(src)).strftime(TS_FMT)
+        except Exception:
+            file_ts = datetime.fromtimestamp(safe_mtime(src)).strftime(TS_FMT)
+
+        _lbl = self._label_settings.get(cam, {})
+        _lbl_enabled = _lbl.get("enabled", False)
+        _lbl_text = _lbl.get("text", "").strip()
+        _lbl_idx = f"{_lbl.get('index', 1):02d}" if _lbl.get("use_index", False) else ""
+        if _lbl_text and _lbl_idx:
+            _lbl_token = f"{_lbl_text}_{_lbl_idx}"
+        else:
+            _lbl_token = _lbl_text or _lbl_idx
+        _base = (f"{custom_name}{src.suffix.lower()}" if (total == 1 and custom_name)
+                 else f"{cam}__{file_ts}{src.suffix.lower()}")
+        if _lbl_enabled and _lbl_token:
+            _stem, _ext = Path(_base).stem, Path(_base).suffix
+            if _lbl.get("mode", "prefix") == "prefix":
+                _base = f"{_lbl_token}__{_stem}{_ext}"
+            else:
+                _base = f"{_stem}__{_lbl_token}{_ext}"
+
+        dst = out_dir / _base
+        try:
+            shutil.copy2(str(src), str(dst))
+        except Exception as e:
+            out["problem"] = f"{cam}: copy failed ({e})"
+            return out
+        if not dst.exists():
+            out["problem"] = f"{cam}: copy reported OK but file is missing at {dst}"
+            return out
+        out["dst"] = dst
+        out["label_bump"] = bool(_lbl_enabled)
+        return out
+
+    def _copy_cameras(self, cams: list[str], source_mode: str, target_ns: int,
+                      out_dir: Path, custom_name: str, total: int,
+                      on_file=None, cycle: int | None = None,
+                      newest: bool = False) -> dict:
+        """Copy every selected camera for one moment.
+
+        CPVA cameras are done in parallel: one share listing and one file copy
+        per camera, done one after the other, is what spread the frames of a
+        single cycle over ten seconds.
+        """
+        copied: list[Path] = []
+        problems: list[str] = []
+        ages: dict[str, int | None] = {}
+
+        if source_mode == "window":
+            for cam in cams:
+                if cycle is not None and not self._auto_copy_active:
+                    break
+                hwnd = None
+                needles = self.build_window_needles(cam)
+                for needle in needles:
+                    hwnd = find_window_by_title_substring(needle, log=self.log)
+                    if hwnd:
+                        break
+                dst = out_dir / (f"{custom_name}.png" if (total == 1 and custom_name)
+                                 else f"{datetime.fromtimestamp(target_ns / 1_000_000_000).strftime(RUN_FOLDER_FMT)}_{cam}__window.png")
+                try:
+                    if not hwnd:
+                        raise RuntimeError(f"Window not found. Tried: {needles}")
+                    take_screenshot_window_png(dst, hwnd)
+                    copied.append(dst)
+                    ages[cam] = 0
+                    if on_file:
+                        on_file(dst, None)
+                except Exception as e:
+                    problems.append(f"{cam}: window capture failed ({e})")
+            return {"copied": copied, "problems": problems, "ages": ages}
+
+        if source_mode != "cpva":
+            return {"copied": copied, "problems": [f"Unknown source mode: {source_mode}"],
+                    "ages": ages}
+
+        known = [c for c in cams if is_known_camera(c)]
+        for cam in cams:
+            if cam not in known:
+                problems.append(f"{cam}: I don't know this camera.")
+        cam_to_folder = self._resolve_cam_folders(target_ns, known) if known else {}
+
+        jobs = []
+        for cam in known:
+            folder = cam_to_folder.get(cam)
+            if not folder:
+                problems.append(f"{cam}: not found in the archive hour folder.")
+                continue
+            jobs.append((cam, folder))
+        if not jobs:
+            return {"copied": copied, "problems": problems, "ages": ages}
+
+        def _one(job):
+            cam, folder = job
+            try:
+                return self._copy_one_camera(
+                    cam, folder, target_ns, out_dir, custom_name, total,
+                    self._auto_last_frame.get(cam), cycle, newest)
+            except Exception as e:
+                return {"cam": cam, "dst": None, "age_ns": None, "src": None,
+                        "label_bump": False, "problem": f"{cam}: {e!r}"}
+
+        with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+            results = list(pool.map(_one, jobs))
+
+        # Merged back in camera order, so the file list, the problems and the
+        # label indices do not depend on which thread finished first.
+        by_cam = {r["cam"]: r for r in results}
+        for cam, _folder in jobs:
+            r = by_cam.get(cam)
+            if r is None:
+                continue
+            ages[cam] = r["age_ns"]
+            if r["src"] is not None and cycle is not None:
+                self._auto_last_frame[cam] = r["src"]
+            if r["problem"]:
+                problems.append(r["problem"])
+            if r["dst"] is not None:
+                copied.append(r["dst"])
+                if r["label_bump"]:
+                    self.after(0, lambda c=cam: self._bump_label_index(c))
+                if on_file:
+                    on_file(r["dst"], r["age_ns"])
+        return {"copied": copied, "problems": problems, "ages": ages}
+
+    def _bump_label_index(self, cam: str):
+        lbl = self._label_settings.setdefault(cam, {})
+        lbl["index"] = lbl.get("index", 1) + 1
+
     def on_copy(self):
         monitors_local = self._selected_monitors()
         all_screens_local = bool(self.all_screens_var.get())
@@ -4399,7 +5205,8 @@ class App(tk.Tk):
         self._run_copy_worker(monitors_local, all_screens_local, cams_local, source_mode)
 
     def _run_copy_worker(self, monitors_local, all_screens_local, cams_local, source_mode,
-                         _auto_callback=None, _cycle_number: int | None = None):
+                         _auto_callback=None):
+        """The manual Copy button: one set of pictures for the moment of the click."""
         if getattr(self, "_busy", False):
             self.log("[UI] Ignored: busy=True")
             return
@@ -4411,216 +5218,82 @@ class App(tk.Tk):
 
         def worker():
             t_click_ns = time.time_ns()
-            self.log(f"[CLICK] t_click_ns={t_click_ns}")
             try:
                 self.log("=== COPY START ===")
                 self.log(f"Source mode: {source_mode}")
                 self.log(f"Station: {self._station_id}")
-                self.log(f"Active presets: {sorted(self._active_presets)}")
                 self.log(f"Selected monitors: {'ALL' if monitors_local is None else [m+1 for m in monitors_local]}")
                 self.log(f"Selected cameras: {cams_local}")
                 self.log(f"Destination: {dest_local}")
 
-                run_ts = datetime.now().strftime(RUN_FOLDER_FMT)
+                run_ts = datetime.fromtimestamp(t_click_ns / 1_000_000_000).strftime(RUN_FOLDER_FMT)
                 total = self._planned_output_count(monitors_local, cams_local)
                 custom_name = self.sanitize_folder_name(self.run_name_var.get())
                 out_dir = self._ensure_output_path(dest_local, run_ts, total)
+                self.after(0, lambda: self._progress_show(total))
 
-                # Show progress bar — při auto cyklech maximum roste dynamicky
-                is_auto_cycle = _cycle_number is not None
-                if is_auto_cycle:
-                    self._auto_total_steps += total
-                    _auto_max = self._auto_total_steps
-                    _is_first_cycle = (_cycle_number == 1)
-                    self.after(0, lambda m=_auto_max, first=_is_first_cycle: self._progress_show(m, keep_value=not first))
-                    # Offset: kolik kroků bylo hotovo v předchozích cyklech
-                    _prev_done = self._auto_total_steps - total
-                else:
-                    self.after(0, lambda: self._progress_show(total))
-                    _prev_done = 0
-                done_steps = 0
-                copied = 0
                 copied_files: list[Path] = []
                 problems: list[str] = []
+                done = [0]
 
-                with timed(self.log, "screenshots"):
-                    if monitors_local is None and all_screens_local:
-                        fname = f"{custom_name}.png" if (total == 1 and custom_name) else f"{run_ts}_all.png"
-                        out = out_dir / fname
-                        self.log(f"[SHOT] saving {out.name}")
-                        take_screenshot_monitor_png(out, None)
-                        copied_files.append(out)
-                        done_steps += 1
-                        self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total: self._progress_update(pd + d, t, "Screenshot (all)"))
-                    elif monitors_local is not None:
-                        for mi in monitors_local:
-                            fname = f"{custom_name}.png" if (total == 1 and custom_name) else f"{run_ts}_monitor{mi+1}.png"
-                            out = out_dir / fname
-                            self.log(f"[SHOT] saving {out.name}")
-                            take_screenshot_monitor_png(out, mi)
+                def _step(label: str):
+                    done[0] += 1
+                    self.after(0, lambda d=done[0], t=total, l=label: self._progress_update(d, t, l))
+
+                # One desktop grab for every selected monitor.
+                targets: list[tuple[Path, int | None]] = []
+                if monitors_local is None and all_screens_local:
+                    fname = f"{custom_name}.png" if (total == 1 and custom_name) else f"{run_ts}_all.png"
+                    targets.append((out_dir / fname, None))
+                elif monitors_local is not None:
+                    for mi in monitors_local:
+                        fname = (f"{custom_name}.png" if (total == 1 and custom_name)
+                                 else f"{run_ts}_monitor{mi+1}.png")
+                        targets.append((out_dir / fname, mi))
+                if targets:
+                    with timed(self.log, "screenshots"):
+                        for out in take_screenshots_monitors_png(targets):
+                            self.log(f"[SHOT] saved {out.name}")
                             copied_files.append(out)
-                            done_steps += 1
-                            self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, m=mi: self._progress_update(pd + d, t, f"Monitor {m+1}"))
+                            _step(out.name)
 
                 if cams_local:
-                    if source_mode == "cpva":
-                        with timed(self.log, "resolve CPVA day_root"):
-                            day_root = today_day_root()
-                            self.log(f"[CPVA] day_root = {day_root}")
+                    with timed(self.log, "cameras"):
+                        res = self._copy_cameras(
+                            cams_local, source_mode, t_click_ns, out_dir,
+                            custom_name, total,
+                            on_file=lambda pth, off: _step(pth.name),
+                            newest=True,   # Copy means "what the cameras have now"
+                        )
+                    copied_files.extend(res["copied"])
+                    problems.extend(res["problems"])
+                    ages = [a for a in res["ages"].values() if a is not None]
+                    if ages:
+                        # The absolute figure is mostly the archive clock running
+                        # behind this PC; what matters is how close together the
+                        # pictures are.
+                        rel = max(ages) - min(ages)
+                        self.log(f"[COPY] newest frames within {fmt_span_ms(rel / 1_000_000)} "
+                                 f"of each other (archive clock is "
+                                 f"{fmt_span_ms(min(ages) / 1_000_000)} behind this PC)")
 
-                        with timed(self.log, "find camera folders (bulk)"):
-                            cam_to_folder = find_camera_folders_bulk(day_root, cams_local, self.log)
-
-                        for cam in cams_local:
-                            self.log(f"\n[CAM] '{cam}' (CPVA match='{cpva_label(cam)}')")
-                            if not self._auto_copy_active and _cycle_number is not None:
-                                self.log("[AUTO] Stop requested — aborting current cycle.")
-                                break
-
-                            if not is_known_camera(cam):
-                                problems.append(f"{cam}: I don't know this camera.")
-                                self.log("[CAM] UNKNOWN CAMERA")
-                                done_steps += 1
-                                self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
-                                continue
-
-                            cam_folder = cam_to_folder.get(cam)
-                            if not cam_folder:
-                                problems.append(f"{cam}: Not found in latest hour folder.")
-                                self.log("[CAM] NOT FOUND (latest hour)")
-                                done_steps += 1
-                                self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
-                                continue
-
-                            self.log(f"[CAM] folder = {cam_folder}")
-                            with timed(self.log, f"find image near click ({cam})"):
-                                latest = find_image_near_click_fast(
-                                    cam_folder, t_click_ns, self.log,
-                                    _cache=self._cam_dir_cache,
-                                    _cache_time=self._cam_dir_cache_time,
-                                    _cache_ttl=self._cam_dir_cache_ttl,
-                                )
-
-                            if not latest:
-                                problems.append(f"{cam}: No timestamped images yet: {cam_folder.name}")
-                                self.log("[CAM] NO TIMESTAMPED IMAGES")
-                                done_steps += 1
-                                self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
-                                continue
-
-                            with timed(self.log, f"copy2 ({cam})"):
-                                try:
-                                    _m = TS_IN_NAME_RE.search(latest.name)
-                                    if _m:
-                                        _ns = int(_m.group(1))
-                                        from zoneinfo import ZoneInfo
-                                        _PRAGUE = ZoneInfo("Europe/Prague")
-                                        file_ts = datetime.fromtimestamp(_ns / 1_000_000_000, tz=_PRAGUE).strftime(TS_FMT)
-                                    else:
-                                        file_ts = datetime.fromtimestamp(safe_mtime(latest)).strftime(TS_FMT)
-                                except Exception:
-                                    file_ts = datetime.fromtimestamp(safe_mtime(latest)).strftime(TS_FMT)
-                                _lbl = self._label_settings.get(cam, {})
-                                _lbl_enabled = _lbl.get("enabled", False)
-                                _lbl_text = _lbl.get("text", "").strip()
-                                _use_index = _lbl.get("use_index", False)
-                                _lbl_idx = f"{_lbl.get('index', 1):02d}" if _use_index else ""
-                                if _lbl_text and _lbl_idx:
-                                    _lbl_token = f"{_lbl_text}_{_lbl_idx}"
-                                elif _lbl_text:
-                                    _lbl_token = _lbl_text
-                                elif _lbl_idx:
-                                    _lbl_token = _lbl_idx
-                                else:
-                                    _lbl_token = ""
-                                _base = f"{custom_name}{latest.suffix.lower()}" if (total == 1 and custom_name) else f"{cam}__{file_ts}{latest.suffix.lower()}"
-                                if _lbl_enabled and _lbl_token:
-                                    _stem = Path(_base).stem
-                                    _ext = Path(_base).suffix
-                                    if _lbl.get("mode", "prefix") == "prefix":
-                                        _base = f"{_lbl_token}__{_stem}{_ext}"
-                                    else:
-                                        _base = f"{_stem}__{_lbl_token}{_ext}"
-                                dst = out_dir / _base
-                                self.log(f"[COPY] {latest} -> {dst}")
-                                shutil.copy2(str(latest), str(dst))
-                                if not dst.exists():
-                                    problems.append(f"{cam}: copy reported OK but file is missing at {dst}")
-                                    self.log(f"[COPY] WARNING: file not present after copy: {dst}")
-                                    done_steps += 1
-                                    self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
-                                    continue
-                                copied_files.append(dst)
-                                copied += 1
-                                if _lbl_enabled:
-                                    self._label_settings.setdefault(cam, {})["index"] = _lbl.get("index", 1) + 1
-
-                            done_steps += 1
-                            self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
-
-                    elif source_mode == "window":
-                        for cam in cams_local:
-                            self.log(f"\n[WIN] '{cam}'")
-                            if not self._auto_copy_active and _cycle_number is not None:
-                                self.log("[AUTO] Stop requested — aborting current cycle.")
-                                break
-                            hwnd = None
-                            needles = self.build_window_needles(cam)
-                            for needle in needles:
-                                hwnd = find_window_by_title_substring(needle, log=self.log)
-                                if hwnd:
-                                    self.log(f"[WIN] matched by: '{needle}'")
-                                    break
-                            try:
-                                with timed(self.log, f"window screenshot ({cam})"):
-                                    dst = out_dir / (f"{custom_name}.png" if (total == 1 and custom_name) else f"{run_ts}_{cam}__window.png")
-                                    if not hwnd:
-                                        raise RuntimeError(f"Window not found. Tried: {needles}")
-                                    self.log(f"[WINSHOT] hwnd={hwnd} -> {dst.name}")
-                                    take_screenshot_window_png(dst, hwnd)
-                                    copied_files.append(dst)
-                                    copied += 1
-                            except Exception as e:
-                                problems.append(f"{cam}: window capture failed ({e})")
-                                self.log(f"[WIN] ERROR: {e}")
-
-                            done_steps += 1
-                            self.after(0, lambda d=done_steps, pd=_prev_done, t=_auto_max if is_auto_cycle else total, c=cam: self._progress_update(pd + d, t, c))
-                    else:
-                        problems.append(f"Unknown source mode: {source_mode}")
-
-                self.log(f"\n=== COPY END | Camera Outputs = {copied} | Problems = {len(problems)} ===")
-                self.log(f"=== OUTPUT FOLDER: {out_dir} ===")
+                self.log(f"=== COPY END | Outputs = {len(copied_files)} | Problems = {len(problems)} ===")
                 self._last_out_dir = out_dir
-                if problems:
-                    self.log("=== COPY FINISHED WITH PROBLEMS ===")
-                    for p in problems:
-                        self.log(f" [!] {p}")
-                else:
-                    self.log(f"=== DONE - {out_dir} ===")
-                # Otevři preview pokud byly zkopírovány soubory
-                if copied > 0:
-                    is_auto = _cycle_number is not None
-                    if is_auto:
-                        self.log(f"[AUTO] Cycle {_cycle_number} done — {out_dir}")
-                        cycle_entry = {
-                            "cycle": _cycle_number,
-                            "ts": datetime.now().strftime("%H:%M:%S"),
-                            "files": list(copied_files),
-                        }
-                        self._auto_cycle_history.append(cycle_entry)
-                        self.after(0, lambda ce=cycle_entry: self._open_auto_preview(ce))
-                    else:
-                        def _open_preview(od=out_dir,
-                                          mon=monitors_local,
-                                          all_s=all_screens_local,
-                                          cams=cams_local,
-                                          src=source_mode,
-                                          ff=list(copied_files)):
-                            if not self._preview_enabled.get():
-                                return
-                            self._open_preview_with_callbacks(od, mon, all_s, cams, src, ff)
-                        self.after(0, _open_preview)
+                for p in problems:
+                    self.log(f" [!] {p}")
+                self.log(f"=== DONE - {out_dir} ===")
+
+                if copied_files:
+                    def _open_preview(od=out_dir,
+                                      mon=monitors_local,
+                                      all_s=all_screens_local,
+                                      cams=cams_local,
+                                      src=source_mode,
+                                      ff=list(copied_files)):
+                        if not self._preview_enabled.get():
+                            return
+                        self._open_preview_with_callbacks(od, mon, all_s, cams, src, ff)
+                    self.after(0, _open_preview)
             except Exception as e:
                 _err = repr(e)
                 self.log(f"[FATAL] {_err}")

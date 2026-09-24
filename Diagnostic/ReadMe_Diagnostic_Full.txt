@@ -54,7 +54,7 @@ Two consequences worth knowing:
 |------|-----------|
 | `main.py` | Entry point and window. Builds the tabs, shows a splash, and records that it is running (`run_status.json` in `%APPDATA%\Diagnostic`, plus the legacy `diagnostic.lock`) so `remote_launcher.py` can tell whether the app is already up. pandas and matplotlib are imported **lazily** (`operation_history_logic` inside `HistoryTab._run`, `monitor_tab` inside `main()` after the splash) — on a cold file cache those imports cost tens of seconds, and this way the splash paints first. |
 | `monitor_tab.py` | The whole PV Monitor tab: PV table, live graph, threshold/condition editing, Settings, share publishing, alert dispatch, Webex commands. By far the largest module (~6.4 k lines) |
-| `alerting.py` | The alert state machine and the notification channels — Teams (`build_messagecard`), SMTP email, and `WebexNotifier` (send + two-way command listening). Also the Qt-free sample-series checks: `classify_trend` (reminder pacing) and `detect_frozen` ("not updating"), and the run-status file (`run_status_path` / `read_run_status` / `write_run_status`) that lets `remote_launcher.py` see from outside whether the app is up and tracking |
+| `alerting.py` | The alert state machine and the notification channels — Teams (`build_messagecard`), SMTP email, and `WebexNotifier` (send + two-way command listening). Also the Qt-free sample-series check `classify_trend` (reminder pacing), and the run-status file (`run_status_path` / `read_run_status` / `write_run_status`) that lets `remote_launcher.py` see from outside whether the app is up and tracking |
 | `cpva_api.py` | Thin CPVA REST client + `get_app_dir()` used to resolve every path |
 | `shared_pvs.py` | PV list + shared settings on the scratch share (see below) |
 | `secrets_util.py` | Windows DPAPI encrypt/decrypt for stored credentials; `resolve_secret()` also understands `${ENV:NAME}` |
@@ -63,8 +63,8 @@ Two consequences worth knowing:
 | `memstats.py` | Reads the Windows memory figures with `ctypes` (no extra package): this program's committed memory and working set, and the whole PC's commit charge against its limit. Feeds the status bar, the half-hourly log line and the listener's console — see "Memory on a long uptime" |
 | `remote_launcher.py` | Standalone Webex listener that starts the app on `/run` (see below). Built as its own program — `dist\Diagnostic Webex listener\` |
 | `operation_history_logic.py` | Long-term drift per waveplate, behind the History tab (see the note above about its missing input file) |
-| `test_alerting.py` | Offline tests for the alerting layer, including the frozen-value detector (`python test_alerting.py`) |
-| `test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict, its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python test_monitor_frozen.py`) |
+| `test_alerting.py` | Offline tests for the alerting layer (`python test_alerting.py`) |
+| `test_monitor_frozen.py` | Offline tests for the two "this is not live" checks as the PV Monitor uses them: the "not updating" verdict (a new reading arriving is the whole question — a steady number is asserted NOT to be a fault, so the chiller false alarms cannot come back), its one-shot notification and table rendering, plus the refresh watchdog — when a stall is announced, and how `/status`, `/alarms`, the State column and a plotted chart say so instead of reporting "ok" (`python test_monitor_frozen.py`) |
 | `test_rule_change_grace.py` | Offline tests for the hold that follows a change of the limits in force: when it opens, what it does to a half-built alert state, what the table and the bot say while it runs, and a regression test reproducing the end-of-shift chiller messages with the hold switched off (`python -m pytest test_rule_change_grace.py`) |
 | `test_bot_commands.py` | Offline tests for the chat command grammar (`python test_bot_commands.py`) |
 | `edge_cdp.py` | The **Sign in with Edge** button: opens a browser window of its own on the canteen page, waits for the sign-in, and reads it out of that window. No extra library — it carries a small websocket client of its own |
@@ -88,14 +88,15 @@ CPVA archive (REST, https://10.78.0.57:8443)
   │  cpva_api.cpva_fetch_samples()
   ▼
 monitor_tab._PollWorker          every poll_interval_s, poll_max_workers at a time
-  │      _BackfillWorker         fills the graph history at launch
+  │      _BackfillWorker         fills the graph history from the archive
   │      _LearnWorker            derives thresholds from N days of archive
   ▼
-PVRuntime.samples (in memory)  ──►  PVTableModel (table)  ──►  GraphPanel (plot)
+PVRuntime.history (in memory)  ──►  PVTableModel (table)  ──►  GraphPanel (plot)
+   every archived reading, not one per poll
   │
   ├─ _check_limits_change        holds alerting after the rule in force changes
   ├─ alerting.AlertEvaluator     thresholds + debounce/settle + re-notify
-  ├─ alerting.detect_frozen      "not updating"  (this PV's reading is dead)
+  ├─ _update_frozen              "not updating"  (no newer reading for this PV)
   ├─ _check_refresh_health       "not refreshed" (this program stopped reading;
   │                              marks the screen and the replies at once, tells
   │                              the chat only if the stall lasts)
@@ -170,6 +171,12 @@ Live monitoring and alerting — in practice the whole program.
   pass overrun the interval, which skips ticks and makes the table lag.
   `_BackfillWorker` fills the graph history, `_LearnWorker` + `compute_baseline`
   derive thresholds from `learn_days_default` days of archive.
+- **The graph draws every archived reading**, not the one averaged number the
+  thresholds use. A chiller that drops to 10 °C for a single reading used to be
+  drawn at 19.2 °C, because that is the mean of 23 twenties and two tens — see
+  "Every reading, not one per poll" in STRUCTURE.md. Alerting is unchanged: the
+  same average, the same settle and cooldown windows, so a sub-second dip shows
+  on the graph and still sends no message.
 - **Alerting** — raw thresholds plus `debounce_count` / `settle_minutes` (no
   hysteresis), `renotify_cooldown_minutes` reminders that speed up or slow down
   with the recent trend (`trend_*` keys), recovery notices, and a data watchdog
@@ -179,8 +186,9 @@ Live monitoring and alerting — in practice the whole program.
   its dependency PVs move, and the measured value cannot follow that fast, so
   alerting for that PV is held for `rule_change_grace_minutes` after every such
   change (`_check_limits_change`, `PVRuntime.grace_until_ns`). See below.
-- **"Not updating" check** — a per-PV freshness check for data that arrives but
-  is no longer live (`frozen_*` keys, `alerting.detect_frozen`). See below.
+- **"Not updating" check** — a per-PV freshness check: the archiver answers, but
+  its newest sample for that PV has stopped advancing (`frozen_*` keys,
+  `_update_frozen`). See below.
 - **Refresh watchdog** — the program's own pulse: if no pass has landed for
   `refresh_alarm_minutes` (Settings, default 3.5 min), everything on screen and
   every chat answer is marked `not refreshed`; a stall lasting past
@@ -338,8 +346,13 @@ Two separators, and only these two are structural (a PV name may contain spaces)
 - `;` separates **options** that configure the command:
   `/plot Chiller 1, Chiller 2, Chiller 3; 7-18; y 15-35`
 
-PV names are matched loosely — any unique part of the display name or the PV name,
-case-insensitive. An ambiguous or unknown name is reported and nothing is sent.
+PV names are matched loosely — any part of the display name or the PV name,
+case-insensitive, and several words all have to appear somewhere in the name
+(`plfe vrt`), in any order. A fragment that fits several PVs takes them all, so
+`/list plfe`, `/status plfe` and `/alarms plfe` answer about the whole PLFE
+group; the reply says how many of the configured PVs that is. Only `/graph`
+still needs a single PV, and it lists the candidates when it gets a group. A
+name that fits nothing is reported and nothing is sent.
 
 Time windows (Europe/Prague, may be given in any option position):
 
@@ -373,15 +386,18 @@ The commands themselves:
 
 | Command | What it does |
 |---|---|
-| `/help`, `/?` | this cheat sheet (a bare `help` with no slash works too) |
+| `/help`, `/?` | this cheat sheet (a bare `help` with no slash works too). One line per command — what it takes and the one condition that catches people out — because it is read on a phone standing at the machine. Everything longer than that lives on the `/help <command>` pages, including the whole of lunch ordering (`/help food`) |
+| `/help <command>` | the long version of one command: its syntax, worked examples and **what to watch out for** — the part a list of options cannot carry. `/help plot` is the one worth reading (why the band looks like a thick line, when `SAMPLED` appears, why `; 300` is 300 hours and `; 300dpi` is a resolution). Pages exist for `status`, `alarms`, `list`, `plot`, `time`, `change`, `undo`, `graph`, `stop`, `enable`, `cancel`, `window`, `yaxis`, `datawatchdog`, `run`, `food` and `mention`; the words people reach for are aliased onto them (`/help dpi`, `/help alerts`, `/help abort`, and `plot help` with no slash). An unknown topic is answered with the list instead of the cheat sheet |
 | `/status [pv, pv]` | value + state for all PVs, or only the named ones. Always ends with when those values were read; if the program has stopped reading, a warning goes above the list and each line reads `not refreshed` in place of `ok`. The whole-list reply also carries the uptime and memory footer, and — only when the canteen sign-in has actually been refused — one quiet line about that |
-| `/alarms` | only PVs currently in warning/alarm. Refuses to answer "all clear" while the values are out of date |
-| `/list` | the configured PVs |
-| `/plot <pv, pv, …>[; window][; y lo-hi][; detail]` | **one** graph with a curve per PV. `/plot all` takes every PV. A single PV also gets its warning/alarm lines — an overlay does not, since the lines would belong to no visible curve. Without a window option the **Alert plot window** from Settings is used. Over a long window see "A plot over weeks or months" below |
+| `/alarms [pv, pv]` | only PVs currently in warning/alarm. With a part of a name, only that group (`/alarms chiller`); if alerting is off for every PV in the group it says that instead of "all clear". Refuses to answer "all clear" while the values are out of date |
+| `/list [pv, pv]` | the configured PVs. With a part of a name, only the matching ones — `/list plfe` answers with the four PLFE pressures and says "4 of 31" so the reply cannot be mistaken for the whole list |
+| `/plot <pv, pv, …>[; window][; y lo-hi][; detail][; 300dpi]` | **one** graph with a curve per PV. `/plot all` takes every PV. A single PV also gets its warning/alarm lines — an overlay does not, since the lines would belong to no visible curve. Without a window option the **Alert plot window** from Settings is used. `; 300dpi` (also `; dpi 300`, 50–1200) draws that one picture at another resolution instead of the **Picture resolution** from Settings, and the reply says which was used. Over a long window see "A plot over weeks or months" below |
 | `/cancel`, `/abort` | take back a plot that is still being fetched. A year-long window is hundreds of requests to the archiver and minutes of waiting; this stops the requests that have not gone out yet and sends nothing, so the right window can be asked for straight away. Requests already in flight still have to come back, so the reply is not instant. "Nothing is running" means there was nothing to take back |
 | `/start` | alerting on (PVs are read and plotted either way) |
 | `/stop [hours]` | alerting off; with hours, auto-resume later. This is about **alerting**, not about a running plot — that one is `/cancel`. If a plot is still being fetched, the reply says so and offers `/cancel` |
 | `/enable <pv, pv>` / `/disable <pv, pv>` | alerting per PV |
+| `/change <pv>` | move a warning or alarm limit without walking to the PC. `/change DA1` prints that PV's limits with a number against each one — the Global four, then four per conditional rule, with the rule in force marked and the current value above them — and the answer is `6 15`. `limit 6 hodnota 15`, `6 = 15`, `6 15, 7 17`, `warn high 25` and `3,3 Hz warn high 14.6` all work, and `6 none` clears a bound. **In a room the answer has to tag the bot too** (`@Diagnostics 6 15`), because Webex delivers nothing else; `/change 6 15` is the form that always gets through, and the whole thing fits on one line as `/change DA1 warn high 25`. One PV at a time: a fragment fitting several is answered with the candidates. Unlike the window's own editor it checks the order — alarm low, warn low, warn high, alarm high, lowest to highest — and refuses a value that would cross another, writing nothing. It takes effect at the next reading and then holds alerting for that PV for the usual rule-change wait. Saved and published like any other change; the question is forgotten after 15 min or on `/cancel`. Only while the app is open |
+| `/undo` | put the last `/change` back. One step, in memory only, gone when the program restarts |
 | `/datawatchdog on\|off` | the "no data at all" alert; no argument shows the state |
 | `/graph <pv\|all>` | what the app window itself shows (one PV or all) |
 | `/window <minutes>` | time window of that live graph |
@@ -415,6 +431,43 @@ wide, but it is drawn at full height, so it is still visible. An average alone
 would have hidden it completely. With more than three curves on one picture the
 bands are left out — they would overlap into mud — and the caption says so.
 
+**Do not expect to SEE the band as shading.** Measured on the Helium Chiller over
+90 days (16.9.2026): 7.28 million readings condensed into 762 points, 9 760
+readings behind each, and the band is **0.40 °C tall at the median — 1 % of the
+picture's height**, because a chiller moves very little in the 2.4 hours one
+point covers. It is doing its job exactly where it matters: the vertical spikes
+to 0, 30 and 58 °C on that picture are band edges, not the average line, and they
+are the one-off excursions the whole feature exists for. So a long plot that
+looks like a single line is not "still in detail" — it is condensed, and the
+proof is in the subtitle (`line = average, band = lowest…highest`), which only
+appears on a condensed picture.
+
+**How the picture is drawn.** 8 × 4 inches at **Picture resolution** (Settings →
+Notification channels, 600 dpi by default) — 4800 × 2400 px, about 300 kB and a
+quarter of a second to draw (110 dpi and 880 × 440 until 16.9.2026, which broke
+up as soon as anybody zoomed in on a phone). One picture can be asked for
+differently: `/plot Chiller 1; 12h; 300dpi`, anything from 50 to 1200 dpi, and
+the reply repeats which resolution it used. Nothing but the pixel count changes
+with the dpi: every size in the picture is in points, so the text and the lines
+keep the same proportions. Measured (`testing/bench_chart_dpi.py`):
+
+    dpi    pixels        PNG      drawing   scratch bitmap
+    110     880 x 440     44 kB    0.06 s      1 MB
+    220    1760 x 880     95 kB    0.08 s      6 MB
+    600    4800 x 2400   299 kB    0.25 s     44 MB
+    900    7200 x 3600   476 kB    0.48 s     99 MB
+   1200    9600 x 4800   720 kB    0.83 s    176 MB
+
+The last column is **not** the file: it is the bitmap matplotlib paints into
+before compressing it to PNG, freed as soon as the picture is made. 1200 dpi is
+there for printing rather than for reading in a chat.
+
+The date and time along the bottom are **horizontal**, date over time, at
+most eight of them; they used to be tilted 30° because that is what matplotlib
+does by itself with labels that do not fit. `testing/shot_chart_axis.py` draws
+the axis at 2 h, 12 h, 3 d, 30 d and 90 d without touching the archiver, so a
+change to it can be looked at.
+
 **How long it takes.** The program first measures how densely each PV is written
 and then asks the archiver for as much at a time as it will answer without
 choking. A chiller over 180 days costs 360 requests instead of 4320, and two of
@@ -443,10 +496,18 @@ tight anyway, it stops, draws what it managed to read and stamps the picture
 `STOPPED EARLY - not enough memory to read it all`, with the reason in the
 reply. A partial graph that says so is always better than a frozen PC.
 
-**When it samples.** If reading every stretch of a very long window would take
-too many requests, the program reads an evenly spread part of it instead — say
-one hour out of every four, across the whole window — and then the picture is
-stamped `SAMPLED - 24 % of the window read` and the message says the same. The
+**When it samples** — later than the wording above suggests. The budget is 600
+requests, and the request size follows the measured write rate, so sampling only
+starts past that. Measured 16.9.2026: one chiller over 90 days is a 12-hour
+request, 180 requests, and **everything is read (100 %, no stamp)**; four
+chillers over 90 days needs 720 and is sampled to 83 %; one pressure over a year
+needs 1095 and is sampled to 55 %. In other words a single PV over three months
+is never sampled — to see the stamp, ask for several PVs or a whole year.
+
+If reading every stretch would take too many requests, the program reads an
+evenly spread part instead — say one hour out of every four, across the whole
+window — and then the picture is stamped `SAMPLED - 24 % of the window read` and
+the message says the same. The
 shape and every peak *inside* a read stretch are real; a spike falling *between*
 two read stretches would not show. Add `; detail` to read all of it however long
 it takes.
@@ -616,6 +677,27 @@ closed and the sign-in starts again on its own — the everyday Edge is still no
 touched, because only this program's own profile is ever closed. The two other
 endings say plainly which they are: **the window was closed before the sign-in
 finished**, or it ran out of time on a named page.
+
+**The window keeps the sign-in from last time, and that is checked before it is
+used.** The sign-in window has a browser profile of its own, so the company
+sign-on from the day before is still in it every morning. It is worth a great
+deal when it still works — that is what makes the button finish in seconds with
+nothing to click — and worth nothing at all once the portal has forgotten it. So
+OKbase is asked about it, and the window stays open until there is an answer:
+while it is being asked, the note under the buttons says *"checking the saved
+sign-in with OKbase"*. If the portal disowns it, the old sign-in is thrown out
+(only OKbase's cookies — the Microsoft ones are kept, which is what makes the
+new sign-in silent) and a fresh one is started in the same window. If OKbase
+cannot be reached at all, the old sign-in is kept and used: a portal having a bad
+minute is not a reason to make anybody sign in again.
+
+Until 2026-09-16 that check was made from inside the window one second after
+opening it — before its page had loaded, when the browser will not let the
+question be asked at all. "Cannot ask" was read as "it still works", so the
+button put up a window with nothing in it, closed it again in a blink, and left
+*"Could not read the menu: the saved OKbase session has expired — sign in
+again"* behind it, every single press. If a window ever flashes past like that
+again, this is the place to look.
 
 **Paste sign-in from clipboard** is the fallback, for a PC where the first cannot
 be used. In the browser: F12 → Network → open Stravování → Objednávka jídel →
@@ -976,65 +1058,56 @@ because that one is the missing `PumpON` dependency and not this.
 ### "Not updating" — a PV that answers but is not live
 
 The data watchdog only fires when *every* PV goes silent. A single PV can fail in
-a much quieter way: the archiver keeps answering, with fresh timestamps and a
-plausible number, but the number never moves — a dead sensor, a stuck IOC, a
-control system republishing its last value. Nothing else in the monitor notices:
-the value sits inside its limits and looks like a beautifully steady reading, or
-sits outside them and alarms every 30 minutes on data that is days old.
+a much quieter way: the archiver keeps answering, but it has no newer reading to
+give, so the number on screen is minutes or hours old. Nothing else in the
+monitor notices: it sits inside its limits and looks like a beautifully steady
+reading, or sits outside them and alarms every 30 minutes on data that is days
+old.
 
-Each poll therefore also asks "is this reading still alive?", in two ways:
+Each poll therefore also asks one question: **is a new reading arriving?** The
+answer is the timestamp of the newest archived sample. Older than the limit
+(derived from the poll pacing — two sample windows or three poll intervals,
+whichever is longer, never under 5 minutes — so it needs no setting of its own)
+and the PV counts as not updating.
 
-- **The value never changes.** `alerting.detect_frozen()` takes the newest
-  reading, walks back through the PV's kept history while the value is still
-  *exactly* the same, and measures how long that run has lasted. The comparison
-  is near-exact on purpose: a working sensor's noise always moves the last digit,
-  only a stuck one repeats it. Longer than **`frozen_after_minutes`** (120 by
-  default) counts as not updating. An unchanged run must also be carried by at
-  least `frozen_min_points` (5) samples, so two readings hours apart are never
-  mistaken for a stuck sensor.
-- **The newest archived sample stops advancing.** The archiver answers, but with
-  data from minutes or hours ago. The limit is derived from the poll pacing (two
-  sample windows or three poll intervals, whichever is longer, never under
-  5 minutes), so it needs no setting of its own.
-
-The history behind the first check is the same one the graph uses, which
-`_BackfillWorker` pre-fills from the archive at launch. That pre-fill covers the
-visible graph window first (`graph_window_minutes`, 1 h by default), so the graph
-appears within a couple of seconds; a follow-up pass right after it tops the
-history up to `frozen_after_minutes` (2 h) so this check is armed. A freeze that
-started over the weekend is therefore still visible within a poll or two of
-opening the app — it does not take 2 hours of runtime to notice. Anything older
-than that is fetched only on request: widen **Graph window** in Settings, or
-right-click the graph and pick **Load older data from archive** (which loads the
-full `history_minutes` span). The archiver serves at most one hour per request,
-so the old behaviour of pre-filling 12 h meant ~370 requests and tens of seconds
-of empty graph on every launch.
+**A value that simply does not change is not a fault.** There used to be a
+second half to this check: a PV serving *exactly* the same number for longer
+than `frozen_after_minutes` (2 h) was taken for a dead sensor, on the reasoning
+that a working sensor's noise always moves the last digit. Measured on the DA1
+chiller (`L3-UTIL-CHL03-001:Temp`, 13 Sep 2026) that reasoning is simply wrong:
+a sample arrives every ~0.7 s, the sensor reports whole tenths of a degree, and
+the chiller is regulated well enough to stay on one tenth for 40–125 minutes at
+a time. The result was `[WARNING] DA1 Chiller — PV NOT UPDATING, value unchanged
+for 2 h 0 min` on a perfectly healthy chiller, followed by an `[OK] Recovered`
+once it drifted a tenth, several times a night. That half was removed on
+16 Sep 2026 together with its setting, its extra history pre-fill and
+`alerting.detect_frozen()`. While readings keep arriving, the PV is live —
+however steady the number is.
 
 What it looks like:
 
 - **State** cell reads `not updating` on its own dark-teal background — it
-  outranks ok/warn/alarm, because a limit verdict on a dead reading means
-  nothing. It is shown for PVs with **On** unchecked too, since a stuck sensor is
-  worth seeing whether or not that PV may raise alerts.
+  outranks ok/warn/alarm, because a limit verdict on an old reading means
+  nothing. It is shown for PVs with **On** unchecked too, since a PV that has
+  stopped being archived is worth seeing whether or not it may raise alerts.
 - **Value** and **Updated** turn italic: still the last known reading, no longer
-  a live one. Their tooltips say since when, and whether the freeze may be older
-  than the data kept here.
+  a live one. Their tooltips say how old it is.
 - The status bar gains `⚠ N not updating`.
-- `/status` and `/alarms` list it with the reason; a frozen PV is reported in
-  `/alarms` as the data fault it is, not as whatever its dead reading scores
+- `/status` and `/alarms` list it with the reason; such a PV is reported in
+  `/alarms` as the data fault it is, not as whatever its old reading scores
   against the limits.
 - With **`frozen_alert_enabled`** on, one notification goes out when a PV stops
-  updating and one when it starts changing again — never repeated, because this
-  is a data fault, not a value excursion. Losing the data entirely does *not*
-  count as recovery (that is the ordinary no-data state).
-- A threshold alert raised on a frozen PV carries `⚠ but this PV is NOT UPDATING
+  updating and one when readings start arriving again — never repeated, because
+  this is a data fault, not a value excursion. Losing the data entirely does
+  *not* count as recovery (that is the ordinary no-data state).
+- A threshold alert raised on such a PV carries `⚠ but this PV is NOT UPDATING
   (…)` in its reason, so a Warning/Alarm message can no longer read as a fresh
   measurement.
 
-Values that genuinely hold still for hours — switch positions, setpoints, enable
-flags — would be flagged for ever, so **Edit PV** has *"Report this PV as not
-updating when its value never changes"* to opt out per PV (`frozen_check`), and
-Settings has the global switch, the time limit and the alert switch.
+A PV that is archived only now and then on purpose would be flagged for ever, so
+**Edit PV** has *"Report this PV as not updating when no new readings arrive"* to
+opt out per PV (`frozen_check`), and Settings has the global switch
+(*"Flag PVs whose readings stop arriving"*) and the alert switch.
 
 ### "Not refreshed" — the program itself stopped reading
 
@@ -1160,7 +1233,7 @@ Nothing has to be configured twice. Where each piece of configuration lives:
 | Configuration | Lives in | Notes |
 |---|---|---|
 | PV list, thresholds, conditional rules, valid ranges, groups | scratch share, `Diagnostic\monitor_pvs_shared.json` | published on every change (2 s debounce), last writer wins, `.bak.json` keeps the loser |
-| Poll pacing, debounce/settle, re-notify + trend behaviour, learn defaults, valid-range defaults, watchdog, "not updating" check, graph and alert-plot windows | same shared file, `settings` block | 30 keys; see `shared_settings_subset()` |
+| Poll pacing, debounce/settle, re-notify + trend behaviour, learn defaults, valid-range defaults, watchdog, "not updating" check, graph and alert-plot windows, picture resolution | same shared file, `settings` block | see `shared_settings_subset()` |
 | Teams / Email / Webex incl. credentials | the build itself, `notify_provision.dat` | see below |
 | Share location + timeout, resolved-root cache | this PC only, `monitor_config.json` | this is what points the PC at the share |
 | Graph PV-list / legend placement | this PC only, `monitor_config.json` | a personal view preference; sharing it would reshuffle everyone's graph |

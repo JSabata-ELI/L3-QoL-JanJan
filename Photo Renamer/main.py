@@ -36,24 +36,33 @@ def _icon_file() -> Path | None:
 
 
 def _icon_app_id() -> str | None:
-    """A taskbar identity derived from the icon's bytes and this run's file name.
+    """A taskbar identity that is new on every launch.
 
-    Windows caches the taskbar picture per AppUserModelID and never re-reads it,
-    so an id once seen without a usable icon keeps drawing the blank placeholder
-    for good. Returns None when there is no icon to give, in which case no id is
-    set at all and Windows keys the button on the process itself.
+    Windows caches the taskbar picture per AppUserModelID and never re-reads
+    it, so every *stable* id tried here eventually picked up a bad cache entry
+    and then drew the blank window placeholder for good: a fixed string, a hash
+    of the icon, and a hash tagged with the build's file name each broke within
+    days. Setting no id at all was no better -- Windows then keys the button on
+    the exe path and caches the picture there instead (Diagnostic v1.3.1,
+    measured 2026-09-17: the window icon, the exe's own icon resource and the
+    shell's own file icon all correct, the taskbar button blank).
+
+    An id Windows has never seen has no cache entry, so the button falls back
+    to the window icon, which every program here sets itself -- measured on a
+    fresh id on 2026-09-04 and again on 2026-09-17. A random suffix per launch
+    makes every run a first-time id, which is why this is the one form that
+    cannot go stale. Nothing here needs a stable identity: no program registers
+    a shortcut, pins itself or sends Windows toasts. The one cost is pinning a
+    *running* taskbar button -- that pin would carry this run's id and would
+    not start the program again, so pin the exe instead.
+
+    Returns None when there is no icon at all; the caller then sets no id and
+    the button keeps taking the exe's own picture.
     """
-    icon = _icon_file()
-    if icon is None:
+    if _icon_file() is None:
         return None
-    try:
-        data = icon.read_bytes()
-    except OSError:
-        return None
-    build = os.path.basename(sys.argv[0] or __file__)
-    digest = hashlib.md5(data + b"\x00"
-                         + build.encode("utf-8", "replace")).hexdigest()[:8]
-    return f"{_APP_ID_PREFIX}.{digest}"
+    import uuid
+    return f"{_APP_ID_PREFIX}.{uuid.uuid4().hex[:12]}"
 
 
 class PhotoRenamerWindow(QMainWindow):

@@ -165,9 +165,19 @@ def main():
 
     lat: "list[float]" = []
     seen: "set[int]" = set()
+    # When the PICTURE of each shot reached the master tile. The operator's question is
+    # not "how long after the archiver" but "is the number there when the picture is",
+    # and those are two different delays: the picture waits for the live poll to notice
+    # the file and for the share read, the number waits for the archiver.
+    painted_at: "dict[int, float]" = {}
+    pic_to_num: "list[float]" = []
+
     deadline = time.monotonic() + (args.period + args.publish_lag) * (args.shots + 3) + 30.0
     while time.monotonic() < deadline:
         app.processEvents()
+        shown = (v._cam_shown_ts_ns or [0])[0] if v._cam_shown_ts_ns else 0
+        if shown and shown not in painted_at:
+            painted_at[shown] = time.monotonic()
         src = v._pv_last_good_ts.get("PTM1")
         if src and src not in seen:
             with lock:
@@ -175,6 +185,8 @@ def main():
             if at is not None:
                 seen.add(src)
                 lat.append(time.monotonic() - at)
+                if src in painted_at:
+                    pic_to_num.append(time.monotonic() - painted_at[src])
         if len(lat) >= args.shots and not th.is_alive():
             break
         time.sleep(0.004)
@@ -187,6 +199,12 @@ def main():
         print(f"publish -> shown  p50 {statistics.median(s)*1000:7.0f} ms   "
               f"p95 {s[min(len(s)-1, int(0.95*len(s)))]*1000:7.0f} ms   "
               f"max {s[-1]*1000:7.0f} ms   min {s[0]*1000:7.0f} ms")
+    if pic_to_num:
+        q = sorted(pic_to_num)
+        print(f"picture -> number p50 {statistics.median(q)*1000:7.0f} ms   "
+              f"p95 {q[min(len(q)-1, int(0.95*len(q)))]*1000:7.0f} ms   "
+              f"max {q[-1]*1000:7.0f} ms   min {q[0]*1000:7.0f} ms   "
+              f"({len(q)} of {args.shots} shots)")
     print(f"requests per shot {used / max(1, args.shots):.1f}")
     if args.trace:
         with lock:

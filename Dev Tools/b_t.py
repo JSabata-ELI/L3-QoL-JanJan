@@ -162,14 +162,14 @@ def bump_patch(ver: str) -> str:
 def exe_icon_count(exe: Path) -> int:
     """How many icon groups the built .exe carries in itself.
 
-    This is what the Windows taskbar draws: a frozen build sets no
-    AppUserModelID (see _icon_app_id() in every program), so Windows keys the
-    taskbar button on the exe file and paints it from the exe's own icon
-    resource. A build that came out without one shows the blank window
-    placeholder instead, and nothing the running program does can fix it -
-    which is exactly the bug that kept coming back. So every build checks it
-    and says so in the log. Returns 0 when the file has no icon, and -1 when
-    the count could not be taken at all.
+    This is the picture Explorer shows for the file itself, and it used to be
+    the one the taskbar drew as well, back when a frozen build set no
+    AppUserModelID. Since 2026-09-17 every program takes a brand-new identity
+    on each launch (see _icon_app_id()), so the taskbar draws the *window*
+    icon and the exe resource no longer decides the button - but a build
+    without one still looks wrong in Explorer and in a pinned shortcut, so
+    every build keeps checking it and saying so in the log. Returns 0 when the
+    file has no icon, and -1 when the count could not be taken at all.
     """
     try:
         import ctypes
@@ -1347,6 +1347,14 @@ class BuilderUI(ttk.Frame):
 
         icon_path = p.resolve() / "icon.ico"
         icon_args = ["--icon", str(icon_path)] if icon_path.exists() else []
+        # Put icon.ico inside the bundle as well, not only next to the exe.
+        # The taskbar button now takes its picture from the window icon (see
+        # _icon_app_id() in every program), so a failed read of the file beside
+        # the exe — a share hiccup, a copy that dropped it — would cost the
+        # picture for that whole run. Every Qt program's _icon_file() already
+        # tries sys._MEIPASS before giving up.
+        if icon_path.exists():
+            icon_args += ["--add-data", f"{icon_path};."]
 
         # Test scripts are dev-only — nothing imports them at runtime, so keep them
         # out of the bundle.
@@ -1673,6 +1681,8 @@ class BuilderUI(ttk.Frame):
 
         icon_path = p.resolve() / "icon.ico"
         icon_args = ["--icon", str(icon_path)] if icon_path.exists() else []
+        if icon_path.exists():
+            icon_args += ["--add-data", f"{icon_path};."]
 
         args = [
             "py", "-m", "PyInstaller",

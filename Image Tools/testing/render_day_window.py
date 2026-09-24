@@ -30,13 +30,15 @@ COL = "sbw4"
 def rows(n):
     out = []
     for i in range(n):
-        dt = datetime(DAY.year, DAY.month, DAY.day, 8 + i // 4, 15 * (i % 4))
+        # Spread over the working day, so the time axis has a whole day to label.
+        dt = datetime(DAY.year, DAY.month, DAY.day, 8 + (i * 11) // 60,
+                      (i * 11) % 60, i % 60)
         ns = int(dt.replace(tzinfo=timezone.utc).timestamp() * 1e9)
         out.append({"_dt": dt, "_ns": ns, COL: f"{10.0 + 0.03 * i:.3f}"})
     return out
 
 
-def result(n=14):
+def result(n=60):
     rr = rows(n)
     return {"day": DAY, "cam": CAM, "status": "ok",
             "best_row": rr[3], "rows_in_tol": rr,
@@ -64,9 +66,19 @@ def fake_find(dr, cam, dt_obj, ts_ns, hour_cache, scan_cache=None):
     return Path(f"//share/2026/9/2/6/{CAM}/{CAM}-_-IMG_-_{ns}.png")
 
 
+def fake_render(path, *a, **k):
+    """The renderer, answered without the share: reading ahead must not send this
+    render at a network path that does not exist (a dead host stalls ~48 s)."""
+    from PySide6.QtGui import QImage
+    img = QImage(8, 8, QImage.Format.Format_Grayscale8)
+    img.fill(0)
+    return img, "test frame", {}
+
+
 w._find_image_for_shot = fake_find
 w._load_and_show_preview = lambda *a, **k: None
-w.resize(1500, 850)
+w._render_preview_frame = fake_render
+w.resize(2560, 1400)
 w.show()
 app.processEvents()
 
@@ -84,6 +96,47 @@ print(f"screenshot: {out}   size={w._day_window.width()}x{w._day_window.height()
 print(f"title: {w._day_window.windowTitle()}")
 print(f"shot rows: {w._day_table.rowCount()}   "
       f"columns: {[w._day_table.horizontalHeaderItem(c).text() for c in range(w._day_table.columnCount())]}")
+print(f"splitter: {w._day_split.sizes()}   "
+      f"list needs {w._day_table_width_needed()} px")
+
+# ── the shot slider under the curve ──────────────────────────────────────────
+sl = w._day_slider
+print(f"slider: range 0..{sl.maximum()}  enabled={sl.isEnabled()}  "
+      f"value={sl.value()}")
+for want in (7, 23, 0, 59):
+    sl.setValue(want)
+    for _ in range(3):
+        app.processEvents()
+    got = w._day_table.currentRow()
+    print(f"  slider -> {want}: table row {got}   {'OK' if got == want else 'WRONG'}")
+for want in (12, 41):
+    w._day_table.selectRow(want)
+    for _ in range(3):
+        app.processEvents()
+    print(f"  table -> {want}: slider {sl.value()}   "
+          f"{'OK' if sl.value() == want else 'WRONG'}")
+
+# The time labels of the axis, as they are actually drawn.
+ticks = [t.get_text() for t in w._day_ax.get_xticklabels()]
+rots = sorted({round(t.get_rotation()) for t in w._day_ax.get_xticklabels()})
+print(f"x labels: {ticks}")
+print(f"x label rotation(s): {rots}")
+ax_box = w._day_ax.get_position()
+print(f"axes fills: x {ax_box.x0:.2f}..{ax_box.x1:.2f}  "
+      f"y {ax_box.y0:.2f}..{ax_box.y1:.2f}")
+
+# Dragged narrow: the labels have to thin out instead of overlapping.
+w._day_window.resize(720, 420)
+for _ in range(20):
+    app.processEvents()
+w._retick_day_xaxis()
+w._day_canvas.draw()
+app.processEvents()
+out_n = HERE / "day_window_narrow.png"
+w._day_window.grab().save(str(out_n))
+print(f"screenshot: {out_n}   "
+      f"canvas {w._day_canvas.width()} px, labels "
+      f"{[t.get_text() for t in w._day_ax.get_xticklabels()]}")
 
 # The bar, half way through a two-day two-camera search.
 w._prog_take("search", 4, "reading PV data · 2026-09-02 · 2/3 PV(s)")

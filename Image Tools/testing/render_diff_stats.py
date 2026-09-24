@@ -12,7 +12,10 @@ What to check on the picture (it is 275 px wide, the real INFO column):
   * EVERY camera has its own histogram, captioned with its own name and numbers —
     not one histogram for the whole grid;
   * the histogram axis is numbered with more than just 0 and 255, the tallest bar is
-    labelled with the count it stands for, and the red line marks the brightest pixel;
+    labelled with the count it stands for ("top"), and the red line marks the
+    brightest pixel;
+  * the difference itself is written INSIDE the picture — max (red), mean (blue) and
+    min (purple) — and a narrow one drops min, then mean, rather than overlapping;
   * nothing is white-on-white and nothing spills out.
 
 Writes diff_stats.png beside this file.
@@ -82,6 +85,12 @@ def main() -> int:
           f"the share of the frame is right ({stats['pct']:.2f} %)")
     check(abs(stats["mean"] - float(cur[cur > 1].mean())) < 0.05,
           f"the mean difference is right ({stats['mean']:.2f})")
+    check(abs(stats["min"] - float(cur[cur > 1].min())) < 0.05,
+          f"the faintest counted pixel is right ({stats['min']:.0f} "
+          f"vs {float(cur[cur > 1].min()):.0f})")
+    check(stats["min"] <= stats["mean"] <= stats["max"],
+          f"min <= mean <= max ({stats['min']:.0f} / {stats['mean']:.1f} / "
+          f"{stats['max']:.0f})")
 
     print("the levels")
     levels = dict(stats["levels"])
@@ -131,7 +140,10 @@ def main() -> int:
     print("the INFO panel — two cameras")
     v._cam_names = ["PTM11WNF", "PCM4"]
     v._cam_ref_paths = [Path("r1.png"), Path("r2.png")]
-    v._cam_diff_stats = {0: stats, 1: stats2}
+    # (frame key, statistics) per camera — the frame key is what stops one frame's
+    # measured numbers from being shown for the next one (see _pick_diff_stats).
+    v._cam_diff_stats = {0: ("f0", stats), 1: ("f1", stats2)}
+    v._cam_diff_final = {0: ("f0", stats), 1: ("f1", stats2)}
     v._flush_cam_diff_stats()
     shown = [b for b in v._diff_hist_blocks if b.isVisibleTo(v)]
     check(len(shown) == 2, f"two cameras → two histograms ({len(shown)})")
@@ -143,11 +155,24 @@ def main() -> int:
     check(v._diff_hist_box.height() <= v._DIFF_BOX_MAX_H,
           f"the box stays within its cap ({v._diff_hist_box.height()} px)")
 
+    # Unticking Subtraction leaves them EXACTLY where they are: with a reference set,
+    # every frame is still measured against it, and the INFO panel sits above the
+    # settings column — hiding the box moved the checkbox itself out from under the
+    # cursor, so clicking on and off to compare was impossible (23.09.2026).
     v.cb_subtract.blockSignals(True)
     v.cb_subtract.setChecked(False)
     v.cb_subtract.blockSignals(False)
     v._flush_cam_diff_stats()
-    check(v.lbl_diff_stats.text() == "", "both go away with Subtraction off")
+    shown_off = [b for b in v._diff_hist_blocks if b.isVisibleTo(v)]
+    check(len(shown_off) == 2,
+          f"the histograms stay put with Subtraction off ({len(shown_off)})")
+    check(v._diff_hist_box.isVisibleTo(v), "and so does their box")
+
+    # They go with the REFERENCE, which is what they describe.
+    v._ref_path = None
+    v._cam_ref_paths = [None, None]
+    v._flush_cam_diff_stats()
+    check(v.lbl_diff_stats.text() == "", "both go away once the reference does")
     check(not v._diff_hist_box.isVisibleTo(v),
           "the histograms are hidden, not left behind")
 
@@ -160,24 +185,57 @@ def main() -> int:
     vl.setSpacing(4)
     lbl = QLabel(line)
     lbl.setWordWrap(True)
-    lbl.setStyleSheet("font-size: 10px; color: #1b5e20; padding: 1px 0;")
+    lbl.setStyleSheet(m._DIFF_TEXT_STYLE)
     vl.addWidget(lbl)
     hist = m._DiffHistogram()
-    hist.set_data(stats["hist"], stats["max"], stats["mean"])
+    hist.set_data(stats["hist"], stats["max"], stats["mean"], stats["min"])
     vl.addWidget(hist)
     for nm, st in (("PTM11WNF", stats), ("PCM4", stats2)):
         b = m._DiffCamBlock(compact=True)
         b.set_block(f"{nm}: " + m.Viewer._fmt_diff_stats(st, compact=True),
-                    st["hist"], st["max"], st["mean"])
+                    st["hist"], st["max"], st["mean"], st["min"])
         vl.addWidget(b)
+    # The SAME numbers while they are still only an estimate — the frame has so far
+    # only been decoded smaller than it will end up. Amber line with "…", grey bars,
+    # "not final" written on the picture. Both states are shot together so the
+    # difference between them can be judged at a glance.
+    prov_lbl = QLabel(m.Viewer._fmt_diff_stats(stats, provisional=True))
+    prov_lbl.setWordWrap(True)
+    prov_lbl.setStyleSheet(m._DIFF_TEXT_PROV_STYLE)
+    vl.addWidget(prov_lbl)
+    prov = m._DiffHistogram()
+    prov.set_data(stats["hist"], stats["max"], stats["mean"], stats["min"],
+                  provisional=True)
+    vl.addWidget(prov)
+    box.move(-4000, -4000)
     box.show()
+
+    # The same histogram squeezed into a tile-sized column: the numbers must DROP,
+    # never overlap each other or the "top" count on the left.
+    narrow = QWidget()
+    narrow.setFixedWidth(130)
+    narrow.setStyleSheet("background: #f3f3f3; color: #111;")
+    nl = QVBoxLayout(narrow)
+    nl.setContentsMargins(4, 4, 4, 4)
+    nh = m._DiffHistogram(compact=True)
+    nh.set_data(stats["hist"], stats["max"], stats["mean"], stats["min"])
+    nl.addWidget(nh)
+    # The narrow one as an estimate too: here "not final" must be the thing that
+    # survives, because a number nobody should write down is worse than no number.
+    nh2 = m._DiffHistogram(compact=True)
+    nh2.set_data(stats["hist"], stats["max"], stats["mean"], stats["min"],
+                 provisional=True)
+    nl.addWidget(nh2)
+    narrow.move(-4000, -4000)
+    narrow.show()
 
     out = Path(__file__).parent
 
     def shoot():
         app.processEvents()
         box.grab().save(str(out / "diff_stats.png"))
-        print("written: diff_stats.png")
+        narrow.grab().save(str(out / "diff_stats_narrow.png"))
+        print("written: diff_stats.png, diff_stats_narrow.png")
         app.quit()
 
     QTimer.singleShot(700, shoot)

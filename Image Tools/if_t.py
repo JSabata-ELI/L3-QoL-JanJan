@@ -596,6 +596,34 @@ def _set_action_icon(btn, name: str, ink: str = "#1e2530"):
 
 _TICK_PNG: "str | None" = None
 
+#  The scroll bars. The plain ones are a pale grey sliver on a pale grey panel —
+#  there is nothing to see and little to grab. This one, the same as Workshop's,
+#  has a track that is visibly a track, a handle dark enough to read against it at
+#  a glance, and no end arrows, which are two more tiny targets nobody uses.
+_SCROLLBAR_QSS = (
+    "QScrollBar:vertical { background: #d8dce2; width: 16px; margin: 0px;"
+    " border: none; }"
+    "QScrollBar::handle:vertical { background: #6c7580; min-height: 28px;"
+    " border-radius: 4px; margin: 2px; }"
+    "QScrollBar::handle:vertical:hover { background: #4a5566; }"
+    "QScrollBar::handle:vertical:pressed { background: #2f3a49; }"
+    "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px;"
+    " background: none; border: none; }"
+    "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical"
+    " { background: none; }"
+    "QScrollBar:horizontal { background: #d8dce2; height: 16px; margin: 0px;"
+    " border: none; }"
+    "QScrollBar::handle:horizontal { background: #6c7580; min-width: 28px;"
+    " border-radius: 4px; margin: 2px; }"
+    "QScrollBar::handle:horizontal:hover { background: #4a5566; }"
+    "QScrollBar::handle:horizontal:pressed { background: #2f3a49; }"
+    "QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal"
+    " { width: 0px; background: none; border: none; }"
+    "QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal"
+    " { background: none; }"
+)
+
+
 def _tick_image_url() -> str:
     """A PAINTED white tick, as a `url(...)` for a stylesheet — or "" if it could
     not be written.
@@ -638,23 +666,45 @@ def _cpva_fetch_samples(channel: str, start_ns: int, end_ns: int,
     """Fetch archiver samples via the shared pooled client (kept as a thin
     wrapper so existing call sites stay unchanged). Raises cpva.CpvaError.
 
-    An empty answer is asked for again under the channel's OTHER name, when it has
-    one: SBW4 lives under a HAPLS-era name and an L3 name, and which of them a
-    given stretch of time was written to depends on the configuration that ran, not
-    on the date. Without this a region search over such a stretch reports "the PV
-    has nothing here" and falls back to the region midpoint, which is how a search
+    A measurement with two archived names is asked under each of them in turn
+    (`cpva.read_order`): SBW4 is looked for under the HAPLS-era name first and
+    under the L3 one only when that holds nothing for these hours. Which name a
+    stretch of time was written to depends on the configuration that ran, not on
+    the date. Without this a region search over such a stretch reports "the PV has
+    nothing here" and falls back to the region midpoint, which is how a search
     that should have worked came back with the wrong frame."""
-    got = cpva.fetch_samples(channel, start_ns, end_ns, timeout=timeout)
-    if got:
-        return got
-    for alt in cpva.channel_aliases(channel):
+    def _inside(raw: list) -> list:
+        """Only what the archiver holds for THESE hours. A window it has nothing
+        for is answered with one carry-over value, which may even be stamped after
+        the window (measured 23.09.2026 on the L3 SBW4 name, three weeks later) —
+        counted as data it hides that the other name holds the whole day."""
+        out = []
+        for s in raw or ():
+            try:
+                t = int(s.get("time"))
+            except (TypeError, ValueError):
+                continue
+            if start_ns <= t <= end_ns:
+                out.append(s)
+        return out
+
+    names = cpva.read_order(channel)
+    first: list = []
+    first_failure: "cpva.CpvaError | None" = None
+    for i, name in enumerate(names):
         try:
-            alt_got = cpva.fetch_samples(alt, start_ns, end_ns, timeout=timeout)
-        except cpva.CpvaError:
+            got = cpva.fetch_samples(name, start_ns, end_ns, timeout=timeout)
+        except cpva.CpvaError as exc:
+            if i == 0:
+                first_failure = exc
             continue
-        if alt_got:
-            return alt_got
-    return got
+        if _inside(got):
+            return got
+        if i == 0:
+            first = got
+    if first_failure is not None and not first:
+        raise first_failure
+    return first
 
 
 # ── a formula over time ───────────────────────────────────────────────────────
@@ -1401,6 +1451,20 @@ QCheckBox::indicator:checked { border: 2px solid #2d7dff; background: #2d7dff; }
 # the PV Search sidebar is light again). Same indicator, light ink: _CHECKBOX_STYLE's
 # #111 label is invisible on near-black.
 _CHECKBOX_STYLE_DARK = _CHECKBOX_STYLE.replace("color: #111;", "color: #eeeeee;")
+
+# The "send this on to another tab" buttons. They sit two or three to a row in a
+# 268 px panel, so they are smaller than a normal button — and every colour is
+# spelled out, both states: a button left to the style comes out pale on pale and
+# a disabled one unreadable. The same block is in is_t.py and sf_t.py; each tab
+# also runs on its own, so it is copied rather than imported (the same reason
+# _import_img_scale is).
+_SEND_BTN_QSS = (
+    "QPushButton { font-size: 10px; padding: 3px 4px; background: #eaeaea; "
+    "color: #111111; border: 1px solid #b4b4b4; border-radius: 3px; }"
+    "QPushButton:hover:!disabled { background: #d8e8ff; border: 1px solid #2d7dff; }"
+    "QPushButton:pressed:!disabled { background: #c3dbff; }"
+    "QPushButton:disabled { background: #ededed; color: #8d8d8d; "
+    "border: 1px solid #d4d4d4; }")
 
 # ── STANDALONE HELPERS ────────────────────────────────────────────────────────
 def _app_dir() -> Path:
@@ -2951,6 +3015,9 @@ class ImageFinderWidget(QWidget):
         # and started by the camera picker, so the two halves of the question may
         # be answered in either order.
         self._pending_pv_cfg: "dict | None" = None
+        # Moments another tab pushed in ("Send to Image Finder"), waiting for the
+        # camera list of their days to come back — see open_moments.
+        self._pushed_moments: "tuple | None" = None
         self._moment_gen = 0
         # Generation token for the "turn the marked regions into instants" step, so a
         # second search started while the first is still reading cannot land on top
@@ -3036,7 +3103,7 @@ class ImageFinderWidget(QWidget):
         left_scroll.setWidgetResizable(True)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
         left_scroll.setStyleSheet(
-            "QScrollArea{background:transparent;}QScrollBar:vertical{width:10px;}")
+            "QScrollArea{background:transparent;}" + _SCROLLBAR_QSS)
 
         lw = QWidget(); lw.setMinimumWidth(240)
         ll = QVBoxLayout(lw); ll.setContentsMargins(0, 0, 4, 0); ll.setSpacing(4)
@@ -3159,11 +3226,7 @@ class ImageFinderWidget(QWidget):
             " border:1px solid #b0b0b0; font-size:11px; }"
             "QListWidget::item { padding:1px 3px; }"
             "QListWidget::item:selected { background:#1565C0; color:#ffffff; }"
-            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
-            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
-            " border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-            " { height:0px; }")
+            + _SCROLLBAR_QSS)
         self._moment_list.itemClicked.connect(self._on_saved_moment_clicked)
         ll.addWidget(self._moment_list)
         mm_row = QHBoxLayout(); mm_row.setSpacing(4)
@@ -3338,7 +3401,7 @@ class ImageFinderWidget(QWidget):
         # ══════════════════ Group: ACTIONS ═══════════════════════════════════
         ll = s_act.body_layout
 
-        # action buttons  row0=[Save As|Folder]  row1=[Workshop]
+        # action buttons  row0=[Save As|Folder]  row1=[Image Slider|Workshop]
         # Load data moved up into Source — this group is only what you do with the
         # frames once they are loaded.
         btn_grid = QGridLayout(); btn_grid.setSpacing(4)
@@ -3349,10 +3412,21 @@ class ImageFinderWidget(QWidget):
         btn_grid.addWidget(self._btn_save, 0, 0)
         btn_grid.addWidget(self._btn_open_folder, 0, 1)
 
+        # Where the frames on the wall go next. One row, in tab order, so "send
+        # this on" is one place to look instead of a button per group.
+        self._btn_send_slider = QPushButton("➤ Image Slider")
+        self._btn_send_slider.setStyleSheet(_SEND_BTN_QSS)
+        self._btn_send_slider.setToolTip(
+            "Send the frames on the wall to the Image Slider tab, where the shots "
+            "either side of each one can be slid through.")
+        self._btn_send_slider.clicked.connect(self.open_in_slider)
+        btn_grid.addWidget(self._btn_send_slider, 1, 0)
+
         self._btn_send_workshop = QPushButton("➤ Workshop")
+        self._btn_send_workshop.setStyleSheet(_SEND_BTN_QSS)
         self._btn_send_workshop.setToolTip("Send currently selected images to Workshop tab for editing")
         self._btn_send_workshop.clicked.connect(self._send_to_workshop)
-        btn_grid.addWidget(self._btn_send_workshop, 1, 0, 1, 2)
+        btn_grid.addWidget(self._btn_send_workshop, 1, 1)
         ll.addLayout(btn_grid)
 
         # The cameras that will be searched — just the list, no banner and no count
@@ -3591,11 +3665,7 @@ class ImageFinderWidget(QWidget):
             "QPlainTextEdit { background:#ffffff; color:#111111;"
             " border:1px solid #b0b0b0; font-family:Consolas,monospace;"
             " font-size:10px; }"
-            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
-            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
-            " border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-            " { height:0px; }")
+            + _SCROLLBAR_QSS)
         self._log_box.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._log_box.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse |
@@ -6367,6 +6437,7 @@ class ImageFinderWidget(QWidget):
 
 
     def _on_load_not_found(self, target_path: Path):
+        self._drop_pushed_moments(f"no camera folders on {target_path}")
         if not self.isVisible():
             return
         self._log(f"Target folder not found: {target_path}")
@@ -6382,6 +6453,7 @@ class ImageFinderWidget(QWidget):
             self._open_pv_region_search()
 
     def _on_load_error(self, err: str):
+        self._drop_pushed_moments(f"the day scan failed ({err})")
         if not self.isVisible():
             return
         self._log(f"ERROR: {err}")
@@ -6433,11 +6505,108 @@ class ImageFinderWidget(QWidget):
             self._log(f"Subfolders loaded: {len(subfolders)}")
             self._status_dot.setStyleSheet("color: green; font-size: 14px;")
             self._sync_time_summary()
+            # A moment another tab sent here waits exactly this long: the cameras
+            # of those days are only known now.
+            self._apply_pushed_moments()
         except Exception as e:
             self._log(f"_on_load_done ERROR: {type(e).__name__}: {e}")
             import traceback
             self._log(traceback.format_exc())
 
+
+    # ── SENT IN FROM ANOTHER TAB ("Send to Image Finder") ─────────────────────
+    # A pushed moment brings its own time window: this much on each side of it, so
+    # a Load data afterwards reads the hours around the moment instead of a whole
+    # day. The Slider's pushed-moment window is the same size, on purpose.
+    PUSHED_MOMENT_PAD_MIN = 15
+
+    def open_moments(self, moments_ns: "list", cam_names: "list | None" = None) -> bool:
+        """Public handoff: THESE moments of THESE cameras, on the wall.
+
+        The other tab has found the shot; this tab is where the same instant is put
+        side by side, camera by camera and day by day — the one thing the Slider
+        cannot do. The days of the moments are picked in the Time window (one
+        window per day, ±PUSHED_MOMENT_PAD_MIN around that day's own moments) and
+        the camera list is re-read for them. The cameras can only be ticked once
+        that scan comes back — the folders of a day this tab has never looked at
+        are not known before it — so the ticking and the wall happen in
+        `_apply_pushed_moments`.
+
+        `cam_names` are camera FOLDER names, the same spelling the Slider's picker
+        uses. Left out, or none of them found on those days, the cameras already
+        picked here are kept; with none picked at all the camera picker opens and
+        the wall follows the pick, which is the "either half first" rule PV Search
+        already works by.
+
+        Returns False only when there is no moment to show.
+        """
+        moments: list = []
+        for t in (moments_ns or []):
+            try:
+                t = int(t)
+            except (TypeError, ValueError):
+                continue
+            if t not in moments:
+                moments.append(t)
+        if not moments:
+            return False
+        cams = [str(c) for c in (cam_names or []) if c]
+
+        # One Time-window entry per day, covering that day's own moments ± the pad.
+        pad = int(self.PUSHED_MOMENT_PAD_MIN)
+        by_day: dict = {}
+        for t in moments:
+            dt = datetime.fromtimestamp(t / 1e9, tz=timezone.utc)
+            if PRAGUE is not None:
+                dt = dt.astimezone(PRAGUE)
+            by_day.setdefault(dt.date(), []).append(dt.hour * 60 + dt.minute)
+        segs = []
+        for day in sorted(by_day):
+            mins = by_day[day]
+            lo = max(0, min(mins) - pad)
+            hi = min(24 * 60 - 1, max(mins) + pad)
+            segs.append(daypicker.PickSeg(day, lo // 60, lo % 60, hi // 60, hi % 60))
+        self._segments = segs
+        self._selected_days = [daypicker.date_to_qdate(s.date) for s in segs]
+        self._user_has_selected_day = True
+        self._status_dot.setStyleSheet("color: gray; font-size: 12px;")
+        self._sync_time_summary()
+
+        self._pushed_moments = (moments, cams)
+        self._log(f"[sent here] {len(moments)} moment(s) on {len(segs)} day(s)"
+                  + (f", {len(cams)} camera(s)" if cams
+                     else " (cameras kept as picked here)"))
+        self.load_folders()
+        return True
+
+    def _apply_pushed_moments(self):
+        """The camera list is in — tick the pushed cameras and build the wall."""
+        pending = self._pushed_moments
+        if not pending:
+            return
+        self._pushed_moments = None
+        moments, cams = pending
+        if cams:
+            want = set(cams)
+            if any(c["name"] in want for c in self._cams):
+                for c in self._cams:
+                    c["checked"] = c["name"] in want
+                self._refresh_selected_table()
+            else:
+                # Never silently swap the pick: a camera that was not archiving on
+                # those days is a fact worth reading, not a reason to show nothing.
+                self._log("[sent here] none of the sent cameras are on these "
+                          "day(s) — keeping the cameras picked here.")
+        picks = [{"ts": t, "kind": "moment", "index": i + 1}
+                 for i, t in enumerate(moments)]
+        self._load_moments(picks)
+
+    def _drop_pushed_moments(self, why: str):
+        """A day scan that found nothing cannot carry a pushed moment any further —
+        dropped here so it cannot fire on top of whatever is loaded next."""
+        if self._pushed_moments:
+            self._pushed_moments = None
+            self._log(f"[sent here] dropped — {why}")
 
     # ── OPEN IN SLIDER / EXPLORER ─────────────────────────────────────────────
     def _send_moment_to_slider(self, with_cameras: bool):
@@ -9985,11 +10154,7 @@ class _PVBrowseDialog(QDialog):
             "QListWidget::item { padding:2px 3px; }"
             "QListWidget::item:selected { background:#cfe4fb; color:#111111; }"
             "QListWidget::item:hover { background:#eef5fd; }"
-            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
-            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
-            " border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-            " { height:0px; }")
+            + _SCROLLBAR_QSS)
         lay.addWidget(self._list, 1)
 
         self._status = QLabel("Loading channels…")
@@ -10383,7 +10548,7 @@ class PVRegionSearchDialog(QDialog):
         lay.addWidget(QLabel(f"{_fmt_day_long(day)}   (Prague time)"))
         row = QHBoxLayout()
         e_a, e_b = QLineEdit(), QLineEdit()
-        for e, txt in ((e_a, "08:00"), (e_b, "19:00")):
+        for e, txt in ((e_a, "07:00"), (e_b, "21:00")):
             e.setPlaceholderText(txt)
             e.setStyleSheet("background:#ffffff;color:#111111;")
         row.addWidget(QLabel("from")); row.addWidget(e_a)
@@ -10501,11 +10666,7 @@ class PVRegionSearchDialog(QDialog):
         "  font-weight: 600; padding: 2px 3px; border: 0px;"
         "  border-right: 1px solid #d0d5db; border-bottom: 1px solid #c4c8cf; }"
         "QTableCornerButton::section { background: #e8ebef; border: 0px; }"
-        "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
-        "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
-        "  border-radius:3px; }"
-        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-        "  { height:0px; }")
+        + _SCROLLBAR_QSS)
 
     # The columns, by name. Six say WHAT was picked, six say what the PVs were
     # doing inside it, and the ✕ takes it off again.
@@ -10966,11 +11127,7 @@ class PVRegionSearchDialog(QDialog):
             " border:1px solid #b0b0b0; }"
             "QTreeWidget::item { padding:1px 2px; }"
             "QTreeWidget::item:selected { background:#1565C0; color:#ffffff; }"
-            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
-            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
-            " border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-            " { height:0px; }")
+            + _SCROLLBAR_QSS)
         self._day_list.currentItemChanged.connect(self._on_day_item_changed)
         # Which days are open is remembered: the list is rebuilt on every pick, and
         # a day that closed itself the moment a moment was added to it would make
@@ -11036,11 +11193,7 @@ class PVRegionSearchDialog(QDialog):
             " background:#f4f8ff; }"
             "QListWidget::indicator:checked { border:2px solid #0D47A1;"
             " background:#2d7dff;" + _tick_image_url() + " }"
-            "QScrollBar:vertical { background:#e8e8e8; width:12px; }"
-            "QScrollBar::handle:vertical { background:#8a8a8a;"
-            " min-height:20px; border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-            " { height:0px; }")
+            + _SCROLLBAR_QSS)
         self._pv_list.setToolTip(
             "The PVs the graph draws. The tick plots one; Browse adds any archiver "
             "channel, Remove takes the selected one off the list.")
@@ -11185,11 +11338,7 @@ class PVRegionSearchDialog(QDialog):
         self._side_scroll = side_scroll
         side_scroll.setStyleSheet(
             "QScrollArea { background:#f3f3f3; border:0px; }"
-            "QScrollBar:vertical { background:#e0e0e0; width:12px; }"
-            "QScrollBar::handle:vertical { background:#8a8a8a; min-height:20px;"
-            " border-radius:3px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
-            " { height:0px; }")
+            + _SCROLLBAR_QSS)
         root.addWidget(side_col)
 
         # ── Right: plot ───────────────────────────────────────────────────
@@ -15056,7 +15205,7 @@ def main():
         QLabel      { background: transparent; }
         QPushButton { padding: 5px 8px; }
         QComboBox   { padding: 3px 6px; }
-    """)
+    """ + _SCROLLBAR_QSS)
     win = QMainWindow()
     win.setWindowTitle("Image Finder")
     win.resize(800, 600)

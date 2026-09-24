@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from alerting import (  # noqa: E402
     AlertEvaluator, AlertLevel, AlertPayload, AlertState, EmailNotifier,
     EvalConfig, NotificationHub, TeamsClient, Thresholds, Trend, WebexNotifier,
-    classify_trend, detect_frozen, fmt_duration,
+    classify_trend, fmt_duration,
 )
 
 SEC = 1_000_000_000
@@ -254,86 +254,11 @@ def test_reminder_cooldown_scale_default_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# Frozen-value ("not updating") detection
-# ---------------------------------------------------------------------------
-
-FROZEN_AFTER = 2 * 3600.0    # 2 h, the app's default
-
-
-def _close(a, b, tol=1.0):
-    return abs(a - b) <= tol
-
-
-def _flat(value, hours, n=60, now_ns=NOW):
-    """n samples of one constant value spread over the last `hours`."""
-    span = int(hours * 3600 * SEC)
-    start = now_ns - span
-    return [(start + int(i / (n - 1) * span), value) for i in range(n)]
-
-
-def test_frozen_constant_value_is_detected():
-    info = detect_frozen(_flat(16.3, 48), NOW, FROZEN_AFTER)
-    assert info.frozen
-    assert info.n_points == 60
-    assert _close(info.span_s, 48 * 3600)
-    # Nothing different precedes the run, so the freeze may be even older.
-    assert not info.bounded
-
-
-def test_frozen_needs_the_full_span():
-    # Same constant value, but only 30 min of it: below the 2 h limit.
-    assert not detect_frozen(_flat(16.3, 0.5), NOW, FROZEN_AFTER).frozen
-
-
-def test_frozen_measures_from_the_last_real_change():
-    moving = [(NOW - int(10 * 3600 * SEC) + i * SEC, 10.0 + i) for i in range(20)]
-    stuck = _flat(16.3, 5, n=40)
-    info = detect_frozen(moving + stuck, NOW, FROZEN_AFTER)
-    assert info.frozen and info.bounded
-    assert _close(info.span_s, 5 * 3600)
-    assert info.n_points == 40
-
-
-def test_moving_value_is_not_frozen():
-    ramp = [(NOW - int(6 * 3600 * SEC) + i * MIN, 16.0 + i * 0.01)
-            for i in range(300)]
-    assert not detect_frozen(ramp, NOW, FROZEN_AFTER).frozen
-
-
-def test_frozen_only_the_latest_value_counts():
-    # It changed 1 min ago after sitting still for hours: not frozen now.
-    samples = (_flat(16.3, 24, n=100, now_ns=NOW - 2 * MIN)
-               + [(NOW - MIN, 16.4), (NOW, 16.4)])
-    info = detect_frozen(samples, NOW, FROZEN_AFTER)
-    assert not info.frozen and info.n_points == 2
-
-
-def test_frozen_ignores_sparse_data():
-    # Two readings 24 h apart carry no evidence of a stuck sensor.
-    sparse = [(NOW - int(24 * 3600 * SEC), 16.3), (NOW, 16.3)]
-    assert not detect_frozen(sparse, NOW, FROZEN_AFTER).frozen
-    # The same span with enough samples behind it is frozen.
-    assert detect_frozen(_flat(16.3, 24, n=5), NOW, FROZEN_AFTER).frozen
-
-
-def test_frozen_averaging_rounding_still_counts_as_unchanged():
-    # Live polls store the mean of N identical samples, which can land a few
-    # float-ULPs apart; that must not read as a real change.
-    v = 16.3
-    samples = [(NOW - int(6 * 3600 * SEC) + i * MIN,
-                sum([v] * 25) / 25 if i % 2 else v) for i in range(300)]
-    assert detect_frozen(samples, NOW, FROZEN_AFTER).frozen
-
-
-def test_frozen_check_disabled_and_no_data():
-    assert not detect_frozen(_flat(16.3, 48), NOW, 0).frozen
-    assert not detect_frozen([], NOW, FROZEN_AFTER).frozen
-    assert detect_frozen([], NOW, FROZEN_AFTER).n_points == 0
-
-
-def test_frozen_ignores_future_samples():
-    future = [(NOW + int(3600 * SEC), 99.0)]
-    assert detect_frozen(_flat(16.3, 48) + future, NOW, FROZEN_AFTER).frozen
+# The frozen-VALUE detector's tests stood here. The detector was removed on
+# 16 Sep 2026: a chiller holding one tenth of a degree for two hours is a
+# healthy chiller, and it was being announced as "PV NOT UPDATING". What is
+# left is monitor_tab's own check on the newest sample's timestamp, tested
+# in test_monitor_frozen.py.
 
 
 def test_fmt_duration():

@@ -308,76 +308,15 @@ def classify_trend(samples, now_ns: int, lookback_s: float,
     return Trend.RISING if overall > 0 else Trend.FALLING
 
 
-# ---------------------------------------------------------------------------
-# Frozen-value detection (pure) — catches a PV that keeps delivering data while
-# the reading behind it has stopped moving (dead sensor, stuck IOC, a control
-# system that republishes its last value). Such a PV looks perfectly healthy:
-# samples keep arriving with fresh timestamps, the value sits inside its limits
-# (or outside them, alarming on data that is days old), and nothing else in the
-# monitor notices. Kept free of Qt/history objects so it can be unit tested:
-# the caller passes raw (timestamp, value) samples read from wherever it keeps
-# them.
-# ---------------------------------------------------------------------------
-
-@dataclass
-class FrozenInfo:
-    """Outcome of one frozen-value check.
-
-    ``bounded`` distinguishes "we saw it change at ``since_ns``" from "it was
-    already at this value at the start of the data we have", i.e. the freeze is
-    at least ``span_s`` long but may well be older.
-    """
-    frozen: bool = False
-    since_ns: int = 0        # timestamp of the oldest sample carrying the value
-    span_s: float = 0.0      # how long the value has been unchanged, up to now
-    n_points: int = 0        # samples making up that unchanged run
-    bounded: bool = False    # True = a different value precedes the run
-
-
-def _same_value(a: float, b: float, rel_tol: float, abs_tol: float) -> bool:
-    return abs(a - b) <= max(abs_tol, rel_tol * max(abs(a), abs(b)))
-
-
-def detect_frozen(samples, now_ns: int, frozen_after_s: float,
-                  min_points: int = 5, rel_tol: float = 1e-9,
-                  abs_tol: float = 0.0) -> FrozenInfo:
-    """Detect a value that has not moved for at least `frozen_after_s` seconds.
-
-    `samples` is any iterable of (timestamp_ns, value) pairs (any order); only
-    those at or before `now_ns` count. The newest sample's value is the
-    reference: the check walks back through the samples while they still carry
-    that same value (within tolerance) and measures the run's length up to
-    `now_ns`, so an ongoing freeze keeps growing between calls.
-
-    The tolerance is deliberately near-exact — the point is "literally the same
-    number over and over", not "roughly steady". A real sensor's noise always
-    moves the last digit; only a stuck one repeats it exactly.
-
-    A run counts as frozen only when it is both long enough AND carried by at
-    least `min_points` samples, so sparse data (two readings hours apart) is
-    never mistaken for a stuck sensor. `frozen_after_s` <= 0 disables the check.
-    """
-    if frozen_after_s <= 0:
-        return FrozenInfo()
-
-    pts = [(t, v) for (t, v) in samples if v is not None and t <= now_ns]
-    if not pts:
-        return FrozenInfo()
-    pts.sort(key=lambda p: p[0])
-
-    ref = pts[-1][1]
-    i = len(pts) - 1
-    while i > 0 and _same_value(pts[i - 1][1], ref, rel_tol, abs_tol):
-        i -= 1
-
-    span_s = max(0.0, (now_ns - pts[i][0]) / 1e9)
-    n_points = len(pts) - i
-    return FrozenInfo(
-        frozen=(span_s >= frozen_after_s and n_points >= max(1, min_points)),
-        since_ns=pts[i][0], span_s=span_s, n_points=n_points,
-        bounded=(i > 0))
-
-
+# The frozen-VALUE detector used to live here: a PV serving the same
+# number over and over was taken for a dead sensor. Measured on the DA1
+# chiller (L3-UTIL-CHL03-001:Temp, 13 Sep 2026) that is simply what a
+# regulated temperature looks like — a sample every ~0.7 s, reported in
+# whole tenths of a degree, one tenth held for 40-125 min. It raised
+# "PV NOT UPDATING" on a healthy chiller, so it was removed on
+# 16 Sep 2026. What counts now is whether a NEW reading arrives at all,
+# which monitor_tab._update_frozen decides from the newest sample's
+# timestamp alone.
 # ---------------------------------------------------------------------------
 # Evaluator
 # ---------------------------------------------------------------------------

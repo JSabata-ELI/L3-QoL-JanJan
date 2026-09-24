@@ -6,8 +6,8 @@ Three claims, all about having more than one camera selected:
      was clicked last, and clears it on the ones that are not selected.
   2. Placing a mark puts it at the SAME normalized spot on every selected camera —
      the middle of one tile is the middle of all of them, whatever each camera's
-     resolution is — and leaves the unselected cameras alone. Only the shape that
-     moved is copied: dragging the cross must not disturb an existing circle.
+     resolution is — and leaves the unselected cameras alone. Only the KIND that
+     moved is copied: dragging a cross must not disturb an existing circle.
   3. One click on a Cal button calibrates every selected camera on ITS OWN frame,
      so two cameras with the beam in different places get two different results.
 
@@ -20,8 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton
 
 import is_t
@@ -134,28 +134,49 @@ def main() -> int:
     ir = src._img_rect()
     check(ir is not None and ir.width() > 0, "source tile has an image rect")
     mid = QPointF(ir.left() + ir.width() / 2.0, ir.top() + ir.height() / 2.0)
-    src._set_cross_at(mid, ir)            # what a click in the middle does
-    got = [grid.get_img_view(i).cross_pos_norm for i in range(3)]
-    check(all(g is not None for g in (got[0], got[2])),
+    src._place_cross_at(mid, ir, new=True)   # what a click in the middle does
+    got = [grid.get_img_view(i).marks["cross"] for i in range(3)]
+    check(len(got[0]) == 1 and len(got[2]) == 1,
           "both selected cameras have a cross")
-    check(got[1] is None, "the unselected camera has none")
-    check(abs(got[0].x() - got[2].x()) < 1e-6 and abs(got[0].y() - got[2].y()) < 1e-6,
-          f"same normalized position: {got[0].x():.3f},{got[0].y():.3f} vs "
-          f"{got[2].x():.3f},{got[2].y():.3f}")
-    check(abs(got[0].x() - 0.5) < 0.01 and abs(got[0].y() - 0.5) < 0.01,
+    check(got[1] == [], "the unselected camera has none")
+    check(got[0] == got[2],
+          f"same normalized position: {got[0]} vs {got[2]}")
+    check(abs(got[0][0][0] - 0.5) < 0.01 and abs(got[0][0][1] - 0.5) < 0.01,
           "the middle of the tile is the middle of the frame")
 
     # A circle already on camera 3 must survive a cross drag.
     other = grid.get_img_view(2)
     other.show_circle = True
-    other.circle_center_norm = QPointF(0.2, 0.8)
-    other.circle_rx_norm = other.circle_ry_norm = other.circle_r_norm = 0.1
-    src._set_cross_at(QPointF(ir.left() + 5, ir.top() + 5), ir)
-    check(other.circle_center_norm is not None
-          and abs(other.circle_center_norm.x() - 0.2) < 1e-6,
+    other.marks["circle"] = [(0.2, 0.8, 0.1, 0.1)]
+    src._place_cross_at(QPointF(ir.left() + 5, ir.top() + 5), ir, new=False)
+    check(other.marks["circle"] == [(0.2, 0.8, 0.1, 0.1)],
           "a cross drag leaves the circle where it was")
-    check(abs(other.cross_pos_norm.x() - grid.get_img_view(0).cross_pos_norm.x()) < 1e-6,
+    check(other.marks["cross"] == grid.get_img_view(0).marks["cross"],
           "the cross followed to the top-left corner")
+
+    # Several marks: a second click adds one more, on every selected camera, and the
+    # lists stay identical — which is what lets Delete take the same mark off all of
+    # them.
+    src._place_cross_at(QPointF(ir.left() + ir.width() - 5, ir.top() + 5), ir, new=True)
+    check(len(src.marks["cross"]) == 2, "a second click added a second cross")
+    check(other.marks["cross"] == src.marks["cross"],
+          "the other selected camera has both crosses too")
+    check(grid.get_img_view(1).marks["cross"] == [],
+          "the unselected camera still has none")
+
+    # Delete takes the picked-out mark off every selected camera.
+    src.set_draw_mode("cross")
+    src._sel = ("cross", 1)
+    src.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Delete,
+                                Qt.KeyboardModifier.NoModifier))
+    check(len(src.marks["cross"]) == 1, "Delete removed one cross")
+    check(other.marks["cross"] == src.marks["cross"],
+          "and removed it on the other selected camera as well")
+
+    for i in range(3):
+        grid.get_img_view(i).marks["cross"] = []
+        grid.get_img_view(i).marks["circle"] = []
+    other.show_circle = False
 
     # A tick box writes only its own shape: the panel's boxes show the LAST clicked
     # tile, so writing all three would hide a circle that only another selected
@@ -169,21 +190,25 @@ def main() -> int:
     # ── 3. calibration runs per camera, all at once ───────────────────────────
     print("Calibration calibrates each selected camera on its own frame")
     for i in range(3):
-        grid.get_img_view(i).cross_pos_norm = None
+        grid.get_img_view(i).marks["cross"] = []
+    # One mark placed by hand on camera 1: Cal must leave it alone and add its own.
+    grid.get_img_view(0).marks["cross"] = [(0.9, 0.9)]
     _FakeBox.calls = []
     v.calibrate_cross()
-    pos = [grid.get_img_view(i).cross_pos_norm for i in range(3)]
+    got = [grid.get_img_view(i).marks["cross"] for i in range(3)]
     check(not _FakeBox.calls, f"no complaint dialog: {_FakeBox.calls}")
-    check(pos[0] is not None and pos[2] is not None,
-          "both selected cameras got a centroid")
-    check(pos[1] is None, "the unselected camera was not touched")
-    check(abs(pos[0].x() - blobs[0][0]) < 0.05 and abs(pos[0].y() - blobs[0][1]) < 0.05,
-          f"camera 1 centroid on its own blob: {pos[0].x():.2f},{pos[0].y():.2f} "
+    check(len(got[0]) == 2 and len(got[2]) == 1,
+          f"both selected cameras got a centroid: {[len(g) for g in got]}")
+    check(got[0][0] == (0.9, 0.9), "the hand-placed cross was left alone")
+    check(got[1] == [], "the unselected camera was not touched")
+    p0, p2 = got[0][-1], got[2][-1]
+    check(abs(p0[0] - blobs[0][0]) < 0.05 and abs(p0[1] - blobs[0][1]) < 0.05,
+          f"camera 1 centroid on its own blob: {p0[0]:.2f},{p0[1]:.2f} "
           f"(expected {blobs[0][0]},{blobs[0][1]})")
-    check(abs(pos[2].x() - blobs[2][0]) < 0.05 and abs(pos[2].y() - blobs[2][1]) < 0.05,
-          f"camera 3 centroid on its own blob: {pos[2].x():.2f},{pos[2].y():.2f} "
+    check(abs(p2[0] - blobs[2][0]) < 0.05 and abs(p2[1] - blobs[2][1]) < 0.05,
+          f"camera 3 centroid on its own blob: {p2[0]:.2f},{p2[1]:.2f} "
           f"(expected {blobs[2][0]},{blobs[2][1]})")
-    check(abs(pos[0].x() - pos[2].x()) > 0.05,
+    check(abs(p0[0] - p2[0]) > 0.05,
           "the two results differ — each camera was measured separately")
 
     # ── 4. nothing selected = every camera ────────────────────────────────────

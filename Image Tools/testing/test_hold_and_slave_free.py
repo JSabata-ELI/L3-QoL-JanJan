@@ -16,8 +16,9 @@
 [B] HOLDING A FRAME ARROW RAMPS UP.
 
     A press is one frame, as it always was. Held down, the rate climbs one rung a second —
-    2, 3, 4 then 5 images per second (HOLD_STEP_RATES) — and stops the moment the button
-    comes back up.
+    2, 3, 4 then 5 images per second — and if it stays down it opens up further, to 8/s
+    after five seconds and 10/s after eight (HOLD_STEP_RAMP). It stops the moment the
+    button comes back up.
 
 Runs offscreen against synthetic local frames — no share, no network:
 
@@ -153,7 +154,7 @@ def main():
                   f"{(handle_ts(v, slave) - want) / 1e9:+.3f} s off")
 
         # ── B. press-and-hold on the frame arrows ─────────────────────────────────
-        print("\n[B] holding the forward arrow ramps up to 5 images per second")
+        print("\n[B] holding the forward arrow ramps up: 2-3-4-5, then 8 and 10 images/s")
         v.btn_next.setEnabled(True)
         v.btn_prev.setEnabled(True)
         # Room to run: park the master well before the end.
@@ -168,35 +169,44 @@ def main():
         check("a click moves exactly one frame", master_frame(v) - f0 == 1,
               f"{master_frame(v) - f0} frames")
 
+        # The table itself, first: every rung the ramp is documented with, read straight
+        # off _hold_rate. A pure function, so this part cannot be blamed on the harness.
+        print("  the ramp table")
+        for held, want in ((0.0, 2), (0.9, 2), (1.0, 3), (2.4, 4), (3.0, 5), (4.9, 5),
+                           (5.0, 8), (7.9, 8), (8.0, 10), (60.0, 10)):
+            check(f"{held:.1f} s held -> {want} images/s",
+                  v._hold_rate(held) == want, f"got {v._hold_rate(held)}")
+
         # The RUNG the hold has reached, sampled while it is held. This, not a count of
         # frames per second, is the assertion that can be trusted here: everything in this
         # harness — decode included — shares one thread offscreen, and GC pauses of nearly
         # a second were measured mid-hold, so a count over any single second is noise.
         # The rate itself is read from the clock by _hold_step_tick, so the interval IS the
         # rung, exactly as the operator experiences it. Counts are checked too, but only
-        # for the thing a count can prove: the ramp must never RUN AWAY past 5/s.
+        # for the thing a count can prove: the ramp must never RUN AWAY past its top rung.
         f0 = master_frame(v)
         QTest.mousePress(v.btn_next, Qt.MouseButton.LeftButton)
         press_t = time.monotonic()
         # Sampled against the REAL clock since the press, never against a sum of pumps:
         # the printing and the checks in between cost time of their own, and adding those
         # up walked the "2.5 s" sample past the 3 s rung boundary.
-        for at, want_rate in ((0.7, 2), (1.5, 3), (2.5, 4), (3.5, 5)):
+        for at, want_rate in ((0.7, 2), (1.5, 3), (2.5, 4), (3.5, 5), (6.0, 8), (8.5, 10)):
             pump(app, max(0.02, at - (time.monotonic() - press_t)))
             check(f"after {at:.1f} s held the rate is {want_rate} images/s",
                   v._hold_timer.interval() == 1000 // want_rate,
                   f"interval {v._hold_timer.interval()} ms "
                   f"(want {1000 // want_rate} ms) at "
                   f"{time.monotonic() - press_t:.2f} s")
-        after_3s = master_frame(v) - f0
-        check("the ramp never runs away", after_3s <= 13,
-              f"{after_3s} frames in 3.5 s (ideal 1+2+3+4)")
-        check("the hold is actually stepping", after_3s >= 4, f"{after_3s} frames")
+        held_total = master_frame(v) - f0
+        # Ideal count over the 8.5 s held: 1 press + 2+3+4+5+5+8+8+10 over the rungs.
+        check("the ramp never runs away", held_total <= 60,
+              f"{held_total} frames in 8.5 s")
+        check("the hold is actually stepping", held_total >= 4, f"{held_total} frames")
 
         f_top = master_frame(v)
         pump(app, 3.0)
         top_rate = (master_frame(v) - f_top) / 3.0
-        check("the top rung is capped at 5 images/s", top_rate <= 5.4,
+        check("the top rung is capped at 10 images/s", top_rate <= 10.8,
               f"{top_rate:.1f} frames/s")
 
         QTest.mouseRelease(v.btn_next, Qt.MouseButton.LeftButton)

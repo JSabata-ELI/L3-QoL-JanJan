@@ -172,6 +172,31 @@ def test_a_spike_reaches_the_band_even_when_the_average_hides_it():
     assert np.nanmax(d.bin_mean) < 40.0
 
 
+def test_the_heading_names_every_channel_not_just_how_many():
+    names = ["DA1 Chiller", "DA2 Chiller", "DA3 Chiller", "DA4 Chiller",
+             "Helium Chiller", "Utility Chiller"]
+    title = mt._chart_title(names, "last 90 d")
+    for n in names:
+        assert n in title.replace("\n", " ")
+    assert "6 PVs" not in title
+    assert "last 90 d" in title.replace("\n", " ")
+    assert max(len(line) for line in title.split("\n")) <= 82
+
+
+def test_a_heading_too_long_to_fit_says_how_many_were_left_out():
+    names = [f"Chiller number {i}" for i in range(40)]
+    title = mt._chart_title(names, "last 7 d")
+    assert "more" in title
+    assert len(title.split("\n")) <= 3
+    assert "Chiller number 0" in title
+    assert "last 7 d" in title.replace("\n", " ")
+
+
+def test_a_single_channel_heading_stays_one_line():
+    title = mt._chart_title(["Helium Chiller"], "last 2 h")
+    assert title == "Helium Chiller  (last 2 h)"
+
+
 def test_timestamps_convert_to_matplotlib_numbers_without_drift():
     t = np.array([END, END + 12 * HOUR], dtype=np.int64)
     num = mt._ns_to_num(t)

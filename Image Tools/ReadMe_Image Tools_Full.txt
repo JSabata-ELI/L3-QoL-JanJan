@@ -209,8 +209,10 @@ SEARCH
     group is: "Time window" and "PV Search" side by side — the two
     that say WHEN to look — "Cameras" on its own row under them,
     and "Load data" at the bottom — the button that actually goes
-    and reads the frames. Actions (Save As..., Folder, Workshop and
-    the list of picked cameras) sits directly below Source.
+    and reads the frames. Actions (Save As... and Folder side by
+    side, the two send buttons "➤ Image Slider" and "➤ Workshop" on
+    the row under them, and the list of picked cameras) sits directly
+    below Source.
   - The log — every line the tab writes about what it is doing — is
     a short box at the very bottom of the left panel. It used to be
     a band across the whole tab under the pictures.
@@ -224,7 +226,7 @@ SEARCH
   - Pick a second day and a table appears with a row per day, each
     with its own From and To. There is nothing to switch on. Go back
     to one day and the table goes away again.
-  - A day you have just added starts at 08:00-19:00, or 08:00 to the
+  - A day you have just added starts at 07:00-21:00, or 07:00 to the
     current hour if it is today. The From/To above the table moves
     every day at once; a row you type in keeps what you typed.
   - Nothing happens until you press OK. Cancel throws the whole
@@ -255,7 +257,8 @@ CAMERAS
     A preset can name a camera the chosen days have no recording of
     — loading it picks the ones that are there and says how many
     were missing.
-  - The chosen cameras are listed under the Workshop button. Click a
+  - The chosen cameras are listed under the row of send buttons
+    ("➤ Image Slider" and "➤ Workshop"). Click a
     camera to look at its first frame, double-click it to take it
     out. The button itself carries no count any more: "0/92" said
     nothing useful, because nobody knows which 92 cameras a given
@@ -586,9 +589,18 @@ LOADING IMAGES
       * The camera list is the union over every selected window,
         so an empty day or hour cannot blank it out.
   - Single camera or multi-camera mode.
-  - Live mode is opt-in: tick "Live mode" in the time-window dialog
-    (or press "Now"). Without it the window is loaded once and
-    nothing follows the newest frame.
+  - Under the pickers sit the two ways out of this tab, side by side:
+    "➤ Image Finder" sends the MOMENT on screen, with the cameras
+    loaded here, to the Image Finder — where that one instant is put
+    side by side for every camera and every day — and "➤ Workshop"
+    sends the picture itself for measuring and marking. The moment is
+    what travels, so one scrubbed to between two frames can be sent
+    as well.
+  - Live mode is opt-in: tick "Live mode" in the time-window dialog.
+    Without it the window is loaded once and nothing follows the
+    newest frame. The "Now" button beside the tick is a different
+    thing: it sets the pick to today and the hour it is, and leaves
+    live mode exactly as it was.
   - In live mode new files are picked up by a Windows directory
     watcher (plus a 0.5–5 s adaptive poll as a safety net) and the
     view auto-advances to the latest frame. A silently dead watcher
@@ -658,10 +670,13 @@ PLAYBACK
   - The grey ◀ ▶ arrows move ONE IMAGE per click (← / → do the same).
     HOLD one down and it keeps going, faster the longer you hold it:
     two images a second for the first second, then three, then four,
-    and five a second from the third second on. Let go and it stops
-    where it is. Five a second is the top speed on purpose — every
-    image is a read off the share for every camera on screen, so a
-    faster arrow would only queue up pictures you have already passed.
+    five from the third second, EIGHT from the fifth and TEN from the
+    eighth. Let go and it stops where it is. The two fast steps come
+    only at the end of a long hold on purpose — every image is a read
+    off the share for every camera on screen, so at ten a second the
+    reads are outrun and only the pictures that arrive in time are
+    drawn. That is what you want when you are holding the arrow to get
+    somewhere; it is not what the first second of a hold should do.
   - Play speed: 0.10 to 5 %/s, as a % of the loaded frames per second
     of real time. So 1 %/s over 6000 loaded frames plays 60 frames a
     second. Speeds above 5 %/s were removed: on a window of any size
@@ -791,6 +806,51 @@ DISPLAY OPTIONS
     the difference statistics are shown next to it. The reference is
     named in a green "Ref:" strip under the camera name, and a
     warning appears if it no longer belongs to the loaded set.
+      · SET REF and REMOVE REF sit side by side under the checkbox.
+        Both act on the cameras selected at the moment you click,
+        and offer to cover all of them when nothing is selected.
+        Removing the reference leaves the Subtraction checkbox
+        exactly as you set it; with no reference left, the panel says
+        so instead of quietly showing plain frames. REMOVE REF is
+        greyed out while there is nothing to remove.
+      · THE NUMBERS MEAN THE SAME THING ON EVERY FRAME. Gamma,
+        Contrast and Brightness are applied to the finished
+        DIFFERENCE, never to the frame before it is subtracted, so
+        moving any of them changes only what you see and not a single
+        number. (Gamma used to bend the current frame before the
+        subtraction while the reference stayed linear - and with Auto
+        gamma it bent every frame by a different amount, which is why
+        the maximum wandered for no reason.)
+      · AUTO IS MEASURED ONCE PER RUN. With Auto contrast, Auto
+        brightness or Auto gamma ticked, the values are worked out on
+        the first difference frame that actually differs and then held
+        for every later frame, so the picture stays steady and two
+        frames can be compared by eye. They are measured again when
+        you set or remove a reference, switch Subtraction on, change
+        the Diff threshold or Offset, or tick an Auto box. Without the
+        hold each frame was adjusted by its own numbers and the
+        picture kept brightening on its own.
+      · WITH A REFERENCE SET THE FRAMES ARE READ AT FULL RESOLUTION
+        STRAIGHT AWAY, because the statistics are measured on the
+        picture that was actually decoded and a shrunken one averages
+        neighbouring pixels - a lower maximum and a different pixel
+        count for the same pair of frames. While you are dragging the
+        slider or playing back, the smaller render is still used for
+        speed; the numbers from it are then shown in AMBER with "..."
+        after them and the histogram bars go grey with "not final"
+        written on them, and they turn green again the moment the
+        full-size render lands.
+      · THE NUMBERS AND THE HISTOGRAMS BELONG TO THE REFERENCE, NOT TO
+        THE CHECKBOX. Untick Subtraction and they stay exactly where
+        they are and go on following the frames - every frame is still
+        measured against the reference, only the picture goes back to
+        being the ordinary one. That is what lets you click Subtraction
+        on and off to compare: nothing moves. (They used to vanish the
+        moment the box was unticked, and because the INFO panel sits
+        ABOVE the settings column the whole column - the Subtraction
+        checkbox included - jumped about 110 px up under the cursor.)
+        They go away when the REFERENCE goes: Remove ref, a new
+        reference, or a new scan.
       · The statistics say HOW MANY PIXELS ARE ABOVE THE BACKGROUND
         of the difference frame (the background being its darkest
         value, which on a difference is 0 and is printed only when it
@@ -805,12 +865,26 @@ DISPLAY OPTIONS
         the numbers stay physical.
       · Under them sits a small histogram: how many pixels differ at
         each brightness, 0 on the left, 255 on the right, with tick
-        numbers across the axis, the count the tallest bar stands for
-        written top-left, and a red line at the brightest pixel. Only
-        the pixels above the background are counted - the background
-        alone is nearly the whole frame and would flatten every other
-        bar - and the bars are on a square-root scale, so a handful
-        of very bright pixels is still visible.
+        numbers across the axis. Only the pixels above the background
+        are counted - the background alone is nearly the whole frame
+        and would flatten every other bar - and the bars are on a
+        square-root scale, so a handful of very bright pixels is
+        still visible.
+      · THE NUMBERS ARE WRITTEN INSIDE THE HISTOGRAM. Top left,
+        "top" is how many pixels the tallest bar stands for - that
+        one is a pixel count. The three on the right are the
+        difference itself, on the same 0-255 scale as the bars:
+        "max" in red is the brightest differing pixel (the red line
+        marks where it sits), "mean" in blue the average of every
+        counted pixel, and "min" in purple the faintest pixel that
+        still counts (a purple dotted line marks that one). With the
+        diff threshold at 0, "min" is the noise floor the sensor
+        leaves behind; set a threshold and "min" reads it back, which
+        is how to check the threshold is doing what it says. A
+        histogram too narrow for all three drops "min" first, then
+        "mean", rather than printing them on top of each other - so
+        a one-camera panel shows everything and a small tile in a
+        grid keeps "max".
       · EVERY CAMERA GETS ITS OWN BLOCK: its name and numbers, then
         its own histogram directly beneath them. (There used to be
         one histogram for the whole grid - the selected camera's -
@@ -819,8 +893,7 @@ DISPLAY OPTIONS
         blocks scroll once they fill their box, so a many-camera grid
         cannot push the settings column off the screen.
       · What used to be printed here and no longer is: the size of
-        the frame (the same on every frame) and the darkest lit
-        pixel (the diff threshold read back).
+        the frame, the same on every frame.
   - Pixel normalization: the 16-bit value against the camera's own
     range. No per-frame auto-scaling, so one palette colour always
     means one intensity, and low-signal cameras (the PDxM1 diodes)
@@ -863,21 +936,43 @@ DISPLAY OPTIONS
     read; you can delete it.
 
 OVERLAYS
-  - Cross reticle (centre of image).
-  - Circle, square, and cross overlays — drag to position/resize.
-    The cross follows the mouse while the button is held: click to drop
-    it, hold to drag it, click somewhere else to move it there.
+  - Circle, square and cross marks, drawn on the picture with the mouse.
+  - AS MANY OF EACH AS YOU LIKE. Every click adds another mark: three
+    crosses on three spots, two boxes around two regions. Switch Draw on
+    for the shape you want and
+      · click an empty place        — a new mark there (drag it to draw
+                                      an ellipse or a rectangle at the
+                                      size you want; a plain click makes
+                                      a small one you can then pull out)
+      · click a mark you already
+        have                        — picks it out, and you can drag it
+      · press Delete                — takes the picked-out mark away
+      · Ctrl+click on a mark        — a NEW mark on top of it, instead of
+                                      picking up the one that is there
+    You only ever click the shape whose Draw button is on: with crosses
+    switched on, the circles and boxes are not in the way. The mark that
+    is picked out is drawn thicker, with a black casing and white dashes,
+    so it can be seen on a black field and on a blown-out beam core
+    alike; a circle and a box also show their white grab points, which
+    are what you pull to resize them. "Remove selected" still takes every
+    mark off at once.
+  - Ticking a box no longer draws anything by itself — the picture stays
+    as it is until you place a mark. It used to put a cross in the middle
+    of the image, which also meant a save wrote an extra "annotated" file
+    that was identical to the original.
   - SEVERAL CAMERAS AT ONCE. The Draw and Cal buttons work on the
     cameras you have marked — on all of them if you have marked none.
     Draw and one click puts the same mark on every marked camera at the
     same place in the picture: click the middle of one camera and it
     lands in the middle of the others too, whatever size their pictures
-    are. Only the shape you moved is copied, so moving the cross leaves
-    their circles alone. Cal measures each marked camera on its own
-    picture — one click, one result per camera — and if it cannot find
-    the shape on some of them, it names those cameras in one message.
-    Marking a camera is done on its name bar; while Draw is switched on
-    a click on the picture draws instead of marking.
+    are. Adding, moving and deleting all travel the same way, so the
+    marked cameras always carry the same set of marks. Only the shape you
+    moved is copied, so moving a cross leaves their circles alone. Cal
+    measures each marked camera on its own picture — one click, one
+    result per camera, ADDED to whatever is already there — and if it
+    cannot find the shape on some of them, it names those cameras in one
+    message. Marking a camera is done on its name bar; while Draw is
+    switched on a click on the picture draws instead of marking.
   - Overlay settings: configure size, opacity, and limits.
   - Overlays can be burned into exported images ("Save with overlay").
     With it ticked, the PV values are added as a white bar under the
@@ -1204,22 +1299,32 @@ PV VALUES
     (%APPDATA%\ELI_ImageTools\slider_ui_state.json).
   - Values update in real time alongside image playback. A frame
     change refreshes the panel immediately; changes arriving faster
-    than 0.5 s are coalesced into one archiver query. At 3.3 Hz that
-    is about two refreshes a second, and asking any faster cannot
-    produce a fresher number: the archiver needs about a second to
-    publish a shot either way. Requests never queue up behind the
-    shots - only one is ever in flight, and the next one always asks
-    about the newest frame, so a long run cannot build a backlog.
-  - THE PANEL WAITS FOR THE ARCHIVER. An image is on the share about
-    0.02 s after the shot, but its archived sample only becomes
-    readable roughly a second later (measured 0.2-2.5 s). So at the
-    moment a new frame appears, the values for it do not exist yet.
-    The panel now says so ("no data yet") and keeps asking until they
-    land, which normally takes one or two retries; it gives up after
-    20 s, when "nothing was archived for this frame" is the true
-    answer. While the answer is still expected — the first 2.5 s —
-    it asks again every 0.4 s at a steady pace, and only after that
-    does it start slowing down. It used to double the gap from the
+    than 0.25 s are coalesced into one archiver query. Requests never
+    queue up behind the shots - only one is ever in flight, and the
+    next one always asks about the newest frame, so a long run cannot
+    build a backlog.
+  - HOW LONG AFTER THE PICTURE THE NUMBER APPEARS: about a fifth of
+    a second, measured 17.09.2026 end to end (234 ms, half-way point
+    of ten shots). It used to be 351 ms, and the difference was the
+    program's own refresh pacing, which had been set to half a second
+    back when the archiver itself took about a second to publish a
+    shot. It no longer does - re-measured the same day, a reading is
+    available as soon as it is stamped (within the 0.2 s the method
+    can resolve), for the energies and for a utility channel alike.
+    So the pacing was shortened to a quarter of a second and the
+    first re-ask after a missing value to 0.12 s. At an ordinary shot
+    rate this costs nothing - the same 2.7 archiver queries per shot;
+    a 3.3 Hz live run asks about twice as often as before.
+  - At that point the slower half of the pair is the PICTURE, not the
+    number: a new file is noticed within half a second and then takes
+    a share read (0.13-0.16 s) to appear.
+  - THE PANEL WAITS FOR THE ARCHIVER. When a value for the frame is
+    not published yet the panel says so ("no data yet") and keeps
+    asking until it lands, which normally takes one or two retries;
+    it gives up after 20 s, when "nothing was archived for this
+    frame" is the true answer. While the answer is still expected —
+    the first 2.5 s — it asks again every 0.12 s at a steady pace,
+    and only after that does it start slowing down. It used to double the gap from the
     first retry, so it stepped straight over the moment the sample
     became readable and the number appeared about 0.7 s later than it
     had to, on every single shot. Measured: 0.8 s before, 0.02 s
@@ -1263,25 +1368,62 @@ PV VALUES
     hours back that is: that is simply what the machine was set to
     when the shot was taken. The program works out which PVs behave
     that way from the archive itself, so a newly added setting needs
-    nothing switched on for it. Energy detectors keep the strict rule
-    above — no reading of their own means "n/a", never the number
-    from a neighbouring shot.
+    nothing switched on for it.
+  - A READING BELONGS TO THE PICTURE IT IS NEAREST TO. Every camera
+    is triggered by the shot, but each one stamps its file with its
+    own small, constant lag behind the reading — and the old fixed
+    ±0.3 s ran straight through the middle of that. Measured on
+    16.09.2026, 15:00 to 16:00, with every one of these cameras
+    storing one picture every 5.00 s, against PTM1:
+
+        PCM4NF   reading 0.16 s from the picture   paired  92 %
+        PCM2NF   reading 0.37 s from the picture   paired   5 %
+        PCW3NF   reading 0.51 s from the picture   paired   0 %
+        PTM9NF   reading 0.39 s from the picture   paired  20 %
+
+    Same shots, same channel, same rate: three of those four said
+    "no data" for readings that were plainly theirs, while the next
+    shot was five seconds away and was never a candidate.
+      A reading is now taken as a picture's own when it is nearer to
+    it than to any other picture OF THAT CAMERA — in practice up to
+    half the gap to the neighbouring picture (never under 0.3 s,
+    never over a minute). Nothing to calibrate per camera: the
+    program reads the spacing off the pictures themselves. With the
+    same measurement, every 5 s camera now pairs 92–93 % with PTM1
+    and 99 % with SBW4, and the ones that reported nothing pair like
+    all the others.
+      It tightens by itself when the pictures come faster. A camera
+    running at 3.3 pictures a second gets 0.15 s, i.e. the strict
+    floor, so the neighbouring shot can never be claimed — which is
+    exactly the case the fixed window existed for, and the one to be
+    ready for when the energies start arriving at that rate too.
+  - A PICTURE BETWEEN TWO SHOTS still has no reading of its own — a
+    camera free-running at 3.3 or 10 pictures a second while the
+    laser fires every 5 s stores forty pictures per shot. Those show
+    the nearest reading greyed and labelled, "(-1.5 s)" or "(+4.1 s)"
+    — the sign says whether it was taken before or after the picture
+    — with the exact moment in the tooltip; and "n/a" when even that
+    is too far, with the reason in the tooltip too.
   - How to read a value (side panel):
       12.3 J          the shot's own archived value.
       ~12.3 J         approximate. Only the waveplate uses this now:
                       the motor was caught mid-move and the position
                       was snapped onto its 1000-count grid.
-      12.3 J (-0.6 s) this frame's own sample is not available (yet),
-      12.3 J (-28 s)  so the value of an earlier shot is shown — the
-                      number in brackets is how much earlier. Greyed;
-                      the tooltip names that shot's exact time.
+      12.3 J (-0.6 s) this frame has no reading of its own, so the
+      12.3 J (-28 s)  nearest one is shown — the number in brackets
+      12.3 J (+4.1 s) is how far away it was taken, minus for before
+                      the picture and plus for after. Greyed; the
+                      tooltip names its exact time.
       12.3 J          the same, when the age of the older reading is
         (older shot)  not known (e.g. right after a restart).
       no data yet     the archiver has not published this frame yet
                       and the PV has no earlier value to show. It
                       fills in by itself.
-      n/a             no sample near this frame and the PV has never
-                      reported one, so there is nothing to hold.
+      n/a             nothing archived near this frame at all — not
+                      within 0.3 s, and not within the wider reach
+                      described above either. The tooltip says how
+                      far the nearest reading is, so "n/a" can be
+                      told from a program that is not reading.
       ERR             the archiver request failed; the next refresh
                       retries it.
       ...             first read, still in flight.
@@ -1473,8 +1615,9 @@ Useful for locating shots at a given energy, waveplate angle, etc.
 
 WHAT IS SEARCHED
   - "Time window" and "Cameras" sit side by side, the picked days are
-    listed under them, and "Load data" is at the bottom of the same
-    group — the action next to everything it acts on.
+    listed under them, and "Load data" and "Load images" are at the
+    bottom of the same group — the actions next to everything they
+    act on.
   - "Time window" opens the one picker every tab opens: a single
     calendar (Monday first, weekends in red, the month and the year
     on the bar above the days) and the times From and To to the
@@ -1484,14 +1627,17 @@ WHAT IS SEARCHED
     and no separate window for one day's times. So the days need NOT
     follow one another: Monday and Thursday alone is a perfectly good
     search. The From/To above the table moves every day at once; a
-    row you type in keeps what you typed. "Now" moves the calendar to
-    today. Nothing happens until OK; Cancel throws the change away.
+    row you type in keeps what you typed. "Now" jumps the whole pick
+    to today and the hour it is - one day, the last hour - so it is
+    one click back to the present from wherever you had wandered off
+    to. Nothing happens until OK; Cancel throws the change away.
     There is no Live mode here; this tab searches what is already
     archived.
-    It opens on 07:00 to 20:00 — the shift, not the whole calendar
+    It opens on 07:00 to 21:00 — the shift, not the whole calendar
     day. Nothing is shot at four in the morning, and a window that
     started at midnight made every search read hours that hold
-    nothing.
+    nothing. Those hours are not even asked for now: the archiver is
+    queried for the picked window, not for the whole day.
     What this replaced was a pair of calendars of its own, Start
     point and End point, which could only pick whole hours and only a
     run of days from one date to another.
@@ -1499,24 +1645,53 @@ WHAT IS SEARCHED
     picker, with the same saved sets ("presets"), so a set of
     cameras saved in one tab is offered in the other. The cameras
     you picked stay listed on the panel below the button.
-  - "Load data" reads the PV data for those days and finds the
-    matching frames. While it runs, the bar under it says how far
-    along it is and how many matches are in, and the grey line under
-    the bar says what is being read right now - the PV data of a
-    given day, or the frame of a given camera. The bar fills
-    gradually inside a single day as well, so one day with one camera
-    no longer sits at zero for the whole wait.
-  - How long is left appears only once it has been MEASURED. The work
-    has two halves of very different speed: the PV data of all the
-    days is read at once and is quick, then the frames are looked for
-    on the network drive day by day, which is the slow part. So
-    nothing is promised while the PV data is being read, and from the
-    second searched day onwards the estimate is the middle of the
-    times the finished days actually took, times the days left. Days
-    the archiver had nothing for are left out of that middle - they
-    finish in a blink and would promise the rest of the search in a
-    blink too. Before, one straight line was drawn through both
-    halves, and the number jumped from minutes to seconds and back.
+  - TWO buttons, because the work has two halves and they cost very
+    different amounts.
+      "Load data" (left) reads the PV data of the picked days and
+      says which shots fall inside the band - how many, and when. It
+      does NOT go to the network drive for a single picture, which is
+      what makes it fast over a long range. The rows are green and
+      say "no image loaded"; the Folder column shows a dash. You can
+      still double-click a day and get its list of shots and its
+      curve.
+      "Load images" (right) does the same AND fetches the picture of
+      every day for every selected camera.
+  - Press "Load data" first and then "Load images" and the numbers
+    are NOT read again: only the pictures are fetched. Changing the
+    cameras in between is fine - the numbers do not depend on the
+    camera. Retyping a target or a tolerance does read again, because
+    that is a different question.
+  - The list does NOT disappear when you press "Load images". The
+    rows that are already there stay where they are and fill in, and
+    the "Image" column beside the date says what has happened to each
+    one:
+      a green tick   the picture of that row is on the network drive
+      a red cross    it was looked for and it is not there
+      a grey dash    nobody has looked yet (you only pressed
+                     "Load data")
+    So you can watch the dashes turn into ticks instead of watching
+    an empty table refill itself.
+  - The pictures of several days and cameras are looked for at the
+    same time, not one after another, which is where most of the
+    waiting used to go. A picture is also no longer opened and read
+    in full just to put it in the list - a few megabytes a row off
+    the network drive. If one turns out to be completely black, you
+    are told when you look at it: that row's tick becomes a cross
+    and says "image is blank (all zero)".
+  - While either runs, the bar under them says how far along it is
+    and how many matches are in, and the grey line under the bar says
+    what is being read right now - the PV data of a given day, or the
+    frame of a given camera. The bar fills gradually inside a single
+    day as well, so one day with one camera no longer sits at zero
+    for the whole wait.
+  - How long is left is MEASURED, never estimated from a table. The
+    two halves are timed separately - the archiver read per PV and
+    day, the picture hunt per day and camera - and what is left is
+    the sum of the two, so the number does not jump as the search
+    crosses from one to the other. Each search remembers the two
+    speeds and the next one starts from them, so only the first
+    search after opening the program has to run for a moment before
+    it can say anything.
   - The same bar appears when you change the picked days: before
     anything can be searched, the cameras of those days have to be
     looked up on the network drive, and that walk is now counted in
@@ -1545,8 +1720,25 @@ RESULTS
   - Table shows the best-matching image path for each
     camera × day combination, with annotated PV values.
   - Click a row to preview the image with an energy overlay bar.
-  - Open Slider: send the selected row to Image Slider.
-  - Save Results: export table to CSV.
+  - "Act on" says what the send buttons and Save work with: "Whole
+    day(s)" — the selected day rows, or all of them when nothing is
+    selected — or "Selected shot", the one picked in the day detail.
+  - One row of send buttons, in tab order:
+      "➤ Image Finder"  sends the MOMENTS of those rows, with the
+                        camera whose tab is in front. Nothing is
+                        copied: the Finder looks the frames up itself
+                        and puts them on one wall, so the same shot
+                        of many days can be compared. A day whose
+                        picture was never loaded can be sent too —
+                        only the instant is needed. Over twelve
+                        moments it asks first.
+      "➤ Image Slider"  copies the matched IMAGES into a set and
+                        hands them over; whatever the Slider was
+                        showing is replaced.
+      "➤ Workshop"      hands the previewed picture over for
+                        measuring and marking.
+    All three stay in place and grey out when there is nothing for
+    them to do, so the row never moves under the pointer.
   - Save Images: export annotated images to a chosen folder.
 
 TECHNICAL NOTES
@@ -2023,6 +2215,41 @@ THE TWO WAYS OUT TO THE IMAGE SLIDER
   was doing before is put down first: live mode, focus mode and the
   watcher, which would otherwise drag the view to the newest frame or
   hide the slider itself.
+
+  Beside them, in Actions, sit the other two ways out of this tab:
+  "➤ Image Slider" hands over the frames that are on the wall as a
+  set, and "➤ Workshop" the pictures that are marked.
+
+THE WAY IN: SENT HERE FROM ANOTHER TAB
+
+  The Image Slider and the Shot Finder both have a "➤ Image Finder"
+  button, and it is the mirror image of "Send moment": they slide
+  through the shots around one instant, this tab puts that one
+  instant side by side for every camera and every day.
+
+  What crosses over is a MOMENT, never a file. This tab then:
+
+    - picks the day of the moment in the Time window, with a quarter
+      of an hour on either side of it, so a tab that was left on
+      another day does not have to be reset by hand;
+    - reads the camera list for that day and only THEN ticks the
+      cameras that came with the moment — the folders of a day this
+      tab has never looked at are not known before that;
+    - looks the nearest frame up itself and puts it on the wall.
+
+  Because it is the moment that travels, an instant scrubbed to
+  between two pictures in the Slider, or a day in the Shot Finder
+  whose picture was never loaded, are both things that can be sent.
+
+  A camera that was not archiving on those days leaves the cameras
+  picked HERE alone, and the log says so — the pick is never quietly
+  emptied. With no camera picked at all, the camera picker opens and
+  the wall follows the pick, the same rule PV Search works by.
+
+  The Shot Finder sends one moment per day row, so the same shot of
+  many days lands on one wall — which is what this tab is for. Over
+  twelve moments it asks first: every moment costs a look in the
+  archive per camera.
 
 A STRETCH WITH NO READING IN IT
 

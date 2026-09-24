@@ -71,17 +71,28 @@ def _flat(value, hours, n=60, now_ns=NOW):
     return [(start + int(i / (n - 1) * span), value) for i in range(n)]
 
 
+def _stale(value=16.3, age_s=3 * 3600):
+    """A PV whose newest archived sample stopped advancing hours ago — the one
+    thing that now counts as 'not updating'."""
+    old = NOW - int(age_s) * SEC
+    hist = [(old - i * MIN, 16.3 + i * 0.1) for i in range(50)]
+    return _rt(hist, value, data_ts_ns=old)
+
+
 # ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
 
-def test_constant_value_is_reported_as_frozen():
+def test_a_steady_value_is_not_reported():
+    """The bug this rule was rewritten for: a chiller regulated to one tenth of
+    a degree kept being announced as "PV NOT UPDATING — value unchanged for
+    2 h". Measured on L3-UTIL-CHL03-001 (13 Sep 2026): a sample every ~0.7 s,
+    the value reported in whole tenths, one tenth held for 40-125 min. Data
+    arriving is what counts, so a flat line is no fault at all."""
     win, pv = _win(), mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt = _rt(_flat(16.3, 60), 16.3)
+    rt = _rt(_flat(21.7, 60), 21.7)       # 2.5 days of exactly 21.7, fresh
     win._update_frozen(pv, rt, NOW)
-    assert rt.frozen
-    assert "unchanged for 2 d 12 h" in rt.frozen_reason
-    assert not rt.frozen_bounded          # constant across all data kept
+    assert not rt.frozen and rt.frozen_reason == ""
 
 
 def test_moving_value_is_not_frozen():
@@ -95,19 +106,18 @@ def test_moving_value_is_not_frozen():
 def test_no_reading_is_no_data_not_frozen():
     """Losing the data is the existing 'no data' state; don't relabel it."""
     win, pv = _win(), mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt = _rt(_flat(16.3, 60), None)
+    rt = _stale(value=None)
     win._update_frozen(pv, rt, NOW)
-    assert not rt.frozen and rt.frozen_since_ns == 0
+    assert not rt.frozen and rt.frozen_reason == ""
 
 
-def test_stale_newest_sample_is_frozen_even_if_values_differ():
-    """Archiver answers, but with data from hours ago."""
+def test_stale_newest_sample_is_the_whole_check():
+    """Archiver answers, but has nothing newer than three hours ago."""
     win, pv = _win(), mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    old = NOW - 3 * 3600 * SEC
-    hist = [(old - i * MIN, 16.3 + i * 0.1) for i in range(50)]
-    rt = _rt(hist, 16.3, data_ts_ns=old)
+    rt = _stale()
     win._update_frozen(pv, rt, NOW)
-    assert rt.frozen and "newest archive sample is 3 h 0 min old" in rt.frozen_reason
+    assert rt.frozen
+    assert "no new reading for 3 h 0 min" in rt.frozen_reason
 
 
 def test_fresh_sample_within_limit_is_not_flagged():
@@ -120,26 +130,14 @@ def test_fresh_sample_within_limit_is_not_flagged():
 
 def test_per_pv_optout_and_global_switch():
     off_pv = mt.PVConfig(name="HALL:Enable", enabled=True, frozen_check=False)
-    rt = _rt(_flat(1.0, 60), 1.0)
+    rt = _stale(value=1.0)
     _win()._update_frozen(off_pv, rt, NOW)
     assert not rt.frozen
 
     on_pv = mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt2 = _rt(_flat(16.3, 60), 16.3)
+    rt2 = _stale()
     _win(frozen_check_enabled=False)._update_frozen(on_pv, rt2, NOW)
     assert not rt2.frozen
-
-
-def test_shorter_freeze_than_configured_is_not_flagged():
-    win = _win(frozen_after_minutes=120)
-    pv = mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt = _rt(_flat(16.3, 1), 16.3)        # 1 h of the same value
-    win._update_frozen(pv, rt, NOW)
-    assert not rt.frozen
-    # Same data, limit lowered to 30 min -> now it counts.
-    win.settings["frozen_after_minutes"] = 30
-    win._update_frozen(pv, rt, NOW)
-    assert rt.frozen
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +153,7 @@ def _armed_win(pv, rt, **overrides):
 
 def test_alert_fires_once_per_episode_then_on_recovery():
     pv = mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt = _rt(_flat(16.3, 60), 16.3)
+    rt = _stale()
     win = _armed_win(pv, rt)
     win._update_frozen(pv, rt, NOW)
     win._check_frozen_alerts()
@@ -172,7 +170,7 @@ def test_alert_fires_once_per_episode_then_on_recovery():
 
 def test_losing_the_data_does_not_look_like_a_recovery():
     pv = mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt = _rt(_flat(16.3, 60), 16.3)
+    rt = _stale()
     win = _armed_win(pv, rt)
     win._update_frozen(pv, rt, NOW)
     win._check_frozen_alerts()
@@ -187,7 +185,7 @@ def test_no_alert_when_monitoring_off_or_alerting_disabled():
                                  ({"frozen_alert_enabled": False}, True, True),
                                  ({}, True, False)):
         pv = mt.PVConfig(name="CHILLER:Temp", enabled=enabled)
-        rt = _rt(_flat(16.3, 60), 16.3)
+        rt = _stale()
         win = _armed_win(pv, rt, **kwargs)
         win._monitoring = mon
         win._update_frozen(pv, rt, NOW)
@@ -208,7 +206,7 @@ def _model(pv, rt, monitoring=True):
 
 def test_state_cell_shows_not_updating():
     pv = mt.PVConfig(name="CHILLER:Temp", enabled=True)
-    rt = _rt(_flat(16.3, 60), 16.3)
+    rt = _stale()
     _win()._update_frozen(pv, rt, NOW)
     m = _model(pv, rt)
     idx = m.index(0, mt.COL_STATE)
@@ -224,7 +222,7 @@ def test_state_cell_shows_not_updating():
 
 def test_state_cell_shows_not_updating_for_pvs_with_alerting_off():
     pv = mt.PVConfig(name="CHILLER:Temp", enabled=False)
-    rt = _rt(_flat(16.3, 60), 16.3)
+    rt = _stale()
     _win()._update_frozen(pv, rt, NOW)
     m = _model(pv, rt)
     assert m.data(m.index(0, mt.COL_STATE), Qt.DisplayRole) == mt.FROZEN_LABEL
@@ -280,7 +278,8 @@ def _refresh_win(pvs=(), runtime=None, last_ok_ns=NOW, **overrides):
                  "_check_refresh_health", "_mark_stale_ui", "_pv_stale_note",
                  "_status_line", "_cmd_status", "_cmd_alarms",
                  "_refresh_note_short", "_freshness_header",
-                 "_freshness_footer", "_resolve_pvs", "_find_pv",
+                 "_freshness_footer", "_resolve_pvs", "_find_pv", "_find_pvs",
+                 "_cmd_list",
                  "_menu_signin_note"):
         setattr(win, name, types.MethodType(getattr(mt.MonitorWidget, name), win))
     win._log = types.MethodType(lambda self, m: self.logged.append(m), win)

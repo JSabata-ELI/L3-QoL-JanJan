@@ -1,8 +1,35 @@
 {
-  "_comment": "Read by Dev Tools/b_t.py at build time. extra_files are copied next to the exe (folders included, recursively). images/ and sounds/ MUST ship with every build: the alarm image is read from images/ next to the exe at runtime, so a build without it can only flash a plain colour, and sounds/ holds the selectable WAV alerts. Dev Tools/cm_t.py then deploys those folders to the share.",
+  "_comment": "Read by Dev Tools/b_t.py at build time. images/ and sounds/ MUST ship with every build: the alarm picture is read from images/ next to the exe, so a build without it can only flash a plain colour, and sounds/ holds the selectable WAV alerts. Dev Tools/cm_t.py then deploys those folders to the share. The three editing tabs are listed as hidden imports because main.py loads them by name (__import__ on a variable), which PyInstaller cannot see - without these the program starts with three red 'tab could not be built' pages. The Qt exclusions are the same ones Image Tools uses; none of this program touches QML, Quick or 3D.",
   "extra_files": [
     "images",
     "sounds"
   ],
-  "hidden_imports": []
+  "collect_all": [],
+  "hidden_imports": [
+    "wa_t",
+    "vl_t",
+    "ar_t",
+    "al_t",
+    "ann_log",
+    "ann_core",
+    "ann_cpva",
+    "ann_screen",
+    "ann_watch",
+    "ann_alarm",
+    "ann_sound",
+    "ann_ui"
+  ],
+  "exclude_modules": [
+    "PySide6.QtQml",
+    "PySide6.QtQuick",
+    "PySide6.QtQuick3D",
+    "PySide6.QtQuickControls2",
+    "PySide6.QtQuickWidgets",
+    "PySide6.Qt3DAnimation",
+    "PySide6.Qt3DCore",
+    "PySide6.Qt3DExtras",
+    "PySide6.Qt3DInput",
+    "PySide6.Qt3DLogic",
+    "PySide6.Qt3DRender"
+  ]
 }
